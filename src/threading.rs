@@ -8,9 +8,13 @@
 //! - False-sharing avoidance for parallel reductions
 //! - Integration with rayon for work-stealing parallelism
 
+#[cfg(feature = "parallel")]
 use crate::block::compute_block_sizes;
+#[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
+#[cfg(feature = "parallel")]
 use crate::order::compute_order;
+#[cfg(feature = "parallel")]
 use crate::MIN_THREAD_LENGTH;
 
 #[cfg(feature = "parallel")]
@@ -38,6 +42,7 @@ pub struct ThreadedContext<'a> {
     pub task_index: usize,
 }
 
+#[cfg(feature = "parallel")]
 impl<'a> ThreadedContext<'a> {
     /// Create a new threaded context.
     pub fn new(
@@ -88,6 +93,7 @@ impl<'a> ThreadedContext<'a> {
     }
 }
 
+#[cfg(feature = "parallel")]
 /// Find the best dimension to split for threading.
 ///
 /// Julia equivalent: `i = _lastargmax((dims .- 1) .* costs)`
@@ -119,6 +125,7 @@ pub fn find_split_dimension(dims: &[usize], costs: &[isize]) -> Option<usize> {
     max_idx
 }
 
+#[cfg(feature = "parallel")]
 /// Check if a dimension should be split.
 ///
 /// Julia: `costs[i] == 0 || dims[i] <= min(blocks[i], 1024)`
@@ -137,6 +144,7 @@ pub fn should_split_dimension(
     cost != 0 && dim > block.min(1024)
 }
 
+#[cfg(feature = "parallel")]
 /// Split context into two halves for parallel execution.
 ///
 /// Julia equivalent:
@@ -200,6 +208,7 @@ pub fn split_context<'a>(
     (ctx1, ctx2)
 }
 
+#[cfg(feature = "parallel")]
 /// Mask costs for dimensions with zero stride in output array.
 ///
 /// Julia: `costs = costs .* .!(iszero.(strides[1]))`
@@ -214,6 +223,7 @@ pub fn mask_reduction_costs(costs: &[isize], output_strides: &[isize]) -> Vec<is
         .collect()
 }
 
+#[cfg(feature = "parallel")]
 /// Compute spacing for false-sharing avoidance in parallel reductions.
 ///
 /// Julia: `spacing = isbitstype(T) ? max(1, div(64, sizeof(T))) : 1`
@@ -231,6 +241,7 @@ pub fn compute_reduction_spacing(elem_size: usize) -> usize {
 // Generic threaded_map is not used directly; par_zip_map2_into uses its own
 // recursive implementation for type-safety with raw pointers.
 
+#[cfg(feature = "parallel")]
 #[cfg(test)]
 mod tests {
     use super::*;
