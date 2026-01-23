@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
 use mdarray_strided::{
-    copy_into, copy_into_uninit, copy_transpose_scale_into, copy_transpose_scale_into_fast,
+    copy_into, copy_into_uninit, copy_transpose_scale_into_fast,
     copy_transpose_scale_into_tiled, map_into, sum, symmetrize_into, zip_map2_into, zip_map4_into,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};

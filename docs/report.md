@@ -139,13 +139,13 @@
 
 | Method | Time (mean) | Throughput | Speedup vs Naive |
 |--------|--------------|------------|------------------|
-| naive | 504.23 µs | 1.98 Gelem/s | 1.00× |
-| strided | 407.24 µs | 2.46 Gelem/s | **1.24×** (faster) |
-| strided (tile=16) | 720.50 µs | 1.39 Gelem/s | **0.70×** (slower) |
-| strided (tile=24) | 705.88 µs | 1.42 Gelem/s | **0.71×** (slower) |
-| strided (tile=32) | 733.71 µs | 1.36 Gelem/s | **0.69×** (slower) |
+| naive | 475.10 µs | 2.10 Gelem/s | 1.00× |
+| strided | 378.34 µs | 2.64 Gelem/s | **1.26×** (faster) |
+| strided (tile=16) | 601.18 µs | 1.66 Gelem/s | **0.79×** (slower) |
+| strided (tile=24) | 598.87 µs | 1.67 Gelem/s | **0.79×** (slower) |
+| strided (tile=32) | 618.86 µs | 1.62 Gelem/s | **0.77×** (slower) |
 
-**分析**: `strided` は `copy_transpose_scale_into_fast` を使用しており、naive より**約1.24倍高速**です。特化カーネルにより、キャッシュ効率が改善されています。タイル版は naive より遅く、デフォルトの `strided` が最適です。
+**分析**: `strided` は `copy_transpose_scale_into_fast` を使用しており、naive より**約1.26倍高速**です。4x4マイクロカーネルによる最適化が効果的です。タイル版は naive より遅く、デフォルトの `strided` が最適です。
 
 #### 4.3 Nonlinear Map (非線形マップ: `B = A .* exp(-2A) .+ sin(A²)`)
 
