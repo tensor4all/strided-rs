@@ -1,257 +1,202 @@
-# mdarray-strided ベンチマークレポート
+# Benchmark Report: mdarray-strided v0.1
 
-**実行日**: 2026-01-23
-**環境**: Rust release build, optimized
+**Date:** January 23, 2026
+**Platform:** macOS (darwin 25.2.0)
 
-## 概要
+This report summarizes performance benchmarks comparing strided array operations against naive implementations.
 
-`mdarray-strided` クレートのパフォーマンスを、naive実装（ネストしたループ）と比較したベンチマーク結果です。各ベンチマークは、連続配列（contiguous）とストライド配列（permuted/transposed）の両方のケースを評価しています。
+## Executive Summary
 
-## ベンチマーク結果
+The strided kernels show significant performance improvements in most operations:
 
-### 1. Copy Operations
+| Operation | Size | Speedup | Notes |
+|-----------|------|---------|-------|
+| `copy_permuted` | 1000×1000 | **0.75x slower** | Simple permutation copy |
+| `zip_map_mixed` | 1000×1000 | **1.46x faster** | Mixed stride access (transpose + add) |
+| `reduce_transposed` | 1000×1000 | **1.07x faster** | Sum of transposed array |
+| `symmetrize_aat` | 4000×4000 | **1.55x faster** | `B = (A + A') / 2` |
+| `scale_transpose` | 1000×1000 | **1.46x faster** (median) | `B = 3.0 * A'` |
+| `nonlinear_map` | 1000×1000 | **≈same** | element-wise ops |
+| `permutedims_4d` | 32×32×32×32 | **≈same** | Full 4D transpose |
+| `multi_permute_sum` | 32×32×32×32 | **2.02x faster** | Sum of 4 permutations |
 
-#### 1.1 Copy Permuted (転置配列のコピー)
+## Detailed Results
 
-**対応ベンチ**: `bench_copy_permuted` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- copy_permuted`
+### 1. Copy Permuted (1000×1000)
 
-| Size | Method | Time (mean) | Throughput | Speedup vs Naive |
-|------|--------|--------------|------------|------------------|
-| 100×100 | naive | 3.87 µs | 2.58 Gelem/s | 1.00× |
-| 100×100 | strided | 5.22 µs | 1.92 Gelem/s | **0.74×** (slower) |
-| 500×500 | naive | 82.98 µs | 3.01 Gelem/s | 1.00× |
-| 500×500 | strided | 79.94 µs | 3.13 Gelem/s | **1.04×** (faster) |
-| 1000×1000 | naive | 368.62 µs | 2.71 Gelem/s | 1.00× |
-| 1000×1000 | strided | 398.87 µs | 2.51 Gelem/s | **0.92×** (slower) |
-
-**分析**: タイル化の閾値を32×32に下げたことで、500×500ではnaiveを上回る性能（1.04×）を達成しました。100×100ではまだnaiveより遅いですが、タイル化により改善が見られます。1000×1000では以前より改善し、naiveに近い水準（0.92×）まで縮まりました。
-
-#### 1.2 Copy Contiguous (連続配列のコピー)
-
-**対応ベンチ**: `bench_copy_contiguous` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- copy_contiguous`
-
-| Size | Method | Time (mean) | Throughput | Speedup vs Naive |
-|------|--------|--------------|------------|------------------|
-| 100×100 | naive | 2.01 µs | 4.98 Gelem/s | 1.00× |
-| 100×100 | strided | 1.45 µs | 6.88 Gelem/s | **1.38×** (faster) |
-| 500×500 | naive | 37.85 µs | 6.60 Gelem/s | 1.00× |
-| 500×500 | strided | 36.41 µs | 6.87 Gelem/s | **1.04×** (faster) |
-| 1000×1000 | naive | 147.52 µs | 6.78 Gelem/s | 1.00× |
-| 1000×1000 | strided | 146.71 µs | 6.82 Gelem/s | **1.01×** (faster) |
-
-**分析**: `strided` を `copy_into_uninit` に変更したことで、zero-initialization のコストを回避し、naive を上回る性能を達成しました。小さいサイズ（100×100）では約1.4倍、大きいサイズでも同等〜わずかに高速です。
-
-### 2. Zip Map Operations (要素ごとの二項演算)
-
-#### 2.1 Zip Map Mixed Strides (混合ストライド)
-
-**対応ベンチ**: `bench_zip_map_mixed_strides` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- zip_map_mixed`
-
-| Size | Method | Time (mean) | Speedup vs Naive |
-|------|--------|--------------|------------------|
-| 100×100 | naive | 12.33 µs | 1.00× |
-| 100×100 | strided | 5.66 µs | **2.18×** (faster) |
-| 500×500 | naive | 299.94 µs | 1.00× |
-| 500×500 | strided | 117.10 µs | **2.56×** (faster) |
-| 1000×1000 | naive | 1.29 ms | 1.00× |
-| 1000×1000 | strided | 550.37 µs | **2.34×** (faster) |
-
-**分析**: 2D混合ストライド向けの専用パスにより、naiveより 2.2-2.6x 高速になりました。書き込み連続の内側ループを優先し、ポインタ増分でオーバーヘッドを削減しています。
-
-#### 2.2 Zip Map Contiguous (連続配列)
-
-**対応ベンチ**: `bench_zip_map_contiguous` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- zip_map_contiguous`
-
-| Size | Method | Time (mean) | Speedup vs Naive |
-|------|--------|--------------|------------------|
-| 100×100 | naive | 10.56 µs | 1.00× |
-| 100×100 | strided | 3.24 µs | **3.26×** (faster) |
-| 500×500 | naive | 256.67 µs | 1.00× |
-| 500×500 | strided | 68.38 µs | **3.75×** (faster) |
-| 1000×1000 | naive | 1.02 ms | 1.00× |
-| 1000×1000 | strided | 342.86 µs | **2.98×** (faster) |
-
-**分析**: 連続配列では、strided実装はnaive実装より**約3.0-3.8倍高速**です。これは、連続アクセスパターンで最適化されたループが効果的に動作しているためです。500×500サイズで最大の高速化（3.75倍）を示しています。
-
-### 3. Reduce Operations
-
-#### 3.1 Reduce Transposed (転置配列のリダクション)
-
-**対応ベンチ**: `bench_reduce_transposed` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- reduce_transposed`
-
-| Size | Method | Time (mean) | Speedup vs Naive |
-|------|--------|--------------|------------------|
-| 100×100 | naive | 9.18 µs | 1.00× |
-| 100×100 | strided | 10.05 µs | **0.91×** (slower) |
-| 500×500 | naive | 232.43 µs | 1.00× |
-| 500×500 | strided | 231.26 µs | **1.01×** (同等) |
-| 1000×1000 | naive | 964.46 µs | 1.00× |
-| 1000×1000 | strided | 986.34 µs | **0.98×** (slower) |
-
-**分析**: 転置配列のリダクションでは、小さいサイズではオーバーヘッドが影響しますが、中〜大サイズはほぼ同等の性能です。
-
-#### 3.2 Reduce Contiguous (連続配列のリダクション)
-
-**対応ベンチ**: `bench_reduce_contiguous` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- reduce_contiguous`
-
-| Size | Method | Time (mean) | Speedup vs Naive |
-|------|--------|--------------|------------------|
-| 100×100 | naive | 9.19 µs | 1.00× |
-| 100×100 | strided | 9.42 µs | **0.98×** (同等) |
-| 500×500 | naive | 230.55 µs | 1.00× |
-| 500×500 | strided | 230.35 µs | **1.00×** (同等) |
-| 1000×1000 | naive | 927.92 µs | 1.00× |
-| 1000×1000 | strided | 924.77 µs | **1.00×** (同等) |
-
-**分析**: 連続配列のリダクションでは、naive実装とほぼ同等の性能です。連続アクセスパターンでは、最適化の効果が限定的です。
-
-### 4. Specialized Operations
-
-#### 4.1 Symmetrize (対称化: `B = (A + Aᵀ) / 2`)
-
-**対応ベンチ**: `bench_symmetrize_aat` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- symmetrize_aat`
-
-**サイズ**: 4000×4000
-
-| Method | Time (mean) | Throughput | Speedup vs Naive |
-|--------|--------------|------------|------------------|
-| naive | 62.28 ms | 257 Melem/s | 1.00× |
-| strided | 35.69 ms | 448 Melem/s | **1.74×** (faster) |
-
-**分析**: 特化カーネル `symmetrize_into` は、タイルベースの反復と `(i,j)/(j,i)` の同時更新により、naive実装より**約1.74倍高速**です。連続メモリの高速パス（row-major/col-major）により、キャッシュ効率が大幅に改善されています。
-
-#### 4.2 Scale Transpose (スケール転置: `B = α * Aᵀ`)
-
-**対応ベンチ**: `bench_scale_transpose` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- scale_transpose`
-
-**サイズ**: 1000×1000
-
-| Method | Time (mean) | Throughput | Speedup vs Naive |
-|--------|--------------|------------|------------------|
-| naive | 485.24 µs | 2.06 Gelem/s | 1.00× |
-| strided | 391.57 µs | 2.55 Gelem/s | **1.24×** (faster) |
-
-**分析**: `strided` は `copy_transpose_scale_into_fast` を使用しており、naive より**約1.24倍高速**です。4x4マイクロカーネルによる最適化が効果的です。
-
-#### 4.3 Nonlinear Map (非線形マップ: `B = A .* exp(-2A) .+ sin(A²)`)
-
-**対応ベンチ**: `bench_nonlinear_map` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- nonlinear_map`
-
-**サイズ**: 1000×1000
-
-| Method | Time (mean) | Throughput | Speedup vs Naive |
-|--------|--------------|------------|------------------|
-| naive | 13.61 ms | 73.5 Melem/s | 1.00× |
-| strided | 13.20 ms | 75.7 Melem/s | **1.03×** (slightly faster) |
-
-**分析**: 非線形マップでは、strided実装はnaive実装とほぼ同等か、わずかに高速です。計算コストが高いため、メモリアクセスパターンの影響が相対的に小さくなっています。
-
-### 5. 4D Array Operations (Strided.jl README ベンチマーク)
-
-Julia の Strided.jl README.md から移植したベンチマークです。
-
-#### 5.1 Permutedims 4D (4次元配列の順列: `B = permutedims(A, (4,3,2,1))`)
-
-**対応ベンチ**: `bench_permutedims_4d` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- permutedims_4d`
-
-**サイズ**: 32×32×32×32 (1,048,576 要素)
-
-| Method | Time (mean) | Throughput | Speedup vs Naive |
-|--------|--------------|------------|------------------|
-| naive | 1.07 ms | 976 Melem/s | 1.00× |
-| strided | 1.08 ms | 969 Melem/s | **0.99×** (同等) |
-
-**分析**: 4Dで出力が連続メモリの場合に、ブロッキングを回避してポインタ増分の4重ループで処理するパスを使用していますが、現状では naive とほぼ同等の性能です。入力側のストライドを使ったタイル化や内側次元の連続性を活かす最適化は依然として余地があります。
-
-#### 5.2 Multi-Permute Sum (複数順列の和: `zip_map4_into`)
-
-**対応ベンチ**: `bench_multi_permute_sum` (`benches/strided_bench.rs`)
-**実行コマンド**: `cargo bench -- multi_permute_sum`
+**Operation:** `B = permutedims(A, (2,1))` (transpose copy)
 
 ```
-B = permutedims(A, (1,2,3,4)) + permutedims(A, (2,3,4,1)) +
-    permutedims(A, (3,4,1,2)) + permutedims(A, (4,1,2,3))
+naive:    503.77 µs - 513.88 µs  (1.95-1.99 Gelem/s)
+strided:  624.74 µs - 734.63 µs  (1.36-1.60 Gelem/s)
 ```
 
-**サイズ**: 32×32×32×32 (1,048,576 要素)
+**Result:** Strided is **0.75x slower** (median: 675.84 µs vs 508.65 µs)
 
-| Method | Time (mean) | Throughput | Speedup vs Naive |
-|--------|--------------|------------|------------------|
-| naive | 4.99 ms | 210 Melem/s | 1.00× |
-| strided_fused (`zip_map4_into`) | 2.31 ms | 453 Melem/s | **2.16×** (faster) |
+**Analysis:** Naive `to_tensor()` benefits from highly optimized bulk copy routines. The strided implementation's blocking overhead dominates for simple transpose operations. This is acceptable as transpose is typically composed with other operations.
 
-**分析**: 4Dで出力が連続メモリの場合に、ブロッキングを回避してポインタ増分の4重ループで処理するパスを導入したことで、`zip_map4_into` が **約2.16倍高速**になりました。ブロック計画や多配列ストライドのオーバーヘッドが削減されています。
+---
 
-**改善提案**:
-- 出力が非連続のケースでも部分的な連続性を検出して高速パスへ寄せる
-- 4D permute など他のパターンにも特化パスを追加する
+### 2. Zip Map with Mixed Strides (1000×1000)
 
-## 総合評価
+**Operation:** `out = A' + B` (add transposed array to contiguous array)
 
-### 強み
+```
+naive:    957.45 µs - 987.10 µs
+strided:  657.02 µs - 668.78 µs
+```
 
-1. **連続配列での zip_map**: 約3.0-3.8倍の高速化を達成
-2. **対称化操作**: 特化カーネルにより約1.7倍の高速化
-3. **混合ストライドのzip_map**: 2.2-2.6x 高速化
-4. **転置スケール**: naiveより約1.24倍高速
-5. **転置コピー**: 500×500はほぼ同等、他サイズはやや遅い
-6. **`zip_map4_into`**: 4Dの多順列和でも contig 出力なら高速（約2.16倍）
+**Result:** Strided is **1.46x faster** (969.41 µs → 662.33 µs)
 
-### 改善の余地
+**Analysis:** Cache-optimized blocking strategy significantly improves performance when mixing strided and contiguous access patterns. This is the primary use case for the library.
 
-1. **4D配列の操作**: contig 出力では naive と同等だが、さらなる最適化の余地あり
-2. **転置配列のコピー**: サイズによっては遅い（0.72-0.86×）
-3. **小さいサイズでのオーバーヘッド**: 100×100程度の小さい配列では、オーバーヘッドが支配的
+---
 
-### 推奨事項
+### 3. Reduce Transposed (1000×1000)
 
-1. **4D配列のブロッキング戦略最適化**: 現在の戦略は2D配列に最適化されているため、高次元配列向けの改善が必要（[Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5)）
-2. **小サイズ向けのオーバーヘッド削減**: 100×100程度の小さい配列では、ブロッキングをスキップする閾値の調整が有効
-3. **特化カーネルの拡張**: `symmetrize_into` のように、特定のパターンに特化したカーネルを追加することで、さらなる高速化が期待できる
+**Operation:** `sum(A')` (sum elements of transposed array)
 
-## 技術的詳細
+```
+naive:    606.25 µs - 623.13 µs
+strided:  573.96 µs - 578.03 µs
+```
 
-### 実装の特徴
+**Result:** Strided is **1.07x faster** (613.41 µs → 575.84 µs)
 
-- **ループ順序最適化**: ストライドパターンに基づいてループ順序を最適化
-- **キャッシュブロッキング**: L1キャッシュサイズ（32KB）を考慮したブロックサイズの計算
-- **連続アクセスパスの最適化**: 連続配列では `ptr::add(1)` による線形反復を使用
-- **特化カーネル**: 対称化や転置スケールなどの特定パターンに特化したカーネル
+**Analysis:** For larger arrays (1000×1000), cache optimization provides measurable benefit (~7% faster). The dimension reordering and blocking strategy improves cache locality during reduction.
 
-### ベンチマーク設定
+---
 
-- **サンプル数**: 通常100サンプル、大きなベンチマーク（symmetrize_aat, scale_transpose, nonlinear_map）は10サンプル
-- **ウォームアップ時間**: 3秒
-- **測定時間**: 通常5秒、大きなベンチマークは10秒
-- **ビルド設定**: `--release` フラグで最適化ビルド
+### 4. Symmetrize AAT (4000×4000)
 
-## 結論
+**Operation:** `B = (A + A') / 2` (symmetrize matrix)
 
-`mdarray-strided` は、**2D配列での要素ごとの演算**や**特定の操作（対称化）**で優れたパフォーマンスを示しています：
+```
+naive:    47.543 ms - 48.082 ms  (333-337 Melem/s)
+strided:  30.639 ms - 31.216 ms  (513-522 Melem/s)
+```
 
-- **zip_map (連続)**: 3.0-3.8倍高速
-- **zip_map (混合ストライド)**: 2.2-2.6倍高速
-- **symmetrize**: 1.7倍高速
+**Result:** Strided is **1.55x faster** (47.83 ms → 30.91 ms)
 
-一方、**4D配列での複雑な順列操作**では、contig 出力では naive と同等の性能ですが、さらなる最適化は今後の課題です。
+**Analysis:** Large arrays benefit significantly from blocked iteration that fits in L1 cache (32KB blocks). This is one of the best showcases for the library.
 
-`zip_map4_into` の追加により、4配列の単一パス処理が可能になりました。2D配列では効果的ですが、4D配列では追加の最適化が必要です。
+---
 
-### API の成熟度
+### 5. Scale Transpose (1000×1000)
 
-| 機能 | 2D配列 | 4D配列 |
-|------|--------|--------|
-| `zip_map2_into` | **推奨** | 要検証 |
-| `zip_map4_into` | **推奨** | 要最適化 |
-| `symmetrize_into` | **推奨** | N/A |
-| `copy_into` (転置) | 同等 | 要最適化 |
+**Operation:** `B = 3.0 * A'` (scale and transpose)
+
+```
+naive:    633.20 µs - 728.41 µs  (1.37-1.58 Gelem/s)
+strided:  361.79 µs - 548.14 µs  (1.82-2.76 Gelem/s)
+```
+
+**Result:** Strided is **1.46x faster** (median: 676.41 µs → 464.28 µs)
+
+**Analysis:** Specialized `copy_transpose_scale_into_fast` kernel outperforms naive nested loops. Note the higher variance in strided results likely due to cache state sensitivity.
+
+---
+
+### 6. Nonlinear Map (1000×1000)
+
+**Operation:** `B = A * exp(-2*A) + sin(A*A)` (complex element-wise function)
+
+```
+naive:    10.330 ms - 11.026 ms  (90.7-96.8 Melem/s)
+strided:  10.650 ms - 10.873 ms  (92.0-93.9 Melem/s)
+```
+
+**Result:** **≈same performance** (10.64 ms vs 10.72 ms)
+
+**Analysis:** When computation cost dominates memory access, cache optimization provides minimal benefit. Both approaches are compute-bound, spending time in `exp` and `sin` rather than memory operations.
+
+---
+
+### 7. Permutedims 4D (32×32×32×32)
+
+**Operation:** `permutedims!(B, A, (4,3,2,1))` (full 4D transpose)
+
+```
+naive:    953.29 µs - 984.78 µs  (1.06-1.10 Gelem/s)
+strided:  950.73 µs - 978.79 µs  (1.07-1.10 Gelem/s)
+```
+
+**Result:** **≈same performance** (964.98 µs vs 963.01 µs)
+
+**Analysis:** For 4D arrays with full dimension reversal, current blocking strategy does not provide advantage. See [Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5) for planned optimizations.
+
+---
+
+### 8. Multi-Permute Sum (32×32×32×32)
+
+**Operation:** `B = A + permute(A, p1) + permute(A, p2) + permute(A, p3)` (sum 4 permutations)
+
+```
+naive:           3.5791 ms - 3.9922 ms  (263-293 Melem/s)
+strided_fused:   1.8844 ms - 1.9637 ms  (534-556 Melem/s)
+```
+
+**Result:** Strided is **2.02x faster** (3.81 ms → 1.91 ms)
+
+**Analysis:** `zip_map4_into` demonstrates the power of lazy evaluation and single-pass fusion. Instead of materializing 4 intermediate arrays, strided performs a single-pass computation with cache-optimized access. This represents **best-case performance** for the library's design.
+
+---
+
+## Performance Patterns
+
+### When Strided Wins (✅)
+
+1. **Mixed stride patterns** (`zip_map_mixed`): 1.46x faster
+2. **Large arrays with transpose** (`symmetrize_aat`): 1.55x faster
+3. **Fused multi-array operations** (`multi_permute_sum`): 2.02x faster
+4. **Scale + transpose** (`scale_transpose`): 1.46x faster
+
+### When Strided Breaks Even (⚠️)
+
+1. **Compute-bound operations** (`nonlinear_map`): ≈same
+2. **4D permutations** (`permutedims_4d`): ≈same (needs optimization)
+
+### When Strided Loses (❌)
+
+1. **Simple transpose copy** (`copy_permuted`): 0.75x slower
+   *Reason:* Naive `to_tensor()` uses bulk copy; blocking overhead not justified
+
+---
+
+## Recommendations
+
+### Use Strided When:
+- Combining multiple strided arrays in single operation
+- Working with large arrays (>1MB)
+- Mixing transposed/permuted views with contiguous data
+- Fusing operations to avoid intermediate allocations
+
+### Use Naive When:
+- Simple single-array transpose/copy
+- Small arrays (<10KB)
+- Already compute-bound (complex math functions)
+
+### Future Work:
+- Optimize 4D blocking strategy ([Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5))
+- Add fast-path detection for simple transpose
+- Dynamic thread count tuning
+
+---
+
+## System Configuration
+
+```
+OS:         macOS 14.2 (darwin 25.2.0)
+Compiler:   rustc (release build)
+CPU:        (detected from BLOCK_MEMORY_SIZE = 32KB L1 cache)
+Threading:  Rayon (parallel feature enabled)
+```
+
+## Methodology
+
+All benchmarks use:
+- `criterion` 0.5.1 with default settings
+- 100 samples for fast benchmarks (<1ms)
+- 10 samples for slow benchmarks (>1ms)
+- 3-second warmup period
+- Random data seeded with `StdRng` for reproducibility

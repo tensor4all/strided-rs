@@ -1,5 +1,5 @@
 ### A Pluto.jl notebook ###
-# v0.20.21
+# v0.20.19
 
 using Markdown
 using InteractiveUtils
@@ -9,82 +9,163 @@ begin
 	@assert Base.Threads.nthreads() == 1
 	using Strided
 	using BenchmarkTools
+	using Statistics
+end
+
+# ╔═╡ 29d8b9fc-eca5-4cce-b18b-692cfe76227c
+versioninfo()
+
+# ╔═╡ a56c11fc-4a80-4820-9d4d-8510a5da4829
+copy_permuted = let
+	A = rand(1000, 1000)
+	B = similar(A)
+	permAlazy = PermutedDimsArray(A, (2, 1))  # lazy permuted view (no copy)
+	@benchmark $B .= $permAlazy
+end
+
+# ╔═╡ 726d5523-d496-4665-875e-be80feb35754
+copy_permuted_strided = let
+	A = rand(1000, 1000)
+	B = similar(A)
+	permAlazy = PermutedDimsArray(A, (2, 1))  # lazy permuted view (no copy)
+	@benchmark @strided $B .= $permAlazy
+end
+
+# ╔═╡ 91871ece-2b69-462c-859c-421533b3fef2
+mean(copy_permuted.times) / mean(copy_permuted_strided.times)
+
+# ╔═╡ e9ee229e-803e-4ab7-aa7e-f79c436b3e97
+zip_map_mixed = let
+	A = rand(1000, 1000)
+	B = rand(1000, 1000)
+	permAlazy = PermutedDimsArray(A, (2, 1))
+	out = similar(A)
+	@benchmark $out .= $permAlazy .+ $B	
+end
+
+# ╔═╡ d281a1ed-caf6-4bef-9598-3df4cb4e530f
+zip_map_mixed_strided = let
+	A = rand(1000, 1000)
+	B = rand(1000, 1000)
+	permAlazy = PermutedDimsArray(A, (2, 1))
+	out = similar(A)
+	@benchmark @strided $out .= $permAlazy .+ $B
+end
+
+# ╔═╡ c7987f13-ee2b-4ba8-80ac-7cb95affb6f9
+mean(zip_map_mixed.times) / mean(zip_map_mixed_strided.times)
+
+# ╔═╡ 9fa850bf-3abb-4daf-9862-73655140f20d
+reduce_transposed = let
+	A = rand(1000, 1000)
+	@benchmark sum($A)
+end
+
+# ╔═╡ 1b9b8c6d-aa71-4e1c-aa8f-fcc8c599799c
+reduce_transposed_strided = let
+	A = rand(1000, 1000)
+	@benchmark sum($A')
+end
+
+# ╔═╡ 09cbdc49-fbe9-4854-b10c-2913818f38db
+mean(reduce_transposed.times) / mean(reduce_transposed_strided.times)
+
+# ╔═╡ d8d1383a-e070-49ef-8c3d-b2e54e686cf5
+let
+	A = rand(1000, 1000)
+	@benchmark @strided sum($A')
 end
 
 # ╔═╡ c385609f-b78e-4ad3-b95d-2961064aec9a
-let
+symmetrize_aat = let
 	A = rand(4000, 4000)
 	B = similar(A)
 	@benchmark $B .= ($A .+ $A') ./ 2;
 end
 
 # ╔═╡ 0d107efb-617a-4598-ac31-1ff6fe6a80d8
-let
+symmetrize_aat_strided = let
 	A = rand(4000, 4000)
 	B = similar(A)
 	@benchmark @strided $B .= ($A .+ $A') ./ 2;
 end
 
+# ╔═╡ c1259929-5868-4178-a870-05098e65e8ab
+mean(symmetrize_aat.times) / mean(symmetrize_aat_strided.times)
+
 # ╔═╡ 8c54539c-3f04-486f-8de2-0131f8368913
-let
+scale_transpose = let
 	A = rand(1000, 1000)
 	B = similar(A)
 	@benchmark $B .= 3 .* $A';
 end
 
 # ╔═╡ 6e0eb066-d783-444b-aa01-0d9395539d06
-let
+scale_transpose_strided = let
 	A = rand(1000, 1000)
 	B = similar(A)
 	@benchmark @strided $B .= 3 .* $A';
 end
 
+# ╔═╡ f18130bc-dc8d-41ed-9617-8349a0253b9d
+mean(scale_transpose.times) / mean(scale_transpose_strided.times)
+
 # ╔═╡ 04158108-cc50-4850-8d0c-a1068a8ebce9
-let
-	A = rand(4000, 4000)
+nonlinear_map = let
+	A = rand(1000, 1000)
 	B = similar(A)
 	@benchmark $B .= $A .* exp.( -2 .* $A) .+ sin.( $A .* $A);
 end
 
 # ╔═╡ d4facb58-37f6-4849-9e62-75eeb45ed391
-let
-	A = rand(4000, 4000)
+nonlinear_map_strided = let
+	A = rand(1000, 1000)
 	B = similar(A)
 	@benchmark @strided $B .= $A .* exp.( -2 .* $A) .+ sin.( $A .* $A);
 end
 
+# ╔═╡ 65c3e4a6-be6b-425d-8477-8e0e65660fbe
+mean(nonlinear_map.times) / mean(nonlinear_map_strided.times)
+
 # ╔═╡ bd460e68-4f07-4589-a308-ce4051718d7e
-let
+permutedims_4d = let
 	A = randn(32,32,32,32)
 	B = similar(A)
 	@benchmark permutedims!($B, $A, (4,3,2,1))
 end
 
 # ╔═╡ ef02e39e-9a3e-43be-9c75-9869d21b0167
-let
+permutedims_4d_strided = let
 	A = randn(32,32,32,32)
 	B = similar(A)
 	@benchmark @strided permutedims!($B, $A, (4,3,2,1))
 end
 
+# ╔═╡ 4c21fe9b-b9dd-4e3f-a643-59d9d17b0ada
+mean(permutedims_4d.times) / mean(permutedims_4d_strided.times)
+
 # ╔═╡ 9e6b8173-7c62-4f8a-bbf7-6884a0bc1a7f
-let
+multi_permute_sum = let
 	A = randn(32,32,32,32)
 	B = similar(A)
 	@benchmark $B .= permutedims($A, (1,2,3,4)) .+ permutedims($A, (2,3,4,1)) .+ permutedims($A, (3,4,1,2)) .+ permutedims($A, (4,1,2,3));
 end
 
 # ╔═╡ f557a7f9-1152-44fd-892d-02d55994d4e2
-let
+multi_permute_sum_strided = let
 	A = randn(32,32,32,32)
 	B = similar(A)
 	@benchmark @strided $B .= permutedims($A, (1,2,3,4)) .+ permutedims($A, (2,3,4,1)) .+ permutedims($A, (3,4,1,2)) .+ permutedims($A, (4,1,2,3));
 end
 
+# ╔═╡ e37c3e54-7ebf-48e7-94f7-8a536f148408
+mean(multi_permute_sum.times) / mean(multi_permute_sum_strided.times)
+
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Strided = "5e0ebb24-38b0-5f93-81fe-25c709ecae67"
 
 [compat]
@@ -98,7 +179,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "ddde5a4ca38026f86bd1065770fa46768c813264"
+project_hash = "db67261165a1c136ec24d7eedf5f6c164b5bb1f2"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -283,15 +364,31 @@ version = "5.15.0+0"
 
 # ╔═╡ Cell order:
 # ╠═323269d2-f801-11f0-8d95-4519f700d1da
+# ╠═29d8b9fc-eca5-4cce-b18b-692cfe76227c
+# ╠═a56c11fc-4a80-4820-9d4d-8510a5da4829
+# ╠═726d5523-d496-4665-875e-be80feb35754
+# ╠═91871ece-2b69-462c-859c-421533b3fef2
+# ╠═e9ee229e-803e-4ab7-aa7e-f79c436b3e97
+# ╠═d281a1ed-caf6-4bef-9598-3df4cb4e530f
+# ╠═c7987f13-ee2b-4ba8-80ac-7cb95affb6f9
+# ╠═9fa850bf-3abb-4daf-9862-73655140f20d
+# ╠═1b9b8c6d-aa71-4e1c-aa8f-fcc8c599799c
+# ╠═09cbdc49-fbe9-4854-b10c-2913818f38db
+# ╠═d8d1383a-e070-49ef-8c3d-b2e54e686cf5
 # ╠═c385609f-b78e-4ad3-b95d-2961064aec9a
 # ╠═0d107efb-617a-4598-ac31-1ff6fe6a80d8
+# ╠═c1259929-5868-4178-a870-05098e65e8ab
 # ╠═8c54539c-3f04-486f-8de2-0131f8368913
 # ╠═6e0eb066-d783-444b-aa01-0d9395539d06
+# ╠═f18130bc-dc8d-41ed-9617-8349a0253b9d
 # ╠═04158108-cc50-4850-8d0c-a1068a8ebce9
 # ╠═d4facb58-37f6-4849-9e62-75eeb45ed391
+# ╠═65c3e4a6-be6b-425d-8477-8e0e65660fbe
 # ╠═bd460e68-4f07-4589-a308-ce4051718d7e
 # ╠═ef02e39e-9a3e-43be-9c75-9869d21b0167
+# ╠═4c21fe9b-b9dd-4e3f-a643-59d9d17b0ada
 # ╠═9e6b8173-7c62-4f8a-bbf7-6884a0bc1a7f
 # ╠═f557a7f9-1152-44fd-892d-02d55994d4e2
+# ╠═e37c3e54-7ebf-48e7-94f7-8a536f148408
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
