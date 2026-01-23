@@ -10,7 +10,6 @@
 
 use num_complex::Complex;
 use num_traits::Num;
-use std::marker::PhantomData;
 
 /// Trait for element-wise operations applied to strided views.
 ///

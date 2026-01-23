@@ -299,7 +299,12 @@ where
     if is_contiguous(&dst_view.dims, &dst_view.strides)
         && is_contiguous(&src_view.dims, &src_view.strides)
     {
-        return symmetrize_into_contig(&dst_view, &src_view, &half);
+        return symmetrize_into_contig_row_major(&dst_view, &src_view, &half);
+    }
+    if is_contiguous_col_major_2d(&dst_view.dims, &dst_view.strides)
+        && is_contiguous_col_major_2d(&src_view.dims, &src_view.strides)
+    {
+        return symmetrize_into_contig_col_major(&dst_view, &src_view, &half);
     }
     let tile = sym_tile_size::<T>();
     let s_row = src_view.strides[0];
@@ -491,7 +496,111 @@ where
     Ok(())
 }
 
-fn symmetrize_into_contig<T>(
+/// Compute `B = (A + Aᴴ) / 2` into `dest`.
+///
+/// - Requires a square 2D input.
+/// - Uses conjugate symmetry; diagonal elements become the real part of `A`.
+pub fn symmetrize_conj_into<T, SD, SS, LD, LS>(
+    dest: &mut Slice<T, SD, LD>,
+    src: &Slice<T, SS, LS>,
+) -> Result<()>
+where
+    T: ComplexFloat + Add<Output = T> + Mul<Output = T> + FromPrimitive,
+    SD: Shape,
+    SS: Shape,
+    LD: Layout,
+    LS: Layout,
+{
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let src_view = StridedView::from_slice(src)?;
+    ensure_same_shape(&dst_view.dims, &src_view.dims)?;
+
+    if src_view.dims.len() != 2 {
+        return Err(StridedError::RankMismatch(src_view.dims.len(), 2));
+    }
+    let n = src_view.dims[0];
+    let m = src_view.dims[1];
+    if n != m {
+        return Err(StridedError::NonSquare { rows: n, cols: m });
+    }
+
+    let half = T::from_f64(0.5).ok_or(StridedError::ScalarConversion)?;
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&src_view.dims, &src_view.strides)
+    {
+        return symmetrize_conj_into_contig_row_major(&dst_view, &src_view, &half);
+    }
+    if is_contiguous_col_major_2d(&dst_view.dims, &dst_view.strides)
+        && is_contiguous_col_major_2d(&src_view.dims, &src_view.strides)
+    {
+        return symmetrize_conj_into_contig_col_major(&dst_view, &src_view, &half);
+    }
+
+    let tile = sym_tile_size::<T>();
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+
+    for i0 in (0..n).step_by(tile) {
+        let i_max = (i0 + tile).min(n);
+        for j0 in (i0..n).step_by(tile) {
+            let j_max = (j0 + tile).min(n);
+
+            if i0 == j0 {
+                for i in i0..i_max {
+                    let start_j = i.max(j0);
+                    let mut src_ij = offset2d(i, start_j, s_row, s_col)?;
+                    let mut dst_ij = offset2d(i, start_j, d_row, d_col)?;
+                    for j in start_j..j_max {
+                        let aij = unsafe { &*src_view.ptr.offset(src_ij) }.clone();
+                        if i == j {
+                            let out = (aij.clone() + aij.conj()) * half.clone();
+                            unsafe {
+                                *dst_view.ptr.offset(dst_ij) = out;
+                            }
+                        } else {
+                            let src_ji = offset2d(j, i, s_row, s_col)?;
+                            let dst_ji = offset2d(j, i, d_row, d_col)?;
+                            let aji = unsafe { &*src_view.ptr.offset(src_ji) }.clone();
+                            let out = (aij + aji.conj()) * half.clone();
+                            unsafe {
+                                *dst_view.ptr.offset(dst_ij) = out.clone();
+                                *dst_view.ptr.offset(dst_ji) = out;
+                            }
+                        }
+                        src_ij = checked_add(src_ij, s_col)?;
+                        dst_ij = checked_add(dst_ij, d_col)?;
+                    }
+                }
+            } else {
+                for i in i0..i_max {
+                    let mut src_ij = offset2d(i, j0, s_row, s_col)?;
+                    let mut dst_ij = offset2d(i, j0, d_row, d_col)?;
+                    let mut src_ji = offset2d(j0, i, s_row, s_col)?;
+                    let mut dst_ji = offset2d(j0, i, d_row, d_col)?;
+                    for _ in j0..j_max {
+                        let aij = unsafe { &*src_view.ptr.offset(src_ij) }.clone();
+                        let aji = unsafe { &*src_view.ptr.offset(src_ji) }.clone();
+                        let out = (aij + aji.conj()) * half.clone();
+                        unsafe {
+                            *dst_view.ptr.offset(dst_ij) = out.clone();
+                            *dst_view.ptr.offset(dst_ji) = out;
+                        }
+                        src_ij = checked_add(src_ij, s_col)?;
+                        dst_ij = checked_add(dst_ij, d_col)?;
+                        src_ji = checked_add(src_ji, s_row)?;
+                        dst_ji = checked_add(dst_ji, d_row)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn symmetrize_into_contig_row_major<T>(
     dest: &StridedViewMut<T>,
     src: &StridedView<T>,
     half: &T,
@@ -541,6 +650,173 @@ where
     }
 
     Ok(())
+}
+
+fn symmetrize_into_contig_col_major<T>(
+    dest: &StridedViewMut<T>,
+    src: &StridedView<T>,
+    half: &T,
+) -> Result<()>
+where
+    T: Clone + Add<Output = T> + Mul<Output = T>,
+{
+    let n = src.dims[0];
+    let total = n
+        .checked_mul(n)
+        .ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    let src_ptr = src.ptr;
+    let dst_ptr = dest.ptr;
+    for i in 0..n {
+        let diag = i
+            .checked_mul(n)
+            .and_then(|v| v.checked_add(i))
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut idx_ij = diag;
+        let mut idx_ji = diag;
+        for _j in i..n {
+            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
+            if idx_ij == idx_ji {
+                unsafe {
+                    *dst_ptr.add(idx_ij) = aij;
+                }
+            } else {
+                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
+                let out = (aij + aji) * half.clone();
+                unsafe {
+                    *dst_ptr.add(idx_ij) = out.clone();
+                    *dst_ptr.add(idx_ji) = out;
+                }
+            }
+            idx_ij = idx_ij
+                .checked_add(n)
+                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji
+                .checked_add(1)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn symmetrize_conj_into_contig_row_major<T>(
+    dest: &StridedViewMut<T>,
+    src: &StridedView<T>,
+    half: &T,
+) -> Result<()>
+where
+    T: ComplexFloat + Add<Output = T> + Mul<Output = T>,
+{
+    let n = src.dims[0];
+    let total = n
+        .checked_mul(n)
+        .ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    let src_ptr = src.ptr;
+    let dst_ptr = dest.ptr;
+    for i in 0..n {
+        let row_base = i
+            .checked_mul(n)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut idx_ij = row_base
+            .checked_add(i)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut idx_ji = idx_ij;
+        for _ in i..n {
+            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
+            if idx_ij == idx_ji {
+                let out = (aij.clone() + aij.conj()) * half.clone();
+                unsafe {
+                    *dst_ptr.add(idx_ij) = out;
+                }
+            } else {
+                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
+                let out = (aij + aji.conj()) * half.clone();
+                unsafe {
+                    *dst_ptr.add(idx_ij) = out.clone();
+                    *dst_ptr.add(idx_ji) = out;
+                }
+            }
+            idx_ij = idx_ij
+                .checked_add(1)
+                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji
+                .checked_add(n)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn symmetrize_conj_into_contig_col_major<T>(
+    dest: &StridedViewMut<T>,
+    src: &StridedView<T>,
+    half: &T,
+) -> Result<()>
+where
+    T: ComplexFloat + Add<Output = T> + Mul<Output = T>,
+{
+    let n = src.dims[0];
+    let total = n
+        .checked_mul(n)
+        .ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    let src_ptr = src.ptr;
+    let dst_ptr = dest.ptr;
+    for i in 0..n {
+        let diag = i
+            .checked_mul(n)
+            .and_then(|v| v.checked_add(i))
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut idx_ij = diag;
+        let mut idx_ji = diag;
+        for _ in i..n {
+            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
+            if idx_ij == idx_ji {
+                let out = (aij.clone() + aij.conj()) * half.clone();
+                unsafe {
+                    *dst_ptr.add(idx_ij) = out;
+                }
+            } else {
+                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
+                let out = (aij + aji.conj()) * half.clone();
+                unsafe {
+                    *dst_ptr.add(idx_ij) = out.clone();
+                    *dst_ptr.add(idx_ji) = out;
+                }
+            }
+            idx_ij = idx_ij
+                .checked_add(n)
+                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji
+                .checked_add(1)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_contiguous_col_major_2d(dims: &[usize], strides: &[isize]) -> bool {
+    if dims.len() != 2 || strides.len() != 2 {
+        return false;
+    }
+    let rows = dims[0] as isize;
+    if rows <= 0 {
+        return true;
+    }
+    strides[0] == 1 && strides[1] == rows
 }
 
 fn sym_tile_size<T>() -> usize {
@@ -699,6 +975,17 @@ where
     let d_row = dst_view.strides[0];
     let d_col = dst_view.strides[1];
 
+    // Check if this is a transpose-like pattern that benefits from tiling
+    // Transpose pattern: reading with large stride, writing sequentially
+    // Only use tiling for arrays larger than 128x128 to avoid overhead on small arrays
+    let is_transpose_pattern = (d_col == 1 && s_col.unsigned_abs() > 1)
+        || (d_row == 1 && s_row.unsigned_abs() > 1);
+    let is_large_enough = rows >= 128 && cols >= 128;
+
+    if is_transpose_pattern && is_large_enough {
+        return copy_2d_tiled(dst_view, src_view);
+    }
+
     if d_col.unsigned_abs() == 1 {
         for i in 0..rows {
             let src_ij = offset2d(i, 0, s_row, s_col)?;
@@ -736,6 +1023,75 @@ where
     }
 
     Ok(false)
+}
+
+/// Tiled 2D copy for better cache performance on transpose-like patterns.
+///
+/// Uses 8x8 blocking to keep data in L1 cache during transpose operations.
+fn copy_2d_tiled<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
+where
+    T: Clone,
+{
+    const TILE: usize = 8;
+
+    let rows = dst_view.dims[0];
+    let cols = dst_view.dims[1];
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+
+    let src_ptr = src_view.ptr;
+    let dst_ptr = dst_view.ptr;
+
+    // Process full tiles
+    let rows_full = rows - rows % TILE;
+    let cols_full = cols - cols % TILE;
+
+    for i0 in (0..rows_full).step_by(TILE) {
+        for j0 in (0..cols_full).step_by(TILE) {
+            // Process 8x8 tile
+            unsafe {
+                let src_base = src_ptr.offset(i0 as isize * s_row + j0 as isize * s_col);
+                let dst_base = dst_ptr.offset(i0 as isize * d_row + j0 as isize * d_col);
+
+                for i in 0..TILE {
+                    let src_row = src_base.offset(i as isize * s_row);
+                    let dst_row = dst_base.offset(i as isize * d_row);
+                    for j in 0..TILE {
+                        let val = (*src_row.offset(j as isize * s_col)).clone();
+                        *dst_row.offset(j as isize * d_col) = val;
+                    }
+                }
+            }
+        }
+
+        // Handle remaining columns
+        for j in cols_full..cols {
+            unsafe {
+                let src_col = src_ptr.offset(j as isize * s_col);
+                let dst_col = dst_ptr.offset(j as isize * d_col);
+                for i in i0..i0 + TILE {
+                    let val = (*src_col.offset(i as isize * s_row)).clone();
+                    *dst_col.offset(i as isize * d_row) = val;
+                }
+            }
+        }
+    }
+
+    // Handle remaining rows
+    for i in rows_full..rows {
+        unsafe {
+            let src_row = src_ptr.offset(i as isize * s_row);
+            let dst_row = dst_ptr.offset(i as isize * d_row);
+            for j in 0..cols {
+                let val = (*src_row.offset(j as isize * s_col)).clone();
+                *dst_row.offset(j as isize * d_col) = val;
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 fn offset2d(i: usize, j: usize, row_stride: isize, col_stride: isize) -> Result<isize> {
