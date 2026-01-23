@@ -44,6 +44,11 @@ where
         return Ok(());
     }
 
+    if dst_view.dims.len() == 4 && is_contiguous(&dst_view.dims, &dst_view.strides) {
+        copy_4d_contig_dst(&dst_view, &src_view)?;
+        return Ok(());
+    }
+
     map_into(dest, src, |x| x.clone())
 }
 
@@ -1006,6 +1011,59 @@ where
     }
 
     Ok(false)
+}
+
+fn copy_4d_contig_dst<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<()>
+where
+    T: Clone,
+{
+    let d0 = dst_view.dims[0];
+    let d1 = dst_view.dims[1];
+    let d2 = dst_view.dims[2];
+    let d3 = dst_view.dims[3];
+    if d0 == 0 || d1 == 0 || d2 == 0 || d3 == 0 {
+        return Ok(());
+    }
+
+    let ds0 = dst_view.strides[0];
+    let ds1 = dst_view.strides[1];
+    let ds2 = dst_view.strides[2];
+    let ds3 = dst_view.strides[3];
+    let ss0 = src_view.strides[0];
+    let ss1 = src_view.strides[1];
+    let ss2 = src_view.strides[2];
+    let ss3 = src_view.strides[3];
+
+    unsafe {
+        let mut dst_i0 = dst_view.ptr;
+        let mut src_i0 = src_view.ptr;
+        for _ in 0..d0 {
+            let mut dst_i1 = dst_i0;
+            let mut src_i1 = src_i0;
+            for _ in 0..d1 {
+                let mut dst_i2 = dst_i1;
+                let mut src_i2 = src_i1;
+                for _ in 0..d2 {
+                    let mut dst_i3 = dst_i2;
+                    let mut src_i3 = src_i2;
+                    for _ in 0..d3 {
+                        let val = (&*src_i3).clone();
+                        *dst_i3 = val;
+                        dst_i3 = dst_i3.offset(ds3);
+                        src_i3 = src_i3.offset(ss3);
+                    }
+                    dst_i2 = dst_i2.offset(ds2);
+                    src_i2 = src_i2.offset(ss2);
+                }
+                dst_i1 = dst_i1.offset(ds1);
+                src_i1 = src_i1.offset(ss1);
+            }
+            dst_i0 = dst_i0.offset(ds0);
+            src_i0 = src_i0.offset(ss0);
+        }
+    }
+
+    Ok(())
 }
 
 /// Tiled 2D copy for better cache performance on transpose-like patterns.

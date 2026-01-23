@@ -394,6 +394,11 @@ where
         return Ok(());
     }
 
+    if dst_view.dims.len() == 4 && is_contiguous(&dst_view.dims, &dst_view.strides) {
+        zip_map4_4d_contig_dst(&dst_view, &a_view, &b_view, &c_view, &e_view, &f)?;
+        return Ok(());
+    }
+
     let strides_list = [
         &dst_view.strides[..],
         &a_view.strides[..],
@@ -442,4 +447,100 @@ where
             Ok(())
         },
     )
+}
+
+fn zip_map4_4d_contig_dst<T, F>(
+    dst_view: &StridedViewMut<T>,
+    a_view: &StridedView<T>,
+    b_view: &StridedView<T>,
+    c_view: &StridedView<T>,
+    e_view: &StridedView<T>,
+    f: &F,
+) -> Result<()>
+where
+    F: Fn(&T, &T, &T, &T) -> T,
+{
+    let d0 = dst_view.dims[0];
+    let d1 = dst_view.dims[1];
+    let d2 = dst_view.dims[2];
+    let d3 = dst_view.dims[3];
+    if d0 == 0 || d1 == 0 || d2 == 0 || d3 == 0 {
+        return Ok(());
+    }
+
+    let ds0 = dst_view.strides[0];
+    let ds1 = dst_view.strides[1];
+    let ds2 = dst_view.strides[2];
+    let ds3 = dst_view.strides[3];
+    let as0 = a_view.strides[0];
+    let as1 = a_view.strides[1];
+    let as2 = a_view.strides[2];
+    let as3 = a_view.strides[3];
+    let bs0 = b_view.strides[0];
+    let bs1 = b_view.strides[1];
+    let bs2 = b_view.strides[2];
+    let bs3 = b_view.strides[3];
+    let cs0 = c_view.strides[0];
+    let cs1 = c_view.strides[1];
+    let cs2 = c_view.strides[2];
+    let cs3 = c_view.strides[3];
+    let es0 = e_view.strides[0];
+    let es1 = e_view.strides[1];
+    let es2 = e_view.strides[2];
+    let es3 = e_view.strides[3];
+
+    unsafe {
+        let mut dst_i0 = dst_view.ptr;
+        let mut a_i0 = a_view.ptr;
+        let mut b_i0 = b_view.ptr;
+        let mut c_i0 = c_view.ptr;
+        let mut e_i0 = e_view.ptr;
+        for _ in 0..d0 {
+            let mut dst_i1 = dst_i0;
+            let mut a_i1 = a_i0;
+            let mut b_i1 = b_i0;
+            let mut c_i1 = c_i0;
+            let mut e_i1 = e_i0;
+            for _ in 0..d1 {
+                let mut dst_i2 = dst_i1;
+                let mut a_i2 = a_i1;
+                let mut b_i2 = b_i1;
+                let mut c_i2 = c_i1;
+                let mut e_i2 = e_i1;
+                for _ in 0..d2 {
+                    let mut dst_i3 = dst_i2;
+                    let mut a_i3 = a_i2;
+                    let mut b_i3 = b_i2;
+                    let mut c_i3 = c_i2;
+                    let mut e_i3 = e_i2;
+                    for _ in 0..d3 {
+                        let out = f(&*a_i3, &*b_i3, &*c_i3, &*e_i3);
+                        *dst_i3 = out;
+                        dst_i3 = dst_i3.offset(ds3);
+                        a_i3 = a_i3.offset(as3);
+                        b_i3 = b_i3.offset(bs3);
+                        c_i3 = c_i3.offset(cs3);
+                        e_i3 = e_i3.offset(es3);
+                    }
+                    dst_i2 = dst_i2.offset(ds2);
+                    a_i2 = a_i2.offset(as2);
+                    b_i2 = b_i2.offset(bs2);
+                    c_i2 = c_i2.offset(cs2);
+                    e_i2 = e_i2.offset(es2);
+                }
+                dst_i1 = dst_i1.offset(ds1);
+                a_i1 = a_i1.offset(as1);
+                b_i1 = b_i1.offset(bs1);
+                c_i1 = c_i1.offset(cs1);
+                e_i1 = e_i1.offset(es1);
+            }
+            dst_i0 = dst_i0.offset(ds0);
+            a_i0 = a_i0.offset(as0);
+            b_i0 = b_i0.offset(bs0);
+            c_i0 = c_i0.offset(cs0);
+            e_i0 = e_i0.offset(es0);
+        }
+    }
+
+    Ok(())
 }
