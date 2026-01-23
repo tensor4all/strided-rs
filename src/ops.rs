@@ -983,10 +983,11 @@ where
 
     // Check if this is a transpose-like pattern that benefits from tiling
     // Transpose pattern: reading with large stride, writing sequentially
-    // Only use tiling for arrays larger than 128x128 to avoid overhead on small arrays
+    // Use tiling for arrays larger than 32x32 to improve cache performance
+    // Smaller threshold helps with 100x100 arrays
     let is_transpose_pattern = (d_col == 1 && s_col.unsigned_abs() > 1)
         || (d_row == 1 && s_row.unsigned_abs() > 1);
-    let is_large_enough = rows >= 128 && cols >= 128;
+    let is_large_enough = rows >= 32 && cols >= 32;
 
     if is_transpose_pattern && is_large_enough {
         return copy_2d_tiled(dst_view, src_view);
