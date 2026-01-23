@@ -3,6 +3,11 @@ use crate::kernel::{
     build_plan, ensure_same_shape, for_each_inner_block, is_contiguous, total_len, StridedView,
     StridedViewMut,
 };
+#[cfg(feature = "parallel")]
+use crate::threading::{
+    find_split_dimension, mask_reduction_costs, should_split_dimension, split_context,
+    ThreadedContext,
+};
 use crate::{Result, StridedError};
 use mdarray::{Layout, Shape, Slice};
 
@@ -572,4 +577,321 @@ where
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Parallel implementations (requires "parallel" feature)
+// ============================================================================
+
+/// Parallel version of zip_map2_into using divide-and-conquer threading.
+///
+/// This implementation follows Julia's `_mapreduce_threaded!` algorithm:
+/// 1. If array is small or single-threaded, run sequentially
+/// 2. Otherwise, find the best dimension to split based on costs
+/// 3. Split the work and recurse in parallel using rayon::join
+#[cfg(feature = "parallel")]
+pub fn par_zip_map2_into<T, SD, SA, SB, LD, LA, LB, F>(
+    dest: &mut Slice<T, SD, LD>,
+    a: &Slice<T, SA, LA>,
+    b: &Slice<T, SB, LB>,
+    f: F,
+) -> Result<()>
+where
+    T: Send + Sync,
+    SD: Shape,
+    SA: Shape,
+    SB: Shape,
+    LD: Layout,
+    LA: Layout,
+    LB: Layout,
+    F: Fn(&T, &T) -> T + Send + Sync,
+{
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let a_view = StridedView::from_slice(a)?;
+    let b_view = StridedView::from_slice(b)?;
+    ensure_same_shape(&dst_view.dims, &a_view.dims)?;
+    ensure_same_shape(&dst_view.dims, &b_view.dims)?;
+
+    // Fast path for contiguous arrays
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&a_view.dims, &a_view.strides)
+        && is_contiguous(&b_view.dims, &b_view.strides)
+    {
+        let len = total_len(&dst_view.dims);
+        let dst_slice =
+            unsafe { std::slice::from_raw_parts_mut(dst_view.ptr, len) };
+        let a_slice = unsafe { std::slice::from_raw_parts(a_view.ptr, len) };
+        let b_slice = unsafe { std::slice::from_raw_parts(b_view.ptr, len) };
+
+        use rayon::prelude::*;
+        dst_slice
+            .par_iter_mut()
+            .zip(a_slice.par_iter())
+            .zip(b_slice.par_iter())
+            .for_each(|((d, av), bv)| {
+                *d = f(av, bv);
+            });
+        return Ok(());
+    }
+
+    // Build threaded context
+    let strides_list = vec![
+        dst_view.strides.as_slice(),
+        a_view.strides.as_slice(),
+        b_view.strides.as_slice(),
+    ];
+    let offsets = vec![0isize, 0, 0];
+
+    let ctx = ThreadedContext::new(
+        dst_view.dims.clone(),
+        strides_list,
+        offsets,
+        std::mem::size_of::<T>(),
+    );
+
+    // Mask costs to avoid splitting reduction dimensions
+    let masked_costs = mask_reduction_costs(&ctx.costs, &dst_view.strides);
+    let ctx = ThreadedContext {
+        costs: masked_costs,
+        ..ctx
+    };
+
+    // Run threaded operation
+    par_zip_map2_recursive(
+        &ctx,
+        SendPtr(dst_view.ptr),
+        SendConstPtr(a_view.ptr),
+        SendConstPtr(b_view.ptr),
+        &dst_view.strides,
+        &a_view.strides,
+        &b_view.strides,
+        &f,
+    );
+
+    Ok(())
+}
+
+/// Wrapper to make raw pointers Send+Sync for parallel execution.
+/// SAFETY: The caller must ensure that parallel access to the pointed data is safe.
+#[cfg(feature = "parallel")]
+struct SendPtr<T>(*mut T);
+
+#[cfg(feature = "parallel")]
+unsafe impl<T: Send> Send for SendPtr<T> {}
+#[cfg(feature = "parallel")]
+unsafe impl<T: Sync> Sync for SendPtr<T> {}
+
+#[cfg(feature = "parallel")]
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        SendPtr(self.0)
+    }
+}
+#[cfg(feature = "parallel")]
+impl<T> Copy for SendPtr<T> {}
+
+#[cfg(feature = "parallel")]
+struct SendConstPtr<T>(*const T);
+
+#[cfg(feature = "parallel")]
+unsafe impl<T: Send> Send for SendConstPtr<T> {}
+#[cfg(feature = "parallel")]
+unsafe impl<T: Sync> Sync for SendConstPtr<T> {}
+
+#[cfg(feature = "parallel")]
+impl<T> Clone for SendConstPtr<T> {
+    fn clone(&self) -> Self {
+        SendConstPtr(self.0)
+    }
+}
+#[cfg(feature = "parallel")]
+impl<T> Copy for SendConstPtr<T> {}
+
+#[cfg(feature = "parallel")]
+fn par_zip_map2_recursive<T, F>(
+    ctx: &ThreadedContext,
+    dst_ptr: SendPtr<T>,
+    a_ptr: SendConstPtr<T>,
+    b_ptr: SendConstPtr<T>,
+    dst_strides: &[isize],
+    a_strides: &[isize],
+    b_strides: &[isize],
+    f: &F,
+) where
+    T: Send + Sync,
+    F: Fn(&T, &T) -> T + Send + Sync,
+{
+    // Check if we should run sequentially
+    if ctx.should_run_sequential() {
+        zip_map2_kernel(
+            &ctx.dims,
+            dst_ptr.0,
+            a_ptr.0,
+            b_ptr.0,
+            dst_strides,
+            a_strides,
+            b_strides,
+            &ctx.offsets,
+            f,
+        );
+        return;
+    }
+
+    // Find dimension to split
+    let split_dim = match find_split_dimension(&ctx.dims, &ctx.costs) {
+        Some(i) => i,
+        None => {
+            zip_map2_kernel(
+                &ctx.dims,
+                dst_ptr.0,
+                a_ptr.0,
+                b_ptr.0,
+                dst_strides,
+                a_strides,
+                b_strides,
+                &ctx.offsets,
+                f,
+            );
+            return;
+        }
+    };
+
+    // Check if we should actually split this dimension
+    if !should_split_dimension(split_dim, &ctx.dims, &ctx.blocks, &ctx.costs) {
+        zip_map2_kernel(
+            &ctx.dims,
+            dst_ptr.0,
+            a_ptr.0,
+            b_ptr.0,
+            dst_strides,
+            a_strides,
+            b_strides,
+            &ctx.offsets,
+            f,
+        );
+        return;
+    }
+
+    // Split and recurse in parallel
+    let (ctx1, ctx2) = split_context(ctx, split_dim);
+
+    rayon::join(
+        || {
+            par_zip_map2_recursive(
+                &ctx1,
+                dst_ptr,
+                a_ptr,
+                b_ptr,
+                dst_strides,
+                a_strides,
+                b_strides,
+                f,
+            )
+        },
+        || {
+            par_zip_map2_recursive(
+                &ctx2,
+                dst_ptr,
+                a_ptr,
+                b_ptr,
+                dst_strides,
+                a_strides,
+                b_strides,
+                f,
+            )
+        },
+    );
+}
+
+#[cfg(feature = "parallel")]
+fn zip_map2_kernel<T, F>(
+    dims: &[usize],
+    dst_ptr: *mut T,
+    a_ptr: *const T,
+    b_ptr: *const T,
+    dst_strides: &[isize],
+    a_strides: &[isize],
+    b_strides: &[isize],
+    offsets: &[isize],
+    f: &F,
+) where
+    F: Fn(&T, &T) -> T,
+{
+    if dims.is_empty() {
+        return;
+    }
+
+    // Simple recursive kernel for arbitrary dimensions
+    zip_map2_kernel_recursive(
+        dims,
+        0,
+        dst_ptr,
+        a_ptr,
+        b_ptr,
+        dst_strides,
+        a_strides,
+        b_strides,
+        offsets[0],
+        offsets[1],
+        offsets[2],
+        f,
+    );
+}
+
+#[cfg(feature = "parallel")]
+fn zip_map2_kernel_recursive<T, F>(
+    dims: &[usize],
+    dim_idx: usize,
+    dst_ptr: *mut T,
+    a_ptr: *const T,
+    b_ptr: *const T,
+    dst_strides: &[isize],
+    a_strides: &[isize],
+    b_strides: &[isize],
+    dst_offset: isize,
+    a_offset: isize,
+    b_offset: isize,
+    f: &F,
+) where
+    F: Fn(&T, &T) -> T,
+{
+    if dim_idx >= dims.len() {
+        // Base case: apply function
+        unsafe {
+            let d = dst_ptr.offset(dst_offset);
+            let av = &*a_ptr.offset(a_offset);
+            let bv = &*b_ptr.offset(b_offset);
+            *d = f(av, bv);
+        }
+        return;
+    }
+
+    let dim = dims[dim_idx];
+    let ds = dst_strides[dim_idx];
+    let as_ = a_strides[dim_idx];
+    let bs = b_strides[dim_idx];
+
+    let mut d_off = dst_offset;
+    let mut a_off = a_offset;
+    let mut b_off = b_offset;
+
+    for _ in 0..dim {
+        zip_map2_kernel_recursive(
+            dims,
+            dim_idx + 1,
+            dst_ptr,
+            a_ptr,
+            b_ptr,
+            dst_strides,
+            a_strides,
+            b_strides,
+            d_off,
+            a_off,
+            b_off,
+            f,
+        );
+        d_off += ds;
+        a_off += as_;
+        b_off += bs;
+    }
 }
