@@ -33,6 +33,7 @@ pub mod broadcast;
 mod element_op;
 mod fuse;
 mod kernel;
+pub mod linalg;
 mod map;
 mod ops;
 mod order;
@@ -58,6 +59,10 @@ pub use view::{
 pub use broadcast::{
     Arg, BroadcastBuilder, CaptureArgs, Consume, Scalar, broadcast_into, broadcast3_into,
     promoteshape, promoteshape2, promoteshape3,
+};
+pub use linalg::{
+    BlasTranspose, axpy as linalg_axpy, axpby, getblasmatrix_identity, isblasmatrix,
+    isblasmatrix_conj, isblasmatrix_identity, lmul, matmul, generic_matmul, rmul,
 };
 
 #[cfg(feature = "blas")]
