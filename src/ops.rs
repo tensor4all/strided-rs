@@ -70,9 +70,7 @@ where
     let src_view = StridedView::from_slice(src)?;
     ensure_same_shape(dest_dims, &src_view.dims)?;
 
-    if is_contiguous(dest_dims, dest_strides)
-        && is_contiguous(&src_view.dims, &src_view.strides)
-    {
+    if is_contiguous(dest_dims, dest_strides) && is_contiguous(&src_view.dims, &src_view.strides) {
         let len = total_len(dest_dims);
         let mut dst_ptr = dest_ptr;
         let mut src_ptr = src_view.ptr;
@@ -87,28 +85,23 @@ where
         return Ok(());
     }
 
-    let strides_list = [&dest_strides[..], &src_view.strides[..]];
+    let strides_list = [dest_strides, &src_view.strides[..]];
     let plan = build_plan(dest_dims, &strides_list, Some(0), std::mem::size_of::<T>());
-    for_each_inner_block(
-        dest_dims,
-        &plan,
-        &strides_list,
-        |offsets, len, strides| {
-            let mut dst_ptr = unsafe { dest_ptr.offset(offsets[0]) };
-            let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
-            let dst_stride = strides[0];
-            let src_stride = strides[1];
-            for _ in 0..len {
-                let val = unsafe { &*src_ptr }.clone();
-                unsafe {
-                    (*dst_ptr).write(val);
-                    dst_ptr = dst_ptr.offset(dst_stride);
-                    src_ptr = src_ptr.offset(src_stride);
-                }
+    for_each_inner_block(dest_dims, &plan, &strides_list, |offsets, len, strides| {
+        let mut dst_ptr = unsafe { dest_ptr.offset(offsets[0]) };
+        let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
+        let dst_stride = strides[0];
+        let src_stride = strides[1];
+        for _ in 0..len {
+            let val = unsafe { &*src_ptr }.clone();
+            unsafe {
+                (*dst_ptr).write(val);
+                dst_ptr = dst_ptr.offset(dst_stride);
+                src_ptr = src_ptr.offset(src_stride);
             }
-            Ok(())
-        },
-    )
+        }
+        Ok(())
+    })
 }
 
 pub fn copy_conj<T, SD, SS, LD, LS>(
@@ -378,7 +371,7 @@ where
     LD: Layout,
     LS: Layout,
 {
-    let tile = transpose_tile_size::<T>().min(TRANSPOSE_TILE).max(1);
+    let tile = transpose_tile_size::<T>().clamp(1, TRANSPOSE_TILE);
     copy_transpose_scale_into_tiled(dest, src, alpha, tile)
 }
 
@@ -415,13 +408,13 @@ where
         ));
     }
 
-    let tile = tile.min(TRANSPOSE_TILE).max(1);
+    let tile = tile.clamp(1, TRANSPOSE_TILE);
     let s_row = src_view.strides[0];
     let s_col = src_view.strides[1];
     let d_row = dst_view.strides[0];
     let d_col = dst_view.strides[1];
-    let prefer_write_contig =
-        d_col.unsigned_abs() == 1 && (s_col.unsigned_abs() != 1 || s_row.unsigned_abs() <= d_row.unsigned_abs());
+    let prefer_write_contig = d_col.unsigned_abs() == 1
+        && (s_col.unsigned_abs() != 1 || s_row.unsigned_abs() <= d_row.unsigned_abs());
     let prefer_read_contig = s_col.unsigned_abs() == 1;
 
     if prefer_write_contig {
@@ -506,13 +499,10 @@ fn transpose_tile_size<T>() -> usize {
     let per_array = crate::BLOCK_MEMORY_SIZE / 2;
     let tile_elems = (per_array / bytes).max(1);
     let tile = (tile_elems as f64).sqrt() as usize;
-    tile.max(1).min(TRANSPOSE_TILE)
+    tile.clamp(1, TRANSPOSE_TILE)
 }
 
-fn copy_2d_contig_write<T>(
-    dst_view: &StridedViewMut<T>,
-    src_view: &StridedView<T>,
-) -> Result<bool>
+fn copy_2d_contig_write<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
 where
     T: Clone,
 {

@@ -1,23 +1,57 @@
 //! Cache-optimized kernels for strided mdarray views.
 //!
-//! v0 behavior:
-//! - All inputs must have identical shapes; broadcasting is not supported.
-//! - Strides of 0 on dimensions with length > 1 are rejected.
-//! - Overlapping src/dest memory is not supported; results are undefined if aliased.
+//! This crate is a Rust port of Julia's Strided.jl/StridedViews.jl libraries.
+//!
+//! # Features
+//!
+//! - `parallel`: Enable rayon-based parallel iteration (`par_iter()`)
+//! - `blas`: Enable BLAS-backed linear algebra operations
+//!
+//! # Example
+//!
+//! ```rust
+//! use mdarray_strided::{StridedArrayView, Identity};
+//!
+//! // Create a 2D view over existing data
+//! let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+//! let view: StridedArrayView<'_, f64, 2, Identity> =
+//!     StridedArrayView::new(&data, [2, 3], [3, 1], 0).unwrap();
+//!
+//! // Access elements
+//! assert_eq!(view.get([0, 0]), 1.0);
+//! assert_eq!(view.get([1, 2]), 6.0);
+//!
+//! // Transpose (zero-copy)
+//! let transposed = view.t();
+//! assert_eq!(transposed.size(), &[3, 2]);
+//! ```
 
+pub mod blas;
 mod block;
+mod element_op;
 mod kernel;
 mod map;
 mod ops;
 mod order;
 mod reduce;
+pub mod view;
 
+pub use blas::{generic_axpy, generic_dot, generic_gemm};
+pub use blas::{is_blas_matrix, is_contiguous_1d, BlasFloat, BlasLayout, BlasMatrix};
+pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose};
 pub use map::{map_into, zip_map2_into, zip_map3_into};
 pub use ops::{
     add, axpy, copy_conj, copy_into, copy_into_uninit, copy_scale, copy_transpose_scale_into,
     copy_transpose_scale_into_tiled, dot, fma, mul, sum, symmetrize_into,
 };
 pub use reduce::{reduce, reduce_axis};
+pub use view::{
+    broadcast_shape, broadcast_shape3, Idx, SliceIndex, StridedArrayView, StridedArrayViewMut,
+    StridedRange,
+};
+
+#[cfg(feature = "blas")]
+pub use blas::{blas_axpy, blas_dot, blas_gemm};
 
 pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;
 pub const CACHE_LINE_SIZE: usize = 64;

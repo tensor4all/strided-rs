@@ -288,8 +288,7 @@ fn bench_scale_transpose(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("strided_tile", tile), &tile, |b, &tile| {
             b.iter(|| {
                 let mut out = Tensor::zeros([size, size]);
-                if let Err(err) = copy_transpose_scale_into_tiled(&mut out, a.as_ref(), 3.0, tile)
-                {
+                if let Err(err) = copy_transpose_scale_into_tiled(&mut out, a.as_ref(), 3.0, tile) {
                     panic!("copy_transpose_scale_into_tiled failed: {err}");
                 }
                 out
@@ -354,8 +353,7 @@ fn bench_nonlinear_map(c: &mut Criterion) {
     group.bench_function("strided", |b| {
         b.iter(|| {
             let mut out = Tensor::zeros([size, size]);
-            if let Err(err) = map_into(&mut out, a_view, |x| x * (-2.0 * x).exp() + (x * x).sin())
-            {
+            if let Err(err) = map_into(&mut out, a_view, |x| x * (-2.0 * x).exp() + (x * x).sin()) {
                 panic!("map_into failed: {err}");
             }
             out
@@ -526,6 +524,145 @@ fn bench_reduce_contiguous(c: &mut Criterion) {
     group.finish();
 }
 
+// Julia equivalent for `bench_permutedims_4d`:
+// ```julia
+// using BenchmarkTools
+//
+// function bench_permutedims_4d_julia()
+//     A = randn(32, 32, 32, 32)
+//     B = similar(A)
+//
+//     # Base permutedims!
+//     @btime permutedims!($B, $A, (4, 3, 2, 1))
+// end
+// ```
+fn bench_permutedims_4d(c: &mut Criterion) {
+    let mut group = c.benchmark_group("permutedims_4d");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(3));
+    group.measurement_time(Duration::from_secs(10));
+
+    let size = 32usize;
+    let elements = size * size * size * size;
+    group.throughput(Throughput::Elements(elements as u64));
+
+    let mut rng = StdRng::seed_from_u64(3);
+    let a = Tensor::<f64, _>::from_fn([size, size, size, size], |_| rng.sample(StandardNormal));
+    let a_view = a.as_ref();
+    // Julia (4,3,2,1) -> Rust [3,2,1,0] (0-indexed)
+    let a_perm = a_view.permute([3, 2, 1, 0]);
+
+    group.bench_function("naive", |b| {
+        b.iter(|| {
+            let mut out = Tensor::zeros([size, size, size, size]);
+            for i in 0..size {
+                for j in 0..size {
+                    for k in 0..size {
+                        for l in 0..size {
+                            out[[i, j, k, l]] = a_perm[[i, j, k, l]];
+                        }
+                    }
+                }
+            }
+            out
+        })
+    });
+
+    group.bench_function("strided", |b| {
+        b.iter(|| {
+            let mut out = Tensor::zeros([size, size, size, size]);
+            if let Err(err) = copy_into(&mut out, &a_perm) {
+                panic!("copy_into failed: {err}");
+            }
+            out
+        })
+    });
+
+    group.finish();
+}
+
+// Julia equivalent for `bench_multi_permute_sum`:
+// ```julia
+// using BenchmarkTools
+//
+// function bench_multi_permute_sum_julia()
+//     A = randn(32, 32, 32, 32)
+//     B = similar(A)
+//
+//     # naive: allocate temporaries for each permutation
+//     @btime $B .= permutedims($A, (1,2,3,4)) .+ permutedims($A, (2,3,4,1)) .+
+//                  permutedims($A, (3,4,1,2)) .+ permutedims($A, (4,1,2,3))
+// end
+// ```
+fn bench_multi_permute_sum(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multi_permute_sum");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(3));
+    group.measurement_time(Duration::from_secs(10));
+
+    let size = 32usize;
+    let elements = size * size * size * size;
+    group.throughput(Throughput::Elements(elements as u64));
+
+    let mut rng = StdRng::seed_from_u64(4);
+    let a = Tensor::<f64, _>::from_fn([size, size, size, size], |_| rng.sample(StandardNormal));
+    let a_view = a.as_ref();
+
+    // Julia (1,2,3,4) -> Rust [0,1,2,3] (identity)
+    // Julia (2,3,4,1) -> Rust [1,2,3,0]
+    // Julia (3,4,1,2) -> Rust [2,3,0,1]
+    // Julia (4,1,2,3) -> Rust [3,0,1,2]
+    let p1 = a_view.permute([0, 1, 2, 3]); // identity
+    let p2 = a_view.permute([1, 2, 3, 0]);
+    let p3 = a_view.permute([2, 3, 0, 1]);
+    let p4 = a_view.permute([3, 0, 1, 2]);
+
+    group.bench_function("naive", |b| {
+        b.iter(|| {
+            let mut out = Tensor::zeros([size, size, size, size]);
+            for i in 0..size {
+                for j in 0..size {
+                    for k in 0..size {
+                        for l in 0..size {
+                            out[[i, j, k, l]] = p1[[i, j, k, l]]
+                                + p2[[i, j, k, l]]
+                                + p3[[i, j, k, l]]
+                                + p4[[i, j, k, l]];
+                        }
+                    }
+                }
+            }
+            out
+        })
+    });
+
+    // Using zip_map for fused operations would require a zip_map4 or chaining
+    // For now, demonstrate adding pairs with temporary buffers
+    group.bench_function("strided_pairwise", |b| {
+        b.iter(|| {
+            // tmp1 = p1 + p2
+            let mut tmp1 = Tensor::zeros([size, size, size, size]);
+            if let Err(err) = zip_map2_into(&mut tmp1, &p1, &p2, |x, y| x + y) {
+                panic!("zip_map2_into failed for p1+p2: {err}");
+            }
+            // tmp2 = p3 + p4
+            let mut tmp2 = Tensor::zeros([size, size, size, size]);
+            if let Err(err) = zip_map2_into(&mut tmp2, &p3, &p4, |x, y| x + y) {
+                panic!("zip_map2_into failed for p3+p4: {err}");
+            }
+            // out = tmp1 + tmp2
+            let mut out = Tensor::zeros([size, size, size, size]);
+            if let Err(err) = zip_map2_into(&mut out, &tmp1.as_ref(), &tmp2.as_ref(), |x, y| x + y)
+            {
+                panic!("zip_map2_into failed for final sum: {err}");
+            }
+            out
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_copy_permuted,
@@ -536,6 +673,8 @@ criterion_group!(
     bench_reduce_contiguous,
     bench_symmetrize_aat,
     bench_scale_transpose,
-    bench_nonlinear_map
+    bench_nonlinear_map,
+    bench_permutedims_4d,
+    bench_multi_permute_sum
 );
 criterion_main!(benches);

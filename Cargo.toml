@@ -10,6 +10,13 @@ mdarray = "0.7.2"
 num-traits = "0.2"
 num-complex = "0.4"
 thiserror = "1.0"
+rayon = { version = "1.10", optional = true }
+cblas = { version = "0.4", optional = true }
+
+[features]
+default = []
+parallel = ["rayon"]
+blas = ["cblas"]
 
 [dev-dependencies]
 criterion = "0.5"
