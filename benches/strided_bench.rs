@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
 use mdarray_strided::{
-    copy_into, copy_into_uninit, copy_transpose_scale_into_fast,
-    copy_transpose_scale_into_tiled, map_into, sum, symmetrize_into, zip_map2_into, zip_map4_into,
+    copy_into, copy_into_uninit, copy_transpose_scale_into_fast, map_into, sum, symmetrize_into,
+    zip_map2_into, zip_map4_into,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -283,18 +283,6 @@ fn bench_scale_transpose(c: &mut Criterion) {
             out
         })
     });
-
-    for tile in [16usize, 24, 32] {
-        group.bench_with_input(BenchmarkId::new("strided_tile", tile), &tile, |b, &tile| {
-            b.iter(|| {
-                let mut out = Tensor::zeros([size, size]);
-                if let Err(err) = copy_transpose_scale_into_tiled(&mut out, a.as_ref(), 3.0, tile) {
-                    panic!("copy_transpose_scale_into_tiled failed: {err}");
-                }
-                out
-            })
-        });
-    }
 
     group.finish();
 }

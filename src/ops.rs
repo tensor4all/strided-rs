@@ -381,23 +381,6 @@ where
     LD: Layout,
     LS: Layout,
 {
-    let tile = transpose_tile_size::<T>().clamp(1, TRANSPOSE_TILE);
-    copy_transpose_scale_into_tiled(dest, src, alpha, tile)
-}
-
-pub fn copy_transpose_scale_into_tiled<T, SD, SS, LD, LS>(
-    dest: &mut Slice<T, SD, LD>,
-    src: &Slice<T, SS, LS>,
-    alpha: T,
-    tile: usize,
-) -> Result<()>
-where
-    T: Clone + Mul<Output = T>,
-    SD: Shape,
-    SS: Shape,
-    LD: Layout,
-    LS: Layout,
-{
     let dst_view = StridedViewMut::from_slice(dest)?;
     let src_view = StridedView::from_slice(src)?;
 
@@ -418,7 +401,7 @@ where
         ));
     }
 
-    let tile = tile.clamp(1, TRANSPOSE_TILE);
+    let tile = transpose_tile_size::<T>().clamp(1, TRANSPOSE_TILE);
     let s_row = src_view.strides[0];
     let s_col = src_view.strides[1];
     let d_row = dst_view.strides[0];
