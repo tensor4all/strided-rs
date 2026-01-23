@@ -260,6 +260,68 @@ if let Some(slice) = view_1d.as_slice() {
 
 MIT
 
+## Linear Algebra
+
+```rust
+use mdarray_strided::{matmul, generic_matmul, linalg_axpy, axpby, lmul, rmul};
+
+// Matrix multiplication: C = alpha * A * B + beta * C
+matmul(&mut c, &a, &b, 1.0, 0.0).unwrap();
+
+// Generic matmul (without BLAS)
+generic_matmul(&mut c, &a, &b, 1.0, 0.0).unwrap();
+
+// Vector operations (1D arrays)
+linalg_axpy(&mut y, 2.0, &x).unwrap();       // y = 2.0 * x + y
+axpby(&mut y, 2.0, &x, 0.5).unwrap();        // y = 2.0 * x + 0.5 * y
+lmul(&mut x, 2.0).unwrap();                  // x = 2.0 * x
+rmul(&mut x, 2.0).unwrap();                  // x = x * 2.0
+```
+
+## Broadcasting with CaptureArgs
+
+```rust
+use mdarray_strided::{broadcast_into, promoteshape, CaptureArgs, Arg, Scalar};
+
+// Broadcast [1, 3] and [4, 1] to [4, 3] and add
+let target = [4, 3];
+let a_promoted = promoteshape(&target, &row_vec).unwrap();
+let b_promoted = promoteshape(&target, &col_vec).unwrap();
+broadcast_into(&mut dest, |x, y| x + y, &a_promoted, &b_promoted).unwrap();
+
+// CaptureArgs for lazy evaluation
+let capture = CaptureArgs::new(|a, b, c| a + b * c, (Arg, Arg, Scalar(2.0)));
+```
+
+## Dimension Reduction
+
+```rust
+use mdarray_strided::mapreducedim_into;
+
+// Sum along axis 0: [3, 4] -> [1, 4]
+let mut dest = Tensor::from_fn([1, 4], |_| 0.0);
+mapreducedim_into(&mut dest, &src, |&x| x, |a, b| a + b, None).unwrap();
+
+// Sum of squares with init_op
+fn zero_init(_: &f64) -> f64 { 0.0 }
+mapreducedim_into(&mut dest, &src, |&x| x * x, |a, b| a + b, Some(zero_init)).unwrap();
+```
+
+## Julia Port Status
+
+This crate is a **~98% complete port** of Julia's Strided.jl/StridedViews.jl:
+
+| Julia Module | Rust Module | Status |
+|--------------|-------------|--------|
+| `stridedview.jl` | `view.rs` | ✅ Complete |
+| `mapreduce.jl` | `kernel.rs`, `map.rs`, `reduce.rs` | ✅ Complete |
+| `broadcast.jl` | `broadcast.rs` | ✅ Complete |
+| `linalg.jl` | `linalg.rs` | ✅ Complete |
+
+## License
+
+MIT
+
 ## Acknowledgments
 
 This crate is inspired by and ports functionality from:

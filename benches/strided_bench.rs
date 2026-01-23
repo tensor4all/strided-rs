@@ -381,17 +381,7 @@ fn bench_copy_contiguous(c: &mut Criterion) {
             b.iter(|| a_view.to_tensor());
         });
 
-        group.bench_with_input(BenchmarkId::new("strided", size), &size, |b, _| {
-            b.iter(|| {
-                let mut out = Tensor::zeros([size, size]);
-                if let Err(err) = copy_into(&mut out, a_view) {
-                    panic!("copy_into failed: {err}");
-                }
-                out
-            })
-        });
-
-        group.bench_with_input(BenchmarkId::new("uninit", size), &size, |b, &size| {
+        group.bench_with_input(BenchmarkId::new("strided", size), &size, |b, &size| {
             let mut buf = vec![MaybeUninit::<f64>::uninit(); size * size];
             let dims = [size, size];
             let strides = [size as isize, 1isize];
