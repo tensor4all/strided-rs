@@ -19,3 +19,7 @@ rand_distr = "0.4"
 
 [lib]
 bench = false
+
+[[bench]]
+name = "strided_bench"
+harness = false
