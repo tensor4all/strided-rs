@@ -1,3 +1,36 @@
+//! Loop ordering algorithm ported from Strided.jl
+//!
+//! This module computes the optimal dimension iteration order using
+//! the index_order + importance bit-packing algorithm from Julia.
+
+use crate::auxiliary::index_order;
+use crate::fuse::{compute_importance, sort_by_importance};
+
+/// Compute the optimal iteration order for dimensions.
+///
+/// This implementation follows Julia's `_mapreduce_order!` algorithm:
+/// 1. Compute `index_order` for each array's strides
+/// 2. Compute importance scores using bit-packing with output weighted 2x
+/// 3. Sort dimensions by importance (descending)
+///
+/// # Arguments
+/// * `dims` - The dimensions of the arrays
+/// * `strides_list` - Slice of stride arrays, one per array
+/// * `dest_index` - Index of the destination array (weighted 2x, typically 0)
+///
+/// # Returns
+/// Permutation of dimension indices in optimal iteration order
+///
+/// # Julia equivalent
+/// ```julia
+/// g = 8 * sizeof(Int) - leading_zeros(M + 1)
+/// importance = 2 .* (1 .<< (g .* (N .- indexorder(strides[1]))))
+/// for k in 2:M
+///     importance = importance .+ (1 .<< (g .* (N .- indexorder(strides[k]))))
+/// end
+/// importance = importance .* (dims .> 1)
+/// p = sortperm(importance; rev=true)
+/// ```
 pub(crate) fn compute_order(
     dims: &[usize],
     strides_list: &[&[isize]],
@@ -8,15 +41,53 @@ pub(crate) fn compute_order(
         return Vec::new();
     }
 
-    let mut order: Vec<usize> = (0..rank).collect();
-    order.sort_by(|&a, &b| {
-        let score_a = dim_score(a, strides_list, dest_index);
-        let score_b = dim_score(b, strides_list, dest_index);
-        score_b.cmp(&score_a).then_with(|| a.cmp(&b))
-    });
-    order
+    if strides_list.is_empty() {
+        return (0..rank).collect();
+    }
+
+    // Compute index_order for each stride array
+    let mut index_orders: Vec<Vec<usize>> = Vec::with_capacity(strides_list.len());
+    for strides in strides_list {
+        index_orders.push(index_order(strides));
+    }
+
+    // Reorder so destination array is first (gets 2x weight)
+    let reordered_strides: Vec<&[isize]>;
+    let reordered_orders: Vec<Vec<usize>>;
+
+    if let Some(dest_idx) = dest_index {
+        if dest_idx < strides_list.len() && dest_idx != 0 {
+            // Move destination to front
+            let mut strides_vec: Vec<&[isize]> = strides_list.to_vec();
+            let mut orders_vec = index_orders;
+
+            let dest_strides = strides_vec.remove(dest_idx);
+            let dest_order = orders_vec.remove(dest_idx);
+
+            strides_vec.insert(0, dest_strides);
+            orders_vec.insert(0, dest_order);
+
+            reordered_strides = strides_vec;
+            reordered_orders = orders_vec;
+        } else {
+            reordered_strides = strides_list.to_vec();
+            reordered_orders = index_orders;
+        }
+    } else {
+        reordered_strides = strides_list.to_vec();
+        reordered_orders = index_orders;
+    }
+
+    // Compute importance using the Julia algorithm
+    let importance = compute_importance(dims, &reordered_strides, &reordered_orders);
+
+    // Sort by importance (descending)
+    sort_by_importance(&importance)
 }
 
+/// Legacy dim_score function for compatibility.
+/// Kept for reference but not used in the new algorithm.
+#[allow(dead_code)]
 fn dim_score(dim: usize, strides_list: &[&[isize]], dest_index: Option<usize>) -> usize {
     let mut score = 0usize;
     for (i, strides) in strides_list.iter().enumerate() {
@@ -25,4 +96,89 @@ fn dim_score(dim: usize, strides_list: &[&[isize]], dest_index: Option<usize>) -
         score = score.saturating_add(weight * stride);
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_order_column_major() {
+        // Column-major array: strides [1, 4]
+        let dims = [4usize, 5];
+        let strides = [1isize, 4];
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // Dimension 0 has smallest stride -> highest importance -> first
+        assert_eq!(order[0], 0);
+        assert_eq!(order[1], 1);
+    }
+
+    #[test]
+    fn test_compute_order_row_major() {
+        // Row-major array: strides [5, 1]
+        let dims = [4usize, 5];
+        let strides = [5isize, 1];
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // Dimension 1 has smallest stride -> highest importance -> first
+        assert_eq!(order[0], 1);
+        assert_eq!(order[1], 0);
+    }
+
+    #[test]
+    fn test_compute_order_mixed() {
+        // Output column-major, input row-major
+        // Output weighted 2x, so dimension 0 should be first
+        let dims = [4usize, 5];
+        let out_strides = [1isize, 4]; // Column-major output
+        let in_strides = [5isize, 1]; // Row-major input
+        let strides_list: Vec<&[isize]> = vec![&out_strides, &in_strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // Output has 2x weight, so column-major wins -> dim 0 first
+        assert_eq!(order[0], 0);
+        assert_eq!(order[1], 1);
+    }
+
+    #[test]
+    fn test_compute_order_3d() {
+        // 3D array: want smallest stride dimension first
+        let dims = [3usize, 4, 5];
+        let strides = [20isize, 5, 1]; // Last dimension is contiguous
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // Dimension 2 has smallest stride -> first in order
+        assert_eq!(order[0], 2);
+    }
+
+    #[test]
+    fn test_compute_order_size_one_dims() {
+        // Size-1 dimensions should have zero importance -> go to back
+        let dims = [4usize, 1, 5];
+        let strides = [1isize, 4, 4];
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // Dimension 1 has size 1 -> should be last
+        assert_eq!(order[2], 1);
+    }
+
+    #[test]
+    fn test_compute_order_empty() {
+        let dims: [usize; 0] = [];
+        let strides: [isize; 0] = [];
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+        assert!(order.is_empty());
+    }
 }

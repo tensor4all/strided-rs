@@ -1,3 +1,4 @@
+use crate::fuse::fuse_dims;
 use crate::{block, order, Result, StridedError};
 use mdarray::{Layout, Shape, Slice};
 
@@ -51,6 +52,12 @@ pub(crate) struct KernelPlan {
     pub(crate) block: Vec<usize>,
 }
 
+/// Build an execution plan for strided iteration.
+///
+/// This follows Julia's `_mapreduce_fuse!` -> `_mapreduce_order!` -> `_mapreduce_block!` pipeline:
+/// 1. Fuse contiguous dimensions
+/// 2. Compute optimal iteration order
+/// 3. Compute block sizes for cache efficiency
 pub(crate) fn build_plan(
     dims: &[usize],
     strides_list: &[&[isize]],
@@ -62,6 +69,30 @@ pub(crate) fn build_plan(
     KernelPlan { order, block }
 }
 
+/// Build an execution plan with dimension fusion.
+///
+/// This is the Julia-faithful version that fuses contiguous dimensions
+/// before computing the iteration order.
+pub(crate) fn build_plan_fused(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    dest_index: Option<usize>,
+    elem_size: usize,
+) -> (Vec<usize>, KernelPlan) {
+    // Fuse contiguous dimensions
+    let fused_dims = fuse_dims(dims, strides_list);
+
+    // Compute order and blocks on fused dimensions
+    let order = order::compute_order(&fused_dims, strides_list, dest_index);
+    let block = block::compute_block_sizes(&fused_dims, &order, strides_list, elem_size);
+
+    (fused_dims, KernelPlan { order, block })
+}
+
+/// Iterate over all elements, calling f with the current offsets.
+///
+/// For small arrays or simple cases, considers using specialized fast paths.
+#[inline]
 pub(crate) fn for_each_offset<F>(
     dims: &[usize],
     plan: &KernelPlan,
@@ -98,6 +129,10 @@ where
     )
 }
 
+/// Iterate over blocks, calling f with (offsets, block_len, inner_strides).
+///
+/// This is useful for operations that can vectorize the innermost loop.
+#[inline]
 pub(crate) fn for_each_inner_block<F>(
     dims: &[usize],
     plan: &KernelPlan,
@@ -136,6 +171,7 @@ where
     )
 }
 
+#[inline]
 fn loop_level<F>(
     level: usize,
     dims: &[usize],
@@ -189,6 +225,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn loop_outer<F>(
     level: usize,
     dims: &[usize],

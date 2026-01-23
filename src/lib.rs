@@ -26,9 +26,11 @@
 //! assert_eq!(transposed.size(), &[3, 2]);
 //! ```
 
+mod auxiliary;
 pub mod blas;
 mod block;
 mod element_op;
+mod fuse;
 mod kernel;
 mod map;
 mod ops;
@@ -55,6 +57,8 @@ pub use blas::{blas_axpy, blas_dot, blas_gemm};
 
 pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;
 pub const CACHE_LINE_SIZE: usize = 64;
+/// Minimum array length before threading is applied (Julia: MINTHREADLENGTH)
+pub const MIN_THREAD_LENGTH: usize = 1 << 15; // 32768
 
 #[derive(Debug, thiserror::Error)]
 pub enum StridedError {
