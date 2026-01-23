@@ -93,6 +93,7 @@ The `extern/` directory contains reference implementations:
 
 Design documentation:
 - `docs/STRIDED_DESIGN.md`: Detailed analysis of Julia implementations and Rust porting guide
+- `docs/report.md`: Benchmark report comparing strided vs naive implementations
 
 ## Key Design Decisions
 
@@ -106,3 +107,16 @@ Design documentation:
 - BLAS `matmul_into` with automatic backend selection
 - `CaptureArgs` equivalent for lazy broadcast evaluation
 - False-sharing avoidance for parallel reductions
+- Optimize blocking strategy for 4D arrays ([Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5))
+
+## Performance Notes
+
+See `docs/report.md` for detailed benchmark results. Summary:
+
+| Operation | 2D Arrays | 4D Arrays |
+|-----------|-----------|-----------|
+| `zip_map` (contiguous) | 3-4x faster | Not tested |
+| `zip_map` (mixed stride) | 2-2.6x faster | - |
+| `symmetrize_into` | 1.5x faster | N/A |
+| `permutedims` | ~same | **slower** (needs optimization) |
+| `zip_map4_into` | Recommended | **slower** (needs optimization) |
