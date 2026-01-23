@@ -2,6 +2,7 @@ use approx::assert_relative_eq;
 use mdarray::{DynRank, Tensor};
 use mdarray_strided::{
     copy_into_uninit, copy_transpose_scale_into, dot, map_into, reduce, reduce_axis, zip_map2_into,
+    zip_map4_into,
 };
 use std::mem::MaybeUninit;
 
@@ -110,6 +111,80 @@ fn test_copy_into_uninit_contiguous() {
         for j in 0..dims[1] {
             let idx = i * dims[1] + j;
             assert_relative_eq!(out[idx], a[[i, j]], epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_zip_map4_into_contiguous() {
+    let a = make_tensor(4, 5);
+    let b = make_tensor(4, 5);
+    let c = make_tensor(4, 5);
+    let d = make_tensor(4, 5);
+    let mut out = Tensor::zeros([4, 5]).into_dyn();
+
+    zip_map4_into(&mut out, &a, &b, &c, &d, |a, b, c, d| a + b + c + d).unwrap();
+
+    for i in 0..4 {
+        for j in 0..5 {
+            let expected = a[[i, j]] + b[[i, j]] + c[[i, j]] + d[[i, j]];
+            assert_relative_eq!(out[[i, j]], expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_zip_map4_into_permuted() {
+    // Test with 4D arrays and various permutations (like the Julia benchmark)
+    let size = 8usize;
+    let a: Tensor<f64, DynRank> =
+        Tensor::from_fn([size, size, size, size], |idx| {
+            (idx[0] + 2 * idx[1] + 3 * idx[2] + 4 * idx[3]) as f64
+        })
+        .into_dyn();
+
+    // Julia (1,2,3,4) -> Rust [0,1,2,3] (identity)
+    // Julia (2,3,4,1) -> Rust [1,2,3,0]
+    // Julia (3,4,1,2) -> Rust [2,3,0,1]
+    // Julia (4,1,2,3) -> Rust [3,0,1,2]
+    let p1 = a.as_ref().permute([0, 1, 2, 3]); // identity
+    let p2 = a.as_ref().permute([1, 2, 3, 0]);
+    let p3 = a.as_ref().permute([2, 3, 0, 1]);
+    let p4 = a.as_ref().permute([3, 0, 1, 2]);
+
+    let mut out = Tensor::zeros([size, size, size, size]).into_dyn();
+
+    zip_map4_into(&mut out, &p1, &p2, &p3, &p4, |a, b, c, d| a + b + c + d).unwrap();
+
+    // Verify against naive computation
+    for i in 0..size {
+        for j in 0..size {
+            for k in 0..size {
+                for l in 0..size {
+                    let expected =
+                        p1[[i, j, k, l]] + p2[[i, j, k, l]] + p3[[i, j, k, l]] + p4[[i, j, k, l]];
+                    assert_relative_eq!(out[[i, j, k, l]], expected, epsilon = 1e-10);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_zip_map4_into_mixed_ops() {
+    let a = make_tensor(3, 4);
+    let b = make_tensor(3, 4);
+    let c = make_tensor(3, 4);
+    let d = make_tensor(3, 4);
+    let mut out = Tensor::zeros([3, 4]).into_dyn();
+
+    // Test with a more complex combining function
+    zip_map4_into(&mut out, &a, &b, &c, &d, |a, b, c, d| a * b + c * d).unwrap();
+
+    for i in 0..3 {
+        for j in 0..4 {
+            let expected = a[[i, j]] * b[[i, j]] + c[[i, j]] * d[[i, j]];
+            assert_relative_eq!(out[[i, j]], expected, epsilon = 1e-10);
         }
     }
 }

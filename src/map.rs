@@ -331,3 +331,115 @@ where
         },
     )
 }
+
+pub fn zip_map4_into<T, SD, SA, SB, SC, SE, LD, LA, LB, LC, LE, F>(
+    dest: &mut Slice<T, SD, LD>,
+    a: &Slice<T, SA, LA>,
+    b: &Slice<T, SB, LB>,
+    c: &Slice<T, SC, LC>,
+    e: &Slice<T, SE, LE>,
+    f: F,
+) -> Result<()>
+where
+    SD: Shape,
+    SA: Shape,
+    SB: Shape,
+    SC: Shape,
+    SE: Shape,
+    LD: Layout,
+    LA: Layout,
+    LB: Layout,
+    LC: Layout,
+    LE: Layout,
+    F: Fn(&T, &T, &T, &T) -> T,
+{
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let a_view = StridedView::from_slice(a)?;
+    let b_view = StridedView::from_slice(b)?;
+    let c_view = StridedView::from_slice(c)?;
+    let e_view = StridedView::from_slice(e)?;
+    ensure_same_shape(&dst_view.dims, &a_view.dims)?;
+    ensure_same_shape(&dst_view.dims, &b_view.dims)?;
+    ensure_same_shape(&dst_view.dims, &c_view.dims)?;
+    ensure_same_shape(&dst_view.dims, &e_view.dims)?;
+
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&a_view.dims, &a_view.strides)
+        && is_contiguous(&b_view.dims, &b_view.strides)
+        && is_contiguous(&c_view.dims, &c_view.strides)
+        && is_contiguous(&e_view.dims, &e_view.strides)
+    {
+        let len = total_len(&dst_view.dims);
+        let mut dst_ptr = dst_view.ptr;
+        let mut a_ptr = a_view.ptr;
+        let mut b_ptr = b_view.ptr;
+        let mut c_ptr = c_view.ptr;
+        let mut e_ptr = e_view.ptr;
+        for _ in 0..len {
+            let out = f(
+                unsafe { &*a_ptr },
+                unsafe { &*b_ptr },
+                unsafe { &*c_ptr },
+                unsafe { &*e_ptr },
+            );
+            unsafe {
+                *dst_ptr = out;
+                dst_ptr = dst_ptr.add(1);
+                a_ptr = a_ptr.add(1);
+                b_ptr = b_ptr.add(1);
+                c_ptr = c_ptr.add(1);
+                e_ptr = e_ptr.add(1);
+            }
+        }
+        return Ok(());
+    }
+
+    let strides_list = [
+        &dst_view.strides[..],
+        &a_view.strides[..],
+        &b_view.strides[..],
+        &c_view.strides[..],
+        &e_view.strides[..],
+    ];
+    let plan = build_plan(
+        &dst_view.dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
+
+    for_each_inner_block(
+        &dst_view.dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut dst_ptr = unsafe { dst_view.ptr.offset(offsets[0]) };
+            let mut a_ptr = unsafe { a_view.ptr.offset(offsets[1]) };
+            let mut b_ptr = unsafe { b_view.ptr.offset(offsets[2]) };
+            let mut c_ptr = unsafe { c_view.ptr.offset(offsets[3]) };
+            let mut e_ptr = unsafe { e_view.ptr.offset(offsets[4]) };
+            let dst_stride = strides[0];
+            let a_stride = strides[1];
+            let b_stride = strides[2];
+            let c_stride = strides[3];
+            let e_stride = strides[4];
+            for _ in 0..len {
+                let out = f(
+                    unsafe { &*a_ptr },
+                    unsafe { &*b_ptr },
+                    unsafe { &*c_ptr },
+                    unsafe { &*e_ptr },
+                );
+                unsafe {
+                    *dst_ptr = out;
+                    dst_ptr = dst_ptr.offset(dst_stride);
+                    a_ptr = a_ptr.offset(a_stride);
+                    b_ptr = b_ptr.offset(b_stride);
+                    c_ptr = c_ptr.offset(c_stride);
+                    e_ptr = e_ptr.offset(e_stride);
+                }
+            }
+            Ok(())
+        },
+    )
+}

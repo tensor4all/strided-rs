@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use mdarray::Tensor;
 use mdarray_strided::{
     copy_into, copy_into_uninit, copy_transpose_scale_into, copy_transpose_scale_into_tiled,
-    map_into, sum, symmetrize_into, zip_map2_into,
+    map_into, sum, symmetrize_into, zip_map2_into, zip_map4_into,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -636,25 +636,13 @@ fn bench_multi_permute_sum(c: &mut Criterion) {
         })
     });
 
-    // Using zip_map for fused operations would require a zip_map4 or chaining
-    // For now, demonstrate adding pairs with temporary buffers
-    group.bench_function("strided_pairwise", |b| {
+    // Using zip_map4_into for fused single-pass operations (no temporaries)
+    group.bench_function("strided_fused", |b| {
         b.iter(|| {
-            // tmp1 = p1 + p2
-            let mut tmp1 = Tensor::zeros([size, size, size, size]);
-            if let Err(err) = zip_map2_into(&mut tmp1, &p1, &p2, |x, y| x + y) {
-                panic!("zip_map2_into failed for p1+p2: {err}");
-            }
-            // tmp2 = p3 + p4
-            let mut tmp2 = Tensor::zeros([size, size, size, size]);
-            if let Err(err) = zip_map2_into(&mut tmp2, &p3, &p4, |x, y| x + y) {
-                panic!("zip_map2_into failed for p3+p4: {err}");
-            }
-            // out = tmp1 + tmp2
             let mut out = Tensor::zeros([size, size, size, size]);
-            if let Err(err) = zip_map2_into(&mut out, &tmp1.as_ref(), &tmp2.as_ref(), |x, y| x + y)
+            if let Err(err) = zip_map4_into(&mut out, &p1, &p2, &p3, &p4, |a, b, c, d| a + b + c + d)
             {
-                panic!("zip_map2_into failed for final sum: {err}");
+                panic!("zip_map4_into failed: {err}");
             }
             out
         })
