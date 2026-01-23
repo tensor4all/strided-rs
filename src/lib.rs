@@ -29,6 +29,7 @@
 mod auxiliary;
 pub mod blas;
 mod block;
+pub mod broadcast;
 mod element_op;
 mod fuse;
 mod kernel;
@@ -53,6 +54,10 @@ pub use reduce::{reduce, reduce_axis};
 pub use view::{
     broadcast_shape, broadcast_shape3, Idx, SliceIndex, StridedArrayView, StridedArrayViewMut,
     StridedRange,
+};
+pub use broadcast::{
+    Arg, BroadcastBuilder, CaptureArgs, Consume, Scalar, broadcast_into, broadcast3_into,
+    promoteshape, promoteshape2, promoteshape3,
 };
 
 #[cfg(feature = "blas")]
