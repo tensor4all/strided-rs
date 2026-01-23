@@ -296,6 +296,11 @@ where
     }
 
     let half = T::from_f64(0.5).ok_or(StridedError::ScalarConversion)?;
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&src_view.dims, &src_view.strides)
+    {
+        return symmetrize_into_contig(&dst_view, &src_view, &half);
+    }
     let tile = sym_tile_size::<T>();
     let s_row = src_view.strides[0];
     let s_col = src_view.strides[1];
@@ -486,6 +491,58 @@ where
     Ok(())
 }
 
+fn symmetrize_into_contig<T>(
+    dest: &StridedViewMut<T>,
+    src: &StridedView<T>,
+    half: &T,
+) -> Result<()>
+where
+    T: Clone + Add<Output = T> + Mul<Output = T>,
+{
+    let n = src.dims[0];
+    let total = n
+        .checked_mul(n)
+        .ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    let src_ptr = src.ptr;
+    let dst_ptr = dest.ptr;
+    for i in 0..n {
+        let row_base = i
+            .checked_mul(n)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut idx_ij = row_base
+            .checked_add(i)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut idx_ji = idx_ij;
+        for j in i..n {
+            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
+            if i == j {
+                unsafe {
+                    *dst_ptr.add(idx_ij) = aij;
+                }
+            } else {
+                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
+                let out = (aij + aji) * half.clone();
+                unsafe {
+                    *dst_ptr.add(idx_ij) = out.clone();
+                    *dst_ptr.add(idx_ji) = out;
+                }
+            }
+            idx_ij = idx_ij
+                .checked_add(1)
+                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji
+                .checked_add(n)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn sym_tile_size<T>() -> usize {
     let bytes = std::mem::size_of::<T>().max(1);
     let per_array = crate::BLOCK_MEMORY_SIZE / 4;
@@ -500,6 +557,131 @@ fn transpose_tile_size<T>() -> usize {
     let tile_elems = (per_array / bytes).max(1);
     let tile = (tile_elems as f64).sqrt() as usize;
     tile.clamp(1, TRANSPOSE_TILE)
+}
+
+/// Optimized scale-transpose using 4x4 micro-kernel.
+///
+/// This version minimizes overhead by:
+/// - Using unchecked pointer arithmetic in inner loops (bounds validated upfront)
+/// - Processing 4x4 blocks to maximize register utilization
+/// - Specializing for row-major contiguous output (most common case)
+pub fn copy_transpose_scale_into_fast<T>(
+    dest: &mut Slice<T, impl Shape, impl Layout>,
+    src: &Slice<T, impl Shape, impl Layout>,
+    alpha: T,
+) -> Result<()>
+where
+    T: Copy + Mul<Output = T>,
+{
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let src_view = StridedView::from_slice(src)?;
+
+    if src_view.dims.len() != 2 {
+        return Err(StridedError::RankMismatch(src_view.dims.len(), 2));
+    }
+    if dst_view.dims.len() != 2 {
+        return Err(StridedError::RankMismatch(dst_view.dims.len(), 2));
+    }
+
+    let rows = src_view.dims[0]; // src rows = dst cols
+    let cols = src_view.dims[1]; // src cols = dst rows
+    let expected = [cols, rows];
+    if dst_view.dims[0] != expected[0] || dst_view.dims[1] != expected[1] {
+        return Err(StridedError::ShapeMismatch(
+            dst_view.dims.clone(),
+            expected.to_vec(),
+        ));
+    }
+
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+
+    // Fast path: output is row-major contiguous (d_col == 1)
+    // This is the common case: dest[j, i] = alpha * src[i, j]
+    // Inner loop writes sequentially to dest rows
+    if d_col == 1 {
+        const TILE: usize = 4;
+        let src_ptr = src_view.ptr;
+        let dst_ptr = dst_view.ptr;
+
+        // Process 4x4 tiles
+        let rows_full = rows - rows % TILE;
+        let cols_full = cols - cols % TILE;
+
+        for j0 in (0..cols_full).step_by(TILE) {
+            for i0 in (0..rows_full).step_by(TILE) {
+                // 4x4 micro-kernel: load 4 rows of 4 elements each, transpose and store
+                unsafe {
+                    // Compute base offsets (only once per tile)
+                    let src_base = src_ptr.offset(i0 as isize * s_row + j0 as isize * s_col);
+                    let dst_base = dst_ptr.offset(j0 as isize * d_row + i0 as isize);
+
+                    // Load 4x4 block from source (row by row)
+                    // src[i0+k, j0+l] for k,l in 0..4
+                    for l in 0..TILE {
+                        let src_col = src_base.offset(l as isize * s_col);
+                        let dst_row = dst_base.offset(l as isize * d_row);
+                        for k in 0..TILE {
+                            let val = *src_col.offset(k as isize * s_row);
+                            *dst_row.add(k) = alpha * val;
+                        }
+                    }
+                }
+            }
+
+            // Handle remaining rows (i0 >= rows_full)
+            for i in rows_full..rows {
+                unsafe {
+                    let src_base = src_ptr.offset(i as isize * s_row + j0 as isize * s_col);
+                    let dst_base = dst_ptr.offset(j0 as isize * d_row + i as isize);
+                    for l in 0..TILE {
+                        let val = *src_base.offset(l as isize * s_col);
+                        *dst_base.offset(l as isize * d_row) = alpha * val;
+                    }
+                }
+            }
+        }
+
+        // Handle remaining columns (j0 >= cols_full)
+        for j in cols_full..cols {
+            unsafe {
+                let src_col = src_ptr.offset(j as isize * s_col);
+                let dst_row = dst_ptr.offset(j as isize * d_row);
+                for i in 0..rows {
+                    let val = *src_col.offset(i as isize * s_row);
+                    *dst_row.add(i) = alpha * val;
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // General case: use simple tiled loop
+    const TILE: usize = 8;
+    let src_ptr = src_view.ptr;
+    let dst_ptr = dst_view.ptr;
+
+    for i0 in (0..rows).step_by(TILE) {
+        let i_end = (i0 + TILE).min(rows);
+        for j0 in (0..cols).step_by(TILE) {
+            let j_end = (j0 + TILE).min(cols);
+            for i in i0..i_end {
+                for j in j0..j_end {
+                    unsafe {
+                        let src_off = i as isize * s_row + j as isize * s_col;
+                        let dst_off = j as isize * d_row + i as isize * d_col;
+                        let val = *src_ptr.offset(src_off);
+                        *dst_ptr.offset(dst_off) = alpha * val;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn copy_2d_contig_write<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>

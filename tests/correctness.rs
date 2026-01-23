@@ -1,8 +1,8 @@
 use approx::assert_relative_eq;
 use mdarray::{DynRank, Tensor};
 use mdarray_strided::{
-    copy_into_uninit, copy_transpose_scale_into, dot, map_into, reduce, reduce_axis, zip_map2_into,
-    zip_map4_into,
+    copy_into_uninit, copy_transpose_scale_into, copy_transpose_scale_into_fast, dot, map_into,
+    reduce, reduce_axis, zip_map2_into, zip_map4_into,
 };
 use std::mem::MaybeUninit;
 
@@ -90,6 +90,56 @@ fn test_copy_transpose_scale_into() {
     for i in 0..2 {
         for j in 0..3 {
             assert_relative_eq!(out[[j, i]], 3.0 * a[[i, j]], epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_copy_transpose_scale_into_fast_small() {
+    let a: Tensor<f64, DynRank> =
+        Tensor::from_fn([2, 3], |idx| (idx[0] * 10 + idx[1]) as f64).into_dyn();
+    let mut out = Tensor::zeros([3, 2]).into_dyn();
+
+    copy_transpose_scale_into_fast(&mut out, &a, 3.0).unwrap();
+
+    for i in 0..2 {
+        for j in 0..3 {
+            assert_relative_eq!(out[[j, i]], 3.0 * a[[i, j]], epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_copy_transpose_scale_into_fast_large() {
+    // Test with a size that exercises the 4x4 micro-kernel and edge cases
+    let a: Tensor<f64, DynRank> =
+        Tensor::from_fn([17, 13], |idx| (idx[0] * 100 + idx[1]) as f64).into_dyn();
+    let mut out = Tensor::zeros([13, 17]).into_dyn();
+
+    copy_transpose_scale_into_fast(&mut out, &a, 2.5).unwrap();
+
+    for i in 0..17 {
+        for j in 0..13 {
+            assert_relative_eq!(out[[j, i]], 2.5 * a[[i, j]], epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_copy_transpose_scale_into_fast_matches_original() {
+    // Verify that fast version produces same results as original
+    let a: Tensor<f64, DynRank> =
+        Tensor::from_fn([100, 80], |idx| (idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01)).into_dyn();
+
+    let mut out_orig = Tensor::zeros([80, 100]).into_dyn();
+    let mut out_fast = Tensor::zeros([80, 100]).into_dyn();
+
+    copy_transpose_scale_into(&mut out_orig, &a, 3.14).unwrap();
+    copy_transpose_scale_into_fast(&mut out_fast, &a, 3.14).unwrap();
+
+    for i in 0..80 {
+        for j in 0..100 {
+            assert_relative_eq!(out_fast[[i, j]], out_orig[[i, j]], epsilon = 1e-10);
         }
     }
 }

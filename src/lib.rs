@@ -42,7 +42,8 @@ pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity
 pub use map::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 pub use ops::{
     add, axpy, copy_conj, copy_into, copy_into_uninit, copy_scale, copy_transpose_scale_into,
-    copy_transpose_scale_into_tiled, dot, fma, mul, sum, symmetrize_into,
+    copy_transpose_scale_into_fast, copy_transpose_scale_into_tiled, dot, fma, mul, sum,
+    symmetrize_into,
 };
 pub use reduce::{reduce, reduce_axis};
 pub use view::{
