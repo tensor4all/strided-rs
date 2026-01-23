@@ -277,8 +277,8 @@ fn bench_scale_transpose(c: &mut Criterion) {
     group.bench_function("strided", |b| {
         b.iter(|| {
             let mut out = Tensor::zeros([size, size]);
-            if let Err(err) = copy_transpose_scale_into(&mut out, a.as_ref(), 3.0) {
-                panic!("copy_transpose_scale_into failed: {err}");
+            if let Err(err) = copy_transpose_scale_into_fast(&mut out, a.as_ref(), 3.0) {
+                panic!("copy_transpose_scale_into_fast failed: {err}");
             }
             out
         })
@@ -295,16 +295,6 @@ fn bench_scale_transpose(c: &mut Criterion) {
             })
         });
     }
-
-    group.bench_function("strided_fast", |b| {
-        b.iter(|| {
-            let mut out = Tensor::zeros([size, size]);
-            if let Err(err) = copy_transpose_scale_into_fast(&mut out, a.as_ref(), 3.0) {
-                panic!("copy_transpose_scale_into_fast failed: {err}");
-            }
-            out
-        })
-    });
 
     group.finish();
 }

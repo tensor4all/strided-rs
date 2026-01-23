@@ -1,6 +1,6 @@
 # mdarray-strided ベンチマークレポート
 
-**実行日**: 2026-01-23  
+**実行日**: 2026-01-23
 **環境**: Rust release build, optimized
 
 ## 概要
@@ -12,6 +12,9 @@
 ### 1. Copy Operations
 
 #### 1.1 Copy Permuted (転置配列のコピー)
+
+**対応ベンチ**: `bench_copy_permuted` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- copy_permuted`
 
 | Size | Method | Time (mean) | Throughput | Speedup vs Naive |
 |------|--------|--------------|------------|------------------|
@@ -25,6 +28,9 @@
 **分析**: 2Dの書き込み連続パスを追加したことで、以前より大幅に改善し、naiveに近い水準まで縮まりました。依然として読み取り側が非連続アクセスになるため、わずかに遅い傾向は残ります。
 
 #### 1.2 Copy Contiguous (連続配列のコピー)
+
+**対応ベンチ**: `bench_copy_contiguous` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- copy_contiguous`
 
 | Size | Method | Time (mean) | Throughput | Speedup vs Naive |
 |------|--------|--------------|------------|------------------|
@@ -44,33 +50,42 @@
 
 #### 2.1 Zip Map Mixed Strides (混合ストライド)
 
+**対応ベンチ**: `bench_zip_map_mixed_strides` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- zip_map_mixed`
+
 | Size | Method | Time (mean) | Speedup vs Naive |
 |------|--------|--------------|------------------|
-| 100×100 | naive | 12.31 µs | 1.00× |
-| 100×100 | strided | 5.64 µs | **2.18×** (faster) |
-| 500×500 | naive | 296.31 µs | 1.00× |
-| 500×500 | strided | 113.69 µs | **2.61×** (faster) |
-| 1000×1000 | naive | 1.25 ms | 1.00× |
-| 1000×1000 | strided | 551.68 µs | **2.27×** (faster) |
+| 100×100 | naive | 12.51 µs | 1.00× |
+| 100×100 | strided | 5.69 µs | **2.20×** (faster) |
+| 500×500 | naive | 321.82 µs | 1.00× |
+| 500×500 | strided | 115.19 µs | **2.79×** (faster) |
+| 1000×1000 | naive | 1.24 ms | 1.00× |
+| 1000×1000 | strided | 566.42 µs | **2.19×** (faster) |
 
-**分析**: 2D混合ストライド向けの専用パスを導入し、naiveより 2-2.6x 高速になりました。書き込み連続の内側ループを優先し、ポインタ増分でオーバーヘッドを削減しています。
+**分析**: 2D混合ストライド向けの専用パスを導入し、naiveより 2.2-2.8x 高速になりました。書き込み連続の内側ループを優先し、ポインタ増分でオーバーヘッドを削減しています。
 
 #### 2.2 Zip Map Contiguous (連続配列)
 
+**対応ベンチ**: `bench_zip_map_contiguous` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- zip_map_contiguous`
+
 | Size | Method | Time (mean) | Speedup vs Naive |
 |------|--------|--------------|------------------|
-| 100×100 | naive | 10.69 µs | 1.00× |
-| 100×100 | strided | 3.38 µs | **3.16×** (faster) |
-| 500×500 | naive | 258.00 µs | 1.00× |
-| 500×500 | strided | 66.27 µs | **3.89×** (faster) |
-| 1000×1000 | naive | ~1.03 ms | 1.00× |
-| 1000×1000 | strided | ~265 µs | **~3.89×** (faster) |
+| 100×100 | naive | 10.88 µs | 1.00× |
+| 100×100 | strided | 3.36 µs | **3.24×** (faster) |
+| 500×500 | naive | 264.17 µs | 1.00× |
+| 500×500 | strided | 66.03 µs | **4.00×** (faster) |
+| 1000×1000 | naive | 1.05 ms | 1.00× |
+| 1000×1000 | strided | 444.27 µs | **2.36×** (faster) |
 
-**分析**: 連続配列では、strided実装はnaive実装より**約3-4倍高速**です。これは、連続アクセスパターンで最適化されたループが効果的に動作しているためです。
+**分析**: 連続配列では、strided実装はnaive実装より**約2.4-4.0倍高速**です。これは、連続アクセスパターンで最適化されたループが効果的に動作しているためです。500×500サイズで最大の高速化（4.0倍）を示しています。
 
 ### 3. Reduce Operations
 
 #### 3.1 Reduce Transposed (転置配列のリダクション)
+
+**対応ベンチ**: `bench_reduce_transposed` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- reduce_transposed`
 
 | Size | Method | Time (mean) | Speedup vs Naive |
 |------|--------|--------------|------------------|
@@ -84,6 +99,9 @@
 **分析**: 転置配列のリダクションでは、小さいサイズではオーバーヘッドが影響しますが、大きいサイズ（1000×1000）ではほぼ同等の性能です。
 
 #### 3.2 Reduce Contiguous (連続配列のリダクション)
+
+**対応ベンチ**: `bench_reduce_contiguous` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- reduce_contiguous`
 
 | Size | Method | Time (mean) | Speedup vs Naive |
 |------|--------|--------------|------------------|
@@ -100,37 +118,46 @@
 
 #### 4.1 Symmetrize (対称化: `B = (A + Aᵀ) / 2`)
 
+**対応ベンチ**: `bench_symmetrize_aat` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- symmetrize_aat`
+
 **サイズ**: 4000×4000
 
 | Method | Time (mean) | Throughput | Speedup vs Naive |
 |--------|--------------|------------|------------------|
-| naive | 62.27 ms | 257 Melem/s | 1.00× |
-| strided | 38.98 ms | 411 Melem/s | **1.60×** (faster) |
+| naive | 61.14 ms | 262 Melem/s | 1.00× |
+| strided | 34.88 ms | 459 Melem/s | **1.75×** (faster) |
 
-**分析**: 特化カーネル `symmetrize_into` は、タイルベースの反復と `(i,j)/(j,i)` の同時更新により、naive実装より**約1.6倍高速**です。キャッシュ効率が大幅に改善されています。
+**分析**: 特化カーネル `symmetrize_into` は、タイルベースの反復と `(i,j)/(j,i)` の同時更新により、naive実装より**約1.75倍高速**です。連続メモリの高速パス（row-major/col-major）により、キャッシュ効率が大幅に改善されています。
 
 #### 4.2 Scale Transpose (スケール転置: `B = α * Aᵀ`)
 
+**対応ベンチ**: `bench_scale_transpose` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- scale_transpose`
+
 **サイズ**: 1000×1000
 
 | Method | Time (mean) | Throughput | Speedup vs Naive |
 |--------|--------------|------------|------------------|
-| naive | 734.41 µs | 1.36 Gelem/s | 1.00× |
-| strided (default) | 692.81 µs | 1.44 Gelem/s | **1.06×** (faster) |
-| strided (tile=16) | 674.47 µs | 1.48 Gelem/s | **1.09×** (faster) |
-| strided (tile=24) | 862.04 µs | 1.16 Gelem/s | **0.85×** (slower) |
-| strided (tile=32) | 681.36 µs | 1.47 Gelem/s | **1.08×** (faster) |
+| naive | 504.23 µs | 1.98 Gelem/s | 1.00× |
+| strided | 407.24 µs | 2.46 Gelem/s | **1.24×** (faster) |
+| strided (tile=16) | 720.50 µs | 1.39 Gelem/s | **0.70×** (slower) |
+| strided (tile=24) | 705.88 µs | 1.42 Gelem/s | **0.71×** (slower) |
+| strided (tile=32) | 733.71 µs | 1.36 Gelem/s | **0.69×** (slower) |
 
-**分析**: 転置カーネルに書き込み連続／読み取り連続の切り替えパスを入れたことで、naiveと同等〜わずかに高速になりました。タイルは 16/32 が良好で、24 は悪化傾向です。
+**分析**: `strided` は `copy_transpose_scale_into_fast` を使用しており、naive より**約1.24倍高速**です。特化カーネルにより、キャッシュ効率が改善されています。タイル版は naive より遅く、デフォルトの `strided` が最適です。
 
 #### 4.3 Nonlinear Map (非線形マップ: `B = A .* exp(-2A) .+ sin(A²)`)
 
+**対応ベンチ**: `bench_nonlinear_map` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- nonlinear_map`
+
 **サイズ**: 1000×1000
 
 | Method | Time (mean) | Throughput | Speedup vs Naive |
 |--------|--------------|------------|------------------|
-| naive | 13.31 ms | 75.1 Melem/s | 1.00× |
-| strided | 12.93 ms | 77.4 Melem/s | **1.03×** (slightly faster) |
+| naive | 13.70 ms | 73.0 Melem/s | 1.00× |
+| strided | 13.34 ms | 75.0 Melem/s | **1.03×** (slightly faster) |
 
 **分析**: 非線形マップでは、strided実装はnaive実装とほぼ同等か、わずかに高速です。計算コストが高いため、メモリアクセスパターンの影響が相対的に小さくなっています。
 
@@ -139,6 +166,9 @@
 Julia の Strided.jl README.md から移植したベンチマークです。
 
 #### 5.1 Permutedims 4D (4次元配列の順列: `B = permutedims(A, (4,3,2,1))`)
+
+**対応ベンチ**: `bench_permutedims_4d` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- permutedims_4d`
 
 **サイズ**: 32×32×32×32 (1,048,576 要素)
 
@@ -151,6 +181,9 @@ Julia の Strided.jl README.md から移植したベンチマークです。
 
 #### 5.2 Multi-Permute Sum (複数順列の和: `zip_map4_into`)
 
+**対応ベンチ**: `bench_multi_permute_sum` (`benches/strided_bench.rs`)
+**実行コマンド**: `cargo bench -- multi_permute_sum`
+
 ```
 B = permutedims(A, (1,2,3,4)) + permutedims(A, (2,3,4,1)) +
     permutedims(A, (3,4,1,2)) + permutedims(A, (4,1,2,3))
@@ -160,15 +193,22 @@ B = permutedims(A, (1,2,3,4)) + permutedims(A, (2,3,4,1)) +
 
 | Method | Time (mean) | Throughput | Speedup vs Naive |
 |--------|--------------|------------|------------------|
-| naive | 4.87 ms | 216 Melem/s | 1.00× |
-| strided_fused (`zip_map4_into`) | 12.68 ms | 83 Melem/s | **0.38×** (slower) |
+| naive | 5.16 ms | 203 Melem/s | 1.00× |
+| strided_fused (`zip_map4_into`) | 13.69 ms | 76.6 Melem/s | **0.38×** (slower) |
 
-**分析**: `zip_map4_into` を使った単一パス実装は、4D配列では naive の4重ループより遅くなっています。これは以下の要因によります：
-- 4D配列でのブロッキングオーバーヘッド
-- 5つの配列（出力 + 4入力）のストライド計算コスト
-- キャッシュ効率が2Dほど良くない
+**分析**: `zip_map4_into` を使った単一パス実装は、4D配列では naive の4重ループより**約2.65倍遅く**なっています。主な要因は以下の通りです：
 
-**今後の改善**: 4D配列向けのブロッキング戦略の最適化、または小次元配列での特化パスが必要です。
+1. **メモリブロックサイズの制約**: 5つの配列（出力+4入力）があるため、`BLOCK_MEMORY_SIZE` (32KB) を5で割ると各配列あたり約6.4KBしか使えず、キャッシュ効率が低下
+2. **ブロッキングオーバーヘッド**: 4D配列では4レベルのループネストとオフセット計算のコストが大きい
+3. **ストライド計算の複雑さ**: 5つの配列のストライドを毎回計算する必要があり、計算コストが高い
+4. **順列パターンの最適化不足**: 特定の順列パターン（identity, [1,2,3,0], [2,3,0,1], [3,0,1,2]）に特化した最適化が未実装
+
+**改善提案**:
+- 4D配列や多配列操作では、ブロックサイズ計算を動的に調整（配列数に応じて、または出力配列を優先）
+- 小ブロックサイズの場合はブロッキングをスキップする閾値を導入
+- ストライドを事前計算してキャッシュ、または共通パターンを最適化
+- 特定の順列パターンに特化したカーネルを追加（順列インデックスの直接計算）
+- 部分的に連続な次元を検出して最適化（内側次元が連続ならその部分で高速パス）
 
 ## 総合評価
 
