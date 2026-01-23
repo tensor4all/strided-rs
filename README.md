@@ -36,7 +36,7 @@ mdarray-strided = { version = "0.1", features = ["parallel", "blas"] }
 ## Quick Start
 
 ```rust
-use mdarray_strided::{StridedArrayView, StridedArrayViewMut, Identity};
+use mdarray_strided::{StridedArrayView, Identity};
 
 // Create a 2D view over existing data
 let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -166,6 +166,50 @@ let sum: f64 = view.par_iter().sum();
 let max: f64 = view.par_iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
 ```
 
+## Map and Reduce Operations
+
+```rust
+use mdarray_strided::{map_into, zip_map2_into, zip_map3_into, zip_map4_into, reduce};
+
+// Unary map: dest[i] = f(src[i])
+map_into(&mut dest, &src, |x| x * 2.0).unwrap();
+
+// Binary zip map: dest[i] = f(a[i], b[i])
+zip_map2_into(&mut dest, &a, &b, |x, y| x + y).unwrap();
+
+// Ternary zip map: dest[i] = f(a[i], b[i], c[i])
+zip_map3_into(&mut dest, &a, &b, &c, |x, y, z| x * y + z).unwrap();
+
+// Quaternary zip map: dest[i] = f(a[i], b[i], c[i], d[i])
+zip_map4_into(&mut dest, &a, &b, &c, &d, |w, x, y, z| w * x + y * z).unwrap();
+
+// Reduce with map
+let total = reduce(&src, |x| *x, |a, b| a + b, 0.0).unwrap();
+```
+
+## High-Level Operations
+
+```rust
+use mdarray_strided::{copy_into, copy_scale, copy_conj, add, mul, axpy, fma, sum, dot};
+
+// Copy operations
+copy_into(&mut dest, &src).unwrap();           // dest = src
+copy_scale(&mut dest, &src, 2.0).unwrap();     // dest = 2.0 * src
+copy_conj(&mut dest, &src).unwrap();           // dest = conj(src)
+
+// Element-wise arithmetic
+add(&mut dest, &a, &b).unwrap();               // dest = a + b
+mul(&mut dest, &a, &b).unwrap();               // dest = a * b
+
+// BLAS-like operations
+axpy(&mut y, 2.0, &x).unwrap();                // y = 2.0 * x + y
+fma(&mut dest, &a, &b, &c).unwrap();           // dest = a * b + c
+
+// Reductions
+let s = sum(&array).unwrap();                  // sum of all elements
+let d = dot(&x, &y).unwrap();                  // dot product
+```
+
 ## BLAS Integration (requires `blas` feature)
 
 ```rust
@@ -203,22 +247,6 @@ let inner_len = view.contiguous_inner_len();
 if let Some(slice) = view_1d.as_slice() {
     // Direct slice access for SIMD/BLAS
 }
-```
-
-## Map and Reduce Operations
-
-```rust
-use mdarray_strided::{map_into, reduce, sum, dot};
-
-// Map operation
-map_into(&mut dest, &src, |x| x * 2.0).unwrap();
-
-// Reduce
-let total = reduce(&src, |x| x, |a, b| a + b, 0.0).unwrap();
-
-// Convenience functions
-let s = sum(&array).unwrap();
-let d = dot(&x, &y).unwrap();
 ```
 
 ## Performance Tips
