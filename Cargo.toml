@@ -30,3 +30,8 @@ bench = false
 [[bench]]
 name = "strided_bench"
 harness = false
+
+[[bench]]
+name = "parallel_bench"
+harness = false
+required-features = ["parallel"]
