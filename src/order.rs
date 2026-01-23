@@ -219,7 +219,7 @@ mod tests {
         // 4D array with various strides (Issue #5 related)
         let dims = [2usize, 3, 4, 5];
         let out_strides = [60isize, 20, 5, 1]; // Column-major-ish
-        let in_strides = [1isize, 2, 6, 24];   // Row-major-ish
+        let in_strides = [1isize, 2, 6, 24]; // Row-major-ish
         let strides_list: Vec<&[isize]> = vec![&out_strides, &in_strides];
 
         let order = compute_order(&dims, &strides_list, Some(0));

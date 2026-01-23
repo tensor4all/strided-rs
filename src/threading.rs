@@ -14,7 +14,6 @@ use crate::order::compute_order;
 use crate::MIN_THREAD_LENGTH;
 
 #[cfg(feature = "parallel")]
-use rayon;
 
 /// Context for threaded mapreduce operations.
 ///
@@ -48,7 +47,7 @@ impl<'a> ThreadedContext<'a> {
         offsets: Vec<isize>,
         elem_size: usize,
     ) -> Self {
-        let strides_refs: Vec<&[isize]> = strides.iter().map(|s| *s).collect();
+        let strides_refs: Vec<&[isize]> = strides.iter().copied().collect();
 
         // Compute dimension ordering
         let order = compute_order(&dims, &strides_refs, Some(0));

@@ -48,10 +48,7 @@ pub(crate) fn compute_block_sizes(
         .collect();
 
     // Compute stride orders (in iteration order)
-    let stride_orders: Vec<Vec<usize>> = byte_strides
-        .iter()
-        .map(|bs| index_order(bs))
-        .collect();
+    let stride_orders: Vec<Vec<usize>> = byte_strides.iter().map(|bs| index_order(bs)).collect();
 
     // Reorder strides for cost computation
     let reordered_strides: Vec<Vec<isize>> = strides_list
@@ -110,19 +107,16 @@ fn compute_blocks(
         .min()
         .unwrap_or(1);
 
-    if stride_orders.iter().all(|orders| !orders.is_empty() && orders[0] == min_order) {
+    if stride_orders
+        .iter()
+        .all(|orders| !orders.is_empty() && orders[0] == min_order)
+    {
         // First dimension has smallest stride in all arrays
         // Keep first dimension, recurse on rest
         let tail_dims: Vec<usize> = dims[1..].to_vec();
         let tail_costs: Vec<isize> = costs[1..].to_vec();
-        let tail_byte_strides: Vec<&[isize]> = byte_strides
-            .iter()
-            .map(|s| &s[1..])
-            .collect();
-        let tail_stride_orders: Vec<&[usize]> = stride_orders
-            .iter()
-            .map(|s| &s[1..])
-            .collect();
+        let tail_byte_strides: Vec<&[isize]> = byte_strides.iter().map(|s| &s[1..]).collect();
+        let tail_stride_orders: Vec<&[usize]> = stride_orders.iter().map(|s| &s[1..]).collect();
 
         let tail_blocks = compute_blocks(
             &tail_dims,
@@ -158,7 +152,7 @@ fn compute_blocks(
             break;
         }
         let i = i.unwrap();
-        blocks[i] = (blocks[i] + 1) / 2;
+        blocks[i] = blocks[i].div_ceil(2);
     }
 
     // Phase 2: Decrement until within target
@@ -221,8 +215,7 @@ fn total_memory_region(dims: &[usize], byte_strides: &[&[isize]]) -> usize {
         }
 
         // Convert to cache lines
-        let contiguous_lines =
-            (num_contiguous_cache_lines as usize / cache_line) + 1;
+        let contiguous_lines = (num_contiguous_cache_lines as usize / cache_line) + 1;
 
         memory_region += cache_line * contiguous_lines * num_cache_line_blocks;
     }
@@ -299,7 +292,13 @@ mod tests {
         let byte_strides: Vec<&[isize]> = vec![&strides];
         let stride_orders: Vec<&[usize]> = vec![&orders];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // Should use full dimensions since it fits
         assert_eq!(blocks, vec![10, 10]);
@@ -315,7 +314,13 @@ mod tests {
         let byte_strides: Vec<&[isize]> = vec![&strides];
         let stride_orders: Vec<&[usize]> = vec![&orders];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // Should reduce block sizes
         assert!(blocks[0] <= dims[0]);
@@ -445,7 +450,13 @@ mod tests {
         let byte_strides: Vec<&[isize]> = vec![&strides1];
         let stride_orders: Vec<&[usize]> = vec![&orders1];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // First dimension should be kept as-is (100)
         assert_eq!(blocks[0], 100);
@@ -468,13 +479,29 @@ mod tests {
 
         // Verify total memory exceeds blocksize first
         let initial_mem = total_memory_region(&dims, &byte_strides);
-        assert!(initial_mem > BLOCK_MEMORY_SIZE, "Initial memory {} should exceed {}", initial_mem, BLOCK_MEMORY_SIZE);
+        assert!(
+            initial_mem > BLOCK_MEMORY_SIZE,
+            "Initial memory {} should exceed {}",
+            initial_mem,
+            BLOCK_MEMORY_SIZE
+        );
 
         // Verify minimum stride > blocksize
         let min_stride = strides.iter().map(|s| s.unsigned_abs()).min().unwrap();
-        assert!(min_stride > BLOCK_MEMORY_SIZE, "Min stride {} should exceed {}", min_stride, BLOCK_MEMORY_SIZE);
+        assert!(
+            min_stride > BLOCK_MEMORY_SIZE,
+            "Min stride {} should exceed {}",
+            min_stride,
+            BLOCK_MEMORY_SIZE
+        );
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // With minimum stride > blocksize, should return all 1s
         assert_eq!(blocks, vec![1, 1]);
@@ -492,7 +519,13 @@ mod tests {
         let byte_strides: Vec<&[isize]> = vec![&strides];
         let stride_orders: Vec<&[usize]> = vec![&orders];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // When first dim has smallest stride, Julia keeps full dims via recursion
         // This is by design for cache efficiency
@@ -518,13 +551,22 @@ mod tests {
         let initial_mem = total_memory_region(&dims, &byte_strides);
         assert!(initial_mem > BLOCK_MEMORY_SIZE);
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // Blocks should be reduced from original dims
         assert_eq!(blocks.len(), 4);
         let total_elements: usize = blocks.iter().product();
         let original_elements: usize = dims.iter().product();
-        assert!(total_elements < original_elements, "Blocks should be smaller than original");
+        assert!(
+            total_elements < original_elements,
+            "Blocks should be smaller than original"
+        );
     }
 
     #[test]
@@ -532,13 +574,19 @@ mod tests {
         // 4D array with permuted strides (Issue #5 scenario)
         let dims = [10usize, 10, 10, 10];
         let costs = [2isize, 4, 8, 16]; // Different costs
-        // Permuted strides: last dim has smallest stride
+                                        // Permuted strides: last dim has smallest stride
         let strides = [8000isize, 800, 80, 8];
         let orders = [4usize, 3, 2, 1];
         let byte_strides: Vec<&[isize]> = vec![&strides];
         let stride_orders: Vec<&[usize]> = vec![&orders];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         assert_eq!(blocks.len(), 4);
         // Verify blocks are valid
@@ -559,7 +607,13 @@ mod tests {
         let byte_strides: Vec<&[isize]> = vec![&strides1, &strides2];
         let stride_orders: Vec<&[usize]> = vec![&orders1, &orders2];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // Should not use the first-dim-smallest special case
         // since arrays have different stride orders
@@ -614,7 +668,13 @@ mod tests {
         let byte_strides: Vec<&[isize]> = vec![&strides];
         let stride_orders: Vec<&[usize]> = vec![&orders];
 
-        let blocks = compute_blocks(&dims, &costs, &byte_strides, &stride_orders, BLOCK_MEMORY_SIZE);
+        let blocks = compute_blocks(
+            &dims,
+            &costs,
+            &byte_strides,
+            &stride_orders,
+            BLOCK_MEMORY_SIZE,
+        );
 
         // Should behave same as positive strides
         assert_eq!(blocks.len(), 2);
@@ -646,7 +706,7 @@ mod tests {
         // This exercises the halving/decrementing reduction path
         let dims = [32usize, 32, 32, 32];
         let order = [3usize, 2, 1, 0]; // Reversed order
-        // Permuted strides: smallest stride is in last position of original
+                                       // Permuted strides: smallest stride is in last position of original
         let strides = [32768isize, 1024, 32, 1];
         let strides_list: Vec<&[isize]> = vec![&strides];
 

@@ -245,7 +245,15 @@ pub fn matmul<'a, T>(
     c: &mut StridedArrayViewMut<'a, T, 2, Identity>,
 ) -> Result<()>
 where
-    T: BlasFloat + ElementOpApply + Copy + Default + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
+    T: BlasFloat
+        + ElementOpApply
+        + Copy
+        + Default
+        + Add<Output = T>
+        + Mul<Output = T>
+        + Zero
+        + One
+        + PartialEq,
 {
     // Validate dimensions: A(m,k) * B(k,n) = C(m,n)
     let m = a.size()[0];
@@ -289,7 +297,15 @@ fn matmul_colmajor_c<'a, T>(
     c: &mut StridedArrayViewMut<'a, T, 2, Identity>,
 ) -> Result<()>
 where
-    T: BlasFloat + ElementOpApply + Copy + Default + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
+    T: BlasFloat
+        + ElementOpApply
+        + Copy
+        + Default
+        + Add<Output = T>
+        + Mul<Output = T>
+        + Zero
+        + One
+        + PartialEq,
 {
     let c_strides = c.strides();
 
@@ -492,10 +508,7 @@ where
 }
 
 /// Scale a matrix in-place: C = β * C
-fn scale_matrix<'a, T>(
-    beta: T,
-    c: &mut StridedArrayViewMut<'a, T, 2, Identity>,
-)
+fn scale_matrix<'a, T>(beta: T, c: &mut StridedArrayViewMut<'a, T, 2, Identity>)
 where
     T: ElementOpApply + Copy + Mul<Output = T> + Zero + One + PartialEq,
 {
@@ -639,10 +652,7 @@ where
 /// ```julia
 /// LinearAlgebra.rmul!(dst::StridedView, α::Number) = mul!(dst, dst, α)
 /// ```
-pub fn rmul<'a, T>(
-    dst: &mut StridedArrayViewMut<'a, T, 1, Identity>,
-    alpha: T,
-) -> Result<()>
+pub fn rmul<'a, T>(dst: &mut StridedArrayViewMut<'a, T, 1, Identity>, alpha: T) -> Result<()>
 where
     T: ElementOpApply + Copy + Mul<Output = T> + One + Zero + PartialEq,
 {
@@ -672,10 +682,7 @@ where
 /// ```julia
 /// LinearAlgebra.lmul!(α::Number, dst::StridedView) = mul!(dst, α, dst)
 /// ```
-pub fn lmul<'a, T>(
-    alpha: T,
-    dst: &mut StridedArrayViewMut<'a, T, 1, Identity>,
-) -> Result<()>
+pub fn lmul<'a, T>(alpha: T, dst: &mut StridedArrayViewMut<'a, T, 1, Identity>) -> Result<()>
 where
     T: ElementOpApply + Copy + Mul<Output = T> + One + Zero + PartialEq,
 {

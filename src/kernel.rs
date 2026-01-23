@@ -145,11 +145,41 @@ where
 
     // Call the specialized kernel based on rank
     match rank {
-        1 => kernel_1d(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        2 => kernel_2d(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        3 => kernel_3d(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        4 => kernel_4d(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        _ => kernel_nd(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
+        1 => kernel_1d(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        2 => kernel_2d(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        3 => kernel_3d(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        4 => kernel_4d(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        _ => kernel_nd(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
     }
 }
 
@@ -191,11 +221,41 @@ where
 
     // Call the specialized kernel based on rank
     match rank {
-        1 => kernel_1d_inner(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        2 => kernel_2d_inner(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        3 => kernel_3d_inner(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        4 => kernel_4d_inner(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
-        _ => kernel_nd_inner(&ordered_dims, &ordered_blocks, &ordered_strides, &mut offsets, &mut f),
+        1 => kernel_1d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        2 => kernel_2d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        3 => kernel_3d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        4 => kernel_4d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
+        _ => kernel_nd_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides,
+            &mut offsets,
+            &mut f,
+        ),
     }
 }
 

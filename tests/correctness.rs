@@ -128,8 +128,10 @@ fn test_copy_transpose_scale_into_fast_large() {
 #[test]
 fn test_copy_transpose_scale_into_fast_matches_original() {
     // Verify that fast version produces same results as original
-    let a: Tensor<f64, DynRank> =
-        Tensor::from_fn([100, 80], |idx| (idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01)).into_dyn();
+    let a: Tensor<f64, DynRank> = Tensor::from_fn([100, 80], |idx| {
+        (idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01)
+    })
+    .into_dyn();
 
     let mut out_orig = Tensor::zeros([80, 100]).into_dyn();
     let mut out_fast = Tensor::zeros([80, 100]).into_dyn();
@@ -187,11 +189,10 @@ fn test_zip_map4_into_contiguous() {
 fn test_zip_map4_into_permuted() {
     // Test with 4D arrays and various permutations (like the Julia benchmark)
     let size = 8usize;
-    let a: Tensor<f64, DynRank> =
-        Tensor::from_fn([size, size, size, size], |idx| {
-            (idx[0] + 2 * idx[1] + 3 * idx[2] + 4 * idx[3]) as f64
-        })
-        .into_dyn();
+    let a: Tensor<f64, DynRank> = Tensor::from_fn([size, size, size, size], |idx| {
+        (idx[0] + 2 * idx[1] + 3 * idx[2] + 4 * idx[3]) as f64
+    })
+    .into_dyn();
 
     // Julia (1,2,3,4) -> Rust [0,1,2,3] (identity)
     // Julia (2,3,4,1) -> Rust [1,2,3,0]

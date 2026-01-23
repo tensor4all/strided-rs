@@ -618,8 +618,7 @@ where
         && is_contiguous(&b_view.dims, &b_view.strides)
     {
         let len = total_len(&dst_view.dims);
-        let dst_slice =
-            unsafe { std::slice::from_raw_parts_mut(dst_view.ptr, len) };
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_view.ptr, len) };
         let a_slice = unsafe { std::slice::from_raw_parts(a_view.ptr, len) };
         let b_slice = unsafe { std::slice::from_raw_parts(b_view.ptr, len) };
 

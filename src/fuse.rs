@@ -317,11 +317,11 @@ mod tests {
         // With same strides, dimension with smaller stride in output wins
         let dims = [4usize, 5];
         let out_strides = [1isize, 4]; // Column-major output
-        let in_strides = [5isize, 1];  // Row-major input
+        let in_strides = [5isize, 1]; // Row-major input
         let all_strides: Vec<&[isize]> = vec![&out_strides, &in_strides];
 
         let order_out = index_order(&out_strides); // [1, 2]
-        let order_in = index_order(&in_strides);   // [2, 1]
+        let order_in = index_order(&in_strides); // [2, 1]
         let index_orders = vec![order_out, order_in];
 
         let importance = compute_importance(&dims, &all_strides, &index_orders);

@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
 use mdarray_strided::{
-    copy_into, copy_transpose_scale_into_fast, map_into, sum, symmetrize_into,
-    zip_map2_into, zip_map4_into,
+    copy_into, copy_transpose_scale_into_fast, map_into, sum, symmetrize_into, zip_map2_into,
+    zip_map4_into,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -394,7 +394,8 @@ fn bench_multi_permute_sum(c: &mut Criterion) {
     group.bench_function("strided_fused", |b| {
         b.iter(|| {
             let mut out = Tensor::zeros([size, size, size, size]);
-            if let Err(err) = zip_map4_into(&mut out, &p1, &p2, &p3, &p4, |a, b, c, d| a + b + c + d)
+            if let Err(err) =
+                zip_map4_into(&mut out, &p1, &p2, &p3, &p4, |a, b, c, d| a + b + c + d)
             {
                 panic!("zip_map4_into failed: {err}");
             }

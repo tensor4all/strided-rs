@@ -31,8 +31,8 @@
 
 use std::marker::PhantomData;
 
-use crate::view::{StridedArrayView, StridedArrayViewMut};
 use crate::element_op::{ElementOp, Identity};
+use crate::view::{StridedArrayView, StridedArrayViewMut};
 use crate::{Result, StridedError};
 
 // ============================================================================
@@ -80,7 +80,9 @@ impl<T: Copy> Consume<T> for Arg {
 
     #[inline]
     fn consume<I: Iterator<Item = T>>(&self, values: &mut I) -> T {
-        values.next().expect("not enough values for Arg consumption")
+        values
+            .next()
+            .expect("not enough values for Arg consumption")
     }
 }
 
@@ -292,12 +294,7 @@ pub fn promoteshape<'a, T, const N: usize, Op: ElementOp>(
     // Safety: We're creating a view with stride-0 dimensions, which is valid
     // as long as we don't mutate and size-1 dims are promoted correctly
     Ok(unsafe {
-        StridedArrayView::new_unchecked(
-            view.data(),
-            *target_size,
-            new_strides,
-            view.offset(),
-        )
+        StridedArrayView::new_unchecked(view.data(), *target_size, new_strides, view.offset())
     })
 }
 
@@ -386,7 +383,9 @@ where
     let capture = CaptureArgs::new(&f, (Arg, Arg));
 
     // Iterate and apply
-    broadcast_kernel_2(dest, &a_promoted, &b_promoted, |av, bv| capture.call2(av, bv))
+    broadcast_kernel_2(dest, &a_promoted, &b_promoted, |av, bv| {
+        capture.call2(av, bv)
+    })
 }
 
 /// Execute a 3-way broadcast operation.
@@ -653,10 +652,7 @@ mod tests {
     #[test]
     fn test_capture_args_ternary() {
         // fma: a + b * c
-        let capture = CaptureArgs::new(
-            |a: f64, b: f64, c: f64| a + b * c,
-            (Arg, Arg, Arg),
-        );
+        let capture = CaptureArgs::new(|a: f64, b: f64, c: f64| a + b * c, (Arg, Arg, Arg));
         let mut values = vec![1.0, 2.0, 3.0].into_iter();
 
         let result: f64 = capture.consume(&mut values);
@@ -667,10 +663,7 @@ mod tests {
     fn test_nested_capture_args() {
         // Nested: f(g(a, b), c) where g(a, b) = a * b, f(x, c) = x + c
         let inner = CaptureArgs::new(|a: f64, b: f64| a * b, (Arg, Arg));
-        let outer = CaptureArgs::new(
-            |x: f64, c: f64| x + c,
-            (inner, Arg),
-        );
+        let outer = CaptureArgs::new(|x: f64, c: f64| x + c, (inner, Arg));
 
         let mut values = vec![2.0, 3.0, 4.0].into_iter();
         let result: f64 = outer.consume(&mut values);

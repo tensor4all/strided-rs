@@ -53,10 +53,8 @@ fn simplify_dims_recursive(size: &[usize], strides: &[isize]) -> (Vec<usize>, Ve
         // Move size-1 dimension to end
         tail_size.push(1);
         tail_strides.push(1);
-        return (tail_size, tail_strides);
-    } else if !tail_size.is_empty()
-        && size[0] as isize * strides[0] == tail_strides[0]
-    {
+        (tail_size, tail_strides)
+    } else if !tail_size.is_empty() && size[0] as isize * strides[0] == tail_strides[0] {
         // Fuse with next dimension: size[0] * tail_size[0], then move a 1 to end
         let fused_size = size[0] * tail_size[0];
         let mut new_size = vec![fused_size];
@@ -67,7 +65,7 @@ fn simplify_dims_recursive(size: &[usize], strides: &[isize]) -> (Vec<usize>, Ve
         new_strides.extend_from_slice(&tail_strides[1..]);
         new_strides.push(1);
 
-        return (new_size, new_strides);
+        (new_size, new_strides)
     } else {
         // No fusion possible
         let mut new_size = vec![size[0]];
@@ -76,7 +74,7 @@ fn simplify_dims_recursive(size: &[usize], strides: &[isize]) -> (Vec<usize>, Ve
         let mut new_strides = vec![strides[0]];
         new_strides.extend_from_slice(&tail_strides);
 
-        return (new_size, new_strides);
+        (new_size, new_strides)
     }
 }
 

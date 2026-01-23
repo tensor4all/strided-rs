@@ -129,9 +129,9 @@ pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity
 // ============================================================================
 // Map operations
 // ============================================================================
-pub use map::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 #[cfg(feature = "parallel")]
 pub use map::par_zip_map2_into;
+pub use map::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 
 // ============================================================================
 // High-level operations
@@ -165,15 +165,15 @@ pub use broadcast::{
 // ============================================================================
 // Linear algebra operations
 // ============================================================================
-pub use linalg::{
-    axpby, generic_matmul, getblasmatrix_identity, isblasmatrix, isblasmatrix_conj,
-    isblasmatrix_identity, lmul, matmul, rmul, BlasTranspose,
-};
 /// AXPY operation for 1D arrays (y = alpha*x + y).
 ///
 /// This is an alias for [`linalg::axpy`] to avoid name collision with the
 /// array-based [`axpy`] function in ops module.
 pub use linalg::axpy as linalg_axpy;
+pub use linalg::{
+    axpby, generic_matmul, getblasmatrix_identity, isblasmatrix, isblasmatrix_conj,
+    isblasmatrix_identity, lmul, matmul, rmul, BlasTranspose,
+};
 
 // ============================================================================
 // BLAS-backed operations (requires "blas" feature)

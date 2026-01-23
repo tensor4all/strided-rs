@@ -615,9 +615,9 @@ impl<'a, T, Op: ElementOp> StridedArrayView<'a, T, 1, Op> {
         let step = index.step();
 
         let new_size = if step > 0 {
-            (range.end.saturating_sub(range.start) + (step as usize - 1)) / step as usize
+            range.end.saturating_sub(range.start).div_ceil(step as usize)
         } else {
-            (range.start.saturating_sub(range.end) + (-step as usize - 1)) / (-step as usize)
+            range.start.saturating_sub(range.end).div_ceil(-step as usize)
         };
 
         let new_offset = (self.offset as isize + range.start as isize * self.strides[0]) as usize;
@@ -746,9 +746,9 @@ impl<'a, T, Op: ElementOp> StridedArrayView<'a, T, 3, Op> {
 
 fn compute_slice_len(start: usize, end: usize, step: isize) -> usize {
     if step > 0 {
-        (end.saturating_sub(start) + (step as usize - 1)) / step as usize
+        end.saturating_sub(start).div_ceil(step as usize)
     } else {
-        (start.saturating_sub(end) + (-step as usize - 1)) / (-step as usize)
+        start.saturating_sub(end).div_ceil(-step as usize)
     }
 }
 
@@ -1248,7 +1248,7 @@ fn validate_bounds<const N: usize>(
     strides: &[isize; N],
     offset: usize,
 ) -> Result<()> {
-    if size.iter().any(|&s| s == 0) {
+    if size.contains(&0) {
         // Empty array, no bounds to check
         return Ok(());
     }

@@ -404,14 +404,16 @@ mod tests {
         let mut dest = Tensor::from_fn([1, 3], |_| 100.0); // Start with non-zero
 
         // Init with zero function
-        fn zero_init(_: &f64) -> f64 { 0.0 }
+        fn zero_init(_: &f64) -> f64 {
+            0.0
+        }
 
         mapreducedim_into(&mut dest, &src, |&x| x, |a, b| a + b, Some(zero_init)).unwrap();
 
         // Should be same as starting from zero
-        assert_eq!(dest[[0, 0]], 5.0);  // 1 + 4
-        assert_eq!(dest[[0, 1]], 7.0);  // 2 + 5
-        assert_eq!(dest[[0, 2]], 9.0);  // 3 + 6
+        assert_eq!(dest[[0, 0]], 5.0); // 1 + 4
+        assert_eq!(dest[[0, 1]], 7.0); // 2 + 5
+        assert_eq!(dest[[0, 2]], 9.0); // 3 + 6
     }
 
     #[test]
@@ -456,7 +458,9 @@ mod tests {
     #[test]
     fn test_mapreducedim_3d() {
         // 3D reduction: [2, 3, 4] -> [2, 1, 4] (reduce middle dim)
-        let src = Tensor::from_fn([2, 3, 4], |idx| (idx[0] * 12 + idx[1] * 4 + idx[2] + 1) as f64);
+        let src = Tensor::from_fn([2, 3, 4], |idx| {
+            (idx[0] * 12 + idx[1] * 4 + idx[2] + 1) as f64
+        });
         let mut dest = Tensor::from_fn([2, 1, 4], |_| 0.0);
 
         mapreducedim_into(&mut dest, &src, |&x| x, |a, b| a + b, None).unwrap();

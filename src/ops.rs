@@ -105,22 +105,32 @@ where
     // Apply dimension fusion to reduce loop levels
     let fused_dims = apply_fusion(dest_dims, &strides_list);
 
-    let plan = build_plan(&fused_dims, &strides_list, Some(0), std::mem::size_of::<T>());
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut dst_ptr = unsafe { dest_ptr.offset(offsets[0]) };
-        let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
-        let dst_stride = strides[0];
-        let src_stride = strides[1];
-        for _ in 0..len {
-            let val = unsafe { &*src_ptr }.clone();
-            unsafe {
-                (*dst_ptr).write(val);
-                dst_ptr = dst_ptr.offset(dst_stride);
-                src_ptr = src_ptr.offset(src_stride);
+    let plan = build_plan(
+        &fused_dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut dst_ptr = unsafe { dest_ptr.offset(offsets[0]) };
+            let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
+            let dst_stride = strides[0];
+            let src_stride = strides[1];
+            for _ in 0..len {
+                let val = unsafe { &*src_ptr }.clone();
+                unsafe {
+                    (*dst_ptr).write(val);
+                    dst_ptr = dst_ptr.offset(dst_stride);
+                    src_ptr = src_ptr.offset(src_stride);
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 pub fn copy_conj<T, SD, SS, LD, LS>(
@@ -559,19 +569,19 @@ where
                     let mut src_ij = offset2d(i, start_j, s_row, s_col)?;
                     let mut dst_ij = offset2d(i, start_j, d_row, d_col)?;
                     for j in start_j..j_max {
-                        let aij = unsafe { &*src_view.ptr.offset(src_ij) }.clone();
+                        let aij = *unsafe { &*src_view.ptr.offset(src_ij) };
                         if i == j {
-                            let out = (aij.clone() + aij.conj()) * half.clone();
+                            let out = (aij + aij.conj()) * half;
                             unsafe {
                                 *dst_view.ptr.offset(dst_ij) = out;
                             }
                         } else {
                             let src_ji = offset2d(j, i, s_row, s_col)?;
                             let dst_ji = offset2d(j, i, d_row, d_col)?;
-                            let aji = unsafe { &*src_view.ptr.offset(src_ji) }.clone();
-                            let out = (aij + aji.conj()) * half.clone();
+                            let aji = *unsafe { &*src_view.ptr.offset(src_ji) };
+                            let out = (aij + aji.conj()) * half;
                             unsafe {
-                                *dst_view.ptr.offset(dst_ij) = out.clone();
+                                *dst_view.ptr.offset(dst_ij) = out;
                                 *dst_view.ptr.offset(dst_ji) = out;
                             }
                         }
@@ -586,11 +596,11 @@ where
                     let mut src_ji = offset2d(j0, i, s_row, s_col)?;
                     let mut dst_ji = offset2d(j0, i, d_row, d_col)?;
                     for _ in j0..j_max {
-                        let aij = unsafe { &*src_view.ptr.offset(src_ij) }.clone();
-                        let aji = unsafe { &*src_view.ptr.offset(src_ji) }.clone();
-                        let out = (aij + aji.conj()) * half.clone();
+                        let aij = *unsafe { &*src_view.ptr.offset(src_ij) };
+                        let aji = *unsafe { &*src_view.ptr.offset(src_ji) };
+                        let out = (aij + aji.conj()) * half;
                         unsafe {
-                            *dst_view.ptr.offset(dst_ij) = out.clone();
+                            *dst_view.ptr.offset(dst_ij) = out;
                             *dst_view.ptr.offset(dst_ji) = out;
                         }
                         src_ij = checked_add(src_ij, s_col)?;
@@ -615,9 +625,7 @@ where
     T: Clone + Add<Output = T> + Mul<Output = T>,
 {
     let n = src.dims[0];
-    let total = n
-        .checked_mul(n)
-        .ok_or(StridedError::OffsetOverflow)?;
+    let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
     if total == 0 {
         return Ok(());
     }
@@ -625,9 +633,7 @@ where
     let src_ptr = src.ptr;
     let dst_ptr = dest.ptr;
     for i in 0..n {
-        let row_base = i
-            .checked_mul(n)
-            .ok_or(StridedError::OffsetOverflow)?;
+        let row_base = i.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
         let mut idx_ij = row_base
             .checked_add(i)
             .ok_or(StridedError::OffsetOverflow)?;
@@ -646,12 +652,8 @@ where
                     *dst_ptr.add(idx_ji) = out;
                 }
             }
-            idx_ij = idx_ij
-                .checked_add(1)
-                .ok_or(StridedError::OffsetOverflow)?;
-            idx_ji = idx_ji
-                .checked_add(n)
-                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ij = idx_ij.checked_add(1).ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji.checked_add(n).ok_or(StridedError::OffsetOverflow)?;
         }
     }
 
@@ -667,9 +669,7 @@ where
     T: Clone + Add<Output = T> + Mul<Output = T>,
 {
     let n = src.dims[0];
-    let total = n
-        .checked_mul(n)
-        .ok_or(StridedError::OffsetOverflow)?;
+    let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
     if total == 0 {
         return Ok(());
     }
@@ -697,12 +697,8 @@ where
                     *dst_ptr.add(idx_ji) = out;
                 }
             }
-            idx_ij = idx_ij
-                .checked_add(n)
-                .ok_or(StridedError::OffsetOverflow)?;
-            idx_ji = idx_ji
-                .checked_add(1)
-                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ij = idx_ij.checked_add(n).ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji.checked_add(1).ok_or(StridedError::OffsetOverflow)?;
         }
     }
 
@@ -718,9 +714,7 @@ where
     T: ComplexFloat + Add<Output = T> + Mul<Output = T>,
 {
     let n = src.dims[0];
-    let total = n
-        .checked_mul(n)
-        .ok_or(StridedError::OffsetOverflow)?;
+    let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
     if total == 0 {
         return Ok(());
     }
@@ -728,34 +722,28 @@ where
     let src_ptr = src.ptr;
     let dst_ptr = dest.ptr;
     for i in 0..n {
-        let row_base = i
-            .checked_mul(n)
-            .ok_or(StridedError::OffsetOverflow)?;
+        let row_base = i.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
         let mut idx_ij = row_base
             .checked_add(i)
             .ok_or(StridedError::OffsetOverflow)?;
         let mut idx_ji = idx_ij;
         for _ in i..n {
-            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
+            let aij = *unsafe { &*src_ptr.add(idx_ij) };
             if idx_ij == idx_ji {
-                let out = (aij.clone() + aij.conj()) * half.clone();
+                let out = (aij + aij.conj()) * *half;
                 unsafe {
                     *dst_ptr.add(idx_ij) = out;
                 }
             } else {
-                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
-                let out = (aij + aji.conj()) * half.clone();
+                let aji = *unsafe { &*src_ptr.add(idx_ji) };
+                let out = (aij + aji.conj()) * *half;
                 unsafe {
-                    *dst_ptr.add(idx_ij) = out.clone();
+                    *dst_ptr.add(idx_ij) = out;
                     *dst_ptr.add(idx_ji) = out;
                 }
             }
-            idx_ij = idx_ij
-                .checked_add(1)
-                .ok_or(StridedError::OffsetOverflow)?;
-            idx_ji = idx_ji
-                .checked_add(n)
-                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ij = idx_ij.checked_add(1).ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji.checked_add(n).ok_or(StridedError::OffsetOverflow)?;
         }
     }
 
@@ -771,9 +759,7 @@ where
     T: ComplexFloat + Add<Output = T> + Mul<Output = T>,
 {
     let n = src.dims[0];
-    let total = n
-        .checked_mul(n)
-        .ok_or(StridedError::OffsetOverflow)?;
+    let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
     if total == 0 {
         return Ok(());
     }
@@ -788,26 +774,22 @@ where
         let mut idx_ij = diag;
         let mut idx_ji = diag;
         for _ in i..n {
-            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
+            let aij = *unsafe { &*src_ptr.add(idx_ij) };
             if idx_ij == idx_ji {
-                let out = (aij.clone() + aij.conj()) * half.clone();
+                let out = (aij + aij.conj()) * *half;
                 unsafe {
                     *dst_ptr.add(idx_ij) = out;
                 }
             } else {
-                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
-                let out = (aij + aji.conj()) * half.clone();
+                let aji = *unsafe { &*src_ptr.add(idx_ji) };
+                let out = (aij + aji.conj()) * *half;
                 unsafe {
-                    *dst_ptr.add(idx_ij) = out.clone();
+                    *dst_ptr.add(idx_ij) = out;
                     *dst_ptr.add(idx_ji) = out;
                 }
             }
-            idx_ij = idx_ij
-                .checked_add(n)
-                .ok_or(StridedError::OffsetOverflow)?;
-            idx_ji = idx_ji
-                .checked_add(1)
-                .ok_or(StridedError::OffsetOverflow)?;
+            idx_ij = idx_ij.checked_add(n).ok_or(StridedError::OffsetOverflow)?;
+            idx_ji = idx_ji.checked_add(1).ok_or(StridedError::OffsetOverflow)?;
         }
     }
 
@@ -985,8 +967,8 @@ where
     // Transpose pattern: reading with large stride, writing sequentially
     // Use tiling for arrays larger than 32x32 to improve cache performance
     // Smaller threshold helps with 100x100 arrays
-    let is_transpose_pattern = (d_col == 1 && s_col.unsigned_abs() > 1)
-        || (d_row == 1 && s_row.unsigned_abs() > 1);
+    let is_transpose_pattern =
+        (d_col == 1 && s_col.unsigned_abs() > 1) || (d_row == 1 && s_row.unsigned_abs() > 1);
     let is_large_enough = rows >= 32 && cols >= 32;
 
     if is_transpose_pattern && is_large_enough {
