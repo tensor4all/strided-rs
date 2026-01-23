@@ -158,8 +158,8 @@ where
 /// - `map_fn`: Function to map each element before reduction
 /// - `reduce_fn`: Binary reduction operation (e.g., `|a, b| a + b`)
 /// - `init_op`: Optional initialization operation applied to destination before reduction.
-///              - `None`: accumulate into existing values (dest = dest + mapped)
-///              - `Some(f)`: apply f to dest first (dest = f(dest)), then accumulate
+///   - `None`: accumulate into existing values (dest = dest + mapped)
+///   - `Some(f)`: apply f to dest first (dest = f(dest)), then accumulate
 ///
 /// # Shape Requirements
 /// - `dest` and `src` must be broadcastable
@@ -248,6 +248,7 @@ where
     // Build promoted strides for broadcast iteration
     let mut dst_promoted_strides = Vec::with_capacity(dims.len());
     let mut src_promoted_strides = Vec::with_capacity(dims.len());
+    #[allow(clippy::needless_range_loop)]
     for i in 0..dims.len() {
         if dst_view.dims[i] == 1 && dims[i] > 1 {
             // Reduction dimension: stride 0 for dest

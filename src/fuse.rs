@@ -117,6 +117,7 @@ pub fn compute_importance(
     }
 
     // Add contributions from remaining arrays
+    #[allow(clippy::needless_range_loop)]
     for k in 1..m {
         for i in 0..n {
             let shift = g * (n - index_orders[k][i]) as u64;

@@ -683,7 +683,7 @@ unsafe impl<T: Sync> Sync for SendPtr<T> {}
 #[cfg(feature = "parallel")]
 impl<T> Clone for SendPtr<T> {
     fn clone(&self) -> Self {
-        SendPtr(self.0)
+        *self
     }
 }
 #[cfg(feature = "parallel")]
@@ -700,13 +700,14 @@ unsafe impl<T: Sync> Sync for SendConstPtr<T> {}
 #[cfg(feature = "parallel")]
 impl<T> Clone for SendConstPtr<T> {
     fn clone(&self) -> Self {
-        SendConstPtr(self.0)
+        *self
     }
 }
 #[cfg(feature = "parallel")]
 impl<T> Copy for SendConstPtr<T> {}
 
 #[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
 fn par_zip_map2_recursive<T, F>(
     ctx: &ThreadedContext,
     dst_ptr: SendPtr<T>,
@@ -803,6 +804,7 @@ fn par_zip_map2_recursive<T, F>(
 }
 
 #[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
 fn zip_map2_kernel<T, F>(
     dims: &[usize],
     dst_ptr: *mut T,
@@ -838,6 +840,7 @@ fn zip_map2_kernel<T, F>(
 }
 
 #[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
 fn zip_map2_kernel_recursive<T, F>(
     dims: &[usize],
     dim_idx: usize,

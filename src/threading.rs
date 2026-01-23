@@ -14,7 +14,6 @@ use crate::order::compute_order;
 use crate::MIN_THREAD_LENGTH;
 
 #[cfg(feature = "parallel")]
-
 /// Context for threaded mapreduce operations.
 ///
 /// This struct holds all the information needed for recursive divide-and-conquer
@@ -47,6 +46,7 @@ impl<'a> ThreadedContext<'a> {
         offsets: Vec<isize>,
         elem_size: usize,
     ) -> Self {
+        #[allow(clippy::iter_cloned_collect)]
         let strides_refs: Vec<&[isize]> = strides.iter().copied().collect();
 
         // Compute dimension ordering

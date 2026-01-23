@@ -165,6 +165,7 @@ impl<'a, T, const N: usize, Op: ElementOp> StridedArrayView<'a, T, N, Op> {
 
     /// Compute the linear index for the given multi-dimensional index.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     fn linear_index(&self, indices: &[usize; N]) -> usize {
         let mut idx = self.offset as isize;
         for i in 0..N {
@@ -180,6 +181,7 @@ impl<'a, T: ElementOpApply, const N: usize, Op: ElementOp> StridedArrayView<'a, 
     /// # Panics
     /// Panics if the index is out of bounds.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     pub fn get(&self, indices: [usize; N]) -> T {
         for i in 0..N {
             assert!(indices[i] < self.size[i], "index out of bounds");
@@ -432,6 +434,7 @@ impl<'a, T, const N: usize, Op: ElementOp> StridedArrayViewMut<'a, T, N, Op> {
 
     /// Compute the linear index for the given multi-dimensional index.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     fn linear_index(&self, indices: &[usize; N]) -> usize {
         let mut idx = self.offset as isize;
         for i in 0..N {
@@ -456,6 +459,7 @@ impl<'a, T, const N: usize, Op: ElementOp> StridedArrayViewMut<'a, T, N, Op> {
 impl<'a, T: ElementOpApply, const N: usize, Op: ElementOp> StridedArrayViewMut<'a, T, N, Op> {
     /// Get an element at the given index, with the element operation applied.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     pub fn get(&self, indices: [usize; N]) -> T {
         for i in 0..N {
             assert!(indices[i] < self.size[i], "index out of bounds");
@@ -482,6 +486,7 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
     /// # Panics
     /// Panics if the index is out of bounds.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     pub fn set(&mut self, indices: [usize; N], value: T) {
         for i in 0..N {
             assert!(indices[i] < self.size[i], "index out of bounds");
@@ -502,6 +507,7 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
 
     /// Get a mutable reference to an element at the given index.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     pub fn get_mut(&mut self, indices: [usize; N]) -> &mut T {
         for i in 0..N {
             assert!(indices[i] < self.size[i], "index out of bounds");
@@ -1145,6 +1151,7 @@ impl<'a, T, const N: usize, Op: ElementOp> StridedArrayView<'a, T, N, Op> {
 
         // Leading dimensions (the first `offset` dimensions) have stride 0
         // (they are new broadcast dimensions)
+        #[allow(clippy::needless_range_loop)]
         for i in 0..offset {
             new_strides[i] = 0;
         }

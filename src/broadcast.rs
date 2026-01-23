@@ -35,6 +35,14 @@ use crate::element_op::{ElementOp, Identity};
 use crate::view::{StridedArrayView, StridedArrayViewMut};
 use crate::{Result, StridedError};
 
+/// Type alias for broadcast promotion result with three views
+type PromoteShape3Result<'a, T, const N: usize, Op1, Op2, Op3> = Result<(
+    StridedArrayView<'a, T, N, Op1>,
+    StridedArrayView<'a, T, N, Op2>,
+    StridedArrayView<'a, T, N, Op3>,
+)>;
+
+
 // ============================================================================
 // Core types for lazy broadcast
 // ============================================================================
@@ -321,11 +329,7 @@ pub fn promoteshape3<'a, T, const N: usize, Op1: ElementOp, Op2: ElementOp, Op3:
     a: &StridedArrayView<'a, T, N, Op1>,
     b: &StridedArrayView<'a, T, N, Op2>,
     c: &StridedArrayView<'a, T, N, Op3>,
-) -> Result<(
-    StridedArrayView<'a, T, N, Op1>,
-    StridedArrayView<'a, T, N, Op2>,
-    StridedArrayView<'a, T, N, Op3>,
-)> {
+) -> PromoteShape3Result<'a, T, N, Op1, Op2, Op3> {
     let a_promoted = promoteshape(target_size, a)?;
     let b_promoted = promoteshape(target_size, b)?;
     let c_promoted = promoteshape(target_size, c)?;

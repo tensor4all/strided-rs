@@ -129,7 +129,7 @@ fn test_copy_transpose_scale_into_fast_large() {
 fn test_copy_transpose_scale_into_fast_matches_original() {
     // Verify that fast version produces same results as original
     let a: Tensor<f64, DynRank> = Tensor::from_fn([100, 80], |idx| {
-        (idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01)
+        idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01
     })
     .into_dyn();
 
