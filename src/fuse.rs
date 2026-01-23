@@ -272,4 +272,74 @@ mod tests {
         let result = permute_by(&data, &perm);
         assert_eq!(result, vec![30, 10, 40, 20]);
     }
+
+    #[test]
+    fn test_compute_importance_with_zero_stride() {
+        // Zero stride (broadcast) gets index_order = 1
+        let dims = [4usize, 5];
+        let strides1 = [0isize, 1]; // First dim is broadcast
+        let all_strides: Vec<&[isize]> = vec![&strides1];
+
+        let order1 = index_order(&strides1);
+        // For stride 0: order = 1 (zero strides always get 1)
+        // For stride 1: order = 1 (no non-zero stride < 1)
+        assert_eq!(order1, vec![1, 1]);
+
+        let index_orders = vec![order1];
+        let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+        // Both dimensions have same index_order, so same importance
+        // (before size-1 filtering)
+        assert_eq!(importance[0], importance[1]);
+    }
+
+    #[test]
+    fn test_compute_importance_size_one_dim() {
+        // Size-1 dimensions get zero importance
+        let dims = [4usize, 1, 5];
+        let strides1 = [1isize, 4, 4];
+        let all_strides: Vec<&[isize]> = vec![&strides1];
+
+        let order1 = index_order(&strides1);
+        let index_orders = vec![order1];
+        let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+        // Dimension 1 has size 1 -> importance = 0
+        assert_eq!(importance[1], 0);
+        // Other dimensions should have non-zero importance
+        assert!(importance[0] > 0);
+        assert!(importance[2] > 0);
+    }
+
+    #[test]
+    fn test_compute_importance_output_2x_weight() {
+        // Output (first array) is weighted 2x
+        // With same strides, dimension with smaller stride in output wins
+        let dims = [4usize, 5];
+        let out_strides = [1isize, 4]; // Column-major output
+        let in_strides = [5isize, 1];  // Row-major input
+        let all_strides: Vec<&[isize]> = vec![&out_strides, &in_strides];
+
+        let order_out = index_order(&out_strides); // [1, 2]
+        let order_in = index_order(&in_strides);   // [2, 1]
+        let index_orders = vec![order_out, order_in];
+
+        let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+        // Output has 2x weight, so dimension 0 (smaller stride in output) wins
+        assert!(importance[0] > importance[1]);
+    }
+
+    #[test]
+    fn test_compute_costs_with_zero() {
+        // Zero strides become cost 1, non-zero become 2*abs
+        let strides1 = [0isize, 2, -3];
+        let strides2 = [1isize, 0, 2];
+        let all_strides: Vec<&[isize]> = vec![&strides1, &strides2];
+
+        let costs = compute_costs(&all_strides);
+        // min abs: [0, 0, 2]
+        // transform: [1, 1, 4]
+        assert_eq!(costs, vec![1, 1, 4]);
+    }
 }

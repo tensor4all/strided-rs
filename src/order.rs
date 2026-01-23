@@ -181,4 +181,53 @@ mod tests {
         let order = compute_order(&dims, &strides_list, Some(0));
         assert!(order.is_empty());
     }
+
+    #[test]
+    fn test_compute_order_with_zero_stride_broadcast() {
+        // Zero stride indicates broadcasting
+        // Julia: zero strides get index_order = 1 (highest priority for iteration)
+        let dims = [4usize, 5, 3];
+        let strides = [0isize, 1, 5]; // First dim is broadcast (stride 0)
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // With index_order: [1, 1, 2] for strides [0, 1, 5]
+        // importance for dim 0: shift = g * (3 - 1) = high
+        // importance for dim 1: shift = g * (3 - 1) = high (same as dim 0)
+        // importance for dim 2: shift = g * (3 - 2) = lower
+        // So dim 2 (largest stride) should be last
+        assert_eq!(order[2], 2);
+    }
+
+    #[test]
+    fn test_compute_order_negative_strides() {
+        // Negative strides should be handled correctly
+        let dims = [4usize, 5];
+        let strides = [-1isize, -4]; // Reversed column-major
+        let strides_list: Vec<&[isize]> = vec![&strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // abs: [1, 4], so dimension 0 has smaller stride -> higher importance -> first
+        assert_eq!(order[0], 0);
+        assert_eq!(order[1], 1);
+    }
+
+    #[test]
+    fn test_compute_order_4d_permuted() {
+        // 4D array with various strides (Issue #5 related)
+        let dims = [2usize, 3, 4, 5];
+        let out_strides = [60isize, 20, 5, 1]; // Column-major-ish
+        let in_strides = [1isize, 2, 6, 24];   // Row-major-ish
+        let strides_list: Vec<&[isize]> = vec![&out_strides, &in_strides];
+
+        let order = compute_order(&dims, &strides_list, Some(0));
+
+        // Output is weighted 2x, so its stride order dominates
+        // Output index_order: [4, 3, 2, 1] (60 > 20 > 5 > 1)
+        // Input index_order: [1, 2, 3, 4] (1 < 2 < 6 < 24)
+        // With output 2x weight, dimension 3 (stride 1 in output) should be first
+        assert_eq!(order[0], 3);
+    }
 }

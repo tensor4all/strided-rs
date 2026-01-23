@@ -261,6 +261,45 @@ mod tests {
     }
 
     #[test]
+    fn test_index_order_negative_strides() {
+        // Negative strides should use absolute value
+        // Julia: si = abs(strides[i])
+        let order = index_order(&[-4, 1, -2]);
+        // abs: [4, 1, 2] -> order: [3, 1, 2]
+        assert_eq!(order, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn test_index_order_tied_strides() {
+        // Tied strides (same absolute value) - both get same order
+        // Julia behavior: if s != 0 && abs(s) < si then k += 1
+        // For tied strides, neither is < the other, so they get same k
+        let order = index_order(&[2, 2, 1]);
+        // For index 0: stride=2, k=1, then check [2,2,1]: 2<2? no, 2<2? no, 1<2? yes -> k=2
+        // For index 1: stride=2, k=1, then check [2,2,1]: 2<2? no, 2<2? no, 1<2? yes -> k=2
+        // For index 2: stride=1, k=1, no other stride < 1 -> k=1
+        assert_eq!(order, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn test_index_order_all_same() {
+        // All strides are the same
+        let order = index_order(&[3, 3, 3]);
+        // All get order 1 (no stride is smaller than another)
+        assert_eq!(order, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn test_index_order_mixed_signs() {
+        // Mixed positive and negative strides with same absolute value
+        let order = index_order(&[2, -2, 1]);
+        // abs: [2, 2, 1]
+        // For both 2s: only 1 is smaller -> order 2
+        // For 1: nothing smaller -> order 1
+        assert_eq!(order, vec![2, 2, 1]);
+    }
+
+    #[test]
     fn test_compute_linear_index() {
         let idx = compute_linear_index(&[2, 3], &[1, 4]);
         assert_eq!(idx, 2 * 1 + 3 * 4); // 14
