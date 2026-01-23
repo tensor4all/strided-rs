@@ -1,9 +1,22 @@
+use crate::fuse::fuse_dims;
 use crate::kernel::{
     build_plan, ensure_same_shape, for_each_inner_block, is_contiguous, total_len, StridedView,
     StridedViewMut,
 };
 use crate::{Result, StridedError};
 use mdarray::{Layout, Shape, Slice};
+
+/// Apply dimension fusion to simplify iteration.
+///
+/// Fuses contiguous dimensions across all arrays, reducing the number of loop levels.
+/// Returns the fused dimensions (strides remain unchanged).
+#[inline]
+fn apply_fusion(dims: &[usize], strides_list: &[&[isize]]) -> Vec<usize> {
+    if dims.len() <= 1 {
+        return dims.to_vec();
+    }
+    fuse_dims(dims, strides_list)
+}
 
 pub fn map_into<T, SD, SS, LD, LS, F>(
     dest: &mut Slice<T, SD, LD>,
@@ -39,15 +52,19 @@ where
     }
 
     let strides_list = [&dst_view.strides[..], &src_view.strides[..]];
+
+    // Apply dimension fusion to reduce loop levels
+    let fused_dims = apply_fusion(&dst_view.dims, &strides_list);
+
     let plan = build_plan(
-        &dst_view.dims,
+        &fused_dims,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
 
     for_each_inner_block(
-        &dst_view.dims,
+        &fused_dims,
         &plan,
         &strides_list,
         |offsets, len, strides| {
@@ -118,15 +135,19 @@ where
         &a_view.strides[..],
         &b_view.strides[..],
     ];
+
+    // Apply dimension fusion to reduce loop levels
+    let fused_dims = apply_fusion(&dst_view.dims, &strides_list);
+
     let plan = build_plan(
-        &dst_view.dims,
+        &fused_dims,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
 
     for_each_inner_block(
-        &dst_view.dims,
+        &fused_dims,
         &plan,
         &strides_list,
         |offsets, len, strides| {
@@ -297,15 +318,19 @@ where
         &b_view.strides[..],
         &c_view.strides[..],
     ];
+
+    // Apply dimension fusion to reduce loop levels
+    let fused_dims = apply_fusion(&dst_view.dims, &strides_list);
+
     let plan = build_plan(
-        &dst_view.dims,
+        &fused_dims,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
 
     for_each_inner_block(
-        &dst_view.dims,
+        &fused_dims,
         &plan,
         &strides_list,
         |offsets, len, strides| {
@@ -406,15 +431,19 @@ where
         &c_view.strides[..],
         &e_view.strides[..],
     ];
+
+    // Apply dimension fusion to reduce loop levels
+    let fused_dims = apply_fusion(&dst_view.dims, &strides_list);
+
     let plan = build_plan(
-        &dst_view.dims,
+        &fused_dims,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
 
     for_each_inner_block(
-        &dst_view.dims,
+        &fused_dims,
         &plan,
         &strides_list,
         |offsets, len, strides| {

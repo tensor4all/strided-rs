@@ -1,3 +1,4 @@
+use crate::fuse::fuse_dims;
 use crate::kernel::{
     build_plan, ensure_same_shape, for_each_inner_block, is_contiguous, total_len, validate_layout,
     StridedView, StridedViewMut,
@@ -12,6 +13,15 @@ use num_traits::Zero;
 use std::mem::MaybeUninit;
 use std::ops::{Add, Mul};
 const TRANSPOSE_TILE: usize = 16;
+
+/// Apply dimension fusion to simplify iteration.
+#[inline]
+fn apply_fusion(dims: &[usize], strides_list: &[&[isize]]) -> Vec<usize> {
+    if dims.len() <= 1 {
+        return dims.to_vec();
+    }
+    fuse_dims(dims, strides_list)
+}
 
 pub fn copy_into<T, SD, SS, LD, LS>(
     dest: &mut Slice<T, SD, LD>,
@@ -91,8 +101,12 @@ where
     }
 
     let strides_list = [dest_strides, &src_view.strides[..]];
-    let plan = build_plan(dest_dims, &strides_list, Some(0), std::mem::size_of::<T>());
-    for_each_inner_block(dest_dims, &plan, &strides_list, |offsets, len, strides| {
+
+    // Apply dimension fusion to reduce loop levels
+    let fused_dims = apply_fusion(dest_dims, &strides_list);
+
+    let plan = build_plan(&fused_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
         let mut dst_ptr = unsafe { dest_ptr.offset(offsets[0]) };
         let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
         let dst_stride = strides[0];
@@ -248,11 +262,15 @@ where
     }
 
     let strides_list = [&a_view.strides[..], &b_view.strides[..]];
-    let plan = build_plan(&a_view.dims, &strides_list, None, std::mem::size_of::<T>());
+
+    // Apply dimension fusion to reduce loop levels
+    let fused_dims = apply_fusion(&a_view.dims, &strides_list);
+
+    let plan = build_plan(&fused_dims, &strides_list, None, std::mem::size_of::<T>());
 
     let mut acc = Some(T::zero());
     for_each_inner_block(
-        &a_view.dims,
+        &fused_dims,
         &plan,
         &strides_list,
         |offsets, len, strides| {

@@ -73,6 +73,7 @@ pub(crate) fn build_plan(
 ///
 /// This is the Julia-faithful version that fuses contiguous dimensions
 /// before computing the iteration order.
+#[allow(dead_code)]
 pub(crate) fn build_plan_fused(
     dims: &[usize],
     strides_list: &[&[isize]],

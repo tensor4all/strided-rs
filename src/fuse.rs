@@ -3,6 +3,9 @@
 //! This module implements the core dimension fusion algorithm that merges
 //! contiguous dimensions to reduce iteration complexity.
 
+// Some helper functions are ported for completeness but not yet used.
+#![allow(dead_code)]
+
 /// Fuse contiguous dimensions across multiple arrays.
 ///
 /// This function fuses subsequent dimensions that are contiguous in memory

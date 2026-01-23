@@ -2,6 +2,9 @@
 //!
 //! These helper functions are used for dimension simplification and stride normalization.
 
+// Some functions are ported for completeness but not yet used in the main code paths.
+#![allow(dead_code)]
+
 /// Simplify the dimensions of a strided view by fusing contiguous dimensions.
 ///
 /// This function fuses subsequent dimensions that are contiguous in memory,
