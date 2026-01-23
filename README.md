@@ -249,16 +249,47 @@ if let Some(slice) = view_1d.as_slice() {
 }
 ```
 
+## Benchmarks
+
+Run benchmarks to measure performance:
+
+```bash
+# Basic strided operations (strided vs naive implementations)
+cargo bench --bench strided_bench
+
+# Parallel benchmarks (sequential vs parallel)
+cargo bench --features parallel --bench parallel_bench
+
+# BLAS benchmarks (generic vs BLAS-backed)
+cargo bench --features blas --bench blas_bench
+
+# Run all benchmarks
+cargo bench --all-features
+```
+
+### Benchmark Reports
+
+Detailed benchmark results are available in the `docs/` directory:
+
+- [`docs/report.md`](docs/report.md) - Strided vs naive implementation comparison
+- [`docs/report_parallel.md`](docs/report_parallel.md) - Sequential vs parallel comparison
+- [`docs/report_blas.md`](docs/report_blas.md) - Generic vs BLAS comparison
+
+### Performance Highlights
+
+| Feature | Speedup | Best Use Case |
+|---------|---------|---------------|
+| **Strided kernels** | 2-4x | Mixed stride patterns |
+| **Parallel** (`par_zip_map2_into`) | 4-6x | Compute-heavy ops, large arrays |
+| **BLAS** (`blas_gemm`) | 40-120x | Matrix multiplication |
+
 ## Performance Tips
 
 1. **Use contiguous arrays when possible** - they get fast-path optimization
-2. **Enable the `parallel` feature** for large arrays
-3. **Use `is_blas_matrix`** to check BLAS compatibility before calling BLAS functions
-4. **Prefer row-major layout** (stride[N-1] == 1) for better cache performance
-
-## License
-
-MIT
+2. **Enable the `parallel` feature** for large arrays (>1M elements) or compute-heavy operations
+3. **Use `blas_*` functions** for linear algebra when BLAS is available
+4. **Use `is_blas_matrix`** to check BLAS compatibility before calling BLAS functions
+5. **Prefer row-major layout** (stride[N-1] == 1) for better cache performance
 
 ## Linear Algebra
 
@@ -317,10 +348,6 @@ This crate is a **~98% complete port** of Julia's Strided.jl/StridedViews.jl:
 | `mapreduce.jl` | `kernel.rs`, `map.rs`, `reduce.rs` | ✅ Complete |
 | `broadcast.jl` | `broadcast.rs` | ✅ Complete |
 | `linalg.jl` | `linalg.rs` | ✅ Complete |
-
-## License
-
-MIT
 
 ## Acknowledgments
 
