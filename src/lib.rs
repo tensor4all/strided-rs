@@ -111,6 +111,7 @@ pub mod linalg;
 mod map;
 mod ops;
 mod order;
+mod promote;
 mod reduce;
 mod threading;
 pub mod view;
@@ -144,7 +145,13 @@ pub use ops::{
 // ============================================================================
 // Reduce operations
 // ============================================================================
-pub use reduce::{mapreducedim_into, reduce, reduce_axis};
+pub use reduce::{
+    mapreducedim_capture1_into, mapreducedim_capture2_into, mapreducedim_capture3_into,
+    mapreducedim_capture4_into, mapreducedim_capture2_views_into,
+    mapreducedim_capture3_views_into, mapreducedim_capture4_views_into,
+    mapreducedim_capture_views_into,
+    mapreducedim_into, reduce, reduce_axis,
+};
 
 // ============================================================================
 // View types and utilities

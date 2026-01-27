@@ -2,7 +2,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use mdarray::Tensor;
 use mdarray_strided::{
     linalg::{generic_matmul, matmul},
-    copy_into, sum, StridedArrayView, StridedArrayViewMut,
+    copy_into, mapreducedim_capture2_into, sum, Arg, CaptureArgs, StridedArrayView,
+    StridedArrayViewMut,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -91,7 +92,7 @@ fn bench_permute_4d(c: &mut Criterion) {
     let mut group = c.benchmark_group("benchtests/permute_4d");
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(2));
-    group.sample_size(5);
+    group.sample_size(10);
 
     // Julia permutations (1-based):
     // (4,3,2,1), (2,3,4,1), (3,4,1,2)
@@ -195,7 +196,7 @@ fn bench_mul_gemm(c: &mut Criterion) {
     let mut group = c.benchmark_group("benchtests/mul_gemm");
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(2));
-    group.sample_size(5);
+    group.sample_size(10);
 
     for &s in &matmul_sizes() {
         let m = s;
@@ -245,5 +246,66 @@ fn bench_mul_gemm(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(julia_benchtests, bench_sum_1d, bench_permute_4d, bench_mul_gemm);
+fn bench_mapreducedim_capture2(c: &mut Criterion) {
+    let mut group = c.benchmark_group("benchtests/mapreducedim_capture2");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(10);
+
+    // Keep runtime bounded; O(s^2) baseline.
+    let max_s = 1024usize;
+
+    for &s in julia_sizes().iter().filter(|&&s| s <= max_s) {
+        let m = s;
+        let n = s;
+        group.throughput(Throughput::Elements((m as u64) * (n as u64)));
+
+        let mut rng = StdRng::seed_from_u64(0xABCD ^ (s as u64));
+        let a = Tensor::<f64, _>::from_fn([m, n], |_| rng.sample(StandardNormal));
+        let b_row = Tensor::<f64, _>::from_fn([1, n], |_| rng.sample(StandardNormal));
+
+        let capture = CaptureArgs::new(|x: f64, y: f64| x + y, (Arg, Arg));
+
+        group.bench_with_input(BenchmarkId::new("base", s), &s, |bencher, _| {
+            bencher.iter(|| {
+                let mut out = vec![0.0f64; n];
+                for j in 0..n {
+                    let add = b_row[[0, j]];
+                    let mut acc = 0.0f64;
+                    for i in 0..m {
+                        acc += a[[i, j]] + add;
+                    }
+                    out[j] = acc;
+                }
+                black_box(&out);
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("strided", s), &s, |bencher, _| {
+            bencher.iter(|| {
+                let mut dest = Tensor::<f64, _>::from_fn([1, n], |_| 0.0f64);
+                mapreducedim_capture2_into(
+                    &mut dest,
+                    a.as_ref(),
+                    b_row.as_ref(),
+                    &capture,
+                    |a, b| a + b,
+                    None,
+                )
+                .unwrap();
+                black_box(dest[[0, 0]]);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    julia_benchtests,
+    bench_sum_1d,
+    bench_permute_4d,
+    bench_mul_gemm,
+    bench_mapreducedim_capture2
+);
 criterion_main!(julia_benchtests);
