@@ -349,6 +349,28 @@ Comparison procedure:
 
 Note:
 - Using the existing `benches/` and `benches/julia_readme_compare.jl` script allows reproducing the README numbers. If discrepancies appear, check `RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`, compiler optimizations, and whether type-specialized micro-kernels are enabled.
+
+**Copy vs Pod and static POD gating**
+
+Summary:
+- The Rust `Copy` trait allows bitwise copying at the language level but does not by itself guarantee the safest or fastest memory-level byte-copy semantics for all optimization paths. Relying only on `Copy` can leave runtime branching, alignment concerns, or missed SIMD/vectorization opportunities.
+
+Recommendation:
+- Use a static POD trait (for example `bytemuck::Pod` or `zerocopy::AsBytes`/`FromBytes`) to mark element types that are safe for raw byte-wise copies. This removes runtime checks (such as `needs_drop`) and enables `memcpy`/`copy_nonoverlapping` fast paths and more aggressive micro-kernel specialization.
+
+Practical notes and steps to adopt in this crate:
+1. Add an explicit dependency in `Cargo.toml`: e.g. `bytemuck = "1"` or `zerocopy = "0.6"`.
+2. Replace runtime gating (e.g. `if !needs_drop::<T>() { ... }`) with static bounds: `T: bytemuck::Pod` or `T: zerocopy::AsBytes + zerocopy::FromBytes` for POD fast paths.
+3. Implement a `copy_2d_transpose_pod<T: Pod>` path that uses `std::ptr::copy_nonoverlapping` when safe and falls back to the generic path otherwise.
+4. Add hand-optimized micro-kernels for common numeric types (`f64`, `f32`, `Complex<f64>`, `Complex<f32>`) that use unrolling and platform SIMD intrinsics where appropriate.
+5. Tune outer-block and micro-tile sizes per target CPU and re-run the `benches/` suite to verify improvements.
+
+Caveats:
+- Complex or user-defined types may not be `Pod` by default; they may require `bytemuck::Pod` derives or manual verification of layout and padding.
+- Alignment requirements must be respected when using raw pointer copies and SIMD loads/stores.
+- Static POD gating improves performance by enabling specialized codegen, but correctness must be validated with tests for all specialized paths.
+
+If you want, I can start by adding `bytemuck` to `Cargo.toml`, update the POD gating in `src/ops.rs` to use `T: bytemuck::Pod`, and run the README benchmark runner to show the before/after. Proceed? 
 ```
 
 ### Benchmark Reports
