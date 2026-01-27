@@ -296,6 +296,41 @@ Next steps:
 - Add unrolled/SIMD micro-kernels for `f64`, `f32`, `Complex{f64}`, `Complex{f32}` (platform-aware NEON/AVX).
 - Tune micro-tile sizes and outer block heuristics per-target CPU.
 - Add tests for correctness of specialized fast paths and POD trait bounds.
+
+**Julia 対応ベンチマーク**
+
+目的: Julia の `Strided.jl` README に載っているベンチマークと同等条件で Rust 側のベンチを実行・比較できるようにする。
+
+- 単一スレッドでの比較（再現性のため）:
+    - Julia: `export JULIA_NUM_THREADS=1` を設定して実行
+    - Rust: `export RAYON_NUM_THREADS=1` を設定して実行
+
+- Julia の実行例 (リポジトリルートにあるスクリプトを使う):
+
+```bash
+export JULIA_NUM_THREADS=1
+jul ia --project=. julia_readme_bench.jl
+```
+
+- Rust の実行例 (Criterion ベンチ):
+
+```bash
+export RAYON_NUM_THREADS=1
+cargo bench --bench strided_bench
+```
+
+- ファイル対応（参考）:
+    - Juliaスクリプト: [julia_readme_bench.jl](julia_readme_bench.jl)
+    - Rustベンチ: [benches/strided_bench.rs](benches/strided_bench.rs) および [benches/mdarray_compare.rs](benches/mdarray_compare.rs)
+    - 追加ログ: `bench_readme_single_thread.log`, `bench_permute_1000.log`
+
+- 比較方法:
+    - 同一ハードウェア、単一スレッド設定で両方実行して各ケース名（例: `permute_32_4d`, `transpose_4000`）の出力を照合する。
+    - Rust の出力は Criterion のサマリ（`cargo bench` の結果）を、Julia は BenchmarkTools の出力を使う。
+    - ベンチ実行時の環境（OS, CPU, コンパイラ最適化フラグ）を記録しておくこと。
+
+注記:
+- 既存の `benches/` と `julia_readme_bench.jl` を使えば、README の数値と同等の比較が可能です。ベンチの差異が出た場合は、`RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`、コンパイラ最適化、またはマイクロカーネルの型特化の有無を確認してください。
 ```
 
 ### Benchmark Reports
