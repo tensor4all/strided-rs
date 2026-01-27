@@ -265,6 +265,7 @@ cargo bench --features blas --bench blas_bench
 
 # Run all benchmarks
 cargo bench --all-features
+```
 
 **Latest Benchmark (2026-01-28)**
 
@@ -309,7 +310,7 @@ Next steps:
 
 ```bash
 export JULIA_NUM_THREADS=1
-jul ia --project=. julia_readme_bench.jl
+julia --project=. julia_readme_bench.jl
 ```
 
 - Rust の実行例 (Criterion ベンチ):
@@ -318,6 +319,35 @@ jul ia --project=. julia_readme_bench.jl
 export RAYON_NUM_THREADS=1
 cargo bench --bench strided_bench
 ```
+
+- Julia README（相当）と同一ケースの比較を出力する Rust ランナー:
+
+```bash
+export RAYON_NUM_THREADS=1
+cargo bench --bench rust_readme_compare
+```
+
+- Julia 側（同一ケース）:
+
+```bash
+export JULIA_NUM_THREADS=1
+julia --project=. benches/julia_readme_compare.jl
+```
+
+**比較結果（単一スレッド, 2026-01-28）**
+
+| Case | Julia Strided (ms) | Rust strided (ms) | Rust mdarray/naive (ms) |
+|---|---:|---:|---:|
+| symmetrize_4000 | 16.425 | 32.300 | 58.165 (naive) |
+| scale_transpose_1000 | 0.408 | 0.405 | 1.030 (naive) |
+| complex_elementwise_1000 | 7.517 | 12.457 | 13.903 (naive) |
+| permute_32_4d | 0.737 | 0.939 | 0.958 (mdarray_assign) |
+| multiple_permute_sum_32_4d | 2.200 | 2.097 | 4.192 (mdarray_alloc4) |
+
+注記:
+- Rust の計測は [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs) が `Instant` で平均時間を表示（ウォームアップ後に複数回実行して平均）。
+- `multiple_permute_sum_32_4d` の `mdarray_alloc4` は Julia の Base 相当（4つの permute を materialize してから加算）を意図。
+- `complex_elementwise_1000` は Julia スクリプト上は Float64 入力（名前だけ complex）なので、Rust 側も `f64` で揃えています。
 
 - ファイル対応（参考）:
     - Juliaスクリプト: [julia_readme_bench.jl](julia_readme_bench.jl)
