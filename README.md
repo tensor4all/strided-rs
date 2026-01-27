@@ -298,43 +298,31 @@ Next steps:
 - Tune micro-tile sizes and outer block heuristics per-target CPU.
 - Add tests for correctness of specialized fast paths and POD trait bounds.
 
-**Julia 対応ベンチマーク**
+**Julia-compatible Benchmarks**
 
-目的: Julia の `Strided.jl` README に載っているベンチマークと同等条件で Rust 側のベンチを実行・比較できるようにする。
+Purpose: Provide a set of Rust benchmarks that match the cases listed in the Strided.jl README so results can be compared under equivalent conditions.
 
-- 単一スレッドでの比較（再現性のため）:
-    - Julia: `export JULIA_NUM_THREADS=1` を設定して実行
-    - Rust: `export RAYON_NUM_THREADS=1` を設定して実行
+- Single-threaded comparison (for reproducibility):
+  - Julia: set `JULIA_NUM_THREADS=1` before running
+  - Rust: set `RAYON_NUM_THREADS=1` before running
 
-- Julia の実行例 (リポジトリルートにあるスクリプトを使う):
-
-```bash
-export JULIA_NUM_THREADS=1
-julia --project=. julia_readme_bench.jl
-```
-
-- Rust の実行例 (Criterion ベンチ):
-
-```bash
-export RAYON_NUM_THREADS=1
-cargo bench --bench strided_bench
-```
-
-- Julia README（相当）と同一ケースの比較を出力する Rust ランナー:
-
-```bash
-export RAYON_NUM_THREADS=1
-cargo bench --bench rust_readme_compare
-```
-
-- Julia 側（同一ケース）:
+- Example: run the Julia script included in this repository:
 
 ```bash
 export JULIA_NUM_THREADS=1
 julia --project=. benches/julia_readme_compare.jl
 ```
 
-**比較結果（単一スレッド, 2026-01-28）**
+- Example: run the Rust runner that prints the same cases:
+
+```bash
+export RAYON_NUM_THREADS=1
+cargo bench --bench rust_readme_compare
+```
+
+- The five matched cases are: `symmetrize_4000`, `scale_transpose_1000`, `complex_elementwise_1000`, `permute_32_4d`, and `multiple_permute_sum_32_4d`.
+
+**Comparison results (single-threaded, 2026-01-28)**
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust mdarray/naive (ms) |
 |---|---:|---:|---:|
@@ -344,23 +332,23 @@ julia --project=. benches/julia_readme_compare.jl
 | permute_32_4d | 0.737 | 0.939 | 0.958 (mdarray_assign) |
 | multiple_permute_sum_32_4d | 2.200 | 2.097 | 4.192 (mdarray_alloc4) |
 
-注記:
-- Rust の計測は [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs) が `Instant` で平均時間を表示（ウォームアップ後に複数回実行して平均）。
-- `multiple_permute_sum_32_4d` の `mdarray_alloc4` は Julia の Base 相当（4つの permute を materialize してから加算）を意図。
-- `complex_elementwise_1000` は Julia スクリプト上は Float64 入力（名前だけ complex）なので、Rust 側も `f64` で揃えています。
+Notes:
+- The Rust measurements are produced by [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs), which uses `Instant` and reports the mean duration after warm-up and repeated iterations.
+- The `mdarray_alloc4` entry for `multiple_permute_sum_32_4d` represents the Julia "Base" approach (materialize four permuted arrays, then add).
+- The `complex_elementwise_1000` case in the Julia script uses `Float64` inputs (the name is historical), so the Rust runner also uses `f64` for parity.
 
-- ファイル対応（参考）:
-    - Juliaスクリプト: [julia_readme_bench.jl](julia_readme_bench.jl)
-    - Rustベンチ: [benches/strided_bench.rs](benches/strided_bench.rs) および [benches/mdarray_compare.rs](benches/mdarray_compare.rs)
-    - 追加ログ: `bench_readme_single_thread.log`, `bench_permute_1000.log`
+File mapping (reference):
+- Julia script: [benches/julia_readme_compare.jl](benches/julia_readme_compare.jl)
+- Rust benches: [benches/strided_bench.rs](benches/strided_bench.rs), [benches/mdarray_compare.rs](benches/mdarray_compare.rs), and the new runner [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs)
+- Example logs: `bench_readme_single_thread.log`, `bench_permute_1000.log`
 
-- 比較方法:
-    - 同一ハードウェア、単一スレッド設定で両方実行して各ケース名（例: `permute_32_4d`, `transpose_4000`）の出力を照合する。
-    - Rust の出力は Criterion のサマリ（`cargo bench` の結果）を、Julia は BenchmarkTools の出力を使う。
-    - ベンチ実行時の環境（OS, CPU, コンパイラ最適化フラグ）を記録しておくこと。
+Comparison procedure:
+- Run both Julia and Rust on the same hardware with single-thread settings and compare the named cases (e.g., `permute_32_4d`, `transpose_4000`).
+- Use Criterion summaries for Rust and BenchmarkTools output for Julia.
+- Record environment details (OS, CPU, compiler flags) when taking measurements.
 
-注記:
-- 既存の `benches/` と `julia_readme_bench.jl` を使えば、README の数値と同等の比較が可能です。ベンチの差異が出た場合は、`RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`、コンパイラ最適化、またはマイクロカーネルの型特化の有無を確認してください。
+Note:
+- Using the existing `benches/` and `benches/julia_readme_compare.jl` script allows reproducing the README numbers. If discrepancies appear, check `RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`, compiler optimizations, and whether type-specialized micro-kernels are enabled.
 ```
 
 ### Benchmark Reports
