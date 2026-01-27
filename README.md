@@ -265,6 +265,37 @@ cargo bench --features blas --bench blas_bench
 
 # Run all benchmarks
 cargo bench --all-features
+
+**Latest Benchmark (2026-01-28)**
+
+- Environment: macOS, single-threaded runs (JULIA_NUM_THREADS=1 for Julia).
+- Rust (Criterion) representative results:
+    - `permute_32_4d`:
+        - `mdarray_assign` ≈ 0.91 ms
+        - `strided::copy_into` ≈ 0.93 ms
+    - `transpose_2000`:
+        - `mdarray_assign` ≈ 3.33 ms
+        - `strided::copy_into` varied (runs showed ~5.0–8.4 ms; micro-kernel overhead observed)
+    - `transpose_4000`:
+        - `mdarray_assign` ≈ 43.2 ms
+        - `strided::copy_into` ≈ 20.4 ms
+
+- Julia (BenchmarkTools) representative results (single-threaded):
+    - `symmetrize_4000` (Strided.jl): ~16.63 ms
+    - `scale_transpose_1000` (Strided.jl): ~0.393 ms
+    - `complex_elementwise_1000` (Strided.jl): ~7.55 ms
+    - `permute_32_4d` (Strided.jl): ~0.748 ms
+    - `multiple_permute_sum_32_4d` (Strided.jl): ~2.20 ms
+
+Notes:
+- Two-level blocking (Julia-style outer block sizing + inner micro-tiles) and a POD byte-copy fast path were implemented to reduce large-transpose overhead.
+- Rust now shows large-matrix transpose improvement (see `transpose_4000`), but medium-size variance indicates micro-kernel overhead and branching costs.
+
+Next steps:
+- Implement static POD gating (e.g. `bytemuck::Pod`) instead of runtime `needs_drop` checks.
+- Add unrolled/SIMD micro-kernels for `f64`, `f32`, `Complex{f64}`, `Complex{f32}` (platform-aware NEON/AVX).
+- Tune micro-tile sizes and outer block heuristics per-target CPU.
+- Add tests for correctness of specialized fast paths and POD trait bounds.
 ```
 
 ### Benchmark Reports
