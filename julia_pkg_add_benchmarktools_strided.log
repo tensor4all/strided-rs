@@ -1,0 +1,14 @@
+[32m[1m    Updating[22m[39m registry at `~/.julia/registries/Tensor4All`
+[32m[1m    Updating[22m[39m git-repo `https://github.com/tensor4all/T4ARegistry.git`
+[32m[1m    Updating[22m[39m registry at `~/.julia/registries/General.toml`
+[32m[1m   Resolving[22m[39m package versions...
+[32m[1m   Installed[22m[39m BenchmarkTools ─ v1.6.3
+[32m[1m    Updating[22m[39m `~/.julia/environments/v1.12/Project.toml`
+  [90m[6e4b80f9] [39m[92m+ BenchmarkTools v1.6.3[39m
+  [90m[5e0ebb24] [39m[92m+ Strided v2.3.2[39m
+[32m[1m    Updating[22m[39m `~/.julia/environments/v1.12/Manifest.toml`
+  [90m[6e4b80f9] [39m[92m+ BenchmarkTools v1.6.3[39m
+  [90m[9abbd945] [39m[92m+ Profile v1.11.0[39m
+[32m[1mPrecompiling[22m[39m packages...
+   1464.0 ms[32m  ✓ [39mBenchmarkTools
+  1 dependency successfully precompiled in 3 seconds. 335 already precompiled.

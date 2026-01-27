@@ -10,6 +10,7 @@ use crate::threading::{
 };
 use crate::{Result, StridedError};
 use mdarray::{Layout, Shape, Slice};
+use std::cmp::min;
 
 /// Apply dimension fusion to simplify iteration.
 ///
@@ -176,6 +177,76 @@ where
     )
 }
 
+/// Cache-optimized 2D tiled operation for transpose patterns.
+/// Assumes: dst is row-major, a is row-major, b is column-major (transpose).
+/// This pattern appears in symmetrize: B .= (A .+ A') ./ 2
+fn zip_map2_2d_tiled_transpose<T, F>(
+    dst_view: &StridedViewMut<T>,
+    a_view: &StridedView<T>,    // row-major
+    b_view: &StridedView<T>,    // column-major (transposed)
+    f: &F,
+) -> Result<bool>
+where
+    F: Fn(&T, &T) -> T,
+{
+    let n = dst_view.dims[0];
+    if n != dst_view.dims[1] {
+        return Ok(false);
+    }
+
+    // Tile size calculation (based on Julia's Strided.jl approach)
+    // Julia uses BLOCKMEMORYSIZE = 32KB for L1 cache and dynamically computes block sizes
+    // Dynamic calculation: tile_size^2 * elem_size * 2 ≈ BLOCK_MEMORY_SIZE
+    // (factor of 2 accounts for reading from two arrays)
+    let elem_size = std::mem::size_of::<T>();
+    const BLOCK_MEMORY_SIZE: usize = 1 << 15; // 32768 bytes (Julia's BLOCKMEMORYSIZE)
+    
+    let tile_size = if elem_size > 0 {
+        let max_elems = BLOCK_MEMORY_SIZE / elem_size / 2;
+        let computed_size = (max_elems as f64).sqrt() as usize;
+        // Clamp to reasonable range (avoid too small or too large tiles)
+        computed_size.clamp(16, 64)
+    } else {
+        32
+    };
+
+    let d_ptr = dst_view.ptr;
+    let a_ptr = a_view.ptr;
+    let b_ptr = b_view.ptr;
+    
+    let d_row_stride = dst_view.strides[0];
+    let a_row_stride = a_view.strides[0];
+    let b_col_stride = b_view.strides[1];
+
+    // Process in tiles for better cache locality
+    for i_tile in (0..n).step_by(tile_size) {
+        let i_end = min(i_tile + tile_size, n);
+        for j_tile in (0..n).step_by(tile_size) {
+            let j_end = min(j_tile + tile_size, n);
+
+            // Process tile
+            for i in i_tile..i_end {
+                let d_row_ptr = unsafe { d_ptr.offset((i as isize) * d_row_stride) };
+                let a_row_ptr = unsafe { a_ptr.offset((i as isize) * a_row_stride) };
+                
+                for j in j_tile..j_end {
+                    // dst[i,j] = f(a[i,j], b[i,j])
+                    // where b is transposed, so b[i,j] accessed as b_ptr[j*b_row + i*b_col]
+                    // Since b is column-major: b[i,j] = b_ptr[i + j*n]
+                    let a_val = unsafe { &*a_row_ptr.offset(j as isize) };
+                    let b_val = unsafe { &*b_ptr.offset((i as isize) + (j as isize) * b_col_stride) };
+                    let result = f(a_val, b_val);
+                    unsafe {
+                        *d_row_ptr.offset(j as isize) = result;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 fn zip_map2_2d_fast<T, F>(
     dst_view: &StridedViewMut<T>,
     a_view: &StridedView<T>,
@@ -201,6 +272,34 @@ where
     let a_col = a_view.strides[1];
     let b_row = b_view.strides[0];
     let b_col = b_view.strides[1];
+
+    // Detect transpose pattern: one is row-major, other is column-major (transposed)
+    // Common case: A is row-major [N, 1], B is transposed [1, N]
+    // This happens in symmetrize: B .= (A .+ A') ./ 2
+    if rows == cols && rows >= 32 {
+        let a_is_rowmajor = a_col.unsigned_abs() == 1 && a_row.unsigned_abs() == cols;
+        let a_is_colmajor = a_row.unsigned_abs() == 1 && a_col.unsigned_abs() == rows;
+        let b_is_rowmajor = b_col.unsigned_abs() == 1 && b_row.unsigned_abs() == cols;
+        let b_is_colmajor = b_row.unsigned_abs() == 1 && b_col.unsigned_abs() == rows;
+        let d_is_rowmajor = d_col.unsigned_abs() == 1 && d_row.unsigned_abs() == cols;
+
+        // Pattern: dest is row-major, A is row-major, B is column-major (transpose of A)
+        if d_is_rowmajor && a_is_rowmajor && b_is_colmajor {
+            if let Ok(success) = zip_map2_2d_tiled_transpose(dst_view, a_view, b_view, f) {
+                if success {
+                    return Ok(true);
+                }
+            }
+        }
+        // Also handle: A is col-major, B is row-major
+        if d_is_rowmajor && a_is_colmajor && b_is_rowmajor {
+            if let Ok(success) = zip_map2_2d_tiled_transpose(dst_view, b_view, a_view, f) {
+                if success {
+                    return Ok(true);
+                }
+            }
+        }
+    }
 
     let d_col_contig = d_col.unsigned_abs() == 1;
     let d_row_contig = d_row.unsigned_abs() == 1;
