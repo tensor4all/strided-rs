@@ -10,9 +10,9 @@ use crate::{Result, StridedError};
 /// BLAS matrix layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlasLayout {
-    /// Row-major (C-style): rows are contiguous, stride[1] == 1
+    /// Row-major (C-style): rows are contiguous, `stride[1] == 1`
     RowMajor,
-    /// Column-major (Fortran-style): columns are contiguous, stride[0] == 1
+    /// Column-major (Fortran-style): columns are contiguous, `stride[0] == 1`
     ColMajor,
 }
 
@@ -28,8 +28,8 @@ pub struct BlasMatrix {
 /// Check if a 2D view is compatible with BLAS operations.
 ///
 /// A matrix is BLAS-compatible if either:
-/// - Row-major: stride[1] == 1 and stride[0] >= cols
-/// - Column-major: stride[0] == 1 and stride[1] >= rows
+/// - Row-major: `stride[1] == 1` and `stride[0] >= cols`
+/// - Column-major: `stride[0] == 1` and `stride[1] >= rows`
 ///
 /// Returns `None` if the view is not BLAS-compatible.
 pub fn is_blas_matrix<'a, T, Op: ElementOp>(

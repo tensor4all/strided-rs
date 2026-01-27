@@ -9,12 +9,9 @@
 //! - Type-level element operations (Identity, Conj, Transpose, Adjoint)
 //! - Lazy transformations (permutedims, slice, reshape)
 
-use crate::broadcast::{broadcast_capture_into, broadcast_into, broadcast3_into, broadcast4_into, Consume};
+use crate::broadcast::{broadcast_capture_into, broadcast_into, Consume};
 use crate::element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose};
-use crate::reduce::{
-    mapreducedim_capture2_views_into, mapreducedim_capture3_views_into,
-    mapreducedim_capture4_views_into, mapreducedim_capture_views_into,
-};
+use crate::reduce::mapreducedim_capture_views_into;
 use crate::{Result, StridedError};
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
@@ -540,68 +537,6 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
         mapreducedim_capture_views_into(self, sources, capture, reduce_fn, init_op)
     }
 
-    /// Map-reduce capture with two sources having potentially different element ops.
-    pub fn mapreducedim_capture2_into<Op1, Op2, C, R>(
-        &mut self,
-        a: &StridedArrayView<'_, T, N, Op1>,
-        b: &StridedArrayView<'_, T, N, Op2>,
-        capture: &C,
-        reduce_fn: R,
-        init_op: Option<fn(&T) -> T>,
-    ) -> Result<()>
-    where
-        T: Copy + ElementOpApply,
-        Op1: ElementOp,
-        Op2: ElementOp,
-        C: Consume<T, Output = T>,
-        R: Fn(T, T) -> T,
-    {
-        mapreducedim_capture2_views_into(self, a, b, capture, reduce_fn, init_op)
-    }
-
-    /// Map-reduce capture with three sources having potentially different element ops.
-    pub fn mapreducedim_capture3_into<Op1, Op2, Op3, C, R>(
-        &mut self,
-        a: &StridedArrayView<'_, T, N, Op1>,
-        b: &StridedArrayView<'_, T, N, Op2>,
-        c: &StridedArrayView<'_, T, N, Op3>,
-        capture: &C,
-        reduce_fn: R,
-        init_op: Option<fn(&T) -> T>,
-    ) -> Result<()>
-    where
-        T: Copy + ElementOpApply,
-        Op1: ElementOp,
-        Op2: ElementOp,
-        Op3: ElementOp,
-        C: Consume<T, Output = T>,
-        R: Fn(T, T) -> T,
-    {
-        mapreducedim_capture3_views_into(self, a, b, c, capture, reduce_fn, init_op)
-    }
-
-    /// Map-reduce capture with four sources having potentially different element ops.
-    pub fn mapreducedim_capture4_into<Op1, Op2, Op3, Op4, C, R>(
-        &mut self,
-        a: &StridedArrayView<'_, T, N, Op1>,
-        b: &StridedArrayView<'_, T, N, Op2>,
-        c: &StridedArrayView<'_, T, N, Op3>,
-        d: &StridedArrayView<'_, T, N, Op4>,
-        capture: &C,
-        reduce_fn: R,
-        init_op: Option<fn(&T) -> T>,
-    ) -> Result<()>
-    where
-        T: Copy + ElementOpApply,
-        Op1: ElementOp,
-        Op2: ElementOp,
-        Op3: ElementOp,
-        Op4: ElementOp,
-        C: Consume<T, Output = T>,
-        R: Fn(T, T) -> T,
-    {
-        mapreducedim_capture4_views_into(self, a, b, c, d, capture, reduce_fn, init_op)
-    }
 
     /// Broadcast with a captured expression over view sources.
     ///
@@ -619,59 +554,22 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
         broadcast_capture_into(self, capture, sources)
     }
 
+
     /// Broadcast a binary operation into this destination view.
-    pub fn broadcast_into<Op1, Op2, F>(
+    pub fn broadcast_into<Op, F>(
         &mut self,
         f: F,
-        a: &StridedArrayView<'_, T, N, Op1>,
-        b: &StridedArrayView<'_, T, N, Op2>,
+        a: &StridedArrayView<'_, T, N, Op>,
+        b: &StridedArrayView<'_, T, N, Op>,
     ) -> Result<()>
     where
         T: Copy + ElementOpApply,
-        Op1: ElementOp,
-        Op2: ElementOp,
+        Op: ElementOp,
         F: Fn(T, T) -> T,
     {
         broadcast_into(self, f, a, b)
     }
 
-    /// Broadcast a ternary operation into this destination view.
-    pub fn broadcast3_into<Op1, Op2, Op3, F>(
-        &mut self,
-        f: F,
-        a: &StridedArrayView<'_, T, N, Op1>,
-        b: &StridedArrayView<'_, T, N, Op2>,
-        c: &StridedArrayView<'_, T, N, Op3>,
-    ) -> Result<()>
-    where
-        T: Copy + ElementOpApply,
-        Op1: ElementOp,
-        Op2: ElementOp,
-        Op3: ElementOp,
-        F: Fn(T, T, T) -> T,
-    {
-        broadcast3_into(self, f, a, b, c)
-    }
-
-    /// Broadcast a quaternary operation into this destination view.
-    pub fn broadcast4_into<Op1, Op2, Op3, Op4, F>(
-        &mut self,
-        f: F,
-        a: &StridedArrayView<'_, T, N, Op1>,
-        b: &StridedArrayView<'_, T, N, Op2>,
-        c: &StridedArrayView<'_, T, N, Op3>,
-        d: &StridedArrayView<'_, T, N, Op4>,
-    ) -> Result<()>
-    where
-        T: Copy + ElementOpApply,
-        Op1: ElementOp,
-        Op2: ElementOp,
-        Op3: ElementOp,
-        Op4: ElementOp,
-        F: Fn(T, T, T, T) -> T,
-    {
-        broadcast4_into(self, f, a, b, c, d)
-    }
 }
 
 // ============================================================================
@@ -1159,7 +1057,7 @@ impl<'a, T: ElementOpApply + Copy, const N: usize, Op: ElementOp> StridedArrayVi
 impl<'a, T, const N: usize, Op: ElementOp> StridedArrayView<'a, T, N, Op> {
     /// Check if dimensions `i` and `i+1` can be fused.
     ///
-    /// Two dimensions can be fused if stride[i+1] == size[i] * stride[i],
+    /// Two dimensions can be fused if `stride[i+1] == size[i] * stride[i]`,
     /// meaning they form a contiguous block.
     pub fn can_fuse_dims(&self, i: usize) -> bool {
         if i + 1 >= N {
@@ -1744,8 +1642,10 @@ mod tests {
             StridedArrayView::<Complex64, 1, Identity>::new(&a_data, [4], [1], 0)
                 .unwrap()
                 .conj();
-        let b: StridedArrayView<'_, Complex64, 1, Identity> =
-            StridedArrayView::new(&b_data, [4], [1], 0).unwrap();
+        let b: StridedArrayView<'_, Complex64, 1, Conj> =
+            StridedArrayView::<Complex64, 1, Identity>::new(&b_data, [4], [1], 0)
+                .unwrap()
+                .conj();
         let mut dest: StridedArrayViewMut<'_, Complex64, 1, Identity> =
             StridedArrayViewMut::new(&mut out, [4], [1], 0).unwrap();
 
@@ -1755,42 +1655,6 @@ mod tests {
         assert_eq!(dest.get([1]), Complex64::new(4.0, 1.0));
         assert_eq!(dest.get([2]), Complex64::new(6.0, -4.0));
         assert_eq!(dest.get([3]), Complex64::new(8.0, 2.0));
-    }
-
-    #[test]
-    fn test_mapreducedim_capture2_view_method_mixed_ops() {
-        let a_data = vec![
-            Complex64::new(1.0, 2.0),
-            Complex64::new(3.0, -1.0),
-            Complex64::new(5.0, 4.0),
-            Complex64::new(7.0, -2.0),
-        ];
-        let b_data = vec![
-            Complex64::new(1.0, 0.0),
-            Complex64::new(2.0, 0.0),
-            Complex64::new(3.0, 0.0),
-            Complex64::new(4.0, 0.0),
-        ];
-        let mut out = vec![Complex64::new(0.0, 0.0); 1];
-
-        let a: StridedArrayView<'_, Complex64, 1, Conj> =
-            StridedArrayView::<Complex64, 1, Identity>::new(&a_data, [4], [1], 0)
-                .unwrap()
-                .conj();
-        let b: StridedArrayView<'_, Complex64, 1, Identity> =
-            StridedArrayView::new(&b_data, [4], [1], 0).unwrap();
-        let mut dest: StridedArrayViewMut<'_, Complex64, 1, Identity> =
-            StridedArrayViewMut::new(&mut out, [1], [1], 0).unwrap();
-
-        let capture = CaptureArgs::new(|x: Complex64, y: Complex64| x + y, (Arg, Arg));
-        dest.mapreducedim_capture2_into(&a, &b, &capture, |a, b| a + b, None)
-            .unwrap();
-
-        // Sum of conj(a[i]) + b[i]
-        // conj(a) = [1-2i, 3+1i, 5-4i, 7+2i]
-        // b = [1,2,3,4]
-        // sum = (1+1+3+2+5+3+7+4) + (-2+1-4+2)i = 26 - 3i
-        assert_eq!(dest.get([0]), Complex64::new(26.0, -3.0));
     }
 
     #[test]

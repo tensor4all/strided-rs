@@ -2,8 +2,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use mdarray::Tensor;
 use mdarray_strided::{
     linalg::{generic_matmul, matmul},
-    copy_into, mapreducedim_capture2_into, sum, Arg, CaptureArgs, StridedArrayView,
-    StridedArrayViewMut,
+    copy_into, mapreducedim_capture_views_into, sum, Arg, CaptureArgs, Identity,
+    StridedArrayView, StridedArrayViewMut,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -261,8 +261,14 @@ fn bench_mapreducedim_capture2(c: &mut Criterion) {
         group.throughput(Throughput::Elements((m as u64) * (n as u64)));
 
         let mut rng = StdRng::seed_from_u64(0xABCD ^ (s as u64));
-        let a = Tensor::<f64, _>::from_fn([m, n], |_| rng.sample(StandardNormal));
-        let b_row = Tensor::<f64, _>::from_fn([1, n], |_| rng.sample(StandardNormal));
+        let mut a_data = Vec::with_capacity(m * n);
+        for _ in 0..(m * n) {
+            a_data.push(rng.sample(StandardNormal));
+        }
+        let mut b_data = Vec::with_capacity(n);
+        for _ in 0..n {
+            b_data.push(rng.sample(StandardNormal));
+        }
 
         let capture = CaptureArgs::new(|x: f64, y: f64| x + y, (Arg, Arg));
 
@@ -270,10 +276,10 @@ fn bench_mapreducedim_capture2(c: &mut Criterion) {
             bencher.iter(|| {
                 let mut out = vec![0.0f64; n];
                 for j in 0..n {
-                    let add = b_row[[0, j]];
+                    let add = b_data[j];
                     let mut acc = 0.0f64;
                     for i in 0..m {
-                        acc += a[[i, j]] + add;
+                        acc += a_data[i * n + j] + add;
                     }
                     out[j] = acc;
                 }
@@ -283,17 +289,23 @@ fn bench_mapreducedim_capture2(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("strided", s), &s, |bencher, _| {
             bencher.iter(|| {
-                let mut dest = Tensor::<f64, _>::from_fn([1, n], |_| 0.0f64);
-                mapreducedim_capture2_into(
+                let a_view: StridedArrayView<'_, f64, 2, Identity> =
+                    StridedArrayView::new(&a_data, [m, n], [n as isize, 1], 0).unwrap();
+                let b_view: StridedArrayView<'_, f64, 2, Identity> =
+                    StridedArrayView::new(&b_data, [1, n], [n as isize, 1], 0).unwrap();
+                let mut out_data = vec![0.0f64; n];
+                let mut dest: StridedArrayViewMut<'_, f64, 2, Identity> =
+                    StridedArrayViewMut::new(&mut out_data, [1, n], [n as isize, 1], 0).unwrap();
+
+                mapreducedim_capture_views_into(
                     &mut dest,
-                    a.as_ref(),
-                    b_row.as_ref(),
+                    &[&a_view, &b_view],
                     &capture,
                     |a, b| a + b,
                     None,
                 )
                 .unwrap();
-                black_box(dest[[0, 0]]);
+                black_box(dest.get([0, 0]));
             })
         });
     }

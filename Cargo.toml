@@ -48,3 +48,7 @@ harness = false
 [[bench]]
 name = "readme_examples"
 harness = false
+
+[[bench]]
+name = "mdarray_compare"
+harness = false

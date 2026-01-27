@@ -67,8 +67,8 @@ impl BlasTranspose {
 
 /// Check if a matrix with Identity operation is BLAS-compatible.
 ///
-/// A matrix is BLAS-compatible if either stride[0] == 1 (column-major)
-/// or stride[1] == 1 (row-major).
+/// A matrix is BLAS-compatible if either `stride[0] == 1` (column-major)
+/// or `stride[1] == 1` (row-major).
 ///
 /// # Julia equivalent
 /// ```julia
@@ -85,7 +85,7 @@ pub fn isblasmatrix_identity<T>(view: &StridedArrayView<'_, T, 2, Identity>) -> 
 
 /// Check if a matrix with Conj operation is BLAS-compatible.
 ///
-/// For Conj matrices, only stride[1] == 1 is BLAS-compatible,
+/// For Conj matrices, only `stride[1] == 1` is BLAS-compatible,
 /// because we need to convert to adjoint which flips the dimensions.
 ///
 /// # Julia equivalent

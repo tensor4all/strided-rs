@@ -29,6 +29,7 @@
 //! let result = captured.call(&[1.0, 3.0]); // 1.0 + 3.0 * 2.0 = 7.0
 //! ```
 
+#[cfg(test)]
 use std::marker::PhantomData;
 
 use crate::element_op::{ElementOp, ElementOpApply, Identity};
@@ -36,14 +37,6 @@ use crate::kernel::{build_plan_fused, for_each_inner_block, is_contiguous, total
 use crate::promote::promote_strides_to_shape;
 use crate::view::{StridedArrayView, StridedArrayViewMut};
 use crate::Result;
-
-/// Type alias for broadcast promotion result with three views
-type PromoteShape3Result<'a, T, const N: usize, Op1, Op2, Op3> = Result<(
-    StridedArrayView<'a, T, N, Op1>,
-    StridedArrayView<'a, T, N, Op2>,
-    StridedArrayView<'a, T, N, Op3>,
-)>;
-
 
 // ============================================================================
 // Core types for lazy broadcast
@@ -241,17 +234,6 @@ impl<F> CaptureArgs<F, (Arg, Arg, Arg)> {
     }
 }
 
-impl<F> CaptureArgs<F, (Arg, Arg, Arg, Arg)> {
-    /// Call the captured function with four values.
-    #[inline]
-    pub fn call4<T>(&self, a: T, b: T, c: T, d: T) -> T
-    where
-        F: Fn(T, T, T, T) -> T,
-    {
-        (self.f)(a, b, c, d)
-    }
-}
-
 // ============================================================================
 // promoteshape: Broadcast arrays to common shape with stride-0
 // ============================================================================
@@ -295,36 +277,6 @@ pub fn promoteshape<'a, T, const N: usize, Op: ElementOp>(
     })
 }
 
-/// Promote multiple views to a common broadcast shape.
-///
-/// Returns a tuple of promoted views, all with the same shape but potentially
-/// with stride-0 dimensions for broadcasting.
-pub fn promoteshape2<'a, T, const N: usize, Op1: ElementOp, Op2: ElementOp>(
-    target_size: &[usize; N],
-    a: &StridedArrayView<'a, T, N, Op1>,
-    b: &StridedArrayView<'a, T, N, Op2>,
-) -> Result<(
-    StridedArrayView<'a, T, N, Op1>,
-    StridedArrayView<'a, T, N, Op2>,
-)> {
-    let a_promoted = promoteshape(target_size, a)?;
-    let b_promoted = promoteshape(target_size, b)?;
-    Ok((a_promoted, b_promoted))
-}
-
-/// Promote three views to a common broadcast shape.
-pub fn promoteshape3<'a, T, const N: usize, Op1: ElementOp, Op2: ElementOp, Op3: ElementOp>(
-    target_size: &[usize; N],
-    a: &StridedArrayView<'a, T, N, Op1>,
-    b: &StridedArrayView<'a, T, N, Op2>,
-    c: &StridedArrayView<'a, T, N, Op3>,
-) -> PromoteShape3Result<'a, T, N, Op1, Op2, Op3> {
-    let a_promoted = promoteshape(target_size, a)?;
-    let b_promoted = promoteshape(target_size, b)?;
-    let c_promoted = promoteshape(target_size, c)?;
-    Ok((a_promoted, b_promoted, c_promoted))
-}
-
 // ============================================================================
 // Broadcast execution
 // ============================================================================
@@ -351,342 +303,21 @@ pub fn promoteshape3<'a, T, const N: usize, Op1: ElementOp, Op2: ElementOp, Op3:
 ///     return dest
 /// end
 /// ```
-pub fn broadcast_into<T, const N: usize, Op1, Op2, F>(
+pub fn broadcast_into<T, const N: usize, Op, F>(
     dest: &mut StridedArrayViewMut<'_, T, N, Identity>,
     f: F,
-    a: &StridedArrayView<'_, T, N, Op1>,
-    b: &StridedArrayView<'_, T, N, Op2>,
+    a: &StridedArrayView<'_, T, N, Op>,
+    b: &StridedArrayView<'_, T, N, Op>,
 ) -> Result<()>
 where
     T: Copy + ElementOpApply,
-    Op1: ElementOp,
-    Op2: ElementOp,
+    Op: ElementOp,
     F: Fn(T, T) -> T,
 {
     // Create capture for the operation
     let capture = CaptureArgs::new(&f, (Arg, Arg));
 
-    broadcast_capture2_into(dest, &capture, a, b)
-}
-
-/// Execute a captured 2-input broadcast expression.
-///
-/// This enables Julia-style nested broadcast expressions and scalar arguments:
-/// `capture` can be a nested `CaptureArgs` tree, and is evaluated lazily per element.
-pub fn broadcast_capture2_into<T, const N: usize, Op1, Op2, C>(
-    dest: &mut StridedArrayViewMut<'_, T, N, Identity>,
-    capture: &C,
-    a: &StridedArrayView<'_, T, N, Op1>,
-    b: &StridedArrayView<'_, T, N, Op2>,
-) -> Result<()>
-where
-    T: Copy + ElementOpApply,
-    Op1: ElementOp,
-    Op2: ElementOp,
-    C: Consume<T, Output = T>,
-{
-    let dims = *dest.size();
-    let dst_strides = *dest.strides();
-    let total = total_len(&dims);
-    if total == 0 {
-        return Ok(());
-    }
-
-    let a_promoted = promoteshape(&dims, a)?;
-    let b_promoted = promoteshape(&dims, b)?;
-
-    let all_contig = is_contiguous(&dims, &dst_strides)
-        && is_contiguous(&dims, a_promoted.strides())
-        && is_contiguous(&dims, b_promoted.strides());
-    if all_contig {
-        let mut dst_ptr = dest.as_mut_ptr();
-        let mut p0 = a_promoted.as_ptr();
-        let mut p1 = b_promoted.as_ptr();
-        for _ in 0..total {
-            let v0 = unsafe { Op1::apply(*p0) };
-            let v1 = unsafe { Op2::apply(*p1) };
-            p0 = unsafe { p0.add(1) };
-            p1 = unsafe { p1.add(1) };
-            let mut it = [v0, v1].into_iter();
-            let out = capture.consume(&mut it);
-            unsafe {
-                *dst_ptr = out;
-                dst_ptr = dst_ptr.add(1);
-            }
-        }
-        return Ok(());
-    }
-
-    let strides_list = [&dst_strides[..], &a_promoted.strides()[..], &b_promoted.strides()[..]];
-    let (fused_dims, plan) =
-        build_plan_fused(&dims, &strides_list, Some(0), std::mem::size_of::<T>());
-
-    let dst_base = dest.as_mut_ptr();
-    let a_base = a_promoted.as_ptr();
-    let b_base = b_promoted.as_ptr();
-
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut dst_ptr = unsafe { dst_base.offset(offsets[0]) };
-        let mut p0 = unsafe { a_base.offset(offsets[1]) };
-        let mut p1 = unsafe { b_base.offset(offsets[2]) };
-        let dst_step = strides[0];
-        let s0 = strides[1];
-        let s1 = strides[2];
-        for _ in 0..len {
-            let v0 = unsafe { Op1::apply(*p0) };
-            let v1 = unsafe { Op2::apply(*p1) };
-            p0 = unsafe { p0.offset(s0) };
-            p1 = unsafe { p1.offset(s1) };
-            let mut it = [v0, v1].into_iter();
-            let out = capture.consume(&mut it);
-            unsafe {
-                *dst_ptr = out;
-                dst_ptr = dst_ptr.offset(dst_step);
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Execute a 3-way broadcast operation.
-pub fn broadcast3_into<T, const N: usize, Op1, Op2, Op3, F>(
-    dest: &mut StridedArrayViewMut<'_, T, N, Identity>,
-    f: F,
-    a: &StridedArrayView<'_, T, N, Op1>,
-    b: &StridedArrayView<'_, T, N, Op2>,
-    c: &StridedArrayView<'_, T, N, Op3>,
-) -> Result<()>
-where
-    T: Copy + ElementOpApply,
-    Op1: ElementOp,
-    Op2: ElementOp,
-    Op3: ElementOp,
-    F: Fn(T, T, T) -> T,
-{
-    let capture = CaptureArgs::new(&f, (Arg, Arg, Arg));
-
-    broadcast_capture3_into(dest, &capture, a, b, c)
-}
-
-/// Execute a captured 3-input broadcast expression.
-pub fn broadcast_capture3_into<T, const N: usize, Op1, Op2, Op3, C>(
-    dest: &mut StridedArrayViewMut<'_, T, N, Identity>,
-    capture: &C,
-    a: &StridedArrayView<'_, T, N, Op1>,
-    b: &StridedArrayView<'_, T, N, Op2>,
-    c: &StridedArrayView<'_, T, N, Op3>,
-) -> Result<()>
-where
-    T: Copy + ElementOpApply,
-    Op1: ElementOp,
-    Op2: ElementOp,
-    Op3: ElementOp,
-    C: Consume<T, Output = T>,
-{
-    let dims = *dest.size();
-    let dst_strides = *dest.strides();
-    let total = total_len(&dims);
-    if total == 0 {
-        return Ok(());
-    }
-
-    let a_promoted = promoteshape(&dims, a)?;
-    let b_promoted = promoteshape(&dims, b)?;
-    let c_promoted = promoteshape(&dims, c)?;
-
-    let all_contig = is_contiguous(&dims, &dst_strides)
-        && is_contiguous(&dims, a_promoted.strides())
-        && is_contiguous(&dims, b_promoted.strides())
-        && is_contiguous(&dims, c_promoted.strides());
-    if all_contig {
-        let mut dst_ptr = dest.as_mut_ptr();
-        let mut p0 = a_promoted.as_ptr();
-        let mut p1 = b_promoted.as_ptr();
-        let mut p2 = c_promoted.as_ptr();
-        for _ in 0..total {
-            let v0 = unsafe { Op1::apply(*p0) };
-            let v1 = unsafe { Op2::apply(*p1) };
-            let v2 = unsafe { Op3::apply(*p2) };
-            p0 = unsafe { p0.add(1) };
-            p1 = unsafe { p1.add(1) };
-            p2 = unsafe { p2.add(1) };
-            let mut it = [v0, v1, v2].into_iter();
-            let out = capture.consume(&mut it);
-            unsafe {
-                *dst_ptr = out;
-                dst_ptr = dst_ptr.add(1);
-            }
-        }
-        return Ok(());
-    }
-
-    let strides_list = [
-        &dst_strides[..],
-        &a_promoted.strides()[..],
-        &b_promoted.strides()[..],
-        &c_promoted.strides()[..],
-    ];
-    let (fused_dims, plan) =
-        build_plan_fused(&dims, &strides_list, Some(0), std::mem::size_of::<T>());
-
-    let dst_base = dest.as_mut_ptr();
-    let a_base = a_promoted.as_ptr();
-    let b_base = b_promoted.as_ptr();
-    let c_base = c_promoted.as_ptr();
-
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut dst_ptr = unsafe { dst_base.offset(offsets[0]) };
-        let mut p0 = unsafe { a_base.offset(offsets[1]) };
-        let mut p1 = unsafe { b_base.offset(offsets[2]) };
-        let mut p2 = unsafe { c_base.offset(offsets[3]) };
-        let dst_step = strides[0];
-        let s0 = strides[1];
-        let s1 = strides[2];
-        let s2 = strides[3];
-        for _ in 0..len {
-            let v0 = unsafe { Op1::apply(*p0) };
-            let v1 = unsafe { Op2::apply(*p1) };
-            let v2 = unsafe { Op3::apply(*p2) };
-            p0 = unsafe { p0.offset(s0) };
-            p1 = unsafe { p1.offset(s1) };
-            p2 = unsafe { p2.offset(s2) };
-            let mut it = [v0, v1, v2].into_iter();
-            let out = capture.consume(&mut it);
-            unsafe {
-                *dst_ptr = out;
-                dst_ptr = dst_ptr.offset(dst_step);
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Execute a 4-way broadcast operation.
-pub fn broadcast4_into<T, const N: usize, Op1, Op2, Op3, Op4, F>(
-    dest: &mut StridedArrayViewMut<'_, T, N, Identity>,
-    f: F,
-    a: &StridedArrayView<'_, T, N, Op1>,
-    b: &StridedArrayView<'_, T, N, Op2>,
-    c: &StridedArrayView<'_, T, N, Op3>,
-    d: &StridedArrayView<'_, T, N, Op4>,
-) -> Result<()>
-where
-    T: Copy + ElementOpApply,
-    Op1: ElementOp,
-    Op2: ElementOp,
-    Op3: ElementOp,
-    Op4: ElementOp,
-    F: Fn(T, T, T, T) -> T,
-{
-    let capture = CaptureArgs::new(&f, (Arg, Arg, Arg, Arg));
-
-    broadcast_capture4_into(dest, &capture, a, b, c, d)
-}
-
-/// Execute a captured 4-input broadcast expression.
-pub fn broadcast_capture4_into<T, const N: usize, Op1, Op2, Op3, Op4, C>(
-    dest: &mut StridedArrayViewMut<'_, T, N, Identity>,
-    capture: &C,
-    a: &StridedArrayView<'_, T, N, Op1>,
-    b: &StridedArrayView<'_, T, N, Op2>,
-    c: &StridedArrayView<'_, T, N, Op3>,
-    d: &StridedArrayView<'_, T, N, Op4>,
-) -> Result<()>
-where
-    T: Copy + ElementOpApply,
-    Op1: ElementOp,
-    Op2: ElementOp,
-    Op3: ElementOp,
-    Op4: ElementOp,
-    C: Consume<T, Output = T>,
-{
-    let dims = *dest.size();
-    let dst_strides = *dest.strides();
-    let total = total_len(&dims);
-    if total == 0 {
-        return Ok(());
-    }
-
-    let a_promoted = promoteshape(&dims, a)?;
-    let b_promoted = promoteshape(&dims, b)?;
-    let c_promoted = promoteshape(&dims, c)?;
-    let d_promoted = promoteshape(&dims, d)?;
-
-    let all_contig = is_contiguous(&dims, &dst_strides)
-        && is_contiguous(&dims, a_promoted.strides())
-        && is_contiguous(&dims, b_promoted.strides())
-        && is_contiguous(&dims, c_promoted.strides())
-        && is_contiguous(&dims, d_promoted.strides());
-    if all_contig {
-        let mut dst_ptr = dest.as_mut_ptr();
-        let mut p0 = a_promoted.as_ptr();
-        let mut p1 = b_promoted.as_ptr();
-        let mut p2 = c_promoted.as_ptr();
-        let mut p3 = d_promoted.as_ptr();
-        for _ in 0..total {
-            let v0 = unsafe { Op1::apply(*p0) };
-            let v1 = unsafe { Op2::apply(*p1) };
-            let v2 = unsafe { Op3::apply(*p2) };
-            let v3 = unsafe { Op4::apply(*p3) };
-            p0 = unsafe { p0.add(1) };
-            p1 = unsafe { p1.add(1) };
-            p2 = unsafe { p2.add(1) };
-            p3 = unsafe { p3.add(1) };
-            let mut it = [v0, v1, v2, v3].into_iter();
-            let out = capture.consume(&mut it);
-            unsafe {
-                *dst_ptr = out;
-                dst_ptr = dst_ptr.add(1);
-            }
-        }
-        return Ok(());
-    }
-
-    let strides_list = [
-        &dst_strides[..],
-        &a_promoted.strides()[..],
-        &b_promoted.strides()[..],
-        &c_promoted.strides()[..],
-        &d_promoted.strides()[..],
-    ];
-    let (fused_dims, plan) =
-        build_plan_fused(&dims, &strides_list, Some(0), std::mem::size_of::<T>());
-
-    let dst_base = dest.as_mut_ptr();
-    let a_base = a_promoted.as_ptr();
-    let b_base = b_promoted.as_ptr();
-    let c_base = c_promoted.as_ptr();
-    let d_base = d_promoted.as_ptr();
-
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut dst_ptr = unsafe { dst_base.offset(offsets[0]) };
-        let mut p0 = unsafe { a_base.offset(offsets[1]) };
-        let mut p1 = unsafe { b_base.offset(offsets[2]) };
-        let mut p2 = unsafe { c_base.offset(offsets[3]) };
-        let mut p3 = unsafe { d_base.offset(offsets[4]) };
-        let dst_step = strides[0];
-        let s0 = strides[1];
-        let s1 = strides[2];
-        let s2 = strides[3];
-        let s3 = strides[4];
-        for _ in 0..len {
-            let v0 = unsafe { Op1::apply(*p0) };
-            let v1 = unsafe { Op2::apply(*p1) };
-            let v2 = unsafe { Op3::apply(*p2) };
-            let v3 = unsafe { Op4::apply(*p3) };
-            p0 = unsafe { p0.offset(s0) };
-            p1 = unsafe { p1.offset(s1) };
-            p2 = unsafe { p2.offset(s2) };
-            p3 = unsafe { p3.offset(s3) };
-            let mut it = [v0, v1, v2, v3].into_iter();
-            let out = capture.consume(&mut it);
-            unsafe {
-                *dst_ptr = out;
-                dst_ptr = dst_ptr.offset(dst_step);
-            }
-        }
-        Ok(())
-    })
+    broadcast_capture_into(dest, &capture, &[a, b])
 }
 
 /// Execute a captured broadcast expression with an arbitrary number of source arrays.
@@ -999,10 +630,12 @@ where
 /// Builder for constructing complex broadcast expressions.
 ///
 /// This allows building nested CaptureArgs with a fluent interface.
+#[cfg(test)]
 pub struct BroadcastBuilder<T> {
     _phantom: PhantomData<T>,
 }
 
+#[cfg(test)]
 impl<T> BroadcastBuilder<T> {
     /// Create a new broadcast builder.
     pub fn new() -> Self {
@@ -1032,6 +665,7 @@ impl<T> BroadcastBuilder<T> {
     }
 }
 
+#[cfg(test)]
 impl<T> Default for BroadcastBuilder<T> {
     fn default() -> Self {
         Self::new()
@@ -1259,7 +893,8 @@ mod tests {
         let mut dest: StridedArrayViewMut<'_, f64, 2, Identity> =
             StridedArrayViewMut::new(&mut dest_data, [2, 3], [3, 1], 0).unwrap();
 
-        broadcast3_into(&mut dest, |x, y, z| x + y * z, &a, &b, &c).unwrap();
+        let capture = CaptureArgs::new(|x: f64, y: f64, z: f64| x + y * z, (Arg, Arg, Arg));
+        broadcast_capture_into(&mut dest, &capture, &[&a, &b, &c]).unwrap();
 
         // Element [0, 0]: 1 + 10 * 2 = 21
         // Element [0, 1]: 2 + 11 * 2 = 24
@@ -1289,7 +924,9 @@ mod tests {
         let mut dest: StridedArrayViewMut<'_, f64, 2, Identity> =
             StridedArrayViewMut::new(&mut dest_data, [2, 2], [2, 1], 0).unwrap();
 
-        broadcast4_into(&mut dest, |x, y, z, w| x + y + z + w, &a, &b, &c, &d).unwrap();
+        let capture =
+            CaptureArgs::new(|x: f64, y: f64, z: f64, w: f64| x + y + z + w, (Arg, Arg, Arg, Arg));
+        broadcast_capture_into(&mut dest, &capture, &[&a, &b, &c, &d]).unwrap();
 
         // Element [0,0]: 1 + 10 + 100 + 1000
         assert_eq!(dest.get([0, 0]), 1111.0);
@@ -1298,31 +935,8 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_capture2_nested_with_scalar() {
-        // dest = (a * b) + 1
-        let a_data: Vec<f64> = (1..=6).map(|x| x as f64).collect();
-        let b_data = vec![2.0; 6];
-        let mut dest_data = vec![0.0; 6];
-
-        let a: StridedArrayView<'_, f64, 2, Identity> =
-            StridedArrayView::new(&a_data, [2, 3], [3, 1], 0).unwrap();
-        let b: StridedArrayView<'_, f64, 2, Identity> =
-            StridedArrayView::new(&b_data, [2, 3], [3, 1], 0).unwrap();
-        let mut dest: StridedArrayViewMut<'_, f64, 2, Identity> =
-            StridedArrayViewMut::new(&mut dest_data, [2, 3], [3, 1], 0).unwrap();
-
-        let inner = CaptureArgs::new(|x: f64, y: f64| x * y, (Arg, Arg));
-        let outer = CaptureArgs::new(|p: f64, s: f64| p + s, (inner, Scalar(1.0)));
-
-        broadcast_capture2_into(&mut dest, &outer, &a, &b).unwrap();
-
-        assert_eq!(dest.get([0, 0]), 1.0 * 2.0 + 1.0);
-        assert_eq!(dest.get([1, 2]), 6.0 * 2.0 + 1.0);
-    }
-
-    #[test]
     fn test_broadcast_capture_into_two_sources() {
-        // Same as broadcast_capture2_into but through the arbitrary-N API.
+        // dest = (a * b) + 1 (nested capture, two sources)
         let a_data: Vec<f64> = (1..=6).map(|x| x as f64).collect();
         let b_data = vec![2.0; 6];
         let mut dest_data = vec![0.0; 6];
@@ -1405,136 +1019,6 @@ mod tests {
         assert_eq!(dest.get([1]), Complex::new(3.0, 1.0));
         assert_eq!(dest.get([2]), Complex::new(5.0, -4.0));
         assert_eq!(dest.get([3]), Complex::new(7.0, 2.0));
-    }
-
-    #[test]
-    fn test_broadcast_capture2_into_mixed_ops() {
-        let a_data = vec![
-            Complex::new(1.0, 2.0),
-            Complex::new(3.0, -1.0),
-            Complex::new(5.0, 4.0),
-            Complex::new(7.0, -2.0),
-        ];
-        let b_data = vec![
-            Complex::new(1.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(3.0, 0.0),
-            Complex::new(4.0, 0.0),
-        ];
-        let mut out = vec![Complex::new(0.0, 0.0); 4];
-
-        let a: StridedArrayView<'_, Complex<f64>, 1, Conj> =
-            StridedArrayView::<Complex<f64>, 1, Identity>::new(&a_data, [4], [1], 0)
-                .unwrap()
-                .conj();
-        let b: StridedArrayView<'_, Complex<f64>, 1, Identity> =
-            StridedArrayView::new(&b_data, [4], [1], 0).unwrap();
-        let mut dest: StridedArrayViewMut<'_, Complex<f64>, 1, Identity> =
-            StridedArrayViewMut::new(&mut out, [4], [1], 0).unwrap();
-
-        let capture = CaptureArgs::new(|x: Complex<f64>, y: Complex<f64>| x + y, (Arg, Arg));
-        broadcast_capture2_into(&mut dest, &capture, &a, &b).unwrap();
-
-        assert_eq!(dest.get([0]), Complex::new(2.0, -2.0));
-        assert_eq!(dest.get([1]), Complex::new(5.0, 1.0));
-        assert_eq!(dest.get([2]), Complex::new(8.0, -4.0));
-        assert_eq!(dest.get([3]), Complex::new(11.0, 2.0));
-    }
-
-    #[test]
-    fn test_broadcast_capture3_into_mixed_ops() {
-        let a_data = vec![
-            Complex::new(1.0, 2.0),
-            Complex::new(3.0, -1.0),
-            Complex::new(5.0, 4.0),
-            Complex::new(7.0, -2.0),
-        ];
-        let b_data = vec![
-            Complex::new(1.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(3.0, 0.0),
-            Complex::new(4.0, 0.0),
-        ];
-        let c_data = vec![
-            Complex::new(2.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(2.0, 0.0),
-        ];
-        let mut out = vec![Complex::new(0.0, 0.0); 4];
-
-        let a: StridedArrayView<'_, Complex<f64>, 1, Conj> =
-            StridedArrayView::<Complex<f64>, 1, Identity>::new(&a_data, [4], [1], 0)
-                .unwrap()
-                .conj();
-        let b: StridedArrayView<'_, Complex<f64>, 1, Identity> =
-            StridedArrayView::new(&b_data, [4], [1], 0).unwrap();
-        let c: StridedArrayView<'_, Complex<f64>, 1, Identity> =
-            StridedArrayView::new(&c_data, [4], [1], 0).unwrap();
-        let mut dest: StridedArrayViewMut<'_, Complex<f64>, 1, Identity> =
-            StridedArrayViewMut::new(&mut out, [4], [1], 0).unwrap();
-
-        let capture =
-            CaptureArgs::new(|x: Complex<f64>, y: Complex<f64>, z: Complex<f64>| x + y + z, (Arg, Arg, Arg));
-        broadcast_capture3_into(&mut dest, &capture, &a, &b, &c).unwrap();
-
-        assert_eq!(dest.get([0]), Complex::new(4.0, -2.0));
-        assert_eq!(dest.get([1]), Complex::new(7.0, 1.0));
-        assert_eq!(dest.get([2]), Complex::new(10.0, -4.0));
-        assert_eq!(dest.get([3]), Complex::new(13.0, 2.0));
-    }
-
-    #[test]
-    fn test_broadcast_capture4_into_mixed_ops() {
-        let a_data = vec![
-            Complex::new(1.0, 2.0),
-            Complex::new(3.0, -1.0),
-            Complex::new(5.0, 4.0),
-            Complex::new(7.0, -2.0),
-        ];
-        let b_data = vec![
-            Complex::new(1.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(3.0, 0.0),
-            Complex::new(4.0, 0.0),
-        ];
-        let c_data = vec![
-            Complex::new(2.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(2.0, 0.0),
-            Complex::new(2.0, 0.0),
-        ];
-        let d_data = vec![
-            Complex::new(1.0, 0.0),
-            Complex::new(1.0, 0.0),
-            Complex::new(1.0, 0.0),
-            Complex::new(1.0, 0.0),
-        ];
-        let mut out = vec![Complex::new(0.0, 0.0); 4];
-
-        let a: StridedArrayView<'_, Complex<f64>, 1, Conj> =
-            StridedArrayView::<Complex<f64>, 1, Identity>::new(&a_data, [4], [1], 0)
-                .unwrap()
-                .conj();
-        let b: StridedArrayView<'_, Complex<f64>, 1, Identity> =
-            StridedArrayView::new(&b_data, [4], [1], 0).unwrap();
-        let c: StridedArrayView<'_, Complex<f64>, 1, Identity> =
-            StridedArrayView::new(&c_data, [4], [1], 0).unwrap();
-        let d: StridedArrayView<'_, Complex<f64>, 1, Identity> =
-            StridedArrayView::new(&d_data, [4], [1], 0).unwrap();
-        let mut dest: StridedArrayViewMut<'_, Complex<f64>, 1, Identity> =
-            StridedArrayViewMut::new(&mut out, [4], [1], 0).unwrap();
-
-        let capture = CaptureArgs::new(
-            |x: Complex<f64>, y: Complex<f64>, z: Complex<f64>, w: Complex<f64>| x + y + z + w,
-            (Arg, Arg, Arg, Arg),
-        );
-        broadcast_capture4_into(&mut dest, &capture, &a, &b, &c, &d).unwrap();
-
-        assert_eq!(dest.get([0]), Complex::new(5.0, -2.0));
-        assert_eq!(dest.get([1]), Complex::new(8.0, 1.0));
-        assert_eq!(dest.get([2]), Complex::new(11.0, -4.0));
-        assert_eq!(dest.get([3]), Complex::new(14.0, 2.0));
     }
 
     #[test]

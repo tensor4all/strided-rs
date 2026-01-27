@@ -6,11 +6,11 @@
 //!
 //! # Feature Flags
 //!
-//! - **`parallel`**: Enable rayon-based parallel iteration via [`par_zip_map2_into`].
+//! - **`parallel`**: Enable rayon-based parallel iteration.
 //!   Uses Julia-style divide-and-conquer threading for large arrays.
 //!
-//! - **`blas`**: Enable CBLAS-backed linear algebra operations ([`blas_axpy`], [`blas_dot`],
-//!   [`blas_gemm`]). Requires a CBLAS implementation to be available.
+//! - **`blas`**: Enable CBLAS-backed linear algebra operations ([`generic_axpy`], [`generic_dot`],
+//!   [`generic_gemm`]). Requires a CBLAS implementation to be available.
 //!
 //! # Core Types
 //!
@@ -24,26 +24,26 @@
 //!
 //! - [`map_into`]: Apply a function element-wise from source to destination
 //! - [`zip_map2_into`], [`zip_map3_into`], [`zip_map4_into`]: Multi-array element-wise operations
-//! - [`par_zip_map2_into`] (with `parallel` feature): Parallel binary map
 //!
 //! ## Reduce Operations
 //!
 //! - [`reduce`]: Full reduction with map function
 //! - [`reduce_axis`]: Reduce along a single axis
 //! - [`mapreducedim_into`]: Map-reduce along dimensions (Julia's `mapreducedim!`)
+//! - [`mapreducedim_capture_views_into`]: Map-reduce with captured broadcast expressions
 //!
 //! ## Broadcast Operations
 //!
-//! - [`broadcast_into`], [`broadcast3_into`]: Broadcasting with automatic shape promotion
-//! - [`promoteshape`], [`promoteshape2`], [`promoteshape3`]: Explicit shape promotion for broadcasting
+//! - [`broadcast_into`]: Broadcasting with automatic shape promotion
+//! - [`promoteshape`]: Explicit shape promotion for broadcasting
 //! - [`CaptureArgs`]: Lazy broadcast expression builder (Julia's `CaptureArgs`)
 //!
 //! ## Linear Algebra
 //!
 //! - [`matmul`], [`generic_matmul`]: Matrix multiplication with alpha/beta scaling
-//! - [`linalg::axpy`](linalg_axpy), [`axpby`]: Vector operations (y = alpha*x + y, y = alpha*x + beta*y)
+//! - [`axpy`], [`axpby`]: Vector operations (y = alpha*x + y, y = alpha*x + beta*y)
 //! - [`lmul`], [`rmul`]: Scalar multiplication
-//! - [`isblasmatrix`], [`isblasmatrix_identity`], [`isblasmatrix_conj`]: BLAS compatibility checks
+//! - [`is_blas_matrix`], [`isblasmatrix_identity`], [`isblasmatrix_conj`]: BLAS compatibility checks
 //!
 //! ## Basic Operations
 //!
@@ -146,11 +146,7 @@ pub use ops::{
 // Reduce operations
 // ============================================================================
 pub use reduce::{
-    mapreducedim_capture1_into, mapreducedim_capture2_into, mapreducedim_capture3_into,
-    mapreducedim_capture4_into, mapreducedim_capture2_views_into,
-    mapreducedim_capture3_views_into, mapreducedim_capture4_views_into,
-    mapreducedim_capture_views_into,
-    mapreducedim_into, reduce, reduce_axis,
+    mapreducedim_capture_views_into, mapreducedim_into, reduce, reduce_axis,
 };
 
 // ============================================================================
@@ -165,8 +161,7 @@ pub use view::{
 // Broadcast operations (CaptureArgs for lazy evaluation)
 // ============================================================================
 pub use broadcast::{
-    broadcast3_into, broadcast_into, promoteshape, promoteshape2, promoteshape3, Arg,
-    BroadcastBuilder, CaptureArgs, Consume, Scalar,
+    broadcast_into, promoteshape, Arg, CaptureArgs, Consume, Scalar,
 };
 
 // ============================================================================

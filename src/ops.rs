@@ -963,6 +963,22 @@ where
     let d_row = dst_view.strides[0];
     let d_col = dst_view.strides[1];
 
+    // Specialized fast path: true transpose copy for square matrices.
+    // This matches the common benchmark pattern: dst is row-major contiguous,
+    // src is the transpose view of a row-major contiguous matrix (i.e. src is column-major).
+    // For T: Copy we can use a stack tile buffer to turn strided loads/stores into
+    // mostly contiguous accesses (Julia/Strided.jl style).
+    if rows == cols
+        && rows >= 64
+        && d_col == 1
+        && d_row.unsigned_abs() == cols
+        && s_row.unsigned_abs() == 1
+        && s_col.unsigned_abs() == rows
+        && copy_2d_transpose_microtile(dst_view, src_view)?
+    {
+        return Ok(true);
+    }
+
     // Check if this is a transpose-like pattern that benefits from tiling
     // Transpose pattern: reading with large stride, writing sequentially
     // Use tiling for arrays larger than 32x32 to improve cache performance
@@ -1012,6 +1028,94 @@ where
     }
 
     Ok(false)
+}
+
+/// Tiled transpose copy for square matrices when:
+/// - dst is row-major contiguous (d_col == 1)
+/// - src is column-major contiguous (s_row == 1)
+///
+/// Returns:
+/// - `Some(true)` if the optimized path ran
+/// - `Some(false)` if the shape/layout doesn't match the fast path
+/// - `None` if `T` is not `Copy` (caller should fall back)
+#[inline]
+fn copy_2d_transpose_microtile<T>(
+    dst_view: &StridedViewMut<T>,
+    src_view: &StridedView<T>,
+) -> Result<bool>
+where
+    T: Clone,
+{
+    if dst_view.dims.len() != 2 || src_view.dims.len() != 2 {
+        return Ok(false);
+    }
+    let n = dst_view.dims[0];
+    if n == 0 || n != dst_view.dims[1] || n != src_view.dims[0] || n != src_view.dims[1] {
+        return Ok(false);
+    }
+
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+
+    if d_col != 1 || d_row.unsigned_abs() != n {
+        return Ok(false);
+    }
+    if s_row.unsigned_abs() != 1 || s_col.unsigned_abs() != n {
+        return Ok(false);
+    }
+
+    // Compute outer tile size based on L1-like block (Julia-style)
+    const BLOCK_MEMORY_SIZE: usize = 1 << 15; // 32KB
+    let elem_size = std::mem::size_of::<T>().max(1);
+    let max_elems = BLOCK_MEMORY_SIZE / elem_size / 2; // factor 2 for src+dst
+    let mut outer_tile = (max_elems as f64).sqrt() as usize;
+    outer_tile = outer_tile.clamp(16, 64);
+
+    const MICRO: usize = 4; // micro-kernel size (register block)
+
+    let src_ptr = src_view.ptr;
+    let dst_ptr = dst_view.ptr;
+
+    for i0 in (0..n).step_by(outer_tile) {
+        let i_end = (i0 + outer_tile).min(n);
+        for j0 in (0..n).step_by(outer_tile) {
+            let j_end = (j0 + outer_tile).min(n);
+
+            for ii in (i0..i_end).step_by(MICRO) {
+                for jj in (j0..j_end).step_by(MICRO) {
+                    // compute block dims
+                    let i_len = (ii + MICRO).min(i_end) - ii;
+                    let j_len = (jj + MICRO).min(j_end) - jj;
+
+                    unsafe {
+                        // load micro-tile into registers (scalars)
+                        let mut buf: [std::mem::MaybeUninit<T>; MICRO * MICRO] =
+                            std::mem::MaybeUninit::uninit().assume_init();
+                        for j in 0..j_len {
+                            let s_col_ptr = src_ptr.offset((ii as isize) * s_row + ((jj + j) as isize) * s_col);
+                            for i in 0..i_len {
+                                let v = (&*s_col_ptr.offset(i as isize * s_row)).clone();
+                                buf[i * MICRO + j].write(v);
+                            }
+                        }
+
+                        // store transposed
+                        for j in 0..j_len {
+                            let d_row_ptr = dst_ptr.offset(((jj + j) as isize) * d_row + (ii as isize) * d_col);
+                            for i in 0..i_len {
+                                let v = buf[i * MICRO + j].assume_init_read();
+                                *d_row_ptr.add(i) = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 fn copy_4d_contig_dst<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<()>

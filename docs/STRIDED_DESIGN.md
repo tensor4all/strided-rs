@@ -1,71 +1,71 @@
-# Strided Array 設計ドキュメント
+# Strided Array Design Document
 
-このドキュメントは、Julia の `StridedViews.jl` および `Strided.jl` パッケージの実装を分析し、Rust での実装に向けた設計知見をまとめたものです。
+This document analyzes the implementations of Julia’s `StridedViews.jl` and `Strided.jl` packages and summarizes design insights for a Rust implementation.
 
-## 目次
+## Table of Contents
 
-1. [概要](#概要)
-2. [StridedView 型の設計](#stridedview-型の設計)
-3. [メモリレイアウトとインデックス計算](#メモリレイアウトとインデックス計算)
-4. [操作関数の合成](#操作関数の合成)
-5. [ビュー変換操作](#ビュー変換操作)
-6. [キャッシュ最適化](#キャッシュ最適化)
-7. [マルチスレッド実装](#マルチスレッド実装)
-8. [ブロードキャスト](#ブロードキャスト)
-9. [線形代数との統合](#線形代数との統合)
-10. [Rust 実装への示唆](#rust-実装への示唆)
+1. [Overview](#overview)
+2. [StridedView Type Design](#stridedview-type-design)
+3. [Memory Layout and Indexing](#memory-layout-and-indexing)
+4. [Operation Composition](#operation-composition)
+5. [View Transformations](#view-transformations)
+6. [Cache Optimization](#cache-optimization)
+7. [Multithreading](#multithreading)
+8. [Broadcasting](#broadcasting)
+9. [Linear Algebra Integration](#linear-algebra-integration)
+10. [Implications for Rust Implementation](#implications-for-rust-implementation)
 
 ---
 
-## 概要
+## Overview
 
-### パッケージ構成
+### Package Structure
 
 ```
-StridedViews.jl  - StridedView 型の定義（データ構造のみ、計算なし）
+StridedViews.jl  - StridedView type definition (data structure only, no computation)
     ↓
-Strided.jl       - 効率的な計算実装（map/reduce、ブロードキャスト、BLAS連携）
+Strided.jl       - Efficient computation implementations (map/reduce, broadcast, BLAS integration)
 ```
 
-### 設計思想
+### Design Principles
 
-1. **ゼロコピー**: `permutedims`, `transpose`, `adjoint`, スライシングはすべてビューを返す
-2. **遅延評価**: 操作はメタデータ（ストライド、オフセット）の変更のみ
-3. **キャッシュフレンドリー**: ブロッキングとループ順序の最適化
-4. **マルチスレッド**: 分割統治法による並列化
+1. **Zero-copy**: `permutedims`, `transpose`, `adjoint`, and slicing return views
+2. **Lazy evaluation**: operations only modify metadata (strides, offsets)
+3. **Cache-friendly**: blocking and loop-order optimization
+4. **Multithreading**: parallelization via divide-and-conquer
 
 ---
 
-## StridedView 型の設計
+## StridedView Type Design
 
-### 型定義
+### Type Definition
 
 ```julia
 struct StridedView{T,N,A<:DenseArray,F<:Union{FN,FC,FA,FT}} <: AbstractArray{T,N}
-    parent::A              # 親配列（実データを保持）
-    size::NTuple{N,Int}    # 各次元のサイズ
-    strides::NTuple{N,Int} # 各次元のストライド
-    offset::Int            # 開始オフセット
-    op::F                  # 要素に適用する操作
+    parent::A              # parent array (stores data)
+    size::NTuple{N,Int}    # size for each dimension
+    strides::NTuple{N,Int} # stride for each dimension
+    offset::Int            # start offset
+    op::F                  # element-wise operation
 end
 ```
 
-### 型パラメータ
+### Type Parameters
 
-| パラメータ | 説明 |
-|-----------|------|
-| `T` | 要素型（`op` 適用後の型） |
-| `N` | 次元数（コンパイル時既知） |
-| `A` | 親配列の型（`DenseArray` のサブタイプ） |
-| `F` | 操作関数の型（4種類のいずれか） |
+| Parameter | Description |
+|-----------|-------------|
+| `T` | Element type (after applying `op`) |
+| `N` | Rank (known at compile time) |
+| `A` | Parent array type (`DenseArray` subtype) |
+| `F` | Operation function type (one of four variants) |
 
-### Rust での対応
+### Rust Mapping
 
 ```rust
 pub struct StridedView<'a, T, const N: usize, Op = Identity> {
-    data: &'a [T],           // または &'a mut [T]
+    data: &'a [T],           // or &'a mut [T]
     size: [usize; N],
-    strides: [isize; N],     // 負のストライドをサポート
+    strides: [isize; N],     // supports negative strides
     offset: usize,
     _op: PhantomData<Op>,
 }
@@ -73,17 +73,17 @@ pub struct StridedView<'a, T, const N: usize, Op = Identity> {
 
 ---
 
-## メモリレイアウトとインデックス計算
+## Memory Layout and Indexing
 
-### 線形インデックス計算
+### Linear Index Calculation
 
-多次元インデックス `(i₁, i₂, ..., iₙ)` から線形インデックスへの変換：
+Conversion from multidimensional index `(i₁, i₂, ..., iₙ)` to linear index:
 
 ```
 linear_index = offset + 1 + Σ(iₖ - 1) * strideₖ
 ```
 
-### Julia 実装
+### Julia Implementation
 
 ```julia
 @inline function _computeind(indices::NTuple{N,Int}, strides::NTuple{N,Int}) where {N}
@@ -92,7 +92,7 @@ end
 _computeind(indices::Tuple{}, strides::Tuple{}) = 1
 ```
 
-### Rust 実装案
+### Rust Sketch
 
 ```rust
 #[inline]
@@ -104,19 +104,19 @@ fn compute_index<const N: usize>(indices: &[usize; N], strides: &[isize; N]) -> 
 }
 ```
 
-### ストライドの正規化
+### Stride Normalization
 
-サイズ1の次元のストライドは任意の値を取れるため、正規化が必要：
+Strides for size-1 dimensions can be arbitrary, so normalization is required:
 
 ```julia
 function _normalizestrides(size::Dims{N}, strides::Dims{N}) where {N}
     for i in 1:N
         if size[i] == 1
-            # サイズ1の次元のストライドを前の次元に基づいて設定
+            # set stride for size-1 dimension based on the previous dimension
             newstride = i == 1 ? 1 : strides[i - 1] * size[i - 1]
             strides = setindex(strides, newstride, i)
         elseif size[i] == 0
-            # サイズ0の次元がある場合、全てのストライドを1に
+            # if any dimension has size 0, set all strides to 1
             return (1, cumprod(size)[1:end-1]...)
         end
     end
@@ -126,42 +126,42 @@ end
 
 ---
 
-## 操作関数の合成
+## Operation Composition
 
-### 4つの操作関数
+### Four Element Operations
 
-| 関数 | 説明 | 型エイリアス |
-|------|------|-------------|
-| `identity` | 恒等関数 | `FN` |
-| `conj` | 複素共役 | `FC` |
-| `transpose` | 転置（要素レベル） | `FT` |
-| `adjoint` | 随伴（共役転置） | `FA` |
+| Function | Description | Type Alias |
+|----------|-------------|------------|
+| `identity` | Identity | `FN` |
+| `conj` | Complex conjugate | `FC` |
+| `transpose` | Transpose (element-wise) | `FT` |
+| `adjoint` | Adjoint (conjugate transpose) | `FA` |
 
-### 合成規則（群構造）
+### Composition Rules (Group Structure)
 
-これらの操作は合成に関して閉じており、群を形成します：
+These operations are closed under composition and form a group:
 
 ```julia
-# conj を適用した後の操作
+# operation after applying conj
 _conj(::FN) = conj       # identity ∘ conj = conj
 _conj(::FC) = identity   # conj ∘ conj = identity
 _conj(::FA) = transpose  # adjoint ∘ conj = transpose
 _conj(::FT) = adjoint    # transpose ∘ conj = adjoint
 
-# transpose を適用した後の操作
+# operation after applying transpose
 _transpose(::FN) = transpose
 _transpose(::FC) = adjoint
 _transpose(::FA) = conj
 _transpose(::FT) = identity
 
-# adjoint を適用した後の操作
+# operation after applying adjoint
 _adjoint(::FN) = adjoint
 _adjoint(::FC) = transpose
 _adjoint(::FA) = identity
 _adjoint(::FT) = conj
 ```
 
-### 群の乗積表
+### Cayley Table
 
 |  ∘  | id | conj | trans | adj |
 |-----|-----|------|-------|-----|
@@ -170,7 +170,7 @@ _adjoint(::FT) = conj
 | **trans** | trans | adj | id | conj |
 | **adj** | adj | trans | conj | id |
 
-### Rust での実装案
+### Rust Sketch
 
 ```rust
 pub trait ElementOp: Copy + Default {
@@ -203,11 +203,11 @@ impl ElementOp for Conj {
 
 ---
 
-## ビュー変換操作
+## View Transformations
 
-### permutedims（次元の並べ替え）
+### permutedims (dimension permutation)
 
-ストライドとサイズを並べ替えるだけで、データコピーなし：
+Reorder strides and sizes without copying data:
 
 ```julia
 @inline function Base.permutedims(a::StridedView{T,N}, p) where {T,N}
@@ -218,14 +218,14 @@ impl ElementOp for Conj {
 end
 ```
 
-### transpose / adjoint（2次元配列）
+### transpose / adjoint (2D arrays)
 
 ```julia
 LinearAlgebra.transpose(a::StridedView{<:Number,2}) = permutedims(a, (2, 1))
 LinearAlgebra.adjoint(a::StridedView{<:Number,2}) = permutedims(conj(a), (2, 1))
 ```
 
-### sview（スライシング）
+### sview (slicing)
 
 ```julia
 @inline function Base.getindex(a::StridedView{T,N}, I::Vararg{SliceIndex,N}) where {T,N}
@@ -237,12 +237,12 @@ LinearAlgebra.adjoint(a::StridedView{<:Number,2}) = permutedims(conj(a), (2, 1))
 end
 ```
 
-#### ビューサイズの計算
+#### View Size Calculation
 
 ```julia
 @inline function _computeviewsize(oldsize::NTuple{N,Int}, I::NTuple{N,SliceIndex}) where {N}
     if isa(I[1], Int)
-        return _computeviewsize(tail(oldsize), tail(I))  # 次元削減
+        return _computeviewsize(tail(oldsize), tail(I))  # dimension reduction
     elseif isa(I[1], Colon)
         return (oldsize[1], _computeviewsize(tail(oldsize), tail(I))...)
     else  # Range
@@ -251,12 +251,12 @@ end
 end
 ```
 
-#### ビューストライドの計算
+#### View Stride Calculation
 
 ```julia
 @inline function _computeviewstrides(oldstrides::NTuple{N,Int}, I::NTuple{N,SliceIndex}) where {N}
     if isa(I[1], Integer)
-        return _computeviewstrides(tail(oldstrides), tail(I))  # 次元削減
+        return _computeviewstrides(tail(oldstrides), tail(I))  # dimension reduction
     elseif isa(I[1], Colon)
         return (oldstrides[1], _computeviewstrides(tail(oldstrides), tail(I))...)
     else  # Range
@@ -265,249 +265,47 @@ end
 end
 ```
 
-### sreshape（ストライド保持リシェイプ）
+---
 
-すべての `reshape` がストライド構造を保持できるわけではない：
+## Cache Optimization
 
-**成功条件**:
-- 次元の分割は常に可能
-- 次元の結合は `stride(A, i+1) == size(A, i) * stride(A, i)` の場合のみ
+### Background
 
-```julia
-function _computereshapestrides(newsize::Dims, oldsize::Dims{N}, strides::Dims{N}) where {N}
-    d, r = divrem(oldsize[1], newsize[1])
-    if r == 0
-        s1 = strides[1]
-        if d == 1
-            # 次元をそのまま進める
-            oldsize = (tail(oldsize)..., 1)
-            strides = (tail(strides)..., 1)
-            stail = _computereshapestrides(tail(newsize), oldsize, strides)
-            return isnothing(stail) ? nothing : (s1, stail...)
-        else
-            # 次元を分割
-            oldsize = (d, tail(oldsize)...)
-            strides = (newsize[1] * s1, tail(strides)...)
-            stail = _computereshapestrides(tail(newsize), oldsize, strides)
-            return isnothing(stail) ? nothing : (s1, stail...)
-        end
-    else
-        # 分割できない場合
-        return prod(newsize) != prod(oldsize) ? throw(DimensionMismatch()) : nothing
-    end
-end
+Contiguous memory access is critical for performance. Strided access can be improved by reordering loops and blocking to improve cache locality.
+
+### Julia Strategy
+
+The core pipeline is:
+
 ```
+_mapreduce_fuse! → _mapreduce_order! → _mapreduce_block! → _mapreduce_kernel!
+```
+
+### Blocking
+
+Block sizes are chosen based on element size and cache capacity to reduce cache misses.
+
+### Loop Order Optimization
+
+Dimensions are ordered by stride magnitude to maximize contiguous access.
 
 ---
 
-## キャッシュ最適化
+## Multithreading
 
-### 定数
+### Divide-and-Conquer Parallelization
 
-```julia
-const BLOCKMEMORYSIZE = 1 << 15  # L1キャッシュサイズ（32KB）
-const _cachelinelength = 64      # キャッシュライン長（64バイト）
-```
+Dimensions are split into independent tasks, and each task is processed in parallel.
 
-### 次元の融合
+### Reduction Considerations
 
-連続する次元を融合してループオーバーヘッドを削減：
+- Do not split reduction dimensions (dest stride 0) to avoid contention
+- For full reductions, use per-thread outputs to avoid false sharing
 
 ```julia
-function _mapreduce_fuse!(f, op, initop, dims, arrays)
-    allstrides = map(strides, arrays)
-    @inbounds for i in length(dims):-1:2
-        merge = true
-        for s in allstrides
-            # 全配列で連続している場合のみ融合可能
-            if s[i] != dims[i - 1] * s[i - 1]
-                merge = false
-                break
-            end
-        end
-        if merge
-            dims = setindex(dims, dims[i - 1] * dims[i], i - 1)
-            dims = setindex(dims, 1, i)
-        end
-    end
-    return _mapreduce_order!(f, op, initop, dims, allstrides, arrays)
-end
-```
-
-### ループ順序の最適化
-
-各次元の「重要度」を計算し、ストライドが小さい次元を内側に配置：
-
-```julia
-function _mapreduce_order!(f, op, initop, dims, strides, arrays)
-    M = length(arrays)
-    N = length(dims)
-
-    # 重要度計算：ストライドが小さいほど重要
-    g = 8 * sizeof(Int) - leading_zeros(M + 1)
-
-    # 出力配列（最初の配列）は2倍の重み
-    importance = 2 .* (1 .<< (g .* (N .- indexorder(strides[1]))))
-    for k in 2:M
-        importance = importance .+ (1 .<< (g .* (N .- indexorder(strides[k]))))
-    end
-
-    # サイズ1の次元は後回し
-    importance = importance .* (dims .> 1)
-
-    # 重要度の降順でソート
-    p = sortperm(importance; rev=true)
-    dims = getindices(dims, p)
-    strides = broadcast(getindices, strides, (p,))
-    ...
-end
-```
-
-#### indexorder 関数
-
-ストライドの相対的な順序を計算：
-
-```julia
-function indexorder(strides::NTuple{N,Int}) where {N}
-    return ntuple(Val(N)) do i
-        si = abs(strides[i])
-        si == 0 && return 1  # ゼロストライドは順序1
-        k = 1
-        for s in strides
-            if s != 0 && abs(s) < si
-                k += 1
-            end
-        end
-        return k
-    end
-end
-```
-
-### ブロックサイズ計算
-
-L1キャッシュに収まるようにブロックサイズを計算：
-
-```julia
-function _computeblocks(dims, costs, bytestrides, strideorders, blocksize=BLOCKMEMORYSIZE)
-    # 全体がキャッシュに収まる場合はそのまま
-    if totalmemoryregion(dims, bytestrides) <= blocksize
-        return dims
-    end
-
-    # 最小ストライド順が全配列で一致する場合、最初の次元はそのまま
-    minstrideorder = minimum(minimum.(strideorders))
-    if all(isequal(minstrideorder), first.(strideorders))
-        d1 = dims[1]
-        dr = _computeblocks(tail(dims), ...)
-        return (d1, dr...)
-    end
-
-    # ブロックサイズを縮小
-    blocks = dims
-    while totalmemoryregion(blocks, bytestrides) >= 2 * blocksize
-        i = _lastargmax((blocks .- 1) .* costs)
-        blocks = setindex(blocks, (blocks[i] + 1) >> 1, i)  # 半分に
-    end
-    while totalmemoryregion(blocks, bytestrides) > blocksize
-        i = _lastargmax((blocks .- 1) .* costs)
-        blocks = setindex(blocks, blocks[i] - 1, i)  # 1ずつ減少
-    end
-    return blocks
-end
-```
-
-### メモリ領域計算
-
-キャッシュライン単位でメモリ領域を計算：
-
-```julia
-function totalmemoryregion(dims, bytestrides)
-    memoryregion = 0
-    for i in 1:length(bytestrides)
-        strides = bytestrides[i]
-        numcontigeouscachelines = 0
-        numcachelineblocks = 1
-        for (d, s) in zip(dims, strides)
-            if s < _cachelinelength
-                # 連続領域：キャッシュライン内
-                numcontigeouscachelines += (d - 1) * s
-            else
-                # 非連続領域：別のキャッシュラインブロック
-                numcachelineblocks *= d
-            end
-        end
-        numcontigeouscachelines = div(numcontigeouscachelines, _cachelinelength) + 1
-        memoryregion += _cachelinelength * numcontigeouscachelines * numcachelineblocks
-    end
-    return memoryregion
-end
-```
-
----
-
-## マルチスレッド実装
-
-### 定数
-
-```julia
-const MINTHREADLENGTH = 1 << 15  # スレッド化の最小要素数（32768）
-```
-
-### 分割統治法
-
-```julia
-function _mapreduce_threaded!(f, op, initop, dims, blocks, strides, offsets,
-                              costs, arrays, nthreads, spacing, taskindex)
-    if nthreads == 1 || prod(dims) <= MINTHREADLENGTH
-        # シングルスレッド実行
-        _mapreduce_kernel!(f, op, initop, dims, blocks, arrays, strides, offsets)
-    else
-        # 最大コストの次元を選択して分割
-        i = _lastargmax((dims .- 1) .* costs)
-
-        if costs[i] == 0 || dims[i] <= min(blocks[i], 1024)
-            # 分割不可能
-            _mapreduce_kernel!(...)
-        else
-            # 次元を半分に分割
-            di = dims[i]
-            ndi = di >> 1
-            nnthreads = nthreads >> 1
-
-            newdims = setindex(dims, ndi, i)
-
-            # 前半を別スレッドで実行
-            t = Threads.@spawn _mapreduce_threaded!(
-                f, op, initop, newdims, blocks, strides,
-                offsets, costs, arrays, nnthreads, spacing, taskindex
-            )
-
-            # 後半を現在のスレッドで実行
-            stridesi = getindex.(strides, i)
-            newoffsets2 = offsets .+ ndi .* stridesi
-            newdims2 = setindex(dims, di - ndi, i)
-            nnthreads2 = nthreads - nnthreads
-
-            _mapreduce_threaded!(
-                f, op, initop, newdims2, blocks, strides,
-                newoffsets2, costs, arrays, nnthreads2, spacing, taskindex + nnthreads
-            )
-
-            wait(t)
-        end
-    end
-end
-```
-
-### リダクション時の考慮事項
-
-- リダクション次元（出力配列のストライドが0）は分割しない（競合回避）
-- 完全リダクションの場合、各スレッドに独立した出力領域を割り当て
-
-```julia
-if op !== nothing && _length(dims, strides[1]) == 1  # 完全リダクション
+if op !== nothing && _length(dims, strides[1]) == 1  # full reduction
     T = eltype(arrays[1])
-    spacing = isbitstype(T) ? max(1, div(64, sizeof(T))) : 1  # False Sharing回避
+    spacing = isbitstype(T) ? max(1, div(64, sizeof(T))) : 1  # avoid false sharing
     threadedout = similar(arrays[1], spacing * get_num_threads())
     ...
 end
@@ -515,7 +313,7 @@ end
 
 ---
 
-## ブロードキャスト
+## Broadcasting
 
 ### BroadcastStyle
 
@@ -526,9 +324,9 @@ end
 Broadcast.BroadcastStyle(::Type{<:StridedView{<:Any,N}}) where {N} = StridedArrayStyle{N}()
 ```
 
-### サイズのプロモーション
+### Size Promotion
 
-サイズ1の次元をストライド0でブロードキャスト：
+Broadcast size-1 dimensions using stride 0:
 
 ```julia
 function promoteshape1(sz::Dims{N}, a::StridedView) where {N}
@@ -536,7 +334,7 @@ function promoteshape1(sz::Dims{N}, a::StridedView) where {N}
         if size(a, d) == sz[d]
             stride(a, d)
         elseif size(a, d) == 1
-            0  # サイズ1の次元はストライド0でブロードキャスト
+            0  # size-1 dimensions broadcast with stride 0
         else
             throw(DimensionMismatch(...))
         end
@@ -545,9 +343,15 @@ function promoteshape1(sz::Dims{N}, a::StridedView) where {N}
 end
 ```
 
-### CaptureArgs（ブロードキャスト式のキャプチャ）
+#### Rust Implementation Notes (mdarray-strided)
 
-ブロードキャスト式を効率的に評価するための構造：
+- Use `promote_strides_to_shape` to promote size-1 dimensions to stride-0
+- `broadcast_capture_into` is the main broadcast evaluation entry point
+- **Mixed-op is removed**. Apply element ops on views (e.g., `conj()`) to keep a single `Op`
+
+### CaptureArgs (Broadcast Expression Capture)
+
+A structure for efficiently evaluating broadcast expressions:
 
 ```julia
 struct CaptureArgs{F,Args<:Tuple}
@@ -555,27 +359,34 @@ struct CaptureArgs{F,Args<:Tuple}
     args::Args
 end
 
-struct Arg  # StridedView のプレースホルダー
+struct Arg  # placeholder for StridedView
 end
 
-# Broadcasted → CaptureArgs 変換
+# Broadcasted → CaptureArgs conversion
 @inline function make_capture(bc::Broadcasted)
     args = make_tcapture(bc.args)
     return CaptureArgs(bc.f, args)
 end
 
-@inline make_capture(a::StridedView) = Arg()  # StridedView はプレースホルダーに
-@inline make_capture(a) = a                   # その他はそのまま
+@inline make_capture(a::StridedView) = Arg()  # StridedView becomes placeholder
+@inline make_capture(a) = a                   # others kept as-is
 
-# 評価時に Arg を実際の値で置換
+# Replace Arg with actual values at evaluation time
 (c::CaptureArgs)(vals...) = consume(c, vals)[1]
 ```
 
+#### Rust Implementation Notes
+
+- Lazy evaluation via `CaptureArgs` + `Consume`
+- Unified API: `broadcast_capture_into(dest, capture, sources)` where `sources` is `&[&StridedArrayView]`
+- 2/3/4-arity helpers removed (single API surface)
+- `mapreducedim_capture_views_into` is the mapreducedim-side entry point
+
 ---
 
-## 線形代数との統合
+## Linear Algebra Integration
 
-### BLAS風操作
+### BLAS-like Operations
 
 ```julia
 LinearAlgebra.rmul!(dst::StridedView, α::Number) = mul!(dst, dst, α)
@@ -584,46 +395,46 @@ LinearAlgebra.axpy!(a, X::StridedView, Y::StridedView) = Y .= a .* X .+ Y
 LinearAlgebra.axpby!(a, X, b, Y) = Y .= a .* X .+ b .* Y
 ```
 
-### 行列乗算
+### Matrix Multiplication
 
-#### BLAS行列の判定
+#### BLAS Matrix Check
 
 ```julia
 function isblasmatrix(A::StridedView{T,2}) where {T<:LinearAlgebra.BlasFloat}
     if A.op == identity
-        return stride(A, 1) == 1 || stride(A, 2) == 1  # 行または列が連続
+        return stride(A, 1) == 1 || stride(A, 2) == 1  # contiguous row or column
     elseif A.op == conj
-        return stride(A, 2) == 1  # 列優先のみ
+        return stride(A, 2) == 1  # column-major only
     else
         return false
     end
 end
 ```
 
-#### BLAS形式への変換
+#### Conversion to BLAS Form
 
 ```julia
 function getblasmatrix(A::StridedView{T,2}) where {T<:LinearAlgebra.BlasFloat}
     if A.op == identity
         if stride(A, 1) == 1
-            return A, 'N'  # 列優先
+            return A, 'N'  # column-major
         else
-            return transpose(A), 'T'  # 行優先 → 転置
+            return transpose(A), 'T'  # row-major → transpose
         end
     else
-        return adjoint(A), 'C'  # 共役転置
+        return adjoint(A), 'C'  # conjugate transpose
     end
 end
 ```
 
-#### 汎用行列乗算（mapreduce ベース）
+#### Generic Matrix Multiplication (mapreduce-based)
 
 ```julia
 function __mul!(C, A, B, α, β)
     m, n = size(C)
     k = size(A, 2)
 
-    # 行列乗算を3次元のmapreduce問題に変換
+    # Convert matrix multiplication to a 3D mapreduce
     # C[i,j] = Σ_k A[i,k] * B[k,j]
     A2 = sreshape(A, (m, 1, k))
     B2 = sreshape(permutedims(B, (2, 1)), (1, n, k))
@@ -635,13 +446,13 @@ end
 
 ---
 
-## Rust 実装への示唆
+## Implications for Rust Implementation
 
-### 1. 型設計
+### 1. Type Design (Current Names)
 
 ```rust
-/// ストライドビュー
-pub struct StridedView<'a, T, const N: usize, Op: ElementOp = Identity> {
+/// Immutable strided view
+pub struct StridedArrayView<'a, T, const N: usize, Op: ElementOp = Identity> {
     data: &'a [T],
     size: [usize; N],
     strides: [isize; N],
@@ -649,8 +460,8 @@ pub struct StridedView<'a, T, const N: usize, Op: ElementOp = Identity> {
     _op: PhantomData<Op>,
 }
 
-/// 可変ストライドビュー
-pub struct StridedViewMut<'a, T, const N: usize, Op: ElementOp = Identity> {
+/// Mutable strided view
+pub struct StridedArrayViewMut<'a, T, const N: usize, Op: ElementOp = Identity> {
     data: &'a mut [T],
     size: [usize; N],
     strides: [isize; N],
@@ -659,23 +470,23 @@ pub struct StridedViewMut<'a, T, const N: usize, Op: ElementOp = Identity> {
 }
 ```
 
-### 2. 操作トレイト
+### 2. Operation Traits
 
 ```rust
 pub trait ElementOp: Copy + Default + 'static {
     fn apply<T: Num + Copy>(value: T) -> T;
 }
 
-// 合成を型レベルで表現
+// Composition is represented at the type level via ElementOp + Compose
 pub trait Compose<Other: ElementOp>: ElementOp {
     type Result: ElementOp;
 }
 ```
 
-### 3. イテレータ設計
+### 3. Iterator Design
 
 ```rust
-/// 効率的な多次元イテレータ
+/// Efficient multidimensional iterator
 pub struct StridedIter<'a, T, const N: usize, Op: ElementOp> {
     view: &'a StridedView<'a, T, N, Op>,
     indices: [usize; N],
@@ -699,91 +510,9 @@ impl<'a, T, const N: usize, Op: ElementOp> Iterator for StridedIter<'a, T, N, Op
 }
 ```
 
-### 4. キャッシュ最適化
-
-```rust
-const L1_CACHE_SIZE: usize = 32 * 1024;  // 32KB
-const CACHE_LINE_SIZE: usize = 64;        // 64 bytes
-
-pub fn compute_blocks<const N: usize>(
-    dims: &[usize; N],
-    costs: &[usize; N],
-    byte_strides: &[Vec<usize>],
-) -> [usize; N] {
-    // Julia実装と同様のロジック
-}
-```
-
-### 5. 並列化（rayon）
-
-```rust
-use rayon::prelude::*;
-
-pub fn parallel_map<T, U, F>(
-    src: &StridedView<T, N>,
-    dst: &mut StridedViewMut<U, N>,
-    f: F,
-) where
-    T: Sync,
-    U: Send,
-    F: Fn(T) -> U + Sync,
-{
-    if dst.len() < MIN_PARALLEL_SIZE {
-        // シングルスレッド
-        sequential_map(src, dst, f);
-    } else {
-        // 分割統治
-        let split_dim = find_best_split_dimension(dst);
-        let (left, right) = split_at_dimension(dst, split_dim);
-        rayon::join(
-            || parallel_map(src_left, left, &f),
-            || parallel_map(src_right, right, &f),
-        );
-    }
-}
-```
-
-### 6. SIMD最適化
-
-```rust
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
-/// 連続メモリ領域の場合にSIMD最適化
-#[inline]
-pub fn simd_add_contiguous(dst: &mut [f64], src: &[f64]) {
-    #[cfg(target_feature = "avx2")]
-    unsafe {
-        // AVX2 実装
-        for i in (0..dst.len()).step_by(4) {
-            let a = _mm256_loadu_pd(dst.as_ptr().add(i));
-            let b = _mm256_loadu_pd(src.as_ptr().add(i));
-            let c = _mm256_add_pd(a, b);
-            _mm256_storeu_pd(dst.as_mut_ptr().add(i), c);
-        }
-    }
-}
-```
-
-### 7. ndarray との統合
-
-```rust
-use ndarray::{ArrayView, ArrayViewMut, Dimension};
-
-impl<'a, T, const N: usize, Op: ElementOp> From<ArrayView<'a, T, Dim<[usize; N]>>>
-    for StridedView<'a, T, N, Op>
-{
-    fn from(arr: ArrayView<'a, T, Dim<[usize; N]>>) -> Self {
-        let shape = arr.shape();
-        let strides = arr.strides();
-        // ...
-    }
-}
-```
-
 ---
 
-## 参考資料
+## References
 
 - [StridedViews.jl](https://github.com/Jutho/StridedViews.jl)
 - [Strided.jl](https://github.com/Jutho/Strided.jl)
