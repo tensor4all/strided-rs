@@ -269,7 +269,7 @@ cargo bench --all-features
 
 **Latest Benchmark (2026-01-28)**
 
-- Environment: macOS, single-threaded runs (JULIA_NUM_THREADS=1 for Julia).
+- Environment: macOS, single-threaded runs (`RAYON_NUM_THREADS=1` for Rust and `JULIA_NUM_THREADS=1` with `julia --project=.` for Julia).
 - Rust (Criterion) representative results:
     - `permute_32_4d`:
         - `mdarray_assign` ≈ 0.91 ms
@@ -282,18 +282,17 @@ cargo bench --all-features
         - `strided::copy_into` ≈ 20.4 ms
 
 - Julia (BenchmarkTools) representative results (single-threaded):
-    - `symmetrize_4000` (Strided.jl): ~16.63 ms
-    - `scale_transpose_1000` (Strided.jl): ~0.393 ms
-    - `complex_elementwise_1000` (Strided.jl): ~7.55 ms
-    - `permute_32_4d` (Strided.jl): ~0.748 ms
-    - `multiple_permute_sum_32_4d` (Strided.jl): ~2.20 ms
+    - `symmetrize_4000` (Strided.jl): ~17.38 ms
+    - `scale_transpose_1000` (Strided.jl): ~0.379 ms
+    - `complex_elementwise_1000` (Strided.jl): ~7.56 ms
+    - `permute_32_4d` (Strided.jl): ~0.844 ms
+    - `multiple_permute_sum_32_4d` (Strided.jl): ~2.26 ms
 
 Notes:
 - Two-level blocking (Julia-style outer block sizing + inner micro-tiles) and a POD byte-copy fast path were implemented to reduce large-transpose overhead.
 - Rust now shows large-matrix transpose improvement (see `transpose_4000`), but medium-size variance indicates micro-kernel overhead and branching costs.
 
 Next steps:
-- Implement static POD gating (e.g. `bytemuck::Pod`) instead of runtime `needs_drop` checks.
 - Add unrolled/SIMD micro-kernels for `f64`, `f32`, `Complex{f64}`, `Complex{f32}` (platform-aware NEON/AVX).
 - Tune micro-tile sizes and outer block heuristics per-target CPU.
 - Add tests for correctness of specialized fast paths and POD trait bounds.
@@ -326,11 +325,11 @@ cargo bench --bench rust_readme_compare
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust mdarray/naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 16.425 | 32.300 | 58.165 (naive) |
-| scale_transpose_1000 | 0.408 | 0.405 | 1.030 (naive) |
-| complex_elementwise_1000 | 7.517 | 12.457 | 13.903 (naive) |
-| permute_32_4d | 0.737 | 0.939 | 0.958 (mdarray_assign) |
-| multiple_permute_sum_32_4d | 2.200 | 2.097 | 4.192 (mdarray_alloc4) |
+| symmetrize_4000 | 17.376 | 27.805 | 66.089 (naive) |
+| scale_transpose_1000 | 0.379 | 0.596 | 1.327 (naive) |
+| complex_elementwise_1000 | 7.562 | 13.164 | 14.301 (naive) |
+| permute_32_4d | 0.844 | 1.424 | 1.044 (mdarray_assign) |
+| multiple_permute_sum_32_4d | 2.257 | 2.865 | 4.559 (mdarray_alloc4) |
 
 Notes:
 - The Rust measurements are produced by [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs), which uses `Instant` and reports the mean duration after warm-up and repeated iterations.
@@ -413,11 +412,11 @@ Detailed benchmark results are available in the `docs/` directory:
     - キャスト互換性はランタイムでサイズ・アライメントをチェックし、不整合時は `StridedError::PodCastUnsupported` を返します。
 
 - ベンチマーク（単一スレッド、代表値）:
-    - symmetrize_4000 — Julia: ~16.4 ms | Rust: ~32.9 ms
-    - scale_transpose_1000 — Julia: ~0.408 ms | Rust: ~0.375 ms
-    - complex_elementwise_1000 — Julia: ~7.52 ms | Rust: ~12.50 ms
-    - permute_32_4d — Julia: ~0.737 ms | Rust: ~0.932 ms
-    - multiple_permute_sum_32_4d — Julia: ~2.20 ms | Rust: ~2.15 ms
+    - symmetrize_4000 — Julia: ~17.38 ms | Rust: ~27.81 ms
+    - scale_transpose_1000 — Julia: ~0.379 ms | Rust: ~0.596 ms
+    - complex_elementwise_1000 — Julia: ~7.56 ms | Rust: ~13.16 ms
+    - permute_32_4d — Julia: ~0.844 ms | Rust: ~1.424 ms
+    - multiple_permute_sum_32_4d — Julia: ~2.26 ms | Rust: ~2.87 ms
 
 - 次の推奨作業:
     1. `Complex` 用のベンチを追加して `copy_into_pod_complex_*` を実測する。
