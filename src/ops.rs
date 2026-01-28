@@ -28,7 +28,7 @@ pub fn copy_into<T, SD, SS, LD, LS>(
     src: &Slice<T, SS, LS>,
 ) -> Result<()>
 where
-    T: Clone,
+    T: Clone + 'static,
     SD: Shape,
     SS: Shape,
     LD: Layout,
@@ -950,7 +950,7 @@ where
 
 fn copy_2d_contig_write<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
 where
-    T: Clone,
+    T: Clone + 'static,
 {
     if dst_view.dims.len() != 2 {
         return Ok(false);
@@ -988,6 +988,17 @@ where
     let is_large_enough = rows >= 32 && cols >= 32;
 
     if is_transpose_pattern && is_large_enough {
+        // Prefer a POD (memcpy-based) fast path for common numeric element types.
+        // Use a concrete-type check here so f32/f64 take the POD fast path immediately.
+        // (We'll later replace this with a static `T: Pod` bound once Pod wrappers/derives
+        // are added for other types.)
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
+            || std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
+        {
+            if copy_2d_transpose_pod(dst_view, src_view)? {
+                return Ok(true);
+            }
+        }
         return copy_2d_tiled(dst_view, src_view);
     }
 
@@ -1066,22 +1077,25 @@ where
         return Ok(false);
     }
 
-    // Compute outer tile size based on L1-like block (Julia-style)
-    const BLOCK_MEMORY_SIZE: usize = 1 << 15; // 32KB
-    let elem_size = std::mem::size_of::<T>().max(1);
-    let max_elems = BLOCK_MEMORY_SIZE / elem_size / 2; // factor 2 for src+dst
-    let mut outer_tile = (max_elems as f64).sqrt() as usize;
-    outer_tile = outer_tile.clamp(16, 64);
+    // Use Julia's block computation to pick outer tile sizes.
+    use crate::block::compute_block_sizes;
+
+    let order = [0usize, 1usize];
+    let elem_size = std::mem::size_of::<T>();
+    let strides_list: [&[isize]; 2] = [&dst_view.strides[..], &src_view.strides[..]];
+    let blocks = compute_block_sizes(&[n, n], &order, &strides_list, elem_size);
+    let outer_i = blocks.get(0).copied().unwrap_or(n).max(1);
+    let outer_j = blocks.get(1).copied().unwrap_or(n).max(1);
 
     const MICRO: usize = 4; // micro-kernel size (register block)
 
     let src_ptr = src_view.ptr;
     let dst_ptr = dst_view.ptr;
 
-    for i0 in (0..n).step_by(outer_tile) {
-        let i_end = (i0 + outer_tile).min(n);
-        for j0 in (0..n).step_by(outer_tile) {
-            let j_end = (j0 + outer_tile).min(n);
+    for i0 in (0..n).step_by(outer_i) {
+        let i_end = (i0 + outer_i).min(n);
+        for j0 in (0..n).step_by(outer_j) {
+            let j_end = (j0 + outer_j).min(n);
 
             for ii in (i0..i_end).step_by(MICRO) {
                 for jj in (j0..j_end).step_by(MICRO) {
@@ -1233,6 +1247,95 @@ where
             for j in 0..cols {
                 let val = (*src_row.offset(j as isize * s_col)).clone();
                 *dst_row.offset(j as isize * d_col) = val;
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// POD-optimized transpose copy: use memcpy-like element moves instead of `clone()`.
+/// Called only when the element type has no drop glue (i.e. safe to bitwise-move).
+fn copy_2d_transpose_pod<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
+where
+    T: Clone,
+{
+    if dst_view.dims.len() != 2 || src_view.dims.len() != 2 {
+        return Ok(false);
+    }
+    let n = dst_view.dims[0];
+    if n == 0 || n != dst_view.dims[1] || n != src_view.dims[0] || n != src_view.dims[1] {
+        return Ok(false);
+    }
+
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+
+    // Canonical layouts only: dst row-major contiguous, src column-major contiguous.
+    if d_col != 1 || d_row.unsigned_abs() != n {
+        return Ok(false);
+    }
+    if s_row.unsigned_abs() != 1 || s_col.unsigned_abs() != n {
+        return Ok(false);
+    }
+
+    use crate::block::compute_block_sizes;
+    let order = [0usize, 1usize];
+    let elem_size = std::mem::size_of::<T>();
+    let strides_list: [&[isize]; 2] = [&dst_view.strides[..], &src_view.strides[..]];
+    let blocks = compute_block_sizes(&[n, n], &order, &strides_list, elem_size);
+    let outer_i = blocks.get(0).copied().unwrap_or(n).max(1);
+    let outer_j = blocks.get(1).copied().unwrap_or(n).max(1);
+
+    const MICRO: usize = 8; // larger micro-kernel for POD types
+
+    let src_ptr_u8 = src_view.ptr as *const u8;
+    let dst_ptr_u8 = dst_view.ptr as *mut u8;
+
+    for i0 in (0..n).step_by(outer_i) {
+        let i_end = (i0 + outer_i).min(n);
+        for j0 in (0..n).step_by(outer_j) {
+            let j_end = (j0 + outer_j).min(n);
+
+            for ii in (i0..i_end).step_by(MICRO) {
+                for jj in (j0..j_end).step_by(MICRO) {
+                    let i_len = (ii + MICRO).min(i_end) - ii;
+                    let j_len = (jj + MICRO).min(j_end) - jj;
+
+                    for j in 0..j_len {
+                        // src column pointer in bytes
+                        let src_col_base = unsafe {
+                            src_ptr_u8.offset((ii as isize * s_row + (jj + j) as isize * s_col) * elem_size as isize)
+                        };
+                        // dst row pointer in bytes
+                        let dst_row_base = unsafe {
+                            dst_ptr_u8.offset(((jj + j) as isize * d_row + ii as isize * d_col) * elem_size as isize)
+                        };
+
+                        // If element size matches f64 or f32, copy entire inner column block
+                        // as elements rather than byte-by-byte; this reduces per-element
+                        // overhead and improves codegen for common numeric types.
+                        if elem_size == 8 {
+                            // f64 path
+                            let src_first = unsafe { src_col_base } as *const f64;
+                            let dst_first = unsafe { dst_row_base } as *mut f64;
+                            unsafe { std::ptr::copy_nonoverlapping(src_first, dst_first, i_len) };
+                        } else if elem_size == 4 {
+                            // f32 path
+                            let src_first = unsafe { src_col_base } as *const f32;
+                            let dst_first = unsafe { dst_row_base } as *mut f32;
+                            unsafe { std::ptr::copy_nonoverlapping(src_first, dst_first, i_len) };
+                        } else {
+                            for i in 0..i_len {
+                                let src_elem = unsafe { src_col_base.offset(i as isize * s_row * elem_size as isize) };
+                                let dst_elem = unsafe { dst_row_base.add(i * elem_size) };
+                                unsafe { std::ptr::copy_nonoverlapping(src_elem, dst_elem, elem_size) };
+                            }
+                        }
+                    }
+                }
             }
         }
     }
