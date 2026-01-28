@@ -6,6 +6,7 @@ use crate::kernel::{
 use crate::map::{map_into, zip_map2_into, zip_map3_into};
 use crate::reduce::reduce;
 use crate::{Result, StridedError};
+use bytemuck::Pod;
 use mdarray::{Layout, Shape, Slice};
 use num_complex::ComplexFloat;
 use num_traits::FromPrimitive;
@@ -13,6 +14,11 @@ use num_traits::Zero;
 use std::mem::MaybeUninit;
 use std::ops::{Add, Mul};
 const TRANSPOSE_TILE: usize = 16;
+
+#[inline]
+fn trace_enabled() -> bool {
+    matches!(std::env::var("STRIDED_TRACE"), Ok(ref v) if v == "1")
+}
 
 /// Apply dimension fusion to simplify iteration.
 #[inline]
@@ -28,7 +34,7 @@ pub fn copy_into<T, SD, SS, LD, LS>(
     src: &Slice<T, SS, LS>,
 ) -> Result<()>
 where
-    T: Clone + 'static,
+    T: Clone,
     SD: Shape,
     SS: Shape,
     LD: Layout,
@@ -60,6 +66,254 @@ where
     }
 
     map_into(dest, src, |x| x.clone())
+}
+
+/// POD-specialized copy.
+///
+/// This is intended for numeric element types where bitwise copies are valid.
+/// Compared to [`copy_into`], it can use memcpy-like kernels for transpose-heavy
+/// patterns without relying on runtime type checks.
+pub fn copy_into_pod<T, SD, SS, LD, LS>(
+    dest: &mut Slice<T, SD, LD>,
+    src: &Slice<T, SS, LS>,
+) -> Result<()>
+where
+    T: Pod,
+    SD: Shape,
+    SS: Shape,
+    LD: Layout,
+    LS: Layout,
+{
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let src_view = StridedView::from_slice(src)?;
+    ensure_same_shape(&dst_view.dims, &src_view.dims)?;
+
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&src_view.dims, &src_view.strides)
+    {
+        let len = total_len(&dst_view.dims);
+        unsafe {
+            let dst_slice = std::slice::from_raw_parts_mut(dst_view.ptr, len);
+            let src_slice = std::slice::from_raw_parts(src_view.ptr, len);
+            let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_slice);
+            let src_bytes: &[u8] = bytemuck::cast_slice(src_slice);
+            dst_bytes.copy_from_slice(src_bytes);
+        }
+        return Ok(());
+    }
+
+    if copy_2d_contig_write_pod(&dst_view, &src_view)? {
+        return Ok(());
+    }
+
+    // Keep the existing specialized 4D path (Pod implies Clone).
+    if dst_view.dims.len() == 4 && is_contiguous(&dst_view.dims, &dst_view.strides) {
+        copy_4d_contig_dst(&dst_view, &src_view)?;
+        return Ok(());
+    }
+
+    let strides_list = [&dst_view.strides[..], &src_view.strides[..]];
+    let fused_dims = apply_fusion(&dst_view.dims, &strides_list);
+    let plan = build_plan(
+        &fused_dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
+
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut dst_ptr = unsafe { dst_view.ptr.offset(offsets[0]) };
+            let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
+            let dst_stride = strides[0];
+            let src_stride = strides[1];
+            for _ in 0..len {
+                unsafe {
+                    *dst_ptr = *src_ptr;
+                    dst_ptr = dst_ptr.offset(dst_stride);
+                    src_ptr = src_ptr.offset(src_stride);
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// POD-aware copy for `Complex<f64>`.
+pub fn copy_into_pod_complex_f64<SD, SS, LD, LS>(
+    dest: &mut Slice<num_complex::Complex<f64>, SD, LD>,
+    src: &Slice<num_complex::Complex<f64>, SS, LS>,
+) -> Result<()>
+where
+    SD: Shape,
+    SS: Shape,
+    LD: Layout,
+    LS: Layout,
+{
+    use crate::pod_complex::{cast_complex_slice_mut_to_pod_f64, cast_complex_slice_to_pod_f64, PodComplexF64};
+
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let src_view = StridedView::from_slice(src)?;
+    ensure_same_shape(&dst_view.dims, &src_view.dims)?;
+
+    // Runtime layout checks to ensure Complex<f64> can be reinterpreted as PodComplexF64
+    if std::mem::size_of::<num_complex::Complex<f64>>() != std::mem::size_of::<PodComplexF64>()
+        || std::mem::align_of::<num_complex::Complex<f64>>() != std::mem::align_of::<PodComplexF64>()
+    {
+        return Err(crate::StridedError::PodCastUnsupported("Complex<f64> layout incompatible"));
+    }
+
+    // Contiguous fast path using bytemuck cast helpers
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&src_view.dims, &src_view.strides)
+    {
+        unsafe {
+            let dst_slice = std::slice::from_raw_parts_mut(dst_view.ptr as *mut num_complex::Complex<f64>, total_len(&dst_view.dims));
+            let src_slice = std::slice::from_raw_parts(src_view.ptr as *const num_complex::Complex<f64>, total_len(&src_view.dims));
+            let dst_pod = cast_complex_slice_mut_to_pod_f64(dst_slice);
+            let src_pod = cast_complex_slice_to_pod_f64(src_slice);
+            let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_pod);
+            let src_bytes: &[u8] = bytemuck::cast_slice(src_pod);
+            dst_bytes.copy_from_slice(src_bytes);
+        }
+        return Ok(());
+    }
+
+    // Non-contiguous: build Pod views and reuse Pod tiling/transpose kernels
+    let dst_pod_view = StridedViewMut {
+        ptr: dst_view.ptr as *mut PodComplexF64,
+        dims: dst_view.dims.clone(),
+        strides: dst_view.strides.clone(),
+    };
+    let src_pod_view = StridedView {
+        ptr: src_view.ptr as *const PodComplexF64,
+        dims: src_view.dims.clone(),
+        strides: src_view.strides.clone(),
+    };
+
+    if copy_2d_contig_write_pod(&dst_pod_view, &src_pod_view)? {
+        return Ok(());
+    }
+
+    // General fused plan path: reuse the same inner-block copy approach but for PodComplexF64
+    let strides_list = [&dst_pod_view.strides[..], &src_pod_view.strides[..]];
+    let fused_dims = apply_fusion(&dst_pod_view.dims, &strides_list);
+    let plan = build_plan(
+        &fused_dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<PodComplexF64>(),
+    );
+
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut dst_ptr = unsafe { (dst_pod_view.ptr as *mut PodComplexF64).offset(offsets[0]) };
+            let mut src_ptr = unsafe { (src_pod_view.ptr as *const PodComplexF64).offset(offsets[1]) };
+            let dst_stride = strides[0];
+            let src_stride = strides[1];
+            for _ in 0..len {
+                unsafe {
+                    *dst_ptr = *src_ptr;
+                    dst_ptr = dst_ptr.offset(dst_stride);
+                    src_ptr = src_ptr.offset(src_stride);
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+/// POD-aware copy for `Complex<f32>`.
+pub fn copy_into_pod_complex_f32<SD, SS, LD, LS>(
+    dest: &mut Slice<num_complex::Complex<f32>, SD, LD>,
+    src: &Slice<num_complex::Complex<f32>, SS, LS>,
+) -> Result<()>
+where
+    SD: Shape,
+    SS: Shape,
+    LD: Layout,
+    LS: Layout,
+{
+    use crate::pod_complex::{cast_complex_slice_mut_to_pod_f32, cast_complex_slice_to_pod_f32, PodComplexF32};
+
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let src_view = StridedView::from_slice(src)?;
+    ensure_same_shape(&dst_view.dims, &src_view.dims)?;
+
+    if std::mem::size_of::<num_complex::Complex<f32>>() != std::mem::size_of::<PodComplexF32>()
+        || std::mem::align_of::<num_complex::Complex<f32>>() != std::mem::align_of::<PodComplexF32>()
+    {
+        return Err(crate::StridedError::PodCastUnsupported("Complex<f32> layout incompatible"));
+    }
+
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&src_view.dims, &src_view.strides)
+    {
+        unsafe {
+            let dst_slice = std::slice::from_raw_parts_mut(dst_view.ptr as *mut num_complex::Complex<f32>, total_len(&dst_view.dims));
+            let src_slice = std::slice::from_raw_parts(src_view.ptr as *const num_complex::Complex<f32>, total_len(&src_view.dims));
+            let dst_pod = cast_complex_slice_mut_to_pod_f32(dst_slice);
+            let src_pod = cast_complex_slice_to_pod_f32(src_slice);
+            let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_pod);
+            let src_bytes: &[u8] = bytemuck::cast_slice(src_pod);
+            dst_bytes.copy_from_slice(src_bytes);
+        }
+        return Ok(());
+    }
+
+    let dst_pod_view = StridedViewMut {
+        ptr: dst_view.ptr as *mut PodComplexF32,
+        dims: dst_view.dims.clone(),
+        strides: dst_view.strides.clone(),
+    };
+    let src_pod_view = StridedView {
+        ptr: src_view.ptr as *const PodComplexF32,
+        dims: src_view.dims.clone(),
+        strides: src_view.strides.clone(),
+    };
+
+    if copy_2d_contig_write_pod(&dst_pod_view, &src_pod_view)? {
+        return Ok(());
+    }
+
+    let strides_list = [&dst_pod_view.strides[..], &src_pod_view.strides[..]];
+    let fused_dims = apply_fusion(&dst_pod_view.dims, &strides_list);
+    let plan = build_plan(
+        &fused_dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<PodComplexF32>(),
+    );
+
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut dst_ptr = unsafe { (dst_pod_view.ptr as *mut PodComplexF32).offset(offsets[0]) };
+            let mut src_ptr = unsafe { (src_pod_view.ptr as *const PodComplexF32).offset(offsets[1]) };
+            let dst_stride = strides[0];
+            let src_stride = strides[1];
+            for _ in 0..len {
+                unsafe {
+                    *dst_ptr = *src_ptr;
+                    dst_ptr = dst_ptr.offset(dst_stride);
+                    src_ptr = src_ptr.offset(src_stride);
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(())
 }
 
 /// Copy `src` into an uninitialized destination buffer.
@@ -332,12 +586,31 @@ where
     if is_contiguous(&dst_view.dims, &dst_view.strides)
         && is_contiguous(&src_view.dims, &src_view.strides)
     {
+        if trace_enabled() {
+            eprintln!(
+                "symmetrize_into: contig row-major fast path dims={:?} dst_strides={:?} src_strides={:?}",
+                dst_view.dims, dst_view.strides, src_view.strides
+            );
+        }
         return symmetrize_into_contig_row_major(&dst_view, &src_view, &half);
     }
     if is_contiguous_col_major_2d(&dst_view.dims, &dst_view.strides)
         && is_contiguous_col_major_2d(&src_view.dims, &src_view.strides)
     {
+        if trace_enabled() {
+            eprintln!(
+                "symmetrize_into: contig col-major fast path dims={:?} dst_strides={:?} src_strides={:?}",
+                dst_view.dims, dst_view.strides, src_view.strides
+            );
+        }
         return symmetrize_into_contig_col_major(&dst_view, &src_view, &half);
+    }
+
+    if trace_enabled() {
+        eprintln!(
+            "symmetrize_into: generic strided path dims={:?} dst_strides={:?} src_strides={:?}",
+            dst_view.dims, dst_view.strides, src_view.strides
+        );
     }
     let tile = sym_tile_size::<T>();
     let s_row = src_view.strides[0];
@@ -387,6 +660,127 @@ where
                         let out = (aij + aji) * half.clone();
                         unsafe {
                             *dst_view.ptr.offset(dst_ij) = out.clone();
+                            *dst_view.ptr.offset(dst_ji) = out;
+                        }
+                        src_ij = checked_add(src_ij, s_col)?;
+                        dst_ij = checked_add(dst_ij, d_col)?;
+                        src_ji = checked_add(src_ji, s_row)?;
+                        dst_ji = checked_add(dst_ji, d_row)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// f64-specialized symmetrize.
+///
+/// This avoids `Clone` overhead in the hot path by relying on `Copy` for `f64`.
+/// Intended for the README parity benchmarks (Julia uses Float64).
+pub fn symmetrize_into_f64<SD, SS, LD, LS>(
+    dest: &mut Slice<f64, SD, LD>,
+    src: &Slice<f64, SS, LS>,
+) -> Result<()>
+where
+    SD: Shape,
+    SS: Shape,
+    LD: Layout,
+    LS: Layout,
+{
+    let dst_view = StridedViewMut::from_slice(dest)?;
+    let src_view = StridedView::from_slice(src)?;
+    ensure_same_shape(&dst_view.dims, &src_view.dims)?;
+
+    if src_view.dims.len() != 2 {
+        return Err(StridedError::RankMismatch(src_view.dims.len(), 2));
+    }
+    let n = src_view.dims[0];
+    let m = src_view.dims[1];
+    if n != m {
+        return Err(StridedError::NonSquare { rows: n, cols: m });
+    }
+
+    if is_contiguous(&dst_view.dims, &dst_view.strides)
+        && is_contiguous(&src_view.dims, &src_view.strides)
+    {
+        if trace_enabled() {
+            eprintln!(
+                "symmetrize_into_f64: contig row-major fast path dims={:?} dst_strides={:?} src_strides={:?}",
+                dst_view.dims, dst_view.strides, src_view.strides
+            );
+        }
+        return symmetrize_into_contig_row_major_f64(&dst_view, &src_view);
+    }
+    if is_contiguous_col_major_2d(&dst_view.dims, &dst_view.strides)
+        && is_contiguous_col_major_2d(&src_view.dims, &src_view.strides)
+    {
+        if trace_enabled() {
+            eprintln!(
+                "symmetrize_into_f64: contig col-major fast path dims={:?} dst_strides={:?} src_strides={:?}",
+                dst_view.dims, dst_view.strides, src_view.strides
+            );
+        }
+        return symmetrize_into_contig_col_major_f64(&dst_view, &src_view);
+    }
+
+    if trace_enabled() {
+        eprintln!(
+            "symmetrize_into_f64: generic strided path dims={:?} dst_strides={:?} src_strides={:?}",
+            dst_view.dims, dst_view.strides, src_view.strides
+        );
+    }
+
+    let half = 0.5f64;
+    let tile = sym_tile_size::<f64>();
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+
+    for i0 in (0..n).step_by(tile) {
+        let i_max = (i0 + tile).min(n);
+        for j0 in (i0..n).step_by(tile) {
+            let j_max = (j0 + tile).min(n);
+
+            if i0 == j0 {
+                for i in i0..i_max {
+                    let start_j = i.max(j0);
+                    let mut src_ij = offset2d(i, start_j, s_row, s_col)?;
+                    let mut dst_ij = offset2d(i, start_j, d_row, d_col)?;
+                    for j in start_j..j_max {
+                        let aij = unsafe { *src_view.ptr.offset(src_ij) };
+                        if i == j {
+                            unsafe {
+                                *dst_view.ptr.offset(dst_ij) = aij;
+                            }
+                        } else {
+                            let src_ji = offset2d(j, i, s_row, s_col)?;
+                            let dst_ji = offset2d(j, i, d_row, d_col)?;
+                            let aji = unsafe { *src_view.ptr.offset(src_ji) };
+                            let out = (aij + aji) * half;
+                            unsafe {
+                                *dst_view.ptr.offset(dst_ij) = out;
+                                *dst_view.ptr.offset(dst_ji) = out;
+                            }
+                        }
+                        src_ij = checked_add(src_ij, s_col)?;
+                        dst_ij = checked_add(dst_ij, d_col)?;
+                    }
+                }
+            } else {
+                for i in i0..i_max {
+                    let mut src_ij = offset2d(i, j0, s_row, s_col)?;
+                    let mut dst_ij = offset2d(i, j0, d_row, d_col)?;
+                    let mut src_ji = offset2d(j0, i, s_row, s_col)?;
+                    let mut dst_ji = offset2d(j0, i, d_row, d_col)?;
+                    for _ in j0..j_max {
+                        let aij = unsafe { *src_view.ptr.offset(src_ij) };
+                        let aji = unsafe { *src_view.ptr.offset(src_ji) };
+                        let out = (aij + aji) * half;
+                        unsafe {
+                            *dst_view.ptr.offset(dst_ij) = out;
                             *dst_view.ptr.offset(dst_ji) = out;
                         }
                         src_ij = checked_add(src_ij, s_col)?;
@@ -544,12 +938,31 @@ where
     if is_contiguous(&dst_view.dims, &dst_view.strides)
         && is_contiguous(&src_view.dims, &src_view.strides)
     {
+        if trace_enabled() {
+            eprintln!(
+                "symmetrize_conj_into: contig row-major fast path dims={:?} dst_strides={:?} src_strides={:?}",
+                dst_view.dims, dst_view.strides, src_view.strides
+            );
+        }
         return symmetrize_conj_into_contig_row_major(&dst_view, &src_view, &half);
     }
     if is_contiguous_col_major_2d(&dst_view.dims, &dst_view.strides)
         && is_contiguous_col_major_2d(&src_view.dims, &src_view.strides)
     {
+        if trace_enabled() {
+            eprintln!(
+                "symmetrize_conj_into: contig col-major fast path dims={:?} dst_strides={:?} src_strides={:?}",
+                dst_view.dims, dst_view.strides, src_view.strides
+            );
+        }
         return symmetrize_conj_into_contig_col_major(&dst_view, &src_view, &half);
+    }
+
+    if trace_enabled() {
+        eprintln!(
+            "symmetrize_conj_into: generic strided path dims={:?} dst_strides={:?} src_strides={:?}",
+            dst_view.dims, dst_view.strides, src_view.strides
+        );
     }
 
     let tile = sym_tile_size::<T>();
@@ -624,36 +1037,116 @@ fn symmetrize_into_contig_row_major<T>(
 where
     T: Clone + Add<Output = T> + Mul<Output = T>,
 {
+    // Match Julia's broadcast logic used in benches/julia_readme_compare.jl:
+    //   @strided B .= (A .+ A') ./ 2
+    // i.e. compute ALL elements: B[i,j] = (A[i,j] + A[j,i]) * half.
     let n = src.dims[0];
     let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
     if total == 0 {
         return Ok(());
     }
 
-    let src_ptr = src.ptr;
-    let dst_ptr = dest.ptr;
-    for i in 0..n {
-        let row_base = i.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
-        let mut idx_ij = row_base
-            .checked_add(i)
-            .ok_or(StridedError::OffsetOverflow)?;
-        let mut idx_ji = idx_ij;
-        for j in i..n {
-            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
-            if i == j {
-                unsafe {
-                    *dst_ptr.add(idx_ij) = aij;
-                }
-            } else {
-                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
+    // Canonical row-major contiguous only.
+    if dest.strides.len() != 2
+        || src.strides.len() != 2
+        || dest.strides[1] != 1
+        || dest.strides[0] != n as isize
+        || src.strides[1] != 1
+        || src.strides[0] != n as isize
+    {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+
+    // Match Julia/Strided.jl block-size estimation exactly by using the same
+    // `compute_order` + `_computeblocks` port (via `build_plan`).
+    // We model B .= (A .+ A') ./ 2 as 3 arrays: (dest, A, A').
+    let at_strides = [src.strides[1], src.strides[0]];
+    let strides_list: [&[isize]; 3] = [&dest.strides[..], &src.strides[..], &at_strides[..]];
+    let plan = build_plan(&[n, n], &strides_list, Some(0), std::mem::size_of::<T>());
+    let b0 = plan.block.get(0).copied().unwrap_or(n).max(1);
+    let b1 = plan.block.get(1).copied().unwrap_or(n).max(1);
+
+    let a_ptr = src.ptr;
+    let d_ptr = dest.ptr;
+    let half = half.clone();
+
+    const MICRO: usize = 4;
+
+    #[inline]
+    unsafe fn do_micro_tile_row_major<T>(
+        n: usize,
+        a_ptr: *const T,
+        d_ptr: *mut T,
+        half: &T,
+        ii: usize,
+        jj: usize,
+        i_end: usize,
+        j_end: usize,
+    ) where
+        T: Clone + Add<Output = T> + Mul<Output = T>,
+    {
+        let i_len = (ii + MICRO).min(i_end) - ii;
+        let j_len = (jj + MICRO).min(j_end) - jj;
+
+        // Read-contiguous transpose-side kernel (fast on this machine):
+        // For each j in the micro-tile, read A[j, ii..] contiguously into a small buffer,
+        // then stream over i (stride-n stores).
+        for dj in 0..j_len {
+            let j = jj + dj;
+
+            let mut aji_buf: [std::mem::MaybeUninit<T>; MICRO] =
+                std::mem::MaybeUninit::uninit().assume_init();
+            let aji_row = a_ptr.add(j * n + ii);
+            for di in 0..i_len {
+                aji_buf[di].write((&*aji_row.add(di)).clone());
+            }
+
+            for di in 0..i_len {
+                let i = ii + di;
+                let aij = (&*a_ptr.add(i * n + j)).clone();
+                let aji = aji_buf[di].assume_init_read();
                 let out = (aij + aji) * half.clone();
-                unsafe {
-                    *dst_ptr.add(idx_ij) = out.clone();
-                    *dst_ptr.add(idx_ji) = out;
+                *d_ptr.add(i * n + j) = out;
+            }
+        }
+    }
+
+    match plan.order.as_slice() {
+        // Iterate blocks in (i, j) order
+        [0, 1] => {
+            for i0 in (0..n).step_by(b0) {
+                let i_end = (i0 + b0).min(n);
+                for j0 in (0..n).step_by(b1) {
+                    let j_end = (j0 + b1).min(n);
+                    for ii in (i0..i_end).step_by(MICRO) {
+                        for jj in (j0..j_end).step_by(MICRO) {
+                            unsafe {
+                                do_micro_tile_row_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                            }
+                        }
+                    }
                 }
             }
-            idx_ij = idx_ij.checked_add(1).ok_or(StridedError::OffsetOverflow)?;
-            idx_ji = idx_ji.checked_add(n).ok_or(StridedError::OffsetOverflow)?;
+        }
+        // Iterate blocks in (j, i) order
+        [1, 0] => {
+            for j0 in (0..n).step_by(b0) {
+                let j_end = (j0 + b0).min(n);
+                for i0 in (0..n).step_by(b1) {
+                    let i_end = (i0 + b1).min(n);
+                    for jj in (j0..j_end).step_by(MICRO) {
+                        for ii in (i0..i_end).step_by(MICRO) {
+                            unsafe {
+                                do_micro_tile_row_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // 2D should always result in a permutation of [0,1].
+            return Err(StridedError::StrideLengthMismatch);
         }
     }
 
@@ -668,38 +1161,296 @@ fn symmetrize_into_contig_col_major<T>(
 where
     T: Clone + Add<Output = T> + Mul<Output = T>,
 {
+    // Same as row-major version but for canonical column-major contiguous.
+    // Julia arrays are column-major by default, so this path is important for parity.
     let n = src.dims[0];
     let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
     if total == 0 {
         return Ok(());
     }
 
-    let src_ptr = src.ptr;
-    let dst_ptr = dest.ptr;
-    for i in 0..n {
-        let diag = i
-            .checked_mul(n)
-            .and_then(|v| v.checked_add(i))
-            .ok_or(StridedError::OffsetOverflow)?;
-        let mut idx_ij = diag;
-        let mut idx_ji = diag;
-        for _j in i..n {
-            let aij = unsafe { &*src_ptr.add(idx_ij) }.clone();
-            if idx_ij == idx_ji {
-                unsafe {
-                    *dst_ptr.add(idx_ij) = aij;
-                }
-            } else {
-                let aji = unsafe { &*src_ptr.add(idx_ji) }.clone();
+    if dest.strides.len() != 2
+        || src.strides.len() != 2
+        || dest.strides[0] != 1
+        || dest.strides[1] != n as isize
+        || src.strides[0] != 1
+        || src.strides[1] != n as isize
+    {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+
+    let at_strides = [src.strides[1], src.strides[0]];
+    let strides_list: [&[isize]; 3] = [&dest.strides[..], &src.strides[..], &at_strides[..]];
+    let plan = build_plan(&[n, n], &strides_list, Some(0), std::mem::size_of::<T>());
+    let b0 = plan.block.get(0).copied().unwrap_or(n).max(1);
+    let b1 = plan.block.get(1).copied().unwrap_or(n).max(1);
+
+    let a_ptr = src.ptr;
+    let d_ptr = dest.ptr;
+    let half = half.clone();
+
+    const MICRO: usize = 4;
+
+    #[inline]
+    unsafe fn do_micro_tile_col_major<T>(
+        n: usize,
+        a_ptr: *const T,
+        d_ptr: *mut T,
+        half: &T,
+        ii: usize,
+        jj: usize,
+        i_end: usize,
+        j_end: usize,
+    ) where
+        T: Clone + Add<Output = T> + Mul<Output = T>,
+    {
+        let i_len = (ii + MICRO).min(i_end) - ii;
+        let j_len = (jj + MICRO).min(j_end) - jj;
+
+        // In col-major, A[i,j] is contiguous across i for fixed j.
+        // Buffer the transpose side A[j,i] (strided across i), then stream the contiguous column.
+        for dj in 0..j_len {
+            let j = jj + dj;
+
+            let mut aji_buf: [std::mem::MaybeUninit<T>; MICRO] =
+                std::mem::MaybeUninit::uninit().assume_init();
+            for di in 0..i_len {
+                let i = ii + di;
+                aji_buf[di].write((&*a_ptr.add(j + i * n)).clone());
+            }
+
+            let aij_col = a_ptr.add(j * n + ii);
+            let d_col = d_ptr.add(j * n + ii);
+            for di in 0..i_len {
+                let aij = (&*aij_col.add(di)).clone();
+                let aji = aji_buf[di].assume_init_read();
                 let out = (aij + aji) * half.clone();
-                unsafe {
-                    *dst_ptr.add(idx_ij) = out.clone();
-                    *dst_ptr.add(idx_ji) = out;
+                *d_col.add(di) = out;
+            }
+        }
+    }
+
+    match plan.order.as_slice() {
+        // (i, j) order
+        [0, 1] => {
+            for i0 in (0..n).step_by(b0) {
+                let i_end = (i0 + b0).min(n);
+                for j0 in (0..n).step_by(b1) {
+                    let j_end = (j0 + b1).min(n);
+                    for ii in (i0..i_end).step_by(MICRO) {
+                        for jj in (j0..j_end).step_by(MICRO) {
+                            unsafe {
+                                do_micro_tile_col_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                            }
+                        }
+                    }
                 }
             }
-            idx_ij = idx_ij.checked_add(n).ok_or(StridedError::OffsetOverflow)?;
-            idx_ji = idx_ji.checked_add(1).ok_or(StridedError::OffsetOverflow)?;
         }
+        // (j, i) order
+        [1, 0] => {
+            for j0 in (0..n).step_by(b0) {
+                let j_end = (j0 + b0).min(n);
+                for i0 in (0..n).step_by(b1) {
+                    let i_end = (i0 + b1).min(n);
+                    for jj in (j0..j_end).step_by(MICRO) {
+                        for ii in (i0..i_end).step_by(MICRO) {
+                            unsafe {
+                                do_micro_tile_col_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => return Err(StridedError::StrideLengthMismatch),
+    }
+
+    Ok(())
+}
+
+fn symmetrize_into_contig_row_major_f64(
+    dest: &StridedViewMut<f64>,
+    src: &StridedView<f64>,
+) -> Result<()> {
+    let n = src.dims[0];
+    let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    if dest.strides.len() != 2
+        || src.strides.len() != 2
+        || dest.strides[1] != 1
+        || dest.strides[0] != n as isize
+        || src.strides[1] != 1
+        || src.strides[0] != n as isize
+    {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+
+    let at_strides = [src.strides[1], src.strides[0]];
+    let strides_list: [&[isize]; 3] = [&dest.strides[..], &src.strides[..], &at_strides[..]];
+    let plan = build_plan(&[n, n], &strides_list, Some(0), std::mem::size_of::<f64>());
+    let b0 = plan.block.get(0).copied().unwrap_or(n).max(1);
+    let b1 = plan.block.get(1).copied().unwrap_or(n).max(1);
+
+    let a_ptr = src.ptr;
+    let d_ptr = dest.ptr;
+
+    const MICRO: usize = 4;
+
+    #[inline]
+    unsafe fn do_micro_tile_row_major_f64(
+        n: usize,
+        a_ptr: *const f64,
+        d_ptr: *mut f64,
+        ii: usize,
+        jj: usize,
+        i_end: usize,
+        j_end: usize,
+    ) {
+        let i_len = (ii + MICRO).min(i_end) - ii;
+        let j_len = (jj + MICRO).min(j_end) - jj;
+
+        for dj in 0..j_len {
+            let j = jj + dj;
+            let mut aji_buf = [0.0f64; MICRO];
+            let aji_row = a_ptr.add(j * n + ii);
+            for di in 0..i_len {
+                aji_buf[di] = *aji_row.add(di);
+            }
+
+            for di in 0..i_len {
+                let i = ii + di;
+                let aij = *a_ptr.add(i * n + j);
+                *d_ptr.add(i * n + j) = (aij + aji_buf[di]) * 0.5;
+            }
+        }
+    }
+
+    match plan.order.as_slice() {
+        [0, 1] => {
+            for i0 in (0..n).step_by(b0) {
+                let i_end = (i0 + b0).min(n);
+                for j0 in (0..n).step_by(b1) {
+                    let j_end = (j0 + b1).min(n);
+                    for ii in (i0..i_end).step_by(MICRO) {
+                        for jj in (j0..j_end).step_by(MICRO) {
+                            unsafe { do_micro_tile_row_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                        }
+                    }
+                }
+            }
+        }
+        [1, 0] => {
+            for j0 in (0..n).step_by(b0) {
+                let j_end = (j0 + b0).min(n);
+                for i0 in (0..n).step_by(b1) {
+                    let i_end = (i0 + b1).min(n);
+                    for jj in (j0..j_end).step_by(MICRO) {
+                        for ii in (i0..i_end).step_by(MICRO) {
+                            unsafe { do_micro_tile_row_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                        }
+                    }
+                }
+            }
+        }
+        _ => return Err(StridedError::StrideLengthMismatch),
+    }
+
+    Ok(())
+}
+
+fn symmetrize_into_contig_col_major_f64(
+    dest: &StridedViewMut<f64>,
+    src: &StridedView<f64>,
+) -> Result<()> {
+    let n = src.dims[0];
+    let total = n.checked_mul(n).ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    if dest.strides.len() != 2
+        || src.strides.len() != 2
+        || dest.strides[0] != 1
+        || dest.strides[1] != n as isize
+        || src.strides[0] != 1
+        || src.strides[1] != n as isize
+    {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+
+    let at_strides = [src.strides[1], src.strides[0]];
+    let strides_list: [&[isize]; 3] = [&dest.strides[..], &src.strides[..], &at_strides[..]];
+    let plan = build_plan(&[n, n], &strides_list, Some(0), std::mem::size_of::<f64>());
+    let b0 = plan.block.get(0).copied().unwrap_or(n).max(1);
+    let b1 = plan.block.get(1).copied().unwrap_or(n).max(1);
+
+    let a_ptr = src.ptr;
+    let d_ptr = dest.ptr;
+
+    const MICRO: usize = 4;
+
+    #[inline]
+    unsafe fn do_micro_tile_col_major_f64(
+        n: usize,
+        a_ptr: *const f64,
+        d_ptr: *mut f64,
+        ii: usize,
+        jj: usize,
+        i_end: usize,
+        j_end: usize,
+    ) {
+        let i_len = (ii + MICRO).min(i_end) - ii;
+        let j_len = (jj + MICRO).min(j_end) - jj;
+
+        for dj in 0..j_len {
+            let j = jj + dj;
+            let mut aji_buf = [0.0f64; MICRO];
+            for di in 0..i_len {
+                let i = ii + di;
+                aji_buf[di] = *a_ptr.add(j + i * n);
+            }
+
+            let aij_col = a_ptr.add(j * n + ii);
+            let d_col = d_ptr.add(j * n + ii);
+            for di in 0..i_len {
+                let aij = *aij_col.add(di);
+                *d_col.add(di) = (aij + aji_buf[di]) * 0.5;
+            }
+        }
+    }
+
+    match plan.order.as_slice() {
+        [0, 1] => {
+            for i0 in (0..n).step_by(b0) {
+                let i_end = (i0 + b0).min(n);
+                for j0 in (0..n).step_by(b1) {
+                    let j_end = (j0 + b1).min(n);
+                    for ii in (i0..i_end).step_by(MICRO) {
+                        for jj in (j0..j_end).step_by(MICRO) {
+                            unsafe { do_micro_tile_col_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                        }
+                    }
+                }
+            }
+        }
+        [1, 0] => {
+            for j0 in (0..n).step_by(b0) {
+                let j_end = (j0 + b0).min(n);
+                for i0 in (0..n).step_by(b1) {
+                    let i_end = (i0 + b1).min(n);
+                    for jj in (j0..j_end).step_by(MICRO) {
+                        for ii in (i0..i_end).step_by(MICRO) {
+                            unsafe { do_micro_tile_col_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                        }
+                    }
+                }
+            }
+        }
+        _ => return Err(StridedError::StrideLengthMismatch),
     }
 
     Ok(())
@@ -950,7 +1701,7 @@ where
 
 fn copy_2d_contig_write<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
 where
-    T: Clone + 'static,
+    T: Clone,
 {
     if dst_view.dims.len() != 2 {
         return Ok(false);
@@ -988,17 +1739,6 @@ where
     let is_large_enough = rows >= 32 && cols >= 32;
 
     if is_transpose_pattern && is_large_enough {
-        // Prefer a POD (memcpy-based) fast path for common numeric element types.
-        // Use a concrete-type check here so f32/f64 take the POD fast path immediately.
-        // (We'll later replace this with a static `T: Pod` bound once Pod wrappers/derives
-        // are added for other types.)
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
-            || std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
-        {
-            if copy_2d_transpose_pod(dst_view, src_view)? {
-                return Ok(true);
-            }
-        }
         return copy_2d_tiled(dst_view, src_view);
     }
 
@@ -1036,6 +1776,43 @@ where
             }
         }
         return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn copy_2d_contig_write_pod<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
+where
+    T: Pod,
+{
+    if dst_view.dims.len() != 2 {
+        return Ok(false);
+    }
+
+    let rows = dst_view.dims[0];
+    let cols = dst_view.dims[1];
+    let s_row = src_view.strides[0];
+    let s_col = src_view.strides[1];
+    let d_row = dst_view.strides[0];
+    let d_col = dst_view.strides[1];
+
+    if rows == cols
+        && rows >= 64
+        && d_col == 1
+        && d_row == cols as isize
+        && s_row == 1
+        && s_col == rows as isize
+        && copy_2d_transpose_pod(dst_view, src_view)?
+    {
+        return Ok(true);
+    }
+
+    // Fallback: POD types are Copy, so the existing tiled clone path is fine.
+    let is_transpose_pattern =
+        (d_col == 1 && s_col.unsigned_abs() > 1) || (d_row == 1 && s_row.unsigned_abs() > 1);
+    let is_large_enough = rows >= 32 && cols >= 32;
+    if is_transpose_pattern && is_large_enough {
+        return copy_2d_tiled(dst_view, src_view);
     }
 
     Ok(false)
@@ -1258,7 +2035,7 @@ where
 /// Called only when the element type has no drop glue (i.e. safe to bitwise-move).
 fn copy_2d_transpose_pod<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
 where
-    T: Clone,
+    T: Pod,
 {
     if dst_view.dims.len() != 2 || src_view.dims.len() != 2 {
         return Ok(false);
@@ -1273,11 +2050,11 @@ where
     let s_row = src_view.strides[0];
     let s_col = src_view.strides[1];
 
-    // Canonical layouts only: dst row-major contiguous, src column-major contiguous.
-    if d_col != 1 || d_row.unsigned_abs() != n {
+    // Canonical layouts only (positive strides): dst row-major contiguous, src column-major contiguous.
+    if d_col != 1 || d_row != n as isize {
         return Ok(false);
     }
-    if s_row.unsigned_abs() != 1 || s_col.unsigned_abs() != n {
+    if s_row != 1 || s_col != n as isize {
         return Ok(false);
     }
 
@@ -1289,10 +2066,10 @@ where
     let outer_i = blocks.get(0).copied().unwrap_or(n).max(1);
     let outer_j = blocks.get(1).copied().unwrap_or(n).max(1);
 
-    const MICRO: usize = 8; // larger micro-kernel for POD types
+    const MICRO: usize = 8; // micro-kernel size
 
-    let src_ptr_u8 = src_view.ptr as *const u8;
-    let dst_ptr_u8 = dst_view.ptr as *mut u8;
+    let src_ptr = src_view.ptr;
+    let dst_ptr = dst_view.ptr;
 
     for i0 in (0..n).step_by(outer_i) {
         let i_end = (i0 + outer_i).min(n);
@@ -1305,35 +2082,9 @@ where
                     let j_len = (jj + MICRO).min(j_end) - jj;
 
                     for j in 0..j_len {
-                        // src column pointer in bytes
-                        let src_col_base = unsafe {
-                            src_ptr_u8.offset((ii as isize * s_row + (jj + j) as isize * s_col) * elem_size as isize)
-                        };
-                        // dst row pointer in bytes
-                        let dst_row_base = unsafe {
-                            dst_ptr_u8.offset(((jj + j) as isize * d_row + ii as isize * d_col) * elem_size as isize)
-                        };
-
-                        // If element size matches f64 or f32, copy entire inner column block
-                        // as elements rather than byte-by-byte; this reduces per-element
-                        // overhead and improves codegen for common numeric types.
-                        if elem_size == 8 {
-                            // f64 path
-                            let src_first = unsafe { src_col_base } as *const f64;
-                            let dst_first = unsafe { dst_row_base } as *mut f64;
-                            unsafe { std::ptr::copy_nonoverlapping(src_first, dst_first, i_len) };
-                        } else if elem_size == 4 {
-                            // f32 path
-                            let src_first = unsafe { src_col_base } as *const f32;
-                            let dst_first = unsafe { dst_row_base } as *mut f32;
-                            unsafe { std::ptr::copy_nonoverlapping(src_first, dst_first, i_len) };
-                        } else {
-                            for i in 0..i_len {
-                                let src_elem = unsafe { src_col_base.offset(i as isize * s_row * elem_size as isize) };
-                                let dst_elem = unsafe { dst_row_base.add(i * elem_size) };
-                                unsafe { std::ptr::copy_nonoverlapping(src_elem, dst_elem, elem_size) };
-                            }
-                        }
+                        let src_first = unsafe { src_ptr.offset(ii as isize * s_row + (jj + j) as isize * s_col) };
+                        let dst_first = unsafe { dst_ptr.offset((jj + j) as isize * d_row + ii as isize * d_col) };
+                        unsafe { std::ptr::copy_nonoverlapping(src_first, dst_first, i_len) };
                     }
                 }
             }

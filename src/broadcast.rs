@@ -277,6 +277,18 @@ pub fn promoteshape<'a, T, const N: usize, Op: ElementOp>(
     })
 }
 
+/// Promote two strided views to a shared target shape.
+///
+/// This is a small convenience wrapper used by tests and mirrors Julia's
+/// `promoteshape(size(dest), a, b)` pattern.
+pub fn promoteshape2<'a, T, const N: usize, Op: ElementOp>(
+    target_size: &[usize; N],
+    a: &StridedArrayView<'a, T, N, Op>,
+    b: &StridedArrayView<'a, T, N, Op>,
+) -> Result<(StridedArrayView<'a, T, N, Op>, StridedArrayView<'a, T, N, Op>)> {
+    Ok((promoteshape(target_size, a)?, promoteshape(target_size, b)?))
+}
+
 // ============================================================================
 // Broadcast execution
 // ============================================================================

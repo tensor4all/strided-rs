@@ -1,6 +1,6 @@
 use mdarray::Tensor;
 use mdarray_strided::{
-    copy_into, copy_transpose_scale_into_fast, map_into, symmetrize_into, zip_map4_into,
+    copy_into_pod, copy_transpose_scale_into_fast, map_into, symmetrize_into_f64, zip_map4_into,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -58,7 +58,7 @@ fn main() {
         });
 
         bench_n("rust_strided", 1, 3, || {
-            symmetrize_into(&mut b, a_view).unwrap();
+            symmetrize_into_f64(&mut b, a_view).unwrap();
             black_box(&b);
         });
         println!();
@@ -130,7 +130,7 @@ fn main() {
         });
 
         bench_n("rust_strided", 20, 50, || {
-            copy_into(&mut b, &a_perm).unwrap();
+            copy_into_pod(&mut b, &a_perm).unwrap();
             black_box(&b);
         });
         println!();
