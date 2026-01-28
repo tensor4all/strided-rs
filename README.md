@@ -325,10 +325,10 @@ cargo bench --bench rust_readme_compare
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust mdarray/naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 17.376 | 27.805 | 66.089 (naive) |
+| symmetrize_4000 | 17.376 | 25.796 | 59.404 (naive) |
 | scale_transpose_1000 | 0.379 | 0.596 | 1.327 (naive) |
 | complex_elementwise_1000 | 7.562 | 13.164 | 14.301 (naive) |
-| permute_32_4d | 0.844 | 1.424 | 1.044 (mdarray_assign) |
+| permute_32_4d | 0.844 | 0.949 | 0.946 (mdarray_assign) |
 | multiple_permute_sum_32_4d | 2.257 | 2.865 | 4.559 (mdarray_alloc4) |
 
 Notes:
@@ -412,10 +412,10 @@ Detailed benchmark results are available in the `docs/` directory:
     - キャスト互換性はランタイムでサイズ・アライメントをチェックし、不整合時は `StridedError::PodCastUnsupported` を返します。
 
 - ベンチマーク（単一スレッド、代表値）:
-    - symmetrize_4000 — Julia: ~17.38 ms | Rust: ~27.81 ms
+    - symmetrize_4000 — Julia: ~17.38 ms | Rust: ~25.80 ms
     - scale_transpose_1000 — Julia: ~0.379 ms | Rust: ~0.596 ms
     - complex_elementwise_1000 — Julia: ~7.56 ms | Rust: ~13.16 ms
-    - permute_32_4d — Julia: ~0.844 ms | Rust: ~1.424 ms
+    - permute_32_4d — Julia: ~0.844 ms | Rust: ~0.949 ms
     - multiple_permute_sum_32_4d — Julia: ~2.26 ms | Rust: ~2.87 ms
 
 - 次の推奨作業:
