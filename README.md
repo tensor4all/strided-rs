@@ -399,6 +399,33 @@ Detailed benchmark results are available in the `docs/` directory:
 
 ## Linear Algebra
 
+## Development status (2026-01-28)
+
+- 概要:
+    - Rust 側に `bytemuck` を導入し、POD 専用経路を追加しました。
+    - 新しい公開 API:
+        - `copy_into_pod<T: Pod>(...)` — 汎用数値型の高速コピー経路。
+        - `copy_into_pod_complex_f32` / `copy_into_pod_complex_f64` — `Complex` をライブラリ内部で境界キャストして POD 経路を再利用する安全化ヘルパ。
+    - `src/pod_complex.rs` を追加して `PodComplexF32` / `PodComplexF64` とキャストユーティリティを提供。
+
+- 安全性と実装方針:
+    - `unsafe` はライブラリ内部に閉じ込め、公開 API は安全に呼べる形を維持しています。
+    - キャスト互換性はランタイムでサイズ・アライメントをチェックし、不整合時は `StridedError::PodCastUnsupported` を返します。
+
+- ベンチマーク（単一スレッド、代表値）:
+    - symmetrize_4000 — Julia: ~16.4 ms | Rust: ~32.9 ms
+    - scale_transpose_1000 — Julia: ~0.408 ms | Rust: ~0.375 ms
+    - complex_elementwise_1000 — Julia: ~7.52 ms | Rust: ~12.50 ms
+    - permute_32_4d — Julia: ~0.737 ms | Rust: ~0.932 ms
+    - multiple_permute_sum_32_4d — Julia: ~2.20 ms | Rust: ~2.15 ms
+
+- 次の推奨作業:
+    1. `Complex` 用のベンチを追加して `copy_into_pod_complex_*` を実測する。
+    2. Complex 向けマイクロカーネル（アンローリング / SIMD）を実装する。
+    3. 外側ブロック・マイクロタイルのパラメータをターゲットごとにチューニングする。
+
+上記を追加したコミットを作成してリモートに push しました。
+
 ```rust
 use mdarray_strided::{matmul, generic_matmul, linalg_axpy, axpby, lmul, rmul};
 
