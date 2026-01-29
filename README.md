@@ -138,9 +138,8 @@ When enabled, `map_into`, `zip_map*_into`, `reduce`, and all high-level ops
 (`copy_into`, `add`, `sum`, `dot`, etc.) automatically parallelize when the
 total element count exceeds 32768. The implementation faithfully ports Julia
 Strided.jl's `_mapreduce_threaded!` recursive dimension-splitting strategy via
-`rayon::join`, with an additional **double-fusion pass** (fuse → order →
-fuse-again → block) that enables threading for any memory layout, not just
-column-major.
+`rayon::join`. The pipeline orders dimensions before fusing (order → fuse →
+block), which enables threading for any memory layout, not just column-major.
 
 ## Benchmarks
 
@@ -212,14 +211,16 @@ The key architectural differences are:
 |---------|-------|------|
 | **Kernel generation** | `@generated` unrolls loops per (rank, num\_arrays) at compile time | Handwritten 1D/2D/3D/4D specializations + generic N-D fallback |
 | **Inner-loop SIMD** | Explicit `@simd` pragma on innermost loop | Stride-specialized inner loops: slice-based when stride=1, raw pointer otherwise; relies on LLVM auto-vectorization |
-| **Threading** | Recursive dimension-splitting via `Threads.@spawn` | Recursive dimension-splitting via `rayon::join` with double-fusion for layout-agnostic parallelization |
+| **Threading** | Recursive dimension-splitting via `Threads.@spawn` | Recursive dimension-splitting via `rayon::join`; order-before-fuse pipeline enables layout-agnostic parallelization |
 
 > **Note: Strided.jl threading bug for non-column-major views.**
-> Julia's `_mapreduce_fuse!` only detects column-major contiguity, so permuted
-> views (e.g. `PermutedDimsArray(A, (2,1))`) with row-major strides are never
-> fused. This causes `_mapreduce_threaded!` to fall through to the single-threaded
-> kernel because all individual dimensions are ≤1024. strided-rs fixes this with
-> a **double-fusion pass** after ordering. See
+> Julia's pipeline fuses before ordering (`fuse → order → block`), so
+> `_mapreduce_fuse!` only detects column-major contiguity. Permuted views
+> (e.g. `PermutedDimsArray(A, (2,1))`) with row-major strides are never fused,
+> causing `_mapreduce_threaded!` to fall through to the single-threaded kernel.
+> strided-rs fixes this by simply reordering the pipeline to `order → fuse →
+> block`: ordering first puts smallest-stride dimensions adjacent, and a single
+> fusion pass then catches contiguity regardless of memory layout. See
 > [docs/strided\_jl\_threading\_bug.md](docs/strided_jl_threading_bug.md) for a
 > minimal reproduction and root cause analysis.
 

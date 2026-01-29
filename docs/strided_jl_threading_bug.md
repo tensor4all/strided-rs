@@ -81,26 +81,25 @@ The pipeline is: `_mapreduce_fuse!` → `_mapreduce_order!` → `_computeblocks`
 For column-major, fusion produces a single `1_000_000`-element dimension that
 exceeds the 1024 guard and is split normally.
 
-## Suggested fix
+## Fix in strided-rs
 
-Apply a **second fusion pass after ordering**. Once `_mapreduce_order!` has
-sorted dimensions by stride importance (smallest stride first), consecutive
-dimensions may now be contiguous regardless of the original memory layout:
+Swap the pipeline order from `fuse → order → block` to `order → fuse → block`.
+Ordering first puts the smallest-stride dimensions adjacent, so a single fusion
+pass catches contiguity regardless of the original memory layout:
 
 ```julia
-# After ordering (pseudocode)
+# Pipeline (pseudocode)
+p = _mapreduce_order!(dims, strides)     # sort by stride importance
 ordered_dims   = permute(dims, p)
 ordered_strides = map(s -> permute(s, p), strides)
-
-# Second fuse on ordered representation
-ordered_dims = _mapreduce_fuse_ordered!(ordered_dims, ordered_strides)
-
-# Then compute blocks and proceed to threading
-blocks = _computeblocks(ordered_dims, ...)
+fused_dims = _mapreduce_fuse!(ordered_dims, ordered_strides)   # single fuse
+blocks = _computeblocks(fused_dims, ...)
 ```
 
 For the row-major example after ordering:
 - `ordered_strides = (1, 1000)` → `s[2] = 1000 == 1000 * 1` → fuses to `(1_000_000, 1)`
 - Now `dims[1] = 1_000_000 > 1024` → threading guard passes → parallelized
 
-This fix is layout-agnostic and preserves the existing algorithm structure.
+This is simpler than a double-fusion approach (fuse → order → fuse) because the
+pre-ordering fuse is redundant: any contiguity it catches will also be caught by
+the post-ordering fuse.

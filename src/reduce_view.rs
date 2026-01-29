@@ -47,8 +47,10 @@ where
     let src_dims_v = src_dims.to_vec();
     let strides_list: [&[isize]; 1] = [&src_strides_v];
 
-    let (fused_dims, plan) =
+    let (fused_dims, ordered_strides, plan) =
         build_plan_fused(&src_dims_v, &strides_list, None, std::mem::size_of::<T>());
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     #[cfg(feature = "parallel")]
     {
@@ -61,21 +63,12 @@ where
             let threadedout_ptr = SendPtr(threadedout.as_mut_ptr());
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let (ordered_dims, ordered_strides, ordered_blocks) =
-                crate::kernel::double_fuse_for_parallel(
-                    &fused_dims,
-                    &strides_list,
-                    &plan,
-                    std::mem::size_of::<T>(),
-                );
-            let strides_refs: Vec<&[isize]> =
-                ordered_strides.iter().map(|s| s.as_slice()).collect();
-            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
 
             // For complete reduction, strides_list has 2 entries:
             // [0] = threadedout (stride 0 everywhere — broadcasting), [1] = src
             // The spacing/taskindex mechanism addresses output slots.
-            let ndim = ordered_dims.len();
+            let ndim = fused_dims.len();
             let mut threaded_strides = Vec::with_capacity(ordered_strides.len() + 1);
             threaded_strides.push(vec![0isize; ndim]); // threadedout: stride 0 (broadcast)
             for s in &ordered_strides {
@@ -90,8 +83,8 @@ where
             // We keep costs unmasked so splitting still works.
 
             mapreduce_threaded(
-                &ordered_dims,
-                &ordered_blocks,
+                &fused_dims,
+                &plan.block,
                 &threaded_strides,
                 &initial_offsets,
                 &costs,
@@ -144,7 +137,7 @@ where
     for_each_inner_block(
         &fused_dims,
         &plan,
-        &strides_list,
+        &ordered_strides_refs,
         |offsets, len, strides| {
             let mut ptr = unsafe { src_ptr.offset(offsets[0]) };
             let stride = strides[0];
