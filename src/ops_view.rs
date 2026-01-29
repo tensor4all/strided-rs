@@ -3,6 +3,7 @@
 use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
     build_plan, ensure_same_shape, for_each_inner_block, is_contiguous, total_len,
+    use_sequential_fast_path,
 };
 use crate::map_view::{map_into, zip_map2_into};
 use crate::reduce_view::reduce;
@@ -12,7 +13,7 @@ use num_traits::Zero;
 use std::ops::{Add, Mul};
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
-pub fn copy_into<T: Copy + ElementOpApply, Op: ElementOp>(
+pub fn copy_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -24,7 +25,10 @@ pub fn copy_into<T: Copy + ElementOpApply, Op: ElementOp>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if is_contiguous(dst_dims, dst_strides) && is_contiguous(src.dims(), src_strides) {
+    if use_sequential_fast_path(total_len(dst_dims))
+        && is_contiguous(dst_dims, dst_strides)
+        && is_contiguous(src.dims(), src_strides)
+    {
         let len = total_len(dst_dims);
         let mut dp = dst_ptr;
         let mut sp = src_ptr;
@@ -42,7 +46,7 @@ pub fn copy_into<T: Copy + ElementOpApply, Op: ElementOp>(
 }
 
 /// Element-wise addition: `dest[i] += src[i]`.
-pub fn add<T: Copy + ElementOpApply + Add<Output = T>, Op: ElementOp>(
+pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -102,7 +106,7 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T>, Op: ElementOp>(
 }
 
 /// Element-wise multiplication: `dest[i] *= src[i]`.
-pub fn mul<T: Copy + ElementOpApply + Mul<Output = T>, Op: ElementOp>(
+pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -162,7 +166,10 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T>, Op: ElementOp>(
 }
 
 /// AXPY: `dest[i] = alpha * src[i] + dest[i]`.
-pub fn axpy<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>, Op: ElementOp>(
+pub fn axpy<
+    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send + Sync,
+    Op: ElementOp,
+>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
     alpha: T,
@@ -223,7 +230,7 @@ pub fn axpy<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>, Op: El
 }
 
 /// Fused multiply-add: `dest[i] += a[i] * b[i]`.
-pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>>(
+pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send + Sync>(
     dest: &mut StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
@@ -281,7 +288,7 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>>(
 }
 
 /// Sum all elements: `sum(src)`.
-pub fn sum<T: Copy + ElementOpApply + Zero + Add<Output = T>, Op: ElementOp>(
+pub fn sum<T: Copy + ElementOpApply + Zero + Add<Output = T> + Send + Sync, Op: ElementOp>(
     src: &StridedView<T, Op>,
 ) -> Result<T> {
     reduce(src, |x| x, |a, b| a + b, T::zero())
@@ -289,7 +296,7 @@ pub fn sum<T: Copy + ElementOpApply + Zero + Add<Output = T>, Op: ElementOp>(
 
 /// Dot product: `sum(a[i] * b[i])`.
 pub fn dot<
-    T: Copy + ElementOpApply + Zero + Mul<Output = T> + Add<Output = T>,
+    T: Copy + ElementOpApply + Zero + Mul<Output = T> + Add<Output = T> + Send + Sync,
     OpA: ElementOp,
     OpB: ElementOp,
 >(
@@ -355,7 +362,9 @@ where
         + Add<Output = T>
         + Mul<Output = T>
         + num_traits::FromPrimitive
-        + std::ops::Div<Output = T>,
+        + std::ops::Div<Output = T>
+        + Send
+        + Sync,
 {
     if src.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
@@ -380,7 +389,9 @@ where
         + Add<Output = T>
         + Mul<Output = T>
         + num_traits::FromPrimitive
-        + std::ops::Div<Output = T>,
+        + std::ops::Div<Output = T>
+        + Send
+        + Sync,
 {
     if src.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
@@ -399,7 +410,7 @@ where
 }
 
 /// Copy with scaling: `dest[i] = scale * src[i]`.
-pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T>, Op: ElementOp>(
+pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
     scale: T,
@@ -408,7 +419,7 @@ pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T>, Op: ElementOp>(
 }
 
 /// Copy with complex conjugation: `dest[i] = conj(src[i])`.
-pub fn copy_conj<T: Copy + ElementOpApply>(
+pub fn copy_conj<T: Copy + ElementOpApply + Send + Sync>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
@@ -423,7 +434,7 @@ pub fn copy_transpose_scale_into<T>(
     scale: T,
 ) -> Result<()>
 where
-    T: Copy + ElementOpApply + Mul<Output = T>,
+    T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync,
 {
     if src.ndim() != 2 || dest.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
