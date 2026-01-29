@@ -4,7 +4,7 @@
 
 use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
-    build_plan_fused, ensure_same_shape, for_each_inner_block, is_contiguous, total_len,
+    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, is_contiguous, total_len,
     use_sequential_fast_path,
 };
 use crate::strided_view::{StridedView, StridedViewMut};
@@ -208,16 +208,10 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
         && is_contiguous(src_dims, src_strides)
     {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut sp = src_ptr;
-        for _ in 0..len {
-            let val = Op::apply(unsafe { *sp });
-            let out = f(val);
-            unsafe {
-                *dp = out;
-                dp = dp.add(1);
-                sp = sp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        for i in 0..len {
+            dst[i] = f(Op::apply(src[i]));
         }
         return Ok(());
     }
@@ -233,6 +227,7 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -277,10 +272,12 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let sp = unsafe { src_ptr.offset(offsets[1]) };
@@ -319,19 +316,11 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
         && is_contiguous(&b_dims_v, &b_strides_v)
     {
         let len = total_len(&dst_dims_v);
-        let mut dp = dst_ptr;
-        let mut ap = a_ptr;
-        let mut bp = b_ptr;
-        for _ in 0..len {
-            let va = OpA::apply(unsafe { *ap });
-            let vb = OpB::apply(unsafe { *bp });
-            let out = f(va, vb);
-            unsafe {
-                *dp = out;
-                dp = dp.add(1);
-                ap = ap.add(1);
-                bp = bp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        for i in 0..len {
+            dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]));
         }
         return Ok(());
     }
@@ -344,6 +333,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -392,10 +382,12 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };
@@ -442,22 +434,12 @@ pub fn zip_map3_into<
         && is_contiguous(c.dims(), c.strides())
     {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut ap = a_ptr;
-        let mut bp = b_ptr;
-        let mut cp = c_ptr;
-        for _ in 0..len {
-            let va = OpA::apply(unsafe { *ap });
-            let vb = OpB::apply(unsafe { *bp });
-            let vc = OpC::apply(unsafe { *cp });
-            let out = f(va, vb, vc);
-            unsafe {
-                *dp = out;
-                dp = dp.add(1);
-                ap = ap.add(1);
-                bp = bp.add(1);
-                cp = cp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
+        for i in 0..len {
+            dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]), OpC::apply(sc[i]));
         }
         return Ok(());
     }
@@ -475,6 +457,7 @@ pub fn zip_map3_into<
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -526,10 +509,12 @@ pub fn zip_map3_into<
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };
@@ -582,25 +567,18 @@ pub fn zip_map4_into<
         && is_contiguous(e.dims(), e.strides())
     {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut ap = a_ptr;
-        let mut bp = b_ptr;
-        let mut cp = c_ptr;
-        let mut ep = e_ptr;
-        for _ in 0..len {
-            let va = OpA::apply(unsafe { *ap });
-            let vb = OpB::apply(unsafe { *bp });
-            let vc = OpC::apply(unsafe { *cp });
-            let ve = OpE::apply(unsafe { *ep });
-            let out = f(va, vb, vc, ve);
-            unsafe {
-                *dp = out;
-                dp = dp.add(1);
-                ap = ap.add(1);
-                bp = bp.add(1);
-                cp = cp.add(1);
-                ep = ep.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
+        let se = unsafe { std::slice::from_raw_parts(e_ptr, len) };
+        for i in 0..len {
+            dst[i] = f(
+                OpA::apply(sa[i]),
+                OpB::apply(sb[i]),
+                OpC::apply(sc[i]),
+                OpE::apply(se[i]),
+            );
         }
         return Ok(());
     }
@@ -625,6 +603,7 @@ pub fn zip_map4_into<
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -678,10 +657,12 @@ pub fn zip_map4_into<
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };

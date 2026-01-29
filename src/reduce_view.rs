@@ -2,7 +2,8 @@
 
 use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block, is_contiguous, total_len, use_sequential_fast_path,
+    build_plan_fused, for_each_inner_block_preordered, is_contiguous, total_len,
+    use_sequential_fast_path,
 };
 use crate::strided_view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
@@ -30,15 +31,10 @@ where
 
     if use_sequential_fast_path(total_len(src_dims)) && is_contiguous(src_dims, src_strides) {
         let len = total_len(src_dims);
-        let mut ptr = src_ptr;
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         let mut acc = init;
-        for _ in 0..len {
-            let val = Op::apply(unsafe { *ptr });
-            let mapped = map_fn(val);
-            acc = reduce_fn(acc, mapped);
-            unsafe {
-                ptr = ptr.add(1);
-            }
+        for &val in src.iter() {
+            acc = reduce_fn(acc, map_fn(Op::apply(val)));
         }
         return Ok(acc);
     }
@@ -49,6 +45,7 @@ where
 
     let (fused_dims, ordered_strides, plan) =
         build_plan_fused(&src_dims_v, &strides_list, None, std::mem::size_of::<T>());
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -95,16 +92,12 @@ where
                     // offsets[0] = spacing * (taskindex - 1) for threadedout
                     // offsets[1] = offset into src
                     let out_offset = offsets[0] as usize;
-                    let src_strides = &strides_list[1..];
                     let src_offsets = &offsets[1..];
-
-                    // Build strides_list for just the source
-                    let src_strides_only: Vec<Vec<isize>> = src_strides.iter().cloned().collect();
 
                     for_each_inner_block_with_offsets(
                         dims,
                         blocks,
-                        &src_strides_only,
+                        &strides_list[1..],
                         src_offsets,
                         |offsets, len, strides| {
                             let mut ptr = unsafe { src_send.as_const().offset(offsets[0]) };
@@ -134,10 +127,12 @@ where
     }
 
     let mut acc = Some(init);
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let mut ptr = unsafe { src_ptr.offset(offsets[0]) };
             let stride = strides[0];

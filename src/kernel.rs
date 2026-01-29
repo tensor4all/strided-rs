@@ -7,16 +7,18 @@ use crate::fuse::fuse_dims;
 use crate::{block, order, Result};
 
 pub(crate) struct KernelPlan {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) order: Vec<usize>, // outer -> inner
     pub(crate) block: Vec<usize>,
 }
 
-/// Build an execution plan for strided iteration.
+/// Build an execution plan for strided iteration (used only in tests).
 ///
 /// This follows Julia's `_mapreduce_fuse!` -> `_mapreduce_order!` -> `_mapreduce_block!` pipeline:
 /// 1. Fuse contiguous dimensions
 /// 2. Compute optimal iteration order
 /// 3. Compute block sizes for cache efficiency
+#[cfg(test)]
 pub(crate) fn build_plan(
     dims: &[usize],
     strides_list: &[&[isize]],
@@ -84,6 +86,7 @@ pub(crate) fn build_plan_fused(
 /// The callback receives the current byte offsets for each array, the number
 /// of elements in the innermost block, and the innermost strides for each array.
 /// This allows the caller to implement vectorized inner loops.
+#[cfg(test)]
 #[inline]
 pub(crate) fn for_each_inner_block<F>(
     dims: &[usize],
@@ -502,10 +505,6 @@ where
                     *offset += s[level];
                 }
             }
-            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset -= (blen as isize) * s[level];
-                *offset += (blen as isize) * s[level];
-            }
             j += blen;
         }
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
@@ -514,6 +513,47 @@ where
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Pre-ordered iteration (for threaded leaf functions)
+// ============================================================================
+
+/// Iterate over blocks with pre-ordered dimensions and initial offsets.
+///
+/// Unlike `for_each_inner_block`, this function assumes that `dims`, `blocks`,
+/// and `strides` are **already in iteration order** (i.e., identity ordering).
+/// It also accepts `initial_offsets` which are added to the starting offsets
+/// before iteration begins.
+///
+/// This avoids the redundant re-ordering and per-callback `Vec` allocation
+/// that `for_each_inner_block_with_offsets` previously incurred.
+#[inline]
+pub(crate) fn for_each_inner_block_preordered<F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[Vec<isize>],
+    initial_offsets: &[isize],
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let rank = dims.len();
+    if rank == 0 {
+        return f(initial_offsets, 1, &[]);
+    }
+
+    // Start from initial_offsets (kernel functions reset to starting values at end)
+    let mut offsets = initial_offsets.to_vec();
+
+    match rank {
+        1 => kernel_1d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        2 => kernel_2d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        3 => kernel_3d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        4 => kernel_4d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        _ => kernel_nd_inner(dims, blocks, strides, &mut offsets, &mut f),
+    }
 }
 
 // ============================================================================

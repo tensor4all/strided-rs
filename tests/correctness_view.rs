@@ -1,7 +1,7 @@
 use approx::assert_relative_eq;
 use strided_rs::{
-    copy_into, copy_transpose_scale_into, dot, map_into, reduce, reduce_axis, symmetrize_into,
-    zip_map2_into, zip_map4_into, StridedArray,
+    add, axpy, copy_into, copy_transpose_scale_into, dot, fma, map_into, mul, reduce, reduce_axis,
+    sum, symmetrize_into, zip_map2_into, zip_map4_into, StridedArray,
 };
 
 fn make_tensor(rows: usize, cols: usize) -> StridedArray<f64> {
@@ -220,5 +220,223 @@ fn test_strided_view_broadcast_and_copy() {
         assert_relative_eq!(dest.get(&[i, 0]), 1.0, epsilon = 1e-10);
         assert_relative_eq!(dest.get(&[i, 1]), 2.0, epsilon = 1e-10);
         assert_relative_eq!(dest.get(&[i, 2]), 3.0, epsilon = 1e-10);
+    }
+}
+
+// ============================================================================
+// Large-array tests: exceed MINTHREADLENGTH (32768) to exercise parallel paths
+// ============================================================================
+
+/// Helper: create a large col-major 2D array (n*n > 32768 when n >= 182).
+fn make_large(n: usize) -> StridedArray<f64> {
+    StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * n + idx[1]) as f64)
+}
+
+#[test]
+fn test_large_map_into() {
+    let n = 200;
+    let a = make_large(n);
+    let mut out = StridedArray::<f64>::col_major(&[n, n]);
+
+    map_into(&mut out.view_mut(), &a.view(), |x| x * 3.0).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            assert_relative_eq!(out.get(&[i, j]), a.get(&[i, j]) * 3.0, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_map_into_permuted() {
+    let n = 200;
+    let a = make_large(n);
+    let a_t = a.view().permute(&[1, 0]).unwrap();
+    let mut out = StridedArray::<f64>::col_major(&[n, n]);
+
+    map_into(&mut out.view_mut(), &a_t, |x| x * 2.0).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            assert_relative_eq!(out.get(&[i, j]), a.get(&[j, i]) * 2.0, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_zip_map2() {
+    let n = 200;
+    let a = make_large(n);
+    let b = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1]) as f64);
+    let mut out = StridedArray::<f64>::col_major(&[n, n]);
+
+    zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            assert_relative_eq!(
+                out.get(&[i, j]),
+                a.get(&[i, j]) + b.get(&[i, j]),
+                epsilon = 1e-10
+            );
+        }
+    }
+}
+
+#[test]
+fn test_large_zip_map4_permuted() {
+    let n = 14; // 14^4 = 38416 > 32768
+    let a = StridedArray::from_fn_col_major(&[n, n, n, n], |idx| {
+        (idx[0] + 2 * idx[1] + 3 * idx[2] + 4 * idx[3]) as f64
+    });
+    let av = a.view();
+    let p1 = av.permute(&[0, 1, 2, 3]).unwrap();
+    let p2 = av.permute(&[1, 2, 3, 0]).unwrap();
+    let p3 = av.permute(&[2, 3, 0, 1]).unwrap();
+    let p4 = av.permute(&[3, 0, 1, 2]).unwrap();
+
+    let mut out = StridedArray::<f64>::col_major(&[n, n, n, n]);
+    zip_map4_into(&mut out.view_mut(), &p1, &p2, &p3, &p4, |a, b, c, d| {
+        a + b + c + d
+    })
+    .unwrap();
+
+    for i in (0..n).step_by(3) {
+        for j in (0..n).step_by(3) {
+            for k in (0..n).step_by(3) {
+                for l in (0..n).step_by(3) {
+                    let expected = p1.get(&[i, j, k, l])
+                        + p2.get(&[i, j, k, l])
+                        + p3.get(&[i, j, k, l])
+                        + p4.get(&[i, j, k, l]);
+                    assert_relative_eq!(out.get(&[i, j, k, l]), expected, epsilon = 1e-10);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_large_reduce() {
+    let n = 200;
+    let a = make_large(n);
+    let result = sum(&a.view()).unwrap();
+    let expected: f64 = a.iter().copied().sum();
+    assert_relative_eq!(result, expected, epsilon = 1e-6);
+}
+
+#[test]
+fn test_large_add() {
+    let n = 200;
+    let b = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1]) as f64);
+    let mut dest = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * 3 + idx[1]) as f64);
+    let expected_base = dest.iter().cloned().collect::<Vec<_>>();
+
+    add(&mut dest.view_mut(), &b.view()).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            let flat = j * n + i; // col-major
+            let expected = expected_base[flat] + b.get(&[i, j]);
+            assert_relative_eq!(dest.get(&[i, j]), expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_mul() {
+    let n = 200;
+    let a = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1] + 1) as f64);
+    let mut dest = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * 2 + idx[1] + 1) as f64);
+    let expected_base = dest.iter().cloned().collect::<Vec<_>>();
+
+    mul(&mut dest.view_mut(), &a.view()).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            let flat = j * n + i;
+            let expected = expected_base[flat] * a.get(&[i, j]);
+            assert_relative_eq!(dest.get(&[i, j]), expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_axpy() {
+    let n = 200;
+    let x = make_large(n);
+    let mut y = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1]) as f64);
+    let y_orig = y.iter().cloned().collect::<Vec<_>>();
+    let alpha = 2.5;
+
+    axpy(&mut y.view_mut(), &x.view(), alpha).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            let flat = j * n + i;
+            let expected = alpha * x.get(&[i, j]) + y_orig[flat];
+            assert_relative_eq!(y.get(&[i, j]), expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_fma() {
+    let n = 200;
+    let a = make_large(n);
+    let b = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1] + 1) as f64);
+    let mut dest = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * 3 + idx[1]) as f64);
+    let dest_orig = dest.iter().cloned().collect::<Vec<_>>();
+
+    fma(&mut dest.view_mut(), &a.view(), &b.view()).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            let flat = j * n + i;
+            let expected = dest_orig[flat] + a.get(&[i, j]) * b.get(&[i, j]);
+            assert_relative_eq!(dest.get(&[i, j]), expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_dot() {
+    let n = 200;
+    let a = make_large(n);
+    let b = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1] + 1) as f64);
+    let result = dot(&a.view(), &b.view()).unwrap();
+    let expected: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    assert_relative_eq!(result, expected, epsilon = 1e-4);
+}
+
+#[test]
+fn test_large_symmetrize() {
+    let n = 200;
+    let a = make_large(n);
+    let mut out = StridedArray::<f64>::col_major(&[n, n]);
+
+    symmetrize_into(&mut out.view_mut(), &a.view()).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            let expected = (a.get(&[i, j]) + a.get(&[j, i])) * 0.5;
+            assert_relative_eq!(out.get(&[i, j]), expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_large_copy_into_permuted() {
+    let n = 200;
+    let a = make_large(n);
+    let a_t = a.view().permute(&[1, 0]).unwrap();
+    let mut out = StridedArray::<f64>::col_major(&[n, n]);
+
+    copy_into(&mut out.view_mut(), &a_t).unwrap();
+
+    for i in (0..n).step_by(17) {
+        for j in (0..n).step_by(19) {
+            assert_relative_eq!(out.get(&[i, j]), a.get(&[j, i]), epsilon = 1e-10);
+        }
     }
 }

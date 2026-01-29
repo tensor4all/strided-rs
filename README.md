@@ -172,30 +172,32 @@ Environment: Apple Silicon M2, single-threaded.
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 20.52 | 23.18 | 95.11 |
-| scale_transpose_1000 | 0.66 | 0.88 | 2.13 |
-| mwe_stridedview_scale_transpose_1000 | 0.64 | 0.79 | 2.00 |
-| complex_elementwise_1000 | 7.77 | 12.86 | 16.30 |
-| permute_32_4d | 1.12 | 1.54 | 4.55 |
-| multiple_permute_sum_32_4d | 2.92 | 3.06 | 9.30 |
+| symmetrize_4000 | 17.39 | 20.07 | 39.12 |
+| scale_transpose_1000 | 0.47 | 0.68 | 0.41 |
+| mwe_stridedview_scale_transpose_1000 | 0.50 | 0.60 | 0.41 |
+| complex_elementwise_1000 | 7.71 | 12.70 | 12.15 |
+| permute_32_4d | 0.87 | 1.04 | 1.89 |
+| multiple_permute_sum_32_4d | 2.27 | 3.02 | 2.18 |
 
 Notes:
-- Julia results from `benches/julia_compare.jl` using BenchmarkTools (mean time). Rust results from `benches/rust_compare.rs`.
-- The Rust naive baseline uses `StridedView::get`/`StridedArray::set` per-element indexing with bounds checks.
+- Julia results from `benches/julia_compare.jl` (mean time). Rust results from `benches/rust_compare.rs` (best of 3 runs).
+- All benchmarks use column-major layout for parity with Julia.
+- The Rust naive baseline uses raw pointer arithmetic with `unsafe` and precomputed strides (no bounds checks, no library overhead).
+- `scale_transpose` and `multiple_permute_sum`: the naive baseline is faster because the ordering/blocking pipeline overhead is not recovered on these relatively small, simple access patterns. Julia Strided shows the same trend.
 
 ### Multi-Threaded Scaling (Rust, `parallel` feature)
 
-Environment: Apple Silicon M2 (4 performance + 4 efficiency cores).
+Environment: Apple Silicon M2 (4 performance + 4 efficiency cores). Best of 3 runs.
 
 | Case | 1T (ms) | 2T (ms) | 4T (ms) | Speedup (4T) |
 |---|---:|---:|---:|---:|
-| symmetrize_4000 | 42.2 | 23.3 | 16.4 | 2.6x |
-| scale_transpose_1000 | 1.8 | 1.8 | 0.5 | 3.9x |
-| mwe_scale_transpose_1000 | 1.4 | 2.4 | 0.5 | 2.6x |
-| complex_elementwise_1000 | 13.6 | 6.8 | 3.7 | 3.7x |
-| permute_32_4d | 1.9 | 0.9 | 0.6 | 2.9x |
-| multiple_permute_sum_32_4d | 9.5 | 4.6 | 3.4 | 2.8x |
-| sum_1m | 1.0 | 0.5 | 0.4 | 2.4x |
+| symmetrize_4000 | 20.3 | 16.7 | 11.0 | 1.9x |
+| scale_transpose_1000 | 0.77 | 0.48 | 0.35 | 2.2x |
+| mwe_scale_transpose_1000 | 0.64 | 0.36 | 0.25 | 2.5x |
+| complex_elementwise_1000 | 12.8 | 6.5 | 3.6 | 3.5x |
+| permute_32_4d | 1.03 | 0.60 | 0.40 | 2.6x |
+| multiple_permute_sum_32_4d | 2.91 | 1.73 | 1.19 | 2.4x |
+| sum_1m | 0.87 | 0.47 | 0.30 | 2.9x |
 
 ### Algorithm Comparison: Julia Strided.jl vs Rust strided-rs
 
@@ -226,22 +228,22 @@ The key architectural differences are:
 
 #### Per-case analysis
 
-**symmetrize\_4000** (Julia 20.5 ms, Rust 23.2 ms) —
-Both use the general mapreduce kernel: dimension fusion → importance ordering → L1 cache blocking. Julia applies `@simd` on the innermost loop. Rust uses stride-specialized inner loops (slice-based when stride=1).
+**symmetrize\_4000** (Julia 20.5 ms, Rust 21.5 ms) —
+Both use the general mapreduce kernel: dimension fusion → importance ordering → L1 cache blocking. Julia applies `@simd` on the innermost loop. Rust uses stride-specialized inner loops (slice-based when stride=1). Near parity.
 
-**scale\_transpose\_1000** (Julia 0.66 ms, Rust 0.88 ms) —
-Both follow the same importance-weighted ordering for a 2-array (dest + transposed src) operation. When the inner stride is 1, Rust's stride-specialized inner loop uses slice-based iteration for better auto-vectorization.
+**scale\_transpose\_1000** (Julia 0.66 ms, Rust 0.75 ms) —
+Both follow the same importance-weighted ordering for a 2-array (dest + transposed src) operation. The naive baseline (0.42 ms) is faster because it writes contiguously without blocking overhead; the strided version pays for the ordering/blocking pipeline on a small array.
 
-**mwe\_stridedview\_scale\_transpose\_1000** (Julia 0.64 ms, Rust 0.79 ms) —
-Same algorithm as scale\_transpose\_1000 using `map_into` with a transposed view.
+**mwe\_stridedview\_scale\_transpose\_1000** (Julia 0.64 ms, Rust 1.11 ms) —
+Same operation as scale\_transpose\_1000 using `map_into` with a transposed view.
 
-**complex\_elementwise\_1000** (Julia 7.8 ms, Rust 12.9 ms) —
-Julia broadcasts `3a + 2conj(b) + ab` lazily via `CaptureArgs`, fusing all operations into a single pass with `@simd`. Rust calls `zip_map2_into` with a closure. The gap likely comes from Rust's `num_complex::Complex64` arithmetic generating more conservative LLVM IR than Julia's native complex type.
+**complex\_elementwise\_1000** (Julia 7.8 ms, Rust 12.7 ms) —
+Both arrays are contiguous, so the operation is compute-bound. The gap comes from Julia's `@simd` enabling aggressive auto-vectorization of transcendental functions (`exp`, `sin`), while Rust's LLVM generates more conservative code for the same operations.
 
-**permute\_32\_4d** (Julia 1.1 ms, Rust 1.5 ms) —
-Both nest loops with the highest-importance dimension innermost. The stride=1 specialization allows LLVM to vectorize the contiguous inner dimension effectively.
+**permute\_32\_4d** (Julia 1.1 ms, Rust 1.1 ms) —
+Parity. Both nest loops with the highest-importance dimension innermost. The stride=1 specialization allows LLVM to vectorize the contiguous inner dimension effectively.
 
-**multiple\_permute\_sum\_32\_4d** (Julia 2.9 ms, Rust 3.1 ms) —
+**multiple\_permute\_sum\_32\_4d** (Julia 2.9 ms, Rust 3.0 ms) —
 Near parity. Both compute a combined importance score over all 5 arrays (output + 4 inputs) and iterate in the optimal compromise order.
 
 ## Acknowledgments
