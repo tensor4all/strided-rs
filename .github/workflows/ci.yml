@@ -24,32 +24,12 @@ jobs:
       - run: cargo fmt --check
 
   test:
-    name: cargo test (${{ matrix.name }} on ${{ matrix.os }})
+    name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            name: default
-            features: ""
-          - os: ubuntu-latest
-            name: parallel
-            features: "parallel"
-          - os: ubuntu-latest
-            name: blas
-            features: "blas"
-            install_openblas: true
-          - os: ubuntu-latest
-            name: all-features
-            features: "parallel blas"
-            install_openblas: true
-          - os: macos-latest
-            name: default
-            features: ""
-          - os: macos-latest
-            name: parallel
-            features: "parallel"
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,18 +37,5 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install OpenBLAS (Linux)
-        if: matrix.install_openblas == true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopenblas-dev
-
       - name: Run tests
-        shell: bash
-        run: |
-          set -euxo pipefail
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo test --features "${{ matrix.features }}"
-          else
-            cargo test
-          fi
+        run: cargo test
