@@ -1,10 +1,10 @@
 use approx::assert_relative_eq;
 use mdarray::{DynRank, Tensor};
+use std::mem::MaybeUninit;
 use strided_rs::{
     copy_into_uninit, copy_transpose_scale_into, copy_transpose_scale_into_fast, dot, map_into,
     reduce, reduce_axis, zip_map2_into, zip_map4_into,
 };
-use std::mem::MaybeUninit;
 
 fn make_tensor(rows: usize, cols: usize) -> Tensor<f64, DynRank> {
     Tensor::from_fn([rows, cols], |idx| (idx[0] * cols + idx[1]) as f64).into_dyn()
@@ -128,10 +128,8 @@ fn test_copy_transpose_scale_into_fast_large() {
 #[test]
 fn test_copy_transpose_scale_into_fast_matches_original() {
     // Verify that fast version produces same results as original
-    let a: Tensor<f64, DynRank> = Tensor::from_fn([100, 80], |idx| {
-        idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01
-    })
-    .into_dyn();
+    let a: Tensor<f64, DynRank> =
+        Tensor::from_fn([100, 80], |idx| idx[0] as f64 * 0.1 + idx[1] as f64 * 0.01).into_dyn();
 
     let mut out_orig = Tensor::zeros([80, 100]).into_dyn();
     let mut out_fast = Tensor::zeros([80, 100]).into_dyn();

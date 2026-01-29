@@ -94,10 +94,10 @@ mod kernel;
 mod map;
 mod ops;
 mod order;
+mod pod_complex;
 mod promote;
 mod reduce;
 pub mod view;
-mod pod_complex;
 
 // ============================================================================
 // Element operations
@@ -113,18 +113,16 @@ pub use map::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 // High-level operations
 // ============================================================================
 pub use ops::{
-    add, axpy, copy_conj, copy_into, copy_into_pod, copy_into_pod_complex_f32, copy_into_pod_complex_f64,
-    copy_into_uninit, copy_scale,
-    copy_transpose_scale_into, copy_transpose_scale_into_fast, dot, fma, mul, sum,
-    symmetrize_conj_into, symmetrize_into, symmetrize_into_f64,
+    add, axpy, copy_conj, copy_into, copy_into_pod, copy_into_pod_complex_f32,
+    copy_into_pod_complex_f64, copy_into_uninit, copy_scale, copy_transpose_scale_into,
+    copy_transpose_scale_into_fast, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
+    symmetrize_into_f64,
 };
 
 // ============================================================================
 // Reduce operations
 // ============================================================================
-pub use reduce::{
-    mapreducedim_capture_views_into, mapreducedim_into, reduce, reduce_axis,
-};
+pub use reduce::{mapreducedim_capture_views_into, mapreducedim_into, reduce, reduce_axis};
 
 // ============================================================================
 // View types and utilities
@@ -137,16 +135,13 @@ pub use view::{
 // Pod complex utilities
 pub use pod_complex::{
     cast_complex_slice_mut_to_pod_f32, cast_complex_slice_mut_to_pod_f64,
-    cast_complex_slice_to_pod_f32, cast_complex_slice_to_pod_f64,
-    PodComplexF32, PodComplexF64,
+    cast_complex_slice_to_pod_f32, cast_complex_slice_to_pod_f64, PodComplexF32, PodComplexF64,
 };
 
 // ============================================================================
 // Broadcast operations (CaptureArgs for lazy evaluation)
 // ============================================================================
-pub use broadcast::{
-    broadcast_into, promoteshape, Arg, CaptureArgs, Consume, Scalar,
-};
+pub use broadcast::{broadcast_into, promoteshape, Arg, CaptureArgs, Consume, Scalar};
 
 // ============================================================================
 // Constants

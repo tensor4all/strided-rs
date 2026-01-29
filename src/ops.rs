@@ -153,7 +153,9 @@ where
     LD: Layout,
     LS: Layout,
 {
-    use crate::pod_complex::{cast_complex_slice_mut_to_pod_f64, cast_complex_slice_to_pod_f64, PodComplexF64};
+    use crate::pod_complex::{
+        cast_complex_slice_mut_to_pod_f64, cast_complex_slice_to_pod_f64, PodComplexF64,
+    };
 
     let dst_view = StridedViewMut::from_slice(dest)?;
     let src_view = StridedView::from_slice(src)?;
@@ -161,9 +163,12 @@ where
 
     // Runtime layout checks to ensure Complex<f64> can be reinterpreted as PodComplexF64
     if std::mem::size_of::<num_complex::Complex<f64>>() != std::mem::size_of::<PodComplexF64>()
-        || std::mem::align_of::<num_complex::Complex<f64>>() != std::mem::align_of::<PodComplexF64>()
+        || std::mem::align_of::<num_complex::Complex<f64>>()
+            != std::mem::align_of::<PodComplexF64>()
     {
-        return Err(crate::StridedError::PodCastUnsupported("Complex<f64> layout incompatible"));
+        return Err(crate::StridedError::PodCastUnsupported(
+            "Complex<f64> layout incompatible",
+        ));
     }
 
     // Contiguous fast path using bytemuck cast helpers
@@ -171,8 +176,14 @@ where
         && is_contiguous(&src_view.dims, &src_view.strides)
     {
         unsafe {
-            let dst_slice = std::slice::from_raw_parts_mut(dst_view.ptr as *mut num_complex::Complex<f64>, total_len(&dst_view.dims));
-            let src_slice = std::slice::from_raw_parts(src_view.ptr as *const num_complex::Complex<f64>, total_len(&src_view.dims));
+            let dst_slice = std::slice::from_raw_parts_mut(
+                dst_view.ptr as *mut num_complex::Complex<f64>,
+                total_len(&dst_view.dims),
+            );
+            let src_slice = std::slice::from_raw_parts(
+                src_view.ptr as *const num_complex::Complex<f64>,
+                total_len(&src_view.dims),
+            );
             let dst_pod = cast_complex_slice_mut_to_pod_f64(dst_slice);
             let src_pod = cast_complex_slice_to_pod_f64(src_slice);
             let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_pod);
@@ -213,8 +224,10 @@ where
         &plan,
         &strides_list,
         |offsets, len, strides| {
-            let mut dst_ptr = unsafe { (dst_pod_view.ptr as *mut PodComplexF64).offset(offsets[0]) };
-            let mut src_ptr = unsafe { (src_pod_view.ptr as *const PodComplexF64).offset(offsets[1]) };
+            let mut dst_ptr =
+                unsafe { (dst_pod_view.ptr as *mut PodComplexF64).offset(offsets[0]) };
+            let mut src_ptr =
+                unsafe { (src_pod_view.ptr as *const PodComplexF64).offset(offsets[1]) };
             let dst_stride = strides[0];
             let src_stride = strides[1];
             for _ in 0..len {
@@ -242,24 +255,35 @@ where
     LD: Layout,
     LS: Layout,
 {
-    use crate::pod_complex::{cast_complex_slice_mut_to_pod_f32, cast_complex_slice_to_pod_f32, PodComplexF32};
+    use crate::pod_complex::{
+        cast_complex_slice_mut_to_pod_f32, cast_complex_slice_to_pod_f32, PodComplexF32,
+    };
 
     let dst_view = StridedViewMut::from_slice(dest)?;
     let src_view = StridedView::from_slice(src)?;
     ensure_same_shape(&dst_view.dims, &src_view.dims)?;
 
     if std::mem::size_of::<num_complex::Complex<f32>>() != std::mem::size_of::<PodComplexF32>()
-        || std::mem::align_of::<num_complex::Complex<f32>>() != std::mem::align_of::<PodComplexF32>()
+        || std::mem::align_of::<num_complex::Complex<f32>>()
+            != std::mem::align_of::<PodComplexF32>()
     {
-        return Err(crate::StridedError::PodCastUnsupported("Complex<f32> layout incompatible"));
+        return Err(crate::StridedError::PodCastUnsupported(
+            "Complex<f32> layout incompatible",
+        ));
     }
 
     if is_contiguous(&dst_view.dims, &dst_view.strides)
         && is_contiguous(&src_view.dims, &src_view.strides)
     {
         unsafe {
-            let dst_slice = std::slice::from_raw_parts_mut(dst_view.ptr as *mut num_complex::Complex<f32>, total_len(&dst_view.dims));
-            let src_slice = std::slice::from_raw_parts(src_view.ptr as *const num_complex::Complex<f32>, total_len(&src_view.dims));
+            let dst_slice = std::slice::from_raw_parts_mut(
+                dst_view.ptr as *mut num_complex::Complex<f32>,
+                total_len(&dst_view.dims),
+            );
+            let src_slice = std::slice::from_raw_parts(
+                src_view.ptr as *const num_complex::Complex<f32>,
+                total_len(&src_view.dims),
+            );
             let dst_pod = cast_complex_slice_mut_to_pod_f32(dst_slice);
             let src_pod = cast_complex_slice_to_pod_f32(src_slice);
             let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(dst_pod);
@@ -298,8 +322,10 @@ where
         &plan,
         &strides_list,
         |offsets, len, strides| {
-            let mut dst_ptr = unsafe { (dst_pod_view.ptr as *mut PodComplexF32).offset(offsets[0]) };
-            let mut src_ptr = unsafe { (src_pod_view.ptr as *const PodComplexF32).offset(offsets[1]) };
+            let mut dst_ptr =
+                unsafe { (dst_pod_view.ptr as *mut PodComplexF32).offset(offsets[0]) };
+            let mut src_ptr =
+                unsafe { (src_pod_view.ptr as *const PodComplexF32).offset(offsets[1]) };
             let dst_stride = strides[0];
             let src_stride = strides[1];
             for _ in 0..len {
@@ -1121,7 +1147,9 @@ where
                     for ii in (i0..i_end).step_by(MICRO) {
                         for jj in (j0..j_end).step_by(MICRO) {
                             unsafe {
-                                do_micro_tile_row_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                                do_micro_tile_row_major(
+                                    n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end,
+                                );
                             }
                         }
                     }
@@ -1137,7 +1165,9 @@ where
                     for jj in (j0..j_end).step_by(MICRO) {
                         for ii in (i0..i_end).step_by(MICRO) {
                             unsafe {
-                                do_micro_tile_row_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                                do_micro_tile_row_major(
+                                    n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end,
+                                );
                             }
                         }
                     }
@@ -1240,7 +1270,9 @@ where
                     for ii in (i0..i_end).step_by(MICRO) {
                         for jj in (j0..j_end).step_by(MICRO) {
                             unsafe {
-                                do_micro_tile_col_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                                do_micro_tile_col_major(
+                                    n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end,
+                                );
                             }
                         }
                     }
@@ -1256,7 +1288,9 @@ where
                     for jj in (j0..j_end).step_by(MICRO) {
                         for ii in (i0..i_end).step_by(MICRO) {
                             unsafe {
-                                do_micro_tile_col_major(n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end);
+                                do_micro_tile_col_major(
+                                    n, a_ptr, d_ptr, &half, ii, jj, i_end, j_end,
+                                );
                             }
                         }
                     }
@@ -1337,7 +1371,9 @@ fn symmetrize_into_contig_row_major_f64(
                     let j_end = (j0 + b1).min(n);
                     for ii in (i0..i_end).step_by(MICRO) {
                         for jj in (j0..j_end).step_by(MICRO) {
-                            unsafe { do_micro_tile_row_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                            unsafe {
+                                do_micro_tile_row_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end)
+                            };
                         }
                     }
                 }
@@ -1350,7 +1386,9 @@ fn symmetrize_into_contig_row_major_f64(
                     let i_end = (i0 + b1).min(n);
                     for jj in (j0..j_end).step_by(MICRO) {
                         for ii in (i0..i_end).step_by(MICRO) {
-                            unsafe { do_micro_tile_row_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                            unsafe {
+                                do_micro_tile_row_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end)
+                            };
                         }
                     }
                 }
@@ -1431,7 +1469,9 @@ fn symmetrize_into_contig_col_major_f64(
                     let j_end = (j0 + b1).min(n);
                     for ii in (i0..i_end).step_by(MICRO) {
                         for jj in (j0..j_end).step_by(MICRO) {
-                            unsafe { do_micro_tile_col_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                            unsafe {
+                                do_micro_tile_col_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end)
+                            };
                         }
                     }
                 }
@@ -1444,7 +1484,9 @@ fn symmetrize_into_contig_col_major_f64(
                     let i_end = (i0 + b1).min(n);
                     for jj in (j0..j_end).step_by(MICRO) {
                         for ii in (i0..i_end).step_by(MICRO) {
-                            unsafe { do_micro_tile_col_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end) };
+                            unsafe {
+                                do_micro_tile_col_major_f64(n, a_ptr, d_ptr, ii, jj, i_end, j_end)
+                            };
                         }
                     }
                 }
@@ -1781,7 +1823,10 @@ where
     Ok(false)
 }
 
-fn copy_2d_contig_write_pod<T>(dst_view: &StridedViewMut<T>, src_view: &StridedView<T>) -> Result<bool>
+fn copy_2d_contig_write_pod<T>(
+    dst_view: &StridedViewMut<T>,
+    src_view: &StridedView<T>,
+) -> Result<bool>
 where
     T: Pod,
 {
@@ -1885,7 +1930,8 @@ where
                         let mut buf: [std::mem::MaybeUninit<T>; MICRO * MICRO] =
                             std::mem::MaybeUninit::uninit().assume_init();
                         for j in 0..j_len {
-                            let s_col_ptr = src_ptr.offset((ii as isize) * s_row + ((jj + j) as isize) * s_col);
+                            let s_col_ptr =
+                                src_ptr.offset((ii as isize) * s_row + ((jj + j) as isize) * s_col);
                             for i in 0..i_len {
                                 let v = (&*s_col_ptr.offset(i as isize * s_row)).clone();
                                 buf[i * MICRO + j].write(v);
@@ -1894,7 +1940,8 @@ where
 
                         // store transposed
                         for j in 0..j_len {
-                            let d_row_ptr = dst_ptr.offset(((jj + j) as isize) * d_row + (ii as isize) * d_col);
+                            let d_row_ptr =
+                                dst_ptr.offset(((jj + j) as isize) * d_row + (ii as isize) * d_col);
                             for i in 0..i_len {
                                 let v = buf[i * MICRO + j].assume_init_read();
                                 *d_row_ptr.add(i) = v;
@@ -2082,8 +2129,12 @@ where
                     let j_len = (jj + MICRO).min(j_end) - jj;
 
                     for j in 0..j_len {
-                        let src_first = unsafe { src_ptr.offset(ii as isize * s_row + (jj + j) as isize * s_col) };
-                        let dst_first = unsafe { dst_ptr.offset((jj + j) as isize * d_row + ii as isize * d_col) };
+                        let src_first = unsafe {
+                            src_ptr.offset(ii as isize * s_row + (jj + j) as isize * s_col)
+                        };
+                        let dst_first = unsafe {
+                            dst_ptr.offset((jj + j) as isize * d_row + ii as isize * d_col)
+                        };
                         unsafe { std::ptr::copy_nonoverlapping(src_first, dst_first, i_len) };
                     }
                 }

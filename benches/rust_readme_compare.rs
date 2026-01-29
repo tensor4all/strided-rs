@@ -1,23 +1,18 @@
 use mdarray::Tensor;
-use strided_rs::{
-    copy_into_pod, copy_transpose_scale_into_fast, map_into, symmetrize_into_f64, zip_map4_into,
-};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_rs::{
+    copy_into_pod, copy_transpose_scale_into_fast, map_into, symmetrize_into_f64, zip_map4_into,
+};
 
 fn mean(durations: &[Duration]) -> Duration {
     let total_nanos: u128 = durations.iter().map(|d| d.as_nanos()).sum();
     Duration::from_nanos((total_nanos / durations.len() as u128) as u64)
 }
 
-fn bench_n(
-    label: &str,
-    warmup_iters: usize,
-    iters: usize,
-    mut f: impl FnMut(),
-) -> Duration {
+fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) -> Duration {
     for _ in 0..warmup_iters {
         f();
     }

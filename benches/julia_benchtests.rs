@@ -1,12 +1,12 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
-use strided_rs::{
-    copy_into, mapreducedim_capture_views_into, sum, Arg, CaptureArgs, Identity,
-    StridedArrayView, StridedArrayViewMut,
-};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
+use strided_rs::{
+    copy_into, mapreducedim_capture_views_into, sum, Arg, CaptureArgs, Identity, StridedArrayView,
+    StridedArrayViewMut,
+};
 
 fn julia_sizes() -> Vec<usize> {
     // Julia: sizes = ceil.(Int, 2 .^ (2:1.5:20))
@@ -105,27 +105,32 @@ fn bench_permute_4d(c: &mut Criterion) {
 
         for (perm, perm_name) in perms {
             // Baseline permutedims!(B, A, p) equivalent: explicit index remap.
-            group.bench_with_input(BenchmarkId::new(format!("permute_base/{perm_name}"), s), &s, |b, _| {
-                let mut b_out = Tensor::<f64, _>::zeros([s, s, s, s]);
-                b.iter(|| {
-                    for o0 in 0..s {
-                        for o1 in 0..s {
-                            for o2 in 0..s {
-                                for o3 in 0..s {
-                                    let out_idx = [o0, o1, o2, o3];
-                                    let mut in_idx = [0usize; 4];
-                                    in_idx[perm[0]] = out_idx[0];
-                                    in_idx[perm[1]] = out_idx[1];
-                                    in_idx[perm[2]] = out_idx[2];
-                                    in_idx[perm[3]] = out_idx[3];
-                                    b_out[[o0, o1, o2, o3]] = a_view[[in_idx[0], in_idx[1], in_idx[2], in_idx[3]]];
+            group.bench_with_input(
+                BenchmarkId::new(format!("permute_base/{perm_name}"), s),
+                &s,
+                |b, _| {
+                    let mut b_out = Tensor::<f64, _>::zeros([s, s, s, s]);
+                    b.iter(|| {
+                        for o0 in 0..s {
+                            for o1 in 0..s {
+                                for o2 in 0..s {
+                                    for o3 in 0..s {
+                                        let out_idx = [o0, o1, o2, o3];
+                                        let mut in_idx = [0usize; 4];
+                                        in_idx[perm[0]] = out_idx[0];
+                                        in_idx[perm[1]] = out_idx[1];
+                                        in_idx[perm[2]] = out_idx[2];
+                                        in_idx[perm[3]] = out_idx[3];
+                                        b_out[[o0, o1, o2, o3]] =
+                                            a_view[[in_idx[0], in_idx[1], in_idx[2], in_idx[3]]];
+                                    }
                                 }
                             }
                         }
-                    }
-                    black_box(&b_out);
-                })
-            });
+                        black_box(&b_out);
+                    })
+                },
+            );
 
             // Strided path: create a lazy permuted view, then copy into B.
             group.bench_with_input(

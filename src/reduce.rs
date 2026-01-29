@@ -1,9 +1,9 @@
+use crate::broadcast::Consume;
+use crate::element_op::{ElementOp, ElementOpApply, Identity};
 use crate::kernel::{
     build_plan_fused, ensure_same_shape, for_each_inner_block, for_each_offset, is_contiguous,
     total_len, StridedView, StridedViewMut,
 };
-use crate::broadcast::Consume;
-use crate::element_op::{ElementOp, ElementOpApply, Identity};
 use crate::promote::{
     broadcast_shape, broadcast_shape as broadcast_shape_dyn, promote_strides_to_shape,
 };
@@ -34,23 +34,32 @@ where
     }
 
     let strides_list = [&src_view.strides[..]];
-    let (fused_dims, plan) =
-        build_plan_fused(&src_view.dims, &strides_list, None, std::mem::size_of::<T>());
+    let (fused_dims, plan) = build_plan_fused(
+        &src_view.dims,
+        &strides_list,
+        None,
+        std::mem::size_of::<T>(),
+    );
 
     let mut acc = Some(init);
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut ptr = unsafe { src_view.ptr.offset(offsets[0]) };
-        let stride = strides[0];
-        for _ in 0..len {
-            let mapped = map_fn(unsafe { &*ptr });
-            let current = acc.take().ok_or(StridedError::OffsetOverflow)?;
-            acc = Some(reduce_fn(current, mapped));
-            unsafe {
-                ptr = ptr.offset(stride);
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut ptr = unsafe { src_view.ptr.offset(offsets[0]) };
+            let stride = strides[0];
+            for _ in 0..len {
+                let mapped = map_fn(unsafe { &*ptr });
+                let current = acc.take().ok_or(StridedError::OffsetOverflow)?;
+                acc = Some(reduce_fn(current, mapped));
+                unsafe {
+                    ptr = ptr.offset(stride);
+                }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     acc.ok_or(StridedError::OffsetOverflow)
 }
@@ -114,8 +123,12 @@ where
     ensure_same_shape(&in_reduced.dims, &out_view.dims)?;
 
     let strides_list = [&in_reduced.strides[..], &out_view.strides[..]];
-    let (fused_dims, plan) =
-        build_plan_fused(&out_view.dims, &strides_list, Some(1), std::mem::size_of::<U>());
+    let (fused_dims, plan) = build_plan_fused(
+        &out_view.dims,
+        &strides_list,
+        Some(1),
+        std::mem::size_of::<U>(),
+    );
 
     for_each_offset(&fused_dims, &plan, &strides_list, |offsets| {
         let mut acc = init.clone();
@@ -215,10 +228,8 @@ where
     // Build promoted strides for broadcast/reduction iteration
     // - Any size-1 dim in dest becomes stride-0 (reduction)
     // - Any size-1 dim in src becomes stride-0 (broadcast)
-    let dst_promoted_strides =
-        promote_strides_to_shape(&dims, &dst_view.dims, &dst_view.strides)?;
-    let src_promoted_strides =
-        promote_strides_to_shape(&dims, &src_view.dims, &src_view.strides)?;
+    let dst_promoted_strides = promote_strides_to_shape(&dims, &dst_view.dims, &dst_view.strides)?;
+    let src_promoted_strides = promote_strides_to_shape(&dims, &src_view.dims, &src_view.strides)?;
 
     // If init_op is provided, apply it first to all dest elements
     if let Some(init) = init_op {
@@ -233,39 +244,44 @@ where
     let (fused_dims, plan) =
         build_plan_fused(&dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut dst_ptr = unsafe { dst_view.ptr.offset(offsets[0]) };
-        let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
-        let dst_stride = strides[0];
-        let src_stride = strides[1];
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut dst_ptr = unsafe { dst_view.ptr.offset(offsets[0]) };
+            let mut src_ptr = unsafe { src_view.ptr.offset(offsets[1]) };
+            let dst_stride = strides[0];
+            let src_stride = strides[1];
 
-        // Check if this is a reduction (stride 0 for dest in inner loop)
-        if dst_stride == 0 && len > 0 {
-            // Reduction: accumulate all src elements into single dest
-            let mut acc = unsafe { (*dst_ptr).clone() };
-            for _ in 0..len {
-                let mapped = map_fn(unsafe { &*src_ptr });
-                acc = reduce_fn(acc, mapped);
-                src_ptr = unsafe { src_ptr.offset(src_stride) };
-            }
-            unsafe {
-                *dst_ptr = acc;
-            }
-        } else {
-            // Non-reduction: apply map and combine with dest
-            for _ in 0..len {
-                let mapped = map_fn(unsafe { &*src_ptr });
-                let current = unsafe { (*dst_ptr).clone() };
-                let result = reduce_fn(current, mapped);
+            // Check if this is a reduction (stride 0 for dest in inner loop)
+            if dst_stride == 0 && len > 0 {
+                // Reduction: accumulate all src elements into single dest
+                let mut acc = unsafe { (*dst_ptr).clone() };
+                for _ in 0..len {
+                    let mapped = map_fn(unsafe { &*src_ptr });
+                    acc = reduce_fn(acc, mapped);
+                    src_ptr = unsafe { src_ptr.offset(src_stride) };
+                }
                 unsafe {
-                    *dst_ptr = result;
-                    dst_ptr = dst_ptr.offset(dst_stride);
-                    src_ptr = src_ptr.offset(src_stride);
+                    *dst_ptr = acc;
+                }
+            } else {
+                // Non-reduction: apply map and combine with dest
+                for _ in 0..len {
+                    let mapped = map_fn(unsafe { &*src_ptr });
+                    let current = unsafe { (*dst_ptr).clone() };
+                    let result = reduce_fn(current, mapped);
+                    unsafe {
+                        *dst_ptr = result;
+                        dst_ptr = dst_ptr.offset(dst_stride);
+                        src_ptr = src_ptr.offset(src_stride);
+                    }
                 }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 /// Apply initialization operation to all elements of a strided view.
@@ -287,18 +303,23 @@ fn apply_init_op<T: Clone>(view: &StridedViewMut<T>, init: fn(&T) -> T) -> Resul
     let (fused_dims, plan) =
         build_plan_fused(&view.dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut ptr = unsafe { view.ptr.offset(offsets[0]) };
-        let stride = strides[0];
-        for _ in 0..len {
-            unsafe {
-                let val = init(&*ptr);
-                *ptr = val;
-                ptr = ptr.offset(stride);
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, strides| {
+            let mut ptr = unsafe { view.ptr.offset(offsets[0]) };
+            let stride = strides[0];
+            for _ in 0..len {
+                unsafe {
+                    let val = init(&*ptr);
+                    *ptr = val;
+                    ptr = ptr.offset(stride);
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 fn apply_init_op_view<T: Copy, const N: usize>(
@@ -326,18 +347,23 @@ fn apply_init_op_view<T: Copy, const N: usize>(
         build_plan_fused(&dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
     let base = view.as_mut_ptr();
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, inner_strides| {
-        let mut ptr = unsafe { base.offset(offsets[0]) };
-        let step = inner_strides[0];
-        for _ in 0..len {
-            unsafe {
-                let val = init(&*ptr);
-                *ptr = val;
-                ptr = ptr.offset(step);
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, inner_strides| {
+            let mut ptr = unsafe { base.offset(offsets[0]) };
+            let step = inner_strides[0];
+            for _ in 0..len {
+                unsafe {
+                    let val = init(&*ptr);
+                    *ptr = val;
+                    ptr = ptr.offset(step);
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 /// View-based Julia-style `mapreducedim!` for an arbitrary number of source arrays.
@@ -402,232 +428,236 @@ where
     let dst_base = dest.as_mut_ptr();
     let src_bases: Vec<*const T> = sources.iter().map(|s| s.as_ptr()).collect();
 
-    for_each_inner_block(&fused_dims, &plan, &strides_list, |offsets, len, inner_strides| {
-        let mut dst_ptr = unsafe { dst_base.offset(offsets[0]) };
-        let dst_step = inner_strides[0];
+    for_each_inner_block(
+        &fused_dims,
+        &plan,
+        &strides_list,
+        |offsets, len, inner_strides| {
+            let mut dst_ptr = unsafe { dst_base.offset(offsets[0]) };
+            let dst_step = inner_strides[0];
 
-        match num_src {
-            0 => {
-                if dst_step == 0 && len > 0 {
-                    let mut acc = unsafe { *dst_ptr };
-                    for _ in 0..len {
-                        let mut it = [].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        acc = reduce_fn(acc, mapped);
-                    }
-                    unsafe { *dst_ptr = acc };
-                } else {
-                    for _ in 0..len {
-                        let mut it = [].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        unsafe {
-                            let current = *dst_ptr;
-                            *dst_ptr = reduce_fn(current, mapped);
-                            dst_ptr = dst_ptr.offset(dst_step);
+            match num_src {
+                0 => {
+                    if dst_step == 0 && len > 0 {
+                        let mut acc = unsafe { *dst_ptr };
+                        for _ in 0..len {
+                            let mut it = [].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            acc = reduce_fn(acc, mapped);
                         }
-                    }
-                }
-            }
-            1 => {
-                let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
-                let s0 = inner_strides[1];
-
-                if dst_step == 0 && len > 0 {
-                    let mut acc = unsafe { *dst_ptr };
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        p0 = unsafe { p0.offset(s0) };
-                        let mut it = [v0].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        acc = reduce_fn(acc, mapped);
-                    }
-                    unsafe { *dst_ptr = acc };
-                } else {
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        p0 = unsafe { p0.offset(s0) };
-                        let mut it = [v0].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        unsafe {
-                            let current = *dst_ptr;
-                            *dst_ptr = reduce_fn(current, mapped);
-                            dst_ptr = dst_ptr.offset(dst_step);
-                        }
-                    }
-                }
-            }
-            2 => {
-                let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
-                let mut p1 = unsafe { src_bases[1].offset(offsets[2]) };
-                let s0 = inner_strides[1];
-                let s1 = inner_strides[2];
-
-                if dst_step == 0 && len > 0 {
-                    let mut acc = unsafe { *dst_ptr };
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        let v1 = unsafe { Op::apply(*p1) };
-                        p0 = unsafe { p0.offset(s0) };
-                        p1 = unsafe { p1.offset(s1) };
-                        let mut it = [v0, v1].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        acc = reduce_fn(acc, mapped);
-                    }
-                    unsafe { *dst_ptr = acc };
-                } else {
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        let v1 = unsafe { Op::apply(*p1) };
-                        p0 = unsafe { p0.offset(s0) };
-                        p1 = unsafe { p1.offset(s1) };
-                        let mut it = [v0, v1].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        unsafe {
-                            let current = *dst_ptr;
-                            *dst_ptr = reduce_fn(current, mapped);
-                            dst_ptr = dst_ptr.offset(dst_step);
-                        }
-                    }
-                }
-            }
-            3 => {
-                let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
-                let mut p1 = unsafe { src_bases[1].offset(offsets[2]) };
-                let mut p2 = unsafe { src_bases[2].offset(offsets[3]) };
-                let s0 = inner_strides[1];
-                let s1 = inner_strides[2];
-                let s2 = inner_strides[3];
-
-                if dst_step == 0 && len > 0 {
-                    let mut acc = unsafe { *dst_ptr };
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        let v1 = unsafe { Op::apply(*p1) };
-                        let v2 = unsafe { Op::apply(*p2) };
-                        p0 = unsafe { p0.offset(s0) };
-                        p1 = unsafe { p1.offset(s1) };
-                        p2 = unsafe { p2.offset(s2) };
-                        let mut it = [v0, v1, v2].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        acc = reduce_fn(acc, mapped);
-                    }
-                    unsafe { *dst_ptr = acc };
-                } else {
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        let v1 = unsafe { Op::apply(*p1) };
-                        let v2 = unsafe { Op::apply(*p2) };
-                        p0 = unsafe { p0.offset(s0) };
-                        p1 = unsafe { p1.offset(s1) };
-                        p2 = unsafe { p2.offset(s2) };
-                        let mut it = [v0, v1, v2].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        unsafe {
-                            let current = *dst_ptr;
-                            *dst_ptr = reduce_fn(current, mapped);
-                            dst_ptr = dst_ptr.offset(dst_step);
-                        }
-                    }
-                }
-            }
-            4 => {
-                let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
-                let mut p1 = unsafe { src_bases[1].offset(offsets[2]) };
-                let mut p2 = unsafe { src_bases[2].offset(offsets[3]) };
-                let mut p3 = unsafe { src_bases[3].offset(offsets[4]) };
-                let s0 = inner_strides[1];
-                let s1 = inner_strides[2];
-                let s2 = inner_strides[3];
-                let s3 = inner_strides[4];
-
-                if dst_step == 0 && len > 0 {
-                    let mut acc = unsafe { *dst_ptr };
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        let v1 = unsafe { Op::apply(*p1) };
-                        let v2 = unsafe { Op::apply(*p2) };
-                        let v3 = unsafe { Op::apply(*p3) };
-                        p0 = unsafe { p0.offset(s0) };
-                        p1 = unsafe { p1.offset(s1) };
-                        p2 = unsafe { p2.offset(s2) };
-                        p3 = unsafe { p3.offset(s3) };
-                        let mut it = [v0, v1, v2, v3].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        acc = reduce_fn(acc, mapped);
-                    }
-                    unsafe { *dst_ptr = acc };
-                } else {
-                    for _ in 0..len {
-                        let v0 = unsafe { Op::apply(*p0) };
-                        let v1 = unsafe { Op::apply(*p1) };
-                        let v2 = unsafe { Op::apply(*p2) };
-                        let v3 = unsafe { Op::apply(*p3) };
-                        p0 = unsafe { p0.offset(s0) };
-                        p1 = unsafe { p1.offset(s1) };
-                        p2 = unsafe { p2.offset(s2) };
-                        p3 = unsafe { p3.offset(s3) };
-                        let mut it = [v0, v1, v2, v3].into_iter();
-                        let mapped = capture.consume(&mut it);
-                        unsafe {
-                            let current = *dst_ptr;
-                            *dst_ptr = reduce_fn(current, mapped);
-                            dst_ptr = dst_ptr.offset(dst_step);
-                        }
-                    }
-                }
-            }
-            _ => {
-                let mut src_ptrs: Vec<*const T> = Vec::with_capacity(num_src);
-                let mut src_steps: Vec<isize> = Vec::with_capacity(num_src);
-                let mut values: Vec<T> = Vec::with_capacity(num_src);
-
-                src_ptrs.clear();
-                src_steps.clear();
-                for i in 0..num_src {
-                    src_ptrs.push(unsafe { src_bases[i].offset(offsets[i + 1]) });
-                    src_steps.push(inner_strides[i + 1]);
-                }
-
-                if dst_step == 0 && len > 0 {
-                    let mut acc = unsafe { *dst_ptr };
-                    for _ in 0..len {
-                        values.clear();
-                        for i in 0..num_src {
+                        unsafe { *dst_ptr = acc };
+                    } else {
+                        for _ in 0..len {
+                            let mut it = [].into_iter();
+                            let mapped = capture.consume(&mut it);
                             unsafe {
-                                values.push(Op::apply(*src_ptrs[i]));
-                                src_ptrs[i] = src_ptrs[i].offset(src_steps[i]);
+                                let current = *dst_ptr;
+                                *dst_ptr = reduce_fn(current, mapped);
+                                dst_ptr = dst_ptr.offset(dst_step);
                             }
                         }
-                        let mut it = values.iter().copied();
-                        let mapped = capture.consume(&mut it);
-                        acc = reduce_fn(acc, mapped);
                     }
-                    unsafe { *dst_ptr = acc };
-                } else {
-                    for _ in 0..len {
-                        values.clear();
-                        for i in 0..num_src {
+                }
+                1 => {
+                    let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
+                    let s0 = inner_strides[1];
+
+                    if dst_step == 0 && len > 0 {
+                        let mut acc = unsafe { *dst_ptr };
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            p0 = unsafe { p0.offset(s0) };
+                            let mut it = [v0].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            acc = reduce_fn(acc, mapped);
+                        }
+                        unsafe { *dst_ptr = acc };
+                    } else {
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            p0 = unsafe { p0.offset(s0) };
+                            let mut it = [v0].into_iter();
+                            let mapped = capture.consume(&mut it);
                             unsafe {
-                                values.push(Op::apply(*src_ptrs[i]));
-                                src_ptrs[i] = src_ptrs[i].offset(src_steps[i]);
+                                let current = *dst_ptr;
+                                *dst_ptr = reduce_fn(current, mapped);
+                                dst_ptr = dst_ptr.offset(dst_step);
                             }
                         }
-                        let mut it = values.iter().copied();
-                        let mapped = capture.consume(&mut it);
-                        unsafe {
-                            let current = *dst_ptr;
-                            *dst_ptr = reduce_fn(current, mapped);
-                            dst_ptr = dst_ptr.offset(dst_step);
+                    }
+                }
+                2 => {
+                    let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
+                    let mut p1 = unsafe { src_bases[1].offset(offsets[2]) };
+                    let s0 = inner_strides[1];
+                    let s1 = inner_strides[2];
+
+                    if dst_step == 0 && len > 0 {
+                        let mut acc = unsafe { *dst_ptr };
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            let v1 = unsafe { Op::apply(*p1) };
+                            p0 = unsafe { p0.offset(s0) };
+                            p1 = unsafe { p1.offset(s1) };
+                            let mut it = [v0, v1].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            acc = reduce_fn(acc, mapped);
+                        }
+                        unsafe { *dst_ptr = acc };
+                    } else {
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            let v1 = unsafe { Op::apply(*p1) };
+                            p0 = unsafe { p0.offset(s0) };
+                            p1 = unsafe { p1.offset(s1) };
+                            let mut it = [v0, v1].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            unsafe {
+                                let current = *dst_ptr;
+                                *dst_ptr = reduce_fn(current, mapped);
+                                dst_ptr = dst_ptr.offset(dst_step);
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
+                    let mut p1 = unsafe { src_bases[1].offset(offsets[2]) };
+                    let mut p2 = unsafe { src_bases[2].offset(offsets[3]) };
+                    let s0 = inner_strides[1];
+                    let s1 = inner_strides[2];
+                    let s2 = inner_strides[3];
+
+                    if dst_step == 0 && len > 0 {
+                        let mut acc = unsafe { *dst_ptr };
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            let v1 = unsafe { Op::apply(*p1) };
+                            let v2 = unsafe { Op::apply(*p2) };
+                            p0 = unsafe { p0.offset(s0) };
+                            p1 = unsafe { p1.offset(s1) };
+                            p2 = unsafe { p2.offset(s2) };
+                            let mut it = [v0, v1, v2].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            acc = reduce_fn(acc, mapped);
+                        }
+                        unsafe { *dst_ptr = acc };
+                    } else {
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            let v1 = unsafe { Op::apply(*p1) };
+                            let v2 = unsafe { Op::apply(*p2) };
+                            p0 = unsafe { p0.offset(s0) };
+                            p1 = unsafe { p1.offset(s1) };
+                            p2 = unsafe { p2.offset(s2) };
+                            let mut it = [v0, v1, v2].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            unsafe {
+                                let current = *dst_ptr;
+                                *dst_ptr = reduce_fn(current, mapped);
+                                dst_ptr = dst_ptr.offset(dst_step);
+                            }
+                        }
+                    }
+                }
+                4 => {
+                    let mut p0 = unsafe { src_bases[0].offset(offsets[1]) };
+                    let mut p1 = unsafe { src_bases[1].offset(offsets[2]) };
+                    let mut p2 = unsafe { src_bases[2].offset(offsets[3]) };
+                    let mut p3 = unsafe { src_bases[3].offset(offsets[4]) };
+                    let s0 = inner_strides[1];
+                    let s1 = inner_strides[2];
+                    let s2 = inner_strides[3];
+                    let s3 = inner_strides[4];
+
+                    if dst_step == 0 && len > 0 {
+                        let mut acc = unsafe { *dst_ptr };
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            let v1 = unsafe { Op::apply(*p1) };
+                            let v2 = unsafe { Op::apply(*p2) };
+                            let v3 = unsafe { Op::apply(*p3) };
+                            p0 = unsafe { p0.offset(s0) };
+                            p1 = unsafe { p1.offset(s1) };
+                            p2 = unsafe { p2.offset(s2) };
+                            p3 = unsafe { p3.offset(s3) };
+                            let mut it = [v0, v1, v2, v3].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            acc = reduce_fn(acc, mapped);
+                        }
+                        unsafe { *dst_ptr = acc };
+                    } else {
+                        for _ in 0..len {
+                            let v0 = unsafe { Op::apply(*p0) };
+                            let v1 = unsafe { Op::apply(*p1) };
+                            let v2 = unsafe { Op::apply(*p2) };
+                            let v3 = unsafe { Op::apply(*p3) };
+                            p0 = unsafe { p0.offset(s0) };
+                            p1 = unsafe { p1.offset(s1) };
+                            p2 = unsafe { p2.offset(s2) };
+                            p3 = unsafe { p3.offset(s3) };
+                            let mut it = [v0, v1, v2, v3].into_iter();
+                            let mapped = capture.consume(&mut it);
+                            unsafe {
+                                let current = *dst_ptr;
+                                *dst_ptr = reduce_fn(current, mapped);
+                                dst_ptr = dst_ptr.offset(dst_step);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let mut src_ptrs: Vec<*const T> = Vec::with_capacity(num_src);
+                    let mut src_steps: Vec<isize> = Vec::with_capacity(num_src);
+                    let mut values: Vec<T> = Vec::with_capacity(num_src);
+
+                    src_ptrs.clear();
+                    src_steps.clear();
+                    for i in 0..num_src {
+                        src_ptrs.push(unsafe { src_bases[i].offset(offsets[i + 1]) });
+                        src_steps.push(inner_strides[i + 1]);
+                    }
+
+                    if dst_step == 0 && len > 0 {
+                        let mut acc = unsafe { *dst_ptr };
+                        for _ in 0..len {
+                            values.clear();
+                            for i in 0..num_src {
+                                unsafe {
+                                    values.push(Op::apply(*src_ptrs[i]));
+                                    src_ptrs[i] = src_ptrs[i].offset(src_steps[i]);
+                                }
+                            }
+                            let mut it = values.iter().copied();
+                            let mapped = capture.consume(&mut it);
+                            acc = reduce_fn(acc, mapped);
+                        }
+                        unsafe { *dst_ptr = acc };
+                    } else {
+                        for _ in 0..len {
+                            values.clear();
+                            for i in 0..num_src {
+                                unsafe {
+                                    values.push(Op::apply(*src_ptrs[i]));
+                                    src_ptrs[i] = src_ptrs[i].offset(src_steps[i]);
+                                }
+                            }
+                            let mut it = values.iter().copied();
+                            let mapped = capture.consume(&mut it);
+                            unsafe {
+                                let current = *dst_ptr;
+                                *dst_ptr = reduce_fn(current, mapped);
+                                dst_ptr = dst_ptr.offset(dst_step);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
-
 
 // Intentionally omitted: dense strides helper not needed in v0.
 
@@ -743,8 +773,7 @@ mod tests {
             StridedArrayViewMut::new(&mut out_data, [1, 4], [4, 1], 0).unwrap();
 
         let capture = CaptureArgs::new(|x: f64, y: f64| x + y, (Arg, Arg));
-        mapreducedim_capture_views_into(&mut out, &[&a, &b], &capture, |a, b| a + b, None)
-            .unwrap();
+        mapreducedim_capture_views_into(&mut out, &[&a, &b], &capture, |a, b| a + b, None).unwrap();
 
         assert_eq!(out.get([0, 0]), 18.0);
         assert_eq!(out.get([0, 1]), 21.0);

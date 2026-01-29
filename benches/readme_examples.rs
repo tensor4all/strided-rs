@@ -1,9 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mdarray::Tensor;
-use strided_rs::{copy_into, copy_transpose_scale_into_fast, zip_map2_into, zip_map4_into};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
+use strided_rs::{copy_into, copy_transpose_scale_into_fast, zip_map2_into, zip_map4_into};
 
 // Benchmark 1: B = (A + A') / 2 for 4000x4000 matrix
 fn bench_symmetrize_4000(c: &mut Criterion) {
@@ -135,8 +135,7 @@ fn bench_permute_32_4d(c: &mut Criterion) {
                             in_idx[perm[1]] = out_idx[1];
                             in_idx[perm[2]] = out_idx[2];
                             in_idx[perm[3]] = out_idx[3];
-                            b[[o0, o1, o2, o3]] =
-                                a[[in_idx[0], in_idx[1], in_idx[2], in_idx[3]]];
+                            b[[o0, o1, o2, o3]] = a[[in_idx[0], in_idx[1], in_idx[2], in_idx[3]]];
                         }
                     }
                 }
@@ -218,8 +217,16 @@ fn bench_multiple_permute_sum_32_4d(c: &mut Criterion) {
             let a_perm1 = a_view.permute(perms[1]);
             let a_perm2 = a_view.permute(perms[2]);
             let a_perm3 = a_view.permute(perms[3]);
-            zip_map4_into(&mut b, &a_perm0, &a_perm1, &a_perm2, &a_perm3, |&p0, &p1, &p2, &p3| p0 + p1 + p2 + p3).unwrap();
-            
+            zip_map4_into(
+                &mut b,
+                &a_perm0,
+                &a_perm1,
+                &a_perm2,
+                &a_perm3,
+                |&p0, &p1, &p2, &p3| p0 + p1 + p2 + p3,
+            )
+            .unwrap();
+
             black_box(&b);
         })
     });

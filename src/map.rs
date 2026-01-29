@@ -41,8 +41,12 @@ where
 
     let strides_list = [&dst_view.strides[..], &src_view.strides[..]];
 
-    let (fused_dims, plan) =
-        build_plan_fused(&dst_view.dims, &strides_list, Some(0), std::mem::size_of::<T>());
+    let (fused_dims, plan) = build_plan_fused(
+        &dst_view.dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
 
     for_each_inner_block(
         &fused_dims,
@@ -117,8 +121,12 @@ where
         &b_view.strides[..],
     ];
 
-    let (fused_dims, plan) =
-        build_plan_fused(&dst_view.dims, &strides_list, Some(0), std::mem::size_of::<T>());
+    let (fused_dims, plan) = build_plan_fused(
+        &dst_view.dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
 
     for_each_inner_block(
         &fused_dims,
@@ -150,8 +158,8 @@ where
 /// This pattern appears in symmetrize: B .= (A .+ A') ./ 2
 fn zip_map2_2d_tiled_transpose<T, F>(
     dst_view: &StridedViewMut<T>,
-    a_view: &StridedView<T>,    // row-major
-    b_view: &StridedView<T>,    // column-major (transposed)
+    a_view: &StridedView<T>, // row-major
+    b_view: &StridedView<T>, // column-major (transposed)
     f: &F,
 ) -> Result<bool>
 where
@@ -168,7 +176,7 @@ where
     // (factor of 2 accounts for reading from two arrays)
     let elem_size = std::mem::size_of::<T>();
     const BLOCK_MEMORY_SIZE: usize = 1 << 15; // 32768 bytes (Julia's BLOCKMEMORYSIZE)
-    
+
     let tile_size = if elem_size > 0 {
         let max_elems = BLOCK_MEMORY_SIZE / elem_size / 2;
         let computed_size = (max_elems as f64).sqrt() as usize;
@@ -181,7 +189,7 @@ where
     let d_ptr = dst_view.ptr;
     let a_ptr = a_view.ptr;
     let b_ptr = b_view.ptr;
-    
+
     let d_row_stride = dst_view.strides[0];
     let a_row_stride = a_view.strides[0];
     let b_col_stride = b_view.strides[1];
@@ -196,13 +204,14 @@ where
             for i in i_tile..i_end {
                 let d_row_ptr = unsafe { d_ptr.offset((i as isize) * d_row_stride) };
                 let a_row_ptr = unsafe { a_ptr.offset((i as isize) * a_row_stride) };
-                
+
                 for j in j_tile..j_end {
                     // dst[i,j] = f(a[i,j], b[i,j])
                     // where b is transposed, so b[i,j] accessed as b_ptr[j*b_row + i*b_col]
                     // Since b is column-major: b[i,j] = b_ptr[i + j*n]
                     let a_val = unsafe { &*a_row_ptr.offset(j as isize) };
-                    let b_val = unsafe { &*b_ptr.offset((i as isize) + (j as isize) * b_col_stride) };
+                    let b_val =
+                        unsafe { &*b_ptr.offset((i as isize) + (j as isize) * b_col_stride) };
                     let result = f(a_val, b_val);
                     unsafe {
                         *d_row_ptr.offset(j as isize) = result;
@@ -391,8 +400,12 @@ where
         &c_view.strides[..],
     ];
 
-    let (fused_dims, plan) =
-        build_plan_fused(&dst_view.dims, &strides_list, Some(0), std::mem::size_of::<T>());
+    let (fused_dims, plan) = build_plan_fused(
+        &dst_view.dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
 
     for_each_inner_block(
         &fused_dims,
@@ -497,8 +510,12 @@ where
         &e_view.strides[..],
     ];
 
-    let (fused_dims, plan) =
-        build_plan_fused(&dst_view.dims, &strides_list, Some(0), std::mem::size_of::<T>());
+    let (fused_dims, plan) = build_plan_fused(
+        &dst_view.dims,
+        &strides_list,
+        Some(0),
+        std::mem::size_of::<T>(),
+    );
 
     for_each_inner_block(
         &fused_dims,
@@ -631,4 +648,3 @@ where
 
     Ok(())
 }
-

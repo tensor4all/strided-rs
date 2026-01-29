@@ -52,7 +52,10 @@ pub(crate) fn promote_strides_to_shape(
     src_strides: &[isize],
 ) -> Result<Vec<isize>> {
     if src_dims.len() != target_dims.len() {
-        return Err(StridedError::RankMismatch(src_dims.len(), target_dims.len()));
+        return Err(StridedError::RankMismatch(
+            src_dims.len(),
+            target_dims.len(),
+        ));
     }
     if src_strides.len() != src_dims.len() {
         return Err(StridedError::StrideLengthMismatch);
@@ -67,7 +70,10 @@ pub(crate) fn promote_strides_to_shape(
         } else if sdim == 1 {
             out.push(0);
         } else {
-            return Err(StridedError::ShapeMismatch(src_dims.to_vec(), target_dims.to_vec()));
+            return Err(StridedError::ShapeMismatch(
+                src_dims.to_vec(),
+                target_dims.to_vec(),
+            ));
         }
     }
 

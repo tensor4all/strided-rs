@@ -537,7 +537,6 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
         mapreducedim_capture_views_into(self, sources, capture, reduce_fn, init_op)
     }
 
-
     /// Broadcast with a captured expression over view sources.
     ///
     /// This is a convenience wrapper over `broadcast_capture_into`.
@@ -554,7 +553,6 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
         broadcast_capture_into(self, capture, sources)
     }
 
-
     /// Broadcast a binary operation into this destination view.
     pub fn broadcast_into<Op, F>(
         &mut self,
@@ -569,7 +567,6 @@ impl<'a, T, const N: usize> StridedArrayViewMut<'a, T, N, Identity> {
     {
         broadcast_into(self, f, a, b)
     }
-
 }
 
 // ============================================================================
@@ -676,9 +673,15 @@ impl<'a, T, Op: ElementOp> StridedArrayView<'a, T, 1, Op> {
         let step = index.step();
 
         let new_size = if step > 0 {
-            range.end.saturating_sub(range.start).div_ceil(step as usize)
+            range
+                .end
+                .saturating_sub(range.start)
+                .div_ceil(step as usize)
         } else {
-            range.start.saturating_sub(range.end).div_ceil(-step as usize)
+            range
+                .start
+                .saturating_sub(range.end)
+                .div_ceil(-step as usize)
         };
 
         let new_offset = (self.offset as isize + range.start as isize * self.strides[0]) as usize;
@@ -2084,5 +2087,4 @@ mod tests {
         let transposed = view.t();
         assert!(transposed.as_slice().is_none());
     }
-
 }

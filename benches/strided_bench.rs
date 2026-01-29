@@ -1,12 +1,12 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand_distr::StandardNormal;
+use std::time::Duration;
 use strided_rs::{
     copy_into, copy_transpose_scale_into_fast, map_into, sum, symmetrize_into, zip_map2_into,
     zip_map4_into,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
-use rand_distr::StandardNormal;
-use std::time::Duration;
 
 // Julia equivalent for `bench_copy_permuted`:
 // ```julia

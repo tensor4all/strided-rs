@@ -44,8 +44,14 @@ impl From<PodComplexF32> for Complex<f32> {
 /// Cast a slice of `Complex<f64>` to a slice of `PodComplexF64` by reinterpreting
 /// the underlying bytes. Unsafe: caller must ensure layout compatibility.
 pub unsafe fn cast_complex_slice_to_pod_f64(src: &[Complex<f64>]) -> &[PodComplexF64] {
-    debug_assert_eq!(std::mem::size_of::<Complex<f64>>(), std::mem::size_of::<PodComplexF64>());
-    debug_assert_eq!(std::mem::align_of::<Complex<f64>>(), std::mem::align_of::<PodComplexF64>());
+    debug_assert_eq!(
+        std::mem::size_of::<Complex<f64>>(),
+        std::mem::size_of::<PodComplexF64>()
+    );
+    debug_assert_eq!(
+        std::mem::align_of::<Complex<f64>>(),
+        std::mem::align_of::<PodComplexF64>()
+    );
     let byte_ptr = src.as_ptr() as *const u8;
     let byte_len = src.len() * std::mem::size_of::<Complex<f64>>();
     let bytes = std::slice::from_raw_parts(byte_ptr, byte_len);
@@ -54,8 +60,14 @@ pub unsafe fn cast_complex_slice_to_pod_f64(src: &[Complex<f64>]) -> &[PodComple
 
 /// Mutable variant for `Complex<f64>`.
 pub unsafe fn cast_complex_slice_mut_to_pod_f64(dst: &mut [Complex<f64>]) -> &mut [PodComplexF64] {
-    debug_assert_eq!(std::mem::size_of::<Complex<f64>>(), std::mem::size_of::<PodComplexF64>());
-    debug_assert_eq!(std::mem::align_of::<Complex<f64>>(), std::mem::align_of::<PodComplexF64>());
+    debug_assert_eq!(
+        std::mem::size_of::<Complex<f64>>(),
+        std::mem::size_of::<PodComplexF64>()
+    );
+    debug_assert_eq!(
+        std::mem::align_of::<Complex<f64>>(),
+        std::mem::align_of::<PodComplexF64>()
+    );
     let byte_ptr = dst.as_mut_ptr() as *mut u8;
     let byte_len = dst.len() * std::mem::size_of::<Complex<f64>>();
     let bytes = std::slice::from_raw_parts_mut(byte_ptr, byte_len);
@@ -64,8 +76,14 @@ pub unsafe fn cast_complex_slice_mut_to_pod_f64(dst: &mut [Complex<f64>]) -> &mu
 
 /// Cast helpers for `Complex<f32>`.
 pub unsafe fn cast_complex_slice_to_pod_f32(src: &[Complex<f32>]) -> &[PodComplexF32] {
-    debug_assert_eq!(std::mem::size_of::<Complex<f32>>(), std::mem::size_of::<PodComplexF32>());
-    debug_assert_eq!(std::mem::align_of::<Complex<f32>>(), std::mem::align_of::<PodComplexF32>());
+    debug_assert_eq!(
+        std::mem::size_of::<Complex<f32>>(),
+        std::mem::size_of::<PodComplexF32>()
+    );
+    debug_assert_eq!(
+        std::mem::align_of::<Complex<f32>>(),
+        std::mem::align_of::<PodComplexF32>()
+    );
     let byte_ptr = src.as_ptr() as *const u8;
     let byte_len = src.len() * std::mem::size_of::<Complex<f32>>();
     let bytes = std::slice::from_raw_parts(byte_ptr, byte_len);
@@ -73,8 +91,14 @@ pub unsafe fn cast_complex_slice_to_pod_f32(src: &[Complex<f32>]) -> &[PodComple
 }
 
 pub unsafe fn cast_complex_slice_mut_to_pod_f32(dst: &mut [Complex<f32>]) -> &mut [PodComplexF32] {
-    debug_assert_eq!(std::mem::size_of::<Complex<f32>>(), std::mem::size_of::<PodComplexF32>());
-    debug_assert_eq!(std::mem::align_of::<Complex<f32>>(), std::mem::align_of::<PodComplexF32>());
+    debug_assert_eq!(
+        std::mem::size_of::<Complex<f32>>(),
+        std::mem::size_of::<PodComplexF32>()
+    );
+    debug_assert_eq!(
+        std::mem::align_of::<Complex<f32>>(),
+        std::mem::align_of::<PodComplexF32>()
+    );
     let byte_ptr = dst.as_mut_ptr() as *mut u8;
     let byte_len = dst.len() * std::mem::size_of::<Complex<f32>>();
     let bytes = std::slice::from_raw_parts_mut(byte_ptr, byte_len);
