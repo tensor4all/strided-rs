@@ -53,6 +53,16 @@ When adding or modifying benchmarks (especially "naive" baselines), optimize the
 - Keep setup/allocation out of the timed region and use `black_box` to prevent dead-code elimination.
 - For parity with Julia scripts, run single-threaded (`RAYON_NUM_THREADS=1` / `JULIA_NUM_THREADS=1`) unless explicitly testing threading.
 
+### Benchmark with native CPU features
+
+By default `rustc` targets a generic `x86-64` baseline (SSE2 only). To enable AVX2/AVX-512 auto-vectorization for the host CPU:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo bench
+```
+
+This can yield significant improvements for contiguous inner loops that LLVM auto-vectorizes.
+
 ## Architecture
 
 ### Core Types
@@ -135,7 +145,6 @@ The `extern/` directory contains reference implementations:
 
 Design documentation:
 - `docs/STRIDED_DESIGN.md`: Detailed analysis of Julia implementations and Rust porting guide
-- `docs/report.md`: Benchmark report comparing strided vs naive implementations
 
 ## Key Design Decisions
 
@@ -150,12 +159,4 @@ Design documentation:
 
 ## Performance Notes
 
-See `docs/report.md` for detailed benchmark results. Summary:
-
-| Operation | 2D Arrays | 4D Arrays |
-|-----------|-----------|-----------|
-| `zip_map` (contiguous) | 3-4x faster | Not tested |
-| `zip_map` (mixed stride) | 2-2.6x faster | - |
-| `symmetrize_into` | 1.5x faster | N/A |
-| `permutedims` | ~same | 2.2x faster |
-| `zip_map4_into` | Recommended | 3.0x faster |
+See `README.md` for benchmark results comparing Rust strided vs naive baselines and Julia Strided.jl.

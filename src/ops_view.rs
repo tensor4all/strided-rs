@@ -12,6 +12,159 @@ use crate::{Result, StridedError};
 use num_traits::Zero;
 use std::ops::{Add, Mul};
 
+// ============================================================================
+// Stride-specialized inner loop helpers for ops_view
+//
+// When all inner strides are 1 (contiguous in the innermost dimension),
+// we use slice-based iteration so LLVM can auto-vectorize effectively.
+// This mirrors the inner_loop_map* helpers in map_view.rs.
+// ============================================================================
+
+/// Inner loop for add: `dst[i] += Op::apply(src[i])`.
+#[inline(always)]
+unsafe fn inner_loop_add<T: Copy + ElementOpApply + Add<Output = T>, Op: ElementOp>(
+    dp: *mut T,
+    ds: isize,
+    sp: *const T,
+    ss: isize,
+    len: usize,
+) {
+    if ds == 1 && ss == 1 {
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        let src = std::slice::from_raw_parts(sp, len);
+        for i in 0..len {
+            dst[i] = dst[i] + Op::apply(src[i]);
+        }
+    } else {
+        let mut dp = dp;
+        let mut sp = sp;
+        for _ in 0..len {
+            *dp = *dp + Op::apply(*sp);
+            dp = dp.offset(ds);
+            sp = sp.offset(ss);
+        }
+    }
+}
+
+/// Inner loop for mul: `dst[i] *= Op::apply(src[i])`.
+#[inline(always)]
+unsafe fn inner_loop_mul<T: Copy + ElementOpApply + Mul<Output = T>, Op: ElementOp>(
+    dp: *mut T,
+    ds: isize,
+    sp: *const T,
+    ss: isize,
+    len: usize,
+) {
+    if ds == 1 && ss == 1 {
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        let src = std::slice::from_raw_parts(sp, len);
+        for i in 0..len {
+            dst[i] = dst[i] * Op::apply(src[i]);
+        }
+    } else {
+        let mut dp = dp;
+        let mut sp = sp;
+        for _ in 0..len {
+            *dp = *dp * Op::apply(*sp);
+            dp = dp.offset(ds);
+            sp = sp.offset(ss);
+        }
+    }
+}
+
+/// Inner loop for axpy: `dst[i] = alpha * Op::apply(src[i]) + dst[i]`.
+#[inline(always)]
+unsafe fn inner_loop_axpy<
+    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>,
+    Op: ElementOp,
+>(
+    dp: *mut T,
+    ds: isize,
+    sp: *const T,
+    ss: isize,
+    len: usize,
+    alpha: T,
+) {
+    if ds == 1 && ss == 1 {
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        let src = std::slice::from_raw_parts(sp, len);
+        for i in 0..len {
+            dst[i] = alpha * Op::apply(src[i]) + dst[i];
+        }
+    } else {
+        let mut dp = dp;
+        let mut sp = sp;
+        for _ in 0..len {
+            *dp = alpha * Op::apply(*sp) + *dp;
+            dp = dp.offset(ds);
+            sp = sp.offset(ss);
+        }
+    }
+}
+
+/// Inner loop for fma: `dst[i] += a[i] * b[i]`.
+#[inline(always)]
+unsafe fn inner_loop_fma<T: Copy + Mul<Output = T> + Add<Output = T>>(
+    dp: *mut T,
+    ds: isize,
+    ap: *const T,
+    a_s: isize,
+    bp: *const T,
+    b_s: isize,
+    len: usize,
+) {
+    if ds == 1 && a_s == 1 && b_s == 1 {
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        let sa = std::slice::from_raw_parts(ap, len);
+        let sb = std::slice::from_raw_parts(bp, len);
+        for i in 0..len {
+            dst[i] = dst[i] + sa[i] * sb[i];
+        }
+    } else {
+        let mut dp = dp;
+        let mut ap = ap;
+        let mut bp = bp;
+        for _ in 0..len {
+            *dp = *dp + *ap * *bp;
+            dp = dp.offset(ds);
+            ap = ap.offset(a_s);
+            bp = bp.offset(b_s);
+        }
+    }
+}
+
+/// Inner loop for dot: `acc += OpA::apply(a[i]) * OpB::apply(b[i])`.
+#[inline(always)]
+unsafe fn inner_loop_dot<
+    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>,
+    OpA: ElementOp,
+    OpB: ElementOp,
+>(
+    ap: *const T,
+    a_s: isize,
+    bp: *const T,
+    b_s: isize,
+    len: usize,
+    mut acc: T,
+) -> T {
+    if a_s == 1 && b_s == 1 {
+        let sa = std::slice::from_raw_parts(ap, len);
+        let sb = std::slice::from_raw_parts(bp, len);
+        for i in 0..len {
+            acc = acc + OpA::apply(sa[i]) * OpB::apply(sb[i]);
+        }
+    } else {
+        let mut ap = ap;
+        let mut bp = bp;
+        for _ in 0..len {
+            acc = acc + OpA::apply(*ap) * OpB::apply(*bp);
+            ap = ap.offset(a_s);
+            bp = bp.offset(b_s);
+        }
+    }
+    acc
+}
+
 /// Copy elements from source to destination: `dest[i] = src[i]`.
 pub fn copy_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
@@ -30,14 +183,10 @@ pub fn copy_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
         && is_contiguous(src.dims(), src_strides)
     {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut sp = src_ptr;
-        for _ in 0..len {
-            unsafe {
-                *dp = Op::apply(*sp);
-                dp = dp.add(1);
-                sp = sp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        for i in 0..len {
+            dst[i] = Op::apply(src[i]);
         }
         return Ok(());
     }
@@ -60,14 +209,10 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: Element
 
     if is_contiguous(dst_dims, dst_strides) && is_contiguous(src.dims(), src_strides) {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut sp = src_ptr;
-        for _ in 0..len {
-            unsafe {
-                *dp = *dp + Op::apply(*sp);
-                dp = dp.add(1);
-                sp = sp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        for i in 0..len {
+            dst[i] = dst[i] + Op::apply(src[i]);
         }
         return Ok(());
     }
@@ -89,17 +234,15 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: Element
         &plan,
         &strides_list,
         |offsets, len, strides| {
-            let mut dp = unsafe { dst_ptr.offset(offsets[0]) };
-            let mut sp = unsafe { src_ptr.offset(offsets[1]) };
-            let ds = strides[0];
-            let ss = strides[1];
-            for _ in 0..len {
-                unsafe {
-                    *dp = *dp + Op::apply(*sp);
-                    dp = dp.offset(ds);
-                    sp = sp.offset(ss);
-                }
-            }
+            unsafe {
+                inner_loop_add::<T, Op>(
+                    dst_ptr.offset(offsets[0]),
+                    strides[0],
+                    src_ptr.offset(offsets[1]),
+                    strides[1],
+                    len,
+                )
+            };
             Ok(())
         },
     )
@@ -120,14 +263,10 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: Element
 
     if is_contiguous(dst_dims, dst_strides) && is_contiguous(src.dims(), src_strides) {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut sp = src_ptr;
-        for _ in 0..len {
-            unsafe {
-                *dp = *dp * Op::apply(*sp);
-                dp = dp.add(1);
-                sp = sp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        for i in 0..len {
+            dst[i] = dst[i] * Op::apply(src[i]);
         }
         return Ok(());
     }
@@ -149,17 +288,15 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: Element
         &plan,
         &strides_list,
         |offsets, len, strides| {
-            let mut dp = unsafe { dst_ptr.offset(offsets[0]) };
-            let mut sp = unsafe { src_ptr.offset(offsets[1]) };
-            let ds = strides[0];
-            let ss = strides[1];
-            for _ in 0..len {
-                unsafe {
-                    *dp = *dp * Op::apply(*sp);
-                    dp = dp.offset(ds);
-                    sp = sp.offset(ss);
-                }
-            }
+            unsafe {
+                inner_loop_mul::<T, Op>(
+                    dst_ptr.offset(offsets[0]),
+                    strides[0],
+                    src_ptr.offset(offsets[1]),
+                    strides[1],
+                    len,
+                )
+            };
             Ok(())
         },
     )
@@ -184,14 +321,10 @@ pub fn axpy<
 
     if is_contiguous(dst_dims, dst_strides) && is_contiguous(src.dims(), src_strides) {
         let len = total_len(dst_dims);
-        let mut dp = dst_ptr;
-        let mut sp = src_ptr;
-        for _ in 0..len {
-            unsafe {
-                *dp = alpha * Op::apply(*sp) + *dp;
-                dp = dp.add(1);
-                sp = sp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        for i in 0..len {
+            dst[i] = alpha * Op::apply(src[i]) + dst[i];
         }
         return Ok(());
     }
@@ -213,17 +346,16 @@ pub fn axpy<
         &plan,
         &strides_list,
         |offsets, len, strides| {
-            let mut dp = unsafe { dst_ptr.offset(offsets[0]) };
-            let mut sp = unsafe { src_ptr.offset(offsets[1]) };
-            let ds = strides[0];
-            let ss = strides[1];
-            for _ in 0..len {
-                unsafe {
-                    *dp = alpha * Op::apply(*sp) + *dp;
-                    dp = dp.offset(ds);
-                    sp = sp.offset(ss);
-                }
-            }
+            unsafe {
+                inner_loop_axpy::<T, Op>(
+                    dst_ptr.offset(offsets[0]),
+                    strides[0],
+                    src_ptr.offset(offsets[1]),
+                    strides[1],
+                    len,
+                    alpha,
+                )
+            };
             Ok(())
         },
     )
@@ -251,16 +383,11 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send +
         && is_contiguous(b.dims(), &b_strides)
     {
         let len = total_len(&dst_dims);
-        let mut dp = dst_ptr;
-        let mut ap = a_ptr;
-        let mut bp = b_ptr;
-        for _ in 0..len {
-            unsafe {
-                *dp = *dp + *ap * *bp;
-                dp = dp.add(1);
-                ap = ap.add(1);
-                bp = bp.add(1);
-            }
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        for i in 0..len {
+            dst[i] = dst[i] + sa[i] * sb[i];
         }
         return Ok(());
     }
@@ -269,20 +396,17 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send +
     let plan = build_plan(&dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
     for_each_inner_block(&dst_dims, &plan, &strides_list, |offsets, len, strides| {
-        let mut dp = unsafe { dst_ptr.offset(offsets[0]) };
-        let mut ap = unsafe { a_ptr.offset(offsets[1]) };
-        let mut bp = unsafe { b_ptr.offset(offsets[2]) };
-        let ds = strides[0];
-        let a_s = strides[1];
-        let b_s = strides[2];
-        for _ in 0..len {
-            unsafe {
-                *dp = *dp + *ap * *bp;
-                dp = dp.offset(ds);
-                ap = ap.offset(a_s);
-                bp = bp.offset(b_s);
-            }
-        }
+        unsafe {
+            inner_loop_fma::<T>(
+                dst_ptr.offset(offsets[0]),
+                strides[0],
+                a_ptr.offset(offsets[1]),
+                strides[1],
+                b_ptr.offset(offsets[2]),
+                strides[2],
+                len,
+            )
+        };
         Ok(())
     })
 }
@@ -313,15 +437,11 @@ pub fn dot<
 
     if is_contiguous(a_dims, a_strides) && is_contiguous(b.dims(), b_strides) {
         let len = total_len(a_dims);
-        let mut ap = a_ptr;
-        let mut bp = b_ptr;
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         let mut acc = T::zero();
-        for _ in 0..len {
-            unsafe {
-                acc = acc + OpA::apply(*ap) * OpB::apply(*bp);
-                ap = ap.add(1);
-                bp = bp.add(1);
-            }
+        for i in 0..len {
+            acc = acc + OpA::apply(sa[i]) * OpB::apply(sb[i]);
         }
         return Ok(acc);
     }
@@ -335,18 +455,17 @@ pub fn dot<
 
     let mut acc = Some(T::zero());
     for_each_inner_block(&a_dims_v, &plan, &strides_list, |offsets, len, strides| {
-        let mut ap = unsafe { a_ptr.offset(offsets[0]) };
-        let mut bp = unsafe { b_ptr.offset(offsets[1]) };
-        let a_s = strides[0];
-        let b_s = strides[1];
         let mut local = acc.take().ok_or(StridedError::OffsetOverflow)?;
-        for _ in 0..len {
-            unsafe {
-                local = local + OpA::apply(*ap) * OpB::apply(*bp);
-                ap = ap.offset(a_s);
-                bp = bp.offset(b_s);
-            }
-        }
+        local = unsafe {
+            inner_loop_dot::<T, OpA, OpB>(
+                a_ptr.offset(offsets[0]),
+                strides[0],
+                b_ptr.offset(offsets[1]),
+                strides[1],
+                len,
+                local,
+            )
+        };
         acc = Some(local);
         Ok(())
     })?;

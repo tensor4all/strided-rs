@@ -517,6 +517,48 @@ where
 }
 
 // ============================================================================
+// Pre-ordered iteration (for threaded leaf functions)
+// ============================================================================
+
+/// Iterate over blocks with pre-ordered dimensions and initial offsets.
+///
+/// Unlike `for_each_inner_block`, this function assumes that `dims`, `blocks`,
+/// and `strides` are **already in iteration order** (i.e., identity ordering).
+/// It also accepts `initial_offsets` which are added to the starting offsets
+/// before iteration begins.
+///
+/// This avoids the redundant re-ordering and per-callback `Vec` allocation
+/// that `for_each_inner_block_with_offsets` previously incurred.
+#[cfg(feature = "parallel")]
+#[inline]
+pub(crate) fn for_each_inner_block_preordered<F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[Vec<isize>],
+    initial_offsets: &[isize],
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let rank = dims.len();
+    if rank == 0 {
+        return f(initial_offsets, 1, &[]);
+    }
+
+    // Start from initial_offsets (kernel functions reset to starting values at end)
+    let mut offsets = initial_offsets.to_vec();
+
+    match rank {
+        1 => kernel_1d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        2 => kernel_2d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        3 => kernel_3d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        4 => kernel_4d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        _ => kernel_nd_inner(dims, blocks, strides, &mut offsets, &mut f),
+    }
+}
+
+// ============================================================================
 // Utility functions
 // ============================================================================
 

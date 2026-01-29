@@ -30,15 +30,10 @@ where
 
     if use_sequential_fast_path(total_len(src_dims)) && is_contiguous(src_dims, src_strides) {
         let len = total_len(src_dims);
-        let mut ptr = src_ptr;
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         let mut acc = init;
-        for _ in 0..len {
-            let val = Op::apply(unsafe { *ptr });
-            let mapped = map_fn(val);
-            acc = reduce_fn(acc, mapped);
-            unsafe {
-                ptr = ptr.add(1);
-            }
+        for &val in src.iter() {
+            acc = reduce_fn(acc, map_fn(Op::apply(val)));
         }
         return Ok(acc);
     }

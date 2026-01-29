@@ -3,7 +3,7 @@
 //! Faithfully ports Julia Strided.jl's `_mapreduce_threaded!` recursive
 //! dimension-splitting strategy using `rayon::join`.
 
-use crate::kernel::{for_each_inner_block, KernelPlan};
+use crate::kernel::for_each_inner_block_preordered;
 use crate::Result;
 
 /// A raw pointer wrapper that is `Send` + `Sync`.
@@ -196,44 +196,22 @@ where
     Ok(())
 }
 
-/// Execute `for_each_inner_block` on a sub-region defined by offsets.
+/// Execute the kernel on a sub-region defined by initial offsets.
 ///
-/// This wraps `for_each_inner_block` to add initial offsets to the callback's offsets,
-/// enabling the threaded splitter to partition work across sub-regions.
+/// Delegates to `for_each_inner_block_preordered` which directly calls
+/// kernel functions with the initial offsets, avoiding redundant re-ordering
+/// and per-callback `Vec` allocation.
 pub(crate) fn for_each_inner_block_with_offsets<F>(
     dims: &[usize],
     blocks: &[usize],
     strides_list: &[Vec<isize>],
     initial_offsets: &[isize],
-    mut f: F,
+    f: F,
 ) -> Result<()>
 where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
-    let rank = dims.len();
-    if rank == 0 {
-        return f(initial_offsets, 1, &[]);
-    }
-
-    // Build a KernelPlan that uses identity ordering (dims/strides are already ordered)
-    let plan = KernelPlan {
-        order: (0..rank).collect(),
-        block: blocks.to_vec(),
-    };
-
-    // Convert Vec<isize> to &[isize] for the kernel
-    let strides_refs: Vec<&[isize]> = strides_list.iter().map(|s| s.as_slice()).collect();
-
-    // Use for_each_inner_block but adjust offsets
-    for_each_inner_block(dims, &plan, &strides_refs, |offsets, len, strides| {
-        // Add initial_offsets to the kernel's offsets
-        let adjusted: Vec<isize> = offsets
-            .iter()
-            .zip(initial_offsets.iter())
-            .map(|(&o, &init)| o + init)
-            .collect();
-        f(&adjusted, len, strides)
-    })
+    for_each_inner_block_preordered(dims, blocks, strides_list, initial_offsets, f)
 }
 
 #[cfg(test)]
