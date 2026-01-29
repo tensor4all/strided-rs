@@ -1,9 +1,0 @@
-# BLAS configuration for different platforms
-
-[target.aarch64-apple-darwin]
-# Use Apple's Accelerate framework for BLAS on macOS (Apple Silicon)
-rustflags = ["-L", "/System/Library/Frameworks/Accelerate.framework/Frameworks/vecLib.framework/Versions/A", "-l", "BLAS"]
-
-[target.x86_64-apple-darwin]
-# Use Apple's Accelerate framework for BLAS on macOS (Intel)
-rustflags = ["-L", "/System/Library/Frameworks/Accelerate.framework/Frameworks/vecLib.framework/Versions/A", "-l", "BLAS"]
