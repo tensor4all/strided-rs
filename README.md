@@ -172,31 +172,32 @@ Environment: Apple Silicon M2, single-threaded.
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 20.52 | 21.47 | 43.95 |
-| scale_transpose_1000 | 0.66 | 0.75 | 0.42 |
-| mwe_stridedview_scale_transpose_1000 | 0.64 | 1.11 | 0.46 |
-| complex_elementwise_1000 | 7.77 | 12.68 | 12.34 |
-| permute_32_4d | 1.12 | 1.12 | 1.99 |
-| multiple_permute_sum_32_4d | 2.92 | 2.98 | 2.21 |
+| symmetrize_4000 | 17.39 | 20.07 | 39.12 |
+| scale_transpose_1000 | 0.47 | 0.68 | 0.41 |
+| mwe_stridedview_scale_transpose_1000 | 0.50 | 0.60 | 0.41 |
+| complex_elementwise_1000 | 7.71 | 12.70 | 12.15 |
+| permute_32_4d | 0.87 | 1.04 | 1.89 |
+| multiple_permute_sum_32_4d | 2.27 | 3.02 | 2.18 |
 
 Notes:
-- Julia results from `benches/julia_compare.jl` using BenchmarkTools (mean time). Rust results from `benches/rust_compare.rs`.
+- Julia results from `benches/julia_compare.jl` (mean time). Rust results from `benches/rust_compare.rs` (best of 3 runs).
 - All benchmarks use column-major layout for parity with Julia.
 - The Rust naive baseline uses raw pointer arithmetic with `unsafe` and precomputed strides (no bounds checks, no library overhead).
+- `scale_transpose` and `multiple_permute_sum`: the naive baseline is faster because the ordering/blocking pipeline overhead is not recovered on these relatively small, simple access patterns. Julia Strided shows the same trend.
 
 ### Multi-Threaded Scaling (Rust, `parallel` feature)
 
-Environment: Apple Silicon M2 (4 performance + 4 efficiency cores).
+Environment: Apple Silicon M2 (4 performance + 4 efficiency cores). Best of 3 runs.
 
 | Case | 1T (ms) | 2T (ms) | 4T (ms) | Speedup (4T) |
 |---|---:|---:|---:|---:|
-| symmetrize_4000 | 22.8 | 18.4 | 13.8 | 1.7x |
-| scale_transpose_1000 | 0.87 | 0.59 | 0.53 | 1.6x |
-| mwe_scale_transpose_1000 | 0.77 | 0.48 | 0.35 | 2.2x |
-| complex_elementwise_1000 | 13.3 | 6.6 | 3.6 | 3.7x |
-| permute_32_4d | 1.1 | 0.66 | 0.52 | 2.1x |
-| multiple_permute_sum_32_4d | 2.9 | 1.8 | 1.3 | 2.2x |
-| sum_1m | 0.91 | 0.47 | 0.29 | 3.1x |
+| symmetrize_4000 | 20.3 | 16.7 | 11.0 | 1.9x |
+| scale_transpose_1000 | 0.77 | 0.48 | 0.35 | 2.2x |
+| mwe_scale_transpose_1000 | 0.64 | 0.36 | 0.25 | 2.5x |
+| complex_elementwise_1000 | 12.8 | 6.5 | 3.6 | 3.5x |
+| permute_32_4d | 1.03 | 0.60 | 0.40 | 2.6x |
+| multiple_permute_sum_32_4d | 2.91 | 1.73 | 1.19 | 2.4x |
+| sum_1m | 0.87 | 0.47 | 0.30 | 2.9x |
 
 ### Algorithm Comparison: Julia Strided.jl vs Rust strided-rs
 
