@@ -32,6 +32,10 @@ name = "rust_compare"
 harness = false
 
 [[bench]]
+name = "scaling_compare"
+harness = false
+
+[[bench]]
 name = "threaded_compare"
 harness = false
 required-features = ["parallel"]
