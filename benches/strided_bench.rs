@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
-use mdarray_strided::{
+use strided_rs::{
     copy_into, copy_transpose_scale_into_fast, map_into, sum, symmetrize_into, zip_map2_into,
     zip_map4_into,
 };
@@ -169,7 +169,7 @@ fn bench_symmetrize_aat(c: &mut Criterion) {
     group.bench_function("strided", |b| {
         b.iter(|| {
             let mut out = Tensor::zeros([size, size]);
-            if let Err(err) = mdarray_strided::symmetrize_into_f64(&mut out, a_view) {
+            if let Err(err) = strided_rs::symmetrize_into_f64(&mut out, a_view) {
                 panic!("symmetrize_into_f64 failed: {err}");
             }
             out

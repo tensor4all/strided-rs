@@ -304,23 +304,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd6d8fe9d13f8b3d8242d143ac5e38608e8cfb418ce679305edd2382888e0357"
 
 [[package]]
-name = "mdarray-strided"
-version = "0.1.0"
-dependencies = [
- "approx",
- "bytemuck",
- "cblas",
- "criterion",
- "mdarray",
- "num-complex",
- "num-traits",
- "rand",
- "rand_distr",
- "rayon",
- "thiserror",
-]
-
-[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +540,23 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "strided-rs"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bytemuck",
+ "cblas",
+ "criterion",
+ "mdarray",
+ "num-complex",
+ "num-traits",
+ "rand",
+ "rand_distr",
+ "rayon",
+ "thiserror",
 ]
 
 [[package]]

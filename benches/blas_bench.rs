@@ -1,4 +1,4 @@
-//! BLAS benchmarks for mdarray-strided
+//! BLAS benchmarks for strided-rs
 //!
 //! This benchmark compares generic implementations vs BLAS-backed implementations
 //! to measure the benefit of the `blas` feature.
@@ -6,7 +6,7 @@
 //! Run with: cargo bench --features blas --bench blas_bench
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use mdarray_strided::{
+use strided_rs::{
     blas_axpy, blas_dot, blas_gemm, generic_axpy, generic_dot, generic_gemm, Identity,
     StridedArrayView, StridedArrayViewMut,
 };

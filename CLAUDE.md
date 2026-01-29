@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mdarray-strided is a Rust library providing cache-optimized kernels for strided multidimensional array operations. It is a **complete port of Julia's Strided.jl/StridedViews.jl libraries**, built on top of the `mdarray` crate.
+strided-rs is a Rust library providing cache-optimized kernels for strided multidimensional array operations. It is a **port of Julia's Strided.jl/StridedViews.jl libraries**, currently built on top of the `mdarray` crate.
 
 **Current Status (v0.1):**
 - Julia Strided.jl/StridedViews.jl port: **~98% complete**

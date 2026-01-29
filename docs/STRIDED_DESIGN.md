@@ -343,7 +343,7 @@ function promoteshape1(sz::Dims{N}, a::StridedView) where {N}
 end
 ```
 
-#### Rust Implementation Notes (mdarray-strided)
+#### Rust Implementation Notes (strided-rs)
 
 - Use `promote_strides_to_shape` to promote size-1 dimensions to stride-0
 - `broadcast_capture_into` is the main broadcast evaluation entry point

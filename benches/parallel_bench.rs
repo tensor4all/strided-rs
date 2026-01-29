@@ -1,4 +1,4 @@
-//! Parallel benchmarks for mdarray-strided
+//! Parallel benchmarks for strided-rs
 //!
 //! This benchmark compares sequential vs parallel implementations
 //! to measure the benefit of the `parallel` feature.
@@ -7,7 +7,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
-use mdarray_strided::{par_zip_map2_into, zip_map2_into};
+use strided_rs::{par_zip_map2_into, zip_map2_into};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;

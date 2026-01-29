@@ -1,4 +1,4 @@
-# Parallel Benchmark Report: mdarray-strided v0.1
+# Parallel Benchmark Report: strided-rs v0.1
 
 **Date:** January 23, 2026
 **Platform:** macOS (darwin 25.2.0)

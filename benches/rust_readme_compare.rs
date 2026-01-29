@@ -1,5 +1,5 @@
 use mdarray::Tensor;
-use mdarray_strided::{
+use strided_rs::{
     copy_into_pod, copy_transpose_scale_into_fast, map_into, symmetrize_into_f64, zip_map4_into,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};

@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mdarray::Tensor;
-use mdarray_strided::copy_into;
+use strided_rs::copy_into;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
 
-// Compare mdarray's assign (iterator-based) with mdarray-strided's copy_into (blocked)
+// Compare mdarray's assign (iterator-based) with strided-rs's copy_into (blocked)
 // for a 4D permutation: (32, 32, 32, 32) -> [3, 2, 1, 0]
 fn bench_permute_compare(c: &mut Criterion) {
     let mut group = c.benchmark_group("compare/permute_32_4d");
@@ -27,7 +27,7 @@ fn bench_permute_compare(c: &mut Criterion) {
         })
     });
 
-    // 2. mdarray-strided's copy_into (blocked/optimized)
+    // 2. strided-rs's copy_into (blocked/optimized)
     group.bench_function("strided_copy_into", |bencher| {
         bencher.iter(|| {
             let a_perm = a.permute(perm);
@@ -59,7 +59,7 @@ fn bench_transpose_compare_2000(c: &mut Criterion) {
         })
     });
 
-    // 2. mdarray-strided copy_into
+    // 2. strided-rs copy_into
     group.bench_function("strided_copy_into", |bencher| {
         bencher.iter(|| {
             let a_t = a.transpose();
@@ -91,7 +91,7 @@ fn bench_transpose_compare_4000(c: &mut Criterion) {
         })
     });
 
-    // 2. mdarray-strided copy_into
+    // 2. strided-rs copy_into
     group.bench_function("strided_copy_into", |bencher| {
         bencher.iter(|| {
             let a_t = a.transpose();

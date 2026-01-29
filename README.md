@@ -1,8 +1,10 @@
-# mdarray-strided
+# strided-rs
 
 Cache-optimized kernels for strided multidimensional array operations in Rust.
 
 This crate is a port of Julia's [Strided.jl](https://github.com/Jutho/Strided.jl) and [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) libraries.
+
+This crate is currently built on top of the `mdarray` crate, but the long-term goal is to remove the `mdarray` dependency.
 
 ## Features
 
@@ -16,18 +18,27 @@ This crate is a port of Julia's [Strided.jl](https://github.com/Jutho/Strided.jl
 
 ## Installation
 
-Add to your `Cargo.toml`:
+This crate is currently **not published to crates.io** (`publish = false` in `Cargo.toml`).
+
+For local development, add a path dependency:
 
 ```toml
 [dependencies]
-mdarray-strided = "0.1"
+strided-rs = { path = "../strided-rs" }
+```
+
+When this crate is published, you will be able to add it to your `Cargo.toml` as:
+
+```toml
+[dependencies]
+strided-rs = "0.1"
 ```
 
 ### Optional Features
 
 ```toml
 [dependencies]
-mdarray-strided = { version = "0.1", features = ["parallel", "blas"] }
+strided-rs = { version = "0.1", features = ["parallel", "blas"] }
 ```
 
 - `parallel`: Enable rayon-based parallel iteration (`par_iter()`)
@@ -36,7 +47,7 @@ mdarray-strided = { version = "0.1", features = ["parallel", "blas"] }
 ## Quick Start
 
 ```rust
-use mdarray_strided::{StridedArrayView, Identity};
+use strided_rs::{StridedArrayView, Identity};
 
 // Create a 2D view over existing data
 let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -71,7 +82,7 @@ A mutable version of `StridedArrayView`.
 ### Slicing
 
 ```rust
-use mdarray_strided::{StridedArrayView, Identity, StridedRange};
+use strided_rs::{StridedArrayView, Identity, StridedRange};
 
 let data: Vec<f64> = (0..24).map(|x| x as f64).collect();
 let view: StridedArrayView<'_, f64, 3, Identity> =
@@ -128,7 +139,7 @@ let matrix = row.broadcast([4, 3]).unwrap();
 Element operations are applied lazily and compose at the type level:
 
 ```rust
-use mdarray_strided::{StridedArrayView, Identity, Conj};
+use strided_rs::{StridedArrayView, Identity, Conj};
 use num_complex::Complex64;
 
 let data = vec![Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)];
@@ -169,7 +180,7 @@ let max: f64 = view.par_iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap()
 ## Map and Reduce Operations
 
 ```rust
-use mdarray_strided::{map_into, zip_map2_into, zip_map3_into, zip_map4_into, reduce};
+use strided_rs::{map_into, zip_map2_into, zip_map3_into, zip_map4_into, reduce};
 
 // Unary map: dest[i] = f(src[i])
 map_into(&mut dest, &src, |x| x * 2.0).unwrap();
@@ -190,7 +201,7 @@ let total = reduce(&src, |x| *x, |a, b| a + b, 0.0).unwrap();
 ## High-Level Operations
 
 ```rust
-use mdarray_strided::{copy_into, copy_scale, copy_conj, add, mul, axpy, fma, sum, dot};
+use strided_rs::{copy_into, copy_scale, copy_conj, add, mul, axpy, fma, sum, dot};
 
 // Copy operations
 copy_into(&mut dest, &src).unwrap();           // dest = src
@@ -213,7 +224,7 @@ let d = dot(&x, &y).unwrap();                  // dot product
 ## BLAS Integration (requires `blas` feature)
 
 ```rust
-use mdarray_strided::{blas_axpy, blas_dot, blas_gemm, is_blas_matrix};
+use strided_rs::{blas_axpy, blas_dot, blas_gemm, is_blas_matrix};
 
 // Check if a matrix is BLAS-compatible
 if let Some(info) = is_blas_matrix(&matrix_view) {
@@ -400,33 +411,31 @@ Detailed benchmark results are available in the `docs/` directory:
 
 ## Development status (2026-01-28)
 
-- 概要:
-    - Rust 側に `bytemuck` を導入し、POD 専用経路を追加しました。
-    - 新しい公開 API:
-        - `copy_into_pod<T: Pod>(...)` — 汎用数値型の高速コピー経路。
-        - `copy_into_pod_complex_f32` / `copy_into_pod_complex_f64` — `Complex` をライブラリ内部で境界キャストして POD 経路を再利用する安全化ヘルパ。
-    - `src/pod_complex.rs` を追加して `PodComplexF32` / `PodComplexF64` とキャストユーティリティを提供。
+- Summary:
+  - Added `bytemuck` and a POD-only fast path.
+  - New public APIs:
+    - `copy_into_pod<T: Pod>(...)`: fast byte-copy path for POD element types.
+    - `copy_into_pod_complex_f32` / `copy_into_pod_complex_f64`: helpers that reuse the POD path for `Complex` via an internal POD representation with runtime checks.
+  - Added `src/pod_complex.rs` providing `PodComplexF32` / `PodComplexF64` and casting utilities.
 
-- 安全性と実装方針:
-    - `unsafe` はライブラリ内部に閉じ込め、公開 API は安全に呼べる形を維持しています。
-    - キャスト互換性はランタイムでサイズ・アライメントをチェックし、不整合時は `StridedError::PodCastUnsupported` を返します。
+- Safety / implementation notes:
+  - `unsafe` is kept internal; the public API remains safe to call.
+  - Cast compatibility is checked at runtime (size/alignment); on mismatch it returns `StridedError::PodCastUnsupported`.
 
-- ベンチマーク（単一スレッド、代表値）:
-    - symmetrize_4000 — Julia: ~17.38 ms | Rust: ~25.80 ms
-    - scale_transpose_1000 — Julia: ~0.379 ms | Rust: ~0.596 ms
-    - complex_elementwise_1000 — Julia: ~7.56 ms | Rust: ~13.16 ms
-    - permute_32_4d — Julia: ~0.844 ms | Rust: ~0.949 ms
-    - multiple_permute_sum_32_4d — Julia: ~2.26 ms | Rust: ~2.87 ms
+- Benchmarks (single-thread representative values):
+  - symmetrize_4000 — Julia: ~17.38 ms | Rust: ~25.80 ms
+  - scale_transpose_1000 — Julia: ~0.379 ms | Rust: ~0.596 ms
+  - complex_elementwise_1000 — Julia: ~7.56 ms | Rust: ~13.16 ms
+  - permute_32_4d — Julia: ~0.844 ms | Rust: ~0.949 ms
+  - multiple_permute_sum_32_4d — Julia: ~2.26 ms | Rust: ~2.87 ms
 
-- 次の推奨作業:
-    1. `Complex` 用のベンチを追加して `copy_into_pod_complex_*` を実測する。
-    2. Complex 向けマイクロカーネル（アンローリング / SIMD）を実装する。
-    3. 外側ブロック・マイクロタイルのパラメータをターゲットごとにチューニングする。
-
-上記を追加したコミットを作成してリモートに push しました。
+- Next steps:
+  1. Add dedicated `Complex` benchmarks to measure `copy_into_pod_complex_*`.
+  2. Implement Complex micro-kernels (unrolling / SIMD).
+  3. Tune outer-block and micro-tile parameters per target CPU.
 
 ```rust
-use mdarray_strided::{matmul, generic_matmul, linalg_axpy, axpby, lmul, rmul};
+use strided_rs::{matmul, generic_matmul, linalg_axpy, axpby, lmul, rmul};
 
 // Matrix multiplication: C = alpha * A * B + beta * C
 matmul(&mut c, &a, &b, 1.0, 0.0).unwrap();
@@ -444,7 +453,7 @@ rmul(&mut x, 2.0).unwrap();                  // x = x * 2.0
 ## Broadcasting with CaptureArgs
 
 ```rust
-use mdarray_strided::{broadcast_into, promoteshape, CaptureArgs, Arg, Scalar};
+use strided_rs::{broadcast_into, promoteshape, CaptureArgs, Arg, Scalar};
 
 // Broadcast [1, 3] and [4, 1] to [4, 3] and add
 let target = [4, 3];
@@ -459,7 +468,7 @@ let capture = CaptureArgs::new(|a, b, c| a + b * c, (Arg, Arg, Scalar(2.0)));
 ## Dimension Reduction
 
 ```rust
-use mdarray_strided::mapreducedim_into;
+use strided_rs::mapreducedim_into;
 
 // Sum along axis 0: [3, 4] -> [1, 4]
 let mut dest = Tensor::from_fn([1, 4], |_| 0.0);
@@ -486,3 +495,12 @@ This crate is a **~98% complete port** of Julia's Strided.jl/StridedViews.jl:
 This crate is inspired by and ports functionality from:
 - [Strided.jl](https://github.com/Jutho/Strided.jl) by Jutho
 - [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) by Jutho
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 (`LICENSE-APACHE`)
+- MIT license (`LICENSE-MIT`)
+
+See `NOTICE` for upstream attribution (Strided.jl / StridedViews.jl are MIT-licensed).

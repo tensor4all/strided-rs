@@ -57,7 +57,7 @@
 //! # Example
 //!
 //! ```rust
-//! use mdarray_strided::{StridedArrayView, Identity};
+//! use strided_rs::{StridedArrayView, Identity};
 //!
 //! // Create a 2D view over existing data
 //! let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -76,7 +76,7 @@
 //! # Broadcasting Example
 //!
 //! ```rust
-//! use mdarray_strided::{StridedArrayView, StridedArrayViewMut, Identity, broadcast_into};
+//! use strided_rs::{StridedArrayView, StridedArrayViewMut, Identity, broadcast_into};
 //!
 //! // Broadcast [1, 3] to [4, 3] and add element-wise
 //! let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];

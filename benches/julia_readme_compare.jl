@@ -3,7 +3,7 @@ using BenchmarkTools
 using Statistics
 
 # Julia must run with 1 thread for fair comparison if Rust is single-threaded (mostly)
-# or just compare as-is. mdarray-strided is single-threaded by default in these benches.
+# or just compare as-is. strided-rs is single-threaded by default in these benches.
 println("Julia Threads: ", Threads.nthreads())
 
 function bench_symmetrize_4000()

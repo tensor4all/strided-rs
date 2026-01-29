@@ -1,8 +1,11 @@
 [package]
-name = "mdarray-strided"
+name = "strided-rs"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
+repository = "https://github.com/tensor4all/strided-rs"
+description = "Cache-optimized kernels for strided multidimensional array operations in Rust (ported from Julia Strided.jl/StridedViews.jl)."
 publish = false
 
 [dependencies]

@@ -1,6 +1,6 @@
 use approx::assert_relative_eq;
 use mdarray::{DynRank, Tensor};
-use mdarray_strided::{
+use strided_rs::{
     copy_into_uninit, copy_transpose_scale_into, copy_transpose_scale_into_fast, dot, map_into,
     reduce, reduce_axis, zip_map2_into, zip_map4_into,
 };
@@ -244,7 +244,7 @@ fn test_zip_map4_into_mixed_ops() {
 #[cfg(feature = "parallel")]
 #[test]
 fn test_par_zip_map2_into_large() {
-    use mdarray_strided::par_zip_map2_into;
+    use strided_rs::par_zip_map2_into;
 
     // Large array to trigger threading
     let size = 500;
@@ -268,7 +268,7 @@ fn test_par_zip_map2_into_large() {
 #[cfg(feature = "parallel")]
 #[test]
 fn test_par_zip_map2_into_transposed() {
-    use mdarray_strided::par_zip_map2_into;
+    use strided_rs::par_zip_map2_into;
 
     let size = 200;
     let a: Tensor<f64, DynRank> =

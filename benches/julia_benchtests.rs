@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
-use mdarray_strided::{
+use strided_rs::{
     linalg::{generic_matmul, matmul},
     copy_into, mapreducedim_capture_views_into, sum, Arg, CaptureArgs, Identity,
     StridedArrayView, StridedArrayViewMut,

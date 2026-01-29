@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use mdarray_strided::broadcast::{CaptureArgs, Arg, Scalar};
+//! use strided_rs::broadcast::{CaptureArgs, Arg, Scalar};
 //!
 //! // Capture: f(x, y, scalar) where x and y are arrays
 //! let captured = CaptureArgs::new(

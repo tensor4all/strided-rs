@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mdarray::Tensor;
-use mdarray_strided::{copy_into, copy_transpose_scale_into_fast, zip_map2_into, zip_map4_into};
+use strided_rs::{copy_into, copy_transpose_scale_into_fast, zip_map2_into, zip_map4_into};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
@@ -98,7 +98,7 @@ fn bench_complex_elementwise_1000(c: &mut Criterion) {
 
     group.bench_function("strided", |bencher| {
         bencher.iter(|| {
-            mdarray_strided::map_into(&mut b, a.as_ref(), |&x| {
+            strided_rs::map_into(&mut b, a.as_ref(), |&x| {
                 x * (-2.0 * x).exp() + (x * x).sin()
             })
             .unwrap();

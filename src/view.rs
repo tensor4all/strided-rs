@@ -26,7 +26,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToIncl
 ///
 /// # Example
 /// ```ignore
-/// use mdarray_strided::{StridedArrayView, Identity};
+/// use strided_rs::{StridedArrayView, Identity};
 ///
 /// let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 /// let view: StridedArrayView<'_, f64, 2, Identity> = StridedArrayView::new(
