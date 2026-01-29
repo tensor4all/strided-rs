@@ -91,16 +91,12 @@ where
                     // offsets[0] = spacing * (taskindex - 1) for threadedout
                     // offsets[1] = offset into src
                     let out_offset = offsets[0] as usize;
-                    let src_strides = &strides_list[1..];
                     let src_offsets = &offsets[1..];
-
-                    // Build strides_list for just the source
-                    let src_strides_only: Vec<Vec<isize>> = src_strides.iter().cloned().collect();
 
                     for_each_inner_block_with_offsets(
                         dims,
                         blocks,
-                        &src_strides_only,
+                        &strides_list[1..],
                         src_offsets,
                         |offsets, len, strides| {
                             let mut ptr = unsafe { src_send.as_const().offset(offsets[0]) };
