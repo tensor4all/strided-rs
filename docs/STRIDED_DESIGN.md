@@ -10,10 +10,8 @@ This document analyzes the implementations of Julia’s `StridedViews.jl` and `S
 4. [Operation Composition](#operation-composition)
 5. [View Transformations](#view-transformations)
 6. [Cache Optimization](#cache-optimization)
-7. [Multithreading](#multithreading)
-8. [Broadcasting](#broadcasting)
-9. [Linear Algebra Integration](#linear-algebra-integration)
-10. [Implications for Rust Implementation](#implications-for-rust-implementation)
+7. [Broadcasting](#broadcasting)
+8. [Implications for Rust Implementation](#implications-for-rust-implementation)
 
 ---
 
@@ -32,7 +30,6 @@ Strided.jl       - Efficient computation implementations (map/reduce, broadcast,
 1. **Zero-copy**: `permutedims`, `transpose`, `adjoint`, and slicing return views
 2. **Lazy evaluation**: operations only modify metadata (strides, offsets)
 3. **Cache-friendly**: blocking and loop-order optimization
-4. **Multithreading**: parallelization via divide-and-conquer
 
 ---
 
@@ -291,28 +288,6 @@ Dimensions are ordered by stride magnitude to maximize contiguous access.
 
 ---
 
-## Multithreading
-
-### Divide-and-Conquer Parallelization
-
-Dimensions are split into independent tasks, and each task is processed in parallel.
-
-### Reduction Considerations
-
-- Do not split reduction dimensions (dest stride 0) to avoid contention
-- For full reductions, use per-thread outputs to avoid false sharing
-
-```julia
-if op !== nothing && _length(dims, strides[1]) == 1  # full reduction
-    T = eltype(arrays[1])
-    spacing = isbitstype(T) ? max(1, div(64, sizeof(T))) : 1  # avoid false sharing
-    threadedout = similar(arrays[1], spacing * get_num_threads())
-    ...
-end
-```
-
----
-
 ## Broadcasting
 
 ### BroadcastStyle
@@ -381,68 +356,6 @@ end
 - Unified API: `broadcast_capture_into(dest, capture, sources)` where `sources` is `&[&StridedArrayView]`
 - 2/3/4-arity helpers removed (single API surface)
 - `mapreducedim_capture_views_into` is the mapreducedim-side entry point
-
----
-
-## Linear Algebra Integration
-
-### BLAS-like Operations
-
-```julia
-LinearAlgebra.rmul!(dst::StridedView, α::Number) = mul!(dst, dst, α)
-LinearAlgebra.lmul!(α::Number, dst::StridedView) = mul!(dst, α, dst)
-LinearAlgebra.axpy!(a, X::StridedView, Y::StridedView) = Y .= a .* X .+ Y
-LinearAlgebra.axpby!(a, X, b, Y) = Y .= a .* X .+ b .* Y
-```
-
-### Matrix Multiplication
-
-#### BLAS Matrix Check
-
-```julia
-function isblasmatrix(A::StridedView{T,2}) where {T<:LinearAlgebra.BlasFloat}
-    if A.op == identity
-        return stride(A, 1) == 1 || stride(A, 2) == 1  # contiguous row or column
-    elseif A.op == conj
-        return stride(A, 2) == 1  # column-major only
-    else
-        return false
-    end
-end
-```
-
-#### Conversion to BLAS Form
-
-```julia
-function getblasmatrix(A::StridedView{T,2}) where {T<:LinearAlgebra.BlasFloat}
-    if A.op == identity
-        if stride(A, 1) == 1
-            return A, 'N'  # column-major
-        else
-            return transpose(A), 'T'  # row-major → transpose
-        end
-    else
-        return adjoint(A), 'C'  # conjugate transpose
-    end
-end
-```
-
-#### Generic Matrix Multiplication (mapreduce-based)
-
-```julia
-function __mul!(C, A, B, α, β)
-    m, n = size(C)
-    k = size(A, 2)
-
-    # Convert matrix multiplication to a 3D mapreduce
-    # C[i,j] = Σ_k A[i,k] * B[k,j]
-    A2 = sreshape(A, (m, 1, k))
-    B2 = sreshape(permutedims(B, (2, 1)), (1, n, k))
-    C2 = sreshape(C, (m, n, 1))
-
-    _mapreducedim!(*, +, initop, (m, n, k), (C2, A2, B2))
-end
-```
 
 ---
 

@@ -7,12 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 strided-rs is a Rust library providing cache-optimized kernels for strided multidimensional array operations. It is a **port of Julia's Strided.jl/StridedViews.jl libraries**, currently built on top of the `mdarray` crate.
 
 **Current Status (v0.1):**
-- Julia Strided.jl/StridedViews.jl port: **~98% complete**
 - Broadcasting with `CaptureArgs` for lazy evaluation (stride-0 for size-1 dims)
 - Zero-copy transformations: slice, reshape, permute, transpose
 - Lazy element operations with type-level composition (`Identity`, `Conj`, `Transpose`, `Adjoint`)
-- Linear algebra: `matmul`, `generic_matmul`, `axpy`, `axpby`, `lmul`, `rmul`
-- Optional features: `parallel` (rayon), `blas` (CBLAS)
+- Cache-optimized map/reduce/broadcast kernels
 - Overlapping src/dest memory is not supported
 
 ## Build Commands
@@ -21,19 +19,11 @@ strided-rs is a Rust library providing cache-optimized kernels for strided multi
 # Build
 cargo build
 
-# Build with all features
-cargo build --all-features
-
 # Run all tests
 cargo test
 
 # Run a single test
 cargo test test_map_into_transposed
-
-# Run tests with features
-cargo test --features parallel
-cargo test --features blas
-cargo test --all-features
 
 # Run benchmarks
 cargo bench
@@ -58,16 +48,13 @@ cargo bench -- copy_permuted
 | `view.rs` | `StridedArrayView`/`StridedArrayViewMut` types with slicing, permutation, reshape, broadcast | `stridedview.jl` |
 | `element_op.rs` | Element operations (`Identity`, `Conj`, `Transpose`, `Adjoint`) with type-level composition | `FN`, `FC`, `FT`, `FA` |
 | `kernel.rs` | `StridedView`/`StridedViewMut` internal wrappers, `_mapreduce_kernel!` implementation | `mapreduce.jl` |
-| `map.rs` | `map_into`, `zip_map2_into`, `zip_map3_into`, `zip_map4_into`, `par_zip_map2_into` | `Base.map!` |
+| `map.rs` | `map_into`, `zip_map2_into`, `zip_map3_into`, `zip_map4_into` | `Base.map!` |
 | `reduce.rs` | `reduce`, `reduce_axis`, `mapreducedim_into` | `Base.mapreduce`, `Base.mapreducedim!` |
 | `broadcast.rs` | `CaptureArgs`, `promoteshape`, `broadcast_into`, `Arg`, `Scalar` | `broadcast.jl` |
-| `linalg.rs` | `matmul`, `generic_matmul`, `axpy`, `axpby`, `lmul`, `rmul`, `isblasmatrix` | `linalg.jl` |
 | `ops.rs` | High-level operations: `copy_into`, `add`, `mul`, `axpy`, `fma`, `sum`, `dot`, `symmetrize_into` | Various |
-| `blas.rs` | BLAS integration: `is_blas_matrix`, `BlasFloat`, generic and BLAS-backed implementations | BLAS dispatch |
 | `order.rs` | Dimension ordering algorithm - sorts dimensions by stride magnitude | `indexorder` |
 | `block.rs` | Block size computation to fit within L1 cache (`_computeblocks`) | `_computeblocks` |
 | `fuse.rs` | Dimension fusion for contiguous dimensions | `_mapreduce_fuse!` |
-| `threading.rs` | Parallel divide-and-conquer threading | `_mapreduce_threaded!` |
 | `auxiliary.rs` | Helper functions: `index_order`, `normalize_strides`, `simplify_dims` | `auxiliary.jl` |
 
 ### Cache Optimization Strategy
@@ -77,7 +64,6 @@ The library uses a blocking strategy faithful to Strided.jl:
 2. **Dimension Reordering**: Dimensions are sorted by stride importance for optimal cache access (`_mapreduce_order!`)
 3. **Tiled Iteration**: Operations are blocked into tiles fitting L1 cache (`_computeblocks`)
 4. **Contiguous Fast Paths**: Contiguous arrays bypass blocking for direct iteration
-5. **Parallel Divide-and-Conquer**: Large arrays split recursively across threads (`_mapreduce_threaded!`)
 
 ### Key Constants
 
@@ -85,15 +71,13 @@ The library uses a blocking strategy faithful to Strided.jl:
 |----------|-------|------------------|
 | `BLOCK_MEMORY_SIZE` | 32KB | `BLOCKMEMORYSIZE` |
 | `CACHE_LINE_SIZE` | 64 bytes | `_cachelinelength` |
-| `MIN_THREAD_LENGTH` | 32768 | `MINTHREADLENGTH` |
 
 ### Dependencies
 
 - `mdarray` (v0.7.2): Base multidimensional array type
 - `num-traits`/`num-complex`: Numeric trait bounds
 - `thiserror`: Error type derivation
-- `rayon` (optional): Parallel iteration
-- `cblas` (optional): BLAS backend
+- `bytemuck`: POD trait for byte-copy fast paths
 
 ## Julia Port Status
 
@@ -105,7 +89,6 @@ The library uses a blocking strategy faithful to Strided.jl:
 | `StridedViews.jl/auxiliary.jl` | `auxiliary.rs` | ✅ Complete |
 | `Strided.jl/mapreduce.jl` | `kernel.rs`, `map.rs`, `reduce.rs`, `fuse.rs`, `block.rs`, `order.rs` | ✅ Complete |
 | `Strided.jl/broadcast.jl` | `broadcast.rs` | ✅ Complete |
-| `Strided.jl/linalg.jl` | `linalg.rs` | ✅ Complete |
 | `Strided.jl/convert.jl` | (via `copy_into`) | ✅ Complete |
 | `Strided.jl/macros.jl` | N/A | ⚠️ Not needed (Rust type system) |
 
@@ -119,7 +102,6 @@ The library uses a blocking strategy faithful to Strided.jl:
 | `permutedims(a, perm)` | `view.permute()` | Zero-copy permutation |
 | `Base.map!(f, dest, srcs...)` | `map_into`, `zip_map*_into` | Up to 4 sources |
 | `Base.mapreducedim!(f, op, dest, src)` | `mapreducedim_into` | Dimension reduction |
-| `LinearAlgebra.mul!(C, A, B, α, β)` | `matmul(c, a, b, alpha, beta)` | BLAS-compatible |
 | `promoteshape(dims, arrays...)` | `promoteshape`, `promoteshape2`, `promoteshape3` | Broadcasting |
 | `CaptureArgs` | `CaptureArgs<F, A>` | Lazy broadcast |
 
@@ -140,13 +122,10 @@ Design documentation:
 2. **Type-level element operations**: Avoid runtime dispatch for conj/transpose via the `ElementOp` trait
 3. **Result-based error handling**: Return `Result<_, StridedError>` for invalid operations
 4. **Trait-based extensibility**: `ElementOp`, `Reduce`, `Map` traits for customization
-5. **Feature-gated optional backends**: `parallel` for rayon, `blas` for CBLAS
 
 ## Remaining Work (TODO)
 
 - Optimize blocking strategy for 4D arrays ([Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5))
-- Dynamic thread count control (`set_num_threads()` / `get_num_threads()` equivalent)
-- Further false-sharing avoidance optimization for parallel reductions
 
 ## Performance Notes
 

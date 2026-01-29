@@ -4,14 +4,6 @@
 //! and [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) libraries, providing
 //! efficient operations on strided multidimensional array views.
 //!
-//! # Feature Flags
-//!
-//! - **`parallel`**: Enable rayon-based parallel iteration.
-//!   Uses Julia-style divide-and-conquer threading for large arrays.
-//!
-//! - **`blas`**: Enable CBLAS-backed linear algebra operations ([`generic_axpy`], [`generic_dot`],
-//!   [`generic_gemm`]). Requires a CBLAS implementation to be available.
-//!
 //! # Core Types
 //!
 //! - [`StridedArrayView`] / [`StridedArrayViewMut`]: Zero-copy strided views over existing data
@@ -37,13 +29,6 @@
 //! - [`broadcast_into`]: Broadcasting with automatic shape promotion
 //! - [`promoteshape`]: Explicit shape promotion for broadcasting
 //! - [`CaptureArgs`]: Lazy broadcast expression builder (Julia's `CaptureArgs`)
-//!
-//! ## Linear Algebra
-//!
-//! - [`matmul`], [`generic_matmul`]: Matrix multiplication with alpha/beta scaling
-//! - [`axpy`], [`axpby`]: Vector operations (y = alpha*x + y, y = alpha*x + beta*y)
-//! - [`lmul`], [`rmul`]: Scalar multiplication
-//! - [`is_blas_matrix`], [`isblasmatrix_identity`], [`isblasmatrix_conj`]: BLAS compatibility checks
 //!
 //! ## Basic Operations
 //!
@@ -101,27 +86,18 @@
 //! - Contiguous arrays use fast paths bypassing the blocking machinery
 
 mod auxiliary;
-pub mod blas;
 mod block;
 pub mod broadcast;
 mod element_op;
 mod fuse;
 mod kernel;
-pub mod linalg;
 mod map;
 mod ops;
 mod order;
 mod promote;
 mod reduce;
-mod threading;
 pub mod view;
 mod pod_complex;
-
-// ============================================================================
-// BLAS module exports
-// ============================================================================
-pub use blas::{generic_axpy, generic_dot, generic_gemm};
-pub use blas::{is_blas_matrix, is_contiguous_1d, BlasFloat, BlasLayout, BlasMatrix};
 
 // ============================================================================
 // Element operations
@@ -131,8 +107,6 @@ pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity
 // ============================================================================
 // Map operations
 // ============================================================================
-#[cfg(feature = "parallel")]
-pub use map::par_zip_map2_into;
 pub use map::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 
 // ============================================================================
@@ -175,25 +149,6 @@ pub use broadcast::{
 };
 
 // ============================================================================
-// Linear algebra operations
-// ============================================================================
-/// AXPY operation for 1D arrays (y = alpha*x + y).
-///
-/// This is an alias for [`linalg::axpy`] to avoid name collision with the
-/// array-based [`axpy`] function in ops module.
-pub use linalg::axpy as linalg_axpy;
-pub use linalg::{
-    axpby, generic_matmul, getblasmatrix_identity, isblasmatrix, isblasmatrix_conj,
-    isblasmatrix_identity, lmul, matmul, rmul, BlasTranspose,
-};
-
-// ============================================================================
-// BLAS-backed operations (requires "blas" feature)
-// ============================================================================
-#[cfg(feature = "blas")]
-pub use blas::{blas_axpy, blas_dot, blas_gemm};
-
-// ============================================================================
 // Constants
 // ============================================================================
 
@@ -207,14 +162,6 @@ pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;
 ///
 /// Used for memory region calculations in block size computation.
 pub const CACHE_LINE_SIZE: usize = 64;
-
-/// Minimum array length before threading is applied.
-///
-/// Arrays smaller than this will be processed single-threaded even with the
-/// `parallel` feature enabled. This avoids thread overhead for small arrays.
-///
-/// Julia equivalent: `MINTHREADLENGTH`
-pub const MIN_THREAD_LENGTH: usize = 1 << 15; // 32768
 
 // ============================================================================
 // Error types

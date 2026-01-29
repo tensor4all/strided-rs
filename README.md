@@ -13,8 +13,6 @@ This crate is currently built on top of the `mdarray` crate, but the long-term g
 - **Zero-copy transformations**: slicing, reshaping, permuting, transposing
 - **Broadcasting** with stride-0 for size-1 dimensions
 - **Cache-optimized iteration** with automatic blocking and loop reordering
-- **Parallel iteration** with rayon (optional)
-- **BLAS integration** for optimized linear algebra (optional)
 
 ## Installation
 
@@ -33,16 +31,6 @@ When this crate is published, you will be able to add it to your `Cargo.toml` as
 [dependencies]
 strided-rs = "0.1"
 ```
-
-### Optional Features
-
-```toml
-[dependencies]
-strided-rs = { version = "0.1", features = ["parallel", "blas"] }
-```
-
-- `parallel`: Enable rayon-based parallel iteration (`par_iter()`)
-- `blas`: Enable BLAS-backed linear algebra operations (`blas_axpy`, `blas_dot`, `blas_gemm`)
 
 ## Quick Start
 
@@ -168,15 +156,6 @@ for (indices, value) in view.enumerate() {
 }
 ```
 
-### Parallel Iteration (requires `parallel` feature)
-
-```rust
-use rayon::prelude::*;
-
-let sum: f64 = view.par_iter().sum();
-let max: f64 = view.par_iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-```
-
 ## Map and Reduce Operations
 
 ```rust
@@ -221,26 +200,6 @@ let s = sum(&array).unwrap();                  // sum of all elements
 let d = dot(&x, &y).unwrap();                  // dot product
 ```
 
-## BLAS Integration (requires `blas` feature)
-
-```rust
-use strided_rs::{blas_axpy, blas_dot, blas_gemm, is_blas_matrix};
-
-// Check if a matrix is BLAS-compatible
-if let Some(info) = is_blas_matrix(&matrix_view) {
-    println!("Layout: {:?}, ld: {}", info.layout, info.ld);
-}
-
-// BLAS axpy: y = alpha * x + y
-blas_axpy(2.0, &x, &mut y).unwrap();
-
-// BLAS dot: result = x · y
-let dot_product = blas_dot(&x, &y).unwrap();
-
-// BLAS gemm: C = alpha * A * B + beta * C
-blas_gemm(1.0, &a, &b, 0.0, &mut c).unwrap();
-```
-
 ## Cache Optimization
 
 The library automatically optimizes iteration order for cache efficiency:
@@ -268,14 +227,11 @@ Run benchmarks to measure performance:
 # Basic strided operations (strided vs naive implementations)
 cargo bench --bench strided_bench
 
-# Parallel benchmarks (sequential vs parallel)
-cargo bench --features parallel --bench parallel_bench
-
-# BLAS benchmarks (generic vs BLAS-backed)
-cargo bench --features blas --bench blas_bench
+# Julia-compatible benchmarks
+cargo bench --bench julia_benchtests
 
 # Run all benchmarks
-cargo bench --all-features
+cargo bench
 ```
 
 **Latest Benchmark (2026-01-28)**
@@ -388,26 +344,19 @@ If you want, I can start by adding `bytemuck` to `Cargo.toml`, update the POD ga
 Detailed benchmark results are available in the `docs/` directory:
 
 - [`docs/report.md`](docs/report.md) - Strided vs naive implementation comparison
-- [`docs/report_parallel.md`](docs/report_parallel.md) - Sequential vs parallel comparison
-- [`docs/report_blas.md`](docs/report_blas.md) - Generic vs BLAS comparison
 
 ### Performance Highlights
 
 | Feature | Speedup | Best Use Case |
 |---------|---------|---------------|
 | **Strided kernels** | 2-4x | Mixed stride patterns |
-| **Parallel** (`par_zip_map2_into`) | 4-6x | Compute-heavy ops, large arrays |
-| **BLAS** (`blas_gemm`) | 40-120x | Matrix multiplication |
+| **Fused multi-array ops** | ~2x | Sum of permutations |
 
 ## Performance Tips
 
 1. **Use contiguous arrays when possible** - they get fast-path optimization
-2. **Enable the `parallel` feature** for large arrays (>1M elements) or compute-heavy operations
-3. **Use `blas_*` functions** for linear algebra when BLAS is available
-4. **Use `is_blas_matrix`** to check BLAS compatibility before calling BLAS functions
-5. **Prefer row-major layout** (stride[N-1] == 1) for better cache performance
-
-## Linear Algebra
+2. **Prefer row-major layout** (stride[N-1] == 1) for better cache performance
+3. **Fuse operations** using `zip_map*_into` to avoid intermediate allocations
 
 ## Development status (2026-01-28)
 
@@ -433,22 +382,6 @@ Detailed benchmark results are available in the `docs/` directory:
   1. Add dedicated `Complex` benchmarks to measure `copy_into_pod_complex_*`.
   2. Implement Complex micro-kernels (unrolling / SIMD).
   3. Tune outer-block and micro-tile parameters per target CPU.
-
-```rust
-use strided_rs::{matmul, generic_matmul, linalg_axpy, axpby, lmul, rmul};
-
-// Matrix multiplication: C = alpha * A * B + beta * C
-matmul(&mut c, &a, &b, 1.0, 0.0).unwrap();
-
-// Generic matmul (without BLAS)
-generic_matmul(&mut c, &a, &b, 1.0, 0.0).unwrap();
-
-// Vector operations (1D arrays)
-linalg_axpy(&mut y, 2.0, &x).unwrap();       // y = 2.0 * x + y
-axpby(&mut y, 2.0, &x, 0.5).unwrap();        // y = 2.0 * x + 0.5 * y
-lmul(&mut x, 2.0).unwrap();                  // x = 2.0 * x
-rmul(&mut x, 2.0).unwrap();                  // x = x * 2.0
-```
 
 ## Broadcasting with CaptureArgs
 
@@ -488,7 +421,6 @@ This crate is a **~98% complete port** of Julia's Strided.jl/StridedViews.jl:
 | `stridedview.jl` | `view.rs` | ✅ Complete |
 | `mapreduce.jl` | `kernel.rs`, `map.rs`, `reduce.rs` | ✅ Complete |
 | `broadcast.jl` | `broadcast.rs` | ✅ Complete |
-| `linalg.jl` | `linalg.rs` | ✅ Complete |
 
 ## Acknowledgments
 

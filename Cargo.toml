@@ -13,14 +13,7 @@ mdarray = "0.7.2"
 num-traits = "0.2"
 num-complex = "0.4"
 thiserror = "1.0"
-rayon = { version = "1.10", optional = true }
-cblas = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
-
-[features]
-default = []
-parallel = ["rayon"]
-blas = ["cblas"]
 
 [dev-dependencies]
 criterion = "0.5"
@@ -34,16 +27,6 @@ bench = false
 [[bench]]
 name = "strided_bench"
 harness = false
-
-[[bench]]
-name = "parallel_bench"
-harness = false
-required-features = ["parallel"]
-
-[[bench]]
-name = "blas_bench"
-harness = false
-required-features = ["blas"]
 
 [[bench]]
 name = "julia_benchtests"

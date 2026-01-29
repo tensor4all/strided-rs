@@ -174,7 +174,6 @@ strided_fused:   1.8637 ms - 1.9016 ms  (551-563 Melem/s)
 
 ### Future Work:
 - Optimize 4D blocking strategy ([Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5))
-- Dynamic thread count tuning
 - Further micro-optimizations for specific access patterns
 
 ---
@@ -190,12 +189,6 @@ The clippy warning fixes have resulted in significant performance improvements:
 - Reduced variance in results due to cleaner, more optimized code
 - Removed unnecessary `clone()` calls, improved loop efficiency, and standardized math operations
 
-### After Threading Fix (without parallel feature)
-
-- Library now compiles without `--features parallel`
-- Benchmarks can be run without parallel dependencies
-- No performance regression when parallel feature is disabled
-
 ---
 
 ## System Configuration
@@ -204,7 +197,6 @@ The clippy warning fixes have resulted in significant performance improvements:
 OS:         macOS 14.2 (darwin 25.2.0)
 Compiler:   rustc (release build)
 CPU:        (detected from BLOCK_MEMORY_SIZE = 32KB L1 cache)
-Threading:  Rayon (parallel feature enabled)
 ```
 
 ## Methodology

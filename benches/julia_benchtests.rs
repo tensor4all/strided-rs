@@ -1,7 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
 use strided_rs::{
-    linalg::{generic_matmul, matmul},
     copy_into, mapreducedim_capture_views_into, sum, Arg, CaptureArgs, Identity,
     StridedArrayView, StridedArrayViewMut,
 };
@@ -49,22 +48,6 @@ fn bench_sum_1d(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("strided", s), &s, |b, _| {
             b.iter(|| black_box(sum(a.as_ref()).unwrap()))
         });
-
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            // Approximate Julia's threaded @strided sum using Rayon on a contiguous slice.
-            // This is not the same scheduler, but provides a useful reference point.
-            group.bench_with_input(BenchmarkId::new("base_rayon", s), &s, |b, _| {
-                // mdarray Tensor is contiguous; treat it as a flat Vec by indexing.
-                // Build a temporary Vec view once.
-                let mut flat = Vec::with_capacity(s);
-                for i in 0..s {
-                    flat.push(a[[i]]);
-                }
-                b.iter(|| black_box(flat.par_iter().copied().sum::<f64>()))
-            });
-        }
     }
 
     group.finish();
@@ -163,89 +146,6 @@ fn bench_permute_4d(c: &mut Criterion) {
     group.finish();
 }
 
-fn matmul_sizes() -> Vec<usize> {
-    // Julia uses the same `sizes` for (m,k,n). That grows too large for full GEMM.
-    // We keep the same list but cap by memory.
-    let mut out = Vec::new();
-    for s in julia_sizes() {
-        // Rough cap for A(m,k), B(k,n), C(m,n) as f64 column-major.
-        let elems = 3u128
-            .saturating_mul(s as u128)
-            .saturating_mul(s as u128);
-        // Reduced from 120M to 12M elements to finish faster
-        if elems > 12_000_000u128 {
-            break;
-        }
-        out.push(s);
-    }
-    out
-}
-
-fn fill_colmajor(m: usize, n: usize, rng: &mut impl Rng) -> Vec<f64> {
-    // Column-major storage: index = row + col*m
-    let mut data = vec![0.0f64; m * n];
-    for col in 0..n {
-        for row in 0..m {
-            data[row + col * m] = rng.sample(StandardNormal);
-        }
-    }
-    data
-}
-
-fn bench_mul_gemm(c: &mut Criterion) {
-    let mut group = c.benchmark_group("benchtests/mul_gemm");
-    group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(2));
-    group.sample_size(10);
-
-    for &s in &matmul_sizes() {
-        let m = s;
-        let k = s;
-        let n = s;
-
-        // Throughput as FLOPs: 2*m*n*k (rough, for GEMM)
-        let flops = 2u64
-            .saturating_mul(m as u64)
-            .saturating_mul(n as u64)
-            .saturating_mul(k as u64);
-        group.throughput(Throughput::Elements(flops));
-
-        let mut rng = StdRng::seed_from_u64(0xD00D ^ (s as u64));
-        let a_data = fill_colmajor(m, k, &mut rng);
-        let b_data = fill_colmajor(k, n, &mut rng);
-        let c_data = fill_colmajor(m, n, &mut rng);
-
-        // Column-major strides.
-        let a = StridedArrayView::<f64, 2>::new(&a_data, [m, k], [1, m as isize], 0).unwrap();
-        let b = StridedArrayView::<f64, 2>::new(&b_data, [k, n], [1, k as isize], 0).unwrap();
-
-        group.bench_with_input(BenchmarkId::new("generic", s), &s, |bencher, _| {
-            bencher.iter(|| {
-                // Fresh C each iter to match Julia mul! shape (overwrite ok).
-                let mut c_buf = c_data.clone();
-                let mut c_view =
-                    StridedArrayViewMut::<f64, 2>::new(&mut c_buf, [m, n], [1, m as isize], 0)
-                        .unwrap();
-                generic_matmul(1.0, &a, &b, 0.0, &mut c_view).unwrap();
-                black_box(c_view.as_ptr());
-            })
-        });
-
-        group.bench_with_input(BenchmarkId::new("matmul_dispatch", s), &s, |bencher, _| {
-            bencher.iter(|| {
-                let mut c_buf = c_data.clone();
-                let mut c_view =
-                    StridedArrayViewMut::<f64, 2>::new(&mut c_buf, [m, n], [1, m as isize], 0)
-                        .unwrap();
-                matmul(1.0, &a, &b, 0.0, &mut c_view).unwrap();
-                black_box(c_view.as_ptr());
-            })
-        });
-    }
-
-    group.finish();
-}
-
 fn bench_mapreducedim_capture2(c: &mut Criterion) {
     let mut group = c.benchmark_group("benchtests/mapreducedim_capture2");
     group.warm_up_time(Duration::from_millis(500));
@@ -317,7 +217,6 @@ criterion_group!(
     julia_benchtests,
     bench_sum_1d,
     bench_permute_4d,
-    bench_mul_gemm,
     bench_mapreducedim_capture2
 );
 criterion_main!(julia_benchtests);

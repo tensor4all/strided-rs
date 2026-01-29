@@ -240,57 +240,6 @@ fn test_zip_map4_into_mixed_ops() {
     }
 }
 
-// Test parallel zip_map2_into
-#[cfg(feature = "parallel")]
-#[test]
-fn test_par_zip_map2_into_large() {
-    use strided_rs::par_zip_map2_into;
-
-    // Large array to trigger threading
-    let size = 500;
-    let a: Tensor<f64, DynRank> =
-        Tensor::from_fn([size, size], |idx| (idx[0] * size + idx[1]) as f64).into_dyn();
-    let b: Tensor<f64, DynRank> =
-        Tensor::from_fn([size, size], |idx| (idx[0] + idx[1] * 2) as f64).into_dyn();
-    let mut out = Tensor::zeros([size, size]).into_dyn();
-
-    par_zip_map2_into(&mut out, &a, &b, |x, y| x + y).unwrap();
-
-    // Verify results
-    for i in 0..size {
-        for j in 0..size {
-            let expected = a[[i, j]] + b[[i, j]];
-            assert_relative_eq!(out[[i, j]], expected, epsilon = 1e-10);
-        }
-    }
-}
-
-#[cfg(feature = "parallel")]
-#[test]
-fn test_par_zip_map2_into_transposed() {
-    use strided_rs::par_zip_map2_into;
-
-    let size = 200;
-    let a: Tensor<f64, DynRank> =
-        Tensor::from_fn([size, size], |idx| (idx[0] * size + idx[1]) as f64).into_dyn();
-    let b: Tensor<f64, DynRank> =
-        Tensor::from_fn([size, size], |idx| (idx[0] + idx[1] * 2) as f64).into_dyn();
-
-    let a_t = a.as_ref().permute([1, 0]);
-    let b_t = b.as_ref().permute([1, 0]);
-    let mut out = Tensor::zeros([size, size]).into_dyn();
-
-    par_zip_map2_into(&mut out, &a_t, &b_t, |x, y| x * y).unwrap();
-
-    // Verify results
-    for i in 0..size {
-        for j in 0..size {
-            let expected = a_t[[i, j]] * b_t[[i, j]];
-            assert_relative_eq!(out[[i, j]], expected, epsilon = 1e-10);
-        }
-    }
-}
-
 fn sum_axis_expected(tensor: &Tensor<f64, DynRank>, axis: usize) -> Tensor<f64, DynRank> {
     let mut dims: Vec<usize> = (0..tensor.rank()).map(|i| tensor.dim(i)).collect();
     let axis_dim = dims.remove(axis);
