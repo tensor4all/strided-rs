@@ -227,6 +227,7 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -332,6 +333,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -455,6 +457,7 @@ pub fn zip_map3_into<
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
@@ -600,6 +603,7 @@ pub fn zip_map4_into<
         Some(0),
         std::mem::size_of::<T>(),
     );
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 

@@ -45,6 +45,7 @@ where
 
     let (fused_dims, ordered_strides, plan) =
         build_plan_fused(&src_dims_v, &strides_list, None, std::mem::size_of::<T>());
+    #[cfg(feature = "parallel")]
     let ordered_strides_refs: Vec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 

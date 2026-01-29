@@ -7,16 +7,18 @@ use crate::fuse::fuse_dims;
 use crate::{block, order, Result};
 
 pub(crate) struct KernelPlan {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) order: Vec<usize>, // outer -> inner
     pub(crate) block: Vec<usize>,
 }
 
-/// Build an execution plan for strided iteration.
+/// Build an execution plan for strided iteration (used only in tests).
 ///
 /// This follows Julia's `_mapreduce_fuse!` -> `_mapreduce_order!` -> `_mapreduce_block!` pipeline:
 /// 1. Fuse contiguous dimensions
 /// 2. Compute optimal iteration order
 /// 3. Compute block sizes for cache efficiency
+#[cfg(test)]
 pub(crate) fn build_plan(
     dims: &[usize],
     strides_list: &[&[isize]],
@@ -84,6 +86,7 @@ pub(crate) fn build_plan_fused(
 /// The callback receives the current byte offsets for each array, the number
 /// of elements in the innermost block, and the innermost strides for each array.
 /// This allows the caller to implement vectorized inner loops.
+#[cfg(test)]
 #[inline]
 pub(crate) fn for_each_inner_block<F>(
     dims: &[usize],
