@@ -1,3 +1,4 @@
+#![cfg(feature = "mdarray")]
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mdarray::Tensor;
 use rand::{rngs::StdRng, Rng, SeedableRng};

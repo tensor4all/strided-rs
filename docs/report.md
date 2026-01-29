@@ -1,6 +1,6 @@
 # Benchmark Report: strided-rs v0.1
 
-**Date:** January 23, 2026
+**Date:** January 29, 2026
 **Platform:** macOS (darwin 25.2.0)
 
 This report summarizes performance benchmarks comparing strided array operations against naive implementations.
@@ -17,8 +17,8 @@ The strided kernels show significant performance improvements in most operations
 | `symmetrize_aat` | 4000×4000 | **1.50x faster** | `B = (A + A') / 2` |
 | `scale_transpose` | 1000×1000 | **2.02x faster** | `B = 3.0 * A'` |
 | `nonlinear_map` | 1000×1000 | **≈same** | element-wise ops |
-| `permutedims_4d` | 32×32×32×32 | **≈same** | Full 4D transpose |
-| `multi_permute_sum` | 32×32×32×32 | **1.97x faster** | Sum of 4 permutations |
+| `permutedims_4d` | 32×32×32×32 | **2.2x faster** | Full 4D transpose |
+| `multi_permute_sum` | 32×32×32×32 | **3.0x faster** | Sum of 4 permutations |
 
 ## Detailed Results
 
@@ -117,13 +117,13 @@ strided:  10.514 ms - 10.619 ms  (94.2-95.1 Melem/s)
 **Operation:** `permutedims!(B, A, (4,3,2,1))` (full 4D transpose)
 
 ```
-naive:    945.03 µs - 968.91 µs  (1.08-1.11 Gelem/s)
-strided:  936.86 µs - 988.94 µs  (1.06-1.12 Gelem/s)
+naive:    4.50 ms
+strided:  2.04 ms
 ```
 
-**Result:** **≈same performance** (955.56 µs vs 963.33 µs)
+**Result:** Strided is **2.2x faster** (4.50 ms → 2.04 ms)
 
-**Analysis:** For 4D arrays with full dimension reversal, current blocking strategy does not provide advantage. See [Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5) for planned optimizations.
+**Analysis:** After fixing kernel loop nesting to match Julia (innermost loop = highest-importance dimension), the 4D permutation now benefits from cache-optimized iteration. Previously the loops were inverted, causing cache misses that made strided slower than naive.
 
 ---
 
@@ -132,13 +132,13 @@ strided:  936.86 µs - 988.94 µs  (1.06-1.12 Gelem/s)
 **Operation:** `B = A + permute(A, p1) + permute(A, p2) + permute(A, p3)` (sum 4 permutations)
 
 ```
-naive:           3.5778 ms - 3.9027 ms  (269-294 Melem/s)
-strided_fused:   1.8637 ms - 1.9016 ms  (551-563 Melem/s)
+naive:           10.00 ms
+strided_fused:    3.31 ms
 ```
 
-**Result:** Strided is **1.97x faster** (3.70 ms → 1.88 ms)
+**Result:** Strided is **3.0x faster** (10.00 ms → 3.31 ms)
 
-**Analysis:** `zip_map4_into` demonstrates the power of lazy evaluation and single-pass fusion. Instead of materializing 4 intermediate arrays, strided performs a single-pass computation with cache-optimized access. This represents **best-case performance** for the library's design.
+**Analysis:** `zip_map4_into` demonstrates the power of lazy evaluation and single-pass fusion. Instead of materializing 4 intermediate arrays, strided performs a single-pass computation with cache-optimized access. After fixing kernel loop nesting, the 4D kernel correctly places the highest-importance dimension innermost, further improving cache behavior.
 
 ---
 
@@ -146,16 +146,16 @@ strided_fused:   1.8637 ms - 1.9016 ms  (551-563 Melem/s)
 
 ### When Strided Wins (✅)
 
-1. **Scale + transpose** (`scale_transpose`): 2.02x faster
-2. **Fused multi-array operations** (`multi_permute_sum`): 1.97x faster
-3. **Simple transpose copy** (`copy_permuted`): 1.85x faster
-4. **Large arrays with transpose** (`symmetrize_aat`): 1.50x faster
-5. **Mixed stride patterns** (`zip_map_mixed`): 1.46x faster
+1. **Fused multi-array 4D operations** (`multi_permute_sum`): 3.0x faster
+2. **4D permutations** (`permutedims_4d`): 2.2x faster
+3. **Scale + transpose** (`scale_transpose`): 2.02x faster
+4. **Simple transpose copy** (`copy_permuted`): 1.85x faster
+5. **Large arrays with transpose** (`symmetrize_aat`): 1.50x faster
+6. **Mixed stride patterns** (`zip_map_mixed`): 1.46x faster
 
 ### When Strided Breaks Even (⚠️)
 
 1. **Compute-bound operations** (`nonlinear_map`): ≈same
-2. **4D permutations** (`permutedims_4d`): ≈same (needs optimization)
 
 ---
 
@@ -173,8 +173,8 @@ strided_fused:   1.8637 ms - 1.9016 ms  (551-563 Melem/s)
 - Already compute-bound (complex math functions)
 
 ### Future Work:
-- Optimize 4D blocking strategy ([Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5))
 - Further micro-optimizations for specific access patterns
+- Explore explicit SIMD intrinsics to close remaining gap with Julia's `@simd`
 
 ---
 

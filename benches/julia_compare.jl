@@ -6,6 +6,22 @@ using Statistics
 # or just compare as-is. strided-rs is single-threaded by default in these benches.
 println("Julia Threads: ", Threads.nthreads())
 
+function bench_mwe_stridedview_scale_transpose_1000()
+    n = 1000
+    A = rand(n, n)
+    B = similar(A)
+
+    # MWE:
+    #   StridedView(B) .= 3 .* StridedView(A)'
+    #
+    # For benchmarking, pre-wrap to avoid measuring wrapper construction.
+    svA = StridedView(A)
+    svB = StridedView(B)
+
+    t = @benchmark $svB .= 3 .* $svA'
+    println("mwe_stridedview_scale_transpose_1000 (StridedView): ", mean(t.times) / 1e6, " ms")
+end
+
 function bench_symmetrize_4000()
     A = rand(4000, 4000)
     B = similar(A)
@@ -43,6 +59,7 @@ function bench_multiple_permute_sum_32_4d()
 end
 
 bench_symmetrize_4000()
+bench_mwe_stridedview_scale_transpose_1000()
 bench_scale_transpose_1000()
 bench_complex_elementwise_1000()
 bench_permute_32_4d()

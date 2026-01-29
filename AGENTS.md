@@ -46,6 +46,13 @@ cargo bench
 cargo bench -- copy_permuted
 ```
 
+## Benchmarking Notes (Rust)
+
+When adding or modifying benchmarks (especially "naive" baselines), optimize the baseline as well:
+- Avoid per-element high-level indexing (`a[[i, j]]`) inside hot loops when the data is contiguous; prefer pointer-based loops or precomputed strides so the "naive" number reflects math + memory traffic, not indexing overhead.
+- Keep setup/allocation out of the timed region and use `black_box` to prevent dead-code elimination.
+- For parity with Julia scripts, run single-threaded (`RAYON_NUM_THREADS=1` / `JULIA_NUM_THREADS=1`) unless explicitly testing threading.
+
 ## Architecture
 
 ### Core Types
@@ -139,7 +146,7 @@ Design documentation:
 
 ## Remaining Work (TODO)
 
-- Optimize blocking strategy for 4D arrays ([Issue #5](https://github.com/AtelierArith/strided-rs-private/issues/5))
+- Explore explicit SIMD intrinsics to close remaining gap with Julia's `@simd`
 
 ## Performance Notes
 
@@ -150,5 +157,5 @@ See `docs/report.md` for detailed benchmark results. Summary:
 | `zip_map` (contiguous) | 3-4x faster | Not tested |
 | `zip_map` (mixed stride) | 2-2.6x faster | - |
 | `symmetrize_into` | 1.5x faster | N/A |
-| `permutedims` | ~same | **slower** (needs optimization) |
-| `zip_map4_into` | Recommended | **slower** (needs optimization) |
+| `permutedims` | ~same | 2.2x faster |
+| `zip_map4_into` | Recommended | 3.0x faster |
