@@ -3,9 +3,6 @@
 //! This module implements the core dimension fusion algorithm that merges
 //! contiguous dimensions to reduce iteration complexity.
 
-// Some helper functions are ported for completeness but not yet used.
-#![allow(dead_code)]
-
 /// Fuse contiguous dimensions across multiple arrays.
 ///
 /// This function fuses subsequent dimensions that are contiguous in memory
@@ -144,11 +141,6 @@ pub fn sort_by_importance(importance: &[u64]) -> Vec<usize> {
     indices
 }
 
-/// Apply a permutation to a slice.
-pub fn permute_by<T: Clone>(data: &[T], perm: &[usize]) -> Vec<T> {
-    perm.iter().map(|&i| data[i].clone()).collect()
-}
-
 /// Compute the minimum stride cost for each dimension.
 ///
 /// Julia: `costs = map(a -> ifelse(iszero(a), 1, a << 1), map(min, strides...))`
@@ -264,14 +256,6 @@ mod tests {
         let costs = compute_costs(&all_strides);
         // min strides: [1, 1, 0], transformed: [2, 2, 1]
         assert_eq!(costs, vec![2, 2, 1]);
-    }
-
-    #[test]
-    fn test_permute_by() {
-        let data = vec![10, 20, 30, 40];
-        let perm = vec![2, 0, 3, 1];
-        let result = permute_by(&data, &perm);
-        assert_eq!(result, vec![30, 10, 40, 20]);
     }
 
     #[test]

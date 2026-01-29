@@ -1,10 +1,9 @@
-use mdarray::Tensor;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use strided_rs::{
-    copy_into_pod, copy_transpose_scale_into_fast, map_into, zip_map2_into, zip_map4_into,
+    copy_into, copy_transpose_scale_into, map_into, zip_map2_into, zip_map4_into, StridedArray,
 };
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -29,34 +28,44 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
     avg
 }
 
+fn make_random_2d(n: usize, seed: u64) -> StridedArray<f64> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    StridedArray::<f64>::from_fn_row_major(&[n, n], |_| rng.sample(StandardNormal))
+}
+
+fn make_random_4d(n: usize, seed: u64) -> StridedArray<f64> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    StridedArray::<f64>::from_fn_row_major(&[n, n, n, n], |_| rng.sample(StandardNormal))
+}
+
 fn main() {
     println!("Rust runner: benches/rust_compare.rs");
-    println!("Note: set RAYON_NUM_THREADS=1 for parity (this runner is single-threaded).");
+    println!("Note: single-threaded runner for parity with Julia.");
     println!();
 
     // 1) symmetrize_4000
     {
         println!("=== Benchmark 1: symmetrize_4000 ===");
         let n = 4000usize;
-        let mut rng = StdRng::seed_from_u64(0);
-        let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.gen::<f64>());
-        let a_view = a.as_ref();
-        let a_t = a_view.permute([1, 0]);
-        let mut b = Tensor::<f64, _>::zeros([n, n]);
+        let a = make_random_2d(n, 0);
+        let a_view = a.view();
+        let a_t = a_view.permute(&[1, 0]).unwrap();
+        let mut b = StridedArray::<f64>::row_major(&[n, n]);
 
         bench_n("rust_naive", 1, 3, || {
+            let av = a.view();
             for i in 0..n {
                 for j in 0..n {
-                    b[[i, j]] = 0.5 * (a_view[[i, j]] + a_view[[j, i]]);
+                    let x = av.get(&[i, j]);
+                    let y = av.get(&[j, i]);
+                    b.set(&[i, j], 0.5 * (x + y));
                 }
             }
             black_box(&b);
         });
 
         bench_n("rust_strided", 1, 3, || {
-            // Match Julia:
-            //   @strided B .= (A .+ A') ./ 2
-            zip_map2_into(&mut b, a_view, &a_t, |&x, &y| (x + y) * 0.5).unwrap();
+            zip_map2_into(&mut b.view_mut(), &a_view, &a_t, |x, y| (x + y) * 0.5).unwrap();
             black_box(&b);
         });
         println!();
@@ -65,84 +74,80 @@ fn main() {
     // 2) scale_transpose_1000
     {
         println!("=== Benchmark 2: scale_transpose_1000 ===");
-        println!("Julia MWE: StridedView(B) .= 3 .* StridedView(A)'");
         let n = 1000usize;
-        let mut rng = StdRng::seed_from_u64(1);
-        let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.sample(StandardNormal));
-        let a_view = a.as_ref();
-        let mut b = Tensor::<f64, _>::zeros([n, n]);
+        let a = make_random_2d(n, 1);
+        let a_view = a.view();
+        let mut b = StridedArray::<f64>::row_major(&[n, n]);
 
         bench_n("rust_naive", 5, 10, || {
+            let av = a.view();
             for i in 0..n {
                 for j in 0..n {
-                    b[[i, j]] = 3.0 * a_view[[j, i]];
+                    b.set(&[i, j], 3.0 * av.get(&[j, i]));
                 }
             }
             black_box(&b);
         });
 
         bench_n("rust_strided", 5, 10, || {
-            copy_transpose_scale_into_fast(&mut b, a_view, 3.0).unwrap();
+            copy_transpose_scale_into(&mut b.view_mut(), &a_view, 3.0).unwrap();
             black_box(&b);
         });
         println!();
     }
 
-    // 2a) mwe_stridedview_scale_transpose_1000 (broadcast-like)
-    //
-    // Julia MWE:
-    //   StridedView(B) .= 3 .* StridedView(A)'
-    //
-    // In Rust we express the same thing as:
-    //   let a_t = a.as_ref().permute([1, 0]);
-    //   map_into(&mut b, &a_t, |x| 3.0 * x)
+    // 2a) mwe_stridedview_scale_transpose_1000 (map_into)
     {
         println!("=== Benchmark 2a: mwe_stridedview_scale_transpose_1000 ===");
         let n = 1000usize;
         let mut rng = StdRng::seed_from_u64(11);
-        let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.gen::<f64>());
-        let a_view = a.as_ref();
-        let a_t = a_view.permute([1, 0]);
-        let mut b = Tensor::<f64, _>::zeros([n, n]);
+        let a = StridedArray::<f64>::from_fn_row_major(&[n, n], |_| rng.gen::<f64>());
+        let a_view = a.view();
+        let a_t = a_view.permute(&[1, 0]).unwrap();
+        let mut b = StridedArray::<f64>::row_major(&[n, n]);
 
         bench_n("rust_naive", 5, 10, || {
+            let av = a.view();
             for i in 0..n {
                 for j in 0..n {
-                    b[[i, j]] = 3.0 * a_view[[j, i]];
+                    b.set(&[i, j], 3.0 * av.get(&[j, i]));
                 }
             }
             black_box(&b);
         });
 
         bench_n("rust_strided_map", 5, 10, || {
-            map_into(&mut b, &a_t, |x| 3.0 * x).unwrap();
+            map_into(&mut b.view_mut(), &a_t, |x| 3.0 * x).unwrap();
             black_box(&b);
         });
 
         println!();
     }
 
-    // 3) complex_elementwise_1000 (note: Julia script uses Float64, not Complex)
+    // 3) complex_elementwise_1000 (Float64)
     {
         println!("=== Benchmark 3: complex_elementwise_1000 (Float64) ===");
         let n = 1000usize;
-        let mut rng = StdRng::seed_from_u64(2);
-        let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.sample(StandardNormal));
-        let a_view = a.as_ref();
-        let mut b = Tensor::<f64, _>::zeros([n, n]);
+        let a = make_random_2d(n, 2);
+        let a_view = a.view();
+        let mut b = StridedArray::<f64>::row_major(&[n, n]);
 
         bench_n("rust_naive", 3, 6, || {
+            let av = a.view();
             for i in 0..n {
                 for j in 0..n {
-                    let x = a_view[[i, j]];
-                    b[[i, j]] = x * (-2.0 * x).exp() + (x * x).sin();
+                    let x = av.get(&[i, j]);
+                    b.set(&[i, j], x * (-2.0 * x).exp() + (x * x).sin());
                 }
             }
             black_box(&b);
         });
 
         bench_n("rust_strided", 3, 6, || {
-            map_into(&mut b, a_view, |x| x * (-2.0 * x).exp() + (x * x).sin()).unwrap();
+            map_into(&mut b.view_mut(), &a_view, |x| {
+                x * (-2.0 * x).exp() + (x * x).sin()
+            })
+            .unwrap();
             black_box(&b);
         });
         println!();
@@ -152,18 +157,27 @@ fn main() {
     {
         println!("=== Benchmark 4: permute_32_4d ===");
         let n = 32usize;
-        let mut rng = StdRng::seed_from_u64(3);
-        let a = Tensor::<f64, _>::from_fn([n, n, n, n], |_| rng.sample(StandardNormal));
-        let mut b = Tensor::<f64, _>::zeros([n, n, n, n]);
-        let a_perm = a.as_ref().permute([3, 2, 1, 0]);
+        let a = make_random_4d(n, 3);
+        let a_view = a.view();
+        let a_perm = a_view.permute(&[3, 2, 1, 0]).unwrap();
+        let mut b = StridedArray::<f64>::row_major(&[n, n, n, n]);
 
-        bench_n("mdarray_assign", 20, 50, || {
-            b.assign(&a_perm);
+        bench_n("rust_naive", 20, 50, || {
+            let ap = a.view().permute(&[3, 2, 1, 0]).unwrap();
+            for i in 0..n {
+                for j in 0..n {
+                    for k in 0..n {
+                        for l in 0..n {
+                            b.set(&[i, j, k, l], ap.get(&[i, j, k, l]));
+                        }
+                    }
+                }
+            }
             black_box(&b);
         });
 
         bench_n("rust_strided", 20, 50, || {
-            copy_into_pod(&mut b, &a_perm).unwrap();
+            copy_into(&mut b.view_mut(), &a_perm).unwrap();
             black_box(&b);
         });
         println!();
@@ -173,30 +187,22 @@ fn main() {
     {
         println!("=== Benchmark 5: multiple_permute_sum_32_4d ===");
         let n = 32usize;
-        let mut rng = StdRng::seed_from_u64(4);
-        let a = Tensor::<f64, _>::from_fn([n, n, n, n], |_| rng.sample(StandardNormal));
-        let mut b = Tensor::<f64, _>::zeros([n, n, n, n]);
-        let a_view = a.as_ref();
+        let a = make_random_4d(n, 4);
+        let a_view = a.view();
 
-        let p1 = a_view.permute([0, 1, 2, 3]);
-        let p2 = a_view.permute([1, 2, 3, 0]);
-        let p3 = a_view.permute([2, 3, 0, 1]);
-        let p4 = a_view.permute([3, 0, 1, 2]);
+        let p1 = a_view.permute(&[0, 1, 2, 3]).unwrap();
+        let p2 = a_view.permute(&[1, 2, 3, 0]).unwrap();
+        let p3 = a_view.permute(&[2, 3, 0, 1]).unwrap();
+        let p4 = a_view.permute(&[3, 0, 1, 2]).unwrap();
+        let mut b = StridedArray::<f64>::row_major(&[n, n, n, n]);
 
-        // Julia "Base" equivalent: allocate temporaries for each permutedims() then sum.
-        bench_n("mdarray_alloc4", 10, 30, || {
-            let t1 = p1.to_tensor();
-            let t2 = p2.to_tensor();
-            let t3 = p3.to_tensor();
-            let t4 = p4.to_tensor();
+        bench_n("rust_naive", 10, 30, || {
             for i in 0..n {
                 for j in 0..n {
                     for k in 0..n {
                         for l in 0..n {
-                            b[[i, j, k, l]] = t1[[i, j, k, l]]
-                                + t2[[i, j, k, l]]
-                                + t3[[i, j, k, l]]
-                                + t4[[i, j, k, l]];
+                            let idx = &[i, j, k, l];
+                            b.set(idx, p1.get(idx) + p2.get(idx) + p3.get(idx) + p4.get(idx));
                         }
                     }
                 }
@@ -204,9 +210,11 @@ fn main() {
             black_box(&b);
         });
 
-        // Julia "@strided" equivalent: fused single-pass (no temporaries).
         bench_n("rust_strided_fused", 10, 30, || {
-            zip_map4_into(&mut b, &p1, &p2, &p3, &p4, |a, b, c, d| a + b + c + d).unwrap();
+            zip_map4_into(&mut b.view_mut(), &p1, &p2, &p3, &p4, |a, b, c, d| {
+                a + b + c + d
+            })
+            .unwrap();
             black_box(&b);
         });
         println!();

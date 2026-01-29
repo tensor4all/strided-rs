@@ -4,14 +4,12 @@ Cache-optimized kernels for strided multidimensional array operations in Rust.
 
 This crate is a port of Julia's [Strided.jl](https://github.com/Jutho/Strided.jl) and [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) libraries.
 
-This crate is currently built on top of the `mdarray` crate, but the long-term goal is to remove the `mdarray` dependency.
-
 ## Features
 
-- **Zero-copy strided views** over contiguous memory
+- **Dynamic-rank strided views** (`StridedView` / `StridedViewMut`) over contiguous memory
+- **Owned strided arrays** (`StridedArray`) with row-major and column-major constructors
 - **Lazy element operations** (conjugate, transpose, adjoint) with type-level composition
-- **Zero-copy transformations**: slicing, reshaping, permuting, transposing
-- **Broadcasting** with stride-0 for size-1 dimensions
+- **Zero-copy transformations**: permuting, transposing, broadcasting
 - **Cache-optimized iteration** with automatic blocking and loop reordering
 
 ## Installation
@@ -25,403 +23,174 @@ For local development, add a path dependency:
 strided-rs = { path = "../strided-rs" }
 ```
 
-When this crate is published, you will be able to add it to your `Cargo.toml` as:
-
-```toml
-[dependencies]
-strided-rs = "0.1"
-```
-
 ## Quick Start
 
 ```rust
-use strided_rs::{StridedArrayView, Identity};
+use strided_rs::{StridedArray, StridedView, map_into};
 
-// Create a 2D view over existing data
-let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-let view: StridedArrayView<'_, f64, 2, Identity> =
-    StridedArrayView::new(&data, [2, 3], [3, 1], 0).unwrap();
+// Create a row-major 2D array
+let src = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| {
+    (idx[0] * 10 + idx[1]) as f64
+});
+let mut dest = StridedArray::<f64>::row_major(&[2, 3]);
 
-// Access elements
-assert_eq!(view.get([0, 0]), 1.0);
-assert_eq!(view.get([1, 2]), 6.0);
-
-// Transpose (zero-copy)
-let transposed = view.t();
-assert_eq!(transposed.size(), &[3, 2]);
-assert_eq!(transposed.get([0, 1]), 4.0);
+// Element-wise map: dest[i] = src[i] * 2
+map_into(&mut dest.view_mut(), &src.view(), |x| x * 2.0).unwrap();
+assert_eq!(dest.get(&[1, 2]), 24.0); // (1*10 + 2) * 2
 ```
 
 ## Core Types
 
-### `StridedArrayView<'a, T, N, Op>`
+### `StridedView<'a, T, Op>` / `StridedViewMut<'a, T>`
 
-An immutable view over strided data with:
+Dynamic-rank immutable/mutable views over strided data:
 - `T`: Element type
-- `N`: Number of dimensions (const generic)
-- `Op`: Element operation (Identity, Conj, Transpose, Adjoint)
+- `Op`: Element operation (Identity, Conj, Transpose, Adjoint) -- applied lazily on access
 
-### `StridedArrayViewMut<'a, T, N, Op>`
+### `StridedArray<T>`
 
-A mutable version of `StridedArrayView`.
+Owned strided multidimensional array with `view()` and `view_mut()` methods.
 
 ## View Operations
 
-### Slicing
-
 ```rust
-use strided_rs::{StridedArrayView, Identity, StridedRange};
+use strided_rs::StridedArray;
 
-let data: Vec<f64> = (0..24).map(|x| x as f64).collect();
-let view: StridedArrayView<'_, f64, 3, Identity> =
-    StridedArrayView::new(&data, [2, 3, 4], [12, 4, 1], 0).unwrap();
+let a = StridedArray::<f64>::from_fn_row_major(&[3, 4], |idx| {
+    (idx[0] * 10 + idx[1]) as f64
+});
+let v = a.view();
 
-// Slice with range
-let sliced = view.slice([0..1, 1..3, 0..4]).unwrap();
-assert_eq!(sliced.size(), &[1, 2, 4]);
+// Transpose (zero-copy, swaps strides)
+let vt = v.transpose_2d().unwrap();
+assert_eq!(vt.dims(), &[4, 3]);
 
-// Slice with stride
-let strided = view.slice([
-    StridedRange::new(0, 2, 1),   // all rows
-    StridedRange::new(0, 3, 2),   // every other column
-    StridedRange::new(0, 4, 1),   // all depth
-]).unwrap();
-```
+// General permutation (zero-copy)
+let vp = v.permute(&[1, 0]).unwrap();
+assert_eq!(vp.get(&[2, 1]), v.get(&[1, 2]));
 
-### Transpose and Permute
-
-```rust
-// 2D transpose
-let transposed = view_2d.t();
-
-// Hermitian adjoint (transpose + conjugate)
-let adjoint = complex_view.h();
-
-// General permutation
-let permuted = view_3d.permute([2, 0, 1]);
-```
-
-### Reshape
-
-```rust
-let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
-let view_1d: StridedArrayView<'_, f64, 1, Identity> =
-    StridedArrayView::new(&data, [12], [1], 0).unwrap();
-
-// Reshape to 2D (only works if contiguous)
-let view_2d = view_1d.reshape_2d([3, 4]).unwrap();
-```
-
-### Broadcasting
-
-```rust
-// Broadcast a row vector [3] to a matrix [4, 3]
-let row: StridedArrayView<'_, f64, 1, Identity> =
-    StridedArrayView::new(&data, [3], [1], 0).unwrap();
-let matrix = row.broadcast([4, 3]).unwrap();
-// row is repeated 4 times (stride-0 broadcasting)
-```
-
-## Element Operations
-
-Element operations are applied lazily and compose at the type level:
-
-```rust
-use strided_rs::{StridedArrayView, Identity, Conj};
-use num_complex::Complex64;
-
-let data = vec![Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)];
-let view: StridedArrayView<'_, Complex64, 1, Identity> =
-    StridedArrayView::new(&data, [2], [1], 0).unwrap();
-
-// Apply conjugate (lazy)
-let conj_view = view.conj();
-assert_eq!(conj_view.get([0]), Complex64::new(1.0, -2.0));
-
-// Double conjugate returns to identity (type-level optimization)
-let double_conj = conj_view.conj(); // type: StridedArrayView<..., Identity>
-```
-
-## Iteration
-
-```rust
-// Sequential iteration
-for value in view.iter() {
-    println!("{}", value);
-}
-
-// Enumerated iteration
-for (indices, value) in view.enumerate() {
-    println!("{:?}: {}", indices, value);
-}
+// Broadcast (stride-0 for size-1 dims)
+let row_data = vec![1.0, 2.0, 3.0];
+let row = strided_rs::StridedView::<f64>::new(&row_data, &[1, 3], &[3, 1], 0).unwrap();
+let broad = row.broadcast(&[4, 3]).unwrap();
 ```
 
 ## Map and Reduce Operations
 
 ```rust
-use strided_rs::{map_into, zip_map2_into, zip_map3_into, zip_map4_into, reduce};
+use strided_rs::{StridedArray, map_into, zip_map2_into, zip_map4_into, reduce};
+
+let a = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[0] as f64);
+let b = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[1] as f64);
+let mut out = StridedArray::<f64>::row_major(&[4, 5]);
 
 // Unary map: dest[i] = f(src[i])
-map_into(&mut dest, &src, |x| x * 2.0).unwrap();
+map_into(&mut out.view_mut(), &a.view(), |x| x * 2.0).unwrap();
 
 // Binary zip map: dest[i] = f(a[i], b[i])
-zip_map2_into(&mut dest, &a, &b, |x, y| x + y).unwrap();
+zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
 
-// Ternary zip map: dest[i] = f(a[i], b[i], c[i])
-zip_map3_into(&mut dest, &a, &b, &c, |x, y, z| x * y + z).unwrap();
-
-// Quaternary zip map: dest[i] = f(a[i], b[i], c[i], d[i])
-zip_map4_into(&mut dest, &a, &b, &c, &d, |w, x, y, z| w * x + y * z).unwrap();
-
-// Reduce with map
-let total = reduce(&src, |x| *x, |a, b| a + b, 0.0).unwrap();
+// Full reduction
+let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
 ```
 
 ## High-Level Operations
 
 ```rust
-use strided_rs::{copy_into, copy_scale, copy_conj, add, mul, axpy, fma, sum, dot};
+use strided_rs::{StridedArray, copy_into, add, dot, symmetrize_into};
 
-// Copy operations
-copy_into(&mut dest, &src).unwrap();           // dest = src
-copy_scale(&mut dest, &src, 2.0).unwrap();     // dest = 2.0 * src
-copy_conj(&mut dest, &src).unwrap();           // dest = conj(src)
+let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
+let mut out = StridedArray::<f64>::row_major(&[4, 4]);
 
-// Element-wise arithmetic
-add(&mut dest, &a, &b).unwrap();               // dest = a + b
-mul(&mut dest, &a, &b).unwrap();               // dest = a * b
+// Copy
+copy_into(&mut out.view_mut(), &a.view()).unwrap();
 
-// BLAS-like operations
-axpy(&mut y, 2.0, &x).unwrap();                // y = 2.0 * x + y
-fma(&mut dest, &a, &b, &c).unwrap();           // dest = a * b + c
+// Element-wise add: dest[i] += src[i]
+add(&mut out.view_mut(), &a.view()).unwrap();
 
-// Reductions
-let s = sum(&array).unwrap();                  // sum of all elements
-let d = dot(&x, &y).unwrap();                  // dot product
+// Dot product
+let d = dot(&a.view(), &a.view()).unwrap();
+
+// Symmetrize: dest = (src + src^T) / 2
+symmetrize_into(&mut out.view_mut(), &a.view()).unwrap();
 ```
 
 ## Cache Optimization
 
 The library automatically optimizes iteration order for cache efficiency:
 
-1. **Dimension Reordering**: Dimensions are sorted by stride magnitude
-2. **Tiled Iteration**: Operations are blocked to fit in L1 cache (32KB)
-3. **Contiguous Fast Paths**: Contiguous arrays bypass blocking for direct iteration
-
-```rust
-// Check contiguity information
-let inner_dims = view.contiguous_inner_dims();
-let inner_len = view.contiguous_inner_len();
-
-// Get contiguous slice (if applicable)
-if let Some(slice) = view_1d.as_slice() {
-    // Direct slice access for SIMD/BLAS
-}
-```
+1. **Dimension Fusion**: Contiguous dimensions are fused to reduce loop overhead
+2. **Dimension Reordering**: Dimensions are sorted by stride magnitude for optimal memory access
+3. **Tiled Iteration**: Operations are blocked to fit in L1 cache (32KB)
+4. **Contiguous Fast Paths**: Contiguous arrays bypass blocking for direct iteration
 
 ## Benchmarks
 
-Run benchmarks to measure performance:
+Run the Rust benchmark runner:
 
 ```bash
-# Basic strided operations (strided vs naive implementations)
-cargo bench --bench strided_bench
-
-# Julia-compatible benchmarks
-cargo bench --bench julia_benchtests
-
-# Run all benchmarks
-cargo bench
-```
-
-**Latest Benchmark (2026-01-28)**
-
-- Environment: macOS, single-threaded runs (`RAYON_NUM_THREADS=1` for Rust and `JULIA_NUM_THREADS=1` with `julia --project=.` for Julia).
-- Rust (Criterion) representative results:
-    - `permute_32_4d`:
-        - `mdarray_assign` ≈ 0.91 ms
-        - `strided::copy_into` ≈ 0.93 ms
-    - `transpose_2000`:
-        - `mdarray_assign` ≈ 3.33 ms
-        - `strided::copy_into` varied (runs showed ~5.0–8.4 ms; micro-kernel overhead observed)
-    - `transpose_4000`:
-        - `mdarray_assign` ≈ 43.2 ms
-        - `strided::copy_into` ≈ 20.4 ms
-
-- Julia (BenchmarkTools) representative results (single-threaded):
-    - `symmetrize_4000` (Strided.jl): ~24.13 ms
-    - `scale_transpose_1000` (Strided.jl): ~0.495 ms
-    - `complex_elementwise_1000` (Strided.jl): ~7.75 ms
-    - `permute_32_4d` (Strided.jl): ~1.096 ms
-    - `multiple_permute_sum_32_4d` (Strided.jl): ~2.26 ms
-
-Notes:
-- Two-level blocking (Julia-style outer block sizing + inner micro-tiles) and a POD byte-copy fast path were implemented to reduce large-transpose overhead.
-- Rust now shows large-matrix transpose improvement (see `transpose_4000`), but medium-size variance indicates micro-kernel overhead and branching costs.
-
-Next steps:
-- Add unrolled/SIMD micro-kernels for `f64`, `f32`, `Complex{f64}`, `Complex{f32}` (platform-aware NEON/AVX).
-- Tune micro-tile sizes and outer block heuristics per-target CPU.
-- Add tests for correctness of specialized fast paths and POD trait bounds.
-
-**Julia-compatible Benchmarks**
-
-Purpose: Provide a set of Rust benchmarks that match the cases listed in the Strided.jl README so results can be compared under equivalent conditions.
-
-- Single-threaded comparison (for reproducibility):
-  - Julia: set `JULIA_NUM_THREADS=1` before running
-  - Rust: set `RAYON_NUM_THREADS=1` before running
-
-- Example: run the Julia script included in this repository:
-
-```bash
-export JULIA_NUM_THREADS=1
-julia --project=. benches/julia_compare.jl
-```
-
-- Example: run the Rust runner that prints the same cases:
-
-```bash
-export RAYON_NUM_THREADS=1
 cargo bench --bench rust_compare
 ```
 
-- The matched cases are: `symmetrize_4000`, `scale_transpose_1000`, `mwe_stridedview_scale_transpose_1000`, `complex_elementwise_1000`, `permute_32_4d`, and `multiple_permute_sum_32_4d`.
+Run the Julia comparison script:
 
-**Comparison results (single-threaded, 2026-01-29)**
+```bash
+JULIA_NUM_THREADS=1 julia --project=. benches/julia_compare.jl
+```
 
-| Case | Julia Strided (ms) | Rust strided (ms) | Rust mdarray/naive (ms) |
+### Benchmark Results (2026-01-29 12:18)
+
+Environment: Apple Silicon M2, single-threaded (`JULIA_NUM_THREADS=1`).
+
+| Case | Julia Strided (ms) | Rust strided (ms) | Rust naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 24.133 | 27.866 | 70.309 (naive) |
-| scale_transpose_1000 | 0.495 | 0.618 | 1.498 (naive) |
-| mwe_stridedview_scale_transpose_1000 | 0.560 | 1.249 (map_into) | 1.415 (naive) |
-| complex_elementwise_1000 | 7.749 | 13.389 | 15.279 (naive) |
-| permute_32_4d | 1.096 | 1.249 | 1.329 (mdarray_assign) |
-| multiple_permute_sum_32_4d | 2.264 | 2.673 | 5.371 (mdarray_alloc4) |
+| symmetrize_4000 | 20.52 | 25.21 | 96.65 |
+| scale_transpose_1000 | 0.66 | 0.79 | 2.15 |
+| mwe_stridedview_scale_transpose_1000 | 0.64 | 0.65 | 2.01 |
+| complex_elementwise_1000 | 7.77 | 13.02 | 16.42 |
+| permute_32_4d | 1.12 | 4.77 | 3.61 |
+| multiple_permute_sum_32_4d | 2.92 | 6.54 | 9.97 |
 
 Notes:
-- The Rust measurements are produced by [benches/rust_compare.rs](benches/rust_compare.rs), which uses `Instant` and reports the mean duration after warm-up and repeated iterations.
-- The `mdarray_alloc4` entry for `multiple_permute_sum_32_4d` represents the Julia "Base" approach (materialize four permuted arrays, then add).
-- The `complex_elementwise_1000` case in the Julia script uses `Float64` inputs (the name is historical), so the Rust runner also uses `f64` for parity.
+- Julia results from `benches/julia_compare.jl` using BenchmarkTools (mean time). Rust results from `benches/rust_compare.rs`.
+- The Rust naive baseline uses `StridedView::get`/`StridedArray::set` per-element indexing with bounds checks.
+- `permute_32_4d` and `multiple_permute_sum_32_4d`: the 4D strided kernel is slower than Julia; this is a known area for optimization.
 
-File mapping (reference):
-- Julia script: [benches/julia_compare.jl](benches/julia_compare.jl)
-- Rust benches: [benches/strided_bench.rs](benches/strided_bench.rs), [benches/mdarray_compare.rs](benches/mdarray_compare.rs), and the new runner [benches/rust_compare.rs](benches/rust_compare.rs)
-- Example logs: `bench_readme_single_thread.log`, `bench_permute_1000.log`
+### Algorithm Comparison: Julia Strided.jl vs Rust strided-rs
 
-Comparison procedure:
-- Run both Julia and Rust on the same hardware with single-thread settings and compare the named cases (e.g., `permute_32_4d`, `transpose_4000`).
-- Use Criterion summaries for Rust and BenchmarkTools output for Julia.
-- Record environment details (OS, CPU, compiler flags) when taking measurements.
+Both implementations share the same core algorithm ported from Strided.jl:
+1. **Dimension fusion** — merge contiguous dimensions to reduce loop depth
+2. **Importance-weighted ordering** — bit-pack stride orders with output array weighted 2× to determine optimal iteration order
+3. **L1 cache blocking** — iteratively halve block sizes until the working set fits in 32 KB
 
-Note:
-- Using the existing `benches/` and `benches/julia_compare.jl` script allows reproducing the README numbers. If discrepancies appear, check `RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`, compiler optimizations, and whether type-specialized micro-kernels are enabled.
+The key architectural differences are:
 
-**Copy vs Pod and static POD gating**
+| Feature | Julia | Rust |
+|---------|-------|------|
+| **Kernel generation** | `@generated` unrolls loops per (rank, num\_arrays) at compile time | Handwritten 1D/2D/3D/4D specializations + generic N-D fallback |
+| **Loop order** | Generated code nests loops in the computed optimal order | Fixed nesting order (0→1→2→3) regardless of computed order |
+| **Inner-loop SIMD** | Explicit `@simd` pragma on innermost loop | Raw pointer arithmetic; relies on LLVM auto-vectorization |
+| **Threading** | Recursive work-stealing via `Threads.@spawn` (disabled in benchmarks) | Single-threaded only |
 
-Summary:
-- The Rust `Copy` trait allows bitwise copying at the language level but does not by itself guarantee the safest or fastest memory-level byte-copy semantics for all optimization paths. Relying only on `Copy` can leave runtime branching, alignment concerns, or missed SIMD/vectorization opportunities.
+#### Per-case analysis
 
-Recommendation:
-- Use a static POD trait (for example `bytemuck::Pod` or `zerocopy::AsBytes`/`FromBytes`) to mark element types that are safe for raw byte-wise copies. This removes runtime checks (such as `needs_drop`) and enables `memcpy`/`copy_nonoverlapping` fast paths and more aggressive micro-kernel specialization.
+**symmetrize\_4000** (Julia 20.5 ms, Rust 25.2 ms) —
+Julia runs `dest .= (src .+ src') ./ 2` through the general mapreduce kernel with `@simd` on the inner loop. Rust uses a dedicated 2D tiled transpose path (`zip_map2_2d_tiled_transpose`) with tile size √(32 KB / 2·8 B) ≈ 45. The Rust 2D fast path avoids the full blocking machinery but uses higher-level element access (`get`/`set_unchecked`) inside tiles, which gives LLVM less vectorization opportunity than Julia's `@simd` stride loop.
 
-Practical notes and steps to adopt in this crate:
-1. Add an explicit dependency in `Cargo.toml`: e.g. `bytemuck = "1"` or `zerocopy = "0.6"`.
-2. Replace runtime gating (e.g. `if !needs_drop::<T>() { ... }`) with static bounds: `T: bytemuck::Pod` or `T: zerocopy::AsBytes + zerocopy::FromBytes` for POD fast paths.
-3. Implement a `copy_2d_transpose_pod<T: Pod>` path that uses `std::ptr::copy_nonoverlapping` when safe and falls back to the generic path otherwise.
-4. Add hand-optimized micro-kernels for common numeric types (`f64`, `f32`, `Complex<f64>`, `Complex<f32>`) that use unrolling and platform SIMD intrinsics where appropriate.
-5. Tune outer-block and micro-tile sizes per target CPU and re-run the `benches/` suite to verify improvements.
+**scale\_transpose\_1000** (Julia 0.66 ms, Rust 0.79 ms) —
+Both follow the same importance-weighted ordering for a 2-array (dest + transposed src) operation. Julia's `@simd` inner loop vectorizes the strided copy more effectively. Rust goes through `build_plan_fused` → `kernel_2d_inner` with pointer-stride advancement; LLVM can vectorize contiguous cases but strided access limits auto-vectorization.
 
-Caveats:
-- Complex or user-defined types may not be `Pod` by default; they may require `bytemuck::Pod` derives or manual verification of layout and padding.
-- Alignment requirements must be respected when using raw pointer copies and SIMD loads/stores.
-- Static POD gating improves performance by enabling specialized codegen, but correctness must be validated with tests for all specialized paths.
+**mwe\_stridedview\_scale\_transpose\_1000** (Julia 0.64 ms, Rust 0.65 ms) —
+Same algorithm as scale\_transpose\_1000. Near-parity here because the operation is simple enough (single unary map on a transposed view) that both compilers generate similar code.
 
-If you want, I can start by adding `bytemuck` to `Cargo.toml`, update the POD gating in `src/ops.rs` to use `T: bytemuck::Pod`, and run the README benchmark runner to show the before/after. Proceed? 
-```
+**complex\_elementwise\_1000** (Julia 7.8 ms, Rust 13.0 ms) —
+Julia broadcasts `3a + 2conj(b) + ab` lazily via `CaptureArgs`, fusing all operations into a single pass with `@simd`. Rust calls `zip_map2_into` with a closure `|a, b| a * 3.0 + b.conj() * 2.0 + a * b`. The gap likely comes from: (1) Julia's `@simd` enabling wider vectorization of complex arithmetic, and (2) Rust's `num_complex::Complex64` arithmetic generating more conservative LLVM IR than Julia's native complex type.
 
-### Benchmark Reports
+**permute\_32\_4d** (Julia 1.1 ms, Rust 4.8 ms) —
+This is the largest gap and reflects a fundamental architectural difference. Julia's `@generated` kernel nests loops in the *computed* optimal order, adapting to any permutation pattern. Rust's `kernel_4d_inner` always iterates dimensions in order 0→1→2→3, ignoring the importance-based ordering. For a (4,3,2,1) permutation, this fixed order causes cache misses because the innermost Rust loop strides through non-contiguous memory. Note that even the naive baseline (3.6 ms) beats the strided kernel here, confirming the loop order issue.
 
-Detailed benchmark results are available in the `docs/` directory:
-
-- [`docs/report.md`](docs/report.md) - Strided vs naive implementation comparison
-
-### Performance Highlights
-
-| Feature | Speedup | Best Use Case |
-|---------|---------|---------------|
-| **Strided kernels** | 2-4x | Mixed stride patterns |
-| **Fused multi-array ops** | ~2x | Sum of permutations |
-
-## Performance Tips
-
-1. **Use contiguous arrays when possible** - they get fast-path optimization
-2. **Prefer row-major layout** (stride[N-1] == 1) for better cache performance
-3. **Fuse operations** using `zip_map*_into` to avoid intermediate allocations
-
-## Development status (2026-01-28)
-
-- Summary:
-  - Added `bytemuck` and a POD-only fast path.
-  - New public APIs:
-    - `copy_into_pod<T: Pod>(...)`: fast byte-copy path for POD element types.
-    - `copy_into_pod_complex_f32` / `copy_into_pod_complex_f64`: helpers that reuse the POD path for `Complex` via an internal POD representation with runtime checks.
-  - Added `src/pod_complex.rs` providing `PodComplexF32` / `PodComplexF64` and casting utilities.
-
-- Safety / implementation notes:
-  - `unsafe` is kept internal; the public API remains safe to call.
-  - Cast compatibility is checked at runtime (size/alignment); on mismatch it returns `StridedError::PodCastUnsupported`.
-
-- Benchmarks (single-thread representative values):
-  - symmetrize_4000 — Julia: ~17.38 ms | Rust: ~25.80 ms
-  - scale_transpose_1000 — Julia: ~0.379 ms | Rust: ~0.596 ms
-  - complex_elementwise_1000 — Julia: ~7.56 ms | Rust: ~13.16 ms
-  - permute_32_4d — Julia: ~0.844 ms | Rust: ~0.949 ms
-  - multiple_permute_sum_32_4d — Julia: ~2.26 ms | Rust: ~2.87 ms
-
-- Next steps:
-  1. Add dedicated `Complex` benchmarks to measure `copy_into_pod_complex_*`.
-  2. Implement Complex micro-kernels (unrolling / SIMD).
-  3. Tune outer-block and micro-tile parameters per target CPU.
-
-## Broadcasting with CaptureArgs
-
-```rust
-use strided_rs::{broadcast_into, promoteshape, CaptureArgs, Arg, Scalar};
-
-// Broadcast [1, 3] and [4, 1] to [4, 3] and add
-let target = [4, 3];
-let a_promoted = promoteshape(&target, &row_vec).unwrap();
-let b_promoted = promoteshape(&target, &col_vec).unwrap();
-broadcast_into(&mut dest, |x, y| x + y, &a_promoted, &b_promoted).unwrap();
-
-// CaptureArgs for lazy evaluation
-let capture = CaptureArgs::new(|a, b, c| a + b * c, (Arg, Arg, Scalar(2.0)));
-```
-
-## Dimension Reduction
-
-```rust
-use strided_rs::mapreducedim_into;
-
-// Sum along axis 0: [3, 4] -> [1, 4]
-let mut dest = Tensor::from_fn([1, 4], |_| 0.0);
-mapreducedim_into(&mut dest, &src, |&x| x, |a, b| a + b, None).unwrap();
-
-// Sum of squares with init_op
-fn zero_init(_: &f64) -> f64 { 0.0 }
-mapreducedim_into(&mut dest, &src, |&x| x * x, |a, b| a + b, Some(zero_init)).unwrap();
-```
-
-## Julia Port Status
-
-This crate is a **~98% complete port** of Julia's Strided.jl/StridedViews.jl:
-
-| Julia Module | Rust Module | Status |
-|--------------|-------------|--------|
-| `stridedview.jl` | `view.rs` | ✅ Complete |
-| `mapreduce.jl` | `kernel.rs`, `map.rs`, `reduce.rs` | ✅ Complete |
-| `broadcast.jl` | `broadcast.rs` | ✅ Complete |
+**multiple\_permute\_sum\_32\_4d** (Julia 2.9 ms, Rust 6.5 ms) —
+Same root cause as permute\_32\_4d, amplified by 4 differently-permuted input arrays. Julia computes a combined importance score over all 5 arrays (output + 4 inputs) and generates loops in the optimal compromise order. Rust computes the same importance scores but does not apply the resulting order to its loop nesting, so cache behavior degrades further with conflicting stride patterns.
 
 ## Acknowledgments
 

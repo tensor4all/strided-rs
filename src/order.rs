@@ -85,19 +85,6 @@ pub(crate) fn compute_order(
     sort_by_importance(&importance)
 }
 
-/// Legacy dim_score function for compatibility.
-/// Kept for reference but not used in the new algorithm.
-#[allow(dead_code)]
-fn dim_score(dim: usize, strides_list: &[&[isize]], dest_index: Option<usize>) -> usize {
-    let mut score = 0usize;
-    for (i, strides) in strides_list.iter().enumerate() {
-        let weight = if dest_index == Some(i) { 2 } else { 1 };
-        let stride = strides[dim].unsigned_abs();
-        score = score.saturating_add(weight * stride);
-    }
-    score
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

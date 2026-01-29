@@ -1,3 +1,4 @@
+#![cfg(feature = "mdarray")]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mdarray::Tensor;
 use rand::{rngs::StdRng, Rng, SeedableRng};

@@ -1,4 +1,4 @@
-//! Cache-optimized kernels for strided mdarray views.
+//! Cache-optimized kernels for strided multidimensional array operations.
 //!
 //! This crate is a Rust port of Julia's [Strided.jl](https://github.com/Jutho/Strided.jl)
 //! and [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) libraries, providing
@@ -6,11 +6,12 @@
 //!
 //! # Core Types
 //!
-//! - [`StridedArrayView`] / [`StridedArrayViewMut`]: Zero-copy strided views over existing data
+//! - [`StridedView`] / [`StridedViewMut`]: Dynamic-rank strided views over existing data
+//! - [`StridedArray`]: Owned strided multidimensional array
 //! - [`ElementOp`] trait and implementations ([`Identity`], [`Conj`], [`Transpose`], [`Adjoint`]):
 //!   Type-level element operations applied lazily on access
 //!
-//! # Primary API (Julia-compatible)
+//! # Primary API (view-based, Julia-compatible)
 //!
 //! ## Map Operations
 //!
@@ -21,61 +22,29 @@
 //!
 //! - [`reduce`]: Full reduction with map function
 //! - [`reduce_axis`]: Reduce along a single axis
-//! - [`mapreducedim_into`]: Map-reduce along dimensions (Julia's `mapreducedim!`)
-//! - [`mapreducedim_capture_views_into`]: Map-reduce with captured broadcast expressions
-//!
-//! ## Broadcast Operations
-//!
-//! - [`broadcast_into`]: Broadcasting with automatic shape promotion
-//! - [`promoteshape`]: Explicit shape promotion for broadcasting
-//! - [`CaptureArgs`]: Lazy broadcast expression builder (Julia's `CaptureArgs`)
 //!
 //! ## Basic Operations
 //!
 //! - [`copy_into`]: Copy array contents
 //! - [`add`], [`mul`]: Element-wise arithmetic
 //! - [`axpy`]: y = alpha*x + y (array version)
-//! - [`fma`]: Fused multiply-add
 //! - [`sum`], [`dot`]: Reductions
 //! - [`symmetrize_into`], [`symmetrize_conj_into`]: Matrix symmetrization
 //!
 //! # Example
 //!
 //! ```rust
-//! use strided_rs::{StridedArrayView, Identity};
+//! use strided_rs::{StridedView, StridedViewMut, StridedArray, Identity, map_into};
 //!
-//! // Create a 2D view over existing data
-//! let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-//! let view: StridedArrayView<'_, f64, 2, Identity> =
-//!     StridedArrayView::new(&data, [2, 3], [3, 1], 0).unwrap();
+//! // Create a column-major array (Julia default)
+//! let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| {
+//!     (idx[0] * 10 + idx[1]) as f64
+//! });
+//! let mut dest = StridedArray::<f64>::col_major(&[2, 3]);
 //!
-//! // Access elements
-//! assert_eq!(view.get([0, 0]), 1.0);
-//! assert_eq!(view.get([1, 2]), 6.0);
-//!
-//! // Transpose (zero-copy)
-//! let transposed = view.t();
-//! assert_eq!(transposed.size(), &[3, 2]);
-//! ```
-//!
-//! # Broadcasting Example
-//!
-//! ```rust
-//! use strided_rs::{StridedArrayView, StridedArrayViewMut, Identity, broadcast_into};
-//!
-//! // Broadcast [1, 3] to [4, 3] and add element-wise
-//! let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
-//! let b_data = vec![10.0, 20.0, 30.0]; // Row vector
-//! let mut dest_data = vec![0.0; 12];
-//!
-//! let a: StridedArrayView<'_, f64, 2, Identity> =
-//!     StridedArrayView::new(&a_data, [4, 3], [3, 1], 0).unwrap();
-//! let b: StridedArrayView<'_, f64, 2, Identity> =
-//!     StridedArrayView::new(&b_data, [1, 3], [3, 1], 0).unwrap();
-//! let mut dest: StridedArrayViewMut<'_, f64, 2, Identity> =
-//!     StridedArrayViewMut::new(&mut dest_data, [4, 3], [3, 1], 0).unwrap();
-//!
-//! broadcast_into(&mut dest, |x, y| x + y, &a, &b).unwrap();
+//! // Map with view-based API
+//! map_into(&mut dest.view_mut(), &src.view(), |x| x * 2.0).unwrap();
+//! assert_eq!(dest.get(&[1, 2]), 24.0); // (1*10 + 2) * 2
 //! ```
 //!
 //! # Cache Optimization
@@ -87,17 +56,16 @@
 
 mod auxiliary;
 mod block;
-pub mod broadcast;
 mod element_op;
 mod fuse;
 mod kernel;
-mod map;
-mod ops;
 mod order;
-mod pod_complex;
-mod promote;
-mod reduce;
-pub mod view;
+pub mod strided_view;
+
+// View-based operation modules
+mod map_view;
+mod ops_view;
+mod reduce_view;
 
 // ============================================================================
 // Element operations
@@ -105,42 +73,29 @@ pub mod view;
 pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose};
 
 // ============================================================================
+// View-based types
+// ============================================================================
+pub use strided_view::{
+    col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut,
+};
+
+// ============================================================================
 // Map operations
 // ============================================================================
-pub use map::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
+pub use map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 
 // ============================================================================
 // High-level operations
 // ============================================================================
-pub use ops::{
-    add, axpy, copy_conj, copy_into, copy_into_pod, copy_into_pod_complex_f32,
-    copy_into_pod_complex_f64, copy_into_uninit, copy_scale, copy_transpose_scale_into,
-    copy_transpose_scale_into_fast, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
+pub use ops_view::{
+    add, axpy, copy_conj, copy_into, copy_scale, copy_transpose_scale_into, dot, fma, mul, sum,
+    symmetrize_conj_into, symmetrize_into,
 };
 
 // ============================================================================
 // Reduce operations
 // ============================================================================
-pub use reduce::{mapreducedim_capture_views_into, mapreducedim_into, reduce, reduce_axis};
-
-// ============================================================================
-// View types and utilities
-// ============================================================================
-pub use view::{
-    broadcast_shape, broadcast_shape3, Idx, SliceIndex, StridedArrayView, StridedArrayViewMut,
-    StridedRange,
-};
-
-// Pod complex utilities
-pub use pod_complex::{
-    cast_complex_slice_mut_to_pod_f32, cast_complex_slice_mut_to_pod_f64,
-    cast_complex_slice_to_pod_f32, cast_complex_slice_to_pod_f64, PodComplexF32, PodComplexF64,
-};
-
-// ============================================================================
-// Broadcast operations (CaptureArgs for lazy evaluation)
-// ============================================================================
-pub use broadcast::{broadcast_into, promoteshape, Arg, CaptureArgs, Consume, Scalar};
+pub use reduce_view::{reduce, reduce_axis};
 
 // ============================================================================
 // Constants
@@ -176,10 +131,6 @@ pub enum StridedError {
     #[error("invalid axis {axis} for rank {rank}")]
     InvalidAxis { axis: usize, rank: usize },
 
-    /// Zero stride is not allowed for the specified dimension.
-    #[error("invalid stride 0 for dim {dim}")]
-    ZeroStride { dim: usize },
-
     /// Stride array length doesn't match dimensions.
     #[error("stride and dims length mismatch")]
     StrideLengthMismatch,
@@ -195,9 +146,6 @@ pub enum StridedError {
     /// Matrix is not square when a square matrix was required.
     #[error("non-square matrix: rows={rows}, cols={cols}")]
     NonSquare { rows: usize, cols: usize },
-    /// POD cast between Complex<T> and internal POD representation is unsupported on this platform.
-    #[error("pod cast unsupported: {0}")]
-    PodCastUnsupported(&'static str),
 }
 
 /// Result type for strided array operations.
