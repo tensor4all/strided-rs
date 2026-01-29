@@ -227,12 +227,14 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
     let dst_dims_v = dst_dims.to_vec();
     let strides_list: [&[isize]; 2] = [&dst_strides_v, &src_strides_v];
 
-    let (fused_dims, plan) = build_plan_fused(
+    let (fused_dims, ordered_strides, plan) = build_plan_fused(
         &dst_dims_v,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     #[cfg(feature = "parallel")]
     {
@@ -242,22 +244,13 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let (ordered_dims, ordered_strides, ordered_blocks) =
-                crate::kernel::double_fuse_for_parallel(
-                    &fused_dims,
-                    &strides_list,
-                    &plan,
-                    std::mem::size_of::<T>(),
-                );
-            let strides_refs: Vec<&[isize]> =
-                ordered_strides.iter().map(|s| s.as_slice()).collect();
-            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
             return mapreduce_threaded(
-                &ordered_dims,
-                &ordered_blocks,
+                &fused_dims,
+                &plan.block,
                 &ordered_strides,
                 &initial_offsets,
                 &costs,
@@ -287,7 +280,7 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
     for_each_inner_block(
         &fused_dims,
         &plan,
-        &strides_list,
+        &ordered_strides_refs,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let sp = unsafe { src_ptr.offset(offsets[1]) };
@@ -345,12 +338,14 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
 
     let strides_list: [&[isize]; 3] = [&dst_strides_v, &a_strides_v, &b_strides_v];
 
-    let (fused_dims, plan) = build_plan_fused(
+    let (fused_dims, ordered_strides, plan) = build_plan_fused(
         &dst_dims_v,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     #[cfg(feature = "parallel")]
     {
@@ -361,22 +356,13 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
             let a_send = SendPtr(a_ptr as *mut T);
             let b_send = SendPtr(b_ptr as *mut T);
 
-            let (ordered_dims, ordered_strides, ordered_blocks) =
-                crate::kernel::double_fuse_for_parallel(
-                    &fused_dims,
-                    &strides_list,
-                    &plan,
-                    std::mem::size_of::<T>(),
-                );
-            let strides_refs: Vec<&[isize]> =
-                ordered_strides.iter().map(|s| s.as_slice()).collect();
-            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
             return mapreduce_threaded(
-                &ordered_dims,
-                &ordered_blocks,
+                &fused_dims,
+                &plan.block,
                 &ordered_strides,
                 &initial_offsets,
                 &costs,
@@ -409,7 +395,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
     for_each_inner_block(
         &fused_dims,
         &plan,
-        &strides_list,
+        &ordered_strides_refs,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };
@@ -483,12 +469,14 @@ pub fn zip_map3_into<
     let dst_dims_v = dst_dims.to_vec();
     let strides_list: [&[isize]; 4] = [&dst_strides_v, &a_strides_v, &b_strides_v, &c_strides_v];
 
-    let (fused_dims, plan) = build_plan_fused(
+    let (fused_dims, ordered_strides, plan) = build_plan_fused(
         &dst_dims_v,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     #[cfg(feature = "parallel")]
     {
@@ -500,22 +488,13 @@ pub fn zip_map3_into<
             let b_send = SendPtr(b_ptr as *mut T);
             let c_send = SendPtr(c_ptr as *mut T);
 
-            let (ordered_dims, ordered_strides, ordered_blocks) =
-                crate::kernel::double_fuse_for_parallel(
-                    &fused_dims,
-                    &strides_list,
-                    &plan,
-                    std::mem::size_of::<T>(),
-                );
-            let strides_refs: Vec<&[isize]> =
-                ordered_strides.iter().map(|s| s.as_slice()).collect();
-            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
             return mapreduce_threaded(
-                &ordered_dims,
-                &ordered_blocks,
+                &fused_dims,
+                &plan.block,
                 &ordered_strides,
                 &initial_offsets,
                 &costs,
@@ -550,7 +529,7 @@ pub fn zip_map3_into<
     for_each_inner_block(
         &fused_dims,
         &plan,
-        &strides_list,
+        &ordered_strides_refs,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };
@@ -640,12 +619,14 @@ pub fn zip_map4_into<
         &e_strides_v,
     ];
 
-    let (fused_dims, plan) = build_plan_fused(
+    let (fused_dims, ordered_strides, plan) = build_plan_fused(
         &dst_dims_v,
         &strides_list,
         Some(0),
         std::mem::size_of::<T>(),
     );
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     #[cfg(feature = "parallel")]
     {
@@ -658,22 +639,13 @@ pub fn zip_map4_into<
             let c_send = SendPtr(c_ptr as *mut T);
             let e_send = SendPtr(e_ptr as *mut T);
 
-            let (ordered_dims, ordered_strides, ordered_blocks) =
-                crate::kernel::double_fuse_for_parallel(
-                    &fused_dims,
-                    &strides_list,
-                    &plan,
-                    std::mem::size_of::<T>(),
-                );
-            let strides_refs: Vec<&[isize]> =
-                ordered_strides.iter().map(|s| s.as_slice()).collect();
-            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
             return mapreduce_threaded(
-                &ordered_dims,
-                &ordered_blocks,
+                &fused_dims,
+                &plan.block,
                 &ordered_strides,
                 &initial_offsets,
                 &costs,
@@ -709,7 +681,7 @@ pub fn zip_map4_into<
     for_each_inner_block(
         &fused_dims,
         &plan,
-        &strides_list,
+        &ordered_strides_refs,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };

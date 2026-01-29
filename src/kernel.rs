@@ -30,22 +30,49 @@ pub(crate) fn build_plan(
 
 /// Build an execution plan with dimension fusion.
 ///
-/// This is the Julia-faithful version that fuses contiguous dimensions
-/// before computing the iteration order.
+/// Pipeline: order → reorder → fuse → block.
+///
+/// Ordering first ensures that dimensions are sorted by stride importance
+/// (smallest stride innermost). Fusing *after* ordering catches contiguous
+/// dimensions regardless of the original memory layout (column-major,
+/// row-major, or any permutation).
+///
+/// Returns `(fused_dims, ordered_strides, KernelPlan)` where dimensions
+/// and strides are already in iteration order (plan.order is identity).
 pub(crate) fn build_plan_fused(
     dims: &[usize],
     strides_list: &[&[isize]],
     dest_index: Option<usize>,
     elem_size: usize,
-) -> (Vec<usize>, KernelPlan) {
-    // Fuse contiguous dimensions
-    let fused_dims = fuse_dims(dims, strides_list);
+) -> (Vec<usize>, Vec<Vec<isize>>, KernelPlan) {
+    // 1. Compute optimal iteration order on original dims
+    let order = order::compute_order(dims, strides_list, dest_index);
 
-    // Compute order and blocks on fused dimensions
-    let order = order::compute_order(&fused_dims, strides_list, dest_index);
-    let block = block::compute_block_sizes(&fused_dims, &order, strides_list, elem_size);
+    // 2. Reorder dims and strides
+    let ordered_dims: Vec<usize> = order.iter().map(|&d| dims[d]).collect();
+    let ordered_strides: Vec<Vec<isize>> = strides_list
+        .iter()
+        .map(|strides| order.iter().map(|&d| strides[d]).collect())
+        .collect();
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
-    (fused_dims, KernelPlan { order, block })
+    // 3. Fuse contiguous dimensions in ordered space
+    let fused_dims = fuse_dims(&ordered_dims, &ordered_strides_refs);
+
+    // 4. Compute blocks with identity ordering (already ordered)
+    let identity: Vec<usize> = (0..fused_dims.len()).collect();
+    let block =
+        block::compute_block_sizes(&fused_dims, &identity, &ordered_strides_refs, elem_size);
+
+    (
+        fused_dims,
+        ordered_strides,
+        KernelPlan {
+            order: identity,
+            block,
+        },
+    )
 }
 
 // ============================================================================
@@ -492,57 +519,6 @@ where
 // ============================================================================
 // Utility functions
 // ============================================================================
-
-/// Reorder by plan, apply a second fusion pass, and recompute blocks.
-///
-/// The standard pipeline (fuse → order → block) only fuses dimensions in their
-/// original order, which works for col-major but misses row-major contiguity.
-/// After ordering puts smallest-stride dimensions first, a second `fuse_dims`
-/// pass can merge dimensions that are now adjacent and contiguous.
-///
-/// Returns `(double_fused_dims, ordered_strides, blocks)` all in iteration order.
-pub(crate) fn double_fuse_for_parallel(
-    fused_dims: &[usize],
-    strides_list: &[&[isize]],
-    plan: &KernelPlan,
-    elem_size: usize,
-) -> (Vec<usize>, Vec<Vec<isize>>, Vec<usize>) {
-    // Step 1: Reorder by plan (smallest stride first)
-    let (ordered_dims, ordered_strides) = reorder_by_plan(fused_dims, strides_list, plan);
-
-    // Step 2: Second fuse on ordered dims/strides
-    let ordered_strides_refs: Vec<&[isize]> =
-        ordered_strides.iter().map(|s| s.as_slice()).collect();
-    let double_fused_dims = fuse_dims(&ordered_dims, &ordered_strides_refs);
-
-    // Step 3: Recompute blocks with identity ordering on double-fused dims
-    let identity: Vec<usize> = (0..double_fused_dims.len()).collect();
-    let blocks = block::compute_block_sizes(
-        &double_fused_dims,
-        &identity,
-        &ordered_strides_refs,
-        elem_size,
-    );
-
-    (double_fused_dims, ordered_strides, blocks)
-}
-
-/// Reorder dimensions and strides according to a plan.
-///
-/// Returns (ordered_dims, ordered_strides_list) where each is reordered
-/// by `plan.order`.
-pub(crate) fn reorder_by_plan(
-    dims: &[usize],
-    strides_list: &[&[isize]],
-    plan: &KernelPlan,
-) -> (Vec<usize>, Vec<Vec<isize>>) {
-    let ordered_dims: Vec<usize> = plan.order.iter().map(|&d| dims[d]).collect();
-    let ordered_strides: Vec<Vec<isize>> = strides_list
-        .iter()
-        .map(|strides| plan.order.iter().map(|&d| strides[d]).collect())
-        .collect();
-    (ordered_dims, ordered_strides)
-}
 
 pub(crate) fn ensure_same_shape(a: &[usize], b: &[usize]) -> Result<()> {
     if a.len() != b.len() {
