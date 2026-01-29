@@ -173,6 +173,8 @@ where
 }
 
 /// 2D kernel with inner block callback
+///
+/// Loop nesting (matches Julia): outer=d1 (lowest importance), inner callback=d0 (highest importance)
 #[inline]
 fn kernel_2d_inner<F>(
     dims: &[usize],
@@ -189,58 +191,50 @@ where
     let b0 = blocks[0].max(1).min(d0);
     let b1 = blocks[1].max(1).min(d1);
 
-    // Inner strides are for the innermost dimension (dim 1)
-    let inner_strides: Vec<isize> = strides.iter().map(|s| s[1]).collect();
+    // Inner strides are for dim 0 (highest importance = smallest stride)
+    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
 
-    let mut j0 = 0usize;
-    while j0 < d0 {
-        let blen0 = b0.min(d0 - j0);
+    // Outer block loop: d1 (lowest importance)
+    let mut j1 = 0usize;
+    while j1 < d1 {
+        let blen1 = b1.min(d1 - j1);
 
-        let mut j1 = 0usize;
-        while j1 < d1 {
-            let blen1 = b1.min(d1 - j1);
+        // Inner block loop: d0 (highest importance)
+        let mut j0 = 0usize;
+        while j0 < d0 {
+            let blen0 = b0.min(d0 - j0);
 
-            // Iterate over outer dimension within block
-            for _ in 0..blen0 {
-                // Call with inner block info
-                f(offsets, blen1, &inner_strides)?;
-
-                // Advance by inner block and step outer
+            // Element loops: outer=d1, inner callback=d0
+            for _ in 0..blen1 {
+                f(offsets, blen0, &inner_strides)?;
                 for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                    *offset += (blen1 as isize) * s[1];
-                    *offset -= (blen1 as isize) * s[1]; // Will be reset below
-                    *offset += s[0];
+                    *offset += s[1];
                 }
             }
-            // Reset outer stride
             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset -= (blen0 as isize) * s[0];
+                *offset -= (blen1 as isize) * s[1];
+                *offset += (blen0 as isize) * s[0];
             }
-
-            // Move to next block in dimension 1
-            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset += (blen1 as isize) * s[1];
-            }
-            j1 += blen1;
+            j0 += blen0;
         }
 
-        // Reset dimension 1, advance dimension 0
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-            *offset -= (d1 as isize) * s[1];
-            *offset += (blen0 as isize) * s[0];
+            *offset -= (d0 as isize) * s[0];
+            *offset += (blen1 as isize) * s[1];
         }
-        j0 += blen0;
+        j1 += blen1;
     }
 
-    // Reset all
     for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-        *offset -= (d0 as isize) * s[0];
+        *offset -= (d1 as isize) * s[1];
     }
 
     Ok(())
 }
 
 /// 3D kernel with inner block callback
+///
+/// Loop nesting (matches Julia): outer=d2, mid=d1, inner callback=d0 (highest importance)
 #[inline]
 fn kernel_3d_inner<F>(
     dims: &[usize],
@@ -259,43 +253,45 @@ where
     let b1 = blocks[1].max(1).min(d1);
     let b2 = blocks[2].max(1).min(d2);
 
-    let inner_strides: Vec<isize> = strides.iter().map(|s| s[2]).collect();
+    // Inner strides are for dim 0 (highest importance)
+    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
 
-    let mut j0 = 0usize;
-    while j0 < d0 {
-        let blen0 = b0.min(d0 - j0);
+    // Outer block loop: d2 (lowest importance)
+    let mut j2 = 0usize;
+    while j2 < d2 {
+        let blen2 = b2.min(d2 - j2);
 
         let mut j1 = 0usize;
         while j1 < d1 {
             let blen1 = b1.min(d1 - j1);
 
-            let mut j2 = 0usize;
-            while j2 < d2 {
-                let blen2 = b2.min(d2 - j2);
+            // Innermost block loop: d0 (highest importance)
+            let mut j0 = 0usize;
+            while j0 < d0 {
+                let blen0 = b0.min(d0 - j0);
 
-                for _ in 0..blen0 {
+                // Element loops: outer=d2, mid=d1, inner callback=d0
+                for _ in 0..blen2 {
                     for _ in 0..blen1 {
-                        f(offsets, blen2, &inner_strides)?;
+                        f(offsets, blen0, &inner_strides)?;
                         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                            *offset += (blen2 as isize) * s[2];
-                            *offset -= (blen2 as isize) * s[2];
                             *offset += s[1];
                         }
                     }
                     for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
                         *offset -= (blen1 as isize) * s[1];
-                        *offset += s[0];
+                        *offset += s[2];
                     }
                 }
                 for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                    *offset -= (blen0 as isize) * s[0];
-                    *offset += (blen2 as isize) * s[2];
+                    *offset -= (blen2 as isize) * s[2];
+                    *offset += (blen0 as isize) * s[0];
                 }
-                j2 += blen2;
+                j0 += blen0;
             }
 
             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset -= (d2 as isize) * s[2];
+                *offset -= (d0 as isize) * s[0];
                 *offset += (blen1 as isize) * s[1];
             }
             j1 += blen1;
@@ -303,19 +299,21 @@ where
 
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
             *offset -= (d1 as isize) * s[1];
-            *offset += (blen0 as isize) * s[0];
+            *offset += (blen2 as isize) * s[2];
         }
-        j0 += blen0;
+        j2 += blen2;
     }
 
     for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-        *offset -= (d0 as isize) * s[0];
+        *offset -= (d2 as isize) * s[2];
     }
 
     Ok(())
 }
 
 /// 4D kernel with inner block callback
+///
+/// Loop nesting (matches Julia): outer=d3, d2, d1, inner callback=d0 (highest importance)
 #[inline]
 fn kernel_4d_inner<F>(
     dims: &[usize],
@@ -336,80 +334,85 @@ where
     let b2 = blocks[2].max(1).min(d2);
     let b3 = blocks[3].max(1).min(d3);
 
-    let inner_strides: Vec<isize> = strides.iter().map(|s| s[3]).collect();
+    // Inner strides are for dim 0 (highest importance)
+    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
 
-    let mut j0 = 0usize;
-    while j0 < d0 {
-        let blen0 = b0.min(d0 - j0);
+    // Outer block loop: d3 (lowest importance)
+    let mut j3 = 0usize;
+    while j3 < d3 {
+        let blen3 = b3.min(d3 - j3);
 
-        let mut j1 = 0usize;
-        while j1 < d1 {
-            let blen1 = b1.min(d1 - j1);
+        let mut j2 = 0usize;
+        while j2 < d2 {
+            let blen2 = b2.min(d2 - j2);
 
-            let mut j2 = 0usize;
-            while j2 < d2 {
-                let blen2 = b2.min(d2 - j2);
+            let mut j1 = 0usize;
+            while j1 < d1 {
+                let blen1 = b1.min(d1 - j1);
 
-                let mut j3 = 0usize;
-                while j3 < d3 {
-                    let blen3 = b3.min(d3 - j3);
+                // Innermost block loop: d0 (highest importance)
+                let mut j0 = 0usize;
+                while j0 < d0 {
+                    let blen0 = b0.min(d0 - j0);
 
-                    for _ in 0..blen0 {
-                        for _ in 0..blen1 {
-                            for _ in 0..blen2 {
-                                f(offsets, blen3, &inner_strides)?;
+                    // Element loops: outer=d3, d2, d1, inner callback=d0
+                    for _ in 0..blen3 {
+                        for _ in 0..blen2 {
+                            for _ in 0..blen1 {
+                                f(offsets, blen0, &inner_strides)?;
                                 for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                                    *offset += (blen3 as isize) * s[3];
-                                    *offset -= (blen3 as isize) * s[3];
-                                    *offset += s[2];
+                                    *offset += s[1];
                                 }
                             }
                             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                                *offset -= (blen2 as isize) * s[2];
-                                *offset += s[1];
+                                *offset -= (blen1 as isize) * s[1];
+                                *offset += s[2];
                             }
                         }
                         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                            *offset -= (blen1 as isize) * s[1];
-                            *offset += s[0];
+                            *offset -= (blen2 as isize) * s[2];
+                            *offset += s[3];
                         }
                     }
                     for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                        *offset -= (blen0 as isize) * s[0];
-                        *offset += (blen3 as isize) * s[3];
+                        *offset -= (blen3 as isize) * s[3];
+                        *offset += (blen0 as isize) * s[0];
                     }
-                    j3 += blen3;
+                    j0 += blen0;
                 }
 
                 for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                    *offset -= (d3 as isize) * s[3];
-                    *offset += (blen2 as isize) * s[2];
+                    *offset -= (d0 as isize) * s[0];
+                    *offset += (blen1 as isize) * s[1];
                 }
-                j2 += blen2;
+                j1 += blen1;
             }
 
             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset -= (d2 as isize) * s[2];
-                *offset += (blen1 as isize) * s[1];
+                *offset -= (d1 as isize) * s[1];
+                *offset += (blen2 as isize) * s[2];
             }
-            j1 += blen1;
+            j2 += blen2;
         }
 
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-            *offset -= (d1 as isize) * s[1];
-            *offset += (blen0 as isize) * s[0];
+            *offset -= (d2 as isize) * s[2];
+            *offset += (blen3 as isize) * s[3];
         }
-        j0 += blen0;
+        j3 += blen3;
     }
 
     for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-        *offset -= (d0 as isize) * s[0];
+        *offset -= (d3 as isize) * s[3];
     }
 
     Ok(())
 }
 
 /// N-dimensional kernel with inner block callback (recursive fallback)
+///
+/// Recursion starts from the last level (outermost = lowest importance)
+/// and descends to level 0 (innermost = highest importance = callback).
 #[inline]
 fn kernel_nd_inner<F>(
     dims: &[usize],
@@ -421,10 +424,14 @@ fn kernel_nd_inner<F>(
 where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
-    let inner_strides: Vec<isize> = strides.iter().map(|s| s[dims.len() - 1]).collect();
-    kernel_nd_inner_level(0, dims, blocks, strides, &inner_strides, offsets, f)
+    // Inner strides are for dim 0 (highest importance)
+    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
+    let last = dims.len() - 1;
+    kernel_nd_inner_level(last, dims, blocks, strides, &inner_strides, offsets, f)
 }
 
+/// Recursive level handler.
+/// `level` counts down from `rank-1` (outermost) to `0` (innermost callback).
 #[inline]
 fn kernel_nd_inner_level<F>(
     level: usize,
@@ -441,29 +448,29 @@ where
     let d = dims[level];
     let b = blocks[level].max(1).min(d);
 
-    if level == dims.len() - 1 {
-        // Innermost level - call callback with block info
+    if level == 0 {
+        // Innermost level (highest importance) - call callback with block info
         let mut j = 0usize;
         while j < d {
             let blen = b.min(d - j);
             f(offsets, blen, inner_strides)?;
             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset += (blen as isize) * s[level];
+                *offset += (blen as isize) * s[0];
             }
             j += blen;
         }
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-            *offset -= (d as isize) * s[level];
+            *offset -= (d as isize) * s[0];
         }
     } else {
-        // Outer level
+        // Outer level — block loop then element loop stepping through this dimension
         let mut j = 0usize;
         while j < d {
             let blen = b.min(d - j);
 
-            // Inner block loop
+            // Element loop for this dimension, recurse into next-inner level
             for _ in 0..blen {
-                kernel_nd_inner_level(level + 1, dims, blocks, strides, inner_strides, offsets, f)?;
+                kernel_nd_inner_level(level - 1, dims, blocks, strides, inner_strides, offsets, f)?;
                 for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
                     *offset += s[level];
                 }
