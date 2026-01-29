@@ -61,6 +61,8 @@ mod fuse;
 mod kernel;
 mod order;
 pub mod strided_view;
+#[cfg(feature = "parallel")]
+mod threading;
 
 // View-based operation modules
 mod map_view;

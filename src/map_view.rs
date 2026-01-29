@@ -5,9 +5,15 @@
 use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
     build_plan_fused, ensure_same_shape, for_each_inner_block, is_contiguous, total_len,
+    use_sequential_fast_path,
 };
 use crate::strided_view::{StridedView, StridedViewMut};
 use crate::Result;
+
+#[cfg(feature = "parallel")]
+use crate::threading::{
+    compute_costs, for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH,
+};
 
 // ============================================================================
 // Stride-specialized inner loop helpers
@@ -183,10 +189,10 @@ unsafe fn inner_loop_map4<
 /// Apply a function element-wise from source to destination.
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
-pub fn map_into<T: Copy + ElementOpApply, Op: ElementOp>(
+pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
-    f: impl Fn(T) -> T,
+    f: impl Fn(T) -> T + Sync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -197,7 +203,10 @@ pub fn map_into<T: Copy + ElementOpApply, Op: ElementOp>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if is_contiguous(dst_dims, dst_strides) && is_contiguous(src_dims, src_strides) {
+    if use_sequential_fast_path(total_len(dst_dims))
+        && is_contiguous(dst_dims, dst_strides)
+        && is_contiguous(src_dims, src_strides)
+    {
         let len = total_len(dst_dims);
         let mut dp = dst_ptr;
         let mut sp = src_ptr;
@@ -225,6 +234,56 @@ pub fn map_into<T: Copy + ElementOpApply, Op: ElementOp>(
         std::mem::size_of::<T>(),
     );
 
+    #[cfg(feature = "parallel")]
+    {
+        let total: usize = fused_dims.iter().product();
+        if total > MINTHREADLENGTH {
+            use crate::threading::SendPtr;
+            let dst_send = SendPtr(dst_ptr);
+            let src_send = SendPtr(src_ptr as *mut T);
+
+            let (ordered_dims, ordered_strides, ordered_blocks) =
+                crate::kernel::double_fuse_for_parallel(
+                    &fused_dims,
+                    &strides_list,
+                    &plan,
+                    std::mem::size_of::<T>(),
+                );
+            let strides_refs: Vec<&[isize]> =
+                ordered_strides.iter().map(|s| s.as_slice()).collect();
+            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let initial_offsets = vec![0isize; strides_list.len()];
+            let nthreads = rayon::current_num_threads();
+
+            return mapreduce_threaded(
+                &ordered_dims,
+                &ordered_blocks,
+                &ordered_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                0,
+                1,
+                &|dims, blocks, strides_list, offsets| {
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        strides_list,
+                        offsets,
+                        |offsets, len, strides| {
+                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                            let sp = unsafe { src_send.as_const().offset(offsets[1]) };
+                            unsafe {
+                                inner_loop_map1::<T, Op>(dp, strides[0], sp, strides[1], len, &f)
+                            };
+                            Ok(())
+                        },
+                    )
+                },
+            );
+        }
+    }
+
     for_each_inner_block(
         &fused_dims,
         &plan,
@@ -239,11 +298,11 @@ pub fn map_into<T: Copy + ElementOpApply, Op: ElementOp>(
 }
 
 /// Binary element-wise operation: `dest[i] = f(a[i], b[i])`.
-pub fn zip_map2_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp>(
+pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB: ElementOp>(
     dest: &mut StridedViewMut<T>,
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
-    f: impl Fn(T, T) -> T,
+    f: impl Fn(T, T) -> T + Sync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -261,7 +320,8 @@ pub fn zip_map2_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp>(
     let a_dims_v = a.dims().to_vec();
     let b_dims_v = b.dims().to_vec();
 
-    if is_contiguous(&dst_dims_v, &dst_strides_v)
+    if use_sequential_fast_path(total_len(&dst_dims_v))
+        && is_contiguous(&dst_dims_v, &dst_strides_v)
         && is_contiguous(&a_dims_v, &a_strides_v)
         && is_contiguous(&b_dims_v, &b_strides_v)
     {
@@ -292,6 +352,60 @@ pub fn zip_map2_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp>(
         std::mem::size_of::<T>(),
     );
 
+    #[cfg(feature = "parallel")]
+    {
+        let total: usize = fused_dims.iter().product();
+        if total > MINTHREADLENGTH {
+            use crate::threading::SendPtr;
+            let dst_send = SendPtr(dst_ptr);
+            let a_send = SendPtr(a_ptr as *mut T);
+            let b_send = SendPtr(b_ptr as *mut T);
+
+            let (ordered_dims, ordered_strides, ordered_blocks) =
+                crate::kernel::double_fuse_for_parallel(
+                    &fused_dims,
+                    &strides_list,
+                    &plan,
+                    std::mem::size_of::<T>(),
+                );
+            let strides_refs: Vec<&[isize]> =
+                ordered_strides.iter().map(|s| s.as_slice()).collect();
+            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let initial_offsets = vec![0isize; strides_list.len()];
+            let nthreads = rayon::current_num_threads();
+
+            return mapreduce_threaded(
+                &ordered_dims,
+                &ordered_blocks,
+                &ordered_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                0,
+                1,
+                &|dims, blocks, strides_list, offsets| {
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        strides_list,
+                        offsets,
+                        |offsets, len, strides| {
+                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                            unsafe {
+                                inner_loop_map2::<T, OpA, OpB>(
+                                    dp, strides[0], ap, strides[1], bp, strides[2], len, &f,
+                                )
+                            };
+                            Ok(())
+                        },
+                    )
+                },
+            );
+        }
+    }
+
     for_each_inner_block(
         &fused_dims,
         &plan,
@@ -311,12 +425,17 @@ pub fn zip_map2_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp>(
 }
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
-pub fn zip_map3_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp, OpC: ElementOp>(
+pub fn zip_map3_into<
+    T: Copy + ElementOpApply + Send + Sync,
+    OpA: ElementOp,
+    OpB: ElementOp,
+    OpC: ElementOp,
+>(
     dest: &mut StridedViewMut<T>,
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
     c: &StridedView<T, OpC>,
-    f: impl Fn(T, T, T) -> T,
+    f: impl Fn(T, T, T) -> T + Sync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -330,7 +449,8 @@ pub fn zip_map3_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp, O
     let dst_dims = dest.dims();
     let dst_strides = dest.strides();
 
-    if is_contiguous(dst_dims, dst_strides)
+    if use_sequential_fast_path(total_len(dst_dims))
+        && is_contiguous(dst_dims, dst_strides)
         && is_contiguous(a.dims(), a.strides())
         && is_contiguous(b.dims(), b.strides())
         && is_contiguous(c.dims(), c.strides())
@@ -370,6 +490,63 @@ pub fn zip_map3_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp, O
         std::mem::size_of::<T>(),
     );
 
+    #[cfg(feature = "parallel")]
+    {
+        let total: usize = fused_dims.iter().product();
+        if total > MINTHREADLENGTH {
+            use crate::threading::SendPtr;
+            let dst_send = SendPtr(dst_ptr);
+            let a_send = SendPtr(a_ptr as *mut T);
+            let b_send = SendPtr(b_ptr as *mut T);
+            let c_send = SendPtr(c_ptr as *mut T);
+
+            let (ordered_dims, ordered_strides, ordered_blocks) =
+                crate::kernel::double_fuse_for_parallel(
+                    &fused_dims,
+                    &strides_list,
+                    &plan,
+                    std::mem::size_of::<T>(),
+                );
+            let strides_refs: Vec<&[isize]> =
+                ordered_strides.iter().map(|s| s.as_slice()).collect();
+            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let initial_offsets = vec![0isize; strides_list.len()];
+            let nthreads = rayon::current_num_threads();
+
+            return mapreduce_threaded(
+                &ordered_dims,
+                &ordered_blocks,
+                &ordered_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                0,
+                1,
+                &|dims, blocks, strides_list, offsets| {
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        strides_list,
+                        offsets,
+                        |offsets, len, strides| {
+                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                            let cp = unsafe { c_send.as_const().offset(offsets[3]) };
+                            unsafe {
+                                inner_loop_map3::<T, OpA, OpB, OpC>(
+                                    dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
+                                    len, &f,
+                                )
+                            };
+                            Ok(())
+                        },
+                    )
+                },
+            );
+        }
+    }
+
     for_each_inner_block(
         &fused_dims,
         &plan,
@@ -391,7 +568,7 @@ pub fn zip_map3_into<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp, O
 
 /// Quaternary element-wise operation: `dest[i] = f(a[i], b[i], c[i], e[i])`.
 pub fn zip_map4_into<
-    T: Copy + ElementOpApply,
+    T: Copy + ElementOpApply + Send + Sync,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
@@ -402,7 +579,7 @@ pub fn zip_map4_into<
     b: &StridedView<T, OpB>,
     c: &StridedView<T, OpC>,
     e: &StridedView<T, OpE>,
-    f: impl Fn(T, T, T, T) -> T,
+    f: impl Fn(T, T, T, T) -> T + Sync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -418,7 +595,8 @@ pub fn zip_map4_into<
     let dst_dims = dest.dims();
     let dst_strides = dest.strides();
 
-    if is_contiguous(dst_dims, dst_strides)
+    if use_sequential_fast_path(total_len(dst_dims))
+        && is_contiguous(dst_dims, dst_strides)
         && is_contiguous(a.dims(), a.strides())
         && is_contiguous(b.dims(), b.strides())
         && is_contiguous(c.dims(), c.strides())
@@ -468,6 +646,65 @@ pub fn zip_map4_into<
         Some(0),
         std::mem::size_of::<T>(),
     );
+
+    #[cfg(feature = "parallel")]
+    {
+        let total: usize = fused_dims.iter().product();
+        if total > MINTHREADLENGTH {
+            use crate::threading::SendPtr;
+            let dst_send = SendPtr(dst_ptr);
+            let a_send = SendPtr(a_ptr as *mut T);
+            let b_send = SendPtr(b_ptr as *mut T);
+            let c_send = SendPtr(c_ptr as *mut T);
+            let e_send = SendPtr(e_ptr as *mut T);
+
+            let (ordered_dims, ordered_strides, ordered_blocks) =
+                crate::kernel::double_fuse_for_parallel(
+                    &fused_dims,
+                    &strides_list,
+                    &plan,
+                    std::mem::size_of::<T>(),
+                );
+            let strides_refs: Vec<&[isize]> =
+                ordered_strides.iter().map(|s| s.as_slice()).collect();
+            let costs = compute_costs(&strides_refs, ordered_dims.len());
+            let initial_offsets = vec![0isize; strides_list.len()];
+            let nthreads = rayon::current_num_threads();
+
+            return mapreduce_threaded(
+                &ordered_dims,
+                &ordered_blocks,
+                &ordered_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                0,
+                1,
+                &|dims, blocks, strides_list, offsets| {
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        strides_list,
+                        offsets,
+                        |offsets, len, strides| {
+                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                            let cp = unsafe { c_send.as_const().offset(offsets[3]) };
+                            let ep = unsafe { e_send.as_const().offset(offsets[4]) };
+                            unsafe {
+                                inner_loop_map4::<T, OpA, OpB, OpC, OpE>(
+                                    dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
+                                    ep, strides[4], len, &f,
+                                )
+                            };
+                            Ok(())
+                        },
+                    )
+                },
+            );
+        }
+    }
 
     for_each_inner_block(
         &fused_dims,

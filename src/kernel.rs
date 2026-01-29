@@ -493,6 +493,57 @@ where
 // Utility functions
 // ============================================================================
 
+/// Reorder by plan, apply a second fusion pass, and recompute blocks.
+///
+/// The standard pipeline (fuse → order → block) only fuses dimensions in their
+/// original order, which works for col-major but misses row-major contiguity.
+/// After ordering puts smallest-stride dimensions first, a second `fuse_dims`
+/// pass can merge dimensions that are now adjacent and contiguous.
+///
+/// Returns `(double_fused_dims, ordered_strides, blocks)` all in iteration order.
+pub(crate) fn double_fuse_for_parallel(
+    fused_dims: &[usize],
+    strides_list: &[&[isize]],
+    plan: &KernelPlan,
+    elem_size: usize,
+) -> (Vec<usize>, Vec<Vec<isize>>, Vec<usize>) {
+    // Step 1: Reorder by plan (smallest stride first)
+    let (ordered_dims, ordered_strides) = reorder_by_plan(fused_dims, strides_list, plan);
+
+    // Step 2: Second fuse on ordered dims/strides
+    let ordered_strides_refs: Vec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
+    let double_fused_dims = fuse_dims(&ordered_dims, &ordered_strides_refs);
+
+    // Step 3: Recompute blocks with identity ordering on double-fused dims
+    let identity: Vec<usize> = (0..double_fused_dims.len()).collect();
+    let blocks = block::compute_block_sizes(
+        &double_fused_dims,
+        &identity,
+        &ordered_strides_refs,
+        elem_size,
+    );
+
+    (double_fused_dims, ordered_strides, blocks)
+}
+
+/// Reorder dimensions and strides according to a plan.
+///
+/// Returns (ordered_dims, ordered_strides_list) where each is reordered
+/// by `plan.order`.
+pub(crate) fn reorder_by_plan(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    plan: &KernelPlan,
+) -> (Vec<usize>, Vec<Vec<isize>>) {
+    let ordered_dims: Vec<usize> = plan.order.iter().map(|&d| dims[d]).collect();
+    let ordered_strides: Vec<Vec<isize>> = strides_list
+        .iter()
+        .map(|strides| plan.order.iter().map(|&d| strides[d]).collect())
+        .collect();
+    (ordered_dims, ordered_strides)
+}
+
 pub(crate) fn ensure_same_shape(a: &[usize], b: &[usize]) -> Result<()> {
     if a.len() != b.len() {
         return Err(crate::StridedError::RankMismatch(a.len(), b.len()));
@@ -528,6 +579,26 @@ pub(crate) fn total_len(dims: &[usize]) -> usize {
         return 1;
     }
     dims.iter().product()
+}
+
+/// Whether the sequential contiguous fast path should be used.
+///
+/// When the `parallel` feature is enabled and the total element count exceeds
+/// the threading threshold, we must *not* take the contiguous fast path so that
+/// the parallel kernel path can be reached.  Julia has no separate contiguous
+/// fast path — everything flows through fuse → order → block → threaded →
+/// kernel, so skipping it here matches Julia's branching.
+#[inline]
+pub(crate) fn use_sequential_fast_path(total: usize) -> bool {
+    #[cfg(feature = "parallel")]
+    {
+        total <= crate::threading::MINTHREADLENGTH
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = total;
+        true
+    }
 }
 
 #[cfg(test)]

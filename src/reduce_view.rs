@@ -1,26 +1,34 @@
 //! Reduce operations on dynamic-rank strided views.
 
 use crate::element_op::{ElementOp, ElementOpApply};
-use crate::kernel::{build_plan_fused, for_each_inner_block, is_contiguous, total_len};
+use crate::kernel::{
+    build_plan_fused, for_each_inner_block, is_contiguous, total_len, use_sequential_fast_path,
+};
 use crate::strided_view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
 
+#[cfg(feature = "parallel")]
+use crate::threading::{
+    compute_costs, for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
+};
+
 /// Full reduction with map function: `reduce(init, op, map.(src))`.
-pub fn reduce<T: Copy + ElementOpApply, Op: ElementOp, M, R, U>(
+pub fn reduce<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
     init: U,
 ) -> Result<U>
 where
-    M: Fn(T) -> U,
-    R: Fn(U, U) -> U,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let src_ptr = src.ptr();
     let src_dims = src.dims();
     let src_strides = src.strides();
 
-    if is_contiguous(src_dims, src_strides) {
+    if use_sequential_fast_path(total_len(src_dims)) && is_contiguous(src_dims, src_strides) {
         let len = total_len(src_dims);
         let mut ptr = src_ptr;
         let mut acc = init;
@@ -41,6 +49,96 @@ where
 
     let (fused_dims, plan) =
         build_plan_fused(&src_dims_v, &strides_list, None, std::mem::size_of::<T>());
+
+    #[cfg(feature = "parallel")]
+    {
+        let total: usize = fused_dims.iter().product();
+        if total > MINTHREADLENGTH {
+            let nthreads = rayon::current_num_threads();
+            // False sharing avoidance: space output slots by cache line size
+            let spacing = (64 / std::mem::size_of::<U>()).max(1);
+            let mut threadedout = vec![init.clone(); spacing * nthreads];
+            let threadedout_ptr = SendPtr(threadedout.as_mut_ptr());
+            let src_send = SendPtr(src_ptr as *mut T);
+
+            let (ordered_dims, ordered_strides, ordered_blocks) =
+                crate::kernel::double_fuse_for_parallel(
+                    &fused_dims,
+                    &strides_list,
+                    &plan,
+                    std::mem::size_of::<T>(),
+                );
+            let strides_refs: Vec<&[isize]> =
+                ordered_strides.iter().map(|s| s.as_slice()).collect();
+            let costs = compute_costs(&strides_refs, ordered_dims.len());
+
+            // For complete reduction, strides_list has 2 entries:
+            // [0] = threadedout (stride 0 everywhere — broadcasting), [1] = src
+            // The spacing/taskindex mechanism addresses output slots.
+            let ndim = ordered_dims.len();
+            let mut threaded_strides = Vec::with_capacity(ordered_strides.len() + 1);
+            threaded_strides.push(vec![0isize; ndim]); // threadedout: stride 0 (broadcast)
+            for s in &ordered_strides {
+                threaded_strides.push(s.clone());
+            }
+            let initial_offsets = vec![0isize; threaded_strides.len()];
+
+            // Mask costs for threadedout stride=0 dims (all dims, since it's fully broadcast)
+            // This means: do NOT split on dims where output stride is 0 — but for complete
+            // reduction, ALL output strides are 0, so costs would all be masked to 0.
+            // Julia handles this with the spacing mechanism: each task writes to its own slot.
+            // We keep costs unmasked so splitting still works.
+
+            mapreduce_threaded(
+                &ordered_dims,
+                &ordered_blocks,
+                &threaded_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                spacing as isize,
+                1,
+                &|dims, blocks, strides_list, offsets| {
+                    // offsets[0] = spacing * (taskindex - 1) for threadedout
+                    // offsets[1] = offset into src
+                    let out_offset = offsets[0] as usize;
+                    let src_strides = &strides_list[1..];
+                    let src_offsets = &offsets[1..];
+
+                    // Build strides_list for just the source
+                    let src_strides_only: Vec<Vec<isize>> = src_strides.iter().cloned().collect();
+
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        &src_strides_only,
+                        src_offsets,
+                        |offsets, len, strides| {
+                            let mut ptr = unsafe { src_send.as_const().offset(offsets[0]) };
+                            let stride = strides[0];
+                            let slot = unsafe { &mut *threadedout_ptr.as_ptr().add(out_offset) };
+                            for _ in 0..len {
+                                let val = Op::apply(unsafe { *ptr });
+                                let mapped = map_fn(val);
+                                *slot = reduce_fn(slot.clone(), mapped);
+                                unsafe {
+                                    ptr = ptr.offset(stride);
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                },
+            )?;
+
+            // Merge thread-local results
+            let mut result = init;
+            for i in 0..nthreads {
+                result = reduce_fn(result, threadedout[i * spacing].clone());
+            }
+            return Ok(result);
+        }
+    }
 
     let mut acc = Some(init);
     for_each_inner_block(
@@ -67,7 +165,7 @@ where
 }
 
 /// Reduce along a single axis, returning a new StridedArray.
-pub fn reduce_axis<T: Copy + ElementOpApply, Op: ElementOp, M, R, U>(
+pub fn reduce_axis<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp, M, R, U>(
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,
@@ -75,9 +173,9 @@ pub fn reduce_axis<T: Copy + ElementOpApply, Op: ElementOp, M, R, U>(
     init: U,
 ) -> Result<StridedArray<U>>
 where
-    M: Fn(T) -> U,
-    R: Fn(U, U) -> U,
-    U: Clone,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     if axis >= rank {

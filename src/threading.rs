@@ -1,0 +1,289 @@
+//! Rayon-based parallel execution for strided operations.
+//!
+//! Faithfully ports Julia Strided.jl's `_mapreduce_threaded!` recursive
+//! dimension-splitting strategy using `rayon::join`.
+
+use crate::kernel::{for_each_inner_block, KernelPlan};
+use crate::Result;
+
+/// A raw pointer wrapper that is `Send` + `Sync`.
+///
+/// # Safety
+/// The caller must guarantee that the pointed-to data is valid for the
+/// lifetime of any parallel operation and that no data races occur
+/// (e.g., different threads write to disjoint regions).
+pub(crate) struct SendPtr<T>(pub(crate) *mut T);
+
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for SendPtr<T> {}
+
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    pub(crate) fn as_ptr(self) -> *mut T {
+        self.0
+    }
+
+    pub(crate) fn as_const(self) -> *const T {
+        self.0 as *const T
+    }
+}
+
+/// Minimum number of elements to justify multi-threaded execution.
+/// Matches Julia's `MINTHREADLENGTH = 1 << 15`.
+pub(crate) const MINTHREADLENGTH: usize = 1 << 15;
+
+/// Compute per-dimension costs for thread-splitting decisions.
+///
+/// Julia `_mapreduce_order!` L137:
+/// ```julia
+/// costs = map(a -> ifelse(iszero(a), 1, a << 1), map(min, strides...))
+/// ```
+///
+/// Takes the per-dimension minimum stride magnitude across all arrays,
+/// then maps: 0 → 1, nonzero → 2*|min_stride|.
+pub(crate) fn compute_costs(strides_list: &[&[isize]], ndim: usize) -> Vec<isize> {
+    (0..ndim)
+        .map(|d| {
+            let min_stride = strides_list
+                .iter()
+                .map(|s| s[d].unsigned_abs() as isize)
+                .min()
+                .unwrap_or(0);
+            if min_stride == 0 {
+                1
+            } else {
+                min_stride * 2
+            }
+        })
+        .collect()
+}
+
+/// Julia's `_lastargmax`: argmax that breaks ties by choosing the last index.
+fn lastargmax(values: &[isize]) -> Option<usize> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut best_idx = 0;
+    let mut best_val = values[0];
+    for (i, &v) in values.iter().enumerate().skip(1) {
+        if v >= best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    Some(best_idx)
+}
+
+/// Recursive dimension-splitting parallel execution.
+///
+/// Faithfully ports Julia's `_mapreduce_threaded!` (mapreduce.jl L195-227).
+///
+/// Parameters:
+/// - `dims`: Ordered dimensions (after fuse/order/block)
+/// - `blocks`: Block sizes per dimension
+/// - `strides_list`: Per-array strides, ordered by plan
+/// - `offsets`: Per-array byte offsets into the data
+/// - `costs`: Per-dimension splitting costs
+/// - `nthreads`: Number of threads available for this subtree
+/// - `spacing`: For complete reduction — stride between thread-local output slots (0 for map)
+/// - `taskindex`: 1-based task index for complete reduction output slot addressing
+/// - `f`: Leaf function — called when we've reached a single-thread region
+///
+/// The leaf function `f` receives `(dims, blocks, strides_list, offsets)` describing
+/// the sub-region to process.
+pub(crate) fn mapreduce_threaded<F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides_list: &[Vec<isize>],
+    offsets: &[isize],
+    costs: &[isize],
+    nthreads: usize,
+    spacing: isize,
+    taskindex: usize,
+    f: &F,
+) -> Result<()>
+where
+    F: Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync,
+{
+    let total: usize = dims.iter().product();
+
+    // Base case: single thread or below threshold
+    if nthreads <= 1 || total <= MINTHREADLENGTH {
+        if spacing != 0 {
+            let mut spaced = offsets.to_vec();
+            spaced[0] += spacing * (taskindex as isize - 1);
+            return f(dims, blocks, strides_list, &spaced);
+        }
+        return f(dims, blocks, strides_list, offsets);
+    }
+
+    // Select split dimension: _lastargmax((dims .- 1) .* costs)
+    let scores: Vec<isize> = dims
+        .iter()
+        .zip(costs.iter())
+        .map(|(&d, &c)| (d as isize - 1) * c)
+        .collect();
+    let i = lastargmax(&scores).unwrap();
+
+    // Guard: costs[i] == 0 || dims[i] <= min(blocks[i], 1024)
+    if costs[i] == 0 || dims[i] <= blocks[i].min(1024) {
+        if spacing != 0 {
+            let mut spaced = offsets.to_vec();
+            spaced[0] += spacing * (taskindex as isize - 1);
+            return f(dims, blocks, strides_list, &spaced);
+        }
+        return f(dims, blocks, strides_list, offsets);
+    }
+
+    // Split dimension i in half
+    let di = dims[i];
+    let ndi = di / 2;
+    let nt_left = nthreads / 2;
+    let nt_right = nthreads - nt_left;
+
+    // Left half: dims[i] = ndi, same offsets
+    let mut left_dims = dims.to_vec();
+    left_dims[i] = ndi;
+
+    // Right half: dims[i] = di - ndi, offsets advanced by ndi * stride[i]
+    let mut right_dims = dims.to_vec();
+    right_dims[i] = di - ndi;
+    let mut right_offsets = offsets.to_vec();
+    for (k, strides) in strides_list.iter().enumerate() {
+        right_offsets[k] += ndi as isize * strides[i];
+    }
+
+    let left_offsets = offsets.to_vec();
+
+    // rayon::join for parallel left/right execution
+    let (r1, r2) = rayon::join(
+        || {
+            mapreduce_threaded(
+                &left_dims,
+                blocks,
+                strides_list,
+                &left_offsets,
+                costs,
+                nt_left,
+                spacing,
+                taskindex,
+                f,
+            )
+        },
+        || {
+            mapreduce_threaded(
+                &right_dims,
+                blocks,
+                strides_list,
+                &right_offsets,
+                costs,
+                nt_right,
+                spacing,
+                taskindex + nt_left,
+                f,
+            )
+        },
+    );
+    r1?;
+    r2?;
+    Ok(())
+}
+
+/// Execute `for_each_inner_block` on a sub-region defined by offsets.
+///
+/// This wraps `for_each_inner_block` to add initial offsets to the callback's offsets,
+/// enabling the threaded splitter to partition work across sub-regions.
+pub(crate) fn for_each_inner_block_with_offsets<F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides_list: &[Vec<isize>],
+    initial_offsets: &[isize],
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let rank = dims.len();
+    if rank == 0 {
+        return f(initial_offsets, 1, &[]);
+    }
+
+    // Build a KernelPlan that uses identity ordering (dims/strides are already ordered)
+    let plan = KernelPlan {
+        order: (0..rank).collect(),
+        block: blocks.to_vec(),
+    };
+
+    // Convert Vec<isize> to &[isize] for the kernel
+    let strides_refs: Vec<&[isize]> = strides_list.iter().map(|s| s.as_slice()).collect();
+
+    // Use for_each_inner_block but adjust offsets
+    for_each_inner_block(dims, &plan, &strides_refs, |offsets, len, strides| {
+        // Add initial_offsets to the kernel's offsets
+        let adjusted: Vec<isize> = offsets
+            .iter()
+            .zip(initial_offsets.iter())
+            .map(|(&o, &init)| o + init)
+            .collect();
+        f(&adjusted, len, strides)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lastargmax() {
+        assert_eq!(lastargmax(&[1, 3, 2]), Some(1));
+        // Ties: last index wins
+        assert_eq!(lastargmax(&[3, 1, 3]), Some(2));
+        assert_eq!(lastargmax(&[]), None);
+        assert_eq!(lastargmax(&[5]), Some(0));
+    }
+
+    #[test]
+    fn test_compute_costs() {
+        // stride 0 → cost 1, stride 1 → cost 2, stride 3 → cost 6
+        let s1: Vec<isize> = vec![1, 0, 3];
+        let s2: Vec<isize> = vec![2, 0, 4];
+        let strides_list: Vec<&[isize]> = vec![&s1, &s2];
+        let costs = compute_costs(&strides_list, 3);
+        assert_eq!(costs, vec![2, 1, 6]);
+    }
+
+    #[test]
+    fn test_mapreduce_threaded_single_thread() {
+        // With nthreads=1, should just call f directly
+        let dims = vec![10, 10];
+        let blocks = vec![10, 10];
+        let strides = vec![vec![1isize, 10], vec![1, 10]];
+        let offsets = vec![0isize, 0];
+        let costs = vec![2, 20];
+
+        let called = std::sync::atomic::AtomicBool::new(false);
+        mapreduce_threaded(
+            &dims,
+            &blocks,
+            &strides,
+            &offsets,
+            &costs,
+            1,
+            0,
+            1,
+            &|_dims, _blocks, _strides, _offsets| {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}

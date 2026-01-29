@@ -12,6 +12,11 @@ publish = false
 num-traits = "0.2"
 num-complex = "0.4"
 thiserror = "1.0"
+rayon = { version = "1.10", optional = true }
+
+[features]
+default = []
+parallel = ["rayon"]
 
 [dev-dependencies]
 criterion = "0.5"
@@ -25,3 +30,8 @@ bench = false
 [[bench]]
 name = "rust_compare"
 harness = false
+
+[[bench]]
+name = "threaded_compare"
+harness = false
+required-features = ["parallel"]
