@@ -4,7 +4,7 @@
 
 use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
-    build_plan_fused, ensure_same_shape, for_each_inner_block, is_contiguous, total_len,
+    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, is_contiguous, total_len,
     use_sequential_fast_path,
 };
 use crate::strided_view::{StridedView, StridedViewMut};
@@ -271,10 +271,12 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let sp = unsafe { src_ptr.offset(offsets[1]) };
@@ -378,10 +380,12 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };
@@ -502,10 +506,12 @@ pub fn zip_map3_into<
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };
@@ -647,10 +653,12 @@ pub fn zip_map4_into<
         }
     }
 
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let ap = unsafe { a_ptr.offset(offsets[1]) };

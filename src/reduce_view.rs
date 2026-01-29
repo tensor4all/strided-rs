@@ -2,7 +2,8 @@
 
 use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block, is_contiguous, total_len, use_sequential_fast_path,
+    build_plan_fused, for_each_inner_block_preordered, is_contiguous, total_len,
+    use_sequential_fast_path,
 };
 use crate::strided_view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
@@ -129,10 +130,12 @@ where
     }
 
     let mut acc = Some(init);
-    for_each_inner_block(
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
         &fused_dims,
-        &plan,
-        &ordered_strides_refs,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
         |offsets, len, strides| {
             let mut ptr = unsafe { src_ptr.offset(offsets[0]) };
             let stride = strides[0];

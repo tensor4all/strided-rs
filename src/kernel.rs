@@ -529,7 +529,6 @@ where
 ///
 /// This avoids the redundant re-ordering and per-callback `Vec` allocation
 /// that `for_each_inner_block_with_offsets` previously incurred.
-#[cfg(feature = "parallel")]
 #[inline]
 pub(crate) fn for_each_inner_block_preordered<F>(
     dims: &[usize],
