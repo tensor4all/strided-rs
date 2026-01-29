@@ -505,10 +505,6 @@ where
                     *offset += s[level];
                 }
             }
-            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset -= (blen as isize) * s[level];
-                *offset += (blen as isize) * s[level];
-            }
             j += blen;
         }
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
