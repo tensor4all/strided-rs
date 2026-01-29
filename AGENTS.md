@@ -46,6 +46,13 @@ cargo bench
 cargo bench -- copy_permuted
 ```
 
+## Benchmarking Notes (Rust)
+
+When adding or modifying benchmarks (especially "naive" baselines), optimize the baseline as well:
+- Avoid per-element high-level indexing (`a[[i, j]]`) inside hot loops when the data is contiguous; prefer pointer-based loops or precomputed strides so the "naive" number reflects math + memory traffic, not indexing overhead.
+- Keep setup/allocation out of the timed region and use `black_box` to prevent dead-code elimination.
+- For parity with Julia scripts, run single-threaded (`RAYON_NUM_THREADS=1` / `JULIA_NUM_THREADS=1`) unless explicitly testing threading.
+
 ## Architecture
 
 ### Core Types

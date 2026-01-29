@@ -41,5 +41,5 @@ name = "mdarray_compare"
 harness = false
 
 [[bench]]
-name = "rust_readme_compare"
+name = "rust_compare"
 harness = false

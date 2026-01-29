@@ -249,10 +249,10 @@ cargo bench
         - `strided::copy_into` ≈ 20.4 ms
 
 - Julia (BenchmarkTools) representative results (single-threaded):
-    - `symmetrize_4000` (Strided.jl): ~17.38 ms
-    - `scale_transpose_1000` (Strided.jl): ~0.379 ms
-    - `complex_elementwise_1000` (Strided.jl): ~7.56 ms
-    - `permute_32_4d` (Strided.jl): ~0.844 ms
+    - `symmetrize_4000` (Strided.jl): ~24.13 ms
+    - `scale_transpose_1000` (Strided.jl): ~0.495 ms
+    - `complex_elementwise_1000` (Strided.jl): ~7.75 ms
+    - `permute_32_4d` (Strided.jl): ~1.096 ms
     - `multiple_permute_sum_32_4d` (Strided.jl): ~2.26 ms
 
 Notes:
@@ -276,36 +276,37 @@ Purpose: Provide a set of Rust benchmarks that match the cases listed in the Str
 
 ```bash
 export JULIA_NUM_THREADS=1
-julia --project=. benches/julia_readme_compare.jl
+julia --project=. benches/julia_compare.jl
 ```
 
 - Example: run the Rust runner that prints the same cases:
 
 ```bash
 export RAYON_NUM_THREADS=1
-cargo bench --bench rust_readme_compare
+cargo bench --bench rust_compare
 ```
 
-- The five matched cases are: `symmetrize_4000`, `scale_transpose_1000`, `complex_elementwise_1000`, `permute_32_4d`, and `multiple_permute_sum_32_4d`.
+- The matched cases are: `symmetrize_4000`, `scale_transpose_1000`, `mwe_stridedview_scale_transpose_1000`, `complex_elementwise_1000`, `permute_32_4d`, and `multiple_permute_sum_32_4d`.
 
-**Comparison results (single-threaded, 2026-01-28)**
+**Comparison results (single-threaded, 2026-01-29)**
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust mdarray/naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 17.376 | 25.796 | 59.404 (naive) |
-| scale_transpose_1000 | 0.379 | 0.596 | 1.327 (naive) |
-| complex_elementwise_1000 | 7.562 | 13.164 | 14.301 (naive) |
-| permute_32_4d | 0.844 | 0.949 | 0.946 (mdarray_assign) |
-| multiple_permute_sum_32_4d | 2.257 | 2.865 | 4.559 (mdarray_alloc4) |
+| symmetrize_4000 | 24.133 | 27.866 | 70.309 (naive) |
+| scale_transpose_1000 | 0.495 | 0.618 | 1.498 (naive) |
+| mwe_stridedview_scale_transpose_1000 | 0.560 | 1.249 (map_into) | 1.415 (naive) |
+| complex_elementwise_1000 | 7.749 | 13.389 | 15.279 (naive) |
+| permute_32_4d | 1.096 | 1.249 | 1.329 (mdarray_assign) |
+| multiple_permute_sum_32_4d | 2.264 | 2.673 | 5.371 (mdarray_alloc4) |
 
 Notes:
-- The Rust measurements are produced by [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs), which uses `Instant` and reports the mean duration after warm-up and repeated iterations.
+- The Rust measurements are produced by [benches/rust_compare.rs](benches/rust_compare.rs), which uses `Instant` and reports the mean duration after warm-up and repeated iterations.
 - The `mdarray_alloc4` entry for `multiple_permute_sum_32_4d` represents the Julia "Base" approach (materialize four permuted arrays, then add).
 - The `complex_elementwise_1000` case in the Julia script uses `Float64` inputs (the name is historical), so the Rust runner also uses `f64` for parity.
 
 File mapping (reference):
-- Julia script: [benches/julia_readme_compare.jl](benches/julia_readme_compare.jl)
-- Rust benches: [benches/strided_bench.rs](benches/strided_bench.rs), [benches/mdarray_compare.rs](benches/mdarray_compare.rs), and the new runner [benches/rust_readme_compare.rs](benches/rust_readme_compare.rs)
+- Julia script: [benches/julia_compare.jl](benches/julia_compare.jl)
+- Rust benches: [benches/strided_bench.rs](benches/strided_bench.rs), [benches/mdarray_compare.rs](benches/mdarray_compare.rs), and the new runner [benches/rust_compare.rs](benches/rust_compare.rs)
 - Example logs: `bench_readme_single_thread.log`, `bench_permute_1000.log`
 
 Comparison procedure:
@@ -314,7 +315,7 @@ Comparison procedure:
 - Record environment details (OS, CPU, compiler flags) when taking measurements.
 
 Note:
-- Using the existing `benches/` and `benches/julia_readme_compare.jl` script allows reproducing the README numbers. If discrepancies appear, check `RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`, compiler optimizations, and whether type-specialized micro-kernels are enabled.
+- Using the existing `benches/` and `benches/julia_compare.jl` script allows reproducing the README numbers. If discrepancies appear, check `RAYON_NUM_THREADS`/`JULIA_NUM_THREADS`, compiler optimizations, and whether type-specialized micro-kernels are enabled.
 
 **Copy vs Pod and static POD gating**
 

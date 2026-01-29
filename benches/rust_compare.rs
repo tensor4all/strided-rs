@@ -4,7 +4,7 @@ use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use strided_rs::{
-    copy_into_pod, copy_transpose_scale_into_fast, map_into, symmetrize_into_f64, zip_map4_into,
+    copy_into_pod, copy_transpose_scale_into_fast, map_into, zip_map2_into, zip_map4_into,
 };
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -30,7 +30,7 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
 }
 
 fn main() {
-    println!("Rust runner: benches/rust_readme_compare.rs");
+    println!("Rust runner: benches/rust_compare.rs");
     println!("Note: set RAYON_NUM_THREADS=1 for parity (this runner is single-threaded).");
     println!();
 
@@ -41,6 +41,7 @@ fn main() {
         let mut rng = StdRng::seed_from_u64(0);
         let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.gen::<f64>());
         let a_view = a.as_ref();
+        let a_t = a_view.permute([1, 0]);
         let mut b = Tensor::<f64, _>::zeros([n, n]);
 
         bench_n("rust_naive", 1, 3, || {
@@ -53,7 +54,9 @@ fn main() {
         });
 
         bench_n("rust_strided", 1, 3, || {
-            symmetrize_into_f64(&mut b, a_view).unwrap();
+            // Match Julia:
+            //   @strided B .= (A .+ A') ./ 2
+            zip_map2_into(&mut b, a_view, &a_t, |&x, &y| (x + y) * 0.5).unwrap();
             black_box(&b);
         });
         println!();
@@ -62,6 +65,7 @@ fn main() {
     // 2) scale_transpose_1000
     {
         println!("=== Benchmark 2: scale_transpose_1000 ===");
+        println!("Julia MWE: StridedView(B) .= 3 .* StridedView(A)'");
         let n = 1000usize;
         let mut rng = StdRng::seed_from_u64(1);
         let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.sample(StandardNormal));
@@ -81,6 +85,40 @@ fn main() {
             copy_transpose_scale_into_fast(&mut b, a_view, 3.0).unwrap();
             black_box(&b);
         });
+        println!();
+    }
+
+    // 2a) mwe_stridedview_scale_transpose_1000 (broadcast-like)
+    //
+    // Julia MWE:
+    //   StridedView(B) .= 3 .* StridedView(A)'
+    //
+    // In Rust we express the same thing as:
+    //   let a_t = a.as_ref().permute([1, 0]);
+    //   map_into(&mut b, &a_t, |x| 3.0 * x)
+    {
+        println!("=== Benchmark 2a: mwe_stridedview_scale_transpose_1000 ===");
+        let n = 1000usize;
+        let mut rng = StdRng::seed_from_u64(11);
+        let a = Tensor::<f64, _>::from_fn([n, n], |_| rng.gen::<f64>());
+        let a_view = a.as_ref();
+        let a_t = a_view.permute([1, 0]);
+        let mut b = Tensor::<f64, _>::zeros([n, n]);
+
+        bench_n("rust_naive", 5, 10, || {
+            for i in 0..n {
+                for j in 0..n {
+                    b[[i, j]] = 3.0 * a_view[[j, i]];
+                }
+            }
+            black_box(&b);
+        });
+
+        bench_n("rust_strided_map", 5, 10, || {
+            map_into(&mut b, &a_t, |x| 3.0 * x).unwrap();
+            black_box(&b);
+        });
+
         println!();
     }
 

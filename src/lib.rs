@@ -116,7 +116,6 @@ pub use ops::{
     add, axpy, copy_conj, copy_into, copy_into_pod, copy_into_pod_complex_f32,
     copy_into_pod_complex_f64, copy_into_uninit, copy_scale, copy_transpose_scale_into,
     copy_transpose_scale_into_fast, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
-    symmetrize_into_f64,
 };
 
 // ============================================================================

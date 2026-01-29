@@ -169,8 +169,8 @@ fn bench_symmetrize_aat(c: &mut Criterion) {
     group.bench_function("strided", |b| {
         b.iter(|| {
             let mut out = Tensor::zeros([size, size]);
-            if let Err(err) = strided_rs::symmetrize_into_f64(&mut out, a_view) {
-                panic!("symmetrize_into_f64 failed: {err}");
+            if let Err(err) = zip_map2_into(&mut out, a_view, &a_t, |&x, &y| (x + y) * 0.5) {
+                panic!("zip_map2_into (symmetrize_aat) failed: {err}");
             }
             out
         })
