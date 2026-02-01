@@ -21,13 +21,13 @@ For local development, add a path dependency:
 
 ```toml
 [dependencies]
-strided = { path = "../strided-rs/strided" }
+strided-kernel = { path = "../strided-rs/strided-kernel" }
 ```
 
 ## Quick Start
 
 ```rust
-use strided::{StridedArray, StridedView, map_into};
+use strided_kernel::{StridedArray, StridedView, map_into};
 
 // Create a row-major 2D array
 let src = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| {
@@ -55,7 +55,7 @@ Owned strided multidimensional array with `view()` and `view_mut()` methods.
 ## View Operations
 
 ```rust
-use strided::StridedArray;
+use strided_kernel::StridedArray;
 
 let a = StridedArray::<f64>::from_fn_row_major(&[3, 4], |idx| {
     (idx[0] * 10 + idx[1]) as f64
@@ -72,14 +72,14 @@ assert_eq!(vp.get(&[2, 1]), v.get(&[1, 2]));
 
 // Broadcast (stride-0 for size-1 dims)
 let row_data = vec![1.0, 2.0, 3.0];
-let row = strided::StridedView::<f64>::new(&row_data, &[1, 3], &[3, 1], 0).unwrap();
+let row = strided_kernel::StridedView::<f64>::new(&row_data, &[1, 3], &[3, 1], 0).unwrap();
 let broad = row.broadcast(&[4, 3]).unwrap();
 ```
 
 ## Map and Reduce Operations
 
 ```rust
-use strided::{StridedArray, map_into, zip_map2_into, zip_map4_into, reduce};
+use strided_kernel::{StridedArray, map_into, zip_map2_into, zip_map4_into, reduce};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[0] as f64);
 let b = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[1] as f64);
@@ -98,7 +98,7 @@ let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
 ## High-Level Operations
 
 ```rust
-use strided::{StridedArray, copy_into, add, dot, symmetrize_into};
+use strided_kernel::{StridedArray, copy_into, add, dot, symmetrize_into};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
 let mut out = StridedArray::<f64>::row_major(&[4, 4]);
@@ -131,7 +131,7 @@ Enable Rayon-based multi-threading with the `parallel` feature:
 
 ```toml
 [dependencies]
-strided = { path = "../strided-rs/strided", features = ["parallel"] }
+strided-kernel = { path = "../strided-rs/strided-kernel", features = ["parallel"] }
 ```
 
 When enabled, `map_into`, `zip_map*_into`, `reduce`, and all high-level ops

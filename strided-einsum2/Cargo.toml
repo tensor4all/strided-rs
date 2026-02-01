@@ -9,8 +9,8 @@ description = "Binary einsum (pairwise tensor contraction) on strided views."
 publish = false
 
 [dependencies]
-stridedview = { path = "../stridedview" }
-strided = { path = "../strided" }
+strided-view = { path = "../strided-view" }
+strided-kernel = { path = "../strided-kernel" }
 num-traits = "0.2"
 thiserror = "1.0"
 faer = { version = "0.24", optional = true }

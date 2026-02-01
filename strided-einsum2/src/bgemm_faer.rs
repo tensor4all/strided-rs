@@ -9,13 +9,13 @@ use faer::linalg::matmul::matmul_with_conj;
 use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Conj, Par};
 use faer_traits::ComplexField;
-use stridedview::{StridedArray, StridedView, StridedViewMut};
+use strided_view::{StridedArray, StridedView, StridedViewMut};
 
 /// Batched strided GEMM using faer: C = alpha * A * B + beta * C
 ///
 /// Same interface as `bgemm_naive::bgemm_strided_into`. Uses faer's optimized
 /// matmul for all cases. When dimension groups have non-contiguous strides,
-/// copies operands to contiguous column-major buffers first using `strided::copy_into`.
+/// copies operands to contiguous column-major buffers first using `strided_kernel::copy_into`.
 pub fn bgemm_strided_into<T>(
     c: &mut StridedViewMut<T>,
     a: &StridedView<T>,
@@ -28,11 +28,11 @@ pub fn bgemm_strided_into<T>(
     beta: T,
     conj_a: bool,
     conj_b: bool,
-) -> stridedview::Result<()>
+) -> strided_view::Result<()>
 where
     T: ComplexField
         + Copy
-        + stridedview::ElementOpApply
+        + strided_view::ElementOpApply
         + Send
         + Sync
         + std::ops::Mul<Output = T>
@@ -83,7 +83,7 @@ where
     let (a_ptr, a_row_stride, a_col_stride);
     if a_needs_copy {
         let mut buf = alloc_batched_col_major(a.dims(), n_batch);
-        strided::copy_into(&mut buf.view_mut(), a)?;
+        strided_kernel::copy_into(&mut buf.view_mut(), a)?;
         a_ptr = buf.view().ptr();
         // Col-major inner A [lo..., sum...]: lo stride = 1, sum stride = m
         a_row_stride = if m == 0 { 0 } else { 1isize };
@@ -107,7 +107,7 @@ where
     let (b_ptr, b_row_stride, b_col_stride);
     if b_needs_copy {
         let mut buf = alloc_batched_col_major(b.dims(), n_batch);
-        strided::copy_into(&mut buf.view_mut(), b)?;
+        strided_kernel::copy_into(&mut buf.view_mut(), b)?;
         b_ptr = buf.view().ptr();
         // Col-major inner B [sum..., ro...]: sum stride = 1, ro stride = k
         b_row_stride = if k == 0 { 0 } else { 1isize };
@@ -132,7 +132,7 @@ where
     if c_needs_copy {
         let mut buf = alloc_batched_col_major(c.dims(), n_batch);
         if beta != T::zero() {
-            strided::copy_into(&mut buf.view_mut(), &c.as_view())?;
+            strided_kernel::copy_into(&mut buf.view_mut(), &c.as_view())?;
         }
         c_ptr = buf.view_mut().as_mut_ptr();
         // Col-major inner C [lo..., ro...]: lo stride = 1, ro stride = m
@@ -203,7 +203,7 @@ where
 
     // If C was copied to a temp buffer, copy the result back
     if let Some(ref c_buf) = c_contig_buf {
-        strided::copy_into(c, &c_buf.view())?;
+        strided_kernel::copy_into(c, &c_buf.view())?;
     }
 
     Ok(())
@@ -249,7 +249,7 @@ fn alloc_batched_col_major<T: num_traits::Zero + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stridedview::StridedArray;
+    use strided_view::StridedArray;
 
     #[test]
     fn test_faer_bgemm_2x2() {

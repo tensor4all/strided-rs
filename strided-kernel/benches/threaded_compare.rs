@@ -2,7 +2,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-use strided::{
+use strided_kernel::{
     copy_into, copy_transpose_scale_into, map_into, sum, zip_map2_into, zip_map4_into, StridedArray,
 };
 

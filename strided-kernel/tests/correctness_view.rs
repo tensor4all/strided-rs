@@ -1,5 +1,5 @@
 use approx::assert_relative_eq;
-use strided::{
+use strided_kernel::{
     add, axpy, copy_into, copy_transpose_scale_into, dot, fma, map_into, mul, reduce, reduce_axis,
     sum, symmetrize_into, zip_map2_into, zip_map4_into, StridedArray,
 };
@@ -210,7 +210,7 @@ fn test_col_major_tensor() {
 #[test]
 fn test_strided_view_broadcast_and_copy() {
     let data = vec![1.0, 2.0, 3.0];
-    let row = strided::StridedView::<f64>::new(&data, &[1, 3], &[3, 1], 0).unwrap();
+    let row = strided_kernel::StridedView::<f64>::new(&data, &[1, 3], &[3, 1], 0).unwrap();
     let broad = row.broadcast(&[4, 3]).unwrap();
 
     let mut dest = StridedArray::<f64>::row_major(&[4, 3]);

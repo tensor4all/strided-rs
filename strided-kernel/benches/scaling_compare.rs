@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-use strided::{copy_into, sum, StridedArray};
+use strided_kernel::{copy_into, sum, StridedArray};
 
 fn median(durations: &mut [Duration]) -> Duration {
     durations.sort();

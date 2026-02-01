@@ -20,7 +20,7 @@
 
 pub mod auxiliary;
 mod element_op;
-pub mod strided_view;
+pub mod view;
 
 // ============================================================================
 // Element operations
@@ -30,9 +30,7 @@ pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity
 // ============================================================================
 // View-based types
 // ============================================================================
-pub use strided_view::{
-    col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut,
-};
+pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 
 // ============================================================================
 // Error types
