@@ -1,6 +1,5 @@
 //! High-level operations on dynamic-rank strided views.
 
-use crate::element_op::{ElementOp, ElementOpApply};
 use crate::kernel::{
     build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, is_contiguous, total_len,
     use_sequential_fast_path,
@@ -11,6 +10,7 @@ use crate::strided_view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use num_traits::Zero;
 use std::ops::{Add, Mul};
+use stridedview::{ElementOp, ElementOpApply};
 
 #[cfg(feature = "parallel")]
 use crate::threading::{
