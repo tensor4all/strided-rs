@@ -83,12 +83,32 @@ pub fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize
         0 => Some((1, 0)),
         1 => Some((dims[0], strides[0])),
         n => {
-            for i in 0..n - 1 {
-                if strides[i] != strides[i + 1] * dims[i + 1] as isize {
+            if dims.len() != strides.len() {
+                return None;
+            }
+            for (&d, &s) in dims.iter().zip(strides.iter()) {
+                if d > 1 && s == 0 {
                     return None;
                 }
             }
-            Some((dims.iter().product(), strides[n - 1]))
+
+            let mut pairs: Vec<(usize, isize)> =
+                dims.iter().copied().zip(strides.iter().copied()).collect();
+            pairs.sort_by_key(|&(d, s)| (s.unsigned_abs(), d));
+
+            for i in 0..n - 1 {
+                let (dim_i, stride_i) = pairs[i];
+                let (dim_next, stride_next) = pairs[i + 1];
+                if dim_i <= 1 || dim_next <= 1 {
+                    continue;
+                }
+                let expected = stride_i.unsigned_abs().checked_mul(dim_i)?;
+                if stride_next.unsigned_abs() != expected {
+                    return None;
+                }
+            }
+
+            Some((dims.iter().product(), pairs[0].1))
         }
     }
 }
@@ -160,8 +180,7 @@ mod tests {
     #[test]
     fn test_try_fuse_group_contiguous_col_major() {
         // 3x4 col-major: strides [1, 3]
-        // stride[0]=1 != stride[1]*dim[1] = 3*4 = 12 → not fusable
-        assert_eq!(try_fuse_group(&[3, 4], &[1, 3]), None);
+        assert_eq!(try_fuse_group(&[3, 4], &[1, 3]), Some((12, 1)));
     }
 
     #[test]

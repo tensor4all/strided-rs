@@ -78,15 +78,14 @@ where
 
     // Copy A to contiguous column-major if inner dims aren't fusable
     let a_contig_buf: Option<StridedArray<T>>;
-    let (a_ptr, a_row_stride, a_col_stride, a_batch_strides_vec);
+    let (a_ptr, a_row_stride, a_col_stride);
     if a_needs_copy {
-        let (mut buf, batch_strides) = alloc_batched_col_major(a.dims(), n_batch);
+        let mut buf = alloc_batched_col_major(a.dims(), n_batch);
         strided::copy_into(&mut buf.view_mut(), a)?;
         a_ptr = buf.view().ptr();
         // Col-major inner A [lo..., sum...]: lo stride = 1, sum stride = m
         a_row_stride = if m == 0 { 0 } else { 1isize };
         a_col_stride = m as isize;
-        a_batch_strides_vec = batch_strides;
         a_contig_buf = Some(buf);
     } else {
         let (_, rs) = fused_a_lo.unwrap();
@@ -94,22 +93,23 @@ where
         a_ptr = a.ptr();
         a_row_stride = rs;
         a_col_stride = cs;
-        a_batch_strides_vec = a_strides[..n_batch].to_vec();
         a_contig_buf = None;
     }
-    let _ = &a_contig_buf; // keep alive
+    let a_batch_strides: &[isize] = match a_contig_buf.as_ref() {
+        Some(buf) => &buf.strides()[..n_batch],
+        None => &a_strides[..n_batch],
+    };
 
     // Copy B to contiguous column-major if inner dims aren't fusable
     let b_contig_buf: Option<StridedArray<T>>;
-    let (b_ptr, b_row_stride, b_col_stride, b_batch_strides_vec);
+    let (b_ptr, b_row_stride, b_col_stride);
     if b_needs_copy {
-        let (mut buf, batch_strides) = alloc_batched_col_major(b.dims(), n_batch);
+        let mut buf = alloc_batched_col_major(b.dims(), n_batch);
         strided::copy_into(&mut buf.view_mut(), b)?;
         b_ptr = buf.view().ptr();
         // Col-major inner B [sum..., ro...]: sum stride = 1, ro stride = k
         b_row_stride = if k == 0 { 0 } else { 1isize };
         b_col_stride = k as isize;
-        b_batch_strides_vec = batch_strides;
         b_contig_buf = Some(buf);
     } else {
         let (_, rs) = fused_b_sum.unwrap();
@@ -117,16 +117,18 @@ where
         b_ptr = b.ptr();
         b_row_stride = rs;
         b_col_stride = cs;
-        b_batch_strides_vec = b_strides[..n_batch].to_vec();
         b_contig_buf = None;
     }
-    let _ = &b_contig_buf; // keep alive
+    let b_batch_strides: &[isize] = match b_contig_buf.as_ref() {
+        Some(buf) => &buf.strides()[..n_batch],
+        None => &b_strides[..n_batch],
+    };
 
     // Copy C to contiguous column-major if inner dims aren't fusable
     let c_contig_buf: Option<StridedArray<T>>;
-    let (c_ptr, c_row_stride, c_col_stride, c_batch_strides_vec);
+    let (c_ptr, c_row_stride, c_col_stride);
     if c_needs_copy {
-        let (mut buf, batch_strides) = alloc_batched_col_major(c.dims(), n_batch);
+        let mut buf = alloc_batched_col_major(c.dims(), n_batch);
         if beta != T::zero() {
             strided::copy_into(&mut buf.view_mut(), &c.as_view())?;
         }
@@ -134,7 +136,6 @@ where
         // Col-major inner C [lo..., ro...]: lo stride = 1, ro stride = m
         c_row_stride = if m == 0 { 0 } else { 1isize };
         c_col_stride = m as isize;
-        c_batch_strides_vec = batch_strides;
         c_contig_buf = Some(buf);
     } else {
         let (_, rs) = fused_c_lo.unwrap();
@@ -142,9 +143,12 @@ where
         c_ptr = c.as_mut_ptr();
         c_row_stride = rs;
         c_col_stride = cs;
-        c_batch_strides_vec = c_strides[..n_batch].to_vec();
         c_contig_buf = None;
     }
+    let c_batch_strides: &[isize] = match c_contig_buf.as_ref() {
+        Some(buf) => &buf.strides()[..n_batch],
+        None => &c_strides[..n_batch],
+    };
 
     let is_beta_zero = beta == T::zero();
     let is_beta_one = beta == T::one();
@@ -158,9 +162,9 @@ where
 
     let mut batch_iter = MultiIndex::new(batch_dims);
     while batch_iter.next().is_some() {
-        let a_batch_off = batch_iter.offset(&a_batch_strides_vec);
-        let b_batch_off = batch_iter.offset(&b_batch_strides_vec);
-        let c_batch_off = batch_iter.offset(&c_batch_strides_vec);
+        let a_batch_off = batch_iter.offset(a_batch_strides);
+        let b_batch_off = batch_iter.offset(b_batch_strides);
+        let c_batch_off = batch_iter.offset(c_batch_strides);
 
         // Pre-scale C by beta if beta is not 0 or 1
         if !is_beta_zero && !is_beta_one {
@@ -210,7 +214,7 @@ where
 fn alloc_batched_col_major<T: num_traits::Zero + Clone>(
     dims: &[usize],
     n_batch: usize,
-) -> (StridedArray<T>, Vec<isize>) {
+) -> StridedArray<T> {
     let total: usize = dims.iter().product::<usize>().max(1);
     let data = vec![T::zero(); total];
 
@@ -233,10 +237,9 @@ fn alloc_batched_col_major<T: num_traits::Zero + Clone>(
         }
     }
 
-    let batch_strides = strides[..n_batch].to_vec();
     let arr =
         StridedArray::from_parts(data, dims, &strides, 0).expect("batched col-major allocation");
-    (arr, batch_strides)
+    arr
 }
 
 #[cfg(test)]

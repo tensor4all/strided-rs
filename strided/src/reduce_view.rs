@@ -39,15 +39,10 @@ where
         return Ok(acc);
     }
 
-    let src_strides_v = src_strides.to_vec();
-    let src_dims_v = src_dims.to_vec();
-    let strides_list: [&[isize]; 1] = [&src_strides_v];
+    let strides_list: [&[isize]; 1] = [src_strides];
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(&src_dims_v, &strides_list, None, std::mem::size_of::<T>());
-    #[cfg(feature = "parallel")]
-    let ordered_strides_refs: Vec<&[isize]> =
-        ordered_strides.iter().map(|s| s.as_slice()).collect();
+        build_plan_fused(src_dims, &strides_list, None, std::mem::size_of::<T>());
 
     #[cfg(feature = "parallel")]
     {
@@ -60,7 +55,7 @@ where
             let threadedout_ptr = SendPtr(threadedout.as_mut_ptr());
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
+            let costs = compute_costs(&ordered_strides, fused_dims.len());
 
             // For complete reduction, strides_list has 2 entries:
             // [0] = threadedout (stride 0 everywhere — broadcasting), [1] = src
@@ -139,7 +134,7 @@ where
             for _ in 0..len {
                 let val = Op::apply(unsafe { *ptr });
                 let mapped = map_fn(val);
-                let current = acc.take().ok_or(StridedError::OffsetOverflow)?;
+                let current = acc.take().expect("accumulator must be initialized");
                 acc = Some(reduce_fn(current, mapped));
                 unsafe {
                     ptr = ptr.offset(stride);
@@ -149,7 +144,7 @@ where
         },
     )?;
 
-    acc.ok_or(StridedError::OffsetOverflow)
+    Ok(acc.expect("accumulator must be initialized"))
 }
 
 /// Reduce along a single axis, returning a new StridedArray.
@@ -200,46 +195,56 @@ where
 
     let total_out: usize = out_dims.iter().product();
     let out_strides = col_major_strides(&out_dims);
-    let mut data = vec![init.clone(); total_out];
+    let mut out =
+        StridedArray::from_parts(vec![init.clone(); total_out], &out_dims, &out_strides, 0)?;
 
-    // Build strides for iteration over non-axis dimensions
-    let iter_strides: Vec<isize> = src_strides
+    // Build source strides for iteration over non-axis dimensions (same rank as out_dims)
+    let src_kept_strides: Vec<isize> = src_strides
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != axis)
         .map(|(_, &s)| s)
         .collect();
 
-    // Iterate over all output positions
-    let out_rank = out_dims.len();
-    let mut idx = vec![0usize; out_rank];
-    for out_i in 0..total_out {
-        // Compute source base offset for this output position
-        let mut base_offset = 0isize;
-        for (d, &index) in idx.iter().enumerate() {
-            base_offset += index as isize * iter_strides[d];
-        }
+    let elem_size = std::mem::size_of::<T>().max(std::mem::size_of::<U>());
+    let strides_list: [&[isize]; 2] = [&out_strides, &src_kept_strides];
+    let (fused_dims, ordered_strides, plan) =
+        build_plan_fused(&out_dims, &strides_list, Some(0), elem_size);
 
-        // Reduce along the axis
-        let mut acc = init.clone();
-        let mut offset = base_offset;
-        for _ in 0..axis_len {
-            let val = Op::apply(unsafe { *src_ptr.offset(offset) });
-            let mapped = map_fn(val);
-            acc = reduce_fn(acc, mapped);
-            offset += axis_stride;
-        }
-        data[out_i] = acc;
+    let out_ptr = out.view_mut().as_mut_ptr();
 
-        // Increment multi-index (column-major order to match out_strides)
-        for d in 0..out_rank {
-            idx[d] += 1;
-            if idx[d] < out_dims[d] {
-                break;
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
+        &fused_dims,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
+        |offsets, len, strides| {
+            let out_step = strides[0];
+            let src_step = strides[1];
+            let mut out_off = offsets[0];
+            let mut src_off = offsets[1];
+
+            for _ in 0..len {
+                let mut acc = init.clone();
+                let mut ptr = unsafe { src_ptr.offset(src_off) };
+                for _ in 0..axis_len {
+                    let val = Op::apply(unsafe { *ptr });
+                    let mapped = map_fn(val);
+                    acc = reduce_fn(acc, mapped);
+                    unsafe {
+                        ptr = ptr.offset(axis_stride);
+                    }
+                }
+                unsafe {
+                    *out_ptr.offset(out_off) = acc;
+                }
+                out_off += out_step;
+                src_off += src_step;
             }
-            idx[d] = 0;
-        }
-    }
+            Ok(())
+        },
+    )?;
 
-    StridedArray::from_parts(data, &out_dims, &out_strides, 0)
+    Ok(out)
 }

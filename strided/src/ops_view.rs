@@ -225,20 +225,10 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: Element
         return Ok(());
     }
 
-    let dst_strides_v = dst_strides.to_vec();
-    let src_strides_v = src_strides.to_vec();
-    let dst_dims_v = dst_dims.to_vec();
-    let strides_list: [&[isize]; 2] = [&dst_strides_v, &src_strides_v];
+    let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
 
-    let (fused_dims, ordered_strides, plan) = build_plan_fused(
-        &dst_dims_v,
-        &strides_list,
-        Some(0),
-        std::mem::size_of::<T>(),
-    );
-    #[cfg(feature = "parallel")]
-    let ordered_strides_refs: Vec<&[isize]> =
-        ordered_strides.iter().map(|s| s.as_slice()).collect();
+    let (fused_dims, ordered_strides, plan) =
+        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
     #[cfg(feature = "parallel")]
     {
@@ -247,7 +237,7 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: Element
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
+            let costs = compute_costs(&ordered_strides, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -331,20 +321,10 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: Element
         return Ok(());
     }
 
-    let dst_strides_v = dst_strides.to_vec();
-    let src_strides_v = src_strides.to_vec();
-    let dst_dims_v = dst_dims.to_vec();
-    let strides_list: [&[isize]; 2] = [&dst_strides_v, &src_strides_v];
+    let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
 
-    let (fused_dims, ordered_strides, plan) = build_plan_fused(
-        &dst_dims_v,
-        &strides_list,
-        Some(0),
-        std::mem::size_of::<T>(),
-    );
-    #[cfg(feature = "parallel")]
-    let ordered_strides_refs: Vec<&[isize]> =
-        ordered_strides.iter().map(|s| s.as_slice()).collect();
+    let (fused_dims, ordered_strides, plan) =
+        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
     #[cfg(feature = "parallel")]
     {
@@ -353,7 +333,7 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: Element
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
+            let costs = compute_costs(&ordered_strides, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -441,20 +421,10 @@ pub fn axpy<
         return Ok(());
     }
 
-    let dst_strides_v = dst_strides.to_vec();
-    let src_strides_v = src_strides.to_vec();
-    let dst_dims_v = dst_dims.to_vec();
-    let strides_list: [&[isize]; 2] = [&dst_strides_v, &src_strides_v];
+    let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
 
-    let (fused_dims, ordered_strides, plan) = build_plan_fused(
-        &dst_dims_v,
-        &strides_list,
-        Some(0),
-        std::mem::size_of::<T>(),
-    );
-    #[cfg(feature = "parallel")]
-    let ordered_strides_refs: Vec<&[isize]> =
-        ordered_strides.iter().map(|s| s.as_slice()).collect();
+    let (fused_dims, ordered_strides, plan) =
+        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
     #[cfg(feature = "parallel")]
     {
@@ -463,7 +433,7 @@ pub fn axpy<
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
+            let costs = compute_costs(&ordered_strides, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -535,17 +505,17 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send +
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
-    let dst_dims = dest.dims().to_vec();
-    let dst_strides = dest.strides().to_vec();
-    let a_strides = a.strides().to_vec();
-    let b_strides = b.strides().to_vec();
+    let dst_dims = dest.dims();
+    let dst_strides = dest.strides();
+    let a_strides = a.strides();
+    let b_strides = b.strides();
 
-    if use_sequential_fast_path(total_len(&dst_dims))
-        && is_contiguous(&dst_dims, &dst_strides)
-        && is_contiguous(a.dims(), &a_strides)
-        && is_contiguous(b.dims(), &b_strides)
+    if use_sequential_fast_path(total_len(dst_dims))
+        && is_contiguous(dst_dims, dst_strides)
+        && is_contiguous(a.dims(), a_strides)
+        && is_contiguous(b.dims(), b_strides)
     {
-        let len = total_len(&dst_dims);
+        let len = total_len(dst_dims);
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
@@ -555,13 +525,10 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send +
         return Ok(());
     }
 
-    let strides_list: [&[isize]; 3] = [&dst_strides, &a_strides, &b_strides];
+    let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(&dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
-    #[cfg(feature = "parallel")]
-    let ordered_strides_refs: Vec<&[isize]> =
-        ordered_strides.iter().map(|s| s.as_slice()).collect();
+        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
 
     #[cfg(feature = "parallel")]
     {
@@ -571,7 +538,7 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send +
             let a_send = SendPtr(a_ptr as *mut T);
             let b_send = SendPtr(b_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides_refs, fused_dims.len());
+            let costs = compute_costs(&ordered_strides, fused_dims.len());
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -668,15 +635,12 @@ pub fn dot<
         return Ok(acc);
     }
 
-    let a_strides_v = a_strides.to_vec();
-    let b_strides_v = b_strides.to_vec();
-    let a_dims_v = a_dims.to_vec();
-    let strides_list: [&[isize]; 2] = [&a_strides_v, &b_strides_v];
+    let strides_list: [&[isize]; 2] = [a_strides, b_strides];
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(&a_dims_v, &strides_list, None, std::mem::size_of::<T>());
+        build_plan_fused(a_dims, &strides_list, None, std::mem::size_of::<T>());
 
-    let mut acc = Some(T::zero());
+    let mut acc = T::zero();
     let initial_offsets = vec![0isize; ordered_strides.len()];
     for_each_inner_block_preordered(
         &fused_dims,
@@ -684,23 +648,21 @@ pub fn dot<
         &ordered_strides,
         &initial_offsets,
         |offsets, len, strides| {
-            let mut local = acc.take().ok_or(StridedError::OffsetOverflow)?;
-            local = unsafe {
+            acc = unsafe {
                 inner_loop_dot::<T, OpA, OpB>(
                     a_ptr.offset(offsets[0]),
                     strides[0],
                     b_ptr.offset(offsets[1]),
                     strides[1],
                     len,
-                    local,
+                    acc,
                 )
             };
-            acc = Some(local);
             Ok(())
         },
     )?;
 
-    acc.ok_or(StridedError::OffsetOverflow)
+    Ok(acc)
 }
 
 /// Symmetrize a square matrix: `dest = (src + src^T) / 2`.

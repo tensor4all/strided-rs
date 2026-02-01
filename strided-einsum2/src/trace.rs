@@ -3,6 +3,7 @@
 //! Trace axes are axes that appear in only one operand and not in the output.
 //! They must be summed out (reduced) before the main contraction.
 
+use crate::util::MultiIndex;
 use stridedview::{ElementOp, ElementOpApply, StridedArray, StridedView};
 
 /// Reduce all trace axes from a view by summing them out.
@@ -27,22 +28,56 @@ where
         panic!("reduce_trace_axes called with empty trace_axes");
     }
 
-    // Use strided::reduce_axis iteratively
-    let mut current = strided::reduce_axis(src, trace_axes[0], Op::apply, |a, b| a + b, T::zero())?;
+    let src_dims = src.dims();
+    let src_strides = src.strides();
+    let src_ptr = src.ptr();
 
-    for (k, &axis) in trace_axes.iter().enumerate().skip(1) {
-        // Each previous reduction removed one axis, so adjust the index
-        let adjusted_axis = axis - (k);
-        current = strided::reduce_axis(
-            &current.view(),
-            adjusted_axis,
-            |x| x,
-            |a, b| a + b,
-            T::zero(),
-        )?;
+    debug_assert!(trace_axes.windows(2).all(|w| w[0] < w[1]));
+
+    let mut is_trace = vec![false; src_dims.len()];
+    for &axis in trace_axes {
+        is_trace[axis] = true;
     }
 
-    Ok(current)
+    let mut out_dims = Vec::with_capacity(src_dims.len().saturating_sub(trace_axes.len()));
+    let mut keep_strides = Vec::with_capacity(out_dims.capacity());
+    let mut trace_dims = Vec::with_capacity(trace_axes.len());
+    let mut trace_strides = Vec::with_capacity(trace_axes.len());
+
+    for (i, (&d, &s)) in src_dims.iter().zip(src_strides.iter()).enumerate() {
+        if is_trace[i] {
+            trace_dims.push(d);
+            trace_strides.push(s);
+        } else {
+            out_dims.push(d);
+            keep_strides.push(s);
+        }
+    }
+
+    let total_out: usize = out_dims.iter().product::<usize>().max(1);
+    let mut out_data = vec![T::zero(); total_out];
+
+    let mut out_iter = MultiIndex::new(&out_dims);
+    let mut trace_iter = MultiIndex::new(&trace_dims);
+    let mut out_i = 0usize;
+
+    while out_iter.next().is_some() {
+        let base_offset = out_iter.offset(&keep_strides);
+        trace_iter.reset();
+
+        let mut acc = T::zero();
+        while trace_iter.next().is_some() {
+            let offset = base_offset + trace_iter.offset(&trace_strides);
+            let val = Op::apply(unsafe { *src_ptr.offset(offset) });
+            acc = acc + val;
+        }
+
+        out_data[out_i] = acc;
+        out_i += 1;
+    }
+
+    let out_strides = stridedview::row_major_strides(&out_dims);
+    StridedArray::from_parts(out_data, &out_dims, &out_strides, 0)
 }
 
 #[cfg(test)]
