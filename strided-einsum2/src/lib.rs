@@ -21,7 +21,9 @@
 //! ).unwrap();
 //! ```
 
-pub mod bgemm;
+#[cfg(feature = "faer")]
+pub mod bgemm_faer;
+pub mod bgemm_naive;
 pub mod plan;
 pub mod trace;
 pub mod util;
@@ -36,6 +38,68 @@ pub use plan::Einsum2Plan;
 /// Trait alias for axis label types.
 pub trait AxisId: Clone + Eq + Hash + Debug {}
 impl<T: Clone + Eq + Hash + Debug> AxisId for T {}
+
+/// Trait alias for element types supported by einsum operations.
+///
+/// When the `faer` feature is enabled, this additionally requires `faer::ComplexField`
+/// so that the faer GEMM backend can be used.
+#[cfg(feature = "faer")]
+pub trait Scalar:
+    Copy
+    + ElementOpApply
+    + Send
+    + Sync
+    + std::ops::Mul<Output = Self>
+    + std::ops::Add<Output = Self>
+    + num_traits::Zero
+    + num_traits::One
+    + PartialEq
+    + faer_traits::ComplexField
+{
+}
+
+#[cfg(feature = "faer")]
+impl<T> Scalar for T where
+    T: Copy
+        + ElementOpApply
+        + Send
+        + Sync
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>
+        + num_traits::Zero
+        + num_traits::One
+        + PartialEq
+        + faer_traits::ComplexField
+{
+}
+
+#[cfg(not(feature = "faer"))]
+pub trait Scalar:
+    Copy
+    + ElementOpApply
+    + Send
+    + Sync
+    + std::ops::Mul<Output = Self>
+    + std::ops::Add<Output = Self>
+    + num_traits::Zero
+    + num_traits::One
+    + PartialEq
+{
+}
+
+#[cfg(not(feature = "faer"))]
+impl<T> Scalar for T where
+    T: Copy
+        + ElementOpApply
+        + Send
+        + Sync
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>
+        + num_traits::Zero
+        + num_traits::One
+        + PartialEq
+{
+}
 
 /// Errors specific to einsum operations.
 #[derive(Debug, thiserror::Error)]
@@ -66,7 +130,7 @@ pub type Result<T> = std::result::Result<T, EinsumError>;
 /// - **sum** (contraction): in A and B, not C
 /// - **left_trace**: only in A (summed out before contraction)
 /// - **right_trace**: only in B (summed out before contraction)
-pub fn einsum2_into<T, OpA, OpB, ID: AxisId>(
+pub fn einsum2_into<T: Scalar, OpA, OpB, ID: AxisId>(
     c: StridedViewMut<T>,
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
@@ -77,15 +141,6 @@ pub fn einsum2_into<T, OpA, OpB, ID: AxisId>(
     beta: T,
 ) -> Result<()>
 where
-    T: Copy
-        + ElementOpApply
-        + Send
-        + Sync
-        + std::ops::Mul<Output = T>
-        + std::ops::Add<Output = T>
-        + num_traits::Zero
-        + num_traits::One
-        + PartialEq,
     OpA: ElementOp,
     OpB: ElementOp,
 {
@@ -129,7 +184,21 @@ where
     let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
 
     // 5. Call batched GEMM
-    bgemm::bgemm_strided_into(
+    #[cfg(feature = "faer")]
+    bgemm_faer::bgemm_strided_into(
+        &mut c_perm,
+        &a_perm,
+        &b_perm,
+        plan.batch.len(),
+        plan.lo.len(),
+        plan.ro.len(),
+        plan.sum.len(),
+        alpha,
+        beta,
+    )?;
+
+    #[cfg(not(feature = "faer"))]
+    bgemm_naive::bgemm_strided_into(
         &mut c_perm,
         &a_perm,
         &b_perm,

@@ -72,6 +72,27 @@ impl Iterator for MultiIndex {
     }
 }
 
+/// Try to fuse a contiguous dimension group into a single (total_size, innermost_stride).
+///
+/// For the group to be fusable, consecutive dimensions must have contiguous strides:
+/// `stride[i] == stride[i+1] * dim[i+1]` for all i.
+///
+/// Returns `None` if strides are not contiguous within the group.
+pub fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
+    match dims.len() {
+        0 => Some((1, 0)),
+        1 => Some((dims[0], strides[0])),
+        n => {
+            for i in 0..n - 1 {
+                if strides[i] != strides[i + 1] * dims[i + 1] as isize {
+                    return None;
+                }
+            }
+            Some((dims.iter().product(), strides[n - 1]))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +139,40 @@ mod tests {
         let mut iter = MultiIndex::new(&[]);
         assert!(iter.next().is_some()); // single scalar iteration
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_try_fuse_group_empty() {
+        assert_eq!(try_fuse_group(&[], &[]), Some((1, 0)));
+    }
+
+    #[test]
+    fn test_try_fuse_group_single() {
+        assert_eq!(try_fuse_group(&[5], &[2]), Some((5, 2)));
+    }
+
+    #[test]
+    fn test_try_fuse_group_contiguous_row_major() {
+        // 3x4 row-major: strides [4, 1]
+        assert_eq!(try_fuse_group(&[3, 4], &[4, 1]), Some((12, 1)));
+    }
+
+    #[test]
+    fn test_try_fuse_group_contiguous_col_major() {
+        // 3x4 col-major: strides [1, 3]
+        // stride[0]=1 != stride[1]*dim[1] = 3*4 = 12 → not fusable
+        assert_eq!(try_fuse_group(&[3, 4], &[1, 3]), None);
+    }
+
+    #[test]
+    fn test_try_fuse_group_contiguous_3d() {
+        // 2x3x4 row-major: strides [12, 4, 1]
+        assert_eq!(try_fuse_group(&[2, 3, 4], &[12, 4, 1]), Some((24, 1)));
+    }
+
+    #[test]
+    fn test_try_fuse_group_non_contiguous() {
+        // strides don't follow contiguity rule
+        assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
     }
 }

@@ -13,6 +13,11 @@ stridedview = { path = "../stridedview" }
 strided = { path = "../strided" }
 num-traits = "0.2"
 thiserror = "1.0"
+faer = { version = "0.24", optional = true }
+faer-traits = { version = "0.24", optional = true }
+
+[features]
+default = ["faer", "faer-traits"]
 
 [dev-dependencies]
 approx = "0.5"
