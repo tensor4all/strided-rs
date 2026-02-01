@@ -28,10 +28,11 @@ pub mod plan;
 pub mod trace;
 pub mod util;
 
+use std::any::TypeId;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use stridedview::{ElementOp, ElementOpApply, StridedView, StridedViewMut};
+use stridedview::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 pub use plan::Einsum2Plan;
 
@@ -120,6 +121,18 @@ pub enum EinsumError {
 
 pub type Result<T> = std::result::Result<T, EinsumError>;
 
+/// Returns `true` if the given `ElementOp` type represents conjugation.
+///
+/// - `Identity` / `Transpose` → `false` (no per-element conjugation)
+/// - `Conj` / `Adjoint` → `true` (per-element conjugation needed)
+///
+/// For scalar types, `Transpose::apply(x) = x` (identity) and the dimension
+/// swap is already reflected in the view's strides/dims.  Similarly,
+/// `Adjoint::apply(x) = x.conj()` with the dimension swap in the view.
+fn op_is_conj<Op: ElementOp + 'static>() -> bool {
+    TypeId::of::<Op>() == TypeId::of::<Conj>() || TypeId::of::<Op>() == TypeId::of::<Adjoint>()
+}
+
 /// Binary einsum contraction: `C = alpha * contract(A, B) + beta * C`.
 ///
 /// `ic`, `ia`, `ib` are axis labels for C, A, B respectively.
@@ -141,8 +154,8 @@ pub fn einsum2_into<T: Scalar, OpA, OpB, ID: AxisId>(
     beta: T,
 ) -> Result<()>
 where
-    OpA: ElementOp,
-    OpB: ElementOp,
+    OpA: ElementOp + 'static,
+    OpB: ElementOp + 'static,
 {
     // 1. Build plan
     let plan = Einsum2Plan::new(ia, ib, ic)?;
@@ -150,30 +163,35 @@ where
     // 2. Validate dimension consistency across operands
     validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
 
-    // 3. Reduce trace axes if present
-    let a_reduced;
-    let a_view: StridedView<T>;
-    let has_left_trace = !plan.left_trace.is_empty();
-    if has_left_trace {
+    // 3. Reduce trace axes if present; determine conjugation flags.
+    //    When trace reduction occurs, Op is already applied during the reduction,
+    //    so conj flag is false. Otherwise, we strip the Op and pass a conj flag
+    //    to the GEMM kernel (avoiding materialization).
+    let (a_buf, conj_a) = if !plan.left_trace.is_empty() {
         let trace_indices = plan.left_trace_indices(ia);
-        a_reduced = trace::reduce_trace_axes(a, &trace_indices)?;
-        a_view = a_reduced.view();
+        (Some(trace::reduce_trace_axes(a, &trace_indices)?), false)
     } else {
-        // No trace: just apply the element op by creating an Identity view
-        // We need to strip the Op to get StridedView<T, Identity>
-        a_view = strip_op_view(a);
-    }
+        (None, op_is_conj::<OpA>())
+    };
 
-    let b_reduced;
-    let b_view: StridedView<T>;
-    let has_right_trace = !plan.right_trace.is_empty();
-    if has_right_trace {
+    let a_view: StridedView<T> = match a_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => StridedView::new(a.data(), a.dims(), a.strides(), a.offset())
+            .expect("strip_op_view: metadata already validated"),
+    };
+
+    let (b_buf, conj_b) = if !plan.right_trace.is_empty() {
         let trace_indices = plan.right_trace_indices(ib);
-        b_reduced = trace::reduce_trace_axes(b, &trace_indices)?;
-        b_view = b_reduced.view();
+        (Some(trace::reduce_trace_axes(b, &trace_indices)?), false)
     } else {
-        b_view = strip_op_view(b);
-    }
+        (None, op_is_conj::<OpB>())
+    };
+
+    let b_view: StridedView<T> = match b_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => StridedView::new(b.data(), b.dims(), b.strides(), b.offset())
+            .expect("strip_op_view: metadata already validated"),
+    };
 
     // 4. Permute to canonical order
     //    A -> [batch, lo, sum]
@@ -195,6 +213,8 @@ where
         plan.sum.len(),
         alpha,
         beta,
+        conj_a,
+        conj_b,
     )?;
 
     #[cfg(not(feature = "faer"))]
@@ -208,24 +228,11 @@ where
         plan.sum.len(),
         alpha,
         beta,
+        conj_a,
+        conj_b,
     )?;
 
     Ok(())
-}
-
-/// Strip the element operation, returning a plain `StridedView<T, Identity>`.
-///
-/// This reuses the same underlying data slice with identical dims/strides/offset.
-/// It is correct only when the element op does not change values (i.e., `Identity`
-/// on real types). For complex types with `Conj`/`Adjoint`, the caller must
-/// materialize first (the trace path already does this).
-fn strip_op_view<'a, T, Op>(src: &StridedView<'a, T, Op>) -> StridedView<'a, T>
-where
-    T: Copy + ElementOpApply,
-    Op: ElementOp,
-{
-    StridedView::new(src.data(), src.dims(), src.strides(), src.offset())
-        .expect("strip_op_view: metadata already validated")
 }
 
 /// Validate that dimensions match across operands for each axis group.
@@ -554,5 +561,139 @@ mod tests {
 
         assert_eq!(c.get(&[0, 0]), 19.0);
         assert_eq!(c.get(&[1, 1]), 50.0);
+    }
+
+    #[test]
+    fn test_complex_matmul() {
+        use num_complex::Complex64;
+        let i = Complex64::i();
+
+        // A = [[1+i, 2], [3, 4-i]]
+        let a_vals = [
+            [1.0 + i, Complex64::new(2.0, 0.0)],
+            [Complex64::new(3.0, 0.0), 4.0 - i],
+        ];
+        let a = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| a_vals[idx[0]][idx[1]]);
+
+        // B = [[1, i], [0, 1]]
+        let b_vals = [
+            [Complex64::new(1.0, 0.0), i],
+            [Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+        ];
+        let b = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| b_vals[idx[0]][idx[1]]);
+
+        let mut c = StridedArray::<Complex64>::row_major(&[2, 2]);
+
+        einsum2_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        )
+        .unwrap();
+
+        // C = A * B
+        // C[0,0] = (1+i)*1 + 2*0 = 1+i
+        // C[0,1] = (1+i)*i + 2*1 = i+i²+2 = i-1+2 = 1+i
+        // C[1,0] = 3*1 + (4-i)*0 = 3
+        // C[1,1] = 3*i + (4-i)*1 = 3i+4-i = 4+2i
+        assert_eq!(c.get(&[0, 0]), 1.0 + i);
+        assert_eq!(c.get(&[0, 1]), 1.0 + i);
+        assert_eq!(c.get(&[1, 0]), Complex64::new(3.0, 0.0));
+        assert_eq!(c.get(&[1, 1]), 4.0 + 2.0 * i);
+    }
+
+    #[test]
+    fn test_complex_matmul_with_conj() {
+        use num_complex::Complex64;
+        let i = Complex64::i();
+
+        // A = [[1+i, 2i], [3, 4-i]]
+        let a_vals = [[1.0 + i, 2.0 * i], [Complex64::new(3.0, 0.0), 4.0 - i]];
+        let a = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| a_vals[idx[0]][idx[1]]);
+
+        // B = identity
+        let b = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| {
+            if idx[0] == idx[1] {
+                Complex64::new(1.0, 0.0)
+            } else {
+                Complex64::new(0.0, 0.0)
+            }
+        });
+
+        let mut c = StridedArray::<Complex64>::row_major(&[2, 2]);
+
+        // C = conj(A) * B = conj(A)
+        let a_conj = a.view().conj();
+        einsum2_into(
+            c.view_mut(),
+            &a_conj,
+            &b.view(),
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        )
+        .unwrap();
+
+        // conj(A) = [[1-i, -2i], [3, 4+i]]
+        assert_eq!(c.get(&[0, 0]), 1.0 - i);
+        assert_eq!(c.get(&[0, 1]), -2.0 * i);
+        assert_eq!(c.get(&[1, 0]), Complex64::new(3.0, 0.0));
+        assert_eq!(c.get(&[1, 1]), 4.0 + i);
+    }
+
+    #[test]
+    fn test_complex_matmul_with_conj_both() {
+        use num_complex::Complex64;
+        let i = Complex64::i();
+
+        // A = [[1+i, 0], [0, 2-i]]
+        let a_vals = [
+            [1.0 + i, Complex64::new(0.0, 0.0)],
+            [Complex64::new(0.0, 0.0), 2.0 - i],
+        ];
+        let a = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| a_vals[idx[0]][idx[1]]);
+
+        // B = [[1, i], [0, 1+i]]
+        let b_vals = [
+            [Complex64::new(1.0, 0.0), i],
+            [Complex64::new(0.0, 0.0), 1.0 + i],
+        ];
+        let b = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| b_vals[idx[0]][idx[1]]);
+
+        let mut c = StridedArray::<Complex64>::row_major(&[2, 2]);
+
+        // C = conj(A) * conj(B)
+        let a_conj = a.view().conj();
+        let b_conj = b.view().conj();
+        einsum2_into(
+            c.view_mut(),
+            &a_conj,
+            &b_conj,
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        )
+        .unwrap();
+
+        // conj(A) = [[1-i, 0], [0, 2+i]]
+        // conj(B) = [[1, -i], [0, 1-i]]
+        // C = conj(A) * conj(B)
+        // C[0,0] = (1-i)*1 + 0*0 = 1-i
+        // C[0,1] = (1-i)*(-i) + 0*(1-i) = -i+i² = -i-1 = -(1+i)
+        // C[1,0] = 0*1 + (2+i)*0 = 0
+        // C[1,1] = 0*(-i) + (2+i)*(1-i) = 2-2i+i-i² = 2-i+1 = 3-i
+        assert_eq!(c.get(&[0, 0]), 1.0 - i);
+        assert_eq!(c.get(&[0, 1]), -(1.0 + i));
+        assert_eq!(c.get(&[1, 0]), Complex64::new(0.0, 0.0));
+        assert_eq!(c.get(&[1, 1]), 3.0 - i);
     }
 }

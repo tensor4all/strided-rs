@@ -3,7 +3,7 @@
 use crate::util::invert_perm;
 use crate::AxisId;
 use crate::EinsumError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Pre-computed execution plan for a binary einsum contraction.
 ///
@@ -99,44 +99,40 @@ impl<ID: AxisId> Einsum2Plan<ID> {
 
         // Build left_perm: maps positions in ia (after trace removal) to [batch, lo, sum] order
         let ia_after_trace: Vec<&ID> = ia.iter().filter(|id| !left_trace.contains(id)).collect();
-        let left_order: Vec<&ID> = batch.iter().chain(lo.iter()).chain(sum.iter()).collect();
-        let left_perm: Vec<usize> = left_order
+        let ia_pos: HashMap<&ID, usize> = ia_after_trace
             .iter()
-            .map(|id| {
-                ia_after_trace
-                    .iter()
-                    .position(|x| *x == *id)
-                    .expect("left_perm: axis not found")
-            })
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        let left_perm: Vec<usize> = batch
+            .iter()
+            .chain(lo.iter())
+            .chain(sum.iter())
+            .map(|id| *ia_pos.get(id).expect("left_perm: axis not found"))
             .collect();
 
         // Build right_perm: maps positions in ib (after trace removal) to [batch, sum, ro] order
         let ib_after_trace: Vec<&ID> = ib.iter().filter(|id| !right_trace.contains(id)).collect();
-        let right_order: Vec<&ID> = batch.iter().chain(sum.iter()).chain(ro.iter()).collect();
-        let right_perm: Vec<usize> = right_order
+        let ib_pos: HashMap<&ID, usize> = ib_after_trace
             .iter()
-            .map(|id| {
-                ib_after_trace
-                    .iter()
-                    .position(|x| *x == *id)
-                    .expect("right_perm: axis not found")
-            })
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        let right_perm: Vec<usize> = batch
+            .iter()
+            .chain(sum.iter())
+            .chain(ro.iter())
+            .map(|id| *ib_pos.get(id).expect("right_perm: axis not found"))
             .collect();
 
         // Build c_to_internal_perm: maps IC order to [batch, lo, ro] order
-        let c_internal_order: Vec<&ID> = batch.iter().chain(lo.iter()).chain(ro.iter()).collect();
-        let c_internal_perm: Vec<usize> = c_internal_order
+        let ic_pos: HashMap<&ID, usize> = ic.iter().enumerate().map(|(i, id)| (id, i)).collect();
+        let c_to_internal_perm: Vec<usize> = batch
             .iter()
-            .map(|id| {
-                ic.iter()
-                    .position(|x| x == *id)
-                    .expect("c_to_internal_perm: axis not found")
-            })
+            .chain(lo.iter())
+            .chain(ro.iter())
+            .map(|id| *ic_pos.get(id).expect("c_to_internal_perm: axis not found"))
             .collect();
-        // We need the inverse: given C in IC order, permute to [batch, lo, ro]
-        // c_internal_perm[i] = position in IC of the i-th internal axis
-        // That IS the permutation we want: c_permuted[i] = c_original[c_internal_perm[i]]
-        let c_to_internal_perm = c_internal_perm;
 
         Ok(Einsum2Plan {
             batch,
