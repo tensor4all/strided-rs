@@ -16,7 +16,11 @@ RAYON_NUM_THREADS=1 cargo bench --bench rust_compare \
 echo ""
 
 echo "--- Julia (Strided.jl, single-threaded) ---"
-JULIA_NUM_THREADS=1 julia "$SCRIPT_DIR/julia_compare.jl"
+if command -v julia >/dev/null 2>&1; then
+    JULIA_NUM_THREADS=1 julia --project="$SCRIPT_DIR" "$SCRIPT_DIR/julia_compare.jl"
+else
+    echo "julia not found; skipping Julia benchmarks."
+fi
 echo ""
 
 echo "============================================================"
@@ -42,6 +46,10 @@ for T in $THREADS; do
     echo ""
 
     echo "--- Julia (Strided.jl) ---"
-    JULIA_NUM_THREADS=$T julia "$SCRIPT_DIR/julia_threaded_compare.jl"
+    if command -v julia >/dev/null 2>&1; then
+        JULIA_NUM_THREADS=$T julia --project="$SCRIPT_DIR" "$SCRIPT_DIR/julia_threaded_compare.jl"
+    else
+        echo "julia not found; skipping Julia benchmarks."
+    fi
     echo ""
 done
