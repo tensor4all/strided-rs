@@ -4,9 +4,9 @@
 //! It uses Julia's `totalmemoryregion` for accurate memory region estimation
 //! and `_computeblocks` for iterative block size reduction.
 
-use crate::auxiliary::index_order;
 use crate::fuse::compute_costs;
 use crate::{BLOCK_MEMORY_SIZE, CACHE_LINE_SIZE};
+use stridedview::auxiliary::index_order;
 
 /// Compute block sizes for tiled iteration.
 ///

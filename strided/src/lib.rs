@@ -54,13 +54,10 @@
 //! - Operations are blocked into tiles fitting L1 cache ([`BLOCK_MEMORY_SIZE`] = 32KB)
 //! - Contiguous arrays use fast paths bypassing the blocking machinery
 
-mod auxiliary;
 mod block;
-mod element_op;
 mod fuse;
 mod kernel;
 mod order;
-pub mod strided_view;
 #[cfg(feature = "parallel")]
 mod threading;
 
@@ -70,15 +67,12 @@ mod ops_view;
 mod reduce_view;
 
 // ============================================================================
-// Element operations
+// Re-exports from stridedview for backward compatibility
 // ============================================================================
-pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose};
-
-// ============================================================================
-// View-based types
-// ============================================================================
-pub use strided_view::{
-    col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut,
+pub use stridedview::strided_view;
+pub use stridedview::{
+    col_major_strides, row_major_strides, Adjoint, Compose, Conj, ElementOp, ElementOpApply,
+    Identity, Result, StridedArray, StridedError, StridedView, StridedViewMut, Transpose,
 };
 
 // ============================================================================
@@ -113,42 +107,3 @@ pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;
 ///
 /// Used for memory region calculations in block size computation.
 pub const CACHE_LINE_SIZE: usize = 64;
-
-// ============================================================================
-// Error types
-// ============================================================================
-
-/// Errors that can occur during strided array operations.
-#[derive(Debug, thiserror::Error)]
-pub enum StridedError {
-    /// Array ranks do not match.
-    #[error("rank mismatch: {0} vs {1}")]
-    RankMismatch(usize, usize),
-
-    /// Array shapes are incompatible for the operation.
-    #[error("shape mismatch: {0:?} vs {1:?}")]
-    ShapeMismatch(Vec<usize>, Vec<usize>),
-
-    /// Invalid axis index for the given array rank.
-    #[error("invalid axis {axis} for rank {rank}")]
-    InvalidAxis { axis: usize, rank: usize },
-
-    /// Stride array length doesn't match dimensions.
-    #[error("stride and dims length mismatch")]
-    StrideLengthMismatch,
-
-    /// Integer overflow while computing array offset.
-    #[error("offset overflow while computing pointer")]
-    OffsetOverflow,
-
-    /// Failed to convert a scalar value for scaling operation.
-    #[error("failed to convert scalar for scaling")]
-    ScalarConversion,
-
-    /// Matrix is not square when a square matrix was required.
-    #[error("non-square matrix: rows={rows}, cols={cols}")]
-    NonSquare { rows: usize, cols: usize },
-}
-
-/// Result type for strided array operations.
-pub type Result<T> = std::result::Result<T, StridedError>;

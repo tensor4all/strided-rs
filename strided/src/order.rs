@@ -3,8 +3,8 @@
 //! This module computes the optimal dimension iteration order using
 //! the index_order + importance bit-packing algorithm from Julia.
 
-use crate::auxiliary::index_order;
 use crate::fuse::{compute_importance, sort_by_importance};
+use stridedview::auxiliary::index_order;
 
 /// Compute the optimal iteration order for dimensions.
 ///

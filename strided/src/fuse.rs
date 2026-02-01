@@ -173,7 +173,7 @@ pub fn compute_costs(all_strides: &[&[isize]]) -> Vec<isize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auxiliary::index_order;
+    use stridedview::auxiliary::index_order;
 
     #[test]
     fn test_fuse_dims_contiguous() {
