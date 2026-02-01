@@ -34,7 +34,7 @@
 //! # Example
 //!
 //! ```rust
-//! use strided_rs::{StridedView, StridedViewMut, StridedArray, Identity, map_into};
+//! use strided::{StridedView, StridedViewMut, StridedArray, Identity, map_into};
 //!
 //! // Create a column-major array (Julia default)
 //! let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| {

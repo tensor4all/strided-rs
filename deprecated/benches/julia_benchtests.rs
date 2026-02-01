@@ -4,7 +4,7 @@ use mdarray::Tensor;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
-use strided_rs::{
+use strided::{
     copy_into, mapreducedim_capture_views_into, sum, Arg, CaptureArgs, Identity, StridedArrayView,
     StridedArrayViewMut,
 };

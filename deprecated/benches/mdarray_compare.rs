@@ -4,7 +4,7 @@ use mdarray::Tensor;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
-use strided_rs::copy_into;
+use strided::copy_into;
 
 // Compare mdarray's assign (iterator-based) with strided-rs's copy_into (blocked)
 // for a 4D permutation: (32, 32, 32, 32) -> [3, 2, 1, 0]
