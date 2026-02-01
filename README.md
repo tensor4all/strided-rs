@@ -146,28 +146,28 @@ block), which enables threading for any memory layout, not just column-major.
 Run all benchmarks (single-threaded + multi-threaded, Rust + Julia):
 
 ```bash
-bash benches/run_all.sh        # default thread counts: 1 2 4
-bash benches/run_all.sh 1 2 4 8  # custom thread counts
+bash strided-kernel/benches/run_all.sh        # default thread counts: 1 2 4
+bash strided-kernel/benches/run_all.sh 1 2 4 8  # custom thread counts
 ```
 
 Or individually:
 
 ```bash
 # Single-threaded Rust
-cargo bench --bench rust_compare
+cargo bench --bench rust_compare --manifest-path strided-kernel/Cargo.toml
 
 # Single-threaded Julia
-JULIA_NUM_THREADS=1 julia --project=. benches/julia_compare.jl
+JULIA_NUM_THREADS=1 julia --project=strided-kernel/benches strided-kernel/benches/julia_compare.jl
 
 # Multi-threaded Rust (N threads)
-RAYON_NUM_THREADS=N cargo bench --features parallel --bench threaded_compare
+RAYON_NUM_THREADS=N cargo bench --features parallel --bench threaded_compare --manifest-path strided-kernel/Cargo.toml
 
 # Multi-threaded comparison script
-bash benches/run_threaded.sh 1 2 4
+bash strided-kernel/benches/run_threaded.sh 1 2 4
 
 # Scaling benchmarks (sum + permute, 1/2/4 threads)
-bash benches/run_scaling.sh
-bash benches/run_scaling.sh 1 2 4 8  # custom thread counts
+bash strided-kernel/benches/run_scaling.sh
+bash strided-kernel/benches/run_scaling.sh 1 2 4 8  # custom thread counts
 ```
 
 ### Single-Threaded Results
@@ -176,32 +176,32 @@ Environment: Apple Silicon M2, single-threaded.
 
 | Case | Julia Strided (ms) | Rust strided (ms) | Rust naive (ms) |
 |---|---:|---:|---:|
-| symmetrize_4000 | 17.39 | 20.07 | 39.12 |
-| scale_transpose_1000 | 0.47 | 0.68 | 0.41 |
-| mwe_stridedview_scale_transpose_1000 | 0.50 | 0.60 | 0.41 |
-| complex_elementwise_1000 | 7.71 | 12.70 | 12.15 |
-| permute_32_4d | 0.87 | 1.04 | 1.89 |
-| multiple_permute_sum_32_4d | 2.27 | 3.02 | 2.18 |
+| symmetrize_4000 | 22.22 | 21.41 | 43.09 |
+| scale_transpose_1000 | 0.67 | 0.95 | 0.47 |
+| mwe_stridedview_scale_transpose_1000 | 0.78 | 0.99 | 0.40 |
+| complex_elementwise_1000 | 8.10 | 12.79 | 12.21 |
+| permute_32_4d | 1.04 | 1.32 | 2.03 |
+| multiple_permute_sum_32_4d | 2.44 | 3.24 | 2.48 |
 
 Notes:
-- Julia results from `benches/julia_compare.jl` (mean time). Rust results from `benches/rust_compare.rs` (best of 3 runs).
+- Julia results from `strided-kernel/benches/julia_compare.jl` (mean time). Rust results from `strided-kernel/benches/rust_compare.rs` (mean time).
 - All benchmarks use column-major layout for parity with Julia.
 - The Rust naive baseline uses raw pointer arithmetic with `unsafe` and precomputed strides (no bounds checks, no library overhead).
 - `scale_transpose` and `multiple_permute_sum`: the naive baseline is faster because the ordering/blocking pipeline overhead is not recovered on these relatively small, simple access patterns. Julia Strided shows the same trend.
 
 ### Multi-Threaded Scaling (Rust, `parallel` feature)
 
-Environment: Apple Silicon M2 (4 performance + 4 efficiency cores). Best of 3 runs.
+Environment: Apple Silicon M2 (4 performance + 4 efficiency cores). Mean time.
 
 | Case | 1T (ms) | 2T (ms) | 4T (ms) | Speedup (4T) |
 |---|---:|---:|---:|---:|
-| symmetrize_4000 | 20.3 | 16.7 | 11.0 | 1.9x |
-| scale_transpose_1000 | 0.77 | 0.48 | 0.35 | 2.2x |
-| mwe_scale_transpose_1000 | 0.64 | 0.36 | 0.25 | 2.5x |
-| complex_elementwise_1000 | 12.8 | 6.5 | 3.6 | 3.5x |
-| permute_32_4d | 1.03 | 0.60 | 0.40 | 2.6x |
-| multiple_permute_sum_32_4d | 2.91 | 1.73 | 1.19 | 2.4x |
-| sum_1m | 0.87 | 0.47 | 0.30 | 2.9x |
+| symmetrize_4000 | 26.30 | 18.95 | 12.29 | 2.1x |
+| scale_transpose_1000 | 1.03 | 0.49 | 0.35 | 2.9x |
+| mwe_scale_transpose_1000 | 0.88 | 0.39 | 0.29 | 3.1x |
+| complex_elementwise_1000 | 13.11 | 6.82 | 3.56 | 3.7x |
+| permute_32_4d | 1.40 | 0.70 | 0.51 | 2.8x |
+| multiple_permute_sum_32_4d | 3.34 | 1.96 | 1.34 | 2.5x |
+| sum_1m | 0.96 | 0.47 | 0.27 | 3.5x |
 
 ### Algorithm Comparison: Julia Strided.jl vs Rust strided-rs
 
@@ -235,7 +235,7 @@ The key architectural differences are:
 These benchmarks measure performance across exponentially-scaled array sizes, showing the
 crossover point where the ordering/blocking pipeline overhead pays off.
 
-Run with: `bash benches/run_scaling.sh` (default: 1 2 4 threads)
+Run with: `bash strided-kernel/benches/run_scaling.sh` (default: 1 2 4 threads)
 
 Environment: Apple Silicon M2 (4P + 4E cores). Median timing, adaptive iteration count.
 
@@ -243,94 +243,94 @@ Environment: Apple Silicon M2 (4P + 4E cores). Median timing, adaptive iteration
 
 | size | Rust naive (μs) | Rust strided 1T | 2T | 4T | Julia base (μs) | Julia Strided 1T | 2T | 4T |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 0.04 | 0.04 | 0.04 | 0.00 | 0.00 | 0.04 | 0.04 | 0.04 |
-| 12 | 0.04 | 0.04 | 0.00 | 0.04 | 0.00 | 0.04 | 0.04 | 0.04 |
-| 32 | 0.04 | 0.00 | 0.00 | 0.00 | 0.00 | 0.04 | 0.04 | 0.04 |
-| 91 | 0.04 | 0.04 | 0.04 | 0.04 | 0.00 | 0.08 | 0.08 | 0.08 |
-| 256 | 0.13 | 0.17 | 0.17 | 0.17 | 0.04 | 0.17 | 0.17 | 0.17 |
-| 725 | 0.58 | 0.67 | 0.63 | 0.63 | 0.08 | 0.38 | 0.38 | 0.38 |
-| 2048 | 2.29 | 2.08 | 1.88 | 1.88 | 0.21 | 1.00 | 0.96 | 1.00 |
-| 5793 | 5.13 | 5.17 | 5.38 | 5.38 | 0.50 | 2.67 | 2.67 | 2.75 |
-| 16384 | 13.96 | 13.96 | 15.25 | 15.29 | 1.58 | 7.46 | 7.46 | 7.71 |
-| 46341 | 39.58 | 40.63 | 28.88 | 46.38 | 4.58 | 21.00 | 21.00 | 21.75 |
-| 131072 | 112.13 | 113.29 | 68.63 | 87.83 | 12.83 | 59.21 | 46.67 | 45.29 |
-| 370728 | 317.33 | 318.46 | 182.13 | 198.29 | 36.50 | 167.38 | 103.23 | 84.04 |
-| 1048576 | 913.50 | 940.21 | 505.13 | 447.96 | 106.04 | 473.71 | 250.00 | 222.90 |
+| 4 | 0.04 | 0.04 | 0.00 | 0.00 | 0.00 | 0.04 | 0.04 | 0.04 |
+| 12 | 0.04 | 0.04 | 0.00 | 0.00 | 0.00 | 0.04 | 0.04 | 0.04 |
+| 32 | 0.04 | 0.04 | 0.00 | 0.00 | 0.00 | 0.04 | 0.04 | 0.04 |
+| 91 | 0.08 | 0.04 | 0.04 | 0.04 | 0.00 | 0.08 | 0.08 | 0.08 |
+| 256 | 0.21 | 0.04 | 0.04 | 0.04 | 0.04 | 0.17 | 0.17 | 0.17 |
+| 725 | 0.75 | 0.12 | 0.08 | 0.08 | 0.08 | 0.38 | 0.38 | 0.38 |
+| 2048 | 2.04 | 0.29 | 0.25 | 0.25 | 0.21 | 0.92 | 0.96 | 0.96 |
+| 5793 | 5.12 | 0.62 | 0.67 | 0.67 | 0.50 | 2.62 | 2.58 | 2.58 |
+| 16384 | 13.96 | 1.83 | 1.83 | 1.83 | 1.54 | 7.08 | 7.25 | 7.25 |
+| 46341 | 39.62 | 40.58 | 36.58 | 38.46 | 4.62 | 20.46 | 26.67 | 16.71 |
+| 131072 | 112.17 | 113.21 | 77.12 | 77.12 | 12.50 | 57.75 | 46.85 | 24.33 |
+| 370728 | 334.54 | 320.54 | 186.08 | 189.25 | 35.25 | 163.33 | 101.56 | 61.71 |
+| 1048576 | 907.58 | 933.54 | 500.00 | 431.79 | 102.54 | 469.21 | 251.29 | 160.67 |
 
 Notes:
-- For 1D contiguous sum, Rust strided matches naive (no ordering/blocking benefit). Julia's `@strided sum` has ~4.5x overhead over `Base.sum` due to mapreduce kernel dispatch.
-- Multi-threading kicks in at large sizes (≥46K elements for 2T, ≥131K for visible 4T benefit).
-- Julia's `Base.sum` uses hand-tuned SIMD reduction; Rust's naive loop is comparable at large sizes.
+- For 1D contiguous sum, Rust strided can beat the naive loop at small/medium sizes due to an explicit SIMD reduction kernel.
+- With the Rust `parallel` feature enabled, sizes above the threading threshold route through the threaded kernel path (even at 1T), so 1T can be slightly slower than the naive loop until multi-threading is enabled.
+- Julia's `Base.sum` uses hand-tuned SIMD reduction; Julia's `@strided sum` includes kernel-dispatch overhead compared to `Base.sum`.
 
 #### 4D Permute: (4,3,2,1) — full reversal
 
 | s | s⁴ | Rust naive (μs) | Rust strided 1T | 2T | 4T | Julia copy (μs) | Julia Strided 1T | 2T | 4T |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 256 | 0.21 | 1.58 | 1.42 | 1.46 | 0.04 | 0.33 | 0.33 | 0.33 |
-| 8 | 4096 | 2.00 | 4.83 | 3.71 | 3.79 | 0.67 | 1.88 | 2.04 | 1.96 |
-| 12 | 20736 | 14.96 | 15.00 | 13.00 | 13.42 | 3.71 | 9.21 | 9.08 | 9.25 |
-| 16 | 65536 | 59.29 | 51.21 | 32.67 | 48.25 | 9.63 | 33.08 | 35.15 | 42.71 |
-| 24 | 331776 | 296.50 | 176.25 | 103.29 | 183.00 | 80.73 | 296.08 | 91.33 | 153.33 |
-| 32 | 1048576 | 1171.88 | 1217.54 | 558.29 | 787.75 | 282.75 | 1916.75 | 815.88 | 718.67 |
-| 48 | 5308416 | 16536.67 | 8519.63 | 5752.17 | 4834.67 | 1553.42 | 10208.33 | 5343.88 | 4161.00 |
-| 64 | 16777216 | 94066.63 | 53422.79 | 28749.04 | 20146.46 | 3535.10 | 49696.58 | 30640.00 | 21502.40 |
+| 4 | 256 | 0.21 | 1.33 | 1.33 | 1.33 | 0.04 | 0.29 | 0.33 | 0.29 |
+| 8 | 4096 | 2.04 | 4.00 | 4.29 | 4.04 | 0.42 | 1.79 | 1.83 | 1.79 |
+| 12 | 20736 | 14.33 | 14.25 | 14.21 | 14.21 | 2.50 | 8.58 | 8.54 | 8.54 |
+| 16 | 65536 | 53.71 | 50.71 | 45.75 | 47.00 | 7.88 | 31.92 | 34.33 | 40.50 |
+| 24 | 331776 | 292.25 | 201.33 | 126.00 | 149.50 | 40.62 | 127.12 | 86.38 | 70.08 |
+| 32 | 1048576 | 1206.62 | 1512.17 | 637.92 | 491.54 | 188.00 | 934.00 | 468.08 | 333.88 |
+| 48 | 5308416 | 19000.92 | 9917.50 | 6321.96 | 3604.54 | 1163.71 | 8151.92 | 5123.25 | 3238.73 |
+| 64 | 16777216 | 98992.71 | 52719.83 | 28936.25 | 17362.04 | 4016.40 | 50167.04 | 26492.71 | 16612.62 |
 
 #### 4D Permute: (2,3,4,1)
 
 | s | s⁴ | Rust naive (μs) | Rust strided 1T | 2T | 4T | Julia copy (μs) | Julia Strided 1T | 2T | 4T |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 256 | 0.21 | 1.67 | 1.38 | 1.42 | 0.04 | 0.29 | 0.29 | 0.29 |
-| 8 | 4096 | 2.08 | 4.63 | 3.58 | 3.71 | 0.75 | 1.67 | 1.75 | 1.71 |
-| 12 | 20736 | 17.83 | 13.58 | 12.54 | 12.54 | 2.75 | 9.17 | 9.75 | 9.79 |
-| 16 | 65536 | 47.33 | 34.83 | 88.50 | 52.71 | 11.67 | 26.96 | 31.63 | 28.58 |
-| 24 | 331776 | 237.08 | 157.33 | 128.46 | 269.63 | 50.88 | 135.44 | 87.38 | 109.79 |
-| 32 | 1048576 | 767.67 | 1000.54 | 858.25 | 828.13 | 189.29 | 1581.75 | 407.92 | 401.44 |
-| 48 | 5308416 | 16737.54 | 6166.25 | 4979.42 | 3750.50 | 1520.38 | 8346.42 | 4572.46 | 3709.42 |
-| 64 | 16777216 | 83689.75 | 28567.17 | 16514.21 | 14024.00 | 4288.92 | 22832.73 | 21118.21 | 10281.23 |
+| 4 | 256 | 0.21 | 1.29 | 1.29 | 1.29 | 0.04 | 0.25 | 0.25 | 0.29 |
+| 8 | 4096 | 2.04 | 3.96 | 3.96 | 3.96 | 0.42 | 1.62 | 1.67 | 1.62 |
+| 12 | 20736 | 17.33 | 13.50 | 13.50 | 13.50 | 2.50 | 8.88 | 8.88 | 8.88 |
+| 16 | 65536 | 46.12 | 38.00 | 39.12 | 40.21 | 7.83 | 25.79 | 29.42 | 31.08 |
+| 24 | 331776 | 229.50 | 172.42 | 114.25 | 135.08 | 42.17 | 129.46 | 86.17 | 77.42 |
+| 32 | 1048576 | 759.46 | 743.42 | 466.25 | 358.88 | 187.92 | 760.98 | 348.23 | 254.29 |
+| 48 | 5308416 | 19792.42 | 6904.42 | 4785.92 | 3156.54 | 1178.33 | 7229.12 | 4260.04 | 2895.08 |
+| 64 | 16777216 | 85280.88 | 24360.12 | 17059.75 | 11069.58 | 4157.96 | 21393.33 | 14701.90 | 9304.46 |
 
 #### 4D Permute: (3,4,1,2)
 
 | s | s⁴ | Rust naive (μs) | Rust strided 1T | 2T | 4T | Julia copy (μs) | Julia Strided 1T | 2T | 4T |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 256 | 0.21 | 1.71 | 1.46 | 1.46 | 0.04 | 0.25 | 0.29 | 0.29 |
-| 8 | 4096 | 2.13 | 4.75 | 3.79 | 3.79 | 0.46 | 1.50 | 1.58 | 1.54 |
-| 12 | 20736 | 10.33 | 14.13 | 13.21 | 13.17 | 2.46 | 7.50 | 8.04 | 7.83 |
-| 16 | 65536 | 49.04 | 35.79 | 71.08 | 32.83 | 7.83 | 26.83 | 30.71 | 28.38 |
-| 24 | 331776 | 239.50 | 176.58 | 412.71 | 167.00 | 40.67 | 118.21 | 82.67 | 144.52 |
-| 32 | 1048576 | 1176.79 | 852.42 | 927.21 | 1516.04 | 153.25 | 898.11 | 884.63 | 724.75 |
-| 48 | 5308416 | 8825.00 | 9592.33 | 4550.63 | 3719.79 | 1062.79 | 5572.79 | 4113.21 | 4702.17 |
-| 64 | 16777216 | 77203.58 | 52305.38 | 29009.25 | 19273.46 | 3609.38 | 26150.75 | 17511.54 | 11675.56 |
+| 4 | 256 | 0.21 | 1.29 | 1.29 | 1.33 | 0.04 | 0.25 | 0.29 | 0.29 |
+| 8 | 4096 | 2.04 | 4.00 | 4.00 | 4.00 | 0.46 | 1.50 | 1.50 | 1.50 |
+| 12 | 20736 | 10.00 | 14.00 | 14.00 | 14.00 | 2.46 | 7.50 | 7.46 | 7.46 |
+| 16 | 65536 | 47.67 | 39.17 | 37.12 | 39.29 | 7.92 | 26.58 | 30.71 | 46.88 |
+| 24 | 331776 | 230.71 | 200.21 | 127.46 | 149.33 | 42.17 | 117.21 | 78.67 | 92.96 |
+| 32 | 1048576 | 1114.75 | 959.54 | 523.00 | 401.04 | 173.79 | 1191.96 | 629.08 | 404.88 |
+| 48 | 5308416 | 9951.62 | 7670.17 | 4815.21 | 3053.54 | 1118.29 | 6055.00 | 4137.88 | 2787.50 |
+| 64 | 16777216 | 70490.25 | 29309.25 | 19775.17 | 14502.79 | 4003.54 | 27776.96 | 18433.83 | 12759.00 |
 
 #### Scaling observations
 
 - **Crossover point**: Strided's ordering/blocking overhead is recovered at ~20K elements (s≥12 for 4D permute). Below this, the naive loop is faster.
 - **Large arrays (s≥48)**: Rust strided achieves 0.3-0.6x of naive single-threaded, and further improves with threading.
 - **Rust vs Julia strided (1T, s=64)**:
-  - (4,3,2,1): Rust 53ms vs Julia 50ms — near parity
-  - (2,3,4,1): Rust 29ms vs Julia 23ms — Rust 1.3x slower
-  - (3,4,1,2): Rust 52ms vs Julia 26ms — Rust 2.0x slower
+  - (4,3,2,1): Rust 52.7ms vs Julia 50.2ms — near parity
+  - (2,3,4,1): Rust 24.4ms vs Julia 21.4ms — Rust 1.1x slower
+  - (3,4,1,2): Rust 29.3ms vs Julia 27.8ms — near parity
 - **Multi-threaded (4T, s=64)**: Both achieve ~2-4x speedup over single-threaded strided. Rust and Julia reach comparable absolute performance at large sizes.
 - **Julia copy vs Rust naive**: Julia's `copy!` is ~10-25x faster than Rust's raw pointer loop for large s because Julia uses optimized `memcpy`; Rust's naive loop does element-by-element copy for parity with the permute benchmark.
 
 #### Per-case analysis
 
-**symmetrize\_4000** (Julia 20.5 ms, Rust 21.5 ms) —
+**symmetrize\_4000** (Julia 22.2 ms, Rust 21.4 ms) —
 Both use the general mapreduce kernel: dimension fusion → importance ordering → L1 cache blocking. Julia applies `@simd` on the innermost loop. Rust uses stride-specialized inner loops (slice-based when stride=1). Near parity.
 
-**scale\_transpose\_1000** (Julia 0.66 ms, Rust 0.75 ms) —
+**scale\_transpose\_1000** (Julia 0.67 ms, Rust 0.95 ms) —
 Both follow the same importance-weighted ordering for a 2-array (dest + transposed src) operation. The naive baseline (0.42 ms) is faster because it writes contiguously without blocking overhead; the strided version pays for the ordering/blocking pipeline on a small array.
 
-**mwe\_stridedview\_scale\_transpose\_1000** (Julia 0.64 ms, Rust 1.11 ms) —
+**mwe\_stridedview\_scale\_transpose\_1000** (Julia 0.78 ms, Rust 0.99 ms) —
 Same operation as scale\_transpose\_1000 using `map_into` with a transposed view.
 
-**complex\_elementwise\_1000** (Julia 7.8 ms, Rust 12.7 ms) —
+**complex\_elementwise\_1000** (Julia 8.1 ms, Rust 12.8 ms) —
 Both arrays are contiguous, so the operation is compute-bound. The gap comes from Julia's `@simd` enabling aggressive auto-vectorization of transcendental functions (`exp`, `sin`), while Rust's LLVM generates more conservative code for the same operations.
 
-**permute\_32\_4d** (Julia 1.1 ms, Rust 1.1 ms) —
-Parity. Both nest loops with the highest-importance dimension innermost. The stride=1 specialization allows LLVM to vectorize the contiguous inner dimension effectively.
+**permute\_32\_4d** (Julia 1.0 ms, Rust 1.3 ms) —
+Both nest loops with the highest-importance dimension innermost. The stride=1 specialization allows LLVM to vectorize the contiguous inner dimension effectively, but Rust is still ~1.3x slower here.
 
-**multiple\_permute\_sum\_32\_4d** (Julia 2.9 ms, Rust 3.0 ms) —
-Near parity. Both compute a combined importance score over all 5 arrays (output + 4 inputs) and iterate in the optimal compromise order.
+**multiple\_permute\_sum\_32\_4d** (Julia 2.4 ms, Rust 3.2 ms) —
+Both compute a combined importance score over all 5 arrays (output + 4 inputs) and iterate in the optimal compromise order, but Rust is still ~1.3x slower.
 
 ## Acknowledgments
 
