@@ -4,7 +4,7 @@ use mdarray::Tensor;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::time::Duration;
-use strided_rs::{copy_into, copy_transpose_scale_into_fast, zip_map2_into, zip_map4_into};
+use strided::{copy_into, copy_transpose_scale_into_fast, zip_map2_into, zip_map4_into};
 
 // Benchmark 1: B = (A + A') / 2 for 4000x4000 matrix
 fn bench_symmetrize_4000(c: &mut Criterion) {
@@ -99,7 +99,7 @@ fn bench_complex_elementwise_1000(c: &mut Criterion) {
 
     group.bench_function("strided", |bencher| {
         bencher.iter(|| {
-            strided_rs::map_into(&mut b, a.as_ref(), |&x| {
+            strided::map_into(&mut b, a.as_ref(), |&x| {
                 x * (-2.0 * x).exp() + (x * x).sin()
             })
             .unwrap();
