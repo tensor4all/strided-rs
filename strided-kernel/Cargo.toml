@@ -13,10 +13,12 @@ strided-view = { path = "../strided-view" }
 num-traits = "0.2"
 num-complex = "0.4"
 rayon = { version = "1.10", optional = true }
+pulp = { version = "0.22", optional = true }
 
 [features]
-default = []
+default = ["simd"]
 parallel = ["rayon"]
+simd = ["dep:pulp"]
 
 [dev-dependencies]
 criterion = "0.5"

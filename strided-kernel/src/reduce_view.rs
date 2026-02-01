@@ -1,9 +1,10 @@
 //! Reduce operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block_preordered, is_contiguous, total_len,
+    build_plan_fused, contiguous_layout, for_each_inner_block_preordered, total_len,
     use_sequential_fast_path,
 };
+use crate::simd;
 use crate::view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
 use strided_view::{ElementOp, ElementOpApply};
@@ -29,14 +30,18 @@ where
     let src_dims = src.dims();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(src_dims)) && is_contiguous(src_dims, src_strides) {
-        let len = total_len(src_dims);
-        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-        let mut acc = init;
-        for &val in src.iter() {
-            acc = reduce_fn(acc, map_fn(Op::apply(val)));
+    if use_sequential_fast_path(total_len(src_dims)) {
+        if contiguous_layout(src_dims, src_strides).is_some() {
+            let len = total_len(src_dims);
+            let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+            return Ok(simd::dispatch_if_large(len, || {
+                let mut acc = init;
+                for &val in src.iter() {
+                    acc = reduce_fn(acc, map_fn(Op::apply(val)));
+                }
+                acc
+            }));
         }
-        return Ok(acc);
     }
 
     let strides_list: [&[isize]; 1] = [src_strides];

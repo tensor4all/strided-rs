@@ -58,6 +58,7 @@ mod block;
 mod fuse;
 mod kernel;
 mod order;
+mod simd;
 #[cfg(feature = "parallel")]
 mod threading;
 

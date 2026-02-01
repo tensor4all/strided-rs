@@ -570,24 +570,56 @@ pub(crate) fn ensure_same_shape(a: &[usize], b: &[usize]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_contiguous(dims: &[usize], strides: &[isize]) -> bool {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ContiguousLayout {
+    /// C-like layout: last axis varies fastest.
+    RowMajor,
+    /// Julia/Fortran-like layout: first axis varies fastest.
+    ColMajor,
+}
+
+/// Returns the contiguous memory layout kind for the given (dims, strides).
+///
+/// Notes:
+/// - Ignores axes with `dim <= 1` since they do not affect addressability.
+/// - Does not treat negative-stride views as contiguous for fast-path purposes.
+pub(crate) fn contiguous_layout(dims: &[usize], strides: &[isize]) -> Option<ContiguousLayout> {
     if dims.len() != strides.len() {
-        return false;
+        return None;
     }
     if dims.is_empty() {
-        return true;
+        return Some(ContiguousLayout::RowMajor);
     }
+
+    // Row-major: check from last to first.
     let mut expected = 1isize;
+    let mut row_ok = true;
     for (&dim, &stride) in dims.iter().rev().zip(strides.iter().rev()) {
         if dim <= 1 {
             continue;
         }
         if stride != expected {
-            return false;
+            row_ok = false;
+            break;
         }
         expected = expected.saturating_mul(dim as isize);
     }
-    true
+    if row_ok {
+        return Some(ContiguousLayout::RowMajor);
+    }
+
+    // Col-major: check from first to last.
+    let mut expected = 1isize;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        if dim <= 1 {
+            continue;
+        }
+        if stride != expected {
+            return None;
+        }
+        expected = expected.saturating_mul(dim as isize);
+    }
+    Some(ContiguousLayout::ColMajor)
 }
 
 pub(crate) fn total_len(dims: &[usize]) -> usize {
@@ -637,5 +669,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(total_elements, 8);
+    }
+
+    #[test]
+    fn test_contiguous_layout_row_vs_col() {
+        let dims = [3usize, 4];
+        let row = [4isize, 1];
+        let col = [1isize, 3];
+        assert_eq!(
+            contiguous_layout(&dims, &row),
+            Some(ContiguousLayout::RowMajor)
+        );
+        assert_eq!(
+            contiguous_layout(&dims, &col),
+            Some(ContiguousLayout::ColMajor)
+        );
+        assert!(contiguous_layout(&dims, &row).is_some());
+        assert!(contiguous_layout(&dims, &col).is_some());
+    }
+
+    #[test]
+    fn test_contiguous_layout_ignores_dim1_axes() {
+        let dims = [2usize, 1, 3];
+        // Middle stride is irrelevant since that axis never varies.
+        let strides = [3isize, 999, 1];
+        assert_eq!(
+            contiguous_layout(&dims, &strides),
+            Some(ContiguousLayout::RowMajor)
+        );
     }
 }

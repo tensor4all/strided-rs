@@ -98,6 +98,18 @@ fn test_copy_into() {
 }
 
 #[test]
+fn test_copy_into_mixed_layouts() {
+    let a = StridedArray::<f64>::from_fn_col_major(&[4, 5], |idx| (idx[0] * 10 + idx[1]) as f64);
+    let mut out = StridedArray::<f64>::row_major(&[4, 5]);
+    copy_into(&mut out.view_mut(), &a.view()).unwrap();
+    for i in 0..4 {
+        for j in 0..5 {
+            assert_relative_eq!(out.get(&[i, j]), a.get(&[i, j]), epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
 fn test_copy_transpose_scale_into() {
     let a = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[3, 2]);
