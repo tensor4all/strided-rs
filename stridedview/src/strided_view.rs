@@ -466,6 +466,36 @@ impl<'a, T> StridedViewMut<'a, T> {
         self.ptr
     }
 
+    /// Permute dimensions, consuming the mutable view.
+    ///
+    /// Returns a new mutable view with reordered dimensions and strides.
+    /// Takes `self` by value to prevent aliasing of mutable views.
+    pub fn permute(self, perm: &[usize]) -> Result<StridedViewMut<'a, T>> {
+        let rank = self.dims.len();
+        if perm.len() != rank {
+            return Err(StridedError::RankMismatch(perm.len(), rank));
+        }
+        let mut seen = vec![false; rank];
+        for &p in perm {
+            if p >= rank {
+                return Err(StridedError::InvalidAxis { axis: p, rank });
+            }
+            if seen[p] {
+                return Err(StridedError::InvalidAxis { axis: p, rank });
+            }
+            seen[p] = true;
+        }
+        let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
+        let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
+        Ok(StridedViewMut {
+            ptr: self.ptr,
+            data: self.data,
+            dims: new_dims.into_boxed_slice(),
+            strides: new_strides.into_boxed_slice(),
+            offset: self.offset,
+        })
+    }
+
     /// Reborrow as an immutable view.
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
         StridedView {

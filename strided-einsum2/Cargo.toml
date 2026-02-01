@@ -1,0 +1,18 @@
+[package]
+name = "strided-einsum2"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
+repository = "https://github.com/tensor4all/strided-rs"
+description = "Binary einsum (pairwise tensor contraction) on strided views."
+publish = false
+
+[dependencies]
+stridedview = { path = "../stridedview" }
+strided = { path = "../strided" }
+num-traits = "0.2"
+thiserror = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
