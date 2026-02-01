@@ -6,7 +6,7 @@
 //! - C: [batch..., lo..., ro...]
 
 use crate::util::MultiIndex;
-use stridedview::{StridedView, StridedViewMut};
+use stridedview::{ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 /// Batched strided GEMM: C = alpha * A * B + beta * C
 ///
@@ -26,9 +26,12 @@ pub fn bgemm_strided_into<T>(
     n_sum: usize,
     alpha: T,
     beta: T,
+    conj_a: bool,
+    conj_b: bool,
 ) -> stridedview::Result<()>
 where
     T: Copy
+        + ElementOpApply
         + std::ops::Mul<Output = T>
         + std::ops::Add<Output = T>
         + num_traits::Zero
@@ -101,8 +104,18 @@ where
                     let a_sum_off = sum_iter.offset(a_sum_strides);
                     let b_sum_off = sum_iter.offset(b_sum_strides);
 
-                    let a_val = unsafe { *a_ptr.offset(a_batch_off + a_lo_off + a_sum_off) };
-                    let b_val = unsafe { *b_ptr.offset(b_batch_off + b_sum_off + b_ro_off) };
+                    let a_raw = unsafe { *a_ptr.offset(a_batch_off + a_lo_off + a_sum_off) };
+                    let b_raw = unsafe { *b_ptr.offset(b_batch_off + b_sum_off + b_ro_off) };
+                    let a_val = if conj_a {
+                        stridedview::Conj::apply(a_raw)
+                    } else {
+                        a_raw
+                    };
+                    let b_val = if conj_b {
+                        stridedview::Conj::apply(b_raw)
+                    } else {
+                        b_raw
+                    };
                     acc = acc + a_val * b_val;
                 }
 
@@ -160,6 +173,8 @@ mod tests {
             1, // n_batch=0, n_lo=1(i), n_ro=1(k), n_sum=1(j)
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -188,6 +203,8 @@ mod tests {
             1,
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -220,6 +237,8 @@ mod tests {
             1, // n_batch=1, n_lo=1, n_ro=1, n_sum=1
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -251,6 +270,8 @@ mod tests {
             1,
             2.0,
             3.0, // alpha=2, beta=3
+            false,
+            false,
         )
         .unwrap();
 
@@ -279,6 +300,8 @@ mod tests {
             0, // no batch, no sum
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 

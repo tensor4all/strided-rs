@@ -5,9 +5,9 @@
 //! copies operands to contiguous column-major buffers before calling faer.
 
 use crate::util::{try_fuse_group, MultiIndex};
-use faer::linalg::matmul::matmul;
+use faer::linalg::matmul::matmul_with_conj;
 use faer::mat::{MatMut, MatRef};
-use faer::{Accum, Par};
+use faer::{Accum, Conj, Par};
 use faer_traits::ComplexField;
 use stridedview::{StridedArray, StridedView, StridedViewMut};
 
@@ -26,6 +26,8 @@ pub fn bgemm_strided_into<T>(
     n_sum: usize,
     alpha: T,
     beta: T,
+    conj_a: bool,
+    conj_b: bool,
 ) -> stridedview::Result<()>
 where
     T: ComplexField
@@ -193,7 +195,9 @@ where
                 c_col_stride,
             );
 
-            matmul(c_mat, accum, a_mat, b_mat, alpha, Par::Seq);
+            let cj_a = if conj_a { Conj::Yes } else { Conj::No };
+            let cj_b = if conj_b { Conj::Yes } else { Conj::No };
+            matmul_with_conj(c_mat, accum, a_mat, cj_a, b_mat, cj_b, alpha, Par::Seq);
         }
     }
 
@@ -267,6 +271,8 @@ mod tests {
             1,
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -294,6 +300,8 @@ mod tests {
             1,
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -321,6 +329,8 @@ mod tests {
             1,
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -351,6 +361,8 @@ mod tests {
             1,
             1.0,
             0.0, // beta=0: C_old should be ignored
+            false,
+            false,
         )
         .unwrap();
 
@@ -380,6 +392,8 @@ mod tests {
             1,
             1.0,
             1.0, // beta=1: C = A*B + C_old
+            false,
+            false,
         )
         .unwrap();
 
@@ -411,6 +425,8 @@ mod tests {
             1,
             2.0,
             3.0, // C = 2*I*B + 3*C_old
+            false,
+            false,
         )
         .unwrap();
 
@@ -436,6 +452,8 @@ mod tests {
             0, // no sum
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -463,6 +481,8 @@ mod tests {
             1,
             1.0f32,
             0.0f32,
+            false,
+            false,
         )
         .unwrap();
 
@@ -491,6 +511,8 @@ mod tests {
             1,
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -522,6 +544,8 @@ mod tests {
             1,
             1.0,
             0.0,
+            false,
+            false,
         )
         .unwrap();
 
@@ -554,6 +578,8 @@ mod tests {
             1,
             2.0,
             3.0, // C = 2*I*B + 3*C_old
+            false,
+            false,
         )
         .unwrap();
 
