@@ -48,7 +48,7 @@ pub(crate) const MINTHREADLENGTH: usize = 1 << 15;
 ///
 /// Takes the per-dimension minimum stride magnitude across all arrays,
 /// then maps: 0 → 1, nonzero → 2*|min_stride|.
-pub(crate) fn compute_costs(strides_list: &[&[isize]], ndim: usize) -> Vec<isize> {
+pub(crate) fn compute_costs(strides_list: &[Vec<isize>], ndim: usize) -> Vec<isize> {
     (0..ndim)
         .map(|d| {
             let min_stride = strides_list
@@ -230,9 +230,7 @@ mod tests {
     #[test]
     fn test_compute_costs() {
         // stride 0 → cost 1, stride 1 → cost 2, stride 3 → cost 6
-        let s1: Vec<isize> = vec![1, 0, 3];
-        let s2: Vec<isize> = vec![2, 0, 4];
-        let strides_list: Vec<&[isize]> = vec![&s1, &s2];
+        let strides_list: Vec<Vec<isize>> = vec![vec![1, 0, 3], vec![2, 0, 4]];
         let costs = compute_costs(&strides_list, 3);
         assert_eq!(costs, vec![2, 1, 6]);
     }

@@ -76,24 +76,27 @@ where
     let is_alpha_one = alpha == T::one();
 
     let mut batch_iter = MultiIndex::new(batch_dims);
+    let mut lo_iter = MultiIndex::new(lo_dims);
+    let mut ro_iter = MultiIndex::new(ro_dims);
+    let mut sum_iter = MultiIndex::new(sum_dims);
     while batch_iter.next().is_some() {
         let a_batch_off = batch_iter.offset(a_batch_strides);
         let b_batch_off = batch_iter.offset(b_batch_strides);
         let c_batch_off = batch_iter.offset(c_batch_strides);
 
-        let mut lo_iter = MultiIndex::new(lo_dims);
+        lo_iter.reset();
         while lo_iter.next().is_some() {
             let a_lo_off = lo_iter.offset(a_lo_strides);
             let c_lo_off = lo_iter.offset(c_lo_strides);
 
-            let mut ro_iter = MultiIndex::new(ro_dims);
+            ro_iter.reset();
             while ro_iter.next().is_some() {
                 let b_ro_off = ro_iter.offset(b_ro_strides);
                 let c_ro_off = ro_iter.offset(c_ro_strides);
 
                 // Accumulate sum over contraction indices
                 let mut acc = T::zero();
-                let mut sum_iter = MultiIndex::new(sum_dims);
+                sum_iter.reset();
                 while sum_iter.next().is_some() {
                     let a_sum_off = sum_iter.offset(a_sum_strides);
                     let b_sum_off = sum_iter.offset(b_sum_strides);

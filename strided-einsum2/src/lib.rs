@@ -28,10 +28,11 @@ pub mod plan;
 pub mod trace;
 pub mod util;
 
+use std::any::TypeId;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use stridedview::{ElementOp, ElementOpApply, StridedView, StridedViewMut};
+use stridedview::{ElementOp, ElementOpApply, Identity, StridedArray, StridedView, StridedViewMut};
 
 pub use plan::Einsum2Plan;
 
@@ -151,29 +152,43 @@ where
     validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
 
     // 3. Reduce trace axes if present
-    let a_reduced;
-    let a_view: StridedView<T>;
-    let has_left_trace = !plan.left_trace.is_empty();
-    if has_left_trace {
+    let a_buf: Option<StridedArray<T>> = if !plan.left_trace.is_empty() {
         let trace_indices = plan.left_trace_indices(ia);
-        a_reduced = trace::reduce_trace_axes(a, &trace_indices)?;
-        a_view = a_reduced.view();
+        Some(trace::reduce_trace_axes(a, &trace_indices)?)
+    } else if TypeId::of::<OpA>() == TypeId::of::<Identity>() {
+        None
     } else {
-        // No trace: just apply the element op by creating an Identity view
-        // We need to strip the Op to get StridedView<T, Identity>
-        a_view = strip_op_view(a);
-    }
+        let total: usize = a.dims().iter().product();
+        let strides = stridedview::row_major_strides(a.dims());
+        let mut buf = StridedArray::from_parts(vec![T::zero(); total], a.dims(), &strides, 0)?;
+        strided::copy_into(&mut buf.view_mut(), a)?;
+        Some(buf)
+    };
 
-    let b_reduced;
-    let b_view: StridedView<T>;
-    let has_right_trace = !plan.right_trace.is_empty();
-    if has_right_trace {
+    let a_view: StridedView<T> = match a_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => StridedView::new(a.data(), a.dims(), a.strides(), a.offset())
+            .expect("strip_op_view: metadata already validated"),
+    };
+
+    let b_buf: Option<StridedArray<T>> = if !plan.right_trace.is_empty() {
         let trace_indices = plan.right_trace_indices(ib);
-        b_reduced = trace::reduce_trace_axes(b, &trace_indices)?;
-        b_view = b_reduced.view();
+        Some(trace::reduce_trace_axes(b, &trace_indices)?)
+    } else if TypeId::of::<OpB>() == TypeId::of::<Identity>() {
+        None
     } else {
-        b_view = strip_op_view(b);
-    }
+        let total: usize = b.dims().iter().product();
+        let strides = stridedview::row_major_strides(b.dims());
+        let mut buf = StridedArray::from_parts(vec![T::zero(); total], b.dims(), &strides, 0)?;
+        strided::copy_into(&mut buf.view_mut(), b)?;
+        Some(buf)
+    };
+
+    let b_view: StridedView<T> = match b_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => StridedView::new(b.data(), b.dims(), b.strides(), b.offset())
+            .expect("strip_op_view: metadata already validated"),
+    };
 
     // 4. Permute to canonical order
     //    A -> [batch, lo, sum]
@@ -211,21 +226,6 @@ where
     )?;
 
     Ok(())
-}
-
-/// Strip the element operation, returning a plain `StridedView<T, Identity>`.
-///
-/// This reuses the same underlying data slice with identical dims/strides/offset.
-/// It is correct only when the element op does not change values (i.e., `Identity`
-/// on real types). For complex types with `Conj`/`Adjoint`, the caller must
-/// materialize first (the trace path already does this).
-fn strip_op_view<'a, T, Op>(src: &StridedView<'a, T, Op>) -> StridedView<'a, T>
-where
-    T: Copy + ElementOpApply,
-    Op: ElementOp,
-{
-    StridedView::new(src.data(), src.dims(), src.strides(), src.offset())
-        .expect("strip_op_view: metadata already validated")
 }
 
 /// Validate that dimensions match across operands for each axis group.

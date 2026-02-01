@@ -9,6 +9,7 @@
 
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::sync::Arc;
 
 use crate::element_op::{ElementOp, ElementOpApply, Identity};
 use crate::{Result, StridedError};
@@ -98,8 +99,8 @@ pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
 pub struct StridedView<'a, T, Op: ElementOp = Identity> {
     ptr: *const T,
     data: &'a [T],
-    dims: Box<[usize]>,
-    strides: Box<[isize]>,
+    dims: Arc<[usize]>,
+    strides: Arc<[isize]>,
     offset: isize,
     _op: PhantomData<Op>,
 }
@@ -138,8 +139,8 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         Ok(Self {
             ptr,
             data,
-            dims: dims.into(),
-            strides: strides.into(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset,
             _op: PhantomData,
         })
@@ -159,8 +160,8 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         Self {
             ptr,
             data,
-            dims: dims.into(),
-            strides: strides.into(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset,
             _op: PhantomData,
         }
@@ -228,8 +229,8 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         Ok(StridedView {
             ptr: self.ptr,
             data: self.data,
-            dims: new_dims.into_boxed_slice(),
-            strides: new_strides.into_boxed_slice(),
+            dims: Arc::from(new_dims),
+            strides: Arc::from(new_strides),
             offset: self.offset,
             _op: PhantomData,
         })
@@ -248,8 +249,8 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         Ok(StridedView {
             ptr: self.ptr,
             data: self.data,
-            dims: Box::new([self.dims[1], self.dims[0]]),
-            strides: Box::new([self.strides[1], self.strides[0]]),
+            dims: Arc::new([self.dims[1], self.dims[0]]),
+            strides: Arc::new([self.strides[1], self.strides[0]]),
             offset: self.offset,
             _op: PhantomData,
         })
@@ -268,8 +269,8 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         Ok(StridedView {
             ptr: self.ptr,
             data: self.data,
-            dims: Box::new([self.dims[1], self.dims[0]]),
-            strides: Box::new([self.strides[1], self.strides[0]]),
+            dims: Arc::new([self.dims[1], self.dims[0]]),
+            strides: Arc::new([self.strides[1], self.strides[0]]),
             offset: self.offset,
             _op: PhantomData,
         })
@@ -318,8 +319,8 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         Ok(StridedView {
             ptr: self.ptr,
             data: self.data,
-            dims: target_dims.into(),
-            strides: new_strides.into_boxed_slice(),
+            dims: Arc::from(target_dims),
+            strides: Arc::from(new_strides),
             offset: self.offset,
             _op: PhantomData,
         })
@@ -368,8 +369,8 @@ impl<'a, T: Copy + ElementOpApply, Op: ElementOp> StridedView<'a, T, Op> {
 pub struct StridedViewMut<'a, T> {
     ptr: *mut T,
     data: &'a mut [T],
-    dims: Box<[usize]>,
-    strides: Box<[isize]>,
+    dims: Arc<[usize]>,
+    strides: Arc<[isize]>,
     offset: isize,
 }
 
@@ -398,8 +399,8 @@ impl<'a, T> StridedViewMut<'a, T> {
         Ok(Self {
             ptr,
             data,
-            dims: dims.into(),
-            strides: strides.into(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset,
         })
     }
@@ -418,8 +419,8 @@ impl<'a, T> StridedViewMut<'a, T> {
         Self {
             ptr,
             data,
-            dims: dims.into(),
-            strides: strides.into(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset,
         }
     }
@@ -490,8 +491,8 @@ impl<'a, T> StridedViewMut<'a, T> {
         Ok(StridedViewMut {
             ptr: self.ptr,
             data: self.data,
-            dims: new_dims.into_boxed_slice(),
-            strides: new_strides.into_boxed_slice(),
+            dims: Arc::from(new_dims),
+            strides: Arc::from(new_strides),
             offset: self.offset,
         })
     }
@@ -544,8 +545,8 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
 /// Supports both column-major (Julia default) and row-major (C default) layouts.
 pub struct StridedArray<T> {
     data: Vec<T>,
-    dims: Box<[usize]>,
-    strides: Box<[isize]>,
+    dims: Arc<[usize]>,
+    strides: Arc<[isize]>,
     offset: isize,
 }
 
@@ -578,8 +579,8 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: dims.into(),
-            strides: strides.into_boxed_slice(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset: 0,
         }
     }
@@ -591,8 +592,8 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = row_major_strides(dims);
         Self {
             data,
-            dims: dims.into(),
-            strides: strides.into_boxed_slice(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset: 0,
         }
     }
@@ -618,8 +619,8 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: dims.into(),
-            strides: strides.into_boxed_slice(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset: 0,
         }
     }
@@ -645,8 +646,8 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: dims.into(),
-            strides: strides.into_boxed_slice(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset: 0,
         }
     }
@@ -663,8 +664,8 @@ impl<T> StridedArray<T> {
         validate_bounds(data.len(), dims, strides, offset)?;
         Ok(Self {
             data,
-            dims: dims.into(),
-            strides: strides.into(),
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
             offset,
         })
     }
