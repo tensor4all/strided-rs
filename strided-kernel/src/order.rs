@@ -4,7 +4,7 @@
 //! the index_order + importance bit-packing algorithm from Julia.
 
 use crate::fuse::{compute_importance, sort_by_importance};
-use stridedview::auxiliary::index_order;
+use strided_view::auxiliary::index_order;
 
 /// Compute the optimal iteration order for dimensions.
 ///

@@ -6,7 +6,7 @@
 
 use crate::fuse::compute_costs;
 use crate::{BLOCK_MEMORY_SIZE, CACHE_LINE_SIZE};
-use stridedview::auxiliary::index_order;
+use strided_view::auxiliary::index_order;
 
 /// Compute block sizes for tiled iteration.
 ///

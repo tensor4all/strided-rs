@@ -4,9 +4,9 @@ use crate::kernel::{
     build_plan_fused, for_each_inner_block_preordered, is_contiguous, total_len,
     use_sequential_fast_path,
 };
-use crate::strided_view::{col_major_strides, StridedArray, StridedView};
+use crate::view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
-use stridedview::{ElementOp, ElementOpApply};
+use strided_view::{ElementOp, ElementOpApply};
 
 #[cfg(feature = "parallel")]
 use crate::threading::{

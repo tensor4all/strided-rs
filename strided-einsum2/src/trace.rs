@@ -4,7 +4,7 @@
 //! They must be summed out (reduced) before the main contraction.
 
 use crate::util::MultiIndex;
-use stridedview::{ElementOp, ElementOpApply, StridedArray, StridedView};
+use strided_view::{ElementOp, ElementOpApply, StridedArray, StridedView};
 
 /// Reduce all trace axes from a view by summing them out.
 ///
@@ -17,7 +17,7 @@ use stridedview::{ElementOp, ElementOpApply, StridedArray, StridedView};
 pub fn reduce_trace_axes<T, Op>(
     src: &StridedView<T, Op>,
     trace_axes: &[usize],
-) -> stridedview::Result<StridedArray<T>>
+) -> strided_view::Result<StridedArray<T>>
 where
     T: Copy + ElementOpApply + Send + Sync + std::ops::Add<Output = T> + num_traits::Zero,
     Op: ElementOp,
@@ -76,14 +76,14 @@ where
         out_i += 1;
     }
 
-    let out_strides = stridedview::row_major_strides(&out_dims);
+    let out_strides = strided_view::row_major_strides(&out_dims);
     StridedArray::from_parts(out_data, &out_dims, &out_strides, 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stridedview::Identity;
+    use strided_view::Identity;
 
     #[test]
     #[should_panic(expected = "reduce_trace_axes called with empty trace_axes")]

@@ -6,7 +6,7 @@
 //! - C: [batch..., lo..., ro...]
 
 use crate::util::MultiIndex;
-use stridedview::{ElementOp, ElementOpApply, StridedView, StridedViewMut};
+use strided_view::{ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 /// Batched strided GEMM: C = alpha * A * B + beta * C
 ///
@@ -28,7 +28,7 @@ pub fn bgemm_strided_into<T>(
     beta: T,
     conj_a: bool,
     conj_b: bool,
-) -> stridedview::Result<()>
+) -> strided_view::Result<()>
 where
     T: Copy
         + ElementOpApply
@@ -107,12 +107,12 @@ where
                     let a_raw = unsafe { *a_ptr.offset(a_batch_off + a_lo_off + a_sum_off) };
                     let b_raw = unsafe { *b_ptr.offset(b_batch_off + b_sum_off + b_ro_off) };
                     let a_val = if conj_a {
-                        stridedview::Conj::apply(a_raw)
+                        strided_view::Conj::apply(a_raw)
                     } else {
                         a_raw
                     };
                     let b_val = if conj_b {
-                        stridedview::Conj::apply(b_raw)
+                        strided_view::Conj::apply(b_raw)
                     } else {
                         b_raw
                     };
@@ -148,7 +148,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stridedview::StridedArray;
+    use strided_view::StridedArray;
 
     #[test]
     fn test_bgemm_2x2() {

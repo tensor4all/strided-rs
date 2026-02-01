@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```
-//! use stridedview::StridedArray;
+//! use strided_view::StridedArray;
 //! use strided_einsum2::einsum2_into;
 //!
 //! // Matrix multiply: C_ik = A_ij * B_jk
@@ -32,7 +32,7 @@ use std::any::TypeId;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use stridedview::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
+use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 pub use plan::Einsum2Plan;
 
@@ -116,7 +116,7 @@ pub enum EinsumError {
         dim_b: usize,
     },
     #[error(transparent)]
-    Strided(#[from] stridedview::StridedError),
+    Strided(#[from] strided_view::StridedError),
 }
 
 pub type Result<T> = std::result::Result<T, EinsumError>;
@@ -312,7 +312,7 @@ fn validate_dimensions<ID: AxisId>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stridedview::StridedArray;
+    use strided_view::StridedArray;
 
     #[test]
     fn test_matmul_ij_jk_ik() {

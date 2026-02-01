@@ -6,11 +6,11 @@ use crate::kernel::{
 };
 use crate::map_view::{map_into, zip_map2_into};
 use crate::reduce_view::reduce;
-use crate::strided_view::{StridedView, StridedViewMut};
+use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use num_traits::Zero;
 use std::ops::{Add, Mul};
-use stridedview::{ElementOp, ElementOpApply};
+use strided_view::{ElementOp, ElementOpApply};
 
 #[cfg(feature = "parallel")]
 use crate::threading::{
