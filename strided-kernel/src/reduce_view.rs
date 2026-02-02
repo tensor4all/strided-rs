@@ -4,6 +4,7 @@ use crate::kernel::{
     build_plan_fused, contiguous_layout, for_each_inner_block_preordered, total_len,
     use_sequential_fast_path,
 };
+use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
@@ -15,16 +16,16 @@ use crate::threading::{
 };
 
 /// Full reduction with map function: `reduce(init, op, map.(src))`.
-pub fn reduce<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp, M, R, U>(
+pub fn reduce<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
     init: U,
 ) -> Result<U>
 where
-    M: Fn(T) -> U + Sync,
-    R: Fn(U, U) -> U + Sync,
-    U: Clone + Send + Sync,
+    M: Fn(T) -> U + MaybeSync,
+    R: Fn(U, U) -> U + MaybeSync,
+    U: Clone + MaybeSendSync,
 {
     let src_ptr = src.ptr();
     let src_dims = src.dims();
@@ -153,7 +154,7 @@ where
 }
 
 /// Reduce along a single axis, returning a new StridedArray.
-pub fn reduce_axis<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp, M, R, U>(
+pub fn reduce_axis<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp, M, R, U>(
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,
@@ -161,9 +162,9 @@ pub fn reduce_axis<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp, M, R, 
     init: U,
 ) -> Result<StridedArray<U>>
 where
-    M: Fn(T) -> U + Sync,
-    R: Fn(U, U) -> U + Sync,
-    U: Clone + Send + Sync,
+    M: Fn(T) -> U + MaybeSync,
+    R: Fn(U, U) -> U + MaybeSync,
+    U: Clone + MaybeSendSync,
 {
     let rank = src.ndim();
     if axis >= rank {
