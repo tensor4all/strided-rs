@@ -1,8 +1,7 @@
 //! Reduce operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    build_plan_fused, contiguous_layout, for_each_inner_block_preordered, total_len,
-    use_sequential_fast_path,
+    build_plan_fused, for_each_inner_block_preordered, sequential_contiguous_layout, total_len,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
@@ -31,18 +30,16 @@ where
     let src_dims = src.dims();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(src_dims)) {
-        if contiguous_layout(src_dims, src_strides).is_some() {
-            let len = total_len(src_dims);
-            let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-            return Ok(simd::dispatch_if_large(len, || {
-                let mut acc = init;
-                for &val in src.iter() {
-                    acc = reduce_fn(acc, map_fn(Op::apply(val)));
-                }
-                acc
-            }));
-        }
+    if sequential_contiguous_layout(src_dims, &[src_strides]).is_some() {
+        let len = total_len(src_dims);
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        return Ok(simd::dispatch_if_large(len, || {
+            let mut acc = init;
+            for &val in src.iter() {
+                acc = reduce_fn(acc, map_fn(Op::apply(val)));
+            }
+            acc
+        }));
     }
 
     let strides_list: [&[isize]; 1] = [src_strides];

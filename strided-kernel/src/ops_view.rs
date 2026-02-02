@@ -1,8 +1,8 @@
 //! High-level operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    build_plan_fused, contiguous_layout, ensure_same_shape, for_each_inner_block_preordered,
-    total_len, use_sequential_fast_path,
+    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, same_contiguous_layout,
+    sequential_contiguous_layout, total_len,
 };
 use crate::map_view::{map_into, zip_map2_into};
 use crate::maybe_sync::MaybeSendSync;
@@ -196,40 +196,33 @@ pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(s)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(src.dims(), src_strides),
-        ) {
-            if d == s {
-                let len = total_len(dst_dims);
-                if TypeId::of::<Op>() == TypeId::of::<crate::Identity>() {
-                    debug_assert!(
-                        {
-                            let nbytes = len
-                                .checked_mul(std::mem::size_of::<T>())
-                                .expect("copy size must not overflow");
-                            let dst_start = dst_ptr as usize;
-                            let src_start = src_ptr as usize;
-                            let dst_end = dst_start.saturating_add(nbytes);
-                            let src_end = src_start.saturating_add(nbytes);
-                            dst_end <= src_start || src_end <= dst_start
-                        },
-                        "overlapping src/dest is not supported"
-                    );
-                    unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
-                } else {
-                    let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                    let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-                    simd::dispatch_if_large(len, || {
-                        for i in 0..len {
-                            dst[i] = Op::apply(src[i]);
-                        }
-                    });
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
+        let len = total_len(dst_dims);
+        if TypeId::of::<Op>() == TypeId::of::<crate::Identity>() {
+            debug_assert!(
+                {
+                    let nbytes = len
+                        .checked_mul(std::mem::size_of::<T>())
+                        .expect("copy size must not overflow");
+                    let dst_start = dst_ptr as usize;
+                    let src_start = src_ptr as usize;
+                    let dst_end = dst_start.saturating_add(nbytes);
+                    let src_end = src_start.saturating_add(nbytes);
+                    dst_end <= src_start || src_end <= dst_start
+                },
+                "overlapping src/dest is not supported"
+            );
+            unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
+        } else {
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+            let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+            simd::dispatch_if_large(len, || {
+                for i in 0..len {
+                    dst[i] = Op::apply(src[i]);
                 }
-                return Ok(());
-            }
+            });
         }
+        return Ok(());
     }
 
     map_into(dest, src, |x| x)
@@ -248,23 +241,16 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: Eleme
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(s)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(src.dims(), src_strides),
-        ) {
-            if d == s {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = dst[i] + Op::apply(src[i]);
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = dst[i] + Op::apply(src[i]);
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
@@ -350,23 +336,16 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: Eleme
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(s)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(src.dims(), src_strides),
-        ) {
-            if d == s {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = dst[i] * Op::apply(src[i]);
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = dst[i] * Op::apply(src[i]);
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
@@ -456,23 +435,16 @@ pub fn axpy<
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(s)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(src.dims(), src_strides),
-        ) {
-            if d == s {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = alpha * Op::apply(src[i]) + dst[i];
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = alpha * Op::apply(src[i]) + dst[i];
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
@@ -564,25 +536,17 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeS
     let a_strides = a.strides();
     let b_strides = b.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(a_l), Some(b_l)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(a.dims(), a_strides),
-            contiguous_layout(b.dims(), b_strides),
-        ) {
-            if d == a_l && d == b_l {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = dst[i] + sa[i] * sb[i];
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = dst[i] + sa[i] * sb[i];
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
@@ -670,7 +634,7 @@ pub fn sum<
     #[cfg(feature = "simd")]
     {
         let len = total_len(src.dims());
-        if use_sequential_fast_path(len) && contiguous_layout(src.dims(), src.strides()).is_some() {
+        if sequential_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
             if TypeId::of::<T>() == TypeId::of::<f32>() {
                 let src = unsafe { std::slice::from_raw_parts(src.ptr() as *const f32, len) };
                 // Safety: T == f32 (checked via TypeId), so bitcast is valid.
@@ -705,37 +669,32 @@ pub fn dot<
     let b_strides = b.strides();
     let a_dims = a.dims();
 
-    if let (Some(a_l), Some(b_l)) = (
-        contiguous_layout(a_dims, a_strides),
-        contiguous_layout(b.dims(), b_strides),
-    ) {
-        if a_l == b_l {
-            let len = total_len(a_dims);
-            let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-            let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-            #[cfg(feature = "simd")]
-            {
-                if TypeId::of::<T>() == TypeId::of::<f32>() {
-                    let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f32, len) };
-                    let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f32, len) };
-                    let out = simd::dot_f32(sa, sb);
-                    return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
-                }
-                if TypeId::of::<T>() == TypeId::of::<f64>() {
-                    let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f64, len) };
-                    let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f64, len) };
-                    let out = simd::dot_f64(sa, sb);
-                    return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
-                }
+    if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
+        let len = total_len(a_dims);
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        #[cfg(feature = "simd")]
+        {
+            if TypeId::of::<T>() == TypeId::of::<f32>() {
+                let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f32, len) };
+                let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f32, len) };
+                let out = simd::dot_f32(sa, sb);
+                return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
             }
-            let mut acc = T::zero();
-            simd::dispatch_if_large(len, || {
-                for i in 0..len {
-                    acc = acc + OpA::apply(sa[i]) * OpB::apply(sb[i]);
-                }
-            });
-            return Ok(acc);
+            if TypeId::of::<T>() == TypeId::of::<f64>() {
+                let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f64, len) };
+                let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f64, len) };
+                let out = simd::dot_f64(sa, sb);
+                return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
+            }
         }
+        let mut acc = T::zero();
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                acc = acc + OpA::apply(sa[i]) * OpB::apply(sb[i]);
+            }
+        });
+        return Ok(acc);
     }
 
     let strides_list: [&[isize]; 2] = [a_strides, b_strides];
