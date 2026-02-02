@@ -173,15 +173,16 @@ pub fn sort_by_importance(importance: &[u64]) -> Vec<usize> {
 /// Compute the minimum stride cost for each dimension.
 ///
 /// Julia: `costs = map(a -> ifelse(iszero(a), 1, a << 1), map(min, strides...))`
-pub fn compute_costs(all_strides: &[&[isize]]) -> Vec<isize> {
+pub fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
     if all_strides.is_empty() {
         return vec![];
     }
 
-    let n = all_strides[0].len();
+    let n = all_strides[0].as_ref().len();
     let mut costs = vec![isize::MAX; n];
 
     for strides in all_strides {
+        let strides = strides.as_ref();
         for i in 0..n {
             costs[i] = costs[i].min(strides[i].abs());
         }
@@ -342,6 +343,14 @@ mod tests {
 
         // Output has 2x weight, so dimension 0 (smaller stride in output) wins
         assert!(importance[0] > importance[1]);
+    }
+
+    #[test]
+    fn test_compute_costs_owned_vecs() {
+        // Ported from threading.rs: verify compute_costs works with Vec<Vec<isize>>
+        let strides_list: Vec<Vec<isize>> = vec![vec![1, 0, 3], vec![2, 0, 4]];
+        let costs = compute_costs(&strides_list);
+        assert_eq!(costs, vec![2, 1, 6]);
     }
 
     #[test]

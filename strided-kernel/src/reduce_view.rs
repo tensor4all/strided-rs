@@ -10,8 +10,10 @@ use crate::{Result, StridedError};
 use strided_view::{ElementOp, ElementOpApply};
 
 #[cfg(feature = "parallel")]
+use crate::fuse::compute_costs;
+#[cfg(feature = "parallel")]
 use crate::threading::{
-    compute_costs, for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
+    for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
 };
 
 /// Full reduction with map function: `reduce(init, op, map.(src))`.
@@ -58,7 +60,7 @@ where
             let threadedout_ptr = SendPtr(threadedout.as_mut_ptr());
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides, fused_dims.len());
+            let costs = compute_costs(&ordered_strides);
 
             // For complete reduction, strides_list has 2 entries:
             // [0] = threadedout (stride 0 everywhere — broadcasting), [1] = src

@@ -45,32 +45,6 @@ impl<T> SendPtr<T> {
 /// Matches Julia's `MINTHREADLENGTH = 1 << 15`.
 pub(crate) const MINTHREADLENGTH: usize = 1 << 15;
 
-/// Compute per-dimension costs for thread-splitting decisions.
-///
-/// Julia `_mapreduce_order!` L137:
-/// ```julia
-/// costs = map(a -> ifelse(iszero(a), 1, a << 1), map(min, strides...))
-/// ```
-///
-/// Takes the per-dimension minimum stride magnitude across all arrays,
-/// then maps: 0 → 1, nonzero → 2*|min_stride|.
-pub(crate) fn compute_costs(strides_list: &[Vec<isize>], ndim: usize) -> Vec<isize> {
-    (0..ndim)
-        .map(|d| {
-            let min_stride = strides_list
-                .iter()
-                .map(|s| s[d].unsigned_abs() as isize)
-                .min()
-                .unwrap_or(0);
-            if min_stride == 0 {
-                1
-            } else {
-                min_stride * 2
-            }
-        })
-        .collect()
-}
-
 /// Recursive dimension-splitting parallel execution.
 ///
 /// Faithfully ports Julia's `_mapreduce_threaded!` (mapreduce.jl L195-227).
@@ -245,14 +219,6 @@ mod tests {
 
         // Single dimension
         assert_eq!(streaming_lastargmax(&[100], &[2]), 0);
-    }
-
-    #[test]
-    fn test_compute_costs() {
-        // stride 0 → cost 1, stride 1 → cost 2, stride 3 → cost 6
-        let strides_list: Vec<Vec<isize>> = vec![vec![1, 0, 3], vec![2, 0, 4]];
-        let costs = compute_costs(&strides_list, 3);
-        assert_eq!(costs, vec![2, 1, 6]);
     }
 
     #[test]
