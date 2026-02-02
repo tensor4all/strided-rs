@@ -68,6 +68,35 @@ pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
     result
 }
 
+/// Remove size-1 dimensions from fused dims and all corresponding strides.
+///
+/// After `fuse_dims()`, many dimensions may be 1 (either originally size-1
+/// or merged into a neighbor). These contribute nothing to iteration but
+/// increase loop depth. This function strips them out.
+///
+/// If ALL dimensions are 1 (scalar-like), a single dimension of size 1
+/// is preserved so the kernel has something to iterate over.
+pub fn compress_dims(dims: &[usize], all_strides: &[Vec<isize>]) -> (Vec<usize>, Vec<Vec<isize>>) {
+    let kept: Vec<usize> = (0..dims.len()).filter(|&i| dims[i] != 1).collect();
+
+    if kept.is_empty() {
+        // All dims are 1 (or empty). Preserve a single trivial dimension.
+        if dims.is_empty() {
+            return (vec![], all_strides.to_vec());
+        }
+        let new_strides = all_strides.iter().map(|s| vec![s[0]]).collect();
+        return (vec![1], new_strides);
+    }
+
+    let new_dims: Vec<usize> = kept.iter().map(|&i| dims[i]).collect();
+    let new_strides: Vec<Vec<isize>> = all_strides
+        .iter()
+        .map(|s| kept.iter().map(|&i| s[i]).collect())
+        .collect();
+
+    (new_dims, new_strides)
+}
+
 /// Compute the "importance" of each dimension for loop ordering.
 ///
 /// This encodes stride order information into importance scores that determine
@@ -326,5 +355,79 @@ mod tests {
         // min abs: [0, 0, 2]
         // transform: [1, 1, 4]
         assert_eq!(costs, vec![1, 1, 4]);
+    }
+
+    // ---- compress_dims tests ----
+
+    #[test]
+    fn test_compress_dims_removes_fused() {
+        let dims = vec![12usize, 1];
+        let strides = vec![vec![1isize, 3]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![12]);
+        assert_eq!(cs, vec![vec![1]]);
+    }
+
+    #[test]
+    fn test_compress_dims_removes_multiple() {
+        let dims = vec![6usize, 1, 4];
+        let strides = vec![vec![1isize, 2, 100]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![6, 4]);
+        assert_eq!(cs, vec![vec![1, 100]]);
+    }
+
+    #[test]
+    fn test_compress_dims_no_removal() {
+        let dims = vec![3usize, 4];
+        let strides = vec![vec![1isize, 3]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![3, 4]);
+        assert_eq!(cs, vec![vec![1, 3]]);
+    }
+
+    #[test]
+    fn test_compress_dims_all_ones() {
+        let dims = vec![1usize, 1, 1];
+        let strides = vec![vec![1isize, 1, 1]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![1]);
+        assert_eq!(cs, vec![vec![1]]);
+    }
+
+    #[test]
+    fn test_compress_dims_multi_arrays() {
+        let dims = vec![6usize, 1, 4];
+        let strides = vec![vec![1isize, 6, 6], vec![4isize, 24, 1]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![6, 4]);
+        assert_eq!(cs, vec![vec![1, 6], vec![4, 1]]);
+    }
+
+    #[test]
+    fn test_compress_dims_single_dim() {
+        let dims = vec![5usize];
+        let strides = vec![vec![1isize]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![5]);
+        assert_eq!(cs, vec![vec![1]]);
+    }
+
+    #[test]
+    fn test_compress_dims_single_dim_one() {
+        let dims = vec![1usize];
+        let strides = vec![vec![1isize]];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert_eq!(cd, vec![1]);
+        assert_eq!(cs, vec![vec![1]]);
+    }
+
+    #[test]
+    fn test_compress_dims_empty() {
+        let dims: Vec<usize> = vec![];
+        let strides: Vec<Vec<isize>> = vec![];
+        let (cd, cs) = compress_dims(&dims, &strides);
+        assert!(cd.is_empty());
+        assert!(cs.is_empty());
     }
 }
