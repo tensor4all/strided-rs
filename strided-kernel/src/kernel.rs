@@ -649,6 +649,38 @@ pub(crate) fn use_sequential_fast_path(total: usize) -> bool {
     }
 }
 
+/// Returns the common contiguous layout if **all** provided stride arrays
+/// share the same contiguous layout for the given `dims`.
+///
+/// Returns `None` if `strides_list` is empty, any array is not contiguous,
+/// or any two arrays have different contiguous layouts.
+#[inline]
+pub(crate) fn same_contiguous_layout(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+) -> Option<ContiguousLayout> {
+    let first = contiguous_layout(dims, strides_list.first()?)?;
+    for strides in &strides_list[1..] {
+        if contiguous_layout(dims, strides)? != first {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// Returns the common contiguous layout only when the sequential fast path
+/// should be used (total elements <= threading threshold).
+#[inline]
+pub(crate) fn sequential_contiguous_layout(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+) -> Option<ContiguousLayout> {
+    if !use_sequential_fast_path(total_len(dims)) {
+        return None;
+    }
+    same_contiguous_layout(dims, strides_list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +728,114 @@ mod tests {
         assert_eq!(
             contiguous_layout(&dims, &strides),
             Some(ContiguousLayout::RowMajor)
+        );
+    }
+
+    // ---- same_contiguous_layout tests ----
+
+    #[test]
+    fn test_same_contiguous_layout_all_row_major() {
+        let dims = [3usize, 4];
+        let s1 = [4isize, 1];
+        let s2 = [4isize, 1];
+        assert_eq!(
+            same_contiguous_layout(&dims, &[&s1, &s2]),
+            Some(ContiguousLayout::RowMajor)
+        );
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_all_col_major() {
+        let dims = [3usize, 4];
+        let s1 = [1isize, 3];
+        let s2 = [1isize, 3];
+        assert_eq!(
+            same_contiguous_layout(&dims, &[&s1, &s2]),
+            Some(ContiguousLayout::ColMajor)
+        );
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_mixed_layouts() {
+        let dims = [3usize, 4];
+        let row = [4isize, 1];
+        let col = [1isize, 3];
+        assert_eq!(same_contiguous_layout(&dims, &[&row, &col]), None);
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_one_noncontiguous() {
+        let dims = [3usize, 4];
+        let row = [4isize, 1];
+        let bad = [8isize, 2];
+        assert_eq!(same_contiguous_layout(&dims, &[&row, &bad]), None);
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_empty_strides_list() {
+        let dims = [3usize, 4];
+        let empty: &[&[isize]] = &[];
+        assert_eq!(same_contiguous_layout(&dims, empty), None);
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_single_array() {
+        let dims = [3usize, 4];
+        let s = [4isize, 1];
+        assert_eq!(
+            same_contiguous_layout(&dims, &[&s[..]]),
+            Some(ContiguousLayout::RowMajor)
+        );
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_many_arrays() {
+        let dims = [2usize, 3];
+        let s = [3isize, 1];
+        assert_eq!(
+            same_contiguous_layout(&dims, &[&s[..], &s[..], &s[..], &s[..], &s[..]]),
+            Some(ContiguousLayout::RowMajor)
+        );
+    }
+
+    #[test]
+    fn test_same_contiguous_layout_empty_dims() {
+        let dims: [usize; 0] = [];
+        let s: [isize; 0] = [];
+        assert_eq!(
+            same_contiguous_layout(&dims, &[&s[..], &s[..]]),
+            Some(ContiguousLayout::RowMajor)
+        );
+    }
+
+    // ---- sequential_contiguous_layout tests ----
+
+    #[test]
+    fn test_sequential_contiguous_layout_small_array() {
+        let dims = [3usize, 4];
+        let s1 = [4isize, 1];
+        let s2 = [4isize, 1];
+        assert_eq!(
+            sequential_contiguous_layout(&dims, &[&s1, &s2]),
+            Some(ContiguousLayout::RowMajor)
+        );
+    }
+
+    #[test]
+    fn test_sequential_contiguous_layout_noncontiguous() {
+        let dims = [3usize, 4];
+        let s1 = [4isize, 1];
+        let s2 = [8isize, 2];
+        assert_eq!(sequential_contiguous_layout(&dims, &[&s1, &s2]), None);
+    }
+
+    #[test]
+    fn test_sequential_contiguous_layout_col_major() {
+        let dims = [3usize, 4];
+        let col = [1isize, 3];
+        assert_eq!(
+            sequential_contiguous_layout(&dims, &[&col]),
+            Some(ContiguousLayout::ColMajor)
         );
     }
 }

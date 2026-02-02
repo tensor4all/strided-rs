@@ -3,8 +3,8 @@
 //! These are the canonical view-based map functions, equivalent to Julia's `Base.map!`.
 
 use crate::kernel::{
-    build_plan_fused, contiguous_layout, ensure_same_shape, for_each_inner_block_preordered,
-    total_len, use_sequential_fast_path,
+    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered,
+    sequential_contiguous_layout, total_len,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
@@ -209,27 +209,19 @@ pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
     let dst_ptr = dest.as_mut_ptr();
     let src_ptr = src.ptr();
     let dst_dims = dest.dims();
-    let src_dims = src.dims();
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(dst_layout), Some(src_layout)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(src_dims, src_strides),
-        ) {
-            if dst_layout == src_layout {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = f(Op::apply(src[i]));
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = f(Op::apply(src[i]));
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
@@ -309,30 +301,20 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
 
-    let a_dims = a.dims();
-    let b_dims = b.dims();
     let a_strides = a.strides();
     let b_strides = b.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(a), Some(b)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(a_dims, a_strides),
-            contiguous_layout(b_dims, b_strides),
-        ) {
-            if d == a && d == b {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]));
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]));
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
@@ -430,27 +412,23 @@ pub fn zip_map3_into<
     let dst_dims = dest.dims();
     let dst_strides = dest.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(a_l), Some(b_l), Some(c_l)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(a.dims(), a.strides()),
-            contiguous_layout(b.dims(), b.strides()),
-            contiguous_layout(c.dims(), c.strides()),
-        ) {
-            if d == a_l && d == b_l && d == c_l {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-                let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]), OpC::apply(sc[i]));
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(
+        dst_dims,
+        &[dst_strides, a.strides(), b.strides(), c.strides()],
+    )
+    .is_some()
+    {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]), OpC::apply(sc[i]));
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 4] = [dst_strides, a.strides(), b.strides(), c.strides()];
@@ -556,34 +534,35 @@ pub fn zip_map4_into<
     let dst_dims = dest.dims();
     let dst_strides = dest.strides();
 
-    if use_sequential_fast_path(total_len(dst_dims)) {
-        if let (Some(d), Some(a_l), Some(b_l), Some(c_l), Some(e_l)) = (
-            contiguous_layout(dst_dims, dst_strides),
-            contiguous_layout(a.dims(), a.strides()),
-            contiguous_layout(b.dims(), b.strides()),
-            contiguous_layout(c.dims(), c.strides()),
-            contiguous_layout(e.dims(), e.strides()),
-        ) {
-            if d == a_l && d == b_l && d == c_l && d == e_l {
-                let len = total_len(dst_dims);
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-                let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
-                let se = unsafe { std::slice::from_raw_parts(e_ptr, len) };
-                simd::dispatch_if_large(len, || {
-                    for i in 0..len {
-                        dst[i] = f(
-                            OpA::apply(sa[i]),
-                            OpB::apply(sb[i]),
-                            OpC::apply(sc[i]),
-                            OpE::apply(se[i]),
-                        );
-                    }
-                });
-                return Ok(());
+    if sequential_contiguous_layout(
+        dst_dims,
+        &[
+            dst_strides,
+            a.strides(),
+            b.strides(),
+            c.strides(),
+            e.strides(),
+        ],
+    )
+    .is_some()
+    {
+        let len = total_len(dst_dims);
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
+        let se = unsafe { std::slice::from_raw_parts(e_ptr, len) };
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = f(
+                    OpA::apply(sa[i]),
+                    OpB::apply(sb[i]),
+                    OpC::apply(sc[i]),
+                    OpE::apply(se[i]),
+                );
             }
-        }
+        });
+        return Ok(());
     }
 
     let strides_list: [&[isize]; 5] = [
