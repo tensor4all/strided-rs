@@ -3,7 +3,7 @@
 //! This module implements the core iteration engine that follows Julia's
 //! `_mapreduce_kernel!` pattern for cache-optimized strided array operations.
 
-use crate::fuse::fuse_dims;
+use crate::fuse::{compress_dims, fuse_dims};
 use crate::{block, order, Result};
 
 pub(crate) struct KernelPlan {
@@ -62,14 +62,23 @@ pub(crate) fn build_plan_fused(
     // 3. Fuse contiguous dimensions in ordered space
     let fused_dims = fuse_dims(&ordered_dims, &ordered_strides_refs);
 
-    // 4. Compute blocks with identity ordering (already ordered)
-    let identity: Vec<usize> = (0..fused_dims.len()).collect();
-    let block =
-        block::compute_block_sizes(&fused_dims, &identity, &ordered_strides_refs, elem_size);
+    // 4. Compress: remove size-1 dimensions to reduce loop depth
+    let (compressed_dims, compressed_strides) = compress_dims(&fused_dims, &ordered_strides);
+    let compressed_strides_refs: Vec<&[isize]> =
+        compressed_strides.iter().map(|s| s.as_slice()).collect();
+
+    // 5. Compute blocks with identity ordering (already ordered)
+    let identity: Vec<usize> = (0..compressed_dims.len()).collect();
+    let block = block::compute_block_sizes(
+        &compressed_dims,
+        &identity,
+        &compressed_strides_refs,
+        elem_size,
+    );
 
     (
-        fused_dims,
-        ordered_strides,
+        compressed_dims,
+        compressed_strides,
         KernelPlan {
             order: identity,
             block,
@@ -837,5 +846,19 @@ mod tests {
             sequential_contiguous_layout(&dims, &[&col]),
             Some(ContiguousLayout::ColMajor)
         );
+    }
+
+    #[test]
+    fn test_build_plan_fused_compresses() {
+        // A contiguous 2x3 column-major array fuses [2,3] -> [6,1] -> compress -> [6]
+        let dims = [2usize, 3];
+        let strides = [1isize, 2];
+        let strides_list: Vec<&[isize]> = vec![&strides];
+        let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), 8);
+        // After fusion + compression, should be 1D
+        assert_eq!(fused_dims, vec![6]);
+        assert_eq!(fused_strides.len(), 1);
+        assert_eq!(fused_strides[0], vec![1]);
+        assert_eq!(plan.block.len(), 1);
     }
 }
