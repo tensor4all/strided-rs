@@ -13,9 +13,9 @@ use crate::Result;
 use strided_view::{ElementOp, ElementOpApply};
 
 #[cfg(feature = "parallel")]
-use crate::threading::{
-    compute_costs, for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH,
-};
+use crate::fuse::compute_costs;
+#[cfg(feature = "parallel")]
+use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH};
 
 // ============================================================================
 // Stride-specialized inner loop helpers
@@ -237,7 +237,7 @@ pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides, fused_dims.len());
+            let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -331,7 +331,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
             let a_send = SendPtr(a_ptr as *mut T);
             let b_send = SendPtr(b_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides, fused_dims.len());
+            let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -446,7 +446,7 @@ pub fn zip_map3_into<
             let b_send = SendPtr(b_ptr as *mut T);
             let c_send = SendPtr(c_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides, fused_dims.len());
+            let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
@@ -587,7 +587,7 @@ pub fn zip_map4_into<
             let c_send = SendPtr(c_ptr as *mut T);
             let e_send = SendPtr(e_ptr as *mut T);
 
-            let costs = compute_costs(&ordered_strides, fused_dims.len());
+            let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
             let nthreads = rayon::current_num_threads();
 
