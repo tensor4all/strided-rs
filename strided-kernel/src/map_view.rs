@@ -6,6 +6,7 @@ use crate::kernel::{
     build_plan_fused, contiguous_layout, ensure_same_shape, for_each_inner_block_preordered,
     total_len, use_sequential_fast_path,
 };
+use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::Result;
@@ -198,10 +199,10 @@ unsafe fn inner_loop_map4<
 /// Apply a function element-wise from source to destination.
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
-pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
+pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
-    f: impl Fn(T) -> T + Sync,
+    f: impl Fn(T) -> T + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -293,11 +294,11 @@ pub fn map_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
 }
 
 /// Binary element-wise operation: `dest[i] = f(a[i], b[i])`.
-pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB: ElementOp>(
+pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, OpB: ElementOp>(
     dest: &mut StridedViewMut<T>,
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
-    f: impl Fn(T, T) -> T + Sync,
+    f: impl Fn(T, T) -> T + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -406,7 +407,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + Send + Sync, OpA: ElementOp, OpB
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
 pub fn zip_map3_into<
-    T: Copy + ElementOpApply + Send + Sync,
+    T: Copy + ElementOpApply + MaybeSendSync,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
@@ -415,7 +416,7 @@ pub fn zip_map3_into<
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
     c: &StridedView<T, OpC>,
-    f: impl Fn(T, T, T) -> T + Sync,
+    f: impl Fn(T, T, T) -> T + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -528,7 +529,7 @@ pub fn zip_map3_into<
 
 /// Quaternary element-wise operation: `dest[i] = f(a[i], b[i], c[i], e[i])`.
 pub fn zip_map4_into<
-    T: Copy + ElementOpApply + Send + Sync,
+    T: Copy + ElementOpApply + MaybeSendSync,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
@@ -539,7 +540,7 @@ pub fn zip_map4_into<
     b: &StridedView<T, OpB>,
     c: &StridedView<T, OpC>,
     e: &StridedView<T, OpE>,
-    f: impl Fn(T, T, T, T) -> T + Sync,
+    f: impl Fn(T, T, T, T) -> T + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;

@@ -5,6 +5,7 @@ use crate::kernel::{
     total_len, use_sequential_fast_path,
 };
 use crate::map_view::{map_into, zip_map2_into};
+use crate::maybe_sync::MaybeSendSync;
 use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -183,7 +184,7 @@ unsafe fn inner_loop_dot<
 }
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
-pub fn copy_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
+pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -235,7 +236,7 @@ pub fn copy_into<T: Copy + ElementOpApply + Send + Sync, Op: ElementOp>(
 }
 
 /// Element-wise addition: `dest[i] += src[i]`.
-pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: ElementOp>(
+pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -337,7 +338,7 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + Send + Sync, Op: Element
 }
 
 /// Element-wise multiplication: `dest[i] *= src[i]`.
-pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: ElementOp>(
+pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -440,7 +441,7 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: Element
 
 /// AXPY: `dest[i] = alpha * src[i] + dest[i]`.
 pub fn axpy<
-    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send + Sync,
+    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeSendSync,
     Op: ElementOp,
 >(
     dest: &mut StridedViewMut<T>,
@@ -547,7 +548,7 @@ pub fn axpy<
 }
 
 /// Fused multiply-add: `dest[i] += a[i] * b[i]`.
-pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send + Sync>(
+pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeSendSync>(
     dest: &mut StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
@@ -661,7 +662,7 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + Send +
 
 /// Sum all elements: `sum(src)`.
 pub fn sum<
-    T: Copy + ElementOpApply + Zero + Add<Output = T> + Send + Sync + 'static,
+    T: Copy + ElementOpApply + Zero + Add<Output = T> + MaybeSendSync + 'static,
     Op: ElementOp,
 >(
     src: &StridedView<T, Op>,
@@ -689,7 +690,7 @@ pub fn sum<
 
 /// Dot product: `sum(a[i] * b[i])`.
 pub fn dot<
-    T: Copy + ElementOpApply + Zero + Mul<Output = T> + Add<Output = T> + Send + Sync + 'static,
+    T: Copy + ElementOpApply + Zero + Mul<Output = T> + Add<Output = T> + MaybeSendSync + 'static,
     OpA: ElementOp,
     OpB: ElementOp,
 >(
@@ -776,8 +777,7 @@ where
         + Mul<Output = T>
         + num_traits::FromPrimitive
         + std::ops::Div<Output = T>
-        + Send
-        + Sync,
+        + MaybeSendSync,
 {
     if src.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
@@ -803,8 +803,7 @@ where
         + Mul<Output = T>
         + num_traits::FromPrimitive
         + std::ops::Div<Output = T>
-        + Send
-        + Sync,
+        + MaybeSendSync,
 {
     if src.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
@@ -823,7 +822,7 @@ where
 }
 
 /// Copy with scaling: `dest[i] = scale * src[i]`.
-pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: ElementOp>(
+pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: ElementOp>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
     scale: T,
@@ -832,7 +831,7 @@ pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync, Op: 
 }
 
 /// Copy with complex conjugation: `dest[i] = conj(src[i])`.
-pub fn copy_conj<T: Copy + ElementOpApply + Send + Sync>(
+pub fn copy_conj<T: Copy + ElementOpApply + MaybeSendSync>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
@@ -847,7 +846,7 @@ pub fn copy_transpose_scale_into<T>(
     scale: T,
 ) -> Result<()>
 where
-    T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync,
+    T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync,
 {
     if src.ndim() != 2 || dest.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));

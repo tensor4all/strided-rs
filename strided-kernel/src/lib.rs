@@ -62,6 +62,9 @@ mod simd;
 #[cfg(feature = "parallel")]
 mod threading;
 
+mod maybe_sync;
+pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
+
 // View-based operation modules
 mod map_view;
 mod ops_view;
