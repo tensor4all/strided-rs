@@ -168,6 +168,12 @@ bash strided-kernel/benches/run_threaded.sh 1 2 4
 # Scaling benchmarks (sum + permute, 1/2/4 threads)
 bash strided-kernel/benches/run_scaling.sh
 bash strided-kernel/benches/run_scaling.sh 1 2 4 8  # custom thread counts
+
+# Rank-25 tensor permutation (quantum circuit simulation workload)
+RAYON_NUM_THREADS=1 cargo bench --bench rank25_permute --manifest-path strided-kernel/Cargo.toml
+
+# Rank-25 Julia comparison
+JULIA_NUM_THREADS=1 julia --project=strided-kernel/benches strided-kernel/benches/julia_rank25_compare.jl
 ```
 
 ### Single-Threaded Results
