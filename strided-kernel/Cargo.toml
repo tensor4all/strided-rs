@@ -42,3 +42,7 @@ harness = false
 name = "threaded_compare"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "rank25_permute"
+harness = false
