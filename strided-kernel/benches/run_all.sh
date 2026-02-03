@@ -24,6 +24,25 @@ fi
 echo ""
 
 echo "============================================================"
+echo " Rank-25 tensor permutation benchmarks"
+echo "============================================================"
+echo ""
+
+echo "--- Rust (strided-rs, single-threaded) ---"
+RAYON_NUM_THREADS=1 cargo bench --bench rank25_permute \
+    --manifest-path "$PROJECT_DIR/Cargo.toml" 2>&1 \
+    | grep -v "^$\|Compiling\|Finished\|Running\|Benchmarking"
+echo ""
+
+echo "--- Julia (Strided.jl, single-threaded) ---"
+if command -v julia >/dev/null 2>&1; then
+    JULIA_NUM_THREADS=1 julia --project="$SCRIPT_DIR" "$SCRIPT_DIR/julia_rank25_compare.jl"
+else
+    echo "julia not found; skipping Julia benchmarks."
+fi
+echo ""
+
+echo "============================================================"
 echo " Multi-threaded benchmarks (Rust parallel feature)"
 echo "============================================================"
 echo ""
