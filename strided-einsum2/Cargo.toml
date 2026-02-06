@@ -22,3 +22,63 @@ default = ["faer", "faer-traits"]
 [dev-dependencies]
 approx = "0.5"
 num-complex = "0.4"
+rand = "0.8"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "manyinds"
+harness = false
+
+[[bench]]
+name = "matmul"
+harness = false
+
+[[bench]]
+name = "batchmul"
+harness = false
+
+[[bench]]
+name = "dot"
+harness = false
+
+[[bench]]
+name = "trace"
+harness = false
+
+[[bench]]
+name = "ptrace"
+harness = false
+
+[[bench]]
+name = "diag"
+harness = false
+
+[[bench]]
+name = "perm"
+harness = false
+
+[[bench]]
+name = "tcontract"
+harness = false
+
+[[bench]]
+name = "star"
+harness = false
+
+[[bench]]
+name = "starandcontract"
+harness = false
+
+[[bench]]
+name = "indexsum"
+harness = false
+
+[[bench]]
+name = "hadamard"
+harness = false
+
+[[bench]]
+name = "outer"
+harness = false
