@@ -1,6 +1,7 @@
 //! Many-index einsum benchmark (OMEinsum-style).
 //!
-//! Contraction: "abcdefghijklmnop,flnqrcipstujvgamdwxyz->bcdeghkmnopqrstuvwxyz"
+//! Reduced index set (12+12→13) for faster runs; same style as the full
+//! "abcdefghijklmnop,flnqrcipstujvgamdwxyz->bcdeghkmnopqrstuvwxyz".
 //! All dimensions size 2. Single-threaded for parity with Julia @benchmark.
 //! Benchmarks both f64 and ComplexF64 (Complex64).
 
@@ -33,31 +34,29 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
     avg
 }
 
-/// Axis labels for the many-index contraction (same as Julia OMEinsum example).
-/// Left:  abcdefghijklmnop (16 dims), Right: flnqrcipstujvgamdwxyz (21 dims),
-/// Output: bcdeghkmnopqrstuvwxyz (21 dims). All dimensions size 2.
-const IA: [char; 16] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+/// Axis labels for the many-index contraction (reduced from full OMEinsum example).
+/// Left:  abcdefghijkl (12 dims), Right: flnqrcipstuj (12 dims),
+/// Output: abdeghkqrstu (13 dims). Contracted: c,f,i,j,l,n. All dimensions size 2.
+const IA: [char; 12] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
 ];
-const IB: [char; 21] = [
-    'f', 'l', 'n', 'q', 'r', 'c', 'i', 'p', 's', 't', 'u', 'j', 'v', 'g', 'a', 'm', 'd', 'w', 'x',
-    'y', 'z',
+const IB: [char; 12] = [
+    'f', 'l', 'n', 'q', 'r', 'c', 'i', 'p', 's', 't', 'u', 'j',
 ];
-const IC: [char; 21] = [
-    'b', 'c', 'd', 'e', 'g', 'h', 'k', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x',
-    'y', 'z',
+const IC: [char; 13] = [
+    'a', 'b', 'd', 'e', 'g', 'h', 'k', 'q', 'r', 'p', 's', 't', 'u',
 ];
 
 fn main() {
     println!("strided-einsum2 bench: manyinds (many-index binary einsum)");
-    println!("Contract: abcdefghijklmnop, flnqrcipstujvgamdwxyz -> bcdeghkmnopqrstuvwxyz");
+    println!("Contract: abcdefghijkl, flnqrcipstuj -> abdeghkqrpstu");
     println!("All dimensions size 2. Column-major for Julia parity.");
     println!();
 
     let dim = 2usize;
-    let shape_a: Vec<usize> = (0..16).map(|_| dim).collect();
-    let shape_b: Vec<usize> = (0..21).map(|_| dim).collect();
-    let shape_c: Vec<usize> = (0..21).map(|_| dim).collect();
+    let shape_a: Vec<usize> = (0..12).map(|_| dim).collect();
+    let shape_b: Vec<usize> = (0..12).map(|_| dim).collect();
+    let shape_c: Vec<usize> = (0..13).map(|_| dim).collect();
 
     let mut rng = StdRng::seed_from_u64(0);
     let a = StridedArray::<f64>::from_fn_col_major(&shape_a, |_| rng.gen::<f64>());
