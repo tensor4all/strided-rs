@@ -37,12 +37,8 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
 /// Axis labels for the many-index contraction (reduced from full OMEinsum example).
 /// Left:  abcdefghijkl (12 dims), Right: flnqrcipstuj (12 dims),
 /// Output: abdeghkqrstu (13 dims). Contracted: c,f,i,j,l,n. All dimensions size 2.
-const IA: [char; 12] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
-];
-const IB: [char; 12] = [
-    'f', 'l', 'n', 'q', 'r', 'c', 'i', 'p', 's', 't', 'u', 'j',
-];
+const IA: [char; 12] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'];
+const IB: [char; 12] = ['f', 'l', 'n', 'q', 'r', 'c', 'i', 'p', 's', 't', 'u', 'j'];
 const IC: [char; 13] = [
     'a', 'b', 'd', 'e', 'g', 'h', 'k', 'q', 'r', 'p', 's', 't', 'u',
 ];
