@@ -110,4 +110,3 @@ fn main() {
         black_box(c_c.data().as_ptr());
     });
 }
-

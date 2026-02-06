@@ -15,8 +15,16 @@ fn mean(durations: &[Duration]) -> Duration {
 }
 
 fn bench_n(label: &str, warmup: usize, iters: usize, mut f: impl FnMut()) -> Duration {
-    for _ in 0..warmup { f(); }
-    let samples: Vec<Duration> = (0..iters).map(|_| { let t = Instant::now(); f(); t.elapsed() }).collect();
+    for _ in 0..warmup {
+        f();
+    }
+    let samples: Vec<Duration> = (0..iters)
+        .map(|_| {
+            let t = Instant::now();
+            f();
+            t.elapsed()
+        })
+        .collect();
     let avg = mean(&samples);
     println!("{label}: {:.3} ms", avg.as_secs_f64() * 1e3);
     avg
@@ -25,7 +33,10 @@ fn bench_n(label: &str, warmup: usize, iters: usize, mut f: impl FnMut()) -> Dur
 fn main() {
     let n = 100usize;
     let shape_3 = [n, n, n];
-    println!("strided-einsum2 bench: hadamard (ein \"ijk,ijk->ijk\"), large ({}^3)", n);
+    println!(
+        "strided-einsum2 bench: hadamard (ein \"ijk,ijk->ijk\"), large ({}^3)",
+        n
+    );
 
     let mut rng = StdRng::seed_from_u64(0);
     let a = StridedArray::<f64>::from_fn_col_major(&shape_3, |_| rng.gen::<f64>());
@@ -38,8 +49,12 @@ fn main() {
     });
 
     let mut rng_c = StdRng::seed_from_u64(1);
-    let ac = StridedArray::<Complex64>::from_fn_col_major(&shape_3, |_| Complex64::new(rng_c.gen(), rng_c.gen()));
-    let bc = StridedArray::<Complex64>::from_fn_col_major(&shape_3, |_| Complex64::new(rng_c.gen(), rng_c.gen()));
+    let ac = StridedArray::<Complex64>::from_fn_col_major(&shape_3, |_| {
+        Complex64::new(rng_c.gen(), rng_c.gen())
+    });
+    let bc = StridedArray::<Complex64>::from_fn_col_major(&shape_3, |_| {
+        Complex64::new(rng_c.gen(), rng_c.gen())
+    });
     let mut cc = StridedArray::<Complex64>::col_major(&shape_3);
     println!("hadamard (ComplexF64):");
     bench_n("hadamard_Complex64_large", 1, 3, || {

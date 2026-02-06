@@ -35,7 +35,10 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
 
 /// Permute ijkl -> ljki (perm [3,1,2,0]) then copy; #[inline(never)] prevents hoisting.
 #[inline(never)]
-fn run_perm_f64(c: &mut StridedArray<f64>, a: &StridedArray<f64>) -> Result<(), strided_view::StridedError> {
+fn run_perm_f64(
+    c: &mut StridedArray<f64>,
+    a: &StridedArray<f64>,
+) -> Result<(), strided_view::StridedError> {
     let permuted = a.view().permute(&[3, 1, 2, 0])?;
     copy_into(&mut c.view_mut(), &permuted)
 }
