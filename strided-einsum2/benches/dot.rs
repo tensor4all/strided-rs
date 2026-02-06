@@ -1,12 +1,10 @@
-//! Dot product benchmark (einsum2 scalar C = sum_ijk A_ijk * B_ijk).
+//! Dot product (einsum2 scalar C = sum_ijk A_ijk * B_ijk).
 //!
-//! Matches Julia OMEinsum ein"ijk,ijk->" with shape (100, 100, 100).
+//! Shape (n1, n2, n3). Three cases:
+//! - (1) square: n1 = n2 = n3
+//! - (2) n1 = n3 >> n2 (tall/skinny in middle dim)
+//! - (3) n1 = n3 << n2 (short/wide in middle dim)
 //! Benchmarks both f64 and Complex64. Column-major for Julia parity.
-//!
-//! Uses #[inline(never)] on the run_dot_* helpers so the compiler cannot
-//! hoist the computation out of the timed loop. If Rust times are much
-//! lower than Julia (e.g. 0.2ms vs 4ms), that is likely due to different
-//! backends (faer vs OMEinsum), not benchmark artifact.
 
 use num_complex::Complex64;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -24,21 +22,17 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
     for _ in 0..warmup_iters {
         f();
     }
-
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t0 = Instant::now();
         f();
         samples.push(t0.elapsed());
     }
-
     let avg = mean(&samples);
-    println!("{label}: {:.3} ms", avg.as_secs_f64() * 1e3);
+    println!("  {label}: {:.3} ms", avg.as_secs_f64() * 1e3);
     avg
 }
 
-/// Run dot once; #[inline(never)] prevents the compiler from hoisting
-/// the computation out of the benchmark loop (same inputs → same output).
 #[inline(never)]
 fn run_dot_f64(
     c: &mut StridedArray<f64>,
@@ -79,28 +73,21 @@ fn run_dot_complex64(
     )
 }
 
-fn main() {
-    println!("strided-einsum2 bench: dot (einsum2 ijk,ijk->)");
-    println!("Shape (100, 100, 100), scalar output. Column-major for Julia parity.");
-    println!();
+fn run_dot_case(case_name: &str, n1: usize, n2: usize, n3: usize, seed_f64: u64, seed_c: u64) {
+    let shape_3 = [n1, n2, n3];
 
-    let shape_3 = [100, 100, 100];
-
-    // f64
-    let mut rng = StdRng::seed_from_u64(0);
+    let mut rng = StdRng::seed_from_u64(seed_f64);
     let a = StridedArray::<f64>::from_fn_col_major(&shape_3, |_| rng.gen::<f64>());
     let b = StridedArray::<f64>::from_fn_col_major(&shape_3, |_| rng.gen::<f64>());
     let mut c = StridedArray::<f64>::col_major(&[]);
 
-    println!("dot (einsum2_into): Float64");
-    bench_n("dot_f64", 2, 5, || {
+    println!("  Float64:");
+    bench_n(&format!("{case_name}_f64_{n1}x{n2}x{n3}"), 2, 5, || {
         run_dot_f64(&mut c, &a, &b).unwrap();
         black_box(c.get(&[]));
     });
-    println!();
 
-    // Complex64
-    let mut rng_c = StdRng::seed_from_u64(1);
+    let mut rng_c = StdRng::seed_from_u64(seed_c);
     let a_c = StridedArray::<Complex64>::from_fn_col_major(&shape_3, |_| {
         Complex64::new(rng_c.gen::<f64>(), rng_c.gen::<f64>())
     });
@@ -108,13 +95,34 @@ fn main() {
         Complex64::new(rng_c.gen::<f64>(), rng_c.gen::<f64>())
     });
     let mut c_c = StridedArray::<Complex64>::col_major(&[]);
-
     let one = Complex64::new(1.0, 0.0);
     let zero = Complex64::new(0.0, 0.0);
 
-    println!("dot (einsum2_into): ComplexF64");
-    bench_n("dot_Complex64", 2, 5, || {
-        run_dot_complex64(&mut c_c, &a_c, &b_c, one, zero).unwrap();
-        black_box(c_c.get(&[]));
-    });
+    println!("  ComplexF64:");
+    bench_n(
+        &format!("{case_name}_Complex64_{n1}x{n2}x{n3}"),
+        2,
+        5,
+        || {
+            run_dot_complex64(&mut c_c, &a_c, &b_c, one, zero).unwrap();
+            black_box(c_c.get(&[]));
+        },
+    );
+}
+
+fn main() {
+    println!("strided-einsum2 bench: dot (einsum2 ijk,ijk->)");
+    println!("Shape (n1, n2, n3), scalar. Column-major.");
+    println!();
+
+    println!("(1) square: n1 = n2 = n3 = 100");
+    run_dot_case("square", 100, 100, 100, 0, 1);
+    println!();
+
+    println!("(2) n1 = n3 >> n2: (2000, 50, 2000)");
+    run_dot_case("tall_skinny", 2000, 50, 2000, 2, 3);
+    println!();
+
+    println!("(3) n1 = n3 << n2: (50, 2000, 50)");
+    run_dot_case("short_wide", 50, 2000, 50, 4, 5);
 }
