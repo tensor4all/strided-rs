@@ -1,5 +1,5 @@
 //! Star contraction benchmark (ein"ij,ik,il->jkl": D[j,k,l] = sum_i A[i,j]*B[i,k]*C[i,l]).
-//! Matches Julia OMEinsum suite "star", large size only (100,100).
+//! Matches Julia OMEinsum suite "star", large size only (50,50).
 //! 3-ary contraction: implemented as explicit loop (no einsum3).
 
 use num_complex::Complex64;
@@ -72,7 +72,7 @@ fn run_star_complex64(
 }
 
 fn main() {
-    let n = 100usize;
+    let n = 50usize;
     let shape_2 = [n, n];
     let shape_3 = [n, n, n];
     println!(

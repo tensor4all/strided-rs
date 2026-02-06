@@ -1,5 +1,5 @@
 //! Star-and-contract benchmark (ein"ij,ik,ik->j": out[j] = sum_ik A[i,j]*B[i,k]*C[i,k]).
-//! Matches Julia OMEinsum suite "starandcontract", large size only (100,100).
+//! Matches Julia OMEinsum suite "starandcontract", large size only (50,50).
 //! 3-ary: implemented as explicit loop.
 
 use num_complex::Complex64;
@@ -68,7 +68,7 @@ fn run_starandcontract_complex64(
 }
 
 fn main() {
-    let n = 100usize;
+    let n = 50usize;
     let shape_2 = [n, n];
     let shape_1 = [n];
     println!(

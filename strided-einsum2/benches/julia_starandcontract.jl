@@ -7,7 +7,7 @@ using Random
 
 function bench_starandcontract(T::DataType)
     println("starandcontract (OMEinsum): $T")
-    m = rand(T, 100, 100)
+    m = rand(T, 50, 50)
     t = @benchmark ein"ij,ik,ik -> j"($m, $m, $m)
     println("starandcontract (OMEinsum): ", mean(t.times) / 1e6, " ms")
     println()
