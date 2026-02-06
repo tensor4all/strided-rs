@@ -176,23 +176,6 @@ RAYON_NUM_THREADS=1 cargo bench --bench rank25_permute --manifest-path strided-k
 JULIA_NUM_THREADS=1 julia --project=strided-kernel/benches strided-kernel/benches/julia_rank25_compare.jl
 ```
 
-#### strided-einsum2 (binary einsum)
-
-The `strided-einsum2` crate provides `einsum2_into` for binary tensor contractions. Benchmarks (Rust and Julia OMEinsum reference scripts) live in `strided-einsum2/benches/`:
-
-```bash
-# Rust benchmarks (run from repo root)
-cargo bench -p strided-einsum2 --bench manyinds   # many-index contraction
-cargo bench -p strided-einsum2 --bench matmul    # 1000×1000 matrix multiply
-cargo bench -p strided-einsum2 --bench batchmul  # batched matmul (1000,1000,3)
-cargo bench -p strided-einsum2 --bench dot       # scalar dot (100,100,100)
-cargo bench -p strided-einsum2 --bench trace      # trace of 1000×1000
-cargo bench -p strided-einsum2 --bench ptrace     # partial trace (100,100,100)->(100)
-cargo bench -p strided-einsum2 --bench diag       # diagonal extraction (100,100,100)->(100,100)
-```
-
-Julia reference scripts (e.g. `julia_matmul.jl`, `julia_dot.jl`) use OMEinsum and can be run with `julia strided-einsum2/benches/julia_<name>.jl` for comparison.
-
 ### Single-Threaded Results
 
 Environment: Apple Silicon M2, single-threaded.
