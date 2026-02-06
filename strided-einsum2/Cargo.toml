@@ -22,3 +22,11 @@ default = ["faer", "faer-traits"]
 [dev-dependencies]
 approx = "0.5"
 num-complex = "0.4"
+rand = "0.8"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "manyinds"
+harness = false
