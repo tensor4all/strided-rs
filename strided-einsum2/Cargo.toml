@@ -62,3 +62,23 @@ harness = false
 [[bench]]
 name = "tcontract"
 harness = false
+
+[[bench]]
+name = "star"
+harness = false
+
+[[bench]]
+name = "starandcontract"
+harness = false
+
+[[bench]]
+name = "indexsum"
+harness = false
+
+[[bench]]
+name = "hadamard"
+harness = false
+
+[[bench]]
+name = "outer"
+harness = false
