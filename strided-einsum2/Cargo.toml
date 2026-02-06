@@ -34,3 +34,23 @@ harness = false
 [[bench]]
 name = "matmul"
 harness = false
+
+[[bench]]
+name = "batchmul"
+harness = false
+
+[[bench]]
+name = "dot"
+harness = false
+
+[[bench]]
+name = "trace"
+harness = false
+
+[[bench]]
+name = "ptrace"
+harness = false
+
+[[bench]]
+name = "diag"
+harness = false
