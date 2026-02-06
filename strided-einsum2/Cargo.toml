@@ -54,3 +54,11 @@ harness = false
 [[bench]]
 name = "diag"
 harness = false
+
+[[bench]]
+name = "perm"
+harness = false
+
+[[bench]]
+name = "tcontract"
+harness = false
