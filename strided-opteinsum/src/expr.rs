@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use num_complex::Complex64;
 use num_traits::Zero;
-use strided_einsum2::einsum2_into;
+use strided_einsum2::{einsum2_into, einsum2_into_owned};
 use strided_view::StridedArray;
 
 use crate::operand::{EinsumOperand, StridedData};
@@ -116,68 +116,158 @@ fn out_dims_from_map(
     Ok(out_dims)
 }
 
-/// Contract two operands by borrowing views. Promotes to c64 if types are mixed.
+/// Contract two operands, consuming them by value. Promotes to c64 if types are mixed.
+///
+/// When both operands are `StridedData::Owned`, dispatches to `einsum2_into_owned`
+/// which can reuse the input buffers during contiguous preparation, avoiding copies.
 fn eval_pair(
-    left: &EinsumOperand<'_>,
+    left: EinsumOperand<'_>,
     left_ids: &[char],
-    right: &EinsumOperand<'_>,
+    right: EinsumOperand<'_>,
     right_ids: &[char],
     output_ids: &[char],
 ) -> crate::Result<EinsumOperand<'static>> {
     match (left, right) {
         (EinsumOperand::F64(ld), EinsumOperand::F64(rd)) => {
-            let a_view = ld.as_view();
-            let b_view = rd.as_view();
+            // Build dim_map from views before destructuring
+            let a_dims: Vec<usize> = ld.dims().to_vec();
+            let b_dims: Vec<usize> = rd.dims().to_vec();
             let mut dim_map: HashMap<char, usize> = HashMap::new();
             for (i, &id) in left_ids.iter().enumerate() {
-                dim_map.insert(id, a_view.dims()[i]);
+                dim_map.insert(id, a_dims[i]);
             }
             for (i, &id) in right_ids.iter().enumerate() {
-                dim_map.insert(id, b_view.dims()[i]);
+                dim_map.insert(id, b_dims[i]);
             }
             let out_dims = out_dims_from_map(&dim_map, output_ids)?;
             let mut c_arr = StridedArray::<f64>::col_major(&out_dims);
-            einsum2_into(
-                c_arr.view_mut(),
-                &a_view,
-                &b_view,
-                output_ids,
-                left_ids,
-                right_ids,
-                1.0,
-                0.0,
-            )?;
+
+            match (ld, rd) {
+                (StridedData::Owned(a), StridedData::Owned(b)) => {
+                    einsum2_into_owned(
+                        c_arr.view_mut(),
+                        a,
+                        b,
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        1.0,
+                        0.0,
+                        false,
+                        false,
+                    )?;
+                }
+                (StridedData::Owned(a), StridedData::View(b)) => {
+                    einsum2_into(
+                        c_arr.view_mut(),
+                        &a.view(),
+                        &b,
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        1.0,
+                        0.0,
+                    )?;
+                }
+                (StridedData::View(a), StridedData::Owned(b)) => {
+                    einsum2_into(
+                        c_arr.view_mut(),
+                        &a,
+                        &b.view(),
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        1.0,
+                        0.0,
+                    )?;
+                }
+                (StridedData::View(a), StridedData::View(b)) => {
+                    einsum2_into(
+                        c_arr.view_mut(),
+                        &a,
+                        &b,
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        1.0,
+                        0.0,
+                    )?;
+                }
+            }
             Ok(EinsumOperand::F64(StridedData::Owned(c_arr)))
         }
         (EinsumOperand::C64(ld), EinsumOperand::C64(rd)) => {
-            let a_view = ld.as_view();
-            let b_view = rd.as_view();
+            let a_dims: Vec<usize> = ld.dims().to_vec();
+            let b_dims: Vec<usize> = rd.dims().to_vec();
             let mut dim_map: HashMap<char, usize> = HashMap::new();
             for (i, &id) in left_ids.iter().enumerate() {
-                dim_map.insert(id, a_view.dims()[i]);
+                dim_map.insert(id, a_dims[i]);
             }
             for (i, &id) in right_ids.iter().enumerate() {
-                dim_map.insert(id, b_view.dims()[i]);
+                dim_map.insert(id, b_dims[i]);
             }
             let out_dims = out_dims_from_map(&dim_map, output_ids)?;
             let mut c_arr = StridedArray::<Complex64>::col_major(&out_dims);
-            einsum2_into(
-                c_arr.view_mut(),
-                &a_view,
-                &b_view,
-                output_ids,
-                left_ids,
-                right_ids,
-                Complex64::new(1.0, 0.0),
-                Complex64::zero(),
-            )?;
+
+            match (ld, rd) {
+                (StridedData::Owned(a), StridedData::Owned(b)) => {
+                    einsum2_into_owned(
+                        c_arr.view_mut(),
+                        a,
+                        b,
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        Complex64::new(1.0, 0.0),
+                        Complex64::zero(),
+                        false,
+                        false,
+                    )?;
+                }
+                (StridedData::Owned(a), StridedData::View(b)) => {
+                    einsum2_into(
+                        c_arr.view_mut(),
+                        &a.view(),
+                        &b,
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        Complex64::new(1.0, 0.0),
+                        Complex64::zero(),
+                    )?;
+                }
+                (StridedData::View(a), StridedData::Owned(b)) => {
+                    einsum2_into(
+                        c_arr.view_mut(),
+                        &a,
+                        &b.view(),
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        Complex64::new(1.0, 0.0),
+                        Complex64::zero(),
+                    )?;
+                }
+                (StridedData::View(a), StridedData::View(b)) => {
+                    einsum2_into(
+                        c_arr.view_mut(),
+                        &a,
+                        &b,
+                        output_ids,
+                        left_ids,
+                        right_ids,
+                        Complex64::new(1.0, 0.0),
+                        Complex64::zero(),
+                    )?;
+                }
+            }
             Ok(EinsumOperand::C64(StridedData::Owned(c_arr)))
         }
-        _ => {
-            // Mixed types: promote both to c64, then recurse (hits C64/C64 branch)
-            let left_c64 = left.to_c64_owned_ref();
-            let right_c64 = right.to_c64_owned_ref();
-            eval_pair(&left_c64, left_ids, &right_c64, right_ids, output_ids)
+        (left, right) => {
+            // Mixed types: promote both to c64 by consuming, then recurse (hits C64/C64 branch)
+            let left_c64 = left.to_c64_owned();
+            let right_c64 = right.to_c64_owned();
+            eval_pair(left_c64, left_ids, right_c64, right_ids, output_ids)
         }
     }
 }
@@ -277,7 +367,7 @@ fn execute_nested<'a>(
             let (left, left_ids) = execute_nested(&args[0], children)?;
             let (right, right_ids) = execute_nested(&args[1], children)?;
             let output_ids: Vec<char> = eins.iy.clone();
-            let result = eval_pair(&left, &left_ids, &right, &right_ids, &output_ids)?;
+            let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids)?;
             Ok((result, output_ids))
         }
     }
@@ -350,7 +440,7 @@ fn eval_node<'a>(
                     let right_needed = compute_child_needed_ids(&node_output_ids, 1, args);
                     let (left, left_ids) = eval_node(&args[0], operands, &left_needed)?;
                     let (right, right_ids) = eval_node(&args[1], operands, &right_needed)?;
-                    let result = eval_pair(&left, &left_ids, &right, &right_ids, &node_output_ids)?;
+                    let result = eval_pair(left, &left_ids, right, &right_ids, &node_output_ids)?;
                     Ok((result, node_output_ids))
                 }
                 _ => {

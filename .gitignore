@@ -29,3 +29,6 @@ Cargo.lock
 extern
 external
 plan
+
+# Git worktrees
+.worktrees/
