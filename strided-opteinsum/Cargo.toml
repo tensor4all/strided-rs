@@ -6,11 +6,17 @@ edition = "2021"
 [dependencies]
 strided-view = { path = "../strided-view" }
 strided-kernel = { path = "../strided-kernel" }
-strided-einsum2 = { path = "../strided-einsum2" }
+strided-einsum2 = { path = "../strided-einsum2", default-features = false }
 omeco = "0.2"
 num-complex = "0.4"
 num-traits = "0.2"
 thiserror = "1.0"
+
+[features]
+default = ["faer"]
+faer = ["strided-einsum2/faer", "strided-einsum2/faer-traits"]
+blas = ["strided-einsum2/blas"]
+blas-inject = ["strided-einsum2/blas-inject"]
 
 [dev-dependencies]
 approx = "0.5"

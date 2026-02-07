@@ -182,7 +182,20 @@ pub fn prepare_input_view<T: Scalar>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
-    let needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0 for size-1 dims).
+    // Batched multi-dim arrays may fuse successfully but still have non-unit strides
+    // in both groups (e.g., col-major [2,2,2] with strides [1,2,4] has rs=2, cs=4
+    // after batch stripping). Force a copy in that case.
+    #[cfg(any(feature = "blas", feature = "blas-inject"))]
+    if !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
@@ -262,7 +275,17 @@ pub fn prepare_input_owned<T: Scalar>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
-    let needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0).
+    #[cfg(any(feature = "blas", feature = "blas-inject"))]
+    if !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
@@ -329,7 +352,17 @@ pub fn prepare_output_view<T: Scalar>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
-    let needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0).
+    #[cfg(any(feature = "blas", feature = "blas-inject"))]
+    if !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
@@ -396,7 +429,17 @@ pub fn prepare_output_owned<T: Scalar>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
-    let needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0).
+    #[cfg(any(feature = "blas", feature = "blas-inject"))]
+    if !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);

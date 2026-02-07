@@ -773,6 +773,37 @@ mod tests {
     }
 
     #[test]
+    fn test_batched_matmul_col_major_output() {
+        // C_bik = A_bij * B_bjk with col-major output (same layout as opteinsum)
+        let a_data = vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
+        let b_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let a = StridedArray::<f64>::from_parts(a_data, &[2, 2, 2], &[4, 2, 1], 0).unwrap();
+        let b = StridedArray::<f64>::from_parts(b_data, &[2, 2, 2], &[4, 2, 1], 0).unwrap();
+        let mut c = StridedArray::<f64>::col_major(&[2, 2, 2]);
+
+        einsum2_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['b', 'i', 'k'],
+            &['b', 'i', 'j'],
+            &['b', 'j', 'k'],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        // batch 0: I * [[1,2],[3,4]] = [[1,2],[3,4]]
+        assert_eq!(c.get(&[0, 0, 0]), 1.0);
+        assert_eq!(c.get(&[0, 0, 1]), 2.0);
+        assert_eq!(c.get(&[0, 1, 0]), 3.0);
+        assert_eq!(c.get(&[0, 1, 1]), 4.0);
+        // batch 1: 2I * [[5,6],[7,8]] = [[10,12],[14,16]]
+        assert_eq!(c.get(&[1, 0, 0]), 10.0);
+        assert_eq!(c.get(&[1, 1, 1]), 16.0);
+    }
+
+    #[test]
     fn test_outer_product() {
         // C_ij = A_i * B_j
         let a = StridedArray::<f64>::from_fn_row_major(&[3], |idx| (idx[0] + 1) as f64);
