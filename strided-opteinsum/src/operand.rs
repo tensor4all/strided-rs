@@ -97,6 +97,36 @@ impl<'a> EinsumOperand<'a> {
         EinsumOperand::C64(StridedData::View(view.clone()))
     }
 
+    /// Promote to an owned Complex64 operand by borrowing the data.
+    ///
+    /// Unlike `to_c64_owned`, this works on `&self` and always copies.
+    pub fn to_c64_owned_ref(&self) -> EinsumOperand<'static> {
+        match self {
+            EinsumOperand::C64(data) => {
+                let view = data.as_view();
+                let dims = view.dims().to_vec();
+                let mut dest = StridedArray::<Complex64>::col_major(&dims);
+                copy_into(&mut dest.view_mut(), &view).expect("copy_into failed");
+                EinsumOperand::C64(StridedData::Owned(dest))
+            }
+            EinsumOperand::F64(data) => {
+                let view = data.as_view();
+                let dims = view.dims().to_vec();
+                let strides = col_major_strides(&dims);
+                let mut f64_dest = StridedArray::<f64>::col_major(&dims);
+                copy_into(&mut f64_dest.view_mut(), &view).expect("copy_into failed");
+                let c64_data: Vec<Complex64> = f64_dest
+                    .data()
+                    .iter()
+                    .map(|&x| Complex64::new(x, 0.0))
+                    .collect();
+                let c64_array = StridedArray::from_parts(c64_data, &dims, &strides, 0)
+                    .expect("from_parts failed");
+                EinsumOperand::C64(StridedData::Owned(c64_array))
+            }
+        }
+    }
+
     /// Promote to an owned Complex64 operand.
     ///
     /// - If already C64 and owned, returns as-is.
