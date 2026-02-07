@@ -141,7 +141,7 @@ fn eval_pair(
                 dim_map.insert(id, b_dims[i]);
             }
             let out_dims = out_dims_from_map(&dim_map, output_ids)?;
-            let mut c_arr = StridedArray::<f64>::col_major(&out_dims);
+            let mut c_arr = StridedArray::<f64>::row_major(&out_dims);
 
             match (ld, rd) {
                 (StridedData::Owned(a), StridedData::Owned(b)) => {
@@ -208,7 +208,7 @@ fn eval_pair(
                 dim_map.insert(id, b_dims[i]);
             }
             let out_dims = out_dims_from_map(&dim_map, output_ids)?;
-            let mut c_arr = StridedArray::<Complex64>::col_major(&out_dims);
+            let mut c_arr = StridedArray::<Complex64>::row_major(&out_dims);
 
             match (ld, rd) {
                 (StridedData::Owned(a), StridedData::Owned(b)) => {
