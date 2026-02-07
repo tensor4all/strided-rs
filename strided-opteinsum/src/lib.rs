@@ -28,7 +28,7 @@ pub mod single_tensor;
 pub mod typed_tensor;
 
 pub use error::{EinsumError, Result};
-pub use operand::{EinsumOperand, StridedData};
+pub use operand::{EinsumOperand, EinsumScalar, StridedData};
 pub use parse::{parse_einsum, EinsumCode, EinsumNode};
 pub use typed_tensor::{needs_c64_promotion, TypedTensor};
 
@@ -41,4 +41,27 @@ pub use typed_tensor::{needs_c64_promotion, TypedTensor};
 pub fn einsum<'a>(notation: &str, operands: Vec<EinsumOperand<'a>>) -> Result<EinsumOperand<'a>> {
     let code = parse_einsum(notation)?;
     code.evaluate(operands)
+}
+
+/// Parse and evaluate an einsum expression, writing the result into a
+/// pre-allocated output buffer with alpha/beta scaling.
+///
+/// `output = alpha * einsum(operands) + beta * output`
+///
+/// # Example
+/// ```ignore
+/// use strided_opteinsum::{einsum_into, EinsumOperand};
+///
+/// let mut c = StridedArray::<f64>::col_major(&[2, 2]);
+/// einsum_into("ij,jk->ik", vec![a.into(), b.into()], c.view_mut(), 1.0, 0.0)?;
+/// ```
+pub fn einsum_into<T: EinsumScalar>(
+    notation: &str,
+    operands: Vec<EinsumOperand<'_>>,
+    output: strided_view::StridedViewMut<T>,
+    alpha: T,
+    beta: T,
+) -> Result<()> {
+    let code = parse_einsum(notation)?;
+    code.evaluate_into(operands, output, alpha, beta)
 }
