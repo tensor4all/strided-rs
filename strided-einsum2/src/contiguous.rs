@@ -253,6 +253,12 @@ pub fn prepare_input_owned<T: Scalar>(
 ///
 /// After GEMM, call [`ContiguousOperandMut::finalize_into`] with the original
 /// view to copy results back if needed.
+///
+/// # Safety contract
+///
+/// When inner dims are fusable (no copy needed), the returned `ContiguousOperandMut`
+/// holds a raw pointer into `view`'s data. The caller must ensure `view` outlives
+/// the returned operand and that no aliasing mutable references exist during GEMM.
 #[cfg(feature = "faer")]
 pub fn prepare_output_view<T: Scalar>(
     view: &mut StridedViewMut<T>,
@@ -316,7 +322,11 @@ pub fn prepare_output_view<T: Scalar>(
 ///
 /// Unlike [`prepare_output_view`], `needs_writeback` is always `false` for owned
 /// arrays because the caller owns the buffer and can use it directly.
+///
+/// Currently unused in production (C is always a `StridedViewMut` from the caller).
+/// Kept for future use when `einsum2_into` accepts owned output arrays.
 #[cfg(feature = "faer")]
+#[allow(dead_code)]
 pub fn prepare_output_owned<T: Scalar>(
     arr: &mut StridedArray<T>,
     n_batch: usize,
