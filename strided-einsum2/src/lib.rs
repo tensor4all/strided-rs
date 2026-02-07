@@ -102,6 +102,8 @@ impl<T> Scalar for T where
 }
 
 /// Trait alias for element types (with `blas` or `blas-inject` feature).
+///
+/// Includes `BlasGemm` so that all `Scalar` types can be dispatched to CBLAS.
 #[cfg(any(feature = "blas", feature = "blas-inject"))]
 pub trait Scalar:
     Copy
@@ -113,6 +115,7 @@ pub trait Scalar:
     + num_traits::Zero
     + num_traits::One
     + PartialEq
+    + bgemm_blas::BlasGemm
 {
 }
 
@@ -127,6 +130,7 @@ impl<T> Scalar for T where
         + num_traits::Zero
         + num_traits::One
         + PartialEq
+        + bgemm_blas::BlasGemm
 {
 }
 
@@ -255,7 +259,10 @@ where
     #[cfg(feature = "faer")]
     einsum2_gemm_dispatch(c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b)?;
 
-    #[cfg(not(feature = "faer"))]
+    #[cfg(any(feature = "blas", feature = "blas-inject"))]
+    einsum2_gemm_dispatch(c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b)?;
+
+    #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
     {
         let a_perm = a_view.permute(&plan.left_perm)?;
         let b_perm = b_view.permute(&plan.right_perm)?;
@@ -289,7 +296,7 @@ where
     Ok(())
 }
 
-/// Internal GEMM dispatch using ContiguousOperand types.
+/// Internal GEMM dispatch using ContiguousOperand types (faer backend).
 ///
 /// Called after trace reduction and Op stripping. Handles:
 /// 1. Permutation to canonical order
@@ -345,6 +352,65 @@ fn einsum2_gemm_dispatch<T: Scalar>(
 
     // 4. GEMM
     bgemm_faer::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta)?;
+
+    // 5. Finalize
+    c_op.finalize_into(&mut c_perm)?;
+
+    Ok(())
+}
+
+/// Internal GEMM dispatch using ContiguousOperand types (BLAS backend).
+///
+/// Same logic as the faer variant but calls `bgemm_blas::bgemm_contiguous_into`
+/// and requires `T: BlasGemm`.
+#[cfg(any(feature = "blas", feature = "blas-inject"))]
+fn einsum2_gemm_dispatch<T: Scalar>(
+    c: StridedViewMut<T>,
+    a: &StridedView<T>,
+    b: &StridedView<T>,
+    plan: &Einsum2Plan<impl AxisId>,
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> Result<()> {
+    // 1. Permute to canonical order
+    let a_perm = a.permute(&plan.left_perm)?;
+    let b_perm = b.permute(&plan.right_perm)?;
+    let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+    // 2. Fast path: element-wise (all batch, no contraction)
+    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+        let mul_fn = move |a_val: T, b_val: T| -> T {
+            let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
+            let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
+            alpha * a_c * b_c
+        };
+        zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        return Ok(());
+    }
+
+    // 3. Prepare contiguous operands
+    let n_batch = plan.batch.len();
+    let n_lo = plan.lo.len();
+    let n_ro = plan.ro.len();
+    let n_sum = plan.sum.len();
+
+    let a_op = contiguous::prepare_input_view(&a_perm, n_batch, n_lo, n_sum, conj_a)?;
+    let b_op = contiguous::prepare_input_view(&b_perm, n_batch, n_sum, n_ro, conj_b)?;
+    let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
+
+    // Compute fused dimension sizes
+    let batch_dims = &a_perm.dims()[..n_batch];
+    let lo_dims = &a_perm.dims()[n_batch..n_batch + n_lo];
+    let sum_dims = &a_perm.dims()[n_batch + n_lo..n_batch + n_lo + n_sum];
+    let ro_dims = &b_perm.dims()[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let m: usize = lo_dims.iter().product::<usize>().max(1);
+    let k: usize = sum_dims.iter().product::<usize>().max(1);
+    let n: usize = ro_dims.iter().product::<usize>().max(1);
+
+    // 4. GEMM
+    bgemm_blas::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta)?;
 
     // 5. Finalize
     c_op.finalize_into(&mut c_perm)?;
@@ -444,6 +510,99 @@ pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
 
     // 8. GEMM
     bgemm_faer::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &batch_dims, m, n, k, alpha, beta)?;
+
+    // 9. Finalize
+    c_op.finalize_into(&mut c_perm)?;
+
+    Ok(())
+}
+
+/// Binary einsum accepting owned inputs for zero-copy optimization (BLAS backend).
+///
+/// Same semantics as the faer variant of [`einsum2_into_owned`] but dispatches
+/// to `bgemm_blas::bgemm_contiguous_into` and requires `T: BlasGemm`.
+#[cfg(any(feature = "blas", feature = "blas-inject"))]
+pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
+    c: StridedViewMut<T>,
+    a: StridedArray<T>,
+    b: StridedArray<T>,
+    ic: &[ID],
+    ia: &[ID],
+    ib: &[ID],
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> Result<()> {
+    // 1. Build plan
+    let plan = Einsum2Plan::new(ia, ib, ic)?;
+
+    // 2. Validate dimensions
+    validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
+
+    // 3. Trace reduction
+    let (a_for_gemm, conj_a_final) = if !plan.left_trace.is_empty() {
+        let trace_indices = plan.left_trace_indices(ia);
+        (trace::reduce_trace_axes(&a.view(), &trace_indices)?, false)
+    } else {
+        (a, conj_a)
+    };
+
+    let (b_for_gemm, conj_b_final) = if !plan.right_trace.is_empty() {
+        let trace_indices = plan.right_trace_indices(ib);
+        (trace::reduce_trace_axes(&b.view(), &trace_indices)?, false)
+    } else {
+        (b, conj_b)
+    };
+
+    // 4. Permute to canonical order (metadata-only on owned arrays)
+    let a_perm = a_for_gemm.permuted(&plan.left_perm)?;
+    let b_perm = b_for_gemm.permuted(&plan.right_perm)?;
+    let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+    let n_batch = plan.batch.len();
+    let n_lo = plan.lo.len();
+    let n_ro = plan.ro.len();
+    let n_sum = plan.sum.len();
+
+    // 5. Fast path: element-wise (all batch, no contraction)
+    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+        let mul_fn = move |a_val: T, b_val: T| -> T {
+            let a_c = if conj_a_final {
+                Conj::apply(a_val)
+            } else {
+                a_val
+            };
+            let b_c = if conj_b_final {
+                Conj::apply(b_val)
+            } else {
+                b_val
+            };
+            alpha * a_c * b_c
+        };
+        zip_map2_into(&mut c_perm, &a_perm.view(), &b_perm.view(), mul_fn)?;
+        return Ok(());
+    }
+
+    // 6. Extract dimension sizes BEFORE consuming arrays via prepare_input_owned
+    let a_dims_perm = a_perm.dims().to_vec();
+    let b_dims_perm = b_perm.dims().to_vec();
+
+    let batch_dims = a_dims_perm[..n_batch].to_vec();
+    let lo_dims = &a_dims_perm[n_batch..n_batch + n_lo];
+    let sum_dims = &a_dims_perm[n_batch + n_lo..];
+    let ro_dims = &b_dims_perm[n_batch + n_sum..];
+    let m: usize = lo_dims.iter().product::<usize>().max(1);
+    let k: usize = sum_dims.iter().product::<usize>().max(1);
+    let n: usize = ro_dims.iter().product::<usize>().max(1);
+
+    // 7. Prepare contiguous operands (owned path -- avoids extra copies)
+    let a_op = contiguous::prepare_input_owned(a_perm, n_batch, n_lo, n_sum, conj_a_final)?;
+    let b_op = contiguous::prepare_input_owned(b_perm, n_batch, n_sum, n_ro, conj_b_final)?;
+    let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
+
+    // 8. GEMM
+    bgemm_blas::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &batch_dims, m, n, k, alpha, beta)?;
 
     // 9. Finalize
     c_op.finalize_into(&mut c_perm)?;
@@ -968,7 +1127,7 @@ mod tests {
         assert_eq!(c.get(&[1, 2]), 72.0);
     }
 
-    #[cfg(feature = "faer")]
+    #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
     #[test]
     fn test_einsum2_owned_matmul() {
         let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
@@ -999,7 +1158,7 @@ mod tests {
         assert_eq!(c.get(&[1, 1]), 50.0);
     }
 
-    #[cfg(feature = "faer")]
+    #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
     #[test]
     fn test_einsum2_owned_batched() {
         let a = StridedArray::<f64>::from_fn_row_major(&[2, 2, 3], |idx| {
@@ -1029,7 +1188,7 @@ mod tests {
         assert_eq!(c.get(&[0, 0, 0]), 22.0);
     }
 
-    #[cfg(feature = "faer")]
+    #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
     #[test]
     fn test_einsum2_owned_alpha_beta() {
         let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
@@ -1061,7 +1220,7 @@ mod tests {
         assert_eq!(c.get(&[1, 1]), 128.0); // 2*4 + 3*40
     }
 
-    #[cfg(feature = "faer")]
+    #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
     #[test]
     fn test_einsum2_owned_elementwise() {
         // All batch, no contraction -- element-wise fast path
@@ -1089,7 +1248,7 @@ mod tests {
         assert_eq!(c.get(&[1, 2]), 72.0); // 2 * 6 * 6
     }
 
-    #[cfg(feature = "faer")]
+    #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
     #[test]
     fn test_einsum2_owned_left_trace() {
         // C_k = sum_j (sum_i A_ij) * B_jk

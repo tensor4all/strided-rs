@@ -51,7 +51,7 @@ pub(crate) fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -
 /// Type-level dispatch trait for CBLAS GEMM.
 ///
 /// Implemented for `f64` (via `cblas_dgemm`) and `Complex64` (via `cblas_zgemm`).
-pub(crate) trait BlasGemm: Sized {
+pub trait BlasGemm: Sized {
     /// Call the appropriate CBLAS GEMM routine.
     ///
     /// Computes `C = alpha * A * B + beta * C` where A is m-by-k, B is k-by-n,
@@ -125,6 +125,8 @@ impl BlasGemm for num_complex::Complex64 {
         c: *mut num_complex::Complex64,
         ldc: i32,
     ) {
+        // cblas-sys uses [f64; 2] for complex, cblas-inject uses Complex64 directly.
+        // Cast pointers to the type each FFI expects.
         unsafe {
             cblas_sys::cblas_zgemm(
                 cblas_sys::CBLAS_LAYOUT::CblasColMajor,
@@ -133,13 +135,13 @@ impl BlasGemm for num_complex::Complex64 {
                 m,
                 n,
                 k,
-                &alpha as *const _ as *const [f64; 2],
-                a as *const _ as *const [f64; 2],
+                (&alpha) as *const _ as *const _,
+                a as *const _ as *const _,
                 lda,
-                b as *const _ as *const [f64; 2],
+                b as *const _ as *const _,
                 ldb,
-                &beta as *const _ as *const [f64; 2],
-                c as *mut _ as *mut [f64; 2],
+                (&beta) as *const _ as *const _,
+                c as *mut _ as *mut _,
                 ldc,
             );
         }
