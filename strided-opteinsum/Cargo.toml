@@ -15,4 +15,5 @@ thiserror = "1.0"
 [dev-dependencies]
 approx = "0.5"
 num-complex = "0.4"
+rand = "0.8"
 strided-view = { path = "../strided-view" }

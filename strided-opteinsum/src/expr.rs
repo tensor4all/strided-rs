@@ -130,7 +130,7 @@ fn eval_pair_f64(
         dim_map.insert(id, b_view.dims()[i]);
     }
 
-    let out_dims: Vec<usize> = output_ids.iter().map(|id| dim_map[id]).collect();
+    let out_dims = out_dims_from_map(&dim_map, output_ids)?;
 
     // Allocate output (col-major)
     let mut c_arr = StridedArray::<f64>::col_major(&out_dims);
@@ -178,7 +178,7 @@ fn eval_pair_c64(
         dim_map.insert(id, b_view.dims()[i]);
     }
 
-    let out_dims: Vec<usize> = output_ids.iter().map(|id| dim_map[id]).collect();
+    let out_dims = out_dims_from_map(&dim_map, output_ids)?;
 
     // Allocate output (col-major)
     let mut c_arr = StridedArray::<Complex64>::col_major(&out_dims);
@@ -196,6 +196,20 @@ fn eval_pair_c64(
     )?;
 
     Ok(EinsumOperand::C64(StridedData::Owned(c_arr)))
+}
+
+fn out_dims_from_map(
+    dim_map: &HashMap<char, usize>,
+    output_ids: &[char],
+) -> crate::Result<Vec<usize>> {
+    let mut out_dims = Vec::with_capacity(output_ids.len());
+    for &id in output_ids {
+        match dim_map.get(&id) {
+            Some(&dim) => out_dims.push(dim),
+            None => return Err(crate::EinsumError::OrphanOutputAxis(id.to_string())),
+        }
+    }
+    Ok(out_dims)
 }
 
 /// Contract two operands, promoting to c64 if types are mixed.
@@ -261,17 +275,27 @@ fn execute_nested(
 ) -> crate::Result<(EinsumOperand<'static>, Vec<char>)> {
     match nested {
         omeco::NestedEinsum::Leaf { tensor_index } => {
-            let (op, ids) = children[*tensor_index]
-                .take()
-                .expect("child operand already consumed");
+            let slot = children.get_mut(*tensor_index).ok_or_else(|| {
+                crate::EinsumError::Internal(format!(
+                    "optimizer referenced child index {} out of bounds",
+                    tensor_index
+                ))
+            })?;
+            let (op, ids) = slot.take().ok_or_else(|| {
+                crate::EinsumError::Internal(format!(
+                    "child operand {} was already consumed",
+                    tensor_index
+                ))
+            })?;
             Ok((op, ids))
         }
         omeco::NestedEinsum::Node { args, eins } => {
-            assert_eq!(
-                args.len(),
-                2,
-                "omeco should produce a binary contraction tree"
-            );
+            if args.len() != 2 {
+                return Err(crate::EinsumError::Internal(format!(
+                    "optimizer produced non-binary node with {} children",
+                    args.len()
+                )));
+            }
             let (left, left_ids) = execute_nested(&args[0], children)?;
             let (right, right_ids) = execute_nested(&args[1], children)?;
             let output_ids: Vec<char> = eins.iy.clone();
@@ -297,9 +321,19 @@ fn eval_node(
 ) -> crate::Result<(EinsumOperand<'static>, Vec<char>)> {
     match node {
         EinsumNode::Leaf { ids, tensor_index } => {
-            let op = operands[*tensor_index]
-                .take()
-                .expect("operand already consumed");
+            let found = operands.len();
+            let slot = operands.get_mut(*tensor_index).ok_or_else(|| {
+                crate::EinsumError::OperandCountMismatch {
+                    expected: tensor_index + 1,
+                    found,
+                }
+            })?;
+            let op = slot.take().ok_or_else(|| {
+                crate::EinsumError::Internal(format!(
+                    "operand {} was already consumed",
+                    tensor_index
+                ))
+            })?;
             Ok((op.to_owned_static(), ids.clone()))
         }
         EinsumNode::Contract { args } => {
@@ -361,7 +395,11 @@ fn eval_node(
                     // 4. Optimize using omeco greedy method
                     let optimizer = omeco::GreedyMethod::default();
                     let nested = omeco::CodeOptimizer::optimize(&optimizer, &code, &dim_sizes)
-                        .expect("omeco optimizer should succeed for 3+ tensors");
+                        .ok_or_else(|| {
+                            crate::EinsumError::Internal(
+                                "optimizer failed to produce a plan".into(),
+                            )
+                        })?;
 
                     // 5. Execute the nested contraction tree
                     let (result, result_ids) = execute_nested(&nested, &mut children)?;
@@ -396,6 +434,14 @@ impl EinsumCode {
         &self,
         operands: Vec<EinsumOperand<'_>>,
     ) -> crate::Result<EinsumOperand<'static>> {
+        let expected = leaf_count(&self.root);
+        if operands.len() != expected {
+            return Err(crate::EinsumError::OperandCountMismatch {
+                expected,
+                found: operands.len(),
+            });
+        }
+
         let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
         let mut ops: Vec<Option<EinsumOperand<'_>>> = operands.into_iter().map(Some).collect();
 
@@ -408,6 +454,13 @@ impl EinsumCode {
 
         // Otherwise, permute/reduce to match the final output_ids.
         eval_single(result, &result_ids, &self.output_ids)
+    }
+}
+
+fn leaf_count(node: &EinsumNode) -> usize {
+    match node {
+        EinsumNode::Leaf { .. } => 1,
+        EinsumNode::Contract { args } => args.iter().map(leaf_count).sum(),
     }
 }
 
@@ -572,5 +625,43 @@ mod tests {
             }
             _ => panic!("expected F64"),
         }
+    }
+
+    #[test]
+    fn test_orphan_output_axis_returns_error() {
+        let code = parse_einsum("ij,jk->iz").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        let err = code.evaluate(vec![a, b]).unwrap_err();
+        assert!(matches!(err, crate::EinsumError::OrphanOutputAxis(ref s) if s == "z"));
+    }
+
+    #[test]
+    fn test_operand_count_mismatch_too_few() {
+        let code = parse_einsum("ij,jk->ik").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let err = code.evaluate(vec![a]).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::EinsumError::OperandCountMismatch {
+                expected: 2,
+                found: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn test_operand_count_mismatch_too_many() {
+        let code = parse_einsum("ij->ji").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        let err = code.evaluate(vec![a, b]).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::EinsumError::OperandCountMismatch {
+                expected: 1,
+                found: 2
+            }
+        ));
     }
 }

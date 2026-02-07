@@ -1,7 +1,13 @@
 use approx::assert_abs_diff_eq;
 use num_complex::Complex64;
-use strided_opteinsum::{einsum, EinsumOperand};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use strided_opteinsum::{einsum, parse_einsum, EinsumNode, EinsumOperand};
 use strided_view::{row_major_strides, StridedArray};
+
+#[path = "support/loop_einsum.rs"]
+mod loop_einsum;
+
+use loop_einsum::{loop_einsum_complex, row_major_c64, row_major_f64, LoopTensor};
 
 fn make_f64(dims: &[usize], data: Vec<f64>) -> EinsumOperand<'static> {
     let strides = row_major_strides(dims);
@@ -15,6 +21,106 @@ fn make_c64(dims: &[usize], data: Vec<Complex64>) -> EinsumOperand<'static> {
     StridedArray::from_parts(data, dims, &strides, 0)
         .unwrap()
         .into()
+}
+
+fn collect_leaf_ids(node: &EinsumNode, out: &mut Vec<Option<Vec<char>>>) {
+    match node {
+        EinsumNode::Leaf { ids, tensor_index } => {
+            if *tensor_index >= out.len() {
+                out.resize_with(*tensor_index + 1, || None);
+            }
+            out[*tensor_index] = Some(ids.clone());
+        }
+        EinsumNode::Contract { args } => {
+            for arg in args {
+                collect_leaf_ids(arg, out);
+            }
+        }
+    }
+}
+
+fn leaf_ids_for_notation(notation: &str) -> Vec<Vec<char>> {
+    let code = parse_einsum(notation).expect("notation should parse");
+    let mut leaf_ids_opt = Vec::new();
+    collect_leaf_ids(&code.root, &mut leaf_ids_opt);
+    leaf_ids_opt
+        .into_iter()
+        .map(|x| x.expect("leaf index should be populated"))
+        .collect()
+}
+
+fn to_complex_array(result: EinsumOperand<'static>) -> StridedArray<Complex64> {
+    match result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            let cdata: Vec<Complex64> =
+                arr.data().iter().map(|&x| Complex64::new(x, 0.0)).collect();
+            StridedArray::from_parts(cdata, arr.dims(), arr.strides(), 0)
+                .expect("f64->c64 conversion should preserve layout")
+        }
+        EinsumOperand::C64(data) => {
+            let arr = data.as_array();
+            StridedArray::from_parts(arr.data().to_vec(), arr.dims(), arr.strides(), 0)
+                .expect("c64 clone should preserve layout")
+        }
+    }
+}
+
+fn for_each_index(dims: &[usize], mut f: impl FnMut(&[usize])) {
+    fn rec(dims: &[usize], depth: usize, idx: &mut Vec<usize>, f: &mut dyn FnMut(&[usize])) {
+        if depth == dims.len() {
+            f(idx);
+            return;
+        }
+        for i in 0..dims[depth] {
+            idx.push(i);
+            rec(dims, depth + 1, idx, f);
+            idx.pop();
+        }
+    }
+    let mut idx = Vec::new();
+    rec(dims, 0, &mut idx, &mut f);
+}
+
+fn assert_complex_arrays_close(
+    actual: &StridedArray<Complex64>,
+    expected: &StridedArray<Complex64>,
+    eps: f64,
+    ctx: &str,
+) {
+    // Scalar representation can appear either as [] or [1] depending on allocation path.
+    let scalar_like = |dims: &[usize]| dims.is_empty() || dims == [1];
+    if scalar_like(actual.dims()) && scalar_like(expected.dims()) {
+        let dr = (actual.data()[0].re - expected.data()[0].re).abs();
+        let di = (actual.data()[0].im - expected.data()[0].im).abs();
+        assert!(
+            dr <= eps && di <= eps,
+            "{ctx}: scalar mismatch, actual={:?}, expected={:?}, eps={eps}",
+            actual.data()[0],
+            expected.data()[0]
+        );
+        return;
+    }
+    assert!(
+        actual.dims() == expected.dims()
+            || (scalar_like(actual.dims()) && scalar_like(expected.dims())),
+        "shape mismatch: actual={:?}, expected={:?}",
+        actual.dims(),
+        expected.dims()
+    );
+    for_each_index(actual.dims(), |idx| {
+        let av = actual.get(idx);
+        let ev = expected.get(idx);
+        let dr = (av.re - ev.re).abs();
+        let di = (av.im - ev.im).abs();
+        assert!(
+            dr <= eps && di <= eps,
+            "{ctx}: mismatch at {:?}, actual={:?}, expected={:?}, eps={eps}",
+            idx,
+            av,
+            ev
+        );
+    });
 }
 
 #[test]
@@ -159,5 +265,92 @@ fn test_flat_three_tensor_e2e() {
             assert_abs_diff_eq!(arr.get(&[1, 1]), 50.0, epsilon = 1e-10);
         }
         _ => panic!("expected F64"),
+    }
+}
+
+fn build_random_case(
+    notation: &str,
+    rng: &mut StdRng,
+    mode: &str,
+    allow_zero_dim: bool,
+) -> (Vec<LoopTensor>, Vec<EinsumOperand<'static>>) {
+    let leaf_ids = leaf_ids_for_notation(notation);
+
+    let mut dim_map = std::collections::HashMap::<char, usize>::new();
+    for ids in &leaf_ids {
+        for &id in ids {
+            dim_map.entry(id).or_insert_with(|| {
+                if allow_zero_dim && rng.gen_bool(0.2) {
+                    0
+                } else {
+                    rng.gen_range(1..=3)
+                }
+            });
+        }
+    }
+
+    let mut loop_ops = Vec::with_capacity(leaf_ids.len());
+    let mut eins_ops = Vec::with_capacity(leaf_ids.len());
+
+    for ids in leaf_ids {
+        let dims: Vec<usize> = ids.iter().map(|id| dim_map[id]).collect();
+        let len = dims.iter().product();
+
+        let is_complex = match mode {
+            "f64" => false,
+            "c64" => true,
+            "mixed" => rng.gen_bool(0.5),
+            _ => panic!("unknown mode"),
+        };
+
+        if is_complex {
+            let data: Vec<Complex64> = (0..len)
+                .map(|_| Complex64::new(rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)))
+                .collect();
+            loop_ops.push(row_major_c64(&dims, data.clone()));
+            eins_ops.push(make_c64(&dims, data));
+        } else {
+            let data: Vec<f64> = (0..len).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            loop_ops.push(row_major_f64(&dims, data.clone()));
+            eins_ops.push(make_f64(&dims, data));
+        }
+    }
+
+    (loop_ops, eins_ops)
+}
+
+fn run_differential_case(
+    notation: &str,
+    rng: &mut StdRng,
+    mode: &str,
+    allow_zero_dim: bool,
+    eps: f64,
+) {
+    let (loop_ops, eins_ops) = build_random_case(notation, rng, mode, allow_zero_dim);
+    let expected =
+        loop_einsum_complex(notation, &loop_ops).expect("reference evaluator should succeed");
+    let actual =
+        to_complex_array(einsum(notation, eins_ops).expect("strided-opteinsum should succeed"));
+    let ctx = format!("notation={notation}, mode={mode}");
+    assert_complex_arrays_close(&actual, &expected, eps, &ctx);
+}
+
+#[test]
+fn test_differential_loop_einsum_f64() {
+    let mut rng = StdRng::seed_from_u64(0x5EED_F64);
+    let notations = ["ij,jk->ik", "ij,kj->ik", "i,j->ij", "i,i->", "bij,bjk->bik"];
+    for _ in 0..30 {
+        let notation = notations[rng.gen_range(0..notations.len())];
+        run_differential_case(notation, &mut rng, "f64", false, 1e-10);
+    }
+}
+
+#[test]
+fn test_differential_loop_einsum_c64() {
+    let mut rng = StdRng::seed_from_u64(0x5EED_C64);
+    let notations = ["ij,jk->ik", "ij,kj->ik", "i,j->ij", "i,i->", "bij,bjk->bik"];
+    for _ in 0..20 {
+        let notation = notations[rng.gen_range(0..notations.len())];
+        run_differential_case(notation, &mut rng, "c64", false, 1e-10);
     }
 }

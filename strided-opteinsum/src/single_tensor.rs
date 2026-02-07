@@ -120,15 +120,13 @@ where
     }
 
     // Compute permutation: for each output axis, find its position in current_ids.
-    let perm: Vec<usize> = output_ids
-        .iter()
-        .map(|oc| {
-            current_ids
-                .iter()
-                .position(|c| c == oc)
-                .expect("output axis not found in current axes")
-        })
-        .collect();
+    let mut perm: Vec<usize> = Vec::with_capacity(output_ids.len());
+    for oc in output_ids {
+        match current_ids.iter().position(|c| c == oc) {
+            Some(pos) => perm.push(pos),
+            None => return Err(crate::EinsumError::OrphanOutputAxis(oc.to_string())),
+        }
+    }
 
     let permuted_view = result_arr.view().permute(&perm)?;
     let out_dims = permuted_view.dims().to_vec();

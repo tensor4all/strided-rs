@@ -163,7 +163,7 @@ impl<ID: AxisId> Einsum2Plan<ID> {
             .collect()
     }
 
-    /// Get the inverse of c_to_internal_perm (maps [batch,lo,ro] back to IC order).
+    /// Get the inverse of c_to_internal_perm (maps `\[batch, lo, ro\]` back to IC order).
     pub fn internal_to_c_perm(&self) -> Vec<usize> {
         invert_perm(&self.c_to_internal_perm)
     }

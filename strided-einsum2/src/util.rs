@@ -1,6 +1,6 @@
 //! Shared helpers for strided-einsum2.
 
-/// Invert a permutation: if perm[i] = j, then result[j] = i.
+/// Invert a permutation: if `perm[i] = j`, then `result[j] = i`.
 pub fn invert_perm(perm: &[usize]) -> Vec<usize> {
     let mut inv = vec![0usize; perm.len()];
     for (i, &p) in perm.iter().enumerate() {
