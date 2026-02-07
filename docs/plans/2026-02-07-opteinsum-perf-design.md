@@ -316,10 +316,11 @@ the cause of the benchmark slowdowns.
 a full copy of the entire input tensor even if only a small part is needed (e.g., trace only
 needs the diagonal). This matters for API ergonomics but does not affect the current benchmarks.
 
-**Future improvement**: Allow `eval_node` to propagate borrowed views through the tree,
+**Next step (Issue #50)**: Allow `eval_node` to propagate borrowed views through the tree,
 only materializing when needed. This requires changing the return type from
-`EinsumOperand<'static>` to a generic-lifetime type, which is a larger refactor tracked
-separately.
+`EinsumOperand<'static>` to a generic-lifetime type. Tracked as
+https://github.com/tensor4all/strided-rs/issues/50 — to be addressed immediately after
+Solutions A-F.
 
 ---
 
