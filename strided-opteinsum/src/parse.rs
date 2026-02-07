@@ -72,6 +72,11 @@ fn parse_arg(s: &str, counter: &mut usize) -> crate::Result<EinsumNode> {
         let inner = &s[1..s.len() - 1];
         parse_args_list(inner, counter)
     } else {
+        if s.is_empty() {
+            return Err(crate::EinsumError::ParseError(
+                "empty operand in args list".into(),
+            ));
+        }
         // Leaf: validate all chars are lowercase ascii
         for c in s.chars() {
             if !c.is_ascii_lowercase() {
@@ -107,6 +112,11 @@ fn split_top_level(s: &str) -> crate::Result<Vec<String>> {
                 current.push(c);
             }
             ',' if depth == 0 => {
+                if current.is_empty() {
+                    return Err(crate::EinsumError::ParseError(
+                        "empty operand in args list".into(),
+                    ));
+                }
                 parts.push(std::mem::take(&mut current));
             }
             _ => {
@@ -117,7 +127,13 @@ fn split_top_level(s: &str) -> crate::Result<Vec<String>> {
     if depth != 0 {
         return Err(crate::EinsumError::ParseError("unbalanced '('".into()));
     }
-    if !current.is_empty() {
+    if current.is_empty() {
+        if !parts.is_empty() {
+            return Err(crate::EinsumError::ParseError(
+                "empty operand in args list".into(),
+            ));
+        }
+    } else {
         parts.push(current);
     }
     Ok(parts)
@@ -289,5 +305,15 @@ mod tests {
     #[test]
     fn test_parse_error_no_arrow() {
         assert!(parse_einsum("ij,jk").is_err());
+    }
+
+    #[test]
+    fn test_parse_error_empty_operand_double_comma() {
+        assert!(parse_einsum("ij,,jk->ik").is_err());
+    }
+
+    #[test]
+    fn test_parse_error_empty_operand_trailing_comma() {
+        assert!(parse_einsum("ij,->i").is_err());
     }
 }

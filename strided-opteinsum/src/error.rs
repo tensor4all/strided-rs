@@ -18,6 +18,12 @@ pub enum EinsumError {
 
     #[error("output axis '{0}' not found in any input")]
     OrphanOutputAxis(String),
+
+    #[error("operand count mismatch: expected {expected}, found {found}")]
+    OperandCountMismatch { expected: usize, found: usize },
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, EinsumError>;
