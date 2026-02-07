@@ -10,13 +10,16 @@ pub enum TypedTensor {
 const DEMOTE_THRESHOLD: f64 = 1e-15;
 
 impl TypedTensor {
+    /// Returns `true` if this tensor holds `f64` data.
     pub fn is_f64(&self) -> bool {
         matches!(self, TypedTensor::F64(_))
     }
+    /// Returns `true` if this tensor holds `Complex64` data.
     pub fn is_c64(&self) -> bool {
         matches!(self, TypedTensor::C64(_))
     }
 
+    /// Returns the dimensions of the underlying array.
     pub fn dims(&self) -> &[usize] {
         match self {
             TypedTensor::F64(a) => a.dims(),

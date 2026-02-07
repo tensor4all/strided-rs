@@ -167,36 +167,43 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         }
     }
 
+    /// Returns the shape (dimension sizes) of this view.
     #[inline]
     pub fn dims(&self) -> &[usize] {
         &self.dims
     }
 
+    /// Returns the strides (in units of `T`) for each dimension.
     #[inline]
     pub fn strides(&self) -> &[isize] {
         &self.strides
     }
 
+    /// Returns the byte offset into the backing data.
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
     }
 
+    /// Returns the number of dimensions (rank).
     #[inline]
     pub fn ndim(&self) -> usize {
         self.dims.len()
     }
 
+    /// Returns the total number of elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.dims.iter().product()
     }
 
+    /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.dims.iter().any(|&d| d == 0)
     }
 
+    /// Returns a reference to the backing data slice.
     #[inline]
     pub fn data(&self) -> &'a [T] {
         self.data
@@ -477,31 +484,37 @@ impl<'a, T> StridedViewMut<'a, T> {
         }
     }
 
+    /// Returns the shape (dimension sizes) of this view.
     #[inline]
     pub fn dims(&self) -> &[usize] {
         &self.dims
     }
 
+    /// Returns the strides (in units of `T`) for each dimension.
     #[inline]
     pub fn strides(&self) -> &[isize] {
         &self.strides
     }
 
+    /// Returns the byte offset into the backing data.
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
     }
 
+    /// Returns the number of dimensions (rank).
     #[inline]
     pub fn ndim(&self) -> usize {
         self.dims.len()
     }
 
+    /// Returns the total number of elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.dims.iter().product()
     }
 
+    /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.dims.iter().any(|&d| d == 0)
@@ -722,36 +735,43 @@ impl<T> StridedArray<T> {
         })
     }
 
+    /// Returns the shape (dimension sizes) of this array.
     #[inline]
     pub fn dims(&self) -> &[usize] {
         &self.dims
     }
 
+    /// Returns the strides (in units of `T`) for each dimension.
     #[inline]
     pub fn strides(&self) -> &[isize] {
         &self.strides
     }
 
+    /// Returns the number of dimensions (rank).
     #[inline]
     pub fn ndim(&self) -> usize {
         self.dims.len()
     }
 
+    /// Returns the total number of elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.dims.iter().product()
     }
 
+    /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.dims.iter().any(|&d| d == 0)
     }
 
+    /// Returns a reference to the backing data slice.
     #[inline]
     pub fn data(&self) -> &[T] {
         &self.data
     }
 
+    /// Returns a mutable reference to the backing data slice.
     #[inline]
     pub fn data_mut(&mut self) -> &mut [T] {
         &mut self.data

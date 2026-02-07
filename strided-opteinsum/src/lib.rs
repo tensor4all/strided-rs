@@ -1,8 +1,30 @@
+//! N-ary Einstein summation with nested contraction notation.
+//!
+//! This crate provides an einsum frontend that parses nested string
+//! notation (e.g. `"(ij,jk),kl->il"`), supports mixed `f64` / `Complex64`
+//! operands, and delegates pairwise contractions to [`strided_einsum2`].
+//! For three or more tensors in a single contraction node the
+//! [`omeco`] greedy optimizer is used to find an efficient pairwise order.
+//!
+//! # Quick start
+//!
+//! ```ignore
+//! use strided_opteinsum::{einsum, EinsumOperand};
+//!
+//! let result = einsum("(ij,jk),kl->il", vec![a.into(), b.into(), c.into()])?;
+//! ```
+
+/// Error types for einsum operations.
 pub mod error;
+/// Recursive contraction-tree evaluation.
 pub mod expr;
+/// Type-erased einsum operands (`f64` / `Complex64`, owned / borrowed).
 pub mod operand;
+/// Nested einsum string parser.
 pub mod parse;
+/// Single-tensor operations (permute, trace, diagonal extraction).
 pub mod single_tensor;
+/// Runtime type dispatch over `f64` and `Complex64` tensors.
 pub mod typed_tensor;
 
 pub use error::{EinsumError, Result};

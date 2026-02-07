@@ -22,10 +22,15 @@
 //! ```
 
 #[cfg(feature = "faer")]
+/// Batched GEMM backend using the [`faer`] library.
 pub mod bgemm_faer;
+/// Batched GEMM fallback using explicit loops.
 pub mod bgemm_naive;
+/// Contraction planning: axis classification and permutation computation.
 pub mod plan;
+/// Trace-axis reduction (summing axes that appear only in one operand).
 pub mod trace;
+/// Shared helpers (permutation inversion, multi-index iteration, dimension fusion).
 pub mod util;
 
 use std::any::TypeId;
@@ -74,6 +79,7 @@ impl<T> Scalar for T where
 {
 }
 
+/// Trait alias for element types (without `faer` feature).
 #[cfg(not(feature = "faer"))]
 pub trait Scalar:
     Copy
@@ -119,6 +125,7 @@ pub enum EinsumError {
     Strided(#[from] strided_view::StridedError),
 }
 
+/// Convenience alias for `Result<T, EinsumError>`.
 pub type Result<T> = std::result::Result<T, EinsumError>;
 
 /// Returns `true` if the given `ElementOp` type represents conjugation.
