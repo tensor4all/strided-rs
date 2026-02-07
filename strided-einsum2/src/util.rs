@@ -20,6 +20,7 @@ pub struct MultiIndex {
 }
 
 impl MultiIndex {
+    /// Create a new iterator over all index tuples for the given dimensions.
     pub fn new(dims: &[usize]) -> Self {
         let total: usize = dims.iter().product();
         Self {

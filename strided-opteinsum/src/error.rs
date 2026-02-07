@@ -1,3 +1,4 @@
+/// Errors that can occur during einsum parsing or evaluation.
 #[derive(Debug, thiserror::Error)]
 pub enum EinsumError {
     #[error("parse error: {0}")]
@@ -26,4 +27,5 @@ pub enum EinsumError {
     Internal(String),
 }
 
+/// Convenience alias for `Result<T, EinsumError>`.
 pub type Result<T> = std::result::Result<T, EinsumError>;
