@@ -26,6 +26,8 @@
 pub mod bgemm_faer;
 /// Batched GEMM fallback using explicit loops.
 pub mod bgemm_naive;
+/// GEMM-ready operand types and preparation functions for contiguous data.
+pub mod contiguous;
 /// Contraction planning: axis classification and permutation computation.
 pub mod plan;
 /// Trace-axis reduction (summing axes that appear only in one operand).

@@ -215,7 +215,7 @@ where
 /// (first inner dim has stride 1), while batch dimensions are stored row-major
 /// (outermost batch dim has the largest stride). This ensures each batch slice
 /// is a contiguous column-major matrix, which faer prefers.
-fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -> StridedArray<T> {
+pub(crate) fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -> StridedArray<T> {
     let total: usize = dims.iter().product::<usize>().max(1);
     // SAFETY: `T: Copy` guarantees no drop glue, so leaving elements
     // uninitialised is safe. Every call-site writes all elements before
