@@ -323,7 +323,7 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
                     rank: ndim,
                 });
             }
-            strides[lo] = strides[lo] + strides[hi];
+            strides[lo] += strides[hi];
             dims[lo] = dims[lo].min(dims[hi]);
             axes_to_remove.push(hi);
         }
