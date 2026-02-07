@@ -256,6 +256,71 @@ if total_elements < DIRECT_LOOP_THRESHOLD {
 
 **Risk**: Low. Falls back to existing path for large arrays.
 
+### Solution F: Eliminate double copy in permute-only path
+
+**Where**: `strided-opteinsum/src/single_tensor.rs`, lines 102-134
+
+**Current code** for permute-only operations (`"ijkl->ljki"`):
+
+```rust
+// Step 5 (line 102-109): No diagonal, no reduction → copy src into owned
+let dims = src.dims().to_vec();
+let mut owned = StridedArray::<T>::col_major(&dims);   // ❌ alloc 810K elements
+copy_into(&mut owned.view_mut(), src)?;                 // ❌ full copy (1st)
+
+// Step 7 (line 131-134): Permute + copy to output order
+let permuted_view = result_arr.view().permute(&perm)?;
+let out_dims = permuted_view.dims().to_vec();
+let mut out = StridedArray::<T>::col_major(&out_dims);  // ❌ alloc 810K elements
+copy_into(&mut out.view_mut(), &permuted_view)?;        // ❌ full copy (2nd)
+```
+
+This copies the data **twice**: src → owned → permuted out. But `src` is already a valid
+view — we can permute it directly and copy once:
+
+```rust
+// Step 5: For permute-only, skip materialization — permute src directly
+if current_ids != output_ids {
+    let permuted_view = src.permute(&perm)?;
+    let out_dims = permuted_view.dims().to_vec();
+    let mut out = StridedArray::<T>::col_major(&out_dims);
+    copy_into(&mut out.view_mut(), &permuted_view)?;  // 1 copy only
+    return Ok(out);
+}
+```
+
+**Fixes**: perm ComplexF64 (3.0x → ~1.5-2x). Halves time for all permute-only operations.
+
+**Risk**: Zero. `src` is a valid borrowed view; `permute` is zero-copy; only 1 `copy_into`.
+
+---
+
+## Allocation Analysis: `to_owned_static()` Clarification
+
+Another agent flagged `to_owned_static()` (expr.rs line 337) as a source of unnecessary copies.
+Precise analysis:
+
+```rust
+fn to_owned_static(self) -> EinsumOperand<'static> {
+    // calls data.into_array() which:
+    //   Owned(arr) => arr          ← zero-copy, returns inner array
+    //   View(view) => copy_into()  ← full copy into new col-major array
+}
+```
+
+**For benchmarks**: Input operands are `StridedArray` (owned) → `StridedData::Owned` →
+`into_array()` returns the inner array directly. **Zero-copy.** So `to_owned_static()` is NOT
+the cause of the benchmark slowdowns.
+
+**For real-world usage**: When users pass `StridedView` (borrowed), `to_owned_static()` forces
+a full copy of the entire input tensor even if only a small part is needed (e.g., trace only
+needs the diagonal). This matters for API ergonomics but does not affect the current benchmarks.
+
+**Future improvement**: Allow `eval_node` to propagate borrowed views through the tree,
+only materializing when needed. This requires changing the return type from
+`EinsumOperand<'static>` to a generic-lifetime type, which is a larger refactor tracked
+separately.
+
 ---
 
 ## Priority and Implementation Order
@@ -266,6 +331,7 @@ if total_elements < DIRECT_LOOP_THRESHOLD {
 | **P0** | C: Specialized trace/ptrace | trace (119x), ptrace (16x) | → ~1x | Small |
 | **P1** | B: Skip materialization | trace, ptrace | Complements C | Small |
 | **P1** | D: Remove Option in reduce | indexsum (4.6x), all reduce | 10-30% | Tiny |
+| **P1** | F: Eliminate double copy in perm | perm (3.0x) | → ~1.5-2x | Tiny |
 | **P2** | E: Direct loop for small diag | diag (31x) | → ~5-10x | Small |
 
 ### Dependency graph
@@ -276,9 +342,21 @@ C (specialized trace/ptrace loops) — independent, fixes trace/ptrace
 B (skip materialization)           — complements C for edge cases
 D (remove Option in reduce)        — independent, fixes indexsum
 E (direct loop for small diag)     — independent, fixes diag
+F (eliminate double copy in perm)   — independent, fixes perm
 ```
 
 All solutions are independent of each other and can be implemented in any order.
+
+### Allocation flow per operation (current vs proposed)
+
+| Operation | Current allocations | After fix | Savings |
+|---|---|---|---|
+| trace `"ii->"` | diag copy + reduce output | direct loop, scalar only (C) | 1000-elem alloc eliminated |
+| ptrace `"iij->j"` | diag copy + reduce output | direct loop, output only (C) | 1 alloc eliminated |
+| diag `"ijj->ij"` | diag copy | direct small loop (E) | kernel overhead eliminated |
+| perm `"ijkl->ljki"` | full copy + permuted copy | permute src + 1 copy (F) | 810K-elem alloc eliminated |
+| indexsum `"ijk->ik"` | reduce output | same (reduce output needed) | overhead reduced (D) |
+| hadamard | GEMM per element | zip_map2_into (A) | 1M GEMM calls eliminated |
 
 ### What is NOT changed
 
@@ -286,6 +364,7 @@ All solutions are independent of each other and can be implemented in any order.
 - `strided-kernel` map/copy kernels — not modified (only bypassed for small cases)
 - `einsum2_into` general logic — only a new early-return branch added
 - Threading/parallelism — no changes
+- `to_owned_static()` — kept as-is (zero-cost for owned inputs; view→owned refactor is separate)
 
 ---
 
@@ -298,7 +377,7 @@ Julia OMEinsum achieves its speed through rule-based dispatch:
 | `Tr()` → `tr(x)` | Solution C: direct trace loop |
 | `Sum()` → `sum(x, dims=dims)` | Solution D: faster reduce_axis |
 | `Diag()` → `compactify!()` | Solution E: direct loop for small diag |
-| `Permutedims()` → `permutedims!` | Existing `permute + copy_into` (adequate) |
+| `Permutedims()` → `permutedims!` | Solution F: single-copy permute |
 | `SimpleBinaryRule` (element-wise) → `A .* B` | Solution A: element-wise fast path |
 
 The core principle is identical: **pattern-match simple operations before falling through to the general GEMM/kernel machinery**.
