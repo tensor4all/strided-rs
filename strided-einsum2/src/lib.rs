@@ -68,9 +68,9 @@ use std::hash::Hash;
 #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
 use backend::BgemmBackend;
 use strided_kernel::zip_map2_into;
-use strided_view::{
-    Adjoint, Conj, ElementOp, ElementOpApply, StridedArray, StridedView, StridedViewMut,
-};
+#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+use strided_view::StridedArray;
+use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 pub use plan::Einsum2Plan;
 

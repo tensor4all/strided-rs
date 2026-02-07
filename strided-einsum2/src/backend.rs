@@ -4,9 +4,6 @@
 //! structs for each backend, and the [`ActiveBackend`] type alias that serves as
 //! the single point of backend selection based on Cargo features.
 
-use crate::contiguous::{ContiguousOperand, ContiguousOperandMut};
-use crate::Scalar;
-
 /// Static configuration for a GEMM backend.
 ///
 /// Each backend declares its requirements so that operand preparation can
@@ -24,9 +21,10 @@ pub trait BackendConfig {
 
 /// Trait for backends that can execute batched GEMM on contiguous operands.
 ///
-/// Implementations are provided by each backend module (faer, blas, naive)
+/// Implementations are provided by each backend module (faer, blas)
 /// in subsequent tasks. The trait is parameterized on the scalar type `T`.
-pub trait BgemmBackend<T: Scalar> {
+#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+pub trait BgemmBackend<T: crate::Scalar> {
     /// Execute batched GEMM: `C = alpha * A * B + beta * C` for each batch.
     ///
     /// - `c`: mutable output operand (batch x m x n)
@@ -36,9 +34,9 @@ pub trait BgemmBackend<T: Scalar> {
     /// - `m`, `n`, `k`: fused matrix dimensions
     /// - `alpha`, `beta`: scaling factors
     fn bgemm_contiguous_into(
-        c: &mut ContiguousOperandMut<T>,
-        a: &ContiguousOperand<T>,
-        b: &ContiguousOperand<T>,
+        c: &mut crate::contiguous::ContiguousOperandMut<T>,
+        a: &crate::contiguous::ContiguousOperand<T>,
+        b: &crate::contiguous::ContiguousOperand<T>,
         batch_dims: &[usize],
         m: usize,
         n: usize,
@@ -73,6 +71,7 @@ impl BackendConfig for BlasBackend {
 }
 
 /// Fallback batched GEMM backend using explicit loops (no external library).
+#[allow(dead_code)]
 pub struct NaiveBackend;
 
 impl BackendConfig for NaiveBackend {
