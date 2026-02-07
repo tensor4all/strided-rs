@@ -37,6 +37,7 @@ use std::any::TypeId;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use strided_kernel::zip_map2_into;
 use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 pub use plan::Einsum2Plan;
@@ -208,7 +209,18 @@ where
     let b_perm = b_view.permute(&plan.right_perm)?;
     let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
 
-    // 5. Call batched GEMM
+    // 5a. Fast path: element-wise operation (all indices are batch, no contraction)
+    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+        let mul_fn = move |a_val: T, b_val: T| -> T {
+            let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
+            let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
+            alpha * a_c * b_c
+        };
+        zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        return Ok(());
+    }
+
+    // 5b. Call batched GEMM
     #[cfg(feature = "faer")]
     bgemm_faer::bgemm_strided_into(
         &mut c_perm,
@@ -702,5 +714,60 @@ mod tests {
         assert_eq!(c.get(&[0, 1]), -(1.0 + i));
         assert_eq!(c.get(&[1, 0]), Complex64::new(0.0, 0.0));
         assert_eq!(c.get(&[1, 1]), 3.0 - i);
+    }
+
+    #[test]
+    fn test_elementwise_hadamard() {
+        // C_ijk = A_ijk * B_ijk — all batch, no contraction
+        let a = StridedArray::<f64>::from_fn_row_major(&[3, 4, 5], |idx| {
+            (idx[0] * 20 + idx[1] * 5 + idx[2] + 1) as f64
+        });
+        let b = StridedArray::<f64>::from_fn_row_major(&[3, 4, 5], |idx| {
+            (idx[0] * 20 + idx[1] * 5 + idx[2] + 1) as f64 * 0.1
+        });
+        let mut c = StridedArray::<f64>::row_major(&[3, 4, 5]);
+
+        einsum2_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'j', 'k'],
+            &['i', 'j', 'k'],
+            &['i', 'j', 'k'],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        // Spot check: C[0,0,0] = 1 * 0.1 = 0.1
+        assert!((c.get(&[0, 0, 0]) - 0.1).abs() < 1e-12);
+        // C[2,3,4] = 60 * 6.0 = 360
+        assert!((c.get(&[2, 3, 4]) - 360.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_elementwise_hadamard_with_alpha() {
+        let a =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let b =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let mut c = StridedArray::<f64>::row_major(&[2, 3]);
+
+        einsum2_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'j'],
+            &['i', 'j'],
+            &['i', 'j'],
+            2.0,
+            0.0,
+        )
+        .unwrap();
+
+        // C[0,0] = 2.0 * 1 * 1 = 2.0
+        assert_eq!(c.get(&[0, 0]), 2.0);
+        // C[1,2] = 2.0 * 6 * 6 = 72.0
+        assert_eq!(c.get(&[1, 2]), 72.0);
     }
 }
