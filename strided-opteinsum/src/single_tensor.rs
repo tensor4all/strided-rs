@@ -145,8 +145,10 @@ where
     }
 
     // Step 2: Apply diagonal_view if any pairs exist, and compute unique_ids.
-    // If diagonal is needed, materialize into an owned array.
+    // If diagonal is needed and reduction follows, reduce directly from the diagonal
+    // view (skip materialization). Otherwise materialize into an owned array.
     let (diag_arr, unique_ids): (Option<StridedArray<T>>, Vec<char>);
+    let mut diag_reduce_done = false;
     if pairs.is_empty() {
         diag_arr = None;
         unique_ids = input_ids.to_vec();
@@ -172,10 +174,36 @@ where
                 .collect();
             return Ok(StridedArray::<T>::col_major(&out_dims));
         }
-        // Materialize the diagonal view into an owned array
-        let mut owned = StridedArray::<T>::col_major(&dims);
-        copy_into(&mut owned.view_mut(), &dv)?;
-        diag_arr = Some(owned);
+
+        // Check if there are axes to reduce — if so, reduce from the diagonal view
+        // directly without materializing first, saving one full copy.
+        let has_reduce = unique_ids.iter().any(|ch| !output_ids.contains(ch));
+        if has_reduce {
+            // Compute axes to reduce (within diagonal view's axes)
+            let mut axes_to_reduce_diag: Vec<usize> = Vec::new();
+            for (i, ch) in unique_ids.iter().enumerate() {
+                if !output_ids.contains(ch) {
+                    axes_to_reduce_diag.push(i);
+                }
+            }
+            axes_to_reduce_diag.sort_unstable();
+            axes_to_reduce_diag.reverse();
+
+            // First reduction reads directly from diagonal view (no copy!)
+            let mut reduced =
+                reduce_axis(&dv, axes_to_reduce_diag[0], |x| x, |a, b| a + b, T::zero())?;
+            // Subsequent reductions read from the owned result of the previous
+            for &ax in &axes_to_reduce_diag[1..] {
+                reduced = reduce_axis(&reduced.view(), ax, |x| x, |a, b| a + b, T::zero())?;
+            }
+            diag_arr = Some(reduced);
+            diag_reduce_done = true;
+        } else {
+            // No reduction follows — materialize for output
+            let mut owned = StridedArray::<T>::col_major(&dims);
+            copy_into(&mut owned.view_mut(), &dv)?;
+            diag_arr = Some(owned);
+        }
     }
 
     // Step 3: Find axes to sum out -- indices in unique_ids that are NOT in output_ids.
@@ -193,22 +221,40 @@ where
 
     let mut current_arr: Option<StridedArray<T>> = None;
 
-    for &ax in axes_to_reduce.iter() {
-        let reduced = if let Some(ref arr) = current_arr {
-            reduce_axis(&arr.view(), ax, |x| x, |a, b| a + b, T::zero())?
-        } else if let Some(ref arr) = diag_arr {
-            reduce_axis(&arr.view(), ax, |x| x, |a, b| a + b, T::zero())?
-        } else {
-            reduce_axis(src, ax, |x| x, |a, b| a + b, T::zero())?
-        };
-        current_arr = Some(reduced);
+    if !diag_reduce_done {
+        for &ax in axes_to_reduce.iter() {
+            let reduced = if let Some(ref arr) = current_arr {
+                reduce_axis(&arr.view(), ax, |x| x, |a, b| a + b, T::zero())?
+            } else if let Some(ref arr) = diag_arr {
+                reduce_axis(&arr.view(), ax, |x| x, |a, b| a + b, T::zero())?
+            } else {
+                reduce_axis(src, ax, |x| x, |a, b| a + b, T::zero())?
+            };
+            current_arr = Some(reduced);
+        }
     }
 
     // Compute current_ids after reductions.
     let mut current_ids = unique_ids.clone();
-    // Remove reduced axes (already sorted descending, so indices stay valid).
-    for &ax in axes_to_reduce.iter() {
-        current_ids.remove(ax);
+    if diag_reduce_done {
+        // Reductions already happened in the diagonal branch.
+        // Remove all reduced axes from current_ids.
+        let mut reduced_axes: Vec<usize> = Vec::new();
+        for (i, ch) in unique_ids.iter().enumerate() {
+            if !output_ids.contains(ch) {
+                reduced_axes.push(i);
+            }
+        }
+        reduced_axes.sort_unstable();
+        reduced_axes.reverse();
+        for ax in reduced_axes {
+            current_ids.remove(ax);
+        }
+    } else {
+        // Remove reduced axes (already sorted descending, so indices stay valid).
+        for &ax in axes_to_reduce.iter() {
+            current_ids.remove(ax);
+        }
     }
 
     // Step 5: Get the current result view for permutation.
