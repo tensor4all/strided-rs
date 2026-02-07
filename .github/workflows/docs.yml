@@ -30,6 +30,16 @@ jobs:
       - name: Prepare Pages artifact
         run: |
           touch target/doc/.nojekyll
+          cat > target/doc/index.html <<'EOF'
+          <!DOCTYPE html><html><head><meta charset="utf-8"><title>strided-rs docs</title>
+          <style>body{font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px}a{display:block;margin:8px 0}</style>
+          </head><body><h1>strided-rs</h1>
+          <a href="strided_view/">strided-view</a>
+          <a href="strided_kernel/">strided-kernel</a>
+          <a href="strided_einsum2/">strided-einsum2</a>
+          <a href="strided_opteinsum/">strided-opteinsum</a>
+          </body></html>
+          EOF
       - uses: actions/upload-pages-artifact@v3
         with:
           path: target/doc
