@@ -18,11 +18,12 @@ faer-traits = { version = "0.24", optional = true }
 cblas-sys = { version = "0.2", optional = true }
 blas-src = { version = "0.14", optional = true }
 cblas-inject = { version = "0.1", optional = true }
+num-complex = { version = "0.4", optional = true }
 
 [features]
 default = ["faer", "faer-traits"]
-blas = ["dep:cblas-sys", "dep:blas-src"]
-blas-inject = ["dep:cblas-inject"]
+blas = ["dep:cblas-sys", "dep:blas-src", "dep:num-complex"]
+blas-inject = ["dep:cblas-inject", "dep:num-complex"]
 
 [dev-dependencies]
 approx = "0.5"

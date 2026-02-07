@@ -30,10 +30,10 @@ compile_error!("Features `faer` and `blas-inject` are mutually exclusive.");
 #[cfg(all(feature = "blas", feature = "blas-inject"))]
 compile_error!("Features `blas` and `blas-inject` are mutually exclusive.");
 
-#[cfg(feature = "blas")]
-extern crate cblas_sys;
 #[cfg(feature = "blas-inject")]
 extern crate cblas_inject as cblas_sys;
+#[cfg(feature = "blas")]
+extern crate cblas_sys;
 
 #[cfg(any(feature = "blas", feature = "blas-inject"))]
 pub mod bgemm_blas;
