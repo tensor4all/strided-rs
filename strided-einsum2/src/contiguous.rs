@@ -64,6 +64,7 @@ impl<T> ContiguousOperand<T> {
     }
 
     /// Returns `true` if this operand owns a buffer (copy was made or ownership transferred).
+    #[cfg(test)]
     #[inline]
     pub(crate) fn has_buf(&self) -> bool {
         self._buf.is_some()
@@ -96,6 +97,7 @@ impl<T> ContiguousOperandMut<T> {
     }
 
     /// Returns `true` if this operand owns a buffer (copy was made).
+    #[cfg(test)]
     #[inline]
     pub(crate) fn has_buf(&self) -> bool {
         self._buf.is_some()
@@ -103,6 +105,7 @@ impl<T> ContiguousOperandMut<T> {
 
     /// Returns `true` if the caller must copy the buffer back to the original
     /// destination after GEMM completes.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn needs_writeback(&self) -> bool {
         self.needs_writeback
