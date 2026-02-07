@@ -347,6 +347,28 @@ where
     Ok(())
 }
 
+use crate::backend::{BgemmBackend, FaerBackend};
+
+impl<T> BgemmBackend<T> for FaerBackend
+where
+    T: crate::Scalar + ComplexField,
+{
+    fn bgemm_contiguous_into(
+        c: &mut ContiguousOperandMut<T>,
+        a: &ContiguousOperand<T>,
+        b: &ContiguousOperand<T>,
+        batch_dims: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: T,
+        beta: T,
+    ) -> strided_view::Result<()> {
+        // Delegate to the existing free function in this module
+        bgemm_contiguous_into(c, a, b, batch_dims, m, n, k, alpha, beta)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
