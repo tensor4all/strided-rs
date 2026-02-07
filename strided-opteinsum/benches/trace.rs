@@ -1,13 +1,10 @@
-//! Trace benchmark (sum of diagonal: ein"ii->").
-//!
-//! Matches Julia OMEinsum ein"ii->" with 1000×1000 matrix.
-//! Trace is unary in Julia; we implement it as a diagonal sum (same workload).
-//! Benchmarks both f64 and Complex64. Column-major for Julia parity.
+//! Trace benchmark via opteinsum (ein"ii->").
 
 use num_complex::Complex64;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_opteinsum::{parse_einsum, EinsumOperand};
 use strided_view::StridedArray;
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -32,45 +29,45 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
     avg
 }
 
-/// Sum diagonal elements; #[inline(never)] prevents hoisting out of the loop.
-#[inline(never)]
-fn run_trace_f64(a: &StridedArray<f64>, n: usize) -> f64 {
-    (0..n).map(|i| a.get(&[i, i])).sum()
-}
-
-#[inline(never)]
-fn run_trace_complex64(a: &StridedArray<Complex64>, n: usize) -> Complex64 {
-    (0..n).map(|i| a.get(&[i, i])).sum()
-}
-
 fn main() {
-    println!("strided-einsum2 bench: trace (ein\"ii->\")");
-    println!("Shape (1000, 1000), scalar output. Column-major for Julia parity.");
+    println!("strided-opteinsum bench: trace (ii->)");
+    println!("Shape (1000, 1000), scalar output. Column-major.");
     println!();
 
     let n = 1000usize;
     let shape_2 = [n, n];
+    let code = parse_einsum("ii->").unwrap();
 
-    // f64
     let mut rng = StdRng::seed_from_u64(0);
     let a = StridedArray::<f64>::from_fn_col_major(&shape_2, |_| rng.gen::<f64>());
+    let a_view = a.view();
 
     println!("trace: Float64");
     bench_n("trace_f64", 2, 5, || {
-        let s = run_trace_f64(&a, n);
-        black_box(s);
+        let result = code
+            .evaluate(vec![EinsumOperand::from_view_f64(&a_view)])
+            .unwrap();
+        match result {
+            EinsumOperand::F64(data) => black_box(data.as_array().data()[0]),
+            _ => unreachable!("expected f64 output"),
+        };
     });
     println!();
 
-    // Complex64
     let mut rng_c = StdRng::seed_from_u64(1);
     let a_c = StridedArray::<Complex64>::from_fn_col_major(&shape_2, |_| {
         Complex64::new(rng_c.gen::<f64>(), rng_c.gen::<f64>())
     });
+    let a_c_view = a_c.view();
 
     println!("trace: ComplexF64");
     bench_n("trace_Complex64", 2, 5, || {
-        let s = run_trace_complex64(&a_c, n);
-        black_box(s);
+        let result = code
+            .evaluate(vec![EinsumOperand::from_view_c64(&a_c_view)])
+            .unwrap();
+        match result {
+            EinsumOperand::C64(data) => black_box(data.as_array().data()[0]),
+            _ => unreachable!("expected complex output"),
+        };
     });
 }
