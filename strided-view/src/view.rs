@@ -293,6 +293,58 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         }
     }
 
+    /// Create a diagonal view by fusing repeated axis pairs via stride trick (zero-copy).
+    ///
+    /// For each pair `(a, b)`:
+    /// - New stride = `strides[a] + strides[b]`
+    /// - New dim = `min(dims[a], dims[b])`
+    /// - The higher-numbered axis is removed
+    /// - Pairs use **original** axis numbering
+    ///
+    /// # Example
+    /// `A[i,i,j]` shape=`[n,n,m]` strides=`[s0,s1,s2]` -> shape=`[n,m]` strides=`[s0+s1, s2]`
+    pub fn diagonal_view(&self, axis_pairs: &[(usize, usize)]) -> Result<StridedView<'a, T, Op>> {
+        let ndim = self.ndim();
+        let mut dims: Vec<usize> = self.dims().to_vec();
+        let mut strides: Vec<isize> = self.strides().to_vec();
+
+        let mut axes_to_remove = Vec::new();
+        for &(a, b) in axis_pairs {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            if lo >= ndim || hi >= ndim {
+                return Err(StridedError::InvalidAxis {
+                    axis: hi,
+                    rank: ndim,
+                });
+            }
+            if lo == hi {
+                return Err(StridedError::InvalidAxis {
+                    axis: lo,
+                    rank: ndim,
+                });
+            }
+            strides[lo] += strides[hi];
+            dims[lo] = dims[lo].min(dims[hi]);
+            axes_to_remove.push(hi);
+        }
+
+        axes_to_remove.sort_unstable();
+        axes_to_remove.dedup();
+        for &ax in axes_to_remove.iter().rev() {
+            dims.remove(ax);
+            strides.remove(ax);
+        }
+
+        unsafe {
+            Ok(StridedView::new_unchecked(
+                self.data(),
+                &dims,
+                &strides,
+                self.offset(),
+            ))
+        }
+    }
+
     /// Broadcast this view to a target shape.
     ///
     /// Size-1 dimensions are expanded (stride set to 0) to match target.
@@ -1013,5 +1065,60 @@ mod tests {
         assert_eq!(t.get(&[0, 1, 0]), 10.0);
         assert_eq!(t.get(&[0, 0, 1]), 1.0);
         assert_eq!(t.get(&[1, 2, 3]), 123.0);
+    }
+
+    #[test]
+    fn test_diagonal_view_2d() {
+        // A[i,i] shape=[3,3] row-major strides=[3,1]
+        // diagonal: shape=[3] strides=[4] (3+1)
+        let data: Vec<f64> = (0..9).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[3, 3], &[3, 1], 0).unwrap();
+        let diag = view.diagonal_view(&[(0, 1)]).unwrap();
+        assert_eq!(diag.dims(), &[3]);
+        assert_eq!(diag.strides(), &[4]);
+        assert_eq!(diag.get(&[0]), 0.0); // A[0,0]
+        assert_eq!(diag.get(&[1]), 4.0); // A[1,1]
+        assert_eq!(diag.get(&[2]), 8.0); // A[2,2]
+    }
+
+    #[test]
+    fn test_diagonal_view_3d_adjacent() {
+        // A[i,i,j] shape=[2,2,3] row-major strides=[6,3,1]
+        // diagonal over (0,1): shape=[2,3] strides=[9,1] (6+3)
+        let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[2, 2, 3], &[6, 3, 1], 0).unwrap();
+        let diag = view.diagonal_view(&[(0, 1)]).unwrap();
+        assert_eq!(diag.dims(), &[2, 3]);
+        assert_eq!(diag.strides(), &[9, 1]);
+        assert_eq!(diag.get(&[0, 0]), 0.0);
+        assert_eq!(diag.get(&[0, 2]), 2.0);
+        assert_eq!(diag.get(&[1, 0]), 9.0);
+    }
+
+    #[test]
+    fn test_diagonal_view_3d_non_adjacent() {
+        // A[i,j,i] shape=[2,3,2] row-major strides=[6,2,1]
+        // diagonal over (0,2): shape=[2,3] strides=[7,2] (6+1)
+        let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[2, 3, 2], &[6, 2, 1], 0).unwrap();
+        let diag = view.diagonal_view(&[(0, 2)]).unwrap();
+        assert_eq!(diag.dims(), &[2, 3]);
+        assert_eq!(diag.strides(), &[7, 2]);
+        assert_eq!(diag.get(&[0, 0]), 0.0);
+        assert_eq!(diag.get(&[0, 1]), 2.0);
+        assert_eq!(diag.get(&[1, 0]), 7.0);
+        assert_eq!(diag.get(&[1, 2]), 11.0);
+    }
+
+    #[test]
+    fn test_diagonal_view_two_pairs() {
+        // A[i,j,i,j] shape=[2,3,2,3] -> A_diag[i,j] shape=[2,3]
+        let data: Vec<f64> = (0..36).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[2, 3, 2, 3], &[18, 6, 3, 1], 0).unwrap();
+        let diag = view.diagonal_view(&[(0, 2), (1, 3)]).unwrap();
+        assert_eq!(diag.dims(), &[2, 3]);
+        assert_eq!(diag.strides(), &[21, 7]);
+        assert_eq!(diag.get(&[0, 0]), 0.0);
+        assert_eq!(diag.get(&[1, 1]), 28.0);
     }
 }

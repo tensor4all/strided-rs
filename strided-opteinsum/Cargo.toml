@@ -1,0 +1,18 @@
+[package]
+name = "strided-opteinsum"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+strided-view = { path = "../strided-view" }
+strided-kernel = { path = "../strided-kernel" }
+strided-einsum2 = { path = "../strided-einsum2" }
+omeco = "0.2"
+num-complex = "0.4"
+num-traits = "0.2"
+thiserror = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+num-complex = "0.4"
+strided-view = { path = "../strided-view" }
