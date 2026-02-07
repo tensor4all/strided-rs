@@ -101,8 +101,8 @@ impl<T> Scalar for T where
 {
 }
 
-/// Trait alias for element types (without `faer` feature).
-#[cfg(not(feature = "faer"))]
+/// Trait alias for element types (with `blas` or `blas-inject` feature).
+#[cfg(any(feature = "blas", feature = "blas-inject"))]
 pub trait Scalar:
     Copy
     + ElementOpApply
@@ -116,7 +116,36 @@ pub trait Scalar:
 {
 }
 
-#[cfg(not(feature = "faer"))]
+#[cfg(any(feature = "blas", feature = "blas-inject"))]
+impl<T> Scalar for T where
+    T: Copy
+        + ElementOpApply
+        + Send
+        + Sync
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>
+        + num_traits::Zero
+        + num_traits::One
+        + PartialEq
+{
+}
+
+/// Trait alias for element types (without `faer` or BLAS features).
+#[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
+pub trait Scalar:
+    Copy
+    + ElementOpApply
+    + Send
+    + Sync
+    + std::ops::Mul<Output = Self>
+    + std::ops::Add<Output = Self>
+    + num_traits::Zero
+    + num_traits::One
+    + PartialEq
+{
+}
+
+#[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
 impl<T> Scalar for T where
     T: Copy
         + ElementOpApply
