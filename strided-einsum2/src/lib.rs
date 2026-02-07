@@ -58,6 +58,9 @@ pub mod trace;
 /// Shared helpers (permutation inversion, multi-index iteration, dimension fusion).
 pub mod util;
 
+/// Backend abstraction for batched GEMM dispatch.
+pub(crate) mod backend;
+
 use std::any::TypeId;
 use std::fmt::Debug;
 use std::hash::Hash;
