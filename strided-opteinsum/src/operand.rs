@@ -39,6 +39,16 @@ impl<'a, T> StridedData<'a, T> {
     }
 }
 
+impl<'a, T> StridedData<'a, T> {
+    /// Permute dimensions (metadata-only reorder, no data copy).
+    pub fn permuted(self, perm: &[usize]) -> strided_view::Result<Self> {
+        match self {
+            StridedData::Owned(arr) => Ok(StridedData::Owned(arr.permuted(perm)?)),
+            StridedData::View(view) => Ok(StridedData::View(view.permute(perm)?)),
+        }
+    }
+}
+
 impl<'a, T> StridedData<'a, T>
 where
     T: Copy + ElementOpApply + Send + Sync + Zero + Default,
@@ -84,6 +94,14 @@ impl<'a> EinsumOperand<'a> {
         match self {
             EinsumOperand::F64(data) => data.dims(),
             EinsumOperand::C64(data) => data.dims(),
+        }
+    }
+
+    /// Permute dimensions (metadata-only reorder, no data copy).
+    pub fn permuted(self, perm: &[usize]) -> crate::Result<Self> {
+        match self {
+            EinsumOperand::F64(data) => Ok(EinsumOperand::F64(data.permuted(perm)?)),
+            EinsumOperand::C64(data) => Ok(EinsumOperand::C64(data.permuted(perm)?)),
         }
     }
 
