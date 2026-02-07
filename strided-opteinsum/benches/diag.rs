@@ -1,13 +1,10 @@
-//! Diagonal extraction benchmark (ein"ijj->ij": C[i,j] = A[i,j,j]).
-//!
-//! Matches Julia OMEinsum ein"ijj->ij" with shape (100, 100, 100).
-//! Unary in Julia; we copy the diagonal slice (no contraction).
-//! Benchmarks both f64 and Complex64. Column-major for Julia parity.
+//! Diagonal extraction benchmark via opteinsum (ein"ijj->ij").
 
 use num_complex::Complex64;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_opteinsum::{parse_einsum, EinsumOperand};
 use strided_view::StridedArray;
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -32,56 +29,45 @@ fn bench_n(label: &str, warmup_iters: usize, iters: usize, mut f: impl FnMut()) 
     avg
 }
 
-/// C[i,j] = A[i,j,j]; #[inline(never)] prevents hoisting out of the loop.
-#[inline(never)]
-fn run_diag_f64(c: &mut StridedArray<f64>, a: &StridedArray<f64>, n: usize) {
-    for i in 0..n {
-        for j in 0..n {
-            c.set(&[i, j], a.get(&[i, j, j]));
-        }
-    }
-}
-
-#[inline(never)]
-fn run_diag_complex64(c: &mut StridedArray<Complex64>, a: &StridedArray<Complex64>, n: usize) {
-    for i in 0..n {
-        for j in 0..n {
-            c.set(&[i, j], a.get(&[i, j, j]));
-        }
-    }
-}
-
 fn main() {
-    println!("strided-einsum2 bench: diag (ein\"ijj->ij\")");
-    println!("Shape (100, 100, 100) -> (100, 100). Column-major for Julia parity.");
+    println!("strided-opteinsum bench: diag (ijj->ij)");
+    println!("Shape (100, 100, 100) -> (100, 100). Column-major.");
     println!();
 
     let n = 100usize;
     let shape_3 = [n, n, n];
-    let shape_2 = [n, n];
+    let code = parse_einsum("ijj->ij").unwrap();
 
-    // f64
     let mut rng = StdRng::seed_from_u64(0);
     let a = StridedArray::<f64>::from_fn_col_major(&shape_3, |_| rng.gen::<f64>());
-    let mut c = StridedArray::<f64>::col_major(&shape_2);
+    let a_view = a.view();
 
     println!("diag: Float64");
     bench_n("diag_f64", 2, 5, || {
-        run_diag_f64(&mut c, &a, n);
-        black_box(c.data().as_ptr());
+        let result = code
+            .evaluate(vec![EinsumOperand::from_view_f64(&a_view)])
+            .unwrap();
+        match result {
+            EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
+            _ => unreachable!("expected f64 output"),
+        };
     });
     println!();
 
-    // Complex64
     let mut rng_c = StdRng::seed_from_u64(1);
     let a_c = StridedArray::<Complex64>::from_fn_col_major(&shape_3, |_| {
         Complex64::new(rng_c.gen::<f64>(), rng_c.gen::<f64>())
     });
-    let mut c_c = StridedArray::<Complex64>::col_major(&shape_2);
+    let a_c_view = a_c.view();
 
     println!("diag: ComplexF64");
     bench_n("diag_Complex64", 2, 5, || {
-        run_diag_complex64(&mut c_c, &a_c, n);
-        black_box(c_c.data().as_ptr());
+        let result = code
+            .evaluate(vec![EinsumOperand::from_view_c64(&a_c_view)])
+            .unwrap();
+        match result {
+            EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),
+            _ => unreachable!("expected complex output"),
+        };
     });
 }
