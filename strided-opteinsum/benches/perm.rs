@@ -48,7 +48,7 @@ fn main() {
             .evaluate(vec![EinsumOperand::from_view_f64(&a_view)])
             .unwrap();
         match result {
-            EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
+            EinsumOperand::F64(data) => black_box(data.as_view().ptr()),
             _ => unreachable!("expected f64 output"),
         };
     });
@@ -66,7 +66,7 @@ fn main() {
             .evaluate(vec![EinsumOperand::from_view_c64(&a_c_view)])
             .unwrap();
         match result {
-            EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),
+            EinsumOperand::C64(data) => black_box(data.as_view().ptr()),
             _ => unreachable!("expected complex output"),
         };
     });

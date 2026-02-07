@@ -38,7 +38,7 @@ pub use typed_tensor::{needs_c64_promotion, TypedTensor};
 /// ```ignore
 /// let result = einsum("(ij,jk),kl->il", vec![a.into(), b.into(), c.into()])?;
 /// ```
-pub fn einsum(notation: &str, operands: Vec<EinsumOperand<'_>>) -> Result<EinsumOperand<'static>> {
+pub fn einsum<'a>(notation: &str, operands: Vec<EinsumOperand<'a>>) -> Result<EinsumOperand<'a>> {
     let code = parse_einsum(notation)?;
     code.evaluate(operands)
 }

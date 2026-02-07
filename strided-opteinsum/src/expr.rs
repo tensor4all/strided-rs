@@ -99,104 +99,8 @@ fn compute_child_needed_ids(
 }
 
 // ---------------------------------------------------------------------------
-// Pairwise contraction helpers
+// Pairwise contraction (borrows operands)
 // ---------------------------------------------------------------------------
-
-fn eval_pair_f64(
-    left: EinsumOperand<'_>,
-    left_ids: &[char],
-    right: EinsumOperand<'_>,
-    right_ids: &[char],
-    output_ids: &[char],
-) -> crate::Result<EinsumOperand<'static>> {
-    let left_data = match left {
-        EinsumOperand::F64(d) => d,
-        _ => unreachable!("eval_pair_f64 called with non-f64 left operand"),
-    };
-    let right_data = match right {
-        EinsumOperand::F64(d) => d,
-        _ => unreachable!("eval_pair_f64 called with non-f64 right operand"),
-    };
-
-    let a_view = left_data.as_view();
-    let b_view = right_data.as_view();
-
-    // Build dimension map
-    let mut dim_map: HashMap<char, usize> = HashMap::new();
-    for (i, &id) in left_ids.iter().enumerate() {
-        dim_map.insert(id, a_view.dims()[i]);
-    }
-    for (i, &id) in right_ids.iter().enumerate() {
-        dim_map.insert(id, b_view.dims()[i]);
-    }
-
-    let out_dims = out_dims_from_map(&dim_map, output_ids)?;
-
-    // Allocate output (col-major)
-    let mut c_arr = StridedArray::<f64>::col_major(&out_dims);
-
-    // Call einsum2_into
-    einsum2_into(
-        c_arr.view_mut(),
-        &a_view,
-        &b_view,
-        output_ids,
-        left_ids,
-        right_ids,
-        1.0,
-        0.0,
-    )?;
-
-    Ok(EinsumOperand::F64(StridedData::Owned(c_arr)))
-}
-
-fn eval_pair_c64(
-    left: EinsumOperand<'_>,
-    left_ids: &[char],
-    right: EinsumOperand<'_>,
-    right_ids: &[char],
-    output_ids: &[char],
-) -> crate::Result<EinsumOperand<'static>> {
-    let left_data = match left {
-        EinsumOperand::C64(d) => d,
-        _ => unreachable!("eval_pair_c64 called with non-c64 left operand"),
-    };
-    let right_data = match right {
-        EinsumOperand::C64(d) => d,
-        _ => unreachable!("eval_pair_c64 called with non-c64 right operand"),
-    };
-
-    let a_view = left_data.as_view();
-    let b_view = right_data.as_view();
-
-    // Build dimension map
-    let mut dim_map: HashMap<char, usize> = HashMap::new();
-    for (i, &id) in left_ids.iter().enumerate() {
-        dim_map.insert(id, a_view.dims()[i]);
-    }
-    for (i, &id) in right_ids.iter().enumerate() {
-        dim_map.insert(id, b_view.dims()[i]);
-    }
-
-    let out_dims = out_dims_from_map(&dim_map, output_ids)?;
-
-    // Allocate output (col-major)
-    let mut c_arr = StridedArray::<Complex64>::col_major(&out_dims);
-
-    // Call einsum2_into
-    einsum2_into(
-        c_arr.view_mut(),
-        &a_view,
-        &b_view,
-        output_ids,
-        left_ids,
-        right_ids,
-        Complex64::new(1.0, 0.0),
-        Complex64::zero(),
-    )?;
-
-    Ok(EinsumOperand::C64(StridedData::Owned(c_arr)))
-}
 
 fn out_dims_from_map(
     dim_map: &HashMap<char, usize>,
@@ -212,33 +116,8 @@ fn out_dims_from_map(
     Ok(out_dims)
 }
 
-/// Contract two operands, promoting to c64 if types are mixed.
+/// Contract two operands by borrowing views. Promotes to c64 if types are mixed.
 fn eval_pair(
-    left: EinsumOperand<'_>,
-    left_ids: &[char],
-    right: EinsumOperand<'_>,
-    right_ids: &[char],
-    output_ids: &[char],
-) -> crate::Result<EinsumOperand<'static>> {
-    match (&left, &right) {
-        (EinsumOperand::F64(_), EinsumOperand::F64(_)) => {
-            eval_pair_f64(left, left_ids, right, right_ids, output_ids)
-        }
-        (EinsumOperand::C64(_), EinsumOperand::C64(_)) => {
-            eval_pair_c64(left, left_ids, right, right_ids, output_ids)
-        }
-        _ => {
-            // Mixed types: promote both to c64
-            let left_c64 = left.to_c64_owned();
-            let right_c64 = right.to_c64_owned();
-            eval_pair_c64(left_c64, left_ids, right_c64, right_ids, output_ids)
-        }
-    }
-}
-
-/// Like `eval_pair` but borrows from operands instead of consuming them.
-/// Avoids the `to_owned_static()` copy for Leaf operands.
-fn eval_pair_ref(
     left: &EinsumOperand<'_>,
     left_ids: &[char],
     right: &EinsumOperand<'_>,
@@ -295,40 +174,19 @@ fn eval_pair_ref(
             Ok(EinsumOperand::C64(StridedData::Owned(c_arr)))
         }
         _ => {
-            // Mixed types: fall back to consuming path with promotion
+            // Mixed types: promote both to c64, then recurse (hits C64/C64 branch)
             let left_c64 = left.to_c64_owned_ref();
             let right_c64 = right.to_c64_owned_ref();
-            eval_pair(left_c64, left_ids, right_c64, right_ids, output_ids)
+            eval_pair(&left_c64, left_ids, &right_c64, right_ids, output_ids)
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Single-tensor dispatch
+// Single-tensor dispatch (borrows operand)
 // ---------------------------------------------------------------------------
 
 fn eval_single(
-    operand: EinsumOperand<'_>,
-    input_ids: &[char],
-    output_ids: &[char],
-) -> crate::Result<EinsumOperand<'static>> {
-    match operand {
-        EinsumOperand::F64(data) => {
-            let view = data.as_view();
-            let result = single_tensor_einsum(&view, input_ids, output_ids)?;
-            Ok(EinsumOperand::F64(StridedData::Owned(result)))
-        }
-        EinsumOperand::C64(data) => {
-            let view = data.as_view();
-            let result = single_tensor_einsum(&view, input_ids, output_ids)?;
-            Ok(EinsumOperand::C64(StridedData::Owned(result)))
-        }
-    }
-}
-
-/// Like `eval_single` but borrows from the operand instead of consuming it.
-/// Avoids the `to_owned_static()` copy for Leaf operands.
-fn eval_single_ref(
     operand: &EinsumOperand<'_>,
     input_ids: &[char],
     output_ids: &[char],
@@ -348,6 +206,38 @@ fn eval_single_ref(
 }
 
 // ---------------------------------------------------------------------------
+// Permutation helpers
+// ---------------------------------------------------------------------------
+
+/// Check if the transformation from input_ids to output_ids is a pure
+/// permutation (same set of chars, same length, no repeated indices).
+fn is_permutation_only(input_ids: &[char], output_ids: &[char]) -> bool {
+    if input_ids.len() != output_ids.len() {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    for &id in input_ids {
+        if !seen.insert(id) {
+            return false; // repeated index = trace, not permutation
+        }
+    }
+    for &id in output_ids {
+        if !seen.contains(&id) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute the permutation that maps input_ids ordering to output_ids ordering.
+fn compute_permutation(input_ids: &[char], output_ids: &[char]) -> Vec<usize> {
+    output_ids
+        .iter()
+        .map(|oid| input_ids.iter().position(|iid| iid == oid).unwrap())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Execute omeco NestedEinsum tree
 // ---------------------------------------------------------------------------
 
@@ -357,10 +247,10 @@ fn eval_single_ref(
 /// `children` is a Vec of Option-wrapped (operand, ids) pairs. The omeco
 /// `NestedEinsum::Leaf` variant references children by index; we `.take()`
 /// each entry to move ownership out exactly once.
-fn execute_nested(
+fn execute_nested<'a>(
     nested: &omeco::NestedEinsum<char>,
-    children: &mut Vec<Option<(EinsumOperand<'static>, Vec<char>)>>,
-) -> crate::Result<(EinsumOperand<'static>, Vec<char>)> {
+    children: &mut Vec<Option<(EinsumOperand<'a>, Vec<char>)>>,
+) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match nested {
         omeco::NestedEinsum::Leaf { tensor_index } => {
             let slot = children.get_mut(*tensor_index).ok_or_else(|| {
@@ -387,7 +277,7 @@ fn execute_nested(
             let (left, left_ids) = execute_nested(&args[0], children)?;
             let (right, right_ids) = execute_nested(&args[1], children)?;
             let output_ids: Vec<char> = eins.iy.clone();
-            let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids)?;
+            let result = eval_pair(&left, &left_ids, &right, &right_ids, &output_ids)?;
             Ok((result, output_ids))
         }
     }
@@ -400,13 +290,16 @@ fn execute_nested(
 /// Recursively evaluate an `EinsumNode`, returning the result operand and
 /// the index chars labelling its axes.
 ///
+/// Leaf nodes return borrowed views directly (no copy). Contract nodes
+/// always produce freshly allocated results (`'static` coerced to `'a`).
+///
 /// `needed_ids` tells this node which indices the caller needs in the result.
 /// For the root call this is the final output indices of the einsum.
-fn eval_node(
+fn eval_node<'a>(
     node: &EinsumNode,
-    operands: &mut Vec<Option<EinsumOperand<'_>>>,
+    operands: &mut Vec<Option<EinsumOperand<'a>>>,
     needed_ids: &HashSet<char>,
-) -> crate::Result<(EinsumOperand<'static>, Vec<char>)> {
+) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match node {
         EinsumNode::Leaf { ids, tensor_index } => {
             let found = operands.len();
@@ -422,7 +315,8 @@ fn eval_node(
                     tensor_index
                 ))
             })?;
-            Ok((op.to_owned_static(), ids.clone()))
+            // Return borrowed view directly — no to_owned_static() copy.
+            Ok((op, ids.clone()))
         }
         EinsumNode::Contract { args } => {
             // Determine which indices this Contract node should output.
@@ -432,90 +326,31 @@ fn eval_node(
                 0 => unreachable!("empty Contract node"),
                 1 => {
                     // Single-tensor operation.
-                    // Optimization: if child is a Leaf, borrow view directly
-                    // to avoid to_owned_static() copy of the full input tensor.
-                    if let EinsumNode::Leaf { ids, tensor_index } = &args[0] {
-                        let found = operands.len();
-                        let slot = operands.get(*tensor_index).ok_or_else(|| {
-                            crate::EinsumError::OperandCountMismatch {
-                                expected: tensor_index + 1,
-                                found,
-                            }
-                        })?;
-                        let op = slot.as_ref().ok_or_else(|| {
-                            crate::EinsumError::Internal(format!(
-                                "operand {} was already consumed",
-                                tensor_index
-                            ))
-                        })?;
-                        let result = eval_single_ref(op, ids, &node_output_ids)?;
-                        operands[*tensor_index].take(); // mark consumed
-                        return Ok((result, node_output_ids));
-                    }
-                    // Fallback: recursive evaluation for nested Contract children
                     let child_needed = compute_child_needed_ids(&node_output_ids, 0, args);
-                    let (operand, input_ids) = eval_node(&args[0], operands, &child_needed)?;
-                    let result = eval_single(operand, &input_ids, &node_output_ids)?;
+                    let (child_op, child_ids) = eval_node(&args[0], operands, &child_needed)?;
+
+                    // Identity passthrough: no allocation needed.
+                    if child_ids == node_output_ids {
+                        return Ok((child_op, node_output_ids));
+                    }
+
+                    // Permutation-only passthrough: metadata reorder, no data copy.
+                    if is_permutation_only(&child_ids, &node_output_ids) {
+                        let perm = compute_permutation(&child_ids, &node_output_ids);
+                        return Ok((child_op.permuted(&perm)?, node_output_ids));
+                    }
+
+                    // General case: trace, reduction, etc.
+                    let result = eval_single(&child_op, &child_ids, &node_output_ids)?;
                     Ok((result, node_output_ids))
                 }
                 2 => {
                     // Binary contraction.
-                    // Optimization: if both children are Leaves, borrow views directly.
-                    if let (
-                        EinsumNode::Leaf {
-                            ids: left_ids,
-                            tensor_index: left_idx,
-                        },
-                        EinsumNode::Leaf {
-                            ids: right_ids,
-                            tensor_index: right_idx,
-                        },
-                    ) = (&args[0], &args[1])
-                    {
-                        let found = operands.len();
-                        let left_op = operands
-                            .get(*left_idx)
-                            .ok_or_else(|| crate::EinsumError::OperandCountMismatch {
-                                expected: left_idx + 1,
-                                found,
-                            })?
-                            .as_ref()
-                            .ok_or_else(|| {
-                                crate::EinsumError::Internal(format!(
-                                    "operand {} was already consumed",
-                                    left_idx
-                                ))
-                            })?;
-                        let right_op = operands
-                            .get(*right_idx)
-                            .ok_or_else(|| crate::EinsumError::OperandCountMismatch {
-                                expected: right_idx + 1,
-                                found,
-                            })?
-                            .as_ref()
-                            .ok_or_else(|| {
-                                crate::EinsumError::Internal(format!(
-                                    "operand {} was already consumed",
-                                    right_idx
-                                ))
-                            })?;
-                        let result = eval_pair_ref(
-                            left_op,
-                            left_ids,
-                            right_op,
-                            right_ids,
-                            &node_output_ids,
-                        )?;
-                        operands[*left_idx].take();
-                        operands[*right_idx].take();
-                        return Ok((result, node_output_ids));
-                    }
-                    // Fallback: recursive evaluation
                     let left_needed = compute_child_needed_ids(&node_output_ids, 0, args);
                     let right_needed = compute_child_needed_ids(&node_output_ids, 1, args);
                     let (left, left_ids) = eval_node(&args[0], operands, &left_needed)?;
                     let (right, right_ids) = eval_node(&args[1], operands, &right_needed)?;
-                    let result = eval_pair(left, &left_ids, right, &right_ids, &node_output_ids)?;
+                    let result = eval_pair(&left, &left_ids, &right, &right_ids, &node_output_ids)?;
                     Ok((result, node_output_ids))
                 }
                 _ => {
@@ -523,7 +358,7 @@ fn eval_node(
                     // an efficient pairwise contraction order.
 
                     // 1. Evaluate all children to get their operands and ids
-                    let mut children: Vec<Option<(EinsumOperand<'static>, Vec<char>)>> = Vec::new();
+                    let mut children: Vec<Option<(EinsumOperand<'a>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
                         let (op, ids) = eval_node(arg, operands, &child_needed)?;
@@ -566,29 +401,19 @@ fn eval_node(
 }
 
 // ---------------------------------------------------------------------------
-// EinsumOperand: helper to convert to 'static lifetime
-// ---------------------------------------------------------------------------
-
-impl<'a> EinsumOperand<'a> {
-    /// Convert to an owned operand with `'static` lifetime.
-    fn to_owned_static(self) -> EinsumOperand<'static> {
-        match self {
-            EinsumOperand::F64(data) => EinsumOperand::F64(StridedData::Owned(data.into_array())),
-            EinsumOperand::C64(data) => EinsumOperand::C64(StridedData::Owned(data.into_array())),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 impl EinsumCode {
     /// Evaluate the einsum contraction tree with the given operands.
-    pub fn evaluate(
+    ///
+    /// Borrowed view operands are propagated through the tree without copying.
+    /// The result lifetime matches the input operand lifetime: if all inputs
+    /// are owned (`'static`), the result is also `'static`.
+    pub fn evaluate<'a>(
         &self,
-        operands: Vec<EinsumOperand<'_>>,
-    ) -> crate::Result<EinsumOperand<'static>> {
+        operands: Vec<EinsumOperand<'a>>,
+    ) -> crate::Result<EinsumOperand<'a>> {
         let expected = leaf_count(&self.root);
         if operands.len() != expected {
             return Err(crate::EinsumError::OperandCountMismatch {
@@ -598,7 +423,7 @@ impl EinsumCode {
         }
 
         let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
-        let mut ops: Vec<Option<EinsumOperand<'_>>> = operands.into_iter().map(Some).collect();
+        let mut ops: Vec<Option<EinsumOperand<'a>>> = operands.into_iter().map(Some).collect();
 
         let (result, result_ids) = eval_node(&self.root, &mut ops, &final_output)?;
 
@@ -607,8 +432,15 @@ impl EinsumCode {
             return Ok(result);
         }
 
-        // Otherwise, permute/reduce to match the final output_ids.
-        eval_single(result, &result_ids, &self.output_ids)
+        // Permutation-only: reorder metadata, no data copy.
+        if is_permutation_only(&result_ids, &self.output_ids) {
+            let perm = compute_permutation(&result_ids, &self.output_ids);
+            return Ok(result.permuted(&perm)?);
+        }
+
+        // General fallback: reduce/trace to match the final output_ids.
+        let adjusted = eval_single(&result, &result_ids, &self.output_ids)?;
+        Ok(adjusted)
     }
 }
 

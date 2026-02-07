@@ -802,6 +802,35 @@ impl<T> StridedArray<T> {
         }
     }
 
+    /// Permute dimensions (metadata-only reorder, no data copy).
+    ///
+    /// Returns a new array with reordered dims and strides.
+    /// The underlying data buffer is not touched.
+    pub fn permuted(self, perm: &[usize]) -> Result<Self> {
+        let rank = self.dims.len();
+        if perm.len() != rank {
+            return Err(StridedError::RankMismatch(perm.len(), rank));
+        }
+        let mut seen = vec![false; rank];
+        for &p in perm {
+            if p >= rank {
+                return Err(StridedError::InvalidAxis { axis: p, rank });
+            }
+            if seen[p] {
+                return Err(StridedError::InvalidAxis { axis: p, rank });
+            }
+            seen[p] = true;
+        }
+        let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
+        let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
+        Ok(Self {
+            data: self.data,
+            dims: Arc::from(new_dims),
+            strides: Arc::from(new_strides),
+            offset: self.offset,
+        })
+    }
+
     /// Iterate over all elements in memory order.
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.data.iter()
