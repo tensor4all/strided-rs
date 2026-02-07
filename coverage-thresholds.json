@@ -1,0 +1,4 @@
+{
+  "_comment": "Per-file line coverage thresholds (%). Files not listed default to 'default'.",
+  "default": 80
+}
