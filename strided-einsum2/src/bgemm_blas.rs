@@ -4,6 +4,7 @@
 //! Operands must already have contiguous inner dimensions (prepared via
 //! `prepare_input_*` and `prepare_output_*` in the `contiguous` module).
 
+use crate::backend::{BgemmBackend, BlasBackend};
 use crate::contiguous::{ContiguousOperand, ContiguousOperandMut};
 use crate::util::MultiIndex;
 use crate::Scalar;
@@ -487,4 +488,25 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     }
 
     Ok(())
+}
+
+impl<T> BgemmBackend<T> for BlasBackend
+where
+    T: Scalar + BlasGemm,
+{
+    fn bgemm_contiguous_into(
+        c: &mut ContiguousOperandMut<T>,
+        a: &ContiguousOperand<T>,
+        b: &ContiguousOperand<T>,
+        batch_dims: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: T,
+        beta: T,
+    ) -> strided_view::Result<()> {
+        // Delegate to the existing free function in this module.
+        // Use explicit module path to disambiguate from the trait method.
+        self::bgemm_contiguous_into(c, a, b, batch_dims, m, n, k, alpha, beta)
+    }
 }
