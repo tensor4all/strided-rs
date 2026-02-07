@@ -76,12 +76,8 @@ pub use plan::Einsum2Plan;
 pub trait AxisId: Clone + Eq + Hash + Debug {}
 impl<T: Clone + Eq + Hash + Debug> AxisId for T {}
 
-/// Trait alias for element types supported by einsum operations.
-///
-/// When the `faer` feature is enabled, this additionally requires `faer::ComplexField`
-/// so that the faer GEMM backend can be used.
-#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
-pub trait Scalar:
+/// Shared trait bounds for all element types, independent of GEMM backend.
+pub trait ScalarBase:
     Copy
     + ElementOpApply
     + Send
@@ -91,12 +87,10 @@ pub trait Scalar:
     + num_traits::Zero
     + num_traits::One
     + PartialEq
-    + faer_traits::ComplexField
 {
 }
 
-#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
-impl<T> Scalar for T where
+impl<T> ScalarBase for T where
     T: Copy
         + ElementOpApply
         + Send
@@ -106,9 +100,18 @@ impl<T> Scalar for T where
         + num_traits::Zero
         + num_traits::One
         + PartialEq
-        + faer_traits::ComplexField
 {
 }
+
+/// Trait alias for element types supported by einsum operations.
+///
+/// When the `faer` feature is enabled, this additionally requires `faer::ComplexField`
+/// so that the faer GEMM backend can be used.
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+pub trait Scalar: ScalarBase + faer_traits::ComplexField {}
+
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+impl<T> Scalar for T where T: ScalarBase + faer_traits::ComplexField {}
 
 /// Trait alias for element types (with `blas` or `blas-inject` feature).
 ///
@@ -120,19 +123,7 @@ impl<T> Scalar for T where
         all(feature = "blas-inject", not(feature = "blas"))
     )
 ))]
-pub trait Scalar:
-    Copy
-    + ElementOpApply
-    + Send
-    + Sync
-    + std::ops::Mul<Output = Self>
-    + std::ops::Add<Output = Self>
-    + num_traits::Zero
-    + num_traits::One
-    + PartialEq
-    + bgemm_blas::BlasGemm
-{
-}
+pub trait Scalar: ScalarBase + bgemm_blas::BlasGemm {}
 
 #[cfg(all(
     not(feature = "faer"),
@@ -141,48 +132,14 @@ pub trait Scalar:
         all(feature = "blas-inject", not(feature = "blas"))
     )
 ))]
-impl<T> Scalar for T where
-    T: Copy
-        + ElementOpApply
-        + Send
-        + Sync
-        + std::ops::Mul<Output = T>
-        + std::ops::Add<Output = T>
-        + num_traits::Zero
-        + num_traits::One
-        + PartialEq
-        + bgemm_blas::BlasGemm
-{
-}
+impl<T> Scalar for T where T: ScalarBase + bgemm_blas::BlasGemm {}
 
 /// Trait alias for element types (without `faer` or BLAS features).
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
-pub trait Scalar:
-    Copy
-    + ElementOpApply
-    + Send
-    + Sync
-    + std::ops::Mul<Output = Self>
-    + std::ops::Add<Output = Self>
-    + num_traits::Zero
-    + num_traits::One
-    + PartialEq
-{
-}
+pub trait Scalar: ScalarBase {}
 
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
-impl<T> Scalar for T where
-    T: Copy
-        + ElementOpApply
-        + Send
-        + Sync
-        + std::ops::Mul<Output = T>
-        + std::ops::Add<Output = T>
-        + num_traits::Zero
-        + num_traits::One
-        + PartialEq
-{
-}
+impl<T> Scalar for T where T: ScalarBase {}
 
 /// Placeholder trait definition for invalid mutually-exclusive feature combinations.
 ///
@@ -192,35 +149,13 @@ impl<T> Scalar for T where
     all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
     all(feature = "blas", feature = "blas-inject")
 ))]
-pub trait Scalar:
-    Copy
-    + ElementOpApply
-    + Send
-    + Sync
-    + std::ops::Mul<Output = Self>
-    + std::ops::Add<Output = Self>
-    + num_traits::Zero
-    + num_traits::One
-    + PartialEq
-{
-}
+pub trait Scalar: ScalarBase {}
 
 #[cfg(any(
     all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
     all(feature = "blas", feature = "blas-inject")
 ))]
-impl<T> Scalar for T where
-    T: Copy
-        + ElementOpApply
-        + Send
-        + Sync
-        + std::ops::Mul<Output = T>
-        + std::ops::Add<Output = T>
-        + num_traits::Zero
-        + num_traits::One
-        + PartialEq
-{
-}
+impl<T> Scalar for T where T: ScalarBase {}
 
 /// Errors specific to einsum operations.
 #[derive(Debug, thiserror::Error)]
