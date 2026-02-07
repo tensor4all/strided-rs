@@ -7,5 +7,5 @@ pub mod typed_tensor;
 
 pub use error::{EinsumError, Result};
 pub use operand::{EinsumOperand, StridedData};
-pub use parse::parse_einsum;
+pub use parse::{parse_einsum, EinsumCode, EinsumNode};
 pub use typed_tensor::TypedTensor;
