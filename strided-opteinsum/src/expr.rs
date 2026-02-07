@@ -246,6 +246,42 @@ fn eval_single(
 }
 
 // ---------------------------------------------------------------------------
+// Execute omeco NestedEinsum tree
+// ---------------------------------------------------------------------------
+
+/// Execute an omeco-optimized contraction tree by contracting pairs according
+/// to the tree structure.
+///
+/// `children` is a Vec of Option-wrapped (operand, ids) pairs. The omeco
+/// `NestedEinsum::Leaf` variant references children by index; we `.take()`
+/// each entry to move ownership out exactly once.
+fn execute_nested(
+    nested: &omeco::NestedEinsum<char>,
+    children: &mut Vec<Option<(EinsumOperand<'static>, Vec<char>)>>,
+) -> crate::Result<(EinsumOperand<'static>, Vec<char>)> {
+    match nested {
+        omeco::NestedEinsum::Leaf { tensor_index } => {
+            let (op, ids) = children[*tensor_index]
+                .take()
+                .expect("child operand already consumed");
+            Ok((op, ids))
+        }
+        omeco::NestedEinsum::Node { args, eins } => {
+            assert_eq!(
+                args.len(),
+                2,
+                "omeco should produce a binary contraction tree"
+            );
+            let (left, left_ids) = execute_nested(&args[0], children)?;
+            let (right, right_ids) = execute_nested(&args[1], children)?;
+            let output_ids: Vec<char> = eins.iy.clone();
+            let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids)?;
+            Ok((result, output_ids))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Recursive evaluation
 // ---------------------------------------------------------------------------
 
@@ -294,50 +330,42 @@ fn eval_node(
                     Ok((result, node_output_ids))
                 }
                 _ => {
-                    // 3+ children: left-to-right fallback.
-                    // Contract args[0] with args[1], then result with args[2], etc.
-                    let child_needed_0 = compute_child_needed_ids(&node_output_ids, 0, args);
-                    let (mut current, mut current_ids) =
-                        eval_node(&args[0], operands, &child_needed_0)?;
+                    // 3+ children: use omeco greedy optimizer to find
+                    // an efficient pairwise contraction order.
 
-                    for (i, arg) in args[1..].iter().enumerate() {
-                        let child_idx = i + 1;
-                        let child_needed =
-                            compute_child_needed_ids(&node_output_ids, child_idx, args);
-                        let (next, next_ids) = eval_node(arg, operands, &child_needed)?;
-
-                        // Compute intermediate output ids:
-                        // Keep ids that are in the final node_output_ids OR
-                        // appear in any remaining sibling subtree.
-                        let remaining_ids: HashSet<char> = args[child_idx + 1..]
-                            .iter()
-                            .flat_map(|a| collect_all_ids(a))
-                            .collect();
-
-                        let intermediate_output: Vec<char> = {
-                            let mut all = Vec::new();
-                            let mut seen = HashSet::new();
-                            for &id in current_ids.iter().chain(next_ids.iter()) {
-                                if seen.insert(id) {
-                                    all.push(id);
-                                }
-                            }
-                            all.into_iter()
-                                .filter(|id| needed_ids.contains(id) || remaining_ids.contains(id))
-                                .collect()
-                        };
-
-                        current = eval_pair(
-                            current,
-                            &current_ids,
-                            next,
-                            &next_ids,
-                            &intermediate_output,
-                        )?;
-                        current_ids = intermediate_output;
+                    // 1. Evaluate all children to get their operands and ids
+                    let mut children: Vec<Option<(EinsumOperand<'static>, Vec<char>)>> = Vec::new();
+                    for (i, arg) in args.iter().enumerate() {
+                        let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
+                        let (op, ids) = eval_node(arg, operands, &child_needed)?;
+                        children.push(Some((op, ids)));
                     }
 
-                    Ok((current, current_ids))
+                    // 2. Build dimension sizes map from evaluated operands
+                    let mut dim_sizes: HashMap<char, usize> = HashMap::new();
+                    for child_opt in &children {
+                        if let Some((op, ids)) = child_opt {
+                            for (j, &id) in ids.iter().enumerate() {
+                                dim_sizes.insert(id, op.dims()[j]);
+                            }
+                        }
+                    }
+
+                    // 3. Build omeco EinCode from child ids and node output ids
+                    let input_ids: Vec<Vec<char>> = children
+                        .iter()
+                        .map(|c| c.as_ref().unwrap().1.clone())
+                        .collect();
+                    let code = omeco::EinCode::new(input_ids, node_output_ids.clone());
+
+                    // 4. Optimize using omeco greedy method
+                    let optimizer = omeco::GreedyMethod::default();
+                    let nested = omeco::CodeOptimizer::optimize(&optimizer, &code, &dim_sizes)
+                        .expect("omeco optimizer should succeed for 3+ tensors");
+
+                    // 5. Execute the nested contraction tree
+                    let (result, result_ids) = execute_nested(&nested, &mut children)?;
+                    Ok((result, result_ids))
                 }
             }
         }
@@ -498,6 +526,49 @@ mod tests {
         match result {
             EinsumOperand::F64(data) => {
                 assert_abs_diff_eq!(data.as_array().data()[0], 6.0);
+            }
+            _ => panic!("expected F64"),
+        }
+    }
+
+    #[test]
+    fn test_three_tensor_flat_omeco() {
+        // ij,jk,kl->il -- flat 3-tensor, should use omeco
+        let code = parse_einsum("ij,jk,kl->il").unwrap();
+        let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = make_f64(&[3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+        // c = identity; AB = [[4,2],[10,5]], AB*I = [[4,2],[10,5]]
+        let c = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+        let result = code.evaluate(vec![a, b, c]).unwrap();
+        match result {
+            EinsumOperand::F64(data) => {
+                let arr = data.as_array();
+                assert_eq!(arr.dims(), &[2, 2]);
+                assert_abs_diff_eq!(arr.get(&[0, 0]), 4.0, epsilon = 1e-10);
+                assert_abs_diff_eq!(arr.get(&[0, 1]), 2.0, epsilon = 1e-10);
+                assert_abs_diff_eq!(arr.get(&[1, 0]), 10.0, epsilon = 1e-10);
+                assert_abs_diff_eq!(arr.get(&[1, 1]), 5.0, epsilon = 1e-10);
+            }
+            _ => panic!("expected F64"),
+        }
+    }
+
+    #[test]
+    fn test_four_tensor_flat_omeco() {
+        // ij,jk,kl,lm->im -- 4-tensor chain
+        let code = parse_einsum("ij,jk,kl,lm->im").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
+        let b = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let c = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
+        let d = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        // I*B = B, B*I = B, B*D = [[19,22],[43,50]]
+        let result = code.evaluate(vec![a, b, c, d]).unwrap();
+        match result {
+            EinsumOperand::F64(data) => {
+                let arr = data.as_array();
+                assert_eq!(arr.dims(), &[2, 2]);
+                assert_abs_diff_eq!(arr.get(&[0, 0]), 19.0, epsilon = 1e-10);
+                assert_abs_diff_eq!(arr.get(&[1, 1]), 50.0, epsilon = 1e-10);
             }
             _ => panic!("expected F64"),
         }
