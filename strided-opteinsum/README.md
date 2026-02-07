@@ -48,48 +48,48 @@ Environment: Apple Silicon M2, single-threaded. Mean time (ms).
 | matmul (2) (2000,50)×(50,2000) ComplexF64 | 44.214 | 46.754 |
 | matmul (3) (50,2000)×(2000,50) Float64 | 0.262 | 0.351 |
 | matmul (3) (50,2000)×(2000,50) ComplexF64 | 1.098 | 1.476 |
-| batchmul (1) square b=3 1000³ Float64 | 120.510 | 130.148 |
-| batchmul (1) square b=3 1000³ ComplexF64 | 606.124 | 683.173 |
-| batchmul (2) b=3 (2000,50)×(50,2000) Float64 | 28.576 | 36.425 |
-| batchmul (2) b=3 (2000,50)×(50,2000) ComplexF64 | 130.857 | 158.332 |
-| batchmul (3) b=3 (50,2000)×(2000,50) Float64 | 0.778 | 1.060 |
-| batchmul (3) b=3 (50,2000)×(2000,50) ComplexF64 | 3.344 | 4.223 |
-| dot (1) square 100³ Float64 | 5.459 | 0.581 |
-| dot (1) square 100³ ComplexF64 | 4.872 | 1.629 |
-| dot (2) (2000,50,2000) Float64 | 1096.416 | 217.776 |
-| dot (2) (2000,50,2000) ComplexF64 | 978.969 | 443.016 |
-| dot (3) (50,2000,50) Float64 | 27.319 | 5.133 |
-| dot (3) (50,2000,50) ComplexF64 | 24.567 | 9.589 |
-| trace 1000×1000 Float64 | 0.003 | 0.356 |
-| trace 1000×1000 ComplexF64 | 0.004 | 0.772 |
-| ptrace (100,100,100)→(100) Float64 | 0.020 | 0.327 |
-| ptrace (100,100,100)→(100) ComplexF64 | 0.029 | 0.700 |
-| diag (100,100,100)→(100,100) Float64 | 0.016 | 0.495 |
-| diag (100,100,100)→(100,100) ComplexF64 | 0.023 | 0.684 |
-| perm (30,30,30,30) Float64 | 0.567 | 0.955 |
-| perm (30,30,30,30) ComplexF64 | 0.835 | 2.540 |
-| tcontract (1) square 30³ Float64 | 0.073 | 0.080 |
-| tcontract (1) square 30³ ComplexF64 | 0.225 | 0.281 |
-| tcontract (2) (2000,50,50)×(50,2000,50) Float64 | 405.114 | 429.890 |
-| tcontract (2) (2000,50,50)×(50,2000,50) ComplexF64 | 1985.169 | 2264.214 |
-| tcontract (3) (50,2000,2000)×(2000,50,2000) Float64 | 719.871 | 889.128 |
-| tcontract (3) (50,2000,2000)×(2000,50,2000) ComplexF64 | 4017.383 | 3591.857 |
-| star (50,50) Float64 | 2.540 | 0.544 |
-| star (50,50) ComplexF64 | 6.403 | 1.741 |
-| starandcontract (50,50) Float64 | 0.111 | 0.032 |
-| starandcontract (50,50) ComplexF64 | 0.126 | 0.034 |
-| indexsum (100,100,100)→(100,100) Float64 | 0.163 | 0.747 |
-| indexsum (100,100,100)→(100,100) ComplexF64 | 1.270 | 1.078 |
-| hadamard (100,100,100) Float64 | 0.196 | 45.906 |
-| hadamard (100,100,100) ComplexF64 | 0.755 | 65.349 |
-| outer (1) square 40⁴ Float64 | 1.455 | 0.599 |
-| outer (1) square 40⁴ ComplexF64 | 2.269 | 1.476 |
-| outer (2) (80,20)×(20,80) Float64 | 1.309 | 0.654 |
-| outer (2) (80,20)×(20,80) ComplexF64 | 2.272 | 1.467 |
-| outer (3) (20,80)×(80,20) Float64 | 1.217 | 0.654 |
-| outer (3) (20,80)×(80,20) ComplexF64 | 2.281 | 1.488 |
-| manyinds (12+12→13 indices, dim 2) Float64 | 0.067 | 0.089 |
-| manyinds (12+12→13 indices, dim 2) ComplexF64 | 0.130 | 0.138 |
+| batchmul (1) square b=3 1000³ Float64 | 120.510 | 165.476 |
+| batchmul (1) square b=3 1000³ ComplexF64 | 606.124 | 713.732 |
+| batchmul (2) b=3 (2000,50)×(50,2000) Float64 | 28.576 | 35.187 |
+| batchmul (2) b=3 (2000,50)×(50,2000) ComplexF64 | 130.857 | 153.312 |
+| batchmul (3) b=3 (50,2000)×(2000,50) Float64 | 0.778 | 0.886 |
+| batchmul (3) b=3 (50,2000)×(2000,50) ComplexF64 | 3.344 | 4.167 |
+| dot (1) square 100³ Float64 | 5.459 | 0.226 |
+| dot (1) square 100³ ComplexF64 | 4.872 | 0.775 |
+| dot (2) (2000,50,2000) Float64 | 1096.416 | 58.041 |
+| dot (2) (2000,50,2000) ComplexF64 | 978.969 | 150.506 |
+| dot (3) (50,2000,50) Float64 | 27.319 | 2.153 |
+| dot (3) (50,2000,50) ComplexF64 | 24.567 | 3.464 |
+| trace 1000×1000 Float64 | 0.003 | 0.001 |
+| trace 1000×1000 ComplexF64 | 0.004 | 0.001 |
+| ptrace (100,100,100)→(100) Float64 | 0.020 | 0.009 |
+| ptrace (100,100,100)→(100) ComplexF64 | 0.029 | 0.012 |
+| diag (100,100,100)→(100,100) Float64 | 0.016 | 0.006 |
+| diag (100,100,100)→(100,100) ComplexF64 | 0.023 | 0.010 |
+| perm (30,30,30,30) Float64 | 0.567 | 1.556 |
+| perm (30,30,30,30) ComplexF64 | 0.835 | 1.973 |
+| tcontract (1) square 30³ Float64 | 0.073 | 0.287 |
+| tcontract (1) square 30³ ComplexF64 | 0.225 | 0.703 |
+| tcontract (2) (2000,50,50)×(50,2000,50) Float64 | 405.114 | 484.457 |
+| tcontract (2) (2000,50,50)×(50,2000,50) ComplexF64 | 1985.169 | 2462.706 |
+| tcontract (3) (50,2000,2000)×(2000,50,2000) Float64 | 719.871 | 779.809 |
+| tcontract (3) (50,2000,2000)×(2000,50,2000) ComplexF64 | 4017.383 | 3548.229 |
+| star (50,50) Float64 | 2.540 | 2.117 |
+| star (50,50) ComplexF64 | 6.403 | 4.481 |
+| starandcontract (50,50) Float64 | 0.111 | 0.071 |
+| starandcontract (50,50) ComplexF64 | 0.126 | 0.095 |
+| indexsum (100,100,100)→(100,100) Float64 | 0.163 | 1.787 |
+| indexsum (100,100,100)→(100,100) ComplexF64 | 1.270 | 1.119 |
+| hadamard (100,100,100) Float64 | 0.196 | 0.439 |
+| hadamard (100,100,100) ComplexF64 | 0.755 | 1.397 |
+| outer (1) square 40⁴ Float64 | 1.455 | 1.592 |
+| outer (1) square 40⁴ ComplexF64 | 2.269 | 2.808 |
+| outer (2) (80,20)×(20,80) Float64 | 1.309 | 1.026 |
+| outer (2) (80,20)×(20,80) ComplexF64 | 2.272 | 2.545 |
+| outer (3) (20,80)×(80,20) Float64 | 1.217 | 0.939 |
+| outer (3) (20,80)×(80,20) ComplexF64 | 2.281 | 2.377 |
+| manyinds (12+12→13 indices, dim 2) Float64 | 0.067 | 0.374 |
+| manyinds (12+12→13 indices, dim 2) ComplexF64 | 0.130 | 0.404 |
 
 ## Notes
 
