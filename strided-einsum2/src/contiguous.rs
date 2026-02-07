@@ -127,17 +127,32 @@ impl<T: Scalar> ContiguousOperandMut<T> {
     }
 }
 
-#[cfg(feature = "faer")]
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 use crate::bgemm_faer::alloc_batched_col_major;
 
-#[cfg(any(feature = "blas", feature = "blas-inject"))]
+#[cfg(all(
+    not(feature = "faer"),
+    any(
+        all(feature = "blas", not(feature = "blas-inject")),
+        all(feature = "blas-inject", not(feature = "blas"))
+    )
+))]
 use crate::bgemm_blas::alloc_batched_col_major;
 
 /// Prepare a borrowed input view for GEMM.
 ///
 /// Checks if the two inner dimension groups are fusable.
 /// If not, copies to a contiguous col-major buffer.
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+#[cfg(any(
+    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
+    all(
+        not(feature = "faer"),
+        any(
+            all(feature = "blas", not(feature = "blas-inject")),
+            all(feature = "blas-inject", not(feature = "blas"))
+        )
+    )
+))]
 pub fn prepare_input_view<T: Scalar>(
     view: &StridedView<T>,
     n_batch: usize,
@@ -232,7 +247,16 @@ pub fn prepare_input_view<T: Scalar>(
 ///
 /// If already contiguous after dimension grouping, transfers ownership without copying.
 /// Otherwise, copies to a new col-major buffer.
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+#[cfg(any(
+    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
+    all(
+        not(feature = "faer"),
+        any(
+            all(feature = "blas", not(feature = "blas-inject")),
+            all(feature = "blas-inject", not(feature = "blas"))
+        )
+    )
+))]
 pub fn prepare_input_owned<T: Scalar>(
     arr: StridedArray<T>,
     n_batch: usize,
@@ -333,7 +357,16 @@ pub fn prepare_input_owned<T: Scalar>(
 /// When inner dims are fusable (no copy needed), the returned `ContiguousOperandMut`
 /// holds a raw pointer into `view`'s data. The caller must ensure `view` outlives
 /// the returned operand and that no aliasing mutable references exist during GEMM.
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+#[cfg(any(
+    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
+    all(
+        not(feature = "faer"),
+        any(
+            all(feature = "blas", not(feature = "blas-inject")),
+            all(feature = "blas-inject", not(feature = "blas"))
+        )
+    )
+))]
 pub fn prepare_output_view<T: Scalar>(
     view: &mut StridedViewMut<T>,
     n_batch: usize,
@@ -409,7 +442,16 @@ pub fn prepare_output_view<T: Scalar>(
 ///
 /// Currently unused in production (C is always a `StridedViewMut` from the caller).
 /// Kept for future use when `einsum2_into` accepts owned output arrays.
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+#[cfg(any(
+    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
+    all(
+        not(feature = "faer"),
+        any(
+            all(feature = "blas", not(feature = "blas-inject")),
+            all(feature = "blas-inject", not(feature = "blas"))
+        )
+    )
+))]
 #[allow(dead_code)]
 pub fn prepare_output_owned<T: Scalar>(
     arr: &mut StridedArray<T>,
@@ -475,7 +517,16 @@ pub fn prepare_output_owned<T: Scalar>(
 }
 
 #[cfg(test)]
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+#[cfg(any(
+    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
+    all(
+        not(feature = "faer"),
+        any(
+            all(feature = "blas", not(feature = "blas-inject")),
+            all(feature = "blas-inject", not(feature = "blas"))
+        )
+    )
+))]
 mod tests {
     use super::*;
 

@@ -30,12 +30,18 @@ compile_error!("Features `faer` and `blas-inject` are mutually exclusive.");
 #[cfg(all(feature = "blas", feature = "blas-inject"))]
 compile_error!("Features `blas` and `blas-inject` are mutually exclusive.");
 
-#[cfg(feature = "blas-inject")]
+#[cfg(all(feature = "blas-inject", not(feature = "blas")))]
 extern crate cblas_inject as cblas_sys;
-#[cfg(feature = "blas")]
+#[cfg(all(feature = "blas", not(feature = "blas-inject")))]
 extern crate cblas_sys;
 
-#[cfg(any(feature = "blas", feature = "blas-inject"))]
+#[cfg(all(
+    not(feature = "faer"),
+    any(
+        all(feature = "blas", not(feature = "blas-inject")),
+        all(feature = "blas-inject", not(feature = "blas"))
+    )
+))]
 pub mod bgemm_blas;
 
 #[cfg(feature = "faer")]
@@ -71,7 +77,7 @@ impl<T: Clone + Eq + Hash + Debug> AxisId for T {}
 ///
 /// When the `faer` feature is enabled, this additionally requires `faer::ComplexField`
 /// so that the faer GEMM backend can be used.
-#[cfg(feature = "faer")]
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 pub trait Scalar:
     Copy
     + ElementOpApply
@@ -86,7 +92,7 @@ pub trait Scalar:
 {
 }
 
-#[cfg(feature = "faer")]
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 impl<T> Scalar for T where
     T: Copy
         + ElementOpApply
@@ -104,7 +110,13 @@ impl<T> Scalar for T where
 /// Trait alias for element types (with `blas` or `blas-inject` feature).
 ///
 /// Includes `BlasGemm` so that all `Scalar` types can be dispatched to CBLAS.
-#[cfg(any(feature = "blas", feature = "blas-inject"))]
+#[cfg(all(
+    not(feature = "faer"),
+    any(
+        all(feature = "blas", not(feature = "blas-inject")),
+        all(feature = "blas-inject", not(feature = "blas"))
+    )
+))]
 pub trait Scalar:
     Copy
     + ElementOpApply
@@ -119,7 +131,13 @@ pub trait Scalar:
 {
 }
 
-#[cfg(any(feature = "blas", feature = "blas-inject"))]
+#[cfg(all(
+    not(feature = "faer"),
+    any(
+        all(feature = "blas", not(feature = "blas-inject")),
+        all(feature = "blas-inject", not(feature = "blas"))
+    )
+))]
 impl<T> Scalar for T where
     T: Copy
         + ElementOpApply
@@ -150,6 +168,44 @@ pub trait Scalar:
 }
 
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
+impl<T> Scalar for T where
+    T: Copy
+        + ElementOpApply
+        + Send
+        + Sync
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>
+        + num_traits::Zero
+        + num_traits::One
+        + PartialEq
+{
+}
+
+/// Placeholder trait definition for invalid mutually-exclusive feature combinations.
+///
+/// The crate emits `compile_error!` above for these combinations. This trait only
+/// avoids cascading type-resolution errors so users see the intended diagnostics.
+#[cfg(any(
+    all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
+    all(feature = "blas", feature = "blas-inject")
+))]
+pub trait Scalar:
+    Copy
+    + ElementOpApply
+    + Send
+    + Sync
+    + std::ops::Mul<Output = Self>
+    + std::ops::Add<Output = Self>
+    + num_traits::Zero
+    + num_traits::One
+    + PartialEq
+{
+}
+
+#[cfg(any(
+    all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
+    all(feature = "blas", feature = "blas-inject")
+))]
 impl<T> Scalar for T where
     T: Copy
         + ElementOpApply
@@ -256,10 +312,16 @@ where
     };
 
     // 4. Dispatch to GEMM
-    #[cfg(feature = "faer")]
+    #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
     einsum2_gemm_dispatch(c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b)?;
 
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
+    #[cfg(all(
+        not(feature = "faer"),
+        any(
+            all(feature = "blas", not(feature = "blas-inject")),
+            all(feature = "blas-inject", not(feature = "blas"))
+        )
+    ))]
     einsum2_gemm_dispatch(c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b)?;
 
     #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
@@ -304,7 +366,7 @@ where
 /// 3. Contiguous preparation via `prepare_input_view`
 /// 4. GEMM via `bgemm_contiguous_into`
 /// 5. Finalize (copy-back if needed)
-#[cfg(feature = "faer")]
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 fn einsum2_gemm_dispatch<T: Scalar>(
     c: StridedViewMut<T>,
     a: &StridedView<T>,
@@ -363,7 +425,13 @@ fn einsum2_gemm_dispatch<T: Scalar>(
 ///
 /// Same logic as the faer variant but calls `bgemm_blas::bgemm_contiguous_into`
 /// and requires `T: BlasGemm`.
-#[cfg(any(feature = "blas", feature = "blas-inject"))]
+#[cfg(all(
+    not(feature = "faer"),
+    any(
+        all(feature = "blas", not(feature = "blas-inject")),
+        all(feature = "blas-inject", not(feature = "blas"))
+    )
+))]
 fn einsum2_gemm_dispatch<T: Scalar>(
     c: StridedViewMut<T>,
     a: &StridedView<T>,
@@ -426,7 +494,7 @@ fn einsum2_gemm_dispatch<T: Scalar>(
 /// the behavior is identical.
 ///
 /// `conj_a` and `conj_b` indicate whether to conjugate elements of A/B.
-#[cfg(feature = "faer")]
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
     c: StridedViewMut<T>,
     a: StridedArray<T>,
@@ -521,7 +589,13 @@ pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
 ///
 /// Same semantics as the faer variant of [`einsum2_into_owned`] but dispatches
 /// to `bgemm_blas::bgemm_contiguous_into` and requires `T: BlasGemm`.
-#[cfg(any(feature = "blas", feature = "blas-inject"))]
+#[cfg(all(
+    not(feature = "faer"),
+    any(
+        all(feature = "blas", not(feature = "blas-inject")),
+        all(feature = "blas-inject", not(feature = "blas"))
+    )
+))]
 pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
     c: StridedViewMut<T>,
     a: StridedArray<T>,

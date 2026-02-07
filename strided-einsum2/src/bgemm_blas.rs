@@ -9,6 +9,186 @@ use crate::util::MultiIndex;
 use crate::Scalar;
 use strided_view::StridedArray;
 
+#[cfg(all(feature = "blas-inject", not(feature = "blas")))]
+mod inject_fallback {
+    use std::ffi::c_char;
+    use std::sync::Once;
+
+    use num_complex::Complex64;
+
+    static REGISTER_ONCE: Once = Once::new();
+
+    #[inline]
+    fn trans_flag(t: c_char) -> u8 {
+        (t as u8).to_ascii_uppercase()
+    }
+
+    #[inline]
+    unsafe fn gemm_real(
+        transa: u8,
+        transb: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a: *const f64,
+        lda: usize,
+        b: *const f64,
+        ldb: usize,
+        beta: f64,
+        c: *mut f64,
+        ldc: usize,
+    ) {
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    let a_val = if transa == b'N' {
+                        *a.add(i + p * lda)
+                    } else {
+                        *a.add(p + i * lda)
+                    };
+                    let b_val = if transb == b'N' {
+                        *b.add(p + j * ldb)
+                    } else {
+                        *b.add(j + p * ldb)
+                    };
+                    sum += a_val * b_val;
+                }
+                let c_ptr = c.add(i + j * ldc);
+                *c_ptr = alpha * sum + beta * *c_ptr;
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn gemm_complex(
+        transa: u8,
+        transb: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Complex64,
+        a: *const Complex64,
+        lda: usize,
+        b: *const Complex64,
+        ldb: usize,
+        beta: Complex64,
+        c: *mut Complex64,
+        ldc: usize,
+    ) {
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum = Complex64::new(0.0, 0.0);
+                for p in 0..k {
+                    let mut a_val = if transa == b'N' {
+                        *a.add(i + p * lda)
+                    } else {
+                        *a.add(p + i * lda)
+                    };
+                    let mut b_val = if transb == b'N' {
+                        *b.add(p + j * ldb)
+                    } else {
+                        *b.add(j + p * ldb)
+                    };
+                    if transa == b'C' {
+                        a_val = a_val.conj();
+                    }
+                    if transb == b'C' {
+                        b_val = b_val.conj();
+                    }
+                    sum += a_val * b_val;
+                }
+                let c_ptr = c.add(i + j * ldc);
+                *c_ptr = alpha * sum + beta * *c_ptr;
+            }
+        }
+    }
+
+    unsafe extern "C" fn dgemm_fallback(
+        transa: *const c_char,
+        transb: *const c_char,
+        m: *const cblas_sys::blasint,
+        n: *const cblas_sys::blasint,
+        k: *const cblas_sys::blasint,
+        alpha: *const f64,
+        a: *const f64,
+        lda: *const cblas_sys::blasint,
+        b: *const f64,
+        ldb: *const cblas_sys::blasint,
+        beta: *const f64,
+        c: *mut f64,
+        ldc: *const cblas_sys::blasint,
+    ) {
+        let transa = trans_flag(*transa);
+        let transb = trans_flag(*transb);
+        unsafe {
+            gemm_real(
+                transa,
+                transb,
+                *m as usize,
+                *n as usize,
+                *k as usize,
+                *alpha,
+                a,
+                *lda as usize,
+                b,
+                *ldb as usize,
+                *beta,
+                c,
+                *ldc as usize,
+            );
+        }
+    }
+
+    unsafe extern "C" fn zgemm_fallback(
+        transa: *const c_char,
+        transb: *const c_char,
+        m: *const cblas_sys::blasint,
+        n: *const cblas_sys::blasint,
+        k: *const cblas_sys::blasint,
+        alpha: *const Complex64,
+        a: *const Complex64,
+        lda: *const cblas_sys::blasint,
+        b: *const Complex64,
+        ldb: *const cblas_sys::blasint,
+        beta: *const Complex64,
+        c: *mut Complex64,
+        ldc: *const cblas_sys::blasint,
+    ) {
+        let transa = trans_flag(*transa);
+        let transb = trans_flag(*transb);
+        unsafe {
+            gemm_complex(
+                transa,
+                transb,
+                *m as usize,
+                *n as usize,
+                *k as usize,
+                *alpha,
+                a,
+                *lda as usize,
+                b,
+                *ldb as usize,
+                *beta,
+                c,
+                *ldc as usize,
+            );
+        }
+    }
+
+    pub(super) fn ensure_registered() {
+        REGISTER_ONCE.call_once(|| unsafe {
+            if !cblas_sys::is_dgemm_registered() {
+                cblas_sys::register_dgemm(dgemm_fallback);
+            }
+            if !cblas_sys::is_zgemm_registered() {
+                cblas_sys::register_zgemm(zgemm_fallback);
+            }
+        });
+    }
+}
+
 /// Allocate a StridedArray with column-major inner dims and row-major batch dims.
 ///
 /// For dims `[batch..., inner...]`, the inner dimensions are stored column-major
@@ -217,6 +397,9 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     alpha: T,
     beta: T,
 ) -> strided_view::Result<()> {
+    #[cfg(all(feature = "blas-inject", not(feature = "blas")))]
+    inject_fallback::ensure_registered();
+
     // Conjugation must be resolved before reaching this function
     // (handled during contiguous preparation).
     debug_assert!(!a.conj());
