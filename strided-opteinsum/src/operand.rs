@@ -335,4 +335,434 @@ mod tests {
             _ => panic!("expected C64 Owned"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // to_c64_owned_ref tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_c64_owned_ref_from_f64_owned() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = 1.0;
+        arr.data_mut()[1] = 2.0;
+        arr.data_mut()[2] = 3.0;
+        arr.data_mut()[3] = 4.0;
+        let op = EinsumOperand::from(arr);
+        let promoted = op.to_c64_owned_ref();
+        assert!(promoted.is_c64());
+        match &promoted {
+            EinsumOperand::C64(StridedData::Owned(arr)) => {
+                assert_eq!(arr.dims(), &[2, 2]);
+                assert_eq!(arr.data()[0], Complex64::new(1.0, 0.0));
+                assert_eq!(arr.data()[1], Complex64::new(2.0, 0.0));
+                assert_eq!(arr.data()[2], Complex64::new(3.0, 0.0));
+                assert_eq!(arr.data()[3], Complex64::new(4.0, 0.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
+
+    #[test]
+    fn test_to_c64_owned_ref_from_f64_view() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = 5.0;
+        arr.data_mut()[1] = 6.0;
+        arr.data_mut()[2] = 7.0;
+        arr.data_mut()[3] = 8.0;
+        let view = arr.view();
+        let op = EinsumOperand::from_view_f64(&view);
+        let promoted = op.to_c64_owned_ref();
+        assert!(promoted.is_c64());
+        match &promoted {
+            EinsumOperand::C64(StridedData::Owned(c_arr)) => {
+                assert_eq!(c_arr.dims(), &[2, 2]);
+                assert_eq!(c_arr.data()[0], Complex64::new(5.0, 0.0));
+                assert_eq!(c_arr.data()[1], Complex64::new(6.0, 0.0));
+                assert_eq!(c_arr.data()[2], Complex64::new(7.0, 0.0));
+                assert_eq!(c_arr.data()[3], Complex64::new(8.0, 0.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
+
+    #[test]
+    fn test_to_c64_owned_ref_from_c64_owned() {
+        let mut arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = Complex64::new(1.0, 2.0);
+        arr.data_mut()[1] = Complex64::new(3.0, 4.0);
+        arr.data_mut()[2] = Complex64::new(5.0, 6.0);
+        arr.data_mut()[3] = Complex64::new(7.0, 8.0);
+        let op = EinsumOperand::from(arr);
+        let copied = op.to_c64_owned_ref();
+        assert!(copied.is_c64());
+        match &copied {
+            EinsumOperand::C64(StridedData::Owned(c_arr)) => {
+                assert_eq!(c_arr.dims(), &[2, 2]);
+                assert_eq!(c_arr.data()[0], Complex64::new(1.0, 2.0));
+                assert_eq!(c_arr.data()[1], Complex64::new(3.0, 4.0));
+                assert_eq!(c_arr.data()[2], Complex64::new(5.0, 6.0));
+                assert_eq!(c_arr.data()[3], Complex64::new(7.0, 8.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
+
+    #[test]
+    fn test_to_c64_owned_ref_from_c64_view() {
+        let mut arr = StridedArray::<Complex64>::col_major(&[3]);
+        arr.data_mut()[0] = Complex64::new(1.0, -1.0);
+        arr.data_mut()[1] = Complex64::new(2.0, -2.0);
+        arr.data_mut()[2] = Complex64::new(3.0, -3.0);
+        let view = arr.view();
+        let op = EinsumOperand::from_view_c64(&view);
+        let copied = op.to_c64_owned_ref();
+        assert!(copied.is_c64());
+        match &copied {
+            EinsumOperand::C64(StridedData::Owned(c_arr)) => {
+                assert_eq!(c_arr.dims(), &[3]);
+                assert_eq!(c_arr.data()[0], Complex64::new(1.0, -1.0));
+                assert_eq!(c_arr.data()[1], Complex64::new(2.0, -2.0));
+                assert_eq!(c_arr.data()[2], Complex64::new(3.0, -3.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // StridedData::into_array tests (View variant)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strided_data_into_array_from_owned() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 3]);
+        for (i, v) in arr.data_mut().iter_mut().enumerate() {
+            *v = i as f64;
+        }
+        let data = StridedData::Owned(arr);
+        let result = data.into_array();
+        assert_eq!(result.dims(), &[2, 3]);
+        assert_eq!(result.data()[0], 0.0);
+        assert_eq!(result.data()[5], 5.0);
+    }
+
+    #[test]
+    fn test_strided_data_into_array_from_view() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 3]);
+        for (i, v) in arr.data_mut().iter_mut().enumerate() {
+            *v = (i as f64) * 10.0;
+        }
+        let view = arr.view();
+        let data = StridedData::<f64>::View(view);
+        let result = data.into_array();
+        assert_eq!(result.dims(), &[2, 3]);
+        // Values should be copied correctly
+        assert_eq!(result.get(&[0, 0]), 0.0);
+        assert_eq!(result.get(&[1, 0]), 10.0);
+    }
+
+    #[test]
+    fn test_strided_data_into_array_from_view_c64() {
+        let mut arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = Complex64::new(1.0, 2.0);
+        arr.data_mut()[1] = Complex64::new(3.0, 4.0);
+        arr.data_mut()[2] = Complex64::new(5.0, 6.0);
+        arr.data_mut()[3] = Complex64::new(7.0, 8.0);
+        let view = arr.view();
+        let data = StridedData::<Complex64>::View(view);
+        let result = data.into_array();
+        assert_eq!(result.dims(), &[2, 2]);
+        assert_eq!(result.get(&[0, 0]), Complex64::new(1.0, 2.0));
+        assert_eq!(result.get(&[1, 1]), Complex64::new(7.0, 8.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // StridedData::as_array tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strided_data_as_array_owned() {
+        let arr = StridedArray::<f64>::col_major(&[3, 2]);
+        let data = StridedData::Owned(arr);
+        let array_ref = data.as_array();
+        assert_eq!(array_ref.dims(), &[3, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "StridedData::as_array called on a View variant")]
+    fn test_strided_data_as_array_view_panics() {
+        let arr = StridedArray::<f64>::col_major(&[3, 2]);
+        let view = arr.view();
+        let data = StridedData::<f64>::View(view);
+        let _ = data.as_array(); // should panic
+    }
+
+    // -----------------------------------------------------------------------
+    // EinsumScalar::validate_operands tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_operands_f64_all_f64() {
+        let arr1 = StridedArray::<f64>::col_major(&[2, 2]);
+        let arr2 = StridedArray::<f64>::col_major(&[2, 2]);
+        let ops: Vec<Option<EinsumOperand>> = vec![
+            Some(EinsumOperand::from(arr1)),
+            Some(EinsumOperand::from(arr2)),
+        ];
+        assert!(f64::validate_operands(&ops).is_ok());
+    }
+
+    #[test]
+    fn test_validate_operands_f64_with_none() {
+        // None entries should be skipped without error
+        let arr = StridedArray::<f64>::col_major(&[2, 2]);
+        let ops: Vec<Option<EinsumOperand>> = vec![Some(EinsumOperand::from(arr)), None];
+        assert!(f64::validate_operands(&ops).is_ok());
+    }
+
+    #[test]
+    fn test_validate_operands_f64_with_c64_returns_error() {
+        let f64_arr = StridedArray::<f64>::col_major(&[2, 2]);
+        let c64_arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        let ops: Vec<Option<EinsumOperand>> = vec![
+            Some(EinsumOperand::from(f64_arr)),
+            Some(EinsumOperand::from(c64_arr)),
+        ];
+        let err = f64::validate_operands(&ops).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::EinsumError::TypeMismatch {
+                output_type: "f64",
+                computed_type: "Complex64",
+            }
+        ));
+    }
+
+    #[test]
+    fn test_validate_operands_c64_accepts_anything() {
+        let f64_arr = StridedArray::<f64>::col_major(&[2, 2]);
+        let c64_arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        let ops: Vec<Option<EinsumOperand>> = vec![
+            Some(EinsumOperand::from(f64_arr)),
+            Some(EinsumOperand::from(c64_arr)),
+        ];
+        assert!(Complex64::validate_operands(&ops).is_ok());
+    }
+
+    #[test]
+    fn test_validate_operands_c64_all_f64() {
+        let arr1 = StridedArray::<f64>::col_major(&[2, 2]);
+        let arr2 = StridedArray::<f64>::col_major(&[2, 2]);
+        let ops: Vec<Option<EinsumOperand>> = vec![
+            Some(EinsumOperand::from(arr1)),
+            Some(EinsumOperand::from(arr2)),
+        ];
+        assert!(Complex64::validate_operands(&ops).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // EinsumScalar::extract_data tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_data_f64_from_f64() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = 42.0;
+        let op = EinsumOperand::from(arr);
+        let data = f64::extract_data(op).unwrap();
+        assert_eq!(data.as_view().get(&[0, 0]), 42.0);
+    }
+
+    #[test]
+    fn test_extract_data_f64_from_c64_returns_error() {
+        let arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        let op = EinsumOperand::from(arr);
+        let err = f64::extract_data(op).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::EinsumError::TypeMismatch {
+                output_type: "f64",
+                computed_type: "Complex64",
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_data_c64_from_c64() {
+        let mut arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = Complex64::new(1.0, 2.0);
+        let op = EinsumOperand::from(arr);
+        let data = Complex64::extract_data(op).unwrap();
+        assert_eq!(data.as_view().get(&[0, 0]), Complex64::new(1.0, 2.0));
+    }
+
+    #[test]
+    fn test_extract_data_c64_from_f64_promotes() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = 5.0;
+        arr.data_mut()[1] = 6.0;
+        arr.data_mut()[2] = 7.0;
+        arr.data_mut()[3] = 8.0;
+        let op = EinsumOperand::from(arr);
+        let data = Complex64::extract_data(op).unwrap();
+        // Data should be promoted from f64 to Complex64
+        match &data {
+            StridedData::Owned(c_arr) => {
+                assert_eq!(c_arr.dims(), &[2, 2]);
+                assert_eq!(c_arr.data()[0], Complex64::new(5.0, 0.0));
+                assert_eq!(c_arr.data()[1], Complex64::new(6.0, 0.0));
+                assert_eq!(c_arr.data()[2], Complex64::new(7.0, 0.0));
+                assert_eq!(c_arr.data()[3], Complex64::new(8.0, 0.0));
+            }
+            StridedData::View(_) => panic!("expected Owned after promotion"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EinsumScalar::type_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_type_name() {
+        assert_eq!(f64::type_name(), "f64");
+        assert_eq!(Complex64::type_name(), "Complex64");
+    }
+
+    // -----------------------------------------------------------------------
+    // StridedData::dims and as_view tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strided_data_dims_and_as_view() {
+        let mut arr = StridedArray::<f64>::col_major(&[3, 4]);
+        for (i, v) in arr.data_mut().iter_mut().enumerate() {
+            *v = i as f64;
+        }
+        // Test Owned variant
+        let owned = StridedData::Owned(arr.clone());
+        assert_eq!(owned.dims(), &[3, 4]);
+        let owned_view = owned.as_view();
+        assert_eq!(owned_view.dims(), &[3, 4]);
+
+        // Test View variant
+        let view = arr.view();
+        let data_view = StridedData::<f64>::View(view);
+        assert_eq!(data_view.dims(), &[3, 4]);
+        let view_again = data_view.as_view();
+        assert_eq!(view_again.dims(), &[3, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // StridedData::permuted tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strided_data_permuted_owned() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 3]);
+        for (i, v) in arr.data_mut().iter_mut().enumerate() {
+            *v = i as f64;
+        }
+        let data = StridedData::Owned(arr);
+        let permuted = data.permuted(&[1, 0]).unwrap();
+        assert_eq!(permuted.dims(), &[3, 2]);
+    }
+
+    #[test]
+    fn test_strided_data_permuted_view() {
+        let mut arr = StridedArray::<f64>::col_major(&[2, 3]);
+        for (i, v) in arr.data_mut().iter_mut().enumerate() {
+            *v = i as f64;
+        }
+        let view = arr.view();
+        let data = StridedData::<f64>::View(view);
+        let permuted = data.permuted(&[1, 0]).unwrap();
+        assert_eq!(permuted.dims(), &[3, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // EinsumOperand::permuted tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_einsum_operand_permuted_f64() {
+        let arr = StridedArray::<f64>::col_major(&[2, 3]);
+        let op = EinsumOperand::from(arr);
+        let permuted = op.permuted(&[1, 0]).unwrap();
+        assert!(permuted.is_f64());
+        assert_eq!(permuted.dims(), &[3, 2]);
+    }
+
+    #[test]
+    fn test_einsum_operand_permuted_c64() {
+        let arr = StridedArray::<Complex64>::col_major(&[4, 5]);
+        let op = EinsumOperand::from(arr);
+        let permuted = op.permuted(&[1, 0]).unwrap();
+        assert!(permuted.is_c64());
+        assert_eq!(permuted.dims(), &[5, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // to_c64_owned edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_c64_owned_c64_view() {
+        // C64 View variant should be materialized into Owned
+        let mut arr = StridedArray::<Complex64>::col_major(&[2, 2]);
+        arr.data_mut()[0] = Complex64::new(1.0, -1.0);
+        arr.data_mut()[1] = Complex64::new(2.0, -2.0);
+        arr.data_mut()[2] = Complex64::new(3.0, -3.0);
+        arr.data_mut()[3] = Complex64::new(4.0, -4.0);
+        let view = arr.view();
+        let op = EinsumOperand::from_view_c64(&view);
+        let owned = op.to_c64_owned();
+        assert!(owned.is_c64());
+        match &owned {
+            EinsumOperand::C64(StridedData::Owned(c_arr)) => {
+                assert_eq!(c_arr.dims(), &[2, 2]);
+                assert_eq!(c_arr.data()[0], Complex64::new(1.0, -1.0));
+                assert_eq!(c_arr.data()[3], Complex64::new(4.0, -4.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
+
+    #[test]
+    fn test_to_c64_owned_c64_already_owned() {
+        // C64 Owned should pass through without reallocation
+        let mut arr = StridedArray::<Complex64>::col_major(&[2]);
+        arr.data_mut()[0] = Complex64::new(10.0, 20.0);
+        arr.data_mut()[1] = Complex64::new(30.0, 40.0);
+        let op = EinsumOperand::from(arr);
+        let owned = op.to_c64_owned();
+        assert!(owned.is_c64());
+        match &owned {
+            EinsumOperand::C64(StridedData::Owned(c_arr)) => {
+                assert_eq!(c_arr.data()[0], Complex64::new(10.0, 20.0));
+                assert_eq!(c_arr.data()[1], Complex64::new(30.0, 40.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
+
+    #[test]
+    fn test_to_c64_owned_f64_view() {
+        // F64 View should be materialized and promoted
+        let mut arr = StridedArray::<f64>::col_major(&[3]);
+        arr.data_mut()[0] = 10.0;
+        arr.data_mut()[1] = 20.0;
+        arr.data_mut()[2] = 30.0;
+        let view = arr.view();
+        let op = EinsumOperand::from_view_f64(&view);
+        let promoted = op.to_c64_owned();
+        assert!(promoted.is_c64());
+        match &promoted {
+            EinsumOperand::C64(StridedData::Owned(c_arr)) => {
+                assert_eq!(c_arr.dims(), &[3]);
+                assert_eq!(c_arr.data()[0], Complex64::new(10.0, 0.0));
+                assert_eq!(c_arr.data()[1], Complex64::new(20.0, 0.0));
+                assert_eq!(c_arr.data()[2], Complex64::new(30.0, 0.0));
+            }
+            _ => panic!("expected C64 Owned"),
+        }
+    }
 }
