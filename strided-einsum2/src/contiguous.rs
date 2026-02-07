@@ -4,6 +4,7 @@
 //! checking fusability, copying to col-major buffers when needed, and managing
 //! the writeback for borrowed output operands.
 
+use crate::backend::{ActiveBackend, BackendConfig};
 use crate::util::try_fuse_group;
 use crate::Scalar;
 use strided_view::{StridedArray, StridedView, StridedViewMut};
@@ -127,32 +128,49 @@ impl<T: Scalar> ContiguousOperandMut<T> {
     }
 }
 
-#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
-use crate::bgemm_faer::alloc_batched_col_major;
+/// Allocate a StridedArray with column-major inner dims and row-major batch dims.
+///
+/// For dims `[batch..., inner...]`, the inner dimensions are stored column-major
+/// (first inner dim has stride 1), while batch dimensions are stored row-major
+/// (outermost batch dim has the largest stride). This ensures each batch slice
+/// is a contiguous column-major matrix, suitable for both faer and CBLAS.
+pub(crate) fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -> StridedArray<T> {
+    let total: usize = dims.iter().product::<usize>().max(1);
+    // SAFETY: `T: Copy` guarantees no drop glue, so leaving elements
+    // uninitialised is safe. Every call-site writes all elements before
+    // reading: A and B via `copy_into`, C via `copy_into` (beta != 0)
+    // or GEMM with replace semantics (beta == 0).
+    let mut data = Vec::with_capacity(total);
+    unsafe { data.set_len(total) };
 
-#[cfg(all(
-    not(feature = "faer"),
-    any(
-        all(feature = "blas", not(feature = "blas-inject")),
-        all(feature = "blas-inject", not(feature = "blas"))
-    )
-))]
-use crate::bgemm_blas::alloc_batched_col_major;
+    // Inner dims: column-major (stride 1 for first inner dim)
+    let inner_dims = &dims[n_batch..];
+    let mut strides = vec![0isize; dims.len()];
+    if !inner_dims.is_empty() {
+        strides[n_batch] = 1;
+        for i in 1..inner_dims.len() {
+            strides[n_batch + i] = strides[n_batch + i - 1] * inner_dims[i - 1] as isize;
+        }
+    }
+
+    // Batch dims: row-major (outermost has largest stride)
+    let inner_size: usize = inner_dims.iter().product::<usize>().max(1);
+    if n_batch > 0 {
+        strides[n_batch - 1] = inner_size as isize;
+        for i in (0..n_batch - 1).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1] as isize;
+        }
+    }
+
+    let arr =
+        StridedArray::from_parts(data, dims, &strides, 0).expect("batched col-major allocation");
+    arr
+}
 
 /// Prepare a borrowed input view for GEMM.
 ///
 /// Checks if the two inner dimension groups are fusable.
 /// If not, copies to a contiguous col-major buffer.
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
 pub fn prepare_input_view<T: Scalar>(
     view: &StridedView<T>,
     n_batch: usize,
@@ -169,11 +187,9 @@ pub fn prepare_input_view<T: Scalar>(
     let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
     let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
 
-    // For BLAS backends, resolve conjugation by copying with conj applied.
-    // BLAS does not support conjugation flags natively (unlike faer), so we
+    // For backends that cannot pass conjugation flags to GEMM (e.g., CBLAS),
     // materialize conj into the data before the GEMM call.
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
-    if conj {
+    if ActiveBackend::MATERIALIZES_CONJ && conj {
         use strided_view::Conj as ConjOp;
         use strided_view::ElementOp;
 
@@ -199,12 +215,10 @@ pub fn prepare_input_view<T: Scalar>(
 
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
 
-    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0 for size-1 dims).
-    // Batched multi-dim arrays may fuse successfully but still have non-unit strides
-    // in both groups (e.g., col-major [2,2,2] with strides [1,2,4] has rs=2, cs=4
-    // after batch stripping). Force a copy in that case.
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
-    if !needs_copy {
+    // Backends requiring unit stride (e.g., CBLAS) need one of {row_stride, col_stride}
+    // to be 1 (or 0 for size-1 dims). Batched multi-dim arrays may fuse successfully
+    // but still have non-unit strides in both groups. Force a copy in that case.
+    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
         if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
@@ -247,16 +261,6 @@ pub fn prepare_input_view<T: Scalar>(
 ///
 /// If already contiguous after dimension grouping, transfers ownership without copying.
 /// Otherwise, copies to a new col-major buffer.
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
 pub fn prepare_input_owned<T: Scalar>(
     arr: StridedArray<T>,
     n_batch: usize,
@@ -273,9 +277,9 @@ pub fn prepare_input_owned<T: Scalar>(
     let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
     let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
 
-    // For BLAS backends, resolve conjugation by copying with conj applied.
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
-    if conj {
+    // For backends that cannot pass conjugation flags to GEMM,
+    // materialize conj into the data before the GEMM call.
+    if ActiveBackend::MATERIALIZES_CONJ && conj {
         use strided_view::Conj as ConjOp;
         use strided_view::ElementOp;
 
@@ -301,9 +305,8 @@ pub fn prepare_input_owned<T: Scalar>(
 
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
 
-    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0).
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
-    if !needs_copy {
+    // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
+    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
         if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
@@ -357,16 +360,6 @@ pub fn prepare_input_owned<T: Scalar>(
 /// When inner dims are fusable (no copy needed), the returned `ContiguousOperandMut`
 /// holds a raw pointer into `view`'s data. The caller must ensure `view` outlives
 /// the returned operand and that no aliasing mutable references exist during GEMM.
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
 pub fn prepare_output_view<T: Scalar>(
     view: &mut StridedViewMut<T>,
     n_batch: usize,
@@ -387,9 +380,8 @@ pub fn prepare_output_view<T: Scalar>(
 
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
 
-    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0).
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
-    if !needs_copy {
+    // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
+    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
         if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
@@ -442,16 +434,6 @@ pub fn prepare_output_view<T: Scalar>(
 ///
 /// Currently unused in production (C is always a `StridedViewMut` from the caller).
 /// Kept for future use when `einsum2_into` accepts owned output arrays.
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
 #[allow(dead_code)]
 pub fn prepare_output_owned<T: Scalar>(
     arr: &mut StridedArray<T>,
@@ -473,9 +455,8 @@ pub fn prepare_output_owned<T: Scalar>(
 
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
 
-    // BLAS requires one of {row_stride, col_stride} to be 1 (or 0).
-    #[cfg(any(feature = "blas", feature = "blas-inject"))]
-    if !needs_copy {
+    // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
+    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
         if rs != 0 && rs != 1 && cs != 0 && cs != 1 {

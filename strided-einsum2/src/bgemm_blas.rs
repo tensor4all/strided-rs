@@ -4,10 +4,10 @@
 //! Operands must already have contiguous inner dimensions (prepared via
 //! `prepare_input_*` and `prepare_output_*` in the `contiguous` module).
 
+use crate::backend::{BgemmBackend, BlasBackend};
 use crate::contiguous::{ContiguousOperand, ContiguousOperandMut};
 use crate::util::MultiIndex;
 use crate::Scalar;
-use strided_view::StridedArray;
 
 #[cfg(all(feature = "blas-inject", not(feature = "blas")))]
 mod inject_fallback {
@@ -187,45 +187,6 @@ mod inject_fallback {
             }
         });
     }
-}
-
-/// Allocate a StridedArray with column-major inner dims and row-major batch dims.
-///
-/// For dims `[batch..., inner...]`, the inner dimensions are stored column-major
-/// (first inner dim has stride 1), while batch dimensions are stored row-major
-/// (outermost batch dim has the largest stride). This ensures each batch slice
-/// is a contiguous column-major matrix, which CBLAS prefers.
-pub(crate) fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -> StridedArray<T> {
-    let total: usize = dims.iter().product::<usize>().max(1);
-    // SAFETY: `T: Copy` guarantees no drop glue, so leaving elements
-    // uninitialised is safe. Every call-site writes all elements before
-    // reading: A and B via `copy_into`, C via `copy_into` (beta != 0)
-    // or CBLAS gemm with beta=0 (overwrites output).
-    let mut data = Vec::with_capacity(total);
-    unsafe { data.set_len(total) };
-
-    // Inner dims: column-major (stride 1 for first inner dim)
-    let inner_dims = &dims[n_batch..];
-    let mut strides = vec![0isize; dims.len()];
-    if !inner_dims.is_empty() {
-        strides[n_batch] = 1;
-        for i in 1..inner_dims.len() {
-            strides[n_batch + i] = strides[n_batch + i - 1] * inner_dims[i - 1] as isize;
-        }
-    }
-
-    // Batch dims: row-major (outermost has largest stride)
-    let inner_size: usize = inner_dims.iter().product::<usize>().max(1);
-    if n_batch > 0 {
-        strides[n_batch - 1] = inner_size as isize;
-        for i in (0..n_batch - 1).rev() {
-            strides[i] = strides[i + 1] * dims[i + 1] as isize;
-        }
-    }
-
-    let arr =
-        StridedArray::from_parts(data, dims, &strides, 0).expect("batched col-major allocation");
-    arr
 }
 
 /// Type-level dispatch trait for CBLAS GEMM.
@@ -487,4 +448,25 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     }
 
     Ok(())
+}
+
+impl<T> BgemmBackend<T> for BlasBackend
+where
+    T: Scalar + BlasGemm,
+{
+    fn bgemm_contiguous_into(
+        c: &mut ContiguousOperandMut<T>,
+        a: &ContiguousOperand<T>,
+        b: &ContiguousOperand<T>,
+        batch_dims: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: T,
+        beta: T,
+    ) -> strided_view::Result<()> {
+        // Delegate to the existing free function in this module.
+        // Use explicit module path to disambiguate from the trait method.
+        self::bgemm_contiguous_into(c, a, b, batch_dims, m, n, k, alpha, beta)
+    }
 }
