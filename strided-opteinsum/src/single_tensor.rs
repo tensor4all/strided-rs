@@ -15,6 +15,123 @@ pub fn single_tensor_einsum<T>(
 where
     T: Copy + ElementOpApply + Send + Sync + std::ops::Add<Output = T> + num_traits::Zero + Default,
 {
+    // Fast path: full trace "cc...c -> " (all indices identical, scalar output)
+    if output_ids.is_empty()
+        && !input_ids.is_empty()
+        && input_ids.iter().all(|&c| c == input_ids[0])
+    {
+        let n = src.dims()[0];
+        let diag_stride: isize = src.strides().iter().sum();
+        let ptr = src.data().as_ptr();
+        let mut offset = src.offset() as isize;
+        let mut acc = T::zero();
+        for _ in 0..n {
+            acc = acc + unsafe { *ptr.offset(offset) };
+            offset += diag_stride;
+        }
+        let mut out = StridedArray::<T>::col_major(&[]);
+        out.data_mut()[0] = acc;
+        return Ok(out);
+    }
+
+    // Fast path: partial trace with one repeated pair
+    // e.g. "iij->j", "iji->j", "jii->j" — one pair of repeated indices, rest go to output
+    {
+        let mut pair: Option<(char, usize, usize)> = None;
+        let mut seen_chars: Vec<(char, usize)> = Vec::new();
+        let mut has_triple = false;
+        for (i, &ch) in input_ids.iter().enumerate() {
+            if let Some(&(_, first)) = seen_chars.iter().find(|(c, _)| *c == ch) {
+                if pair.is_some() {
+                    // More than one pair — not a simple partial trace
+                    has_triple = true;
+                    break;
+                }
+                pair = Some((ch, first, i));
+            } else {
+                seen_chars.push((ch, i));
+            }
+        }
+
+        if let Some((repeated_ch, pos0, pos1)) = pair {
+            if !has_triple && !output_ids.contains(&repeated_ch) {
+                // All non-repeated indices must be in output_ids
+                let free_ids: Vec<(char, usize)> = input_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != pos0 && *i != pos1)
+                    .map(|(i, &ch)| (ch, i))
+                    .collect();
+                let all_free_in_output = free_ids.iter().all(|(ch, _)| output_ids.contains(ch));
+
+                if all_free_in_output && free_ids.len() == output_ids.len() {
+                    let n = src.dims()[pos0]; // diagonal length
+                    let diag_stride = src.strides()[pos0] + src.strides()[pos1];
+                    let ptr = src.data().as_ptr();
+                    let base_offset = src.offset() as isize;
+
+                    // Compute output permutation: output_ids order vs free_ids order
+                    let out_dims: Vec<usize> = output_ids
+                        .iter()
+                        .map(|oc| {
+                            let (_, src_axis) = free_ids.iter().find(|(ch, _)| ch == oc).unwrap();
+                            src.dims()[*src_axis]
+                        })
+                        .collect();
+                    let out_strides_src: Vec<isize> = output_ids
+                        .iter()
+                        .map(|oc| {
+                            let (_, src_axis) = free_ids.iter().find(|(ch, _)| ch == oc).unwrap();
+                            src.strides()[*src_axis]
+                        })
+                        .collect();
+
+                    let total_out: usize = out_dims.iter().product::<usize>().max(1);
+                    let out_col_strides = strided_view::col_major_strides(&out_dims);
+                    let mut out_data = vec![T::zero(); total_out];
+
+                    // Iterate over output elements using col-major order
+                    let out_rank = out_dims.len();
+                    let mut idx = vec![0usize; out_rank];
+                    for flat in 0..total_out {
+                        // Compute source offset for this output position
+                        let mut src_off = base_offset;
+                        for d in 0..out_rank {
+                            src_off += idx[d] as isize * out_strides_src[d];
+                        }
+                        // Sum along diagonal
+                        let mut acc = T::zero();
+                        let mut diag_off = src_off;
+                        for _ in 0..n {
+                            acc = acc + unsafe { *ptr.offset(diag_off) };
+                            diag_off += diag_stride;
+                        }
+                        // Write to output using col-major flat index
+                        let mut out_flat = 0usize;
+                        for d in 0..out_rank {
+                            out_flat += idx[d] * out_col_strides[d] as usize;
+                        }
+                        out_data[out_flat] = acc;
+
+                        // Increment index (col-major order)
+                        if flat + 1 < total_out {
+                            for d in 0..out_rank {
+                                idx[d] += 1;
+                                if idx[d] < out_dims[d] {
+                                    break;
+                                }
+                                idx[d] = 0;
+                            }
+                        }
+                    }
+
+                    return StridedArray::from_parts(out_data, &out_dims, &out_col_strides, 0)
+                        .map_err(|e| crate::EinsumError::Strided(e));
+                }
+            }
+        }
+    }
+
     // Step 1: Find repeated index pairs for diagonal_view.
     // Scan input_ids left-to-right. If a char appears twice, record (first_pos, second_pos).
     let mut pairs: Vec<(usize, usize)> = Vec::new();
@@ -94,28 +211,37 @@ where
         current_ids.remove(ax);
     }
 
-    // Step 5: Get the current result array.
-    let result_arr = if let Some(arr) = current_arr {
-        arr
-    } else if let Some(arr) = diag_arr {
-        arr
-    } else {
-        // No reduction, no diagonal -- just permutation or identity.
-        // We need to materialize from the source.
-        let dims = src.dims().to_vec();
-        let mut owned = StridedArray::<T>::col_major(&dims);
-        copy_into(&mut owned.view_mut(), src)?;
-        owned
-    };
+    // Step 5: Get the current result view for permutation.
+    // For permute-only (no diagonal, no reduction), use src directly to avoid double copy.
 
     // Step 6: Handle scalar output (output_ids is empty).
     if output_ids.is_empty() {
+        let result_arr = if let Some(arr) = current_arr {
+            arr
+        } else if let Some(arr) = diag_arr {
+            arr
+        } else {
+            // Scalar from source (shouldn't normally happen — scalar output implies reduction)
+            let mut owned = StridedArray::<T>::col_major(&[]);
+            owned.data_mut()[0] = unsafe { *src.data().as_ptr().offset(src.offset() as isize) };
+            owned
+        };
         return Ok(result_arr);
     }
 
     // Step 7: Permute to output order if needed.
     if current_ids == output_ids {
-        // Already in the right order.
+        let result_arr = if let Some(arr) = current_arr {
+            arr
+        } else if let Some(arr) = diag_arr {
+            arr
+        } else {
+            // Identity: copy src to col-major owned array
+            let dims = src.dims().to_vec();
+            let mut owned = StridedArray::<T>::col_major(&dims);
+            copy_into(&mut owned.view_mut(), src)?;
+            owned
+        };
         return Ok(result_arr);
     }
 
@@ -128,7 +254,17 @@ where
         }
     }
 
-    let permuted_view = result_arr.view().permute(&perm)?;
+    // Permute from the best available source (avoid intermediate copy)
+    let source_view = if let Some(ref arr) = current_arr {
+        arr.view()
+    } else if let Some(ref arr) = diag_arr {
+        arr.view()
+    } else {
+        // No intermediate — permute src directly (single copy instead of double)
+        src.clone()
+    };
+
+    let permuted_view = source_view.permute(&perm)?;
     let out_dims = permuted_view.dims().to_vec();
     let mut out = StridedArray::<T>::col_major(&out_dims);
     copy_into(&mut out.view_mut(), &permuted_view)?;
