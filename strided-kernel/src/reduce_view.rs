@@ -126,7 +126,7 @@ where
         }
     }
 
-    let mut acc = Some(init);
+    let mut acc = init;
     let initial_offsets = vec![0isize; ordered_strides.len()];
     for_each_inner_block_preordered(
         &fused_dims,
@@ -139,8 +139,7 @@ where
             for _ in 0..len {
                 let val = Op::apply(unsafe { *ptr });
                 let mapped = map_fn(val);
-                let current = acc.take().expect("accumulator must be initialized");
-                acc = Some(reduce_fn(current, mapped));
+                acc = reduce_fn(acc.clone(), mapped);
                 unsafe {
                     ptr = ptr.offset(stride);
                 }
@@ -149,7 +148,7 @@ where
         },
     )?;
 
-    Ok(acc.expect("accumulator must be initialized"))
+    Ok(acc)
 }
 
 /// Reduce along a single axis, returning a new StridedArray.
