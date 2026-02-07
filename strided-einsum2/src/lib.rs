@@ -40,7 +40,9 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use strided_kernel::zip_map2_into;
-use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
+use strided_view::{
+    Adjoint, Conj, ElementOp, ElementOpApply, StridedArray, StridedView, StridedViewMut,
+};
 
 pub use plan::Einsum2Plan;
 
@@ -203,15 +205,69 @@ where
             .expect("strip_op_view: metadata already validated"),
     };
 
-    // 4. Permute to canonical order
-    //    A -> [batch, lo, sum]
-    //    B -> [batch, sum, ro]
-    //    C -> [batch, lo, ro]
-    let a_perm = a_view.permute(&plan.left_perm)?;
-    let b_perm = b_view.permute(&plan.right_perm)?;
+    // 4. Dispatch to GEMM
+    #[cfg(feature = "faer")]
+    einsum2_gemm_dispatch(c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b)?;
+
+    #[cfg(not(feature = "faer"))]
+    {
+        let a_perm = a_view.permute(&plan.left_perm)?;
+        let b_perm = b_view.permute(&plan.right_perm)?;
+        let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+        if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+            let mul_fn = move |a_val: T, b_val: T| -> T {
+                let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
+                let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
+                alpha * a_c * b_c
+            };
+            zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+            return Ok(());
+        }
+
+        bgemm_naive::bgemm_strided_into(
+            &mut c_perm,
+            &a_perm,
+            &b_perm,
+            plan.batch.len(),
+            plan.lo.len(),
+            plan.ro.len(),
+            plan.sum.len(),
+            alpha,
+            beta,
+            conj_a,
+            conj_b,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Internal GEMM dispatch using ContiguousOperand types.
+///
+/// Called after trace reduction and Op stripping. Handles:
+/// 1. Permutation to canonical order
+/// 2. Element-wise fast path (if applicable)
+/// 3. Contiguous preparation via `prepare_input_view`
+/// 4. GEMM via `bgemm_contiguous_into`
+/// 5. Finalize (copy-back if needed)
+#[cfg(feature = "faer")]
+fn einsum2_gemm_dispatch<T: Scalar>(
+    c: StridedViewMut<T>,
+    a: &StridedView<T>,
+    b: &StridedView<T>,
+    plan: &Einsum2Plan<impl AxisId>,
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> Result<()> {
+    // 1. Permute to canonical order
+    let a_perm = a.permute(&plan.left_perm)?;
+    let b_perm = b.permute(&plan.right_perm)?;
     let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
 
-    // 5a. Fast path: element-wise operation (all indices are batch, no contraction)
+    // 2. Fast path: element-wise (all batch, no contraction)
     if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
         let mul_fn = move |a_val: T, b_val: T| -> T {
             let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
@@ -222,36 +278,129 @@ where
         return Ok(());
     }
 
-    // 5b. Call batched GEMM
-    #[cfg(feature = "faer")]
-    bgemm_faer::bgemm_strided_into(
-        &mut c_perm,
-        &a_perm,
-        &b_perm,
-        plan.batch.len(),
-        plan.lo.len(),
-        plan.ro.len(),
-        plan.sum.len(),
-        alpha,
-        beta,
-        conj_a,
-        conj_b,
-    )?;
+    // 3. Prepare contiguous operands
+    let n_batch = plan.batch.len();
+    let n_lo = plan.lo.len();
+    let n_ro = plan.ro.len();
+    let n_sum = plan.sum.len();
 
-    #[cfg(not(feature = "faer"))]
-    bgemm_naive::bgemm_strided_into(
-        &mut c_perm,
-        &a_perm,
-        &b_perm,
-        plan.batch.len(),
-        plan.lo.len(),
-        plan.ro.len(),
-        plan.sum.len(),
-        alpha,
-        beta,
-        conj_a,
-        conj_b,
-    )?;
+    let a_op = contiguous::prepare_input_view(&a_perm, n_batch, n_lo, n_sum, conj_a)?;
+    let b_op = contiguous::prepare_input_view(&b_perm, n_batch, n_sum, n_ro, conj_b)?;
+    let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
+
+    // Compute fused dimension sizes
+    let batch_dims = &a_perm.dims()[..n_batch];
+    let lo_dims = &a_perm.dims()[n_batch..n_batch + n_lo];
+    let sum_dims = &a_perm.dims()[n_batch + n_lo..n_batch + n_lo + n_sum];
+    let ro_dims = &b_perm.dims()[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let m: usize = lo_dims.iter().product::<usize>().max(1);
+    let k: usize = sum_dims.iter().product::<usize>().max(1);
+    let n: usize = ro_dims.iter().product::<usize>().max(1);
+
+    // 4. GEMM
+    bgemm_faer::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta)?;
+
+    // 5. Finalize
+    c_op.finalize_into(&mut c_perm)?;
+
+    Ok(())
+}
+
+/// Binary einsum accepting owned inputs for zero-copy optimization.
+///
+/// Same semantics as [`einsum2_into`] but accepts owned `StridedArray` inputs.
+/// When inputs have non-contiguous strides after permutation, ownership
+/// transfer avoids allocating separate buffers. For contiguous inputs,
+/// the behavior is identical.
+///
+/// `conj_a` and `conj_b` indicate whether to conjugate elements of A/B.
+#[cfg(feature = "faer")]
+pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
+    c: StridedViewMut<T>,
+    a: StridedArray<T>,
+    b: StridedArray<T>,
+    ic: &[ID],
+    ia: &[ID],
+    ib: &[ID],
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> Result<()> {
+    // 1. Build plan
+    let plan = Einsum2Plan::new(ia, ib, ic)?;
+
+    // 2. Validate dimensions
+    validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
+
+    // 3. Trace reduction: reduce trace axes if present.
+    //    When trace reduction occurs, conjugation is applied during reduction,
+    //    so the conj flag becomes false. Otherwise keep the caller's flag.
+    let (a_for_gemm, conj_a_final) = if !plan.left_trace.is_empty() {
+        let trace_indices = plan.left_trace_indices(ia);
+        (trace::reduce_trace_axes(&a.view(), &trace_indices)?, false)
+    } else {
+        (a, conj_a)
+    };
+
+    let (b_for_gemm, conj_b_final) = if !plan.right_trace.is_empty() {
+        let trace_indices = plan.right_trace_indices(ib);
+        (trace::reduce_trace_axes(&b.view(), &trace_indices)?, false)
+    } else {
+        (b, conj_b)
+    };
+
+    // 4. Permute to canonical order (metadata-only on owned arrays)
+    let a_perm = a_for_gemm.permuted(&plan.left_perm)?;
+    let b_perm = b_for_gemm.permuted(&plan.right_perm)?;
+    let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+    let n_batch = plan.batch.len();
+    let n_lo = plan.lo.len();
+    let n_ro = plan.ro.len();
+    let n_sum = plan.sum.len();
+
+    // 5. Fast path: element-wise (all batch, no contraction)
+    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+        let mul_fn = move |a_val: T, b_val: T| -> T {
+            let a_c = if conj_a_final {
+                Conj::apply(a_val)
+            } else {
+                a_val
+            };
+            let b_c = if conj_b_final {
+                Conj::apply(b_val)
+            } else {
+                b_val
+            };
+            alpha * a_c * b_c
+        };
+        zip_map2_into(&mut c_perm, &a_perm.view(), &b_perm.view(), mul_fn)?;
+        return Ok(());
+    }
+
+    // 6. Extract dimension sizes BEFORE consuming arrays via prepare_input_owned
+    let a_dims_perm = a_perm.dims().to_vec();
+    let b_dims_perm = b_perm.dims().to_vec();
+
+    let batch_dims = a_dims_perm[..n_batch].to_vec();
+    let lo_dims = &a_dims_perm[n_batch..n_batch + n_lo];
+    let sum_dims = &a_dims_perm[n_batch + n_lo..];
+    let ro_dims = &b_dims_perm[n_batch + n_sum..];
+    let m: usize = lo_dims.iter().product::<usize>().max(1);
+    let k: usize = sum_dims.iter().product::<usize>().max(1);
+    let n: usize = ro_dims.iter().product::<usize>().max(1);
+
+    // 7. Prepare contiguous operands (owned path -- avoids extra copies)
+    let a_op = contiguous::prepare_input_owned(a_perm, n_batch, n_lo, n_sum, conj_a_final)?;
+    let b_op = contiguous::prepare_input_owned(b_perm, n_batch, n_sum, n_ro, conj_b_final)?;
+    let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
+
+    // 8. GEMM
+    bgemm_faer::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &batch_dims, m, n, k, alpha, beta)?;
+
+    // 9. Finalize
+    c_op.finalize_into(&mut c_perm)?;
 
     Ok(())
 }
@@ -771,5 +920,160 @@ mod tests {
         assert_eq!(c.get(&[0, 0]), 2.0);
         // C[1,2] = 2.0 * 6 * 6 = 72.0
         assert_eq!(c.get(&[1, 2]), 72.0);
+    }
+
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_einsum2_owned_matmul() {
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[1.0, 2.0], [3.0, 4.0]][idx[0]][idx[1]]
+        });
+        let b = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[5.0, 6.0], [7.0, 8.0]][idx[0]][idx[1]]
+        });
+        let mut c = StridedArray::<f64>::row_major(&[2, 2]);
+
+        einsum2_into_owned(
+            c.view_mut(),
+            a,
+            b,
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            1.0,
+            0.0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 19.0);
+        assert_eq!(c.get(&[0, 1]), 22.0);
+        assert_eq!(c.get(&[1, 0]), 43.0);
+        assert_eq!(c.get(&[1, 1]), 50.0);
+    }
+
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_einsum2_owned_batched() {
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2, 3], |idx| {
+            (idx[0] * 6 + idx[1] * 3 + idx[2] + 1) as f64
+        });
+        let b = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
+            (idx[0] * 6 + idx[1] * 2 + idx[2] + 1) as f64
+        });
+        let mut c = StridedArray::<f64>::row_major(&[2, 2, 2]);
+
+        einsum2_into_owned(
+            c.view_mut(),
+            a,
+            b,
+            &['b', 'i', 'k'],
+            &['b', 'i', 'j'],
+            &['b', 'j', 'k'],
+            1.0,
+            0.0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Batch 0: A0=[[1,2,3],[4,5,6]], B0=[[1,2],[3,4],[5,6]]
+        // C0[0,0] = 1*1+2*3+3*5 = 22
+        assert_eq!(c.get(&[0, 0, 0]), 22.0);
+    }
+
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_einsum2_owned_alpha_beta() {
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[1.0, 0.0], [0.0, 1.0]][idx[0]][idx[1]]
+        });
+        let b = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[1.0, 2.0], [3.0, 4.0]][idx[0]][idx[1]]
+        });
+        let mut c = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[10.0, 20.0], [30.0, 40.0]][idx[0]][idx[1]]
+        });
+
+        einsum2_into_owned(
+            c.view_mut(),
+            a,
+            b,
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            2.0,
+            3.0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // C = 2*I*B + 3*C_old
+        assert_eq!(c.get(&[0, 0]), 32.0); // 2*1 + 3*10
+        assert_eq!(c.get(&[1, 1]), 128.0); // 2*4 + 3*40
+    }
+
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_einsum2_owned_elementwise() {
+        // All batch, no contraction -- element-wise fast path
+        let a =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let b =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let mut c = StridedArray::<f64>::row_major(&[2, 3]);
+
+        einsum2_into_owned(
+            c.view_mut(),
+            a,
+            b,
+            &['i', 'j'],
+            &['i', 'j'],
+            &['i', 'j'],
+            2.0,
+            0.0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 2.0); // 2 * 1 * 1
+        assert_eq!(c.get(&[1, 2]), 72.0); // 2 * 6 * 6
+    }
+
+    #[cfg(feature = "faer")]
+    #[test]
+    fn test_einsum2_owned_left_trace() {
+        // C_k = sum_j (sum_i A_ij) * B_jk
+        // left_trace=[i], sum=[j], ro=[k]
+        let a =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        // A = [[1,2,3],[4,5,6]]
+        // sum over i: [5, 7, 9]
+        let b =
+            StridedArray::<f64>::from_fn_row_major(&[3, 2], |idx| (idx[0] * 2 + idx[1] + 1) as f64);
+        // B = [[1,2],[3,4],[5,6]]
+        let mut c = StridedArray::<f64>::row_major(&[2]);
+
+        einsum2_into_owned(
+            c.view_mut(),
+            a,
+            b,
+            &['k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            1.0,
+            0.0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // C[0] = 5*1 + 7*3 + 9*5 = 5 + 21 + 45 = 71
+        // C[1] = 5*2 + 7*4 + 9*6 = 10 + 28 + 54 = 92
+        assert_eq!(c.get(&[0]), 71.0);
+        assert_eq!(c.get(&[1]), 92.0);
     }
 }
