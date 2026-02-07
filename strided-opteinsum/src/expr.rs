@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use num_complex::Complex64;
 use num_traits::Zero;
 use strided_einsum2::{einsum2_into, einsum2_into_owned};
-use strided_view::StridedArray;
+use strided_kernel::copy_scale;
+use strided_view::{StridedArray, StridedViewMut};
 
-use crate::operand::{EinsumOperand, StridedData};
+use crate::operand::{EinsumOperand, EinsumScalar, StridedData};
 use crate::parse::{EinsumCode, EinsumNode};
 use crate::single_tensor::single_tensor_einsum;
 
@@ -273,6 +274,112 @@ fn eval_pair(
 }
 
 // ---------------------------------------------------------------------------
+// Pairwise contraction into user-provided output (zero-copy for final step)
+// ---------------------------------------------------------------------------
+
+/// Contract two operands directly into a user-provided output buffer.
+///
+/// Unlike `eval_pair`, this writes into `output` with alpha/beta scaling
+/// instead of allocating a fresh array. Used for the final contraction in
+/// `evaluate_into`.
+fn eval_pair_into<T: EinsumScalar>(
+    left: EinsumOperand<'_>,
+    left_ids: &[char],
+    right: EinsumOperand<'_>,
+    right_ids: &[char],
+    output: StridedViewMut<T>,
+    output_ids: &[char],
+    alpha: T,
+    beta: T,
+) -> crate::Result<()> {
+    let left_data = T::extract_data(left)?;
+    let right_data = T::extract_data(right)?;
+
+    match (left_data, right_data) {
+        (StridedData::Owned(a), StridedData::Owned(b)) => {
+            einsum2_into_owned(
+                output, a, b, output_ids, left_ids, right_ids, alpha, beta, false, false,
+            )?;
+        }
+        (StridedData::Owned(a), StridedData::View(b)) => {
+            einsum2_into(
+                output,
+                &a.view(),
+                &b,
+                output_ids,
+                left_ids,
+                right_ids,
+                alpha,
+                beta,
+            )?;
+        }
+        (StridedData::View(a), StridedData::Owned(b)) => {
+            einsum2_into(
+                output,
+                &a,
+                &b.view(),
+                output_ids,
+                left_ids,
+                right_ids,
+                alpha,
+                beta,
+            )?;
+        }
+        (StridedData::View(a), StridedData::View(b)) => {
+            einsum2_into(output, &a, &b, output_ids, left_ids, right_ids, alpha, beta)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Accumulate helper for single-tensor results
+// ---------------------------------------------------------------------------
+
+/// Write `output = alpha * result + beta * output`.
+///
+/// `result` must already have the same shape as `output`.
+fn accumulate_into<T: EinsumScalar>(
+    output: &mut StridedViewMut<T>,
+    result: &StridedArray<T>,
+    alpha: T,
+    beta: T,
+) -> crate::Result<()> {
+    let result_view = result.view();
+    if beta == T::zero() {
+        if alpha == T::one() {
+            strided_kernel::copy_into(output, &result_view)?;
+        } else {
+            copy_scale(output, &result_view, alpha)?;
+        }
+    } else {
+        // General case: output = alpha * result + beta * output
+        // axpy does: output += alpha * result, so we need to scale output by beta first.
+        // We use a temporary to avoid aliasing issues.
+        let dims = output.dims().to_vec();
+        let mut temp = StridedArray::<T>::col_major(&dims);
+        strided_kernel::copy_into(&mut temp.view_mut(), &result_view)?;
+        // temp now holds result data in col-major layout
+        // output = beta * output + alpha * temp
+        // Using zip_map2_into would need output as both src and dest.
+        // Instead: copy_scale output into a second temp, then zip_map2_into.
+        // But simpler: use axpy which reads+writes dest.
+        // axpy(dest, src, alpha) does: dest[i] = dest[i] + alpha * src[i]
+        // So: first scale output by beta, then axpy with alpha.
+        // "scale output by beta" = copy_scale into temp2, copy back. Or just
+        // use a different approach: compute full result in temp, copy to output.
+        //
+        // Simplest correct approach for this rare path:
+        let mut output_copy = StridedArray::<T>::col_major(&dims);
+        strided_kernel::copy_into(&mut output_copy.view_mut(), &output.as_view())?;
+        strided_kernel::zip_map2_into(output, &temp.view(), &output_copy.view(), |r, o| {
+            alpha * r + beta * o
+        })?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Single-tensor dispatch (borrows operand)
 // ---------------------------------------------------------------------------
 
@@ -369,6 +476,64 @@ fn execute_nested<'a>(
             let output_ids: Vec<char> = eins.iy.clone();
             let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids)?;
             Ok((result, output_ids))
+        }
+    }
+}
+
+/// Execute an omeco-optimized contraction tree, writing the root contraction
+/// directly into a user-provided output buffer.
+///
+/// Inner (non-root) contractions use normal `execute_nested` / `eval_pair`.
+/// Only the root `Node`'s contraction is written directly into `output`.
+fn execute_nested_into<'a, T: EinsumScalar>(
+    nested: &omeco::NestedEinsum<char>,
+    children: &mut Vec<Option<(EinsumOperand<'a>, Vec<char>)>>,
+    output: StridedViewMut<T>,
+    output_ids: &[char],
+    alpha: T,
+    beta: T,
+) -> crate::Result<()> {
+    match nested {
+        omeco::NestedEinsum::Node { args, eins: _ } => {
+            if args.len() != 2 {
+                return Err(crate::EinsumError::Internal(format!(
+                    "optimizer produced non-binary node with {} children",
+                    args.len()
+                )));
+            }
+            // Evaluate children normally (they allocate temporaries)
+            let (left, left_ids) = execute_nested(&args[0], children)?;
+            let (right, right_ids) = execute_nested(&args[1], children)?;
+            // Root contraction writes directly into user's output
+            eval_pair_into(
+                left, &left_ids, right, &right_ids, output, output_ids, alpha, beta,
+            )
+        }
+        omeco::NestedEinsum::Leaf { tensor_index } => {
+            // Root is a single leaf — extract and accumulate into output
+            let slot = children.get_mut(*tensor_index).ok_or_else(|| {
+                crate::EinsumError::Internal(format!(
+                    "optimizer referenced child index {} out of bounds",
+                    tensor_index
+                ))
+            })?;
+            let (op, op_ids) = slot.take().ok_or_else(|| {
+                crate::EinsumError::Internal(format!(
+                    "child operand {} was already consumed",
+                    tensor_index
+                ))
+            })?;
+            let data = T::extract_data(op)?;
+            let arr = data.into_array();
+            // Permute if needed
+            if op_ids != output_ids {
+                let perm = compute_permutation(&op_ids, output_ids);
+                let permuted = arr.permuted(&perm)?;
+                accumulate_into(&mut { output }, &permuted, alpha, beta)?;
+            } else {
+                accumulate_into(&mut { output }, &arr, alpha, beta)?;
+            }
+            Ok(())
         }
     }
 }
@@ -538,6 +703,183 @@ fn leaf_count(node: &EinsumNode) -> usize {
     match node {
         EinsumNode::Leaf { .. } => 1,
         EinsumNode::Contract { args } => args.iter().map(leaf_count).sum(),
+    }
+}
+
+/// Build a dimension map from operands and the parsed tree.
+///
+/// Maps each index char to its dimension size by walking the tree's Leaf nodes
+/// and matching them to the corresponding operands.
+fn build_dim_map(
+    node: &EinsumNode,
+    operands: &[Option<EinsumOperand<'_>>],
+) -> HashMap<char, usize> {
+    let mut dim_map = HashMap::new();
+    build_dim_map_inner(node, operands, &mut dim_map);
+    dim_map
+}
+
+fn build_dim_map_inner(
+    node: &EinsumNode,
+    operands: &[Option<EinsumOperand<'_>>],
+    dim_map: &mut HashMap<char, usize>,
+) {
+    match node {
+        EinsumNode::Leaf { ids, tensor_index } => {
+            if let Some(Some(op)) = operands.get(*tensor_index) {
+                for (i, &id) in ids.iter().enumerate() {
+                    dim_map.insert(id, op.dims()[i]);
+                }
+            }
+        }
+        EinsumNode::Contract { args } => {
+            for arg in args {
+                build_dim_map_inner(arg, operands, dim_map);
+            }
+        }
+    }
+}
+
+impl EinsumCode {
+    /// Evaluate the einsum contraction tree, writing the result directly into
+    /// a user-provided output buffer with alpha/beta scaling.
+    ///
+    /// `output = alpha * einsum(operands) + beta * output`
+    ///
+    /// The output element type `T` must match the computation: use `f64` when
+    /// all operands are real, `Complex64` when any operand is complex.
+    /// If `T = f64` but any operand is complex, returns `TypeMismatch` error.
+    /// If `T = Complex64`, real operands are promoted automatically.
+    pub fn evaluate_into<T: EinsumScalar>(
+        &self,
+        operands: Vec<EinsumOperand<'_>>,
+        mut output: StridedViewMut<T>,
+        alpha: T,
+        beta: T,
+    ) -> crate::Result<()> {
+        let expected = leaf_count(&self.root);
+        if operands.len() != expected {
+            return Err(crate::EinsumError::OperandCountMismatch {
+                expected,
+                found: operands.len(),
+            });
+        }
+
+        // Validate output type compatibility
+        let mut ops: Vec<Option<EinsumOperand<'_>>> = operands.into_iter().map(Some).collect();
+        T::validate_operands(&ops)?;
+
+        // Compute expected output shape
+        let dim_map = build_dim_map(&self.root, &ops);
+        let expected_dims = out_dims_from_map(&dim_map, &self.output_ids)?;
+        if output.dims() != expected_dims.as_slice() {
+            return Err(crate::EinsumError::OutputShapeMismatch {
+                expected: expected_dims,
+                got: output.dims().to_vec(),
+            });
+        }
+
+        let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
+
+        match &self.root {
+            EinsumNode::Leaf { ids, tensor_index } => {
+                // Single operand: extract, permute/trace, accumulate
+                let op = ops[*tensor_index].take().ok_or_else(|| {
+                    crate::EinsumError::Internal("operand already consumed".into())
+                })?;
+                let single_result = eval_single(&op, ids, &self.output_ids)?;
+                let data = T::extract_data(single_result)?;
+                accumulate_into(&mut output, &data.into_array(), alpha, beta)?;
+            }
+            EinsumNode::Contract { args } => match args.len() {
+                0 => unreachable!("empty Contract node"),
+                1 => {
+                    // Single child: evaluate, then accumulate
+                    let child_needed = compute_child_needed_ids(&self.output_ids, 0, args);
+                    let (child_op, child_ids) = eval_node(&args[0], &mut ops, &child_needed)?;
+
+                    if child_ids == self.output_ids {
+                        // Identity: just accumulate
+                        let data = T::extract_data(child_op)?;
+                        accumulate_into(&mut output, &data.into_array(), alpha, beta)?;
+                    } else if is_permutation_only(&child_ids, &self.output_ids) {
+                        // Permutation: permute the data, then accumulate
+                        let perm = compute_permutation(&child_ids, &self.output_ids);
+                        let data = T::extract_data(child_op)?;
+                        let arr = data.into_array();
+                        let permuted = arr.permuted(&perm)?;
+                        accumulate_into(&mut output, &permuted, alpha, beta)?;
+                    } else {
+                        // General: trace/reduction
+                        let result = eval_single(&child_op, &child_ids, &self.output_ids)?;
+                        let data = T::extract_data(result)?;
+                        accumulate_into(&mut output, &data.into_array(), alpha, beta)?;
+                    }
+                }
+                2 => {
+                    // Binary contraction: write directly into output
+                    let left_needed = compute_child_needed_ids(&self.output_ids, 0, args);
+                    let right_needed = compute_child_needed_ids(&self.output_ids, 1, args);
+                    let (left, left_ids) = eval_node(&args[0], &mut ops, &left_needed)?;
+                    let (right, right_ids) = eval_node(&args[1], &mut ops, &right_needed)?;
+                    eval_pair_into(
+                        left,
+                        &left_ids,
+                        right,
+                        &right_ids,
+                        output,
+                        &self.output_ids,
+                        alpha,
+                        beta,
+                    )?;
+                }
+                _ => {
+                    // 3+ children: use omeco, final contraction into output
+                    let node_output_ids = compute_contract_output_ids(args, &final_output);
+
+                    let mut children: Vec<Option<(EinsumOperand<'_>, Vec<char>)>> = Vec::new();
+                    for (i, arg) in args.iter().enumerate() {
+                        let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
+                        let (op, ids) = eval_node(arg, &mut ops, &child_needed)?;
+                        children.push(Some((op, ids)));
+                    }
+
+                    let mut dim_sizes: HashMap<char, usize> = HashMap::new();
+                    for child_opt in &children {
+                        if let Some((op, ids)) = child_opt {
+                            for (j, &id) in ids.iter().enumerate() {
+                                dim_sizes.insert(id, op.dims()[j]);
+                            }
+                        }
+                    }
+
+                    let input_ids: Vec<Vec<char>> = children
+                        .iter()
+                        .map(|c| c.as_ref().unwrap().1.clone())
+                        .collect();
+                    let code = omeco::EinCode::new(input_ids, self.output_ids.clone());
+
+                    let optimizer = omeco::GreedyMethod::default();
+                    let nested = omeco::CodeOptimizer::optimize(&optimizer, &code, &dim_sizes)
+                        .ok_or_else(|| {
+                            crate::EinsumError::Internal(
+                                "optimizer failed to produce a plan".into(),
+                            )
+                        })?;
+
+                    execute_nested_into(
+                        &nested,
+                        &mut children,
+                        output,
+                        &self.output_ids,
+                        alpha,
+                        beta,
+                    )?;
+                }
+            },
+        }
+
+        Ok(())
     }
 }
 
@@ -740,5 +1082,179 @@ mod tests {
                 found: 2
             }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_into tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_into_matmul() {
+        let code = parse_einsum("ij,jk->ik").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        let mut c = StridedArray::<f64>::col_major(&[2, 2]);
+        code.evaluate_into(vec![a, b], c.view_mut(), 1.0, 0.0)
+            .unwrap();
+        assert_abs_diff_eq!(c.get(&[0, 0]), 19.0);
+        assert_abs_diff_eq!(c.get(&[0, 1]), 22.0);
+        assert_abs_diff_eq!(c.get(&[1, 0]), 43.0);
+        assert_abs_diff_eq!(c.get(&[1, 1]), 50.0);
+    }
+
+    #[test]
+    fn test_into_matmul_alpha_beta() {
+        // C = 2 * A*B + 3 * C_old
+        let code = parse_einsum("ij,jk->ik").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        // A*B = [[19,22],[43,50]]
+        // C_old = [[1,1],[1,1]]
+        // result = 2*[[19,22],[43,50]] + 3*[[1,1],[1,1]] = [[41,47],[89,103]]
+        let mut c = StridedArray::<f64>::col_major(&[2, 2]);
+        for v in c.data_mut().iter_mut() {
+            *v = 1.0;
+        }
+        code.evaluate_into(vec![a, b], c.view_mut(), 2.0, 3.0)
+            .unwrap();
+        assert_abs_diff_eq!(c.get(&[0, 0]), 41.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(c.get(&[0, 1]), 47.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(c.get(&[1, 0]), 89.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(c.get(&[1, 1]), 103.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_into_single_tensor_permute() {
+        let code = parse_einsum("ij->ji").unwrap();
+        let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut c = StridedArray::<f64>::col_major(&[3, 2]);
+        code.evaluate_into(vec![a], c.view_mut(), 1.0, 0.0).unwrap();
+        assert_eq!(c.dims(), &[3, 2]);
+        assert_abs_diff_eq!(c.get(&[0, 0]), 1.0);
+        assert_abs_diff_eq!(c.get(&[0, 1]), 4.0);
+        assert_abs_diff_eq!(c.get(&[1, 0]), 2.0);
+        assert_abs_diff_eq!(c.get(&[2, 1]), 6.0);
+    }
+
+    #[test]
+    fn test_into_single_tensor_trace() {
+        let code = parse_einsum("ii->").unwrap();
+        let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
+        let mut c = StridedArray::<f64>::col_major(&[]);
+        code.evaluate_into(vec![a], c.view_mut(), 1.0, 0.0).unwrap();
+        assert_abs_diff_eq!(c.data()[0], 6.0);
+    }
+
+    #[test]
+    fn test_into_three_tensor_omeco() {
+        let code = parse_einsum("ij,jk,kl->il").unwrap();
+        let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = make_f64(&[3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+        let c_op = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+        let mut out = StridedArray::<f64>::col_major(&[2, 2]);
+        code.evaluate_into(vec![a, b, c_op], out.view_mut(), 1.0, 0.0)
+            .unwrap();
+        assert_abs_diff_eq!(out.get(&[0, 0]), 4.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(out.get(&[0, 1]), 2.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(out.get(&[1, 0]), 10.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(out.get(&[1, 1]), 5.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_into_nested() {
+        let code = parse_einsum("(ij,jk),kl->il").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+        let b = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let c_op = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        let mut out = StridedArray::<f64>::col_major(&[2, 2]);
+        code.evaluate_into(vec![a, b, c_op], out.view_mut(), 1.0, 0.0)
+            .unwrap();
+        assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(out.get(&[0, 1]), 22.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(out.get(&[1, 0]), 43.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(out.get(&[1, 1]), 50.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_into_dot_product() {
+        let code = parse_einsum("i,i->").unwrap();
+        let a = make_f64(&[3], vec![1.0, 2.0, 3.0]);
+        let b = make_f64(&[3], vec![4.0, 5.0, 6.0]);
+        let mut c = StridedArray::<f64>::col_major(&[]);
+        code.evaluate_into(vec![a, b], c.view_mut(), 1.0, 0.0)
+            .unwrap();
+        assert_abs_diff_eq!(c.data()[0], 32.0);
+    }
+
+    #[test]
+    fn test_into_type_mismatch_f64_output_c64_input() {
+        let code = parse_einsum("ij->ji").unwrap();
+        let c64_data = vec![
+            Complex64::new(1.0, 0.0),
+            Complex64::new(2.0, 0.0),
+            Complex64::new(3.0, 0.0),
+            Complex64::new(4.0, 0.0),
+        ];
+        let strides = row_major_strides(&[2, 2]);
+        let arr = StridedArray::from_parts(c64_data, &[2, 2], &strides, 0).unwrap();
+        let op = EinsumOperand::C64(StridedData::Owned(arr));
+        let mut out = StridedArray::<f64>::col_major(&[2, 2]);
+        let err = code
+            .evaluate_into(vec![op], out.view_mut(), 1.0, 0.0)
+            .unwrap_err();
+        assert!(matches!(err, crate::EinsumError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_into_shape_mismatch() {
+        let code = parse_einsum("ij,jk->ik").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        let mut out = StridedArray::<f64>::col_major(&[3, 3]); // wrong shape
+        let err = code
+            .evaluate_into(vec![a, b], out.view_mut(), 1.0, 0.0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::EinsumError::OutputShapeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_into_c64_output() {
+        let code = parse_einsum("ij,jk->ik").unwrap();
+        let c64 = |r| Complex64::new(r, 0.0);
+        let a_data = vec![c64(1.0), c64(2.0), c64(3.0), c64(4.0)];
+        let b_data = vec![c64(5.0), c64(6.0), c64(7.0), c64(8.0)];
+        let strides = row_major_strides(&[2, 2]);
+        let a = EinsumOperand::C64(StridedData::Owned(
+            StridedArray::from_parts(a_data, &[2, 2], &strides, 0).unwrap(),
+        ));
+        let b = EinsumOperand::C64(StridedData::Owned(
+            StridedArray::from_parts(b_data, &[2, 2], &strides, 0).unwrap(),
+        ));
+        let mut out = StridedArray::<Complex64>::col_major(&[2, 2]);
+        code.evaluate_into(vec![a, b], out.view_mut(), c64(1.0), Complex64::zero())
+            .unwrap();
+        assert_abs_diff_eq!(out.get(&[0, 0]).re, 19.0);
+        assert_abs_diff_eq!(out.get(&[1, 1]).re, 50.0);
+    }
+
+    #[test]
+    fn test_into_mixed_types_c64_output() {
+        // f64 + c64 operands -> c64 output (f64 gets promoted)
+        let code = parse_einsum("ij,jk->ik").unwrap();
+        let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let c64 = |r| Complex64::new(r, 0.0);
+        let b_data = vec![c64(5.0), c64(6.0), c64(7.0), c64(8.0)];
+        let strides = row_major_strides(&[2, 2]);
+        let b = EinsumOperand::C64(StridedData::Owned(
+            StridedArray::from_parts(b_data, &[2, 2], &strides, 0).unwrap(),
+        ));
+        let mut out = StridedArray::<Complex64>::col_major(&[2, 2]);
+        code.evaluate_into(vec![a, b], out.view_mut(), c64(1.0), Complex64::zero())
+            .unwrap();
+        assert_abs_diff_eq!(out.get(&[0, 0]).re, 19.0);
+        assert_abs_diff_eq!(out.get(&[1, 1]).re, 50.0);
     }
 }

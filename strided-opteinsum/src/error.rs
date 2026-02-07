@@ -23,6 +23,18 @@ pub enum EinsumError {
     #[error("operand count mismatch: expected {expected}, found {found}")]
     OperandCountMismatch { expected: usize, found: usize },
 
+    #[error("type mismatch: output is {output_type} but computation requires {computed_type}")]
+    TypeMismatch {
+        output_type: &'static str,
+        computed_type: &'static str,
+    },
+
+    #[error("output shape mismatch: expected {expected:?}, got {got:?}")]
+    OutputShapeMismatch {
+        expected: Vec<usize>,
+        got: Vec<usize>,
+    },
+
     #[error("internal error: {0}")]
     Internal(String),
 }

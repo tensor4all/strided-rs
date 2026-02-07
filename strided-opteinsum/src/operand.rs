@@ -1,5 +1,6 @@
 use num_complex::Complex64;
 use num_traits::Zero;
+use strided_einsum2::Scalar;
 use strided_kernel::copy_into;
 use strided_view::{col_major_strides, ElementOpApply, StridedArray, StridedView};
 
@@ -190,6 +191,97 @@ impl From<StridedArray<f64>> for EinsumOperand<'static> {
 impl From<StridedArray<Complex64>> for EinsumOperand<'static> {
     fn from(arr: StridedArray<Complex64>) -> Self {
         EinsumOperand::C64(StridedData::Owned(arr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EinsumScalar trait — sealed, implemented for f64 and Complex64
+// ---------------------------------------------------------------------------
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for f64 {}
+    impl Sealed for num_complex::Complex64 {}
+}
+
+/// Scalar types that can be used as the output element type for `einsum_into`.
+///
+/// Sealed trait: only implemented for `f64` and `Complex64`.
+pub trait EinsumScalar: private::Sealed + Scalar + Default + 'static {
+    /// Human-readable type name for error messages.
+    fn type_name() -> &'static str;
+
+    /// Extract typed data from a type-erased `EinsumOperand`, promoting if needed.
+    ///
+    /// For `f64`: returns error if operand is `C64`.
+    /// For `Complex64`: promotes `F64` operands to `C64`.
+    fn extract_data<'a>(op: EinsumOperand<'a>) -> crate::Result<StridedData<'a, Self>>;
+
+    /// Check whether any operand requires this type or is incompatible.
+    /// Returns error early if `T = f64` but any operand is `C64`.
+    fn validate_operands(ops: &[Option<EinsumOperand<'_>>]) -> crate::Result<()>;
+}
+
+impl EinsumScalar for f64 {
+    fn type_name() -> &'static str {
+        "f64"
+    }
+
+    fn extract_data<'a>(op: EinsumOperand<'a>) -> crate::Result<StridedData<'a, f64>> {
+        match op {
+            EinsumOperand::F64(data) => Ok(data),
+            EinsumOperand::C64(_) => Err(crate::EinsumError::TypeMismatch {
+                output_type: "f64",
+                computed_type: "Complex64",
+            }),
+        }
+    }
+
+    fn validate_operands(ops: &[Option<EinsumOperand<'_>>]) -> crate::Result<()> {
+        for op in ops.iter().flatten() {
+            if op.is_c64() {
+                return Err(crate::EinsumError::TypeMismatch {
+                    output_type: "f64",
+                    computed_type: "Complex64",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl EinsumScalar for Complex64 {
+    fn type_name() -> &'static str {
+        "Complex64"
+    }
+
+    fn extract_data<'a>(op: EinsumOperand<'a>) -> crate::Result<StridedData<'a, Complex64>> {
+        match op {
+            EinsumOperand::C64(data) => Ok(data),
+            EinsumOperand::F64(data) => {
+                // Promote f64 → Complex64.
+                // First materialize to col-major f64, then convert elements.
+                let view = data.as_view();
+                let dims = view.dims().to_vec();
+                let strides = col_major_strides(&dims);
+                let mut f64_col = StridedArray::<f64>::col_major(&dims);
+                copy_into(&mut f64_col.view_mut(), &view)
+                    .expect("copy_into failed in extract_data");
+                let c64_data: Vec<Complex64> = f64_col
+                    .data()
+                    .iter()
+                    .map(|&x| Complex64::new(x, 0.0))
+                    .collect();
+                let c64_array = StridedArray::from_parts(c64_data, &dims, &strides, 0)
+                    .expect("from_parts failed in extract_data");
+                Ok(StridedData::Owned(c64_array))
+            }
+        }
+    }
+
+    fn validate_operands(_ops: &[Option<EinsumOperand<'_>>]) -> crate::Result<()> {
+        // Complex64 output accepts both f64 and c64 operands
+        Ok(())
     }
 }
 
