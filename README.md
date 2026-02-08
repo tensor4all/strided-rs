@@ -11,6 +11,7 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 - [`strided-kernel`](strided-kernel/README.md): cache-optimized elementwise/reduction kernels over strided views
 - [`strided-einsum2`](strided-einsum2/README.md): binary einsum (`einsum2_into`) on strided tensors
 - [`strided-opteinsum`](strided-opteinsum/README.md): N-ary einsum frontend with nested notation and contraction-order optimization
+- [`mdarray-opteinsum`](mdarray-opteinsum/): einsum wrapper for `mdarray` arrays (row-major ↔ column-major transparent conversion)
 
 ## Features
 

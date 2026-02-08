@@ -1,0 +1,28 @@
+[package]
+name = "mdarray-opteinsum"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
+repository = "https://github.com/tensor4all/strided-rs"
+description = "N-ary einsum frontend for mdarray arrays, powered by strided-opteinsum."
+publish = false
+
+[dependencies]
+mdarray = "0.8.0"
+strided-opteinsum = { path = "../strided-opteinsum", default-features = false }
+strided-view = { path = "../strided-view" }
+strided-kernel = { path = "../strided-kernel" }
+num-complex = "0.4"
+num-traits = "0.2"
+thiserror = "1.0"
+
+[features]
+default = ["faer"]
+faer = ["strided-opteinsum/faer"]
+blas = ["strided-opteinsum/blas"]
+
+[dev-dependencies]
+approx = "0.5"
+num-complex = "0.4"
