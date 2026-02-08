@@ -831,6 +831,11 @@ impl<T> StridedArray<T> {
         })
     }
 
+    /// Consume the array and return the backing `Vec<T>`.
+    pub fn into_data(self) -> Vec<T> {
+        self.data
+    }
+
     /// Iterate over all elements in memory order.
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.data.iter()
@@ -839,6 +844,32 @@ impl<T> StridedArray<T> {
     /// Mutable iteration over all elements in memory order.
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
         self.data.iter_mut()
+    }
+}
+
+impl<T: Default> StridedArray<T> {
+    /// Create a column-major tensor reusing an existing buffer.
+    ///
+    /// If `buf` has at least `product(dims)` elements, it is truncated and
+    /// zeroed.  Otherwise a fresh buffer is allocated.
+    pub fn col_major_from_buffer(mut buf: Vec<T>, dims: &[usize]) -> Self {
+        let total: usize = dims.iter().product();
+        if buf.len() >= total {
+            buf.truncate(total);
+        } else {
+            buf.resize_with(total, T::default);
+        }
+        // Zero the reused region
+        for v in buf.iter_mut() {
+            *v = T::default();
+        }
+        let strides = col_major_strides(dims);
+        Self {
+            data: buf,
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
+            offset: 0,
+        }
     }
 }
 

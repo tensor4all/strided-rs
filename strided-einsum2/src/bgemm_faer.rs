@@ -163,12 +163,11 @@ where
         Accum::Add
     };
 
-    let mut batch_iter = MultiIndex::new(batch_dims);
-    while batch_iter.next().is_some() {
-        let a_batch_off = batch_iter.offset(a_batch_strides);
-        let b_batch_off = batch_iter.offset(b_batch_strides);
-        let c_batch_off = batch_iter.offset(c_batch_strides);
+    let cj_a = if conj_a { Conj::Yes } else { Conj::No };
+    let cj_b = if conj_b { Conj::Yes } else { Conj::No };
 
+    // Inline closure for per-batch GEMM (shared between fast and slow paths)
+    let do_batch = |a_batch_off: isize, b_batch_off: isize, c_batch_off: isize| {
         // Pre-scale C by beta if beta is not 0 or 1
         if !is_beta_zero && !is_beta_one {
             let c_base = unsafe { c_ptr.offset(c_batch_off) };
@@ -196,9 +195,35 @@ where
                 c_col_stride,
             );
 
-            let cj_a = if conj_a { Conj::Yes } else { Conj::No };
-            let cj_b = if conj_b { Conj::Yes } else { Conj::No };
             matmul_with_conj(c_mat, accum, a_mat, cj_a, b_mat, cj_b, alpha, Par::rayon(0));
+        }
+    };
+
+    // Fast path: when batch dims are contiguous for all operands, use pointer
+    // increments instead of MultiIndex carry-based iteration.
+    let fused_a = try_fuse_group(batch_dims, a_batch_strides);
+    let fused_b = try_fuse_group(batch_dims, b_batch_strides);
+    let fused_c = try_fuse_group(batch_dims, c_batch_strides);
+
+    if let (Some((total, a_step)), Some((_, b_step)), Some((_, c_step))) =
+        (fused_a, fused_b, fused_c)
+    {
+        let mut a_off = 0isize;
+        let mut b_off = 0isize;
+        let mut c_off = 0isize;
+        for _ in 0..total {
+            do_batch(a_off, b_off, c_off);
+            a_off += a_step;
+            b_off += b_step;
+            c_off += c_step;
+        }
+    } else {
+        let mut batch_iter = MultiIndex::new(batch_dims);
+        while batch_iter.next().is_some() {
+            let a_batch_off = batch_iter.offset(a_batch_strides);
+            let b_batch_off = batch_iter.offset(b_batch_strides);
+            let c_batch_off = batch_iter.offset(c_batch_strides);
+            do_batch(a_batch_off, b_batch_off, c_batch_off);
         }
     }
 
@@ -268,12 +293,8 @@ where
     let conj_a = if a.conj() { Conj::Yes } else { Conj::No };
     let conj_b = if b.conj() { Conj::Yes } else { Conj::No };
 
-    let mut batch_iter = MultiIndex::new(batch_dims);
-    while batch_iter.next().is_some() {
-        let a_batch_off = batch_iter.offset(a_batch_strides);
-        let b_batch_off = batch_iter.offset(b_batch_strides);
-        let c_batch_off = batch_iter.offset(c_batch_strides);
-
+    // Inline closure for per-batch GEMM (shared between fast and slow paths)
+    let do_batch = |a_batch_off: isize, b_batch_off: isize, c_batch_off: isize| {
         // Pre-scale C by beta if beta is not 0 or 1
         if !is_beta_zero && !is_beta_one {
             let c_base = unsafe { c_ptr.offset(c_batch_off) };
@@ -311,6 +332,34 @@ where
                 alpha,
                 Par::rayon(0),
             );
+        }
+    };
+
+    // Fast path: when batch dims are contiguous for all operands, use pointer
+    // increments instead of MultiIndex carry-based iteration.
+    let fused_a = try_fuse_group(batch_dims, a_batch_strides);
+    let fused_b = try_fuse_group(batch_dims, b_batch_strides);
+    let fused_c = try_fuse_group(batch_dims, c_batch_strides);
+
+    if let (Some((total, a_step)), Some((_, b_step)), Some((_, c_step))) =
+        (fused_a, fused_b, fused_c)
+    {
+        let mut a_off = 0isize;
+        let mut b_off = 0isize;
+        let mut c_off = 0isize;
+        for _ in 0..total {
+            do_batch(a_off, b_off, c_off);
+            a_off += a_step;
+            b_off += b_step;
+            c_off += c_step;
+        }
+    } else {
+        let mut batch_iter = MultiIndex::new(batch_dims);
+        while batch_iter.next().is_some() {
+            let a_batch_off = batch_iter.offset(a_batch_strides);
+            let b_batch_off = batch_iter.offset(b_batch_strides);
+            let c_batch_off = batch_iter.offset(c_batch_strides);
+            do_batch(a_batch_off, b_batch_off, c_batch_off);
         }
     }
 
