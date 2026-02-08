@@ -1,7 +1,8 @@
 //! Reduce operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block_preordered, sequential_contiguous_layout, total_len,
+    build_plan_fused, for_each_inner_block_preordered, same_contiguous_layout,
+    sequential_contiguous_layout, total_len,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
@@ -42,6 +43,33 @@ where
             }
             acc
         }));
+    }
+
+    // Parallel contiguous fast path: split into rayon chunks with slice-based iteration.
+    // This enables LLVM auto-vectorization on each chunk, unlike the general threaded path
+    // which uses scalar pointer-offset loops.
+    #[cfg(feature = "parallel")]
+    {
+        let total = total_len(src_dims);
+        if total > MINTHREADLENGTH && same_contiguous_layout(src_dims, &[src_strides]).is_some() {
+            let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total) };
+            use rayon::prelude::*;
+            let nthreads = rayon::current_num_threads();
+            let chunk_size = (total + nthreads - 1) / nthreads;
+            let result = src_slice
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    simd::dispatch_if_large(chunk.len(), || {
+                        let mut acc = init.clone();
+                        for &val in chunk.iter() {
+                            acc = reduce_fn(acc, map_fn(Op::apply(val)));
+                        }
+                        acc
+                    })
+                })
+                .reduce(|| init.clone(), |a, b| reduce_fn(a, b));
+            return Ok(result);
+        }
     }
 
     let strides_list: [&[isize]; 1] = [src_strides];

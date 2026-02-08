@@ -636,17 +636,37 @@ pub fn sum<
     #[cfg(feature = "simd")]
     {
         let len = total_len(src.dims());
-        if sequential_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
+        if same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
             if TypeId::of::<T>() == TypeId::of::<f32>() {
-                let src = unsafe { std::slice::from_raw_parts(src.ptr() as *const f32, len) };
-                // Safety: T == f32 (checked via TypeId), so bitcast is valid.
-                let out = simd::sum_f32(src);
-                // Safety: out is f32 and T == f32.
+                let src_slice = unsafe { std::slice::from_raw_parts(src.ptr() as *const f32, len) };
+                #[cfg(feature = "parallel")]
+                if len > MINTHREADLENGTH {
+                    use rayon::prelude::*;
+                    let nthreads = rayon::current_num_threads();
+                    let chunk_size = (len + nthreads - 1) / nthreads;
+                    let out: f32 = src_slice
+                        .par_chunks(chunk_size)
+                        .map(|chunk| simd::sum_f32(chunk))
+                        .sum();
+                    return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
+                }
+                let out = simd::sum_f32(src_slice);
                 return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
             }
             if TypeId::of::<T>() == TypeId::of::<f64>() {
-                let src = unsafe { std::slice::from_raw_parts(src.ptr() as *const f64, len) };
-                let out = simd::sum_f64(src);
+                let src_slice = unsafe { std::slice::from_raw_parts(src.ptr() as *const f64, len) };
+                #[cfg(feature = "parallel")]
+                if len > MINTHREADLENGTH {
+                    use rayon::prelude::*;
+                    let nthreads = rayon::current_num_threads();
+                    let chunk_size = (len + nthreads - 1) / nthreads;
+                    let out: f64 = src_slice
+                        .par_chunks(chunk_size)
+                        .map(|chunk| simd::sum_f64(chunk))
+                        .sum();
+                    return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
+                }
+                let out = simd::sum_f64(src_slice);
                 return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
             }
         }
