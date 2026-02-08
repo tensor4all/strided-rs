@@ -20,6 +20,55 @@ map_into(&mut dst.view_mut(), &src.view(), |x| 2.0 * x).unwrap();
 assert_eq!(dst.get(&[1, 2]), 10.0);
 ```
 
+## Map and Reduce Operations
+
+```rust
+use strided_kernel::{StridedArray, map_into, zip_map2_into, reduce};
+
+let a = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[0] as f64);
+let b = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[1] as f64);
+let mut out = StridedArray::<f64>::row_major(&[4, 5]);
+
+// Unary map: dest[i] = f(src[i])
+map_into(&mut out.view_mut(), &a.view(), |x| x * 2.0).unwrap();
+
+// Binary zip map: dest[i] = f(a[i], b[i])
+zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
+
+// Full reduction
+let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
+```
+
+## High-Level Operations
+
+```rust
+use strided_kernel::{StridedArray, copy_into, add, dot, symmetrize_into};
+
+let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
+let mut out = StridedArray::<f64>::row_major(&[4, 4]);
+
+// Copy
+copy_into(&mut out.view_mut(), &a.view()).unwrap();
+
+// Element-wise add: dest[i] += src[i]
+add(&mut out.view_mut(), &a.view()).unwrap();
+
+// Dot product
+let d = dot(&a.view(), &a.view()).unwrap();
+
+// Symmetrize: dest = (src + src^T) / 2
+symmetrize_into(&mut out.view_mut(), &a.view()).unwrap();
+```
+
+## Cache Optimization
+
+The library automatically optimizes iteration order for cache efficiency:
+
+1. **Dimension Fusion**: Contiguous dimensions are fused to reduce loop overhead
+2. **Dimension Reordering**: Dimensions are sorted by stride magnitude for optimal memory access
+3. **Tiled Iteration**: Operations are blocked to fit in L1 cache (32KB)
+4. **Contiguous Fast Paths**: Contiguous arrays bypass blocking for direct iteration
+
 ## Parallel Feature
 
 ```toml

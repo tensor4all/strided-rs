@@ -1,8 +1,9 @@
 //! Reduce operations on dynamic-rank strided views.
 
+#[cfg(feature = "parallel")]
+use crate::kernel::same_contiguous_layout;
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block_preordered, same_contiguous_layout,
-    sequential_contiguous_layout, total_len,
+    build_plan_fused, for_each_inner_block_preordered, sequential_contiguous_layout, total_len,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
