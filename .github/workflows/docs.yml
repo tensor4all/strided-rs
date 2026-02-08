@@ -39,6 +39,7 @@ jobs:
           <a href="strided_einsum2/">strided-einsum2</a>
           <a href="strided_opteinsum/">strided-opteinsum</a>
           <a href="mdarray_opteinsum/">mdarray-opteinsum</a>
+          <a href="ndarray_opteinsum/">ndarray-opteinsum</a>
           </body></html>
           EOF
       - uses: actions/upload-pages-artifact@v3

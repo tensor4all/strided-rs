@@ -12,6 +12,7 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 - [`strided-einsum2`](strided-einsum2/README.md): binary einsum (`einsum2_into`) on strided tensors
 - [`strided-opteinsum`](strided-opteinsum/README.md): N-ary einsum frontend with nested notation and contraction-order optimization
 - [`mdarray-opteinsum`](mdarray-opteinsum/): einsum wrapper for `mdarray` arrays (row-major ↔ column-major transparent conversion)
+- [`ndarray-opteinsum`](ndarray-opteinsum/): einsum wrapper for `ndarray` arrays (direct strides passthrough)
 
 ## Features
 
@@ -73,6 +74,7 @@ See each sub-crate README for detailed API examples and benchmarks:
 - [`strided-einsum2`](strided-einsum2/README.md) — binary einsum with GEMM backend
 - [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum, [benchmarks](strided-opteinsum/README.md#benchmarks)
 - [`mdarray-opteinsum`](mdarray-opteinsum/README.md) — einsum wrapper for `mdarray` arrays
+- [`ndarray-opteinsum`](ndarray-opteinsum/README.md) — einsum wrapper for `ndarray` arrays
 
 ## Acknowledgments
 
