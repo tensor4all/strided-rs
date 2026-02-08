@@ -261,13 +261,10 @@ where
             // auto-vectorize the contiguous inner loop.
             if out_step == 1 && src_step == 1 && axis_len > 1 {
                 let n = len as usize;
-                let out_slice = unsafe {
-                    std::slice::from_raw_parts_mut(out_ptr.offset(offsets[0]), n)
-                };
+                let out_slice =
+                    unsafe { std::slice::from_raw_parts_mut(out_ptr.offset(offsets[0]), n) };
                 // First reduction element → initialize output
-                let src0 = unsafe {
-                    std::slice::from_raw_parts(src_ptr.offset(offsets[1]), n)
-                };
+                let src0 = unsafe { std::slice::from_raw_parts(src_ptr.offset(offsets[1]), n) };
                 for i in 0..n {
                     out_slice[i] = map_fn(Op::apply(src0[i]));
                 }
@@ -280,8 +277,7 @@ where
                         )
                     };
                     for i in 0..n {
-                        out_slice[i] =
-                            reduce_fn(out_slice[i].clone(), map_fn(Op::apply(src_k[i])));
+                        out_slice[i] = reduce_fn(out_slice[i].clone(), map_fn(Op::apply(src_k[i])));
                     }
                 }
                 return Ok(());
