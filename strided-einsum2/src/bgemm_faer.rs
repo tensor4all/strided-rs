@@ -301,7 +301,16 @@ where
                 c_col_stride,
             );
 
-            matmul_with_conj(c_mat, accum, a_mat, conj_a, b_mat, conj_b, alpha, Par::rayon(0));
+            matmul_with_conj(
+                c_mat,
+                accum,
+                a_mat,
+                conj_a,
+                b_mat,
+                conj_b,
+                alpha,
+                Par::rayon(0),
+            );
         }
     }
 
