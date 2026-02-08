@@ -198,7 +198,7 @@ where
 
             let cj_a = if conj_a { Conj::Yes } else { Conj::No };
             let cj_b = if conj_b { Conj::Yes } else { Conj::No };
-            matmul_with_conj(c_mat, accum, a_mat, cj_a, b_mat, cj_b, alpha, Par::Seq);
+            matmul_with_conj(c_mat, accum, a_mat, cj_a, b_mat, cj_b, alpha, Par::rayon(0));
         }
     }
 
@@ -301,7 +301,7 @@ where
                 c_col_stride,
             );
 
-            matmul_with_conj(c_mat, accum, a_mat, conj_a, b_mat, conj_b, alpha, Par::Seq);
+            matmul_with_conj(c_mat, accum, a_mat, conj_a, b_mat, conj_b, alpha, Par::rayon(0));
         }
     }
 
