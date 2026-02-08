@@ -34,17 +34,19 @@ impl BufferPool {
 
     fn acquire_col_major_f64(&mut self, dims: &[usize]) -> StridedArray<f64> {
         let total: usize = dims.iter().product();
+        // SAFETY: einsum2_into with beta=0 writes every output element before reading.
         match self.f64_pool.get_mut(&total).and_then(|v| v.pop()) {
-            Some(buf) => StridedArray::col_major_from_buffer(buf, dims),
-            None => StridedArray::col_major(dims),
+            Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
+            None => unsafe { StridedArray::col_major_uninit(dims) },
         }
     }
 
     fn acquire_col_major_c64(&mut self, dims: &[usize]) -> StridedArray<Complex64> {
         let total: usize = dims.iter().product();
+        // SAFETY: einsum2_into with beta=0 writes every output element before reading.
         match self.c64_pool.get_mut(&total).and_then(|v| v.pop()) {
-            Some(buf) => StridedArray::col_major_from_buffer(buf, dims),
-            None => StridedArray::col_major(dims),
+            Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
+            None => unsafe { StridedArray::col_major_uninit(dims) },
         }
     }
 

@@ -873,6 +873,44 @@ impl<T: Default> StridedArray<T> {
     }
 }
 
+impl<T: Copy> StridedArray<T> {
+    /// Create a column-major tensor with **uninitialized** data.
+    ///
+    /// # Safety
+    /// Caller must write every element before reading.
+    pub unsafe fn col_major_uninit(dims: &[usize]) -> Self {
+        let total: usize = dims.iter().product();
+        let mut data = Vec::with_capacity(total);
+        data.set_len(total);
+        let strides = col_major_strides(dims);
+        Self {
+            data,
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
+            offset: 0,
+        }
+    }
+
+    /// Reuse an existing buffer as a column-major tensor **without zeroing**.
+    ///
+    /// # Safety
+    /// Caller must write every element before reading.
+    pub unsafe fn col_major_from_buffer_uninit(mut buf: Vec<T>, dims: &[usize]) -> Self {
+        let total: usize = dims.iter().product();
+        if buf.capacity() < total {
+            buf.reserve(total - buf.len());
+        }
+        buf.set_len(total);
+        let strides = col_major_strides(dims);
+        Self {
+            data: buf,
+            dims: Arc::from(dims),
+            strides: Arc::from(strides),
+            offset: 0,
+        }
+    }
+}
+
 impl<T: Copy + ElementOpApply> StridedArray<T> {
     /// Get an element by multi-dimensional index.
     pub fn get(&self, indices: &[usize]) -> T {

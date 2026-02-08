@@ -336,12 +336,23 @@ where
 
     // 2. Fast path: element-wise (all batch, no contraction)
     if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
-        let mul_fn = move |a_val: T, b_val: T| -> T {
-            let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
-            let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
-            alpha * a_c * b_c
-        };
-        zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        if alpha == T::one() && !conj_a && !conj_b {
+            zip_map2_into(&mut c_perm, &a_perm, &b_perm, |a_val, b_val| a_val * b_val)?;
+        } else if alpha == T::one() {
+            let mul_fn = move |a_val: T, b_val: T| -> T {
+                let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
+                let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
+                a_c * b_c
+            };
+            zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        } else {
+            let mul_fn = move |a_val: T, b_val: T| -> T {
+                let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
+                let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
+                alpha * a_c * b_c
+            };
+            zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        }
         return Ok(());
     }
 
