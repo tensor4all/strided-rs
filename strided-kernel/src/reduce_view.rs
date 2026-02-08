@@ -255,9 +255,41 @@ where
         |offsets, len, strides| {
             let out_step = strides[0];
             let src_step = strides[1];
+
+            // Fast path: when both output and source have stride 1, swap to
+            // reduction-outer / output-inner with slices so LLVM can
+            // auto-vectorize the contiguous inner loop.
+            if out_step == 1 && src_step == 1 && axis_len > 1 {
+                let n = len as usize;
+                let out_slice = unsafe {
+                    std::slice::from_raw_parts_mut(out_ptr.offset(offsets[0]), n)
+                };
+                // First reduction element → initialize output
+                let src0 = unsafe {
+                    std::slice::from_raw_parts(src_ptr.offset(offsets[1]), n)
+                };
+                for i in 0..n {
+                    out_slice[i] = map_fn(Op::apply(src0[i]));
+                }
+                // Remaining reduction elements → accumulate
+                for k in 1..axis_len {
+                    let src_k = unsafe {
+                        std::slice::from_raw_parts(
+                            src_ptr.offset(offsets[1] + k as isize * axis_stride),
+                            n,
+                        )
+                    };
+                    for i in 0..n {
+                        out_slice[i] =
+                            reduce_fn(out_slice[i].clone(), map_fn(Op::apply(src_k[i])));
+                    }
+                }
+                return Ok(());
+            }
+
+            // General path: output-outer, reduction-inner
             let mut out_off = offsets[0];
             let mut src_off = offsets[1];
-
             for _ in 0..len {
                 let mut acc = init.clone();
                 let mut ptr = unsafe { src_ptr.offset(src_off) };
