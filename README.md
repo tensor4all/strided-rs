@@ -72,6 +72,7 @@ See each sub-crate README for detailed API examples and benchmarks:
 - [`strided-kernel`](strided-kernel/README.md) — map/reduce/broadcast kernels, [benchmarks](strided-kernel/README.md#benchmarks)
 - [`strided-einsum2`](strided-einsum2/README.md) — binary einsum with GEMM backend
 - [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum, [benchmarks](strided-opteinsum/README.md#benchmarks)
+- [`mdarray-opteinsum`](mdarray-opteinsum/README.md) — einsum wrapper for `mdarray` arrays
 
 ## Acknowledgments
 
