@@ -11,6 +11,59 @@ use crate::parse::{EinsumCode, EinsumNode};
 use crate::single_tensor::single_tensor_einsum;
 
 // ---------------------------------------------------------------------------
+// Buffer pool for intermediate reuse
+// ---------------------------------------------------------------------------
+
+/// Reusable buffer pool for intermediate tensor allocations.
+///
+/// Tracks freed `Vec<f64>` and `Vec<Complex64>` buffers indexed by length.
+/// When a contraction step completes, its input buffers are returned to the
+/// pool. Subsequent steps can reuse these buffers instead of allocating fresh.
+struct BufferPool {
+    f64_pool: HashMap<usize, Vec<Vec<f64>>>,
+    c64_pool: HashMap<usize, Vec<Vec<Complex64>>>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            f64_pool: HashMap::new(),
+            c64_pool: HashMap::new(),
+        }
+    }
+
+    fn acquire_col_major_f64(&mut self, dims: &[usize]) -> StridedArray<f64> {
+        let total: usize = dims.iter().product();
+        match self.f64_pool.get_mut(&total).and_then(|v| v.pop()) {
+            Some(buf) => StridedArray::col_major_from_buffer(buf, dims),
+            None => StridedArray::col_major(dims),
+        }
+    }
+
+    fn acquire_col_major_c64(&mut self, dims: &[usize]) -> StridedArray<Complex64> {
+        let total: usize = dims.iter().product();
+        match self.c64_pool.get_mut(&total).and_then(|v| v.pop()) {
+            Some(buf) => StridedArray::col_major_from_buffer(buf, dims),
+            None => StridedArray::col_major(dims),
+        }
+    }
+
+    fn release_f64(&mut self, data: StridedData<'_, f64>) {
+        if let StridedData::Owned(arr) = data {
+            let buf = arr.into_data();
+            self.f64_pool.entry(buf.len()).or_default().push(buf);
+        }
+    }
+
+    fn release_c64(&mut self, data: StridedData<'_, Complex64>) {
+        if let StridedData::Owned(arr) = data {
+            let buf = arr.into_data();
+            self.c64_pool.entry(buf.len()).or_default().push(buf);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper: collect all index chars from a subtree, preserving first-seen order
 // ---------------------------------------------------------------------------
 
@@ -140,141 +193,70 @@ fn out_dims_from_ids(
 
 /// Contract two operands, consuming them by value. Promotes to c64 if types are mixed.
 ///
-/// When both operands are `StridedData::Owned`, dispatches to `einsum2_into_owned`
-/// which can reuse the input buffers during contiguous preparation, avoiding copies.
+/// Uses view-based `einsum2_into` so that owned input buffers can be released
+/// back to the `pool` for reuse by subsequent contraction steps.
 fn eval_pair(
     left: EinsumOperand<'_>,
     left_ids: &[char],
     right: EinsumOperand<'_>,
     right_ids: &[char],
     output_ids: &[char],
+    pool: &mut BufferPool,
 ) -> crate::Result<EinsumOperand<'static>> {
     match (left, right) {
         (EinsumOperand::F64(ld), EinsumOperand::F64(rd)) => {
             let a_dims: Vec<usize> = ld.dims().to_vec();
             let b_dims: Vec<usize> = rd.dims().to_vec();
             let out_dims = out_dims_from_ids(left_ids, &a_dims, right_ids, &b_dims, output_ids)?;
-            let mut c_arr = StridedArray::<f64>::col_major(&out_dims);
+            let mut c_arr = pool.acquire_col_major_f64(&out_dims);
 
-            match (ld, rd) {
-                (StridedData::Owned(a), StridedData::Owned(b)) => {
-                    einsum2_into_owned(
-                        c_arr.view_mut(),
-                        a,
-                        b,
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        1.0,
-                        0.0,
-                        false,
-                        false,
-                    )?;
-                }
-                (StridedData::Owned(a), StridedData::View(b)) => {
-                    einsum2_into(
-                        c_arr.view_mut(),
-                        &a.view(),
-                        &b,
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        1.0,
-                        0.0,
-                    )?;
-                }
-                (StridedData::View(a), StridedData::Owned(b)) => {
-                    einsum2_into(
-                        c_arr.view_mut(),
-                        &a,
-                        &b.view(),
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        1.0,
-                        0.0,
-                    )?;
-                }
-                (StridedData::View(a), StridedData::View(b)) => {
-                    einsum2_into(
-                        c_arr.view_mut(),
-                        &a,
-                        &b,
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        1.0,
-                        0.0,
-                    )?;
-                }
+            {
+                let a_view = ld.as_view();
+                let b_view = rd.as_view();
+                einsum2_into(
+                    c_arr.view_mut(),
+                    &a_view,
+                    &b_view,
+                    output_ids,
+                    left_ids,
+                    right_ids,
+                    1.0,
+                    0.0,
+                )?;
             }
+            pool.release_f64(ld);
+            pool.release_f64(rd);
             Ok(EinsumOperand::F64(StridedData::Owned(c_arr)))
         }
         (EinsumOperand::C64(ld), EinsumOperand::C64(rd)) => {
             let a_dims: Vec<usize> = ld.dims().to_vec();
             let b_dims: Vec<usize> = rd.dims().to_vec();
             let out_dims = out_dims_from_ids(left_ids, &a_dims, right_ids, &b_dims, output_ids)?;
-            let mut c_arr = StridedArray::<Complex64>::col_major(&out_dims);
+            let mut c_arr = pool.acquire_col_major_c64(&out_dims);
 
-            match (ld, rd) {
-                (StridedData::Owned(a), StridedData::Owned(b)) => {
-                    einsum2_into_owned(
-                        c_arr.view_mut(),
-                        a,
-                        b,
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        Complex64::new(1.0, 0.0),
-                        Complex64::zero(),
-                        false,
-                        false,
-                    )?;
-                }
-                (StridedData::Owned(a), StridedData::View(b)) => {
-                    einsum2_into(
-                        c_arr.view_mut(),
-                        &a.view(),
-                        &b,
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        Complex64::new(1.0, 0.0),
-                        Complex64::zero(),
-                    )?;
-                }
-                (StridedData::View(a), StridedData::Owned(b)) => {
-                    einsum2_into(
-                        c_arr.view_mut(),
-                        &a,
-                        &b.view(),
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        Complex64::new(1.0, 0.0),
-                        Complex64::zero(),
-                    )?;
-                }
-                (StridedData::View(a), StridedData::View(b)) => {
-                    einsum2_into(
-                        c_arr.view_mut(),
-                        &a,
-                        &b,
-                        output_ids,
-                        left_ids,
-                        right_ids,
-                        Complex64::new(1.0, 0.0),
-                        Complex64::zero(),
-                    )?;
-                }
+            {
+                let a_view = ld.as_view();
+                let b_view = rd.as_view();
+                einsum2_into(
+                    c_arr.view_mut(),
+                    &a_view,
+                    &b_view,
+                    output_ids,
+                    left_ids,
+                    right_ids,
+                    Complex64::new(1.0, 0.0),
+                    Complex64::zero(),
+                )?;
             }
+            pool.release_c64(ld);
+            pool.release_c64(rd);
             Ok(EinsumOperand::C64(StridedData::Owned(c_arr)))
         }
         (left, right) => {
             // Mixed types: promote both to c64 by consuming, then recurse (hits C64/C64 branch)
             let left_c64 = left.to_c64_owned();
             let right_c64 = right.to_c64_owned();
-            eval_pair(left_c64, left_ids, right_c64, right_ids, output_ids)
+            eval_pair(left_c64, left_ids, right_c64, right_ids, output_ids, pool)
         }
     }
 }
@@ -453,6 +435,7 @@ fn compute_permutation(input_ids: &[char], output_ids: &[char]) -> Vec<usize> {
 fn execute_nested<'a>(
     nested: &omeco::NestedEinsum<char>,
     children: &mut Vec<Option<(EinsumOperand<'a>, Vec<char>)>>,
+    pool: &mut BufferPool,
 ) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match nested {
         omeco::NestedEinsum::Leaf { tensor_index } => {
@@ -477,10 +460,10 @@ fn execute_nested<'a>(
                     args.len()
                 )));
             }
-            let (left, left_ids) = execute_nested(&args[0], children)?;
-            let (right, right_ids) = execute_nested(&args[1], children)?;
+            let (left, left_ids) = execute_nested(&args[0], children, pool)?;
+            let (right, right_ids) = execute_nested(&args[1], children, pool)?;
             let output_ids: Vec<char> = eins.iy.clone();
-            let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids)?;
+            let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids, pool)?;
             Ok((result, output_ids))
         }
     }
@@ -498,6 +481,7 @@ fn execute_nested_into<'a, T: EinsumScalar>(
     output_ids: &[char],
     alpha: T,
     beta: T,
+    pool: &mut BufferPool,
 ) -> crate::Result<()> {
     match nested {
         omeco::NestedEinsum::Node { args, eins: _ } => {
@@ -508,8 +492,8 @@ fn execute_nested_into<'a, T: EinsumScalar>(
                 )));
             }
             // Evaluate children normally (they allocate temporaries)
-            let (left, left_ids) = execute_nested(&args[0], children)?;
-            let (right, right_ids) = execute_nested(&args[1], children)?;
+            let (left, left_ids) = execute_nested(&args[0], children, pool)?;
+            let (right, right_ids) = execute_nested(&args[1], children, pool)?;
             // Root contraction writes directly into user's output
             eval_pair_into(
                 left, &left_ids, right, &right_ids, output, output_ids, alpha, beta,
@@ -560,6 +544,7 @@ fn eval_node<'a>(
     node: &EinsumNode,
     operands: &mut Vec<Option<EinsumOperand<'a>>>,
     needed_ids: &HashSet<char>,
+    pool: &mut BufferPool,
 ) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match node {
         EinsumNode::Leaf { ids, tensor_index } => {
@@ -588,7 +573,7 @@ fn eval_node<'a>(
                 1 => {
                     // Single-tensor operation.
                     let child_needed = compute_child_needed_ids(&node_output_ids, 0, args);
-                    let (child_op, child_ids) = eval_node(&args[0], operands, &child_needed)?;
+                    let (child_op, child_ids) = eval_node(&args[0], operands, &child_needed, pool)?;
 
                     // Identity passthrough: no allocation needed.
                     if child_ids == node_output_ids {
@@ -609,9 +594,10 @@ fn eval_node<'a>(
                     // Binary contraction.
                     let left_needed = compute_child_needed_ids(&node_output_ids, 0, args);
                     let right_needed = compute_child_needed_ids(&node_output_ids, 1, args);
-                    let (left, left_ids) = eval_node(&args[0], operands, &left_needed)?;
-                    let (right, right_ids) = eval_node(&args[1], operands, &right_needed)?;
-                    let result = eval_pair(left, &left_ids, right, &right_ids, &node_output_ids)?;
+                    let (left, left_ids) = eval_node(&args[0], operands, &left_needed, pool)?;
+                    let (right, right_ids) = eval_node(&args[1], operands, &right_needed, pool)?;
+                    let result =
+                        eval_pair(left, &left_ids, right, &right_ids, &node_output_ids, pool)?;
                     Ok((result, node_output_ids))
                 }
                 _ => {
@@ -622,7 +608,7 @@ fn eval_node<'a>(
                     let mut children: Vec<Option<(EinsumOperand<'a>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
-                        let (op, ids) = eval_node(arg, operands, &child_needed)?;
+                        let (op, ids) = eval_node(arg, operands, &child_needed, pool)?;
                         children.push(Some((op, ids)));
                     }
 
@@ -653,7 +639,7 @@ fn eval_node<'a>(
                         })?;
 
                     // 5. Execute the nested contraction tree
-                    let (result, result_ids) = execute_nested(&nested, &mut children)?;
+                    let (result, result_ids) = execute_nested(&nested, &mut children, pool)?;
                     Ok((result, result_ids))
                 }
             }
@@ -685,8 +671,9 @@ impl EinsumCode {
 
         let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
         let mut ops: Vec<Option<EinsumOperand<'a>>> = operands.into_iter().map(Some).collect();
+        let mut pool = BufferPool::new();
 
-        let (result, result_ids) = eval_node(&self.root, &mut ops, &final_output)?;
+        let (result, result_ids) = eval_node(&self.root, &mut ops, &final_output, &mut pool)?;
 
         // If the result ids already match the desired output, we're done.
         if result_ids == self.output_ids {
@@ -786,6 +773,7 @@ impl EinsumCode {
         }
 
         let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
+        let mut pool = BufferPool::new();
 
         match &self.root {
             EinsumNode::Leaf { ids, tensor_index } => {
@@ -802,7 +790,8 @@ impl EinsumCode {
                 1 => {
                     // Single child: evaluate, then accumulate
                     let child_needed = compute_child_needed_ids(&self.output_ids, 0, args);
-                    let (child_op, child_ids) = eval_node(&args[0], &mut ops, &child_needed)?;
+                    let (child_op, child_ids) =
+                        eval_node(&args[0], &mut ops, &child_needed, &mut pool)?;
 
                     if child_ids == self.output_ids {
                         // Identity: just accumulate
@@ -826,8 +815,9 @@ impl EinsumCode {
                     // Binary contraction: write directly into output
                     let left_needed = compute_child_needed_ids(&self.output_ids, 0, args);
                     let right_needed = compute_child_needed_ids(&self.output_ids, 1, args);
-                    let (left, left_ids) = eval_node(&args[0], &mut ops, &left_needed)?;
-                    let (right, right_ids) = eval_node(&args[1], &mut ops, &right_needed)?;
+                    let (left, left_ids) = eval_node(&args[0], &mut ops, &left_needed, &mut pool)?;
+                    let (right, right_ids) =
+                        eval_node(&args[1], &mut ops, &right_needed, &mut pool)?;
                     eval_pair_into(
                         left,
                         &left_ids,
@@ -846,7 +836,7 @@ impl EinsumCode {
                     let mut children: Vec<Option<(EinsumOperand<'_>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
-                        let (op, ids) = eval_node(arg, &mut ops, &child_needed)?;
+                        let (op, ids) = eval_node(arg, &mut ops, &child_needed, &mut pool)?;
                         children.push(Some((op, ids)));
                     }
 
@@ -880,6 +870,7 @@ impl EinsumCode {
                         &self.output_ids,
                         alpha,
                         beta,
+                        &mut pool,
                     )?;
                 }
             },
