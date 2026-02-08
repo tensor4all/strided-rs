@@ -117,6 +117,27 @@ fn out_dims_from_map(
     Ok(out_dims)
 }
 
+/// Look up output dimensions directly from left/right ids without HashMap allocation.
+fn out_dims_from_ids(
+    left_ids: &[char],
+    left_dims: &[usize],
+    right_ids: &[char],
+    right_dims: &[usize],
+    output_ids: &[char],
+) -> crate::Result<Vec<usize>> {
+    let mut out_dims = Vec::with_capacity(output_ids.len());
+    for &id in output_ids {
+        if let Some(pos) = left_ids.iter().position(|&c| c == id) {
+            out_dims.push(left_dims[pos]);
+        } else if let Some(pos) = right_ids.iter().position(|&c| c == id) {
+            out_dims.push(right_dims[pos]);
+        } else {
+            return Err(crate::EinsumError::OrphanOutputAxis(id.to_string()));
+        }
+    }
+    Ok(out_dims)
+}
+
 /// Contract two operands, consuming them by value. Promotes to c64 if types are mixed.
 ///
 /// When both operands are `StridedData::Owned`, dispatches to `einsum2_into_owned`
@@ -130,18 +151,10 @@ fn eval_pair(
 ) -> crate::Result<EinsumOperand<'static>> {
     match (left, right) {
         (EinsumOperand::F64(ld), EinsumOperand::F64(rd)) => {
-            // Build dim_map from views before destructuring
             let a_dims: Vec<usize> = ld.dims().to_vec();
             let b_dims: Vec<usize> = rd.dims().to_vec();
-            let mut dim_map: HashMap<char, usize> = HashMap::new();
-            for (i, &id) in left_ids.iter().enumerate() {
-                dim_map.insert(id, a_dims[i]);
-            }
-            for (i, &id) in right_ids.iter().enumerate() {
-                dim_map.insert(id, b_dims[i]);
-            }
-            let out_dims = out_dims_from_map(&dim_map, output_ids)?;
-            let mut c_arr = StridedArray::<f64>::row_major(&out_dims);
+            let out_dims = out_dims_from_ids(left_ids, &a_dims, right_ids, &b_dims, output_ids)?;
+            let mut c_arr = StridedArray::<f64>::col_major(&out_dims);
 
             match (ld, rd) {
                 (StridedData::Owned(a), StridedData::Owned(b)) => {
@@ -200,15 +213,8 @@ fn eval_pair(
         (EinsumOperand::C64(ld), EinsumOperand::C64(rd)) => {
             let a_dims: Vec<usize> = ld.dims().to_vec();
             let b_dims: Vec<usize> = rd.dims().to_vec();
-            let mut dim_map: HashMap<char, usize> = HashMap::new();
-            for (i, &id) in left_ids.iter().enumerate() {
-                dim_map.insert(id, a_dims[i]);
-            }
-            for (i, &id) in right_ids.iter().enumerate() {
-                dim_map.insert(id, b_dims[i]);
-            }
-            let out_dims = out_dims_from_map(&dim_map, output_ids)?;
-            let mut c_arr = StridedArray::<Complex64>::row_major(&out_dims);
+            let out_dims = out_dims_from_ids(left_ids, &a_dims, right_ids, &b_dims, output_ids)?;
+            let mut c_arr = StridedArray::<Complex64>::col_major(&out_dims);
 
             match (ld, rd) {
                 (StridedData::Owned(a), StridedData::Owned(b)) => {
