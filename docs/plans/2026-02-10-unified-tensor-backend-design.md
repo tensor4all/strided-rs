@@ -1,5 +1,5 @@
 # strided-rs: Unified Tensor Backend Design Specification
-**Version:** 1.2 (Feb 2026)
+**Version:** 1.3 (Feb 2026)
 **Scope:** Tensor4all Layer 1 Integration (CPU/NVIDIA/AMD)
 
 ---
@@ -288,32 +288,115 @@ Complex64  buffer: [re₀, im₀, re₁, im₁, ...]  (f32 × 2N elements)
 - **GEMM:** Delegated to BLAS libraries (cuBLAS/hipBLAS) which natively handle `cuDoubleComplex` / `hipDoubleComplex` (interleaved layout, ABI-compatible with `[f64; 2]`).
 - **Element-wise:** Kernels index `buffer[2*i]` (real) and `buffer[2*i+1]` (imag), compute using real-valued built-in math functions.
 
-## 9. Execution Pipeline
+## 9. Workspace Crate Structure
+
+### 9.1 Overview
+
+```
+strided-rs/
+├── strided-view/          # StridedArrayView types (zero-copy view abstraction)
+├── strided-kernel/        # CPU cache-optimized map/reduce/broadcast kernels
+├── strided-device/        # [NEW] Device abstraction, GPU ops, memory, BLAS dispatch
+├── strided-einsum2/       # Binary einsum (GEMM backend)
+├── strided-opteinsum/     # N-ary einsum with contraction tree optimization
+├── strided-linalg/        # [NEW] SVD, QR, LU, Cholesky, eigendecomposition
+├── ndarray-opteinsum/     # ndarray frontend for opteinsum
+└── mdarray-opteinsum/     # mdarray frontend for opteinsum
+```
+
+### 9.2 Dependency Graph
+
+```
+strided-view
+    ↑
+    ├── strided-kernel          (CPU ops: map, reduce, broadcast)
+    │
+    └── strided-device          (device mgmt, GPU ops, BLAS/LAPACK dispatch)
+         │  ├── device.rs       Device enum, runtime detection
+         │  ├── stream.rs       Unified stream (CPU thread pool / GPU stream)
+         │  ├── memory.rs       Memory pool, recycling, async safety
+         │  ├── blas.rs         cuBLAS/hipBLAS Zgemm via dlopen
+         │  ├── solver.rs       cuSOLVER/hipSOLVER via dlopen
+         │  └── elementwise.rs  GPU element-wise kernels (CubeCL JIT)
+         │
+         ├── strided-einsum2    (binary einsum → blas.rs for GEMM)
+         ├── strided-linalg     (SVD/QR → solver.rs for LAPACK)
+         └── strided-opteinsum  (N-ary einsum → einsum2 + linalg)
+```
+
+### 9.3 strided-device (New Crate)
+
+Central device abstraction layer. All GPU-related functionality lives here.
+
+**Responsibilities:**
+- `Device` enum and runtime GPU detection
+- Unified `Stream` abstraction (Rayon thread pool / CUDA stream / HIP stream)
+- GPU memory pool with slab allocation and async-safe recycling
+- BLAS dispatch: cuBLAS/hipBLAS via dlopen (`cudarc` for CUDA, `libloading` for ROCm)
+- LAPACK dispatch: cuSOLVER/hipSOLVER via dlopen
+- GPU element-wise kernels: CubeCL JIT (interleaved f64 for complex) or NVRTC/HIPRTC fallback
+- `TensorPromise` for async execution
+
+**Why one crate:** GPU element-wise, BLAS, solver, memory, and streams are all tied to a `Device`. Splitting them would create circular dependencies or excessive coupling between crates.
+
+```rust
+// Cargo.toml for strided-device
+[features]
+default = []
+cpu-faer = ["faer"]
+cpu-accelerate = ["accelerate-src"]
+cuda = ["cudarc"]
+rocm = ["libloading"]
+cubecl = ["cubecl-core", "cubecl-cuda"]  # optional, for GPU element-wise
+```
+
+### 9.4 strided-linalg (New Crate)
+
+Dense linear algebra decompositions.
+
+| Operation | CPU Backend | GPU Backend |
+|-----------|-------------|-------------|
+| SVD | faer / Accelerate LAPACK | cuSOLVER `Zgesvd` / hipSOLVER |
+| QR | faer / Accelerate LAPACK | cuSOLVER `Zgeqrf` / hipSOLVER |
+| LU | faer / Accelerate LAPACK | cuSOLVER `Zgetrf` / hipSOLVER |
+| Cholesky | faer / Accelerate LAPACK | cuSOLVER `Zpotrf` / hipSOLVER |
+| Eigendecomposition | faer / Accelerate LAPACK | cuSOLVER `Zheevd` / hipSOLVER |
+
+Depends on `strided-device` for backend dispatch and `strided-view` for input/output types.
+
+### 9.5 strided-kernel (Unchanged)
+
+Remains CPU-only. Contains the cache-optimized map/reduce/broadcast implementation ported from Strided.jl. No GPU code, no renaming for now.
+
+Future consideration: rename to `strided-cpu-ops` if the "kernel" naming causes confusion.
+
+## 10. Execution Pipeline
 
 1. **Definition**: User calls `einsum(..., &device, &stream)`.
 2. **Planning**: Select the appropriate kernel backend based on device:
    - `Device::Cpu(_)` → faer or Accelerate
    - `Device::Cuda(_)` → cuBLAS Zgemm (dlopen via cudarc)
    - `Device::Rocm(_)` → hipBLAS Zgemm (dlopen via hiparc)
-3. **Allocation**: Acquire an output buffer from the memory pool via recycling.
+3. **Allocation**: Acquire an output buffer from the memory pool via recycling (`strided-device` memory pool).
 4. **Dispatch**: Submit the operation to the stream and immediately return a `TensorPromise`.
 5. **Completion**: Once computation finishes, the buffer becomes "available" for subsequent operations or data retrieval back to the CPU.
 
 ---
 
-## 10. Open Design Questions
+## 11. Open Design Questions
 
 - How to represent device placement in the type system (type-level vs. runtime enum)?
 - Ownership model for cross-device transfers (copy semantics vs. move semantics)?
 - Error propagation strategy for async failures surfaced at `.wait()` time.
-- Integration boundary between `strided-kernel` (existing CPU kernels) and the new stream/device abstraction.
 - Whether `TensorPromise` should implement `Future` for `async`/`await` interop.
 - Should Accelerate be auto-selected on macOS, or require explicit feature flag?
 - CubeCL f64 fix: contribute upstream or maintain a fork?
 - Kernel caching strategy for NVRTC/HIPRTC compiled kernels (compile once, reuse across calls).
 - ROCm device validation strategy to avoid crashes on unsupported architectures.
+- Should `strided-kernel` be renamed to `strided-cpu-ops` to avoid ambiguity with GPU "kernels"?
+- How should `strided-linalg` expose truncated SVD (rank-k approximation)?
 
-## 11. External Dependencies & Upstream Contributions
+## 12. External Dependencies & Upstream Contributions
 
 | Dependency | Role | Status | Action Needed |
 |---|---|---|---|
@@ -327,3 +410,4 @@ Complex64  buffer: [re₀, im₀, re₁, im₁, ...]  (f32 × 2N elements)
 *Origin: Gemini brainstorm - Feb 2026*
 *v1.1: Excluded Metal GPU; added Accelerate; added backend matrix*
 *v1.2: Added runtime loading strategy; GPU element-wise kernel analysis; CubeCL f64/complex status; type support roadmap; hybrid GEMM+CubeCL architecture*
+*v1.3: Added workspace crate structure (strided-device, strided-linalg); dependency graph; crate responsibilities*
