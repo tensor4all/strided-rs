@@ -95,3 +95,5 @@ Environment: Apple Silicon M2, single-threaded. Mean time (ms).
 
 - Current parser accepts ASCII lowercase index labels.
 - Generative output notation such as `->ii` is tracked in GitHub issues.
+
+See also [benchmark suite](https://github.com/tensor4all/strided-rs-benchmark-suite) for strided-rs based on the einsum benchmark
