@@ -23,6 +23,9 @@ use num_traits::Num;
 ///   Adj  | Adj  | Trans| Conj  | Id
 /// ```
 pub trait ElementOp: Copy + Default + 'static {
+    /// Whether this operation is the identity (no-op).
+    const IS_IDENTITY: bool = false;
+
     /// Apply the operation to a value.
     fn apply<T: ElementOpApply>(value: T) -> T;
 
@@ -107,6 +110,8 @@ pub struct Adjoint;
 
 // Identity implementations
 impl ElementOp for Identity {
+    const IS_IDENTITY: bool = true;
+
     #[inline(always)]
     fn apply<T: ElementOpApply>(value: T) -> T {
         value

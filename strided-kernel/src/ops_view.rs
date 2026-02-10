@@ -11,7 +11,6 @@ use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use num_traits::Zero;
-use std::any::TypeId;
 use std::ops::{Add, Mul};
 use strided_view::{ElementOp, ElementOpApply};
 
@@ -200,7 +199,7 @@ pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
         let len = total_len(dst_dims);
-        if TypeId::of::<Op>() == TypeId::of::<crate::Identity>() {
+        if Op::IS_IDENTITY {
             debug_assert!(
                 {
                     let nbytes = len
@@ -626,48 +625,46 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeS
     )
 }
 
+#[cfg(feature = "parallel")]
+fn parallel_simd_sum<T: Copy + Zero + Add<Output = T> + simd::MaybeSimdOps + Send + Sync>(
+    src: &[T],
+) -> Option<T> {
+    use rayon::prelude::*;
+    // Check that T has SIMD support
+    if T::try_simd_sum(&[]).is_none() {
+        return None;
+    }
+    let nthreads = rayon::current_num_threads();
+    let chunk_size = (src.len() + nthreads - 1) / nthreads;
+    let result = src
+        .par_chunks(chunk_size)
+        .map(|chunk| T::try_simd_sum(chunk).unwrap())
+        .reduce(|| T::zero(), |a, b| a + b);
+    Some(result)
+}
+
 /// Sum all elements: `sum(src)`.
 pub fn sum<
-    T: Copy + ElementOpApply + Zero + Add<Output = T> + MaybeSendSync + 'static,
+    T: Copy + ElementOpApply + Zero + Add<Output = T> + MaybeSendSync + simd::MaybeSimdOps,
     Op: ElementOp,
 >(
     src: &StridedView<T, Op>,
 ) -> Result<T> {
-    #[cfg(feature = "simd")]
-    {
-        let len = total_len(src.dims());
+    // SIMD fast path: contiguous Identity view with SIMD support
+    if Op::IS_IDENTITY {
         if same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
-            if TypeId::of::<T>() == TypeId::of::<f32>() {
-                let src_slice = unsafe { std::slice::from_raw_parts(src.ptr() as *const f32, len) };
-                #[cfg(feature = "parallel")]
-                if len > MINTHREADLENGTH {
-                    use rayon::prelude::*;
-                    let nthreads = rayon::current_num_threads();
-                    let chunk_size = (len + nthreads - 1) / nthreads;
-                    let out: f32 = src_slice
-                        .par_chunks(chunk_size)
-                        .map(|chunk| simd::sum_f32(chunk))
-                        .sum();
-                    return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
+            let len = total_len(src.dims());
+            let src_slice = unsafe { std::slice::from_raw_parts(src.ptr(), len) };
+
+            #[cfg(feature = "parallel")]
+            if len > MINTHREADLENGTH {
+                if let Some(result) = parallel_simd_sum(src_slice) {
+                    return Ok(result);
                 }
-                let out = simd::sum_f32(src_slice);
-                return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
             }
-            if TypeId::of::<T>() == TypeId::of::<f64>() {
-                let src_slice = unsafe { std::slice::from_raw_parts(src.ptr() as *const f64, len) };
-                #[cfg(feature = "parallel")]
-                if len > MINTHREADLENGTH {
-                    use rayon::prelude::*;
-                    let nthreads = rayon::current_num_threads();
-                    let chunk_size = (len + nthreads - 1) / nthreads;
-                    let out: f64 = src_slice
-                        .par_chunks(chunk_size)
-                        .map(|chunk| simd::sum_f64(chunk))
-                        .sum();
-                    return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
-                }
-                let out = simd::sum_f64(src_slice);
-                return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
+
+            if let Some(result) = T::try_simd_sum(src_slice) {
+                return Ok(result);
             }
         }
     }
@@ -676,7 +673,13 @@ pub fn sum<
 
 /// Dot product: `sum(a[i] * b[i])`.
 pub fn dot<
-    T: Copy + ElementOpApply + Zero + Mul<Output = T> + Add<Output = T> + MaybeSendSync + 'static,
+    T: Copy
+        + ElementOpApply
+        + Zero
+        + Mul<Output = T>
+        + Add<Output = T>
+        + MaybeSendSync
+        + simd::MaybeSimdOps,
     OpA: ElementOp,
     OpB: ElementOp,
 >(
@@ -693,23 +696,19 @@ pub fn dot<
 
     if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
         let len = total_len(a_dims);
-        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-        #[cfg(feature = "simd")]
-        {
-            if TypeId::of::<T>() == TypeId::of::<f32>() {
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f32, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f32, len) };
-                let out = simd::dot_f32(sa, sb);
-                return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
-            }
-            if TypeId::of::<T>() == TypeId::of::<f64>() {
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f64, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f64, len) };
-                let out = simd::dot_f64(sa, sb);
-                return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
+
+        // SIMD fast path: both contiguous, both Identity ops
+        if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
+            let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+            let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+            if let Some(result) = T::try_simd_dot(sa, sb) {
+                return Ok(result);
             }
         }
+
+        // Generic contiguous fast path
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         let mut acc = T::zero();
         simd::dispatch_if_large(len, || {
             for i in 0..len {
