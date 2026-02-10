@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use num_complex::Complex64;
 use num_traits::Zero;
@@ -71,23 +71,22 @@ impl BufferPool {
 
 fn collect_all_ids(node: &EinsumNode) -> Vec<char> {
     let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    collect_all_ids_inner(node, &mut result, &mut seen);
+    collect_all_ids_inner(node, &mut result);
     result
 }
 
-fn collect_all_ids_inner(node: &EinsumNode, result: &mut Vec<char>, seen: &mut HashSet<char>) {
+fn collect_all_ids_inner(node: &EinsumNode, result: &mut Vec<char>) {
     match node {
         EinsumNode::Leaf { ids, .. } => {
             for &id in ids {
-                if seen.insert(id) {
+                if !result.contains(&id) {
                     result.push(id);
                 }
             }
         }
         EinsumNode::Contract { args } => {
             for arg in args {
-                collect_all_ids_inner(arg, result, seen);
+                collect_all_ids_inner(arg, result);
             }
         }
     }
@@ -102,13 +101,12 @@ fn collect_all_ids_inner(node: &EinsumNode, result: &mut Vec<char>, seen: &mut H
 /// An index is kept if it appears in `needed_ids` (what the parent/caller
 /// needs from this node) AND it is actually present in at least one child
 /// subtree.
-fn compute_contract_output_ids(args: &[EinsumNode], needed_ids: &HashSet<char>) -> Vec<char> {
+fn compute_contract_output_ids(args: &[EinsumNode], needed_ids: &[char]) -> Vec<char> {
     // Walk args in order and collect ids preserving first-seen order
     let mut all_ids_ordered = Vec::new();
-    let mut seen = HashSet::new();
     for arg in args {
         for id in collect_all_ids(arg) {
-            if seen.insert(id) {
+            if !all_ids_ordered.contains(&id) {
                 all_ids_ordered.push(id);
             }
         }
@@ -134,19 +132,19 @@ fn compute_child_needed_ids(
     output_ids: &[char],
     child_idx: usize,
     args: &[EinsumNode],
-) -> HashSet<char> {
-    let mut needed: HashSet<char> = output_ids.iter().cloned().collect();
+) -> Vec<char> {
+    let mut needed: Vec<char> = output_ids.to_vec();
 
     // Add indices shared between this child and any sibling
-    let child_ids: HashSet<char> = collect_all_ids(&args[child_idx]).into_iter().collect();
+    let child_ids = collect_all_ids(&args[child_idx]);
     for (j, arg) in args.iter().enumerate() {
         if j == child_idx {
             continue;
         }
-        let sibling_ids: HashSet<char> = collect_all_ids(arg).into_iter().collect();
+        let sibling_ids = collect_all_ids(arg);
         for &id in &child_ids {
-            if sibling_ids.contains(&id) {
-                needed.insert(id);
+            if sibling_ids.contains(&id) && !needed.contains(&id) {
+                needed.push(id);
             }
         }
     }
@@ -402,14 +400,15 @@ fn is_permutation_only(input_ids: &[char], output_ids: &[char]) -> bool {
     if input_ids.len() != output_ids.len() {
         return false;
     }
-    let mut seen = HashSet::new();
-    for &id in input_ids {
-        if !seen.insert(id) {
+    // Check no repeated indices in input (linear scan)
+    for (i, &id) in input_ids.iter().enumerate() {
+        if input_ids[..i].contains(&id) {
             return false; // repeated index = trace, not permutation
         }
     }
+    // Check all output ids appear in input
     for &id in output_ids {
-        if !seen.contains(&id) {
+        if !input_ids.contains(&id) {
             return false;
         }
     }
@@ -545,7 +544,7 @@ fn execute_nested_into<'a, T: EinsumScalar>(
 fn eval_node<'a>(
     node: &EinsumNode,
     operands: &mut Vec<Option<EinsumOperand<'a>>>,
-    needed_ids: &HashSet<char>,
+    needed_ids: &[char],
     pool: &mut BufferPool,
 ) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match node {
@@ -671,11 +670,10 @@ impl EinsumCode {
             });
         }
 
-        let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
         let mut ops: Vec<Option<EinsumOperand<'a>>> = operands.into_iter().map(Some).collect();
         let mut pool = BufferPool::new();
 
-        let (result, result_ids) = eval_node(&self.root, &mut ops, &final_output, &mut pool)?;
+        let (result, result_ids) = eval_node(&self.root, &mut ops, &self.output_ids, &mut pool)?;
 
         // If the result ids already match the desired output, we're done.
         if result_ids == self.output_ids {
@@ -774,7 +772,6 @@ impl EinsumCode {
             });
         }
 
-        let final_output: HashSet<char> = self.output_ids.iter().cloned().collect();
         let mut pool = BufferPool::new();
 
         match &self.root {
@@ -833,7 +830,7 @@ impl EinsumCode {
                 }
                 _ => {
                     // 3+ children: use omeco, final contraction into output
-                    let node_output_ids = compute_contract_output_ids(args, &final_output);
+                    let node_output_ids = compute_contract_output_ids(args, &self.output_ids);
 
                     let mut children: Vec<Option<(EinsumOperand<'_>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
