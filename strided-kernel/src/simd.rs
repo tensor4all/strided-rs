@@ -231,17 +231,7 @@ mod simd_impls {
     }
 }
 
-// Backward-compatible wrappers (will be removed in Task 4/5)
-#[cfg(feature = "simd")]
-pub(crate) fn sum_f32(src: &[f32]) -> f32 {
-    f32::try_simd_sum(src).unwrap()
-}
-
-#[cfg(feature = "simd")]
-pub(crate) fn sum_f64(src: &[f64]) -> f64 {
-    f64::try_simd_sum(src).unwrap()
-}
-
+// Backward-compatible wrappers (dot wrappers will be removed in Task 5)
 #[cfg(feature = "simd")]
 pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     f32::try_simd_dot(a, b).unwrap()
