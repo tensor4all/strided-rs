@@ -6,19 +6,11 @@ Support non-standard semirings (starting with tropical/max-plus algebra) in the 
 
 ## Approach: Newtype Wrapper
 
-Instead of introducing a `SemiringOps<T>` trait and parameterizing the entire einsum stack, define a newtype `Tropical(f64)` that implements Rust's standard arithmetic traits with tropical semantics. The existing type system handles everything:
+Define a newtype `Tropical(f64)` that implements Rust's standard arithmetic traits with tropical semantics. The existing type system handles everything:
 
 - `Tropical` satisfies `ScalarBase` (the existing einsum trait bound)
 - `Tropical` does NOT satisfy `faer::ComplexField` or `BlasGemm` -- GEMM is automatically excluded by the type system, falling back to naive loops
 - No API changes, no new parameters, no refactoring
-
-### Alternatives Considered
-
-**A. Parallel API (two entry points):** Add `einsum2_semiring_into` alongside existing `einsum2_into`, parameterized by `SemiringOps<T>`. Keeps existing API stable but duplicates code.
-
-**B. Unified API (SemiringOps-centric):** Refactor `einsum2_into` to take `ops: &S` where `S: SemiringOps<T>`. Clean but massive breaking change -- every call site needs updating, GEMM specialization becomes complex.
-
-**C. Newtype wrapper (chosen):** Zero changes to existing code. The type system provides backend dispatch for free. Simplest possible design.
 
 ## Design
 
