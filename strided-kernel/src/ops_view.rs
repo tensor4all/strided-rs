@@ -200,7 +200,7 @@ pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
         let len = total_len(dst_dims);
-        if TypeId::of::<Op>() == TypeId::of::<crate::Identity>() {
+        if Op::IS_IDENTITY {
             debug_assert!(
                 {
                     let nbytes = len
