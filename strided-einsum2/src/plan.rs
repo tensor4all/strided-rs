@@ -3,7 +3,6 @@
 use crate::util::invert_perm;
 use crate::AxisId;
 use crate::EinsumError;
-use std::collections::{HashMap, HashSet};
 
 /// Pre-computed execution plan for a binary einsum contraction.
 ///
@@ -36,31 +35,36 @@ impl<ID: AxisId> Einsum2Plan<ID> {
     /// Build a plan from axis labels.
     ///
     /// `ia`, `ib`, `ic` are the axis labels for A, B, C respectively.
+    ///
+    /// Uses linear scans instead of hash collections for axis classification,
+    /// which is faster for the small label sets typical in einsum contractions.
     pub fn new(ia: &[ID], ib: &[ID], ic: &[ID]) -> Result<Self, EinsumError> {
-        let ia_set: HashSet<&ID> = ia.iter().collect();
-        let ib_set: HashSet<&ID> = ib.iter().collect();
-        let ic_set: HashSet<&ID> = ic.iter().collect();
-
-        // Validate: no duplicate axes within a single operand
-        if ia_set.len() != ia.len() {
-            return Err(EinsumError::DuplicateAxis(
-                "left operand has duplicate axis labels".into(),
-            ));
+        // Validate: no duplicate axes within a single operand (linear scan)
+        for (i, id) in ia.iter().enumerate() {
+            if ia[..i].iter().any(|x| x == id) {
+                return Err(EinsumError::DuplicateAxis(
+                    "left operand has duplicate axis labels".into(),
+                ));
+            }
         }
-        if ib_set.len() != ib.len() {
-            return Err(EinsumError::DuplicateAxis(
-                "right operand has duplicate axis labels".into(),
-            ));
+        for (i, id) in ib.iter().enumerate() {
+            if ib[..i].iter().any(|x| x == id) {
+                return Err(EinsumError::DuplicateAxis(
+                    "right operand has duplicate axis labels".into(),
+                ));
+            }
         }
-        if ic_set.len() != ic.len() {
-            return Err(EinsumError::DuplicateAxis(
-                "output has duplicate axis labels".into(),
-            ));
+        for (i, id) in ic.iter().enumerate() {
+            if ic[..i].iter().any(|x| x == id) {
+                return Err(EinsumError::DuplicateAxis(
+                    "output has duplicate axis labels".into(),
+                ));
+            }
         }
 
         // Validate: every output axis must appear in at least one input
         for id in ic {
-            if !ia_set.contains(id) && !ib_set.contains(id) {
+            if !ia.contains(id) && !ib.contains(id) {
                 return Err(EinsumError::OrphanOutputAxis(format!("{:?}", id)));
             }
         }
@@ -71,13 +75,13 @@ impl<ID: AxisId> Einsum2Plan<ID> {
         let mut left_trace = Vec::new();
 
         for id in ia {
-            if ib_set.contains(id) {
-                if ic_set.contains(id) {
+            if ib.contains(id) {
+                if ic.contains(id) {
                     batch.push(id.clone());
                 } else {
                     sum.push(id.clone());
                 }
-            } else if ic_set.contains(id) {
+            } else if ic.contains(id) {
                 lo.push(id.clone());
             } else {
                 left_trace.push(id.clone());
@@ -88,8 +92,8 @@ impl<ID: AxisId> Einsum2Plan<ID> {
         let mut right_trace = Vec::new();
 
         for id in ib {
-            if !ia_set.contains(id) {
-                if ic_set.contains(id) {
+            if !ia.contains(id) {
+                if ic.contains(id) {
                     ro.push(id.clone());
                 } else {
                     right_trace.push(id.clone());
@@ -98,40 +102,44 @@ impl<ID: AxisId> Einsum2Plan<ID> {
         }
 
         // Build left_perm: maps positions in ia (after trace removal) to [batch, lo, sum] order
+        // Use linear scan instead of HashMap — faster for small label sets.
         let ia_after_trace: Vec<&ID> = ia.iter().filter(|id| !left_trace.contains(id)).collect();
-        let ia_pos: HashMap<&ID, usize> = ia_after_trace
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i))
-            .collect();
         let left_perm: Vec<usize> = batch
             .iter()
             .chain(lo.iter())
             .chain(sum.iter())
-            .map(|id| *ia_pos.get(id).expect("left_perm: axis not found"))
+            .map(|id| {
+                ia_after_trace
+                    .iter()
+                    .position(|aid| *aid == id)
+                    .expect("left_perm: axis not found")
+            })
             .collect();
 
         // Build right_perm: maps positions in ib (after trace removal) to [batch, sum, ro] order
         let ib_after_trace: Vec<&ID> = ib.iter().filter(|id| !right_trace.contains(id)).collect();
-        let ib_pos: HashMap<&ID, usize> = ib_after_trace
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i))
-            .collect();
         let right_perm: Vec<usize> = batch
             .iter()
             .chain(sum.iter())
             .chain(ro.iter())
-            .map(|id| *ib_pos.get(id).expect("right_perm: axis not found"))
+            .map(|id| {
+                ib_after_trace
+                    .iter()
+                    .position(|bid| *bid == id)
+                    .expect("right_perm: axis not found")
+            })
             .collect();
 
         // Build c_to_internal_perm: maps IC order to [batch, lo, ro] order
-        let ic_pos: HashMap<&ID, usize> = ic.iter().enumerate().map(|(i, id)| (id, i)).collect();
         let c_to_internal_perm: Vec<usize> = batch
             .iter()
             .chain(lo.iter())
             .chain(ro.iter())
-            .map(|id| *ic_pos.get(id).expect("c_to_internal_perm: axis not found"))
+            .map(|id| {
+                ic.iter()
+                    .position(|c_id| c_id == id)
+                    .expect("c_to_internal_perm: axis not found")
+            })
             .collect();
 
         Ok(Einsum2Plan {
