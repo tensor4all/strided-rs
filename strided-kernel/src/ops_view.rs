@@ -11,7 +11,6 @@ use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use num_traits::Zero;
-use std::any::TypeId;
 use std::ops::{Add, Mul};
 use strided_view::{ElementOp, ElementOpApply};
 
@@ -674,7 +673,13 @@ pub fn sum<
 
 /// Dot product: `sum(a[i] * b[i])`.
 pub fn dot<
-    T: Copy + ElementOpApply + Zero + Mul<Output = T> + Add<Output = T> + MaybeSendSync + 'static,
+    T: Copy
+        + ElementOpApply
+        + Zero
+        + Mul<Output = T>
+        + Add<Output = T>
+        + MaybeSendSync
+        + simd::MaybeSimdOps,
     OpA: ElementOp,
     OpB: ElementOp,
 >(
@@ -691,23 +696,19 @@ pub fn dot<
 
     if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
         let len = total_len(a_dims);
-        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-        #[cfg(feature = "simd")]
-        {
-            if TypeId::of::<T>() == TypeId::of::<f32>() {
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f32, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f32, len) };
-                let out = simd::dot_f32(sa, sb);
-                return Ok(unsafe { std::mem::transmute_copy::<f32, T>(&out) });
-            }
-            if TypeId::of::<T>() == TypeId::of::<f64>() {
-                let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const f64, len) };
-                let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const f64, len) };
-                let out = simd::dot_f64(sa, sb);
-                return Ok(unsafe { std::mem::transmute_copy::<f64, T>(&out) });
+
+        // SIMD fast path: both contiguous, both Identity ops
+        if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
+            let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+            let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+            if let Some(result) = T::try_simd_dot(sa, sb) {
+                return Ok(result);
             }
         }
+
+        // Generic contiguous fast path
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         let mut acc = T::zero();
         simd::dispatch_if_large(len, || {
             for i in 0..len {
