@@ -1,5 +1,5 @@
 # strided-rs: Unified Tensor Backend Design Specification
-**Version:** 1.3 (Feb 2026)
+**Version:** 1.5 (Feb 2026)
 **Scope:** Tensor4all Layer 1 Integration (CPU/NVIDIA/AMD)
 
 ---
@@ -370,7 +370,168 @@ Remains CPU-only. Contains the cache-optimized map/reduce/broadcast implementati
 
 Future consideration: rename to `strided-cpu-ops` if the "kernel" naming causes confusion.
 
-## 10. Execution Pipeline
+## 10. Full Stack Architecture (Layer 0–3)
+
+### 10.1 Layer Overview
+
+```
+Layer 3: Applications (domain-specific)
+  ├── Symmetry (U(1), SU(2) → block selection rules)
+  ├── Named index / ITensor-like API
+  ├── TN algorithms (DMRG, TEBD, TCI, ...)
+  └── Physics-informed NN
+
+Layer 2: tenet (tensor network computation framework)
+  ├── tenet-ad             Automatic differentiation (Wirtinger-aware)
+  ├── tenet-block          Block-sparse tensor (generic, symmetry-agnostic)
+  └── tenet-burn           Burn interop (real tensor bridge)
+
+Layer 1: strided-rs (device-aware operations)
+  ├── strided-device       Device abstraction, GPU, memory, BLAS/LAPACK dispatch
+  ├── strided-einsum2      Binary einsum (GEMM backend)
+  ├── strided-opteinsum    N-ary einsum with contraction tree
+  └── strided-linalg       SVD, QR, LU, Cholesky, eigen
+
+Layer 0: strided-rs foundation
+  ├── strided-view         StridedArrayView types (zero-copy)
+  └── strided-kernel       CPU cache-optimized map/reduce/broadcast
+```
+
+Layer 2 uses the **tenet** namespace (separate from strided-rs). tenet provides the computational building blocks for tensor network applications without embedding domain-specific physics concepts (symmetry, named indices) — those belong in Layer 3.
+
+### 10.2 Automatic Differentiation Strategy
+
+#### The Problem: Burn's Autodiff Cannot Handle Complex Numbers
+
+Burn's `TensorKind` has only `Float`, `Int`, `Bool` — no `Complex`. Complex autodiff requires **Wirtinger derivatives** (`∂f/∂z` and `∂f/∂z̄`), which Burn's real-valued chain rule does not implement. Operations like `conj`, `abs`, `real`, `imag` would produce incorrect gradients.
+
+#### Short Term: tenet-ad (Self-contained AD)
+
+Build a focused AD system for tensor network operations. Prior art: **ndtensors-rs** (proven approach).
+
+**Scope:** Only differentiate operations that tensor networks actually use:
+
+| Operation | Forward | Backward (known formula) |
+|-----------|---------|--------------------------|
+| einsum | strided-opteinsum | Transpose subscripts + einsum |
+| SVD | strided-linalg | Seeger et al. 2017 |
+| QR | strided-linalg | Known formula |
+| exp(z) | element-wise | exp(z) * grad |
+| Element-wise (+, *, conj) | strided-kernel | Standard + Wirtinger rules |
+
+**Design:**
+
+```rust
+// tenet-ad (Layer 2)
+pub struct TrackedTensor<T> {
+    data: StridedArray<T>,      // actual data (f64 or Complex64)
+    node: Option<NodeRef>,       // computation graph node
+}
+
+// Wirtinger-aware backward for complex operations
+// For f: C → C, the chain rule uses both ∂f/∂z and ∂f/∂z̄
+pub trait WirtingerBackward {
+    fn backward_holomorphic(&self, grad: &Tensor) -> Tensor;   // ∂f/∂z
+    fn backward_conjugate(&self, grad: &Tensor) -> Tensor;     // ∂f/∂z̄
+}
+```
+
+**Advantages:**
+- Complex128 support from day one
+- Wirtinger derivatives built-in
+- Small, focused scope (einsum + linalg + element-wise)
+- Proven by ndtensors-rs
+
+#### Long Term: Extend Burn with Complex Kind
+
+Contribute `Complex` as a new `TensorKind` to Burn, enabling Burn's autodiff for complex tensors. This would allow mixed NN + TN computation in a single autodiff graph.
+
+**Prerequisites (upstream Burn contributions):**
+1. Add `Complex` to `TensorKind` enum (with `ComplexTensorOps` trait)
+2. Add Wirtinger derivative support to `burn-autodiff`
+3. CubeCL complex type or interleaved-f64 lowering
+4. At least one backend implementation (e.g., `burn-ndarray`)
+
+**Previous attempts:** Burn PRs #3330 and #3608 both went stale. Core team considers it a fundamental `Kind` redesign. Community interest exists (FFT, quantum computing) but no champion.
+
+**When Burn gets Complex support:**
+
+```rust
+// Long-term vision: unified autodiff graph
+let nn_output: Tensor<Autodiff<B>, 2, Float> = model.forward(input);
+
+// Convert real → complex
+let tn_input: Tensor<Autodiff<B>, 2, Complex> = nn_output.to_complex();
+
+// TN operations within Burn's autodiff graph
+let tn_result = einsum_burn("ij,jk->ik", &tn_input, &mps_tensor);
+
+// Gradient flows through both NN and TN
+let grads = tn_result.backward();
+```
+
+#### Burn Interop During Short-Term Phase
+
+Even before Burn gets Complex support, **real-valued tensors** can be exchanged:
+
+```
+Burn Autodiff (real only)     tenet-ad (complex + real)
+     │                              │
+     │  real Tensor ←→ real Tensor  │
+     │  via TensorData (CPU copy)   │
+     │                              │
+     │  Custom Backward Op:         │
+     │  register einsum/SVD with    │
+     │  Burn's graph for real parts │
+```
+
+- NN layers: Use Burn's autodiff (mature, GPU-accelerated)
+- TN operations on complex tensors: Use tenet-ad
+- Interface: Exchange real-valued tensors via `TensorData`
+- For real-valued TN ops: Register as Burn Custom Backward Ops for seamless gradient flow
+
+### 10.3 Block Tensor (Generic, Symmetry-Agnostic)
+
+`tenet-block` provides a generic block-sparse tensor data structure. It has no knowledge of symmetry groups — block selection logic is the caller's responsibility (Layer 3).
+
+```rust
+// tenet-block (Layer 2): generic block-sparse tensor
+pub struct BlockTensor<T> {
+    blocks: HashMap<BlockIndex, StridedArray<T>>,  // each block is dense
+    structure: BlockStructure,                       // which blocks exist
+}
+
+// Block-level einsum — caller provides the contraction pairs
+fn block_einsum<T>(
+    subscripts: &str,
+    a: &BlockTensor<T>,
+    b: &BlockTensor<T>,
+    pairs: &[(BlockIndex, BlockIndex, BlockIndex)],  // (a_block, b_block, out_block)
+) -> BlockTensor<T> {
+    for &(ai, bi, ci) in pairs {
+        einsum2_into(subscripts, &a.blocks[&ai], &b.blocks[&bi], &mut output[ci]);
+    }
+    output
+}
+```
+
+Symmetry-aware block selection is implemented at Layer 3:
+
+```rust
+// Layer 3: physics-specific symmetry logic
+fn u1_contraction_pairs(
+    a: &U1Structure,
+    b: &U1Structure,
+) -> Vec<(BlockIndex, BlockIndex, BlockIndex)> {
+    // Enumerate non-zero block pairs from quantum number conservation
+}
+
+// Usage: Layer 3 drives Layer 2
+let pairs = u1_contraction_pairs(&a_structure, &b_structure);
+let result = block_einsum("ij,jk->ik", &a, &b, &pairs);
+```
+
+## 11. Execution Pipeline
 
 1. **Definition**: User calls `einsum(..., &device, &stream)`.
 2. **Planning**: Select the appropriate kernel backend based on device:
@@ -383,7 +544,7 @@ Future consideration: rename to `strided-cpu-ops` if the "kernel" naming causes 
 
 ---
 
-## 11. Open Design Questions
+## 12. Open Design Questions
 
 - How to represent device placement in the type system (type-level vs. runtime enum)?
 - Ownership model for cross-device transfers (copy semantics vs. move semantics)?
@@ -396,13 +557,14 @@ Future consideration: rename to `strided-cpu-ops` if the "kernel" naming causes 
 - Should `strided-kernel` be renamed to `strided-cpu-ops` to avoid ambiguity with GPU "kernels"?
 - How should `strided-linalg` expose truncated SVD (rank-k approximation)?
 
-## 12. External Dependencies & Upstream Contributions
+## 13. External Dependencies & Upstream Contributions
 
 | Dependency | Role | Status | Action Needed |
 |---|---|---|---|
 | `cudarc` | CUDA dlopen | Stable, maintained | Use as-is |
 | `libloading` | Generic dlopen | Stable | Use for ROCm (hiparc) |
 | `CubeCL` | GPU JIT kernels | f64 broken (CUDA/ROCm) | **Contribute f64 fix PR** |
+| `Burn` | NN framework + autodiff | No complex type support | Long-term: contribute Complex Kind |
 | `faer` | CPU GEMM | Stable | Use as-is |
 | `accelerate-src` | Apple BLAS | Stable | Use for macOS |
 
@@ -411,3 +573,5 @@ Future consideration: rename to `strided-cpu-ops` if the "kernel" naming causes 
 *v1.1: Excluded Metal GPU; added Accelerate; added backend matrix*
 *v1.2: Added runtime loading strategy; GPU element-wise kernel analysis; CubeCL f64/complex status; type support roadmap; hybrid GEMM+CubeCL architecture*
 *v1.3: Added workspace crate structure (strided-device, strided-linalg); dependency graph; crate responsibilities*
+*v1.4: Added full stack architecture (Layer 0-3); AD strategy (short-term: self-contained Wirtinger AD, long-term: Burn Complex Kind); Burn interop analysis; block tensor design*
+*v1.5: Renamed Layer 2 to "tenet" namespace; separated symmetry (Layer 3) from generic block tensor (Layer 2); removed named index from Layer 2*
