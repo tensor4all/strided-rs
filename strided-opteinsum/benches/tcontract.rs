@@ -54,10 +54,13 @@ fn run_tcontract_case(
         5,
         || {
             let result = code
-                .evaluate(vec![
-                    EinsumOperand::from_view(&a_view),
-                    EinsumOperand::from_view(&b_view),
-                ])
+                .evaluate(
+                    vec![
+                        EinsumOperand::from_view(&a_view),
+                        EinsumOperand::from_view(&b_view),
+                    ],
+                    None,
+                )
                 .unwrap();
             match result {
                 EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
@@ -83,10 +86,13 @@ fn run_tcontract_case(
         5,
         || {
             let result = code
-                .evaluate(vec![
-                    EinsumOperand::from_view(&a_c_view),
-                    EinsumOperand::from_view(&b_c_view),
-                ])
+                .evaluate(
+                    vec![
+                        EinsumOperand::from_view(&a_c_view),
+                        EinsumOperand::from_view(&b_c_view),
+                    ],
+                    None,
+                )
                 .unwrap();
             match result {
                 EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),

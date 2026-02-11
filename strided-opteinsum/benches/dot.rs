@@ -40,10 +40,13 @@ fn run_dot_case(case_name: &str, n1: usize, n2: usize, n3: usize, seed_f64: u64,
     println!("  Float64:");
     bench_n(&format!("{case_name}_f64_{n1}x{n2}x{n3}"), 2, 5, || {
         let result = code
-            .evaluate(vec![
-                EinsumOperand::from_view(&a_view),
-                EinsumOperand::from_view(&b_view),
-            ])
+            .evaluate(
+                vec![
+                    EinsumOperand::from_view(&a_view),
+                    EinsumOperand::from_view(&b_view),
+                ],
+                None,
+            )
             .unwrap();
         match result {
             EinsumOperand::F64(data) => black_box(data.as_array().data()[0]),
@@ -68,10 +71,13 @@ fn run_dot_case(case_name: &str, n1: usize, n2: usize, n3: usize, seed_f64: u64,
         5,
         || {
             let result = code
-                .evaluate(vec![
-                    EinsumOperand::from_view(&a_c_view),
-                    EinsumOperand::from_view(&b_c_view),
-                ])
+                .evaluate(
+                    vec![
+                        EinsumOperand::from_view(&a_c_view),
+                        EinsumOperand::from_view(&b_c_view),
+                    ],
+                    None,
+                )
                 .unwrap();
             match result {
                 EinsumOperand::C64(data) => black_box(data.as_array().data()[0]),

@@ -45,7 +45,7 @@ fn main() {
     println!("trace: Float64");
     bench_n("trace_f64", 2, 5, || {
         let result = code
-            .evaluate(vec![EinsumOperand::from_view(&a_view)])
+            .evaluate(vec![EinsumOperand::from_view(&a_view)], None)
             .unwrap();
         match result {
             EinsumOperand::F64(data) => black_box(data.as_array().data()[0]),
@@ -63,7 +63,7 @@ fn main() {
     println!("trace: ComplexF64");
     bench_n("trace_Complex64", 2, 5, || {
         let result = code
-            .evaluate(vec![EinsumOperand::from_view(&a_c_view)])
+            .evaluate(vec![EinsumOperand::from_view(&a_c_view)], None)
             .unwrap();
         match result {
             EinsumOperand::C64(data) => black_box(data.as_array().data()[0]),

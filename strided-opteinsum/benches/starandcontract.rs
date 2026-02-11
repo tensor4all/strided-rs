@@ -47,11 +47,14 @@ fn main() {
     println!("starandcontract (Float64):");
     bench_n("starandcontract_f64_large", 1, 3, || {
         let result = code
-            .evaluate(vec![
-                EinsumOperand::from_view(&a_view),
-                EinsumOperand::from_view(&b_view),
-                EinsumOperand::from_view(&c_view),
-            ])
+            .evaluate(
+                vec![
+                    EinsumOperand::from_view(&a_view),
+                    EinsumOperand::from_view(&b_view),
+                    EinsumOperand::from_view(&c_view),
+                ],
+                None,
+            )
             .unwrap();
         match result {
             EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
@@ -75,11 +78,14 @@ fn main() {
     println!("starandcontract (ComplexF64):");
     bench_n("starandcontract_Complex64_large", 1, 3, || {
         let result = code
-            .evaluate(vec![
-                EinsumOperand::from_view(&ac_view),
-                EinsumOperand::from_view(&bc_view),
-                EinsumOperand::from_view(&cc_view),
-            ])
+            .evaluate(
+                vec![
+                    EinsumOperand::from_view(&ac_view),
+                    EinsumOperand::from_view(&bc_view),
+                    EinsumOperand::from_view(&cc_view),
+                ],
+                None,
+            )
             .unwrap();
         match result {
             EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),

@@ -184,12 +184,16 @@ fn compute_child_needed_ids(
 fn out_dims_from_map(
     dim_map: &HashMap<char, usize>,
     output_ids: &[char],
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<Vec<usize>> {
     let mut out_dims = Vec::with_capacity(output_ids.len());
     for &id in output_ids {
-        match dim_map.get(&id) {
-            Some(&dim) => out_dims.push(dim),
-            None => return Err(crate::EinsumError::OrphanOutputAxis(id.to_string())),
+        if let Some(&dim) = dim_map.get(&id) {
+            out_dims.push(dim);
+        } else if let Some(&dim) = size_dict.get(&id) {
+            out_dims.push(dim);
+        } else {
+            return Err(crate::EinsumError::OrphanOutputAxis(id.to_string()));
         }
     }
     Ok(out_dims)
@@ -202,6 +206,7 @@ fn out_dims_from_ids(
     right_ids: &[char],
     right_dims: &[usize],
     output_ids: &[char],
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<Vec<usize>> {
     let mut out_dims = Vec::with_capacity(output_ids.len());
     for &id in output_ids {
@@ -209,6 +214,8 @@ fn out_dims_from_ids(
             out_dims.push(left_dims[pos]);
         } else if let Some(pos) = right_ids.iter().position(|&c| c == id) {
             out_dims.push(right_dims[pos]);
+        } else if let Some(&dim) = size_dict.get(&id) {
+            out_dims.push(dim);
         } else {
             return Err(crate::EinsumError::OrphanOutputAxis(id.to_string()));
         }
@@ -227,8 +234,16 @@ fn eval_pair_alloc<T: PoolOps>(
     right_ids: &[char],
     output_ids: &[char],
     pool: &mut BufferPool,
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<EinsumOperand<'static>> {
-    let out_dims = out_dims_from_ids(left_ids, ld.dims(), right_ids, rd.dims(), output_ids)?;
+    let out_dims = out_dims_from_ids(
+        left_ids,
+        ld.dims(),
+        right_ids,
+        rd.dims(),
+        output_ids,
+        size_dict,
+    )?;
     let mut c_arr = T::pool_acquire(pool, &out_dims);
     {
         let a_view = ld.as_view();
@@ -260,19 +275,22 @@ fn eval_pair(
     right_ids: &[char],
     output_ids: &[char],
     pool: &mut BufferPool,
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<EinsumOperand<'static>> {
     match (left, right) {
         (EinsumOperand::F64(ld), EinsumOperand::F64(rd)) => {
-            eval_pair_alloc(ld, left_ids, rd, right_ids, output_ids, pool)
+            eval_pair_alloc(ld, left_ids, rd, right_ids, output_ids, pool, size_dict)
         }
         (EinsumOperand::C64(ld), EinsumOperand::C64(rd)) => {
-            eval_pair_alloc(ld, left_ids, rd, right_ids, output_ids, pool)
+            eval_pair_alloc(ld, left_ids, rd, right_ids, output_ids, pool, size_dict)
         }
         (left, right) => {
             // Mixed types: promote both to c64 by consuming, then recurse (hits C64/C64 branch)
             let left_c64 = left.to_c64_owned();
             let right_c64 = right.to_c64_owned();
-            eval_pair(left_c64, left_ids, right_c64, right_ids, output_ids, pool)
+            eval_pair(
+                left_c64, left_ids, right_c64, right_ids, output_ids, pool, size_dict,
+            )
         }
     }
 }
@@ -392,9 +410,10 @@ fn eval_single_typed<T: EinsumScalar>(
     data: &StridedData<'_, T>,
     input_ids: &[char],
     output_ids: &[char],
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<EinsumOperand<'static>> {
     let view = data.as_view();
-    let result = single_tensor_einsum(&view, input_ids, output_ids)?;
+    let result = single_tensor_einsum(&view, input_ids, output_ids, Some(size_dict))?;
     Ok(T::wrap_array(result))
 }
 
@@ -402,10 +421,11 @@ fn eval_single(
     operand: &EinsumOperand<'_>,
     input_ids: &[char],
     output_ids: &[char],
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<EinsumOperand<'static>> {
     match operand {
-        EinsumOperand::F64(data) => eval_single_typed(data, input_ids, output_ids),
-        EinsumOperand::C64(data) => eval_single_typed(data, input_ids, output_ids),
+        EinsumOperand::F64(data) => eval_single_typed(data, input_ids, output_ids, size_dict),
+        EinsumOperand::C64(data) => eval_single_typed(data, input_ids, output_ids, size_dict),
     }
 }
 
@@ -456,6 +476,7 @@ fn execute_nested<'a>(
     nested: &omeco::NestedEinsum<char>,
     children: &mut Vec<Option<(EinsumOperand<'a>, Vec<char>)>>,
     pool: &mut BufferPool,
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match nested {
         omeco::NestedEinsum::Leaf { tensor_index } => {
@@ -480,10 +501,18 @@ fn execute_nested<'a>(
                     args.len()
                 )));
             }
-            let (left, left_ids) = execute_nested(&args[0], children, pool)?;
-            let (right, right_ids) = execute_nested(&args[1], children, pool)?;
+            let (left, left_ids) = execute_nested(&args[0], children, pool, size_dict)?;
+            let (right, right_ids) = execute_nested(&args[1], children, pool, size_dict)?;
             let output_ids: Vec<char> = eins.iy.clone();
-            let result = eval_pair(left, &left_ids, right, &right_ids, &output_ids, pool)?;
+            let result = eval_pair(
+                left,
+                &left_ids,
+                right,
+                &right_ids,
+                &output_ids,
+                pool,
+                size_dict,
+            )?;
             Ok((result, output_ids))
         }
     }
@@ -502,6 +531,7 @@ fn execute_nested_into<'a, T: EinsumScalar>(
     alpha: T,
     beta: T,
     pool: &mut BufferPool,
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<()> {
     match nested {
         omeco::NestedEinsum::Node { args, eins: _ } => {
@@ -512,8 +542,8 @@ fn execute_nested_into<'a, T: EinsumScalar>(
                 )));
             }
             // Evaluate children normally (they allocate temporaries)
-            let (left, left_ids) = execute_nested(&args[0], children, pool)?;
-            let (right, right_ids) = execute_nested(&args[1], children, pool)?;
+            let (left, left_ids) = execute_nested(&args[0], children, pool, size_dict)?;
+            let (right, right_ids) = execute_nested(&args[1], children, pool, size_dict)?;
             // Root contraction writes directly into user's output
             eval_pair_into(
                 left, &left_ids, right, &right_ids, output, output_ids, alpha, beta,
@@ -565,6 +595,7 @@ fn eval_node<'a>(
     operands: &mut Vec<Option<EinsumOperand<'a>>>,
     needed_ids: &[char],
     pool: &mut BufferPool,
+    size_dict: &HashMap<char, usize>,
 ) -> crate::Result<(EinsumOperand<'a>, Vec<char>)> {
     match node {
         EinsumNode::Leaf { ids, tensor_index } => {
@@ -593,7 +624,8 @@ fn eval_node<'a>(
                 1 => {
                     // Single-tensor operation.
                     let child_needed = compute_child_needed_ids(&node_output_ids, 0, args);
-                    let (child_op, child_ids) = eval_node(&args[0], operands, &child_needed, pool)?;
+                    let (child_op, child_ids) =
+                        eval_node(&args[0], operands, &child_needed, pool, size_dict)?;
 
                     // Identity passthrough: no allocation needed.
                     if child_ids == node_output_ids {
@@ -606,18 +638,27 @@ fn eval_node<'a>(
                         return Ok((child_op.permuted(&perm)?, node_output_ids));
                     }
 
-                    // General case: trace, reduction, etc.
-                    let result = eval_single(&child_op, &child_ids, &node_output_ids)?;
+                    // General case: trace, reduction, repeat, duplicate, etc.
+                    let result = eval_single(&child_op, &child_ids, &node_output_ids, size_dict)?;
                     Ok((result, node_output_ids))
                 }
                 2 => {
                     // Binary contraction.
                     let left_needed = compute_child_needed_ids(&node_output_ids, 0, args);
                     let right_needed = compute_child_needed_ids(&node_output_ids, 1, args);
-                    let (left, left_ids) = eval_node(&args[0], operands, &left_needed, pool)?;
-                    let (right, right_ids) = eval_node(&args[1], operands, &right_needed, pool)?;
-                    let result =
-                        eval_pair(left, &left_ids, right, &right_ids, &node_output_ids, pool)?;
+                    let (left, left_ids) =
+                        eval_node(&args[0], operands, &left_needed, pool, size_dict)?;
+                    let (right, right_ids) =
+                        eval_node(&args[1], operands, &right_needed, pool, size_dict)?;
+                    let result = eval_pair(
+                        left,
+                        &left_ids,
+                        right,
+                        &right_ids,
+                        &node_output_ids,
+                        pool,
+                        size_dict,
+                    )?;
                     Ok((result, node_output_ids))
                 }
                 _ => {
@@ -628,7 +669,7 @@ fn eval_node<'a>(
                     let mut children: Vec<Option<(EinsumOperand<'a>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
-                        let (op, ids) = eval_node(arg, operands, &child_needed, pool)?;
+                        let (op, ids) = eval_node(arg, operands, &child_needed, pool, size_dict)?;
                         children.push(Some((op, ids)));
                     }
 
@@ -659,7 +700,8 @@ fn eval_node<'a>(
                         })?;
 
                     // 5. Execute the nested contraction tree
-                    let (result, result_ids) = execute_nested(&nested, &mut children, pool)?;
+                    let (result, result_ids) =
+                        execute_nested(&nested, &mut children, pool, size_dict)?;
                     Ok((result, result_ids))
                 }
             }
@@ -677,9 +719,13 @@ impl EinsumCode {
     /// Borrowed view operands are propagated through the tree without copying.
     /// The result lifetime matches the input operand lifetime: if all inputs
     /// are owned (`'static`), the result is also `'static`.
+    ///
+    /// Pass `size_dict` to specify sizes for output indices not present in any
+    /// input (generative outputs like `"->ii"` or `"i->ij"`).
     pub fn evaluate<'a>(
         &self,
         operands: Vec<EinsumOperand<'a>>,
+        size_dict: Option<&HashMap<char, usize>>,
     ) -> crate::Result<EinsumOperand<'a>> {
         let expected = leaf_count(&self.root);
         if operands.len() != expected {
@@ -692,7 +738,14 @@ impl EinsumCode {
         let mut ops: Vec<Option<EinsumOperand<'a>>> = operands.into_iter().map(Some).collect();
         let mut pool = BufferPool::new();
 
-        let (result, result_ids) = eval_node(&self.root, &mut ops, &self.output_ids, &mut pool)?;
+        // Build unified size_dict: operand-inferred sizes + user-provided overrides
+        let mut unified = build_dim_map(&self.root, &ops);
+        if let Some(sd) = size_dict {
+            merge_size_dict(&mut unified, sd)?;
+        }
+
+        let (result, result_ids) =
+            eval_node(&self.root, &mut ops, &self.output_ids, &mut pool, &unified)?;
 
         // If the result ids already match the desired output, we're done.
         if result_ids == self.output_ids {
@@ -705,8 +758,8 @@ impl EinsumCode {
             return Ok(result.permuted(&perm)?);
         }
 
-        // General fallback: reduce/trace to match the final output_ids.
-        let adjusted = eval_single(&result, &result_ids, &self.output_ids)?;
+        // General fallback: reduce/trace/repeat/duplicate to match the final output_ids.
+        let adjusted = eval_single(&result, &result_ids, &self.output_ids, &unified)?;
         Ok(adjusted)
     }
 }
@@ -729,6 +782,29 @@ fn build_dim_map(
     let mut dim_map = HashMap::new();
     build_dim_map_inner(node, operands, &mut dim_map);
     dim_map
+}
+
+/// Merge user-provided size_dict into the unified map.
+///
+/// Returns an error if a label appears in both maps with different sizes.
+fn merge_size_dict(
+    unified: &mut HashMap<char, usize>,
+    user: &HashMap<char, usize>,
+) -> crate::Result<()> {
+    for (&label, &size) in user {
+        if let Some(&existing) = unified.get(&label) {
+            if existing != size {
+                return Err(crate::EinsumError::DimensionMismatch {
+                    axis: label.to_string(),
+                    dim_a: existing,
+                    dim_b: size,
+                });
+            }
+        } else {
+            unified.insert(label, size);
+        }
+    }
+    Ok(())
 }
 
 fn build_dim_map_inner(
@@ -762,12 +838,16 @@ impl EinsumCode {
     /// all operands are real, `Complex64` when any operand is complex.
     /// If `T = f64` but any operand is complex, returns `TypeMismatch` error.
     /// If `T = Complex64`, real operands are promoted automatically.
+    ///
+    /// Pass `size_dict` to specify sizes for output indices not present in any
+    /// input (generative outputs like `"->ii"` or `"i->ij"`).
     pub fn evaluate_into<T: EinsumScalar>(
         &self,
         operands: Vec<EinsumOperand<'_>>,
         mut output: StridedViewMut<T>,
         alpha: T,
         beta: T,
+        size_dict: Option<&HashMap<char, usize>>,
     ) -> crate::Result<()> {
         let expected = leaf_count(&self.root);
         if operands.len() != expected {
@@ -781,9 +861,14 @@ impl EinsumCode {
         let mut ops: Vec<Option<EinsumOperand<'_>>> = operands.into_iter().map(Some).collect();
         T::validate_operands(&ops)?;
 
+        // Build unified size_dict: operand-inferred sizes + user-provided overrides
+        let mut unified = build_dim_map(&self.root, &ops);
+        if let Some(sd) = size_dict {
+            merge_size_dict(&mut unified, sd)?;
+        }
+
         // Compute expected output shape
-        let dim_map = build_dim_map(&self.root, &ops);
-        let expected_dims = out_dims_from_map(&dim_map, &self.output_ids)?;
+        let expected_dims = out_dims_from_map(&unified, &self.output_ids, &unified)?;
         if output.dims() != expected_dims.as_slice() {
             return Err(crate::EinsumError::OutputShapeMismatch {
                 expected: expected_dims,
@@ -799,7 +884,7 @@ impl EinsumCode {
                 let op = ops[*tensor_index].take().ok_or_else(|| {
                     crate::EinsumError::Internal("operand already consumed".into())
                 })?;
-                let single_result = eval_single(&op, ids, &self.output_ids)?;
+                let single_result = eval_single(&op, ids, &self.output_ids, &unified)?;
                 let data = T::extract_data(single_result)?;
                 accumulate_into(&mut output, &data.into_array(), alpha, beta)?;
             }
@@ -809,7 +894,7 @@ impl EinsumCode {
                     // Single child: evaluate, then accumulate
                     let child_needed = compute_child_needed_ids(&self.output_ids, 0, args);
                     let (child_op, child_ids) =
-                        eval_node(&args[0], &mut ops, &child_needed, &mut pool)?;
+                        eval_node(&args[0], &mut ops, &child_needed, &mut pool, &unified)?;
 
                     if child_ids == self.output_ids {
                         // Identity: just accumulate
@@ -823,8 +908,9 @@ impl EinsumCode {
                         let permuted = arr.permuted(&perm)?;
                         accumulate_into(&mut output, &permuted, alpha, beta)?;
                     } else {
-                        // General: trace/reduction
-                        let result = eval_single(&child_op, &child_ids, &self.output_ids)?;
+                        // General: trace/reduction/repeat/duplicate
+                        let result =
+                            eval_single(&child_op, &child_ids, &self.output_ids, &unified)?;
                         let data = T::extract_data(result)?;
                         accumulate_into(&mut output, &data.into_array(), alpha, beta)?;
                     }
@@ -833,9 +919,10 @@ impl EinsumCode {
                     // Binary contraction: write directly into output
                     let left_needed = compute_child_needed_ids(&self.output_ids, 0, args);
                     let right_needed = compute_child_needed_ids(&self.output_ids, 1, args);
-                    let (left, left_ids) = eval_node(&args[0], &mut ops, &left_needed, &mut pool)?;
+                    let (left, left_ids) =
+                        eval_node(&args[0], &mut ops, &left_needed, &mut pool, &unified)?;
                     let (right, right_ids) =
-                        eval_node(&args[1], &mut ops, &right_needed, &mut pool)?;
+                        eval_node(&args[1], &mut ops, &right_needed, &mut pool, &unified)?;
                     eval_pair_into(
                         left,
                         &left_ids,
@@ -854,7 +941,8 @@ impl EinsumCode {
                     let mut children: Vec<Option<(EinsumOperand<'_>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
-                        let (op, ids) = eval_node(arg, &mut ops, &child_needed, &mut pool)?;
+                        let (op, ids) =
+                            eval_node(arg, &mut ops, &child_needed, &mut pool, &unified)?;
                         children.push(Some((op, ids)));
                     }
 
@@ -889,6 +977,7 @@ impl EinsumCode {
                         alpha,
                         beta,
                         &mut pool,
+                        &unified,
                     )?;
                 }
             },
@@ -921,7 +1010,7 @@ mod tests {
         let code = parse_einsum("ij,jk->ik").unwrap();
         let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-        let result = code.evaluate(vec![a, b]).unwrap();
+        let result = code.evaluate(vec![a, b], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 let arr = data.as_array();
@@ -943,7 +1032,7 @@ mod tests {
         let b = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let c = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
         // A*B = B, B*C = [[19,22],[43,50]]
-        let result = code.evaluate(vec![a, b, c]).unwrap();
+        let result = code.evaluate(vec![a, b, c], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 let arr = data.as_array();
@@ -962,7 +1051,7 @@ mod tests {
         let code = parse_einsum("i,j->ij").unwrap();
         let a = make_f64(&[3], vec![1.0, 2.0, 3.0]);
         let b = make_f64(&[2], vec![10.0, 20.0]);
-        let result = code.evaluate(vec![a, b]).unwrap();
+        let result = code.evaluate(vec![a, b], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 let arr = data.as_array();
@@ -979,7 +1068,7 @@ mod tests {
         let code = parse_einsum("i,i->").unwrap();
         let a = make_f64(&[3], vec![1.0, 2.0, 3.0]);
         let b = make_f64(&[3], vec![4.0, 5.0, 6.0]);
-        let result = code.evaluate(vec![a, b]).unwrap();
+        let result = code.evaluate(vec![a, b], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 // 1*4 + 2*5 + 3*6 = 32
@@ -993,7 +1082,7 @@ mod tests {
     fn test_single_tensor_permute() {
         let code = parse_einsum("ij->ji").unwrap();
         let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let result = code.evaluate(vec![a]).unwrap();
+        let result = code.evaluate(vec![a], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 let arr = data.as_array();
@@ -1009,7 +1098,7 @@ mod tests {
     fn test_single_tensor_trace() {
         let code = parse_einsum("ii->").unwrap();
         let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
-        let result = code.evaluate(vec![a]).unwrap();
+        let result = code.evaluate(vec![a], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 assert_abs_diff_eq!(data.as_array().data()[0], 6.0);
@@ -1026,7 +1115,7 @@ mod tests {
         let b = make_f64(&[3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
         // c = identity; AB = [[4,2],[10,5]], AB*I = [[4,2],[10,5]]
         let c = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
-        let result = code.evaluate(vec![a, b, c]).unwrap();
+        let result = code.evaluate(vec![a, b, c], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 let arr = data.as_array();
@@ -1049,7 +1138,7 @@ mod tests {
         let c = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
         let d = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
         // I*B = B, B*I = B, B*D = [[19,22],[43,50]]
-        let result = code.evaluate(vec![a, b, c, d]).unwrap();
+        let result = code.evaluate(vec![a, b, c, d], None).unwrap();
         match result {
             EinsumOperand::F64(data) => {
                 let arr = data.as_array();
@@ -1066,7 +1155,7 @@ mod tests {
         let code = parse_einsum("ij,jk->iz").unwrap();
         let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-        let err = code.evaluate(vec![a, b]).unwrap_err();
+        let err = code.evaluate(vec![a, b], None).unwrap_err();
         assert!(matches!(err, crate::EinsumError::OrphanOutputAxis(ref s) if s == "z"));
     }
 
@@ -1074,7 +1163,7 @@ mod tests {
     fn test_operand_count_mismatch_too_few() {
         let code = parse_einsum("ij,jk->ik").unwrap();
         let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
-        let err = code.evaluate(vec![a]).unwrap_err();
+        let err = code.evaluate(vec![a], None).unwrap_err();
         assert!(matches!(
             err,
             crate::EinsumError::OperandCountMismatch {
@@ -1089,7 +1178,7 @@ mod tests {
         let code = parse_einsum("ij->ji").unwrap();
         let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-        let err = code.evaluate(vec![a, b]).unwrap_err();
+        let err = code.evaluate(vec![a, b], None).unwrap_err();
         assert!(matches!(
             err,
             crate::EinsumError::OperandCountMismatch {
@@ -1109,7 +1198,7 @@ mod tests {
         let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
         let mut c = StridedArray::<f64>::col_major(&[2, 2]);
-        code.evaluate_into(vec![a, b], c.view_mut(), 1.0, 0.0)
+        code.evaluate_into(vec![a, b], c.view_mut(), 1.0, 0.0, None)
             .unwrap();
         assert_abs_diff_eq!(c.get(&[0, 0]), 19.0);
         assert_abs_diff_eq!(c.get(&[0, 1]), 22.0);
@@ -1130,7 +1219,7 @@ mod tests {
         for v in c.data_mut().iter_mut() {
             *v = 1.0;
         }
-        code.evaluate_into(vec![a, b], c.view_mut(), 2.0, 3.0)
+        code.evaluate_into(vec![a, b], c.view_mut(), 2.0, 3.0, None)
             .unwrap();
         assert_abs_diff_eq!(c.get(&[0, 0]), 41.0, epsilon = 1e-10);
         assert_abs_diff_eq!(c.get(&[0, 1]), 47.0, epsilon = 1e-10);
@@ -1143,7 +1232,8 @@ mod tests {
         let code = parse_einsum("ij->ji").unwrap();
         let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let mut c = StridedArray::<f64>::col_major(&[3, 2]);
-        code.evaluate_into(vec![a], c.view_mut(), 1.0, 0.0).unwrap();
+        code.evaluate_into(vec![a], c.view_mut(), 1.0, 0.0, None)
+            .unwrap();
         assert_eq!(c.dims(), &[3, 2]);
         assert_abs_diff_eq!(c.get(&[0, 0]), 1.0);
         assert_abs_diff_eq!(c.get(&[0, 1]), 4.0);
@@ -1156,7 +1246,8 @@ mod tests {
         let code = parse_einsum("ii->").unwrap();
         let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
         let mut c = StridedArray::<f64>::col_major(&[]);
-        code.evaluate_into(vec![a], c.view_mut(), 1.0, 0.0).unwrap();
+        code.evaluate_into(vec![a], c.view_mut(), 1.0, 0.0, None)
+            .unwrap();
         assert_abs_diff_eq!(c.data()[0], 6.0);
     }
 
@@ -1167,7 +1258,7 @@ mod tests {
         let b = make_f64(&[3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
         let c_op = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
         let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-        code.evaluate_into(vec![a, b, c_op], out.view_mut(), 1.0, 0.0)
+        code.evaluate_into(vec![a, b, c_op], out.view_mut(), 1.0, 0.0, None)
             .unwrap();
         assert_abs_diff_eq!(out.get(&[0, 0]), 4.0, epsilon = 1e-10);
         assert_abs_diff_eq!(out.get(&[0, 1]), 2.0, epsilon = 1e-10);
@@ -1182,7 +1273,7 @@ mod tests {
         let b = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let c_op = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
         let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-        code.evaluate_into(vec![a, b, c_op], out.view_mut(), 1.0, 0.0)
+        code.evaluate_into(vec![a, b, c_op], out.view_mut(), 1.0, 0.0, None)
             .unwrap();
         assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);
         assert_abs_diff_eq!(out.get(&[0, 1]), 22.0, epsilon = 1e-10);
@@ -1196,7 +1287,7 @@ mod tests {
         let a = make_f64(&[3], vec![1.0, 2.0, 3.0]);
         let b = make_f64(&[3], vec![4.0, 5.0, 6.0]);
         let mut c = StridedArray::<f64>::col_major(&[]);
-        code.evaluate_into(vec![a, b], c.view_mut(), 1.0, 0.0)
+        code.evaluate_into(vec![a, b], c.view_mut(), 1.0, 0.0, None)
             .unwrap();
         assert_abs_diff_eq!(c.data()[0], 32.0);
     }
@@ -1215,7 +1306,7 @@ mod tests {
         let op = EinsumOperand::C64(StridedData::Owned(arr));
         let mut out = StridedArray::<f64>::col_major(&[2, 2]);
         let err = code
-            .evaluate_into(vec![op], out.view_mut(), 1.0, 0.0)
+            .evaluate_into(vec![op], out.view_mut(), 1.0, 0.0, None)
             .unwrap_err();
         assert!(matches!(err, crate::EinsumError::TypeMismatch { .. }));
     }
@@ -1227,7 +1318,7 @@ mod tests {
         let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
         let mut out = StridedArray::<f64>::col_major(&[3, 3]); // wrong shape
         let err = code
-            .evaluate_into(vec![a, b], out.view_mut(), 1.0, 0.0)
+            .evaluate_into(vec![a, b], out.view_mut(), 1.0, 0.0, None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1249,8 +1340,14 @@ mod tests {
             StridedArray::from_parts(b_data, &[2, 2], &strides, 0).unwrap(),
         ));
         let mut out = StridedArray::<Complex64>::col_major(&[2, 2]);
-        code.evaluate_into(vec![a, b], out.view_mut(), c64(1.0), Complex64::zero())
-            .unwrap();
+        code.evaluate_into(
+            vec![a, b],
+            out.view_mut(),
+            c64(1.0),
+            Complex64::zero(),
+            None,
+        )
+        .unwrap();
         assert_abs_diff_eq!(out.get(&[0, 0]).re, 19.0);
         assert_abs_diff_eq!(out.get(&[1, 1]).re, 50.0);
     }
@@ -1267,8 +1364,14 @@ mod tests {
             StridedArray::from_parts(b_data, &[2, 2], &strides, 0).unwrap(),
         ));
         let mut out = StridedArray::<Complex64>::col_major(&[2, 2]);
-        code.evaluate_into(vec![a, b], out.view_mut(), c64(1.0), Complex64::zero())
-            .unwrap();
+        code.evaluate_into(
+            vec![a, b],
+            out.view_mut(),
+            c64(1.0),
+            Complex64::zero(),
+            None,
+        )
+        .unwrap();
         assert_abs_diff_eq!(out.get(&[0, 0]).re, 19.0);
         assert_abs_diff_eq!(out.get(&[1, 1]).re, 50.0);
     }

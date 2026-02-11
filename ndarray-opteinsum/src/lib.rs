@@ -103,7 +103,7 @@ fn to_einsum_operand<'a>(op: &NdOperand<'a>) -> EinsumOperand<'a> {
 pub fn einsum<T: EinsumScalar>(notation: &str, operands: Vec<NdOperand<'_>>) -> Result<ArrayD<T>> {
     let einsum_ops: Vec<EinsumOperand<'_>> =
         operands.iter().map(|op| to_einsum_operand(op)).collect();
-    let result = strided_opteinsum::einsum(notation, einsum_ops)?;
+    let result = strided_opteinsum::einsum(notation, einsum_ops, None)?;
     let data = T::extract_data(result)?;
     let strided_arr = data.into_array();
     Ok(strided_array_to_ndarray(strided_arr))
@@ -123,7 +123,7 @@ pub fn einsum_into<'a, T: EinsumScalar>(
     let einsum_ops: Vec<EinsumOperand<'_>> =
         operands.iter().map(|op| to_einsum_operand(op)).collect();
     let strided_out = view_mut_to_strided_view_mut(output);
-    strided_opteinsum::einsum_into(notation, einsum_ops, strided_out, alpha, beta)?;
+    strided_opteinsum::einsum_into(notation, einsum_ops, strided_out, alpha, beta, None)?;
     Ok(())
 }
 

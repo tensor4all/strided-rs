@@ -37,9 +37,21 @@ pub fn parse_einsum(s: &str) -> crate::Result<EinsumCode> {
         }
     }
 
-    // Parse LHS as args_list
+    // Parse LHS as args_list.
+    // Empty LHS (e.g. "->ii") means a single scalar operand with no indices.
     let mut counter: usize = 0;
-    let root = parse_args_list(lhs, &mut counter)?;
+    let root = if lhs.is_empty() {
+        let tensor_index = counter;
+        let _ = counter; // counter not read after this point when LHS is empty
+        EinsumNode::Contract {
+            args: vec![EinsumNode::Leaf {
+                ids: vec![],
+                tensor_index,
+            }],
+        }
+    } else {
+        parse_args_list(lhs, &mut counter)?
+    };
 
     Ok(EinsumCode { root, output_ids })
 }

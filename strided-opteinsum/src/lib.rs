@@ -11,8 +11,10 @@
 //! ```ignore
 //! use strided_opteinsum::{einsum, EinsumOperand};
 //!
-//! let result = einsum("(ij,jk),kl->il", vec![a.into(), b.into(), c.into()])?;
+//! let result = einsum("(ij,jk),kl->il", vec![a.into(), b.into(), c.into()], None)?;
 //! ```
+
+use std::collections::HashMap;
 
 /// Error types for einsum operations.
 pub mod error;
@@ -34,13 +36,20 @@ pub use typed_tensor::{needs_c64_promotion, TypedTensor};
 
 /// Parse and evaluate an einsum expression in one call.
 ///
+/// Pass `size_dict` to specify sizes for output indices not present in any
+/// input (generative outputs like `"->ii"` or `"i->ij"`).
+///
 /// # Example
 /// ```ignore
-/// let result = einsum("(ij,jk),kl->il", vec![a.into(), b.into(), c.into()])?;
+/// let result = einsum("(ij,jk),kl->il", vec![a.into(), b.into(), c.into()], None)?;
 /// ```
-pub fn einsum<'a>(notation: &str, operands: Vec<EinsumOperand<'a>>) -> Result<EinsumOperand<'a>> {
+pub fn einsum<'a>(
+    notation: &str,
+    operands: Vec<EinsumOperand<'a>>,
+    size_dict: Option<&HashMap<char, usize>>,
+) -> Result<EinsumOperand<'a>> {
     let code = parse_einsum(notation)?;
-    code.evaluate(operands)
+    code.evaluate(operands, size_dict)
 }
 
 /// Parse and evaluate an einsum expression, writing the result into a
@@ -48,12 +57,15 @@ pub fn einsum<'a>(notation: &str, operands: Vec<EinsumOperand<'a>>) -> Result<Ei
 ///
 /// `output = alpha * einsum(operands) + beta * output`
 ///
+/// Pass `size_dict` to specify sizes for output indices not present in any
+/// input (generative outputs like `"->ii"` or `"i->ij"`).
+///
 /// # Example
 /// ```ignore
 /// use strided_opteinsum::{einsum_into, EinsumOperand};
 ///
 /// let mut c = StridedArray::<f64>::col_major(&[2, 2]);
-/// einsum_into("ij,jk->ik", vec![a.into(), b.into()], c.view_mut(), 1.0, 0.0)?;
+/// einsum_into("ij,jk->ik", vec![a.into(), b.into()], c.view_mut(), 1.0, 0.0, None)?;
 /// ```
 pub fn einsum_into<T: EinsumScalar>(
     notation: &str,
@@ -61,7 +73,8 @@ pub fn einsum_into<T: EinsumScalar>(
     output: strided_view::StridedViewMut<T>,
     alpha: T,
     beta: T,
+    size_dict: Option<&HashMap<char, usize>>,
 ) -> Result<()> {
     let code = parse_einsum(notation)?;
-    code.evaluate_into(operands, output, alpha, beta)
+    code.evaluate_into(operands, output, alpha, beta, size_dict)
 }

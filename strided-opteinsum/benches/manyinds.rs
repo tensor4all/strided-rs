@@ -51,10 +51,13 @@ fn main() {
     println!("=== manyinds f64 (opteinsum) ===");
     bench_n("opteinsum_f64", 1, 5, || {
         let result = code
-            .evaluate(vec![
-                EinsumOperand::from_view(&a_view),
-                EinsumOperand::from_view(&b_view),
-            ])
+            .evaluate(
+                vec![
+                    EinsumOperand::from_view(&a_view),
+                    EinsumOperand::from_view(&b_view),
+                ],
+                None,
+            )
             .unwrap();
         match result {
             EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
@@ -76,10 +79,13 @@ fn main() {
     println!("=== manyinds Complex64 (opteinsum) ===");
     bench_n("opteinsum_Complex64", 1, 5, || {
         let result = code
-            .evaluate(vec![
-                EinsumOperand::from_view(&a_c_view),
-                EinsumOperand::from_view(&b_c_view),
-            ])
+            .evaluate(
+                vec![
+                    EinsumOperand::from_view(&a_c_view),
+                    EinsumOperand::from_view(&b_c_view),
+                ],
+                None,
+            )
             .unwrap();
         match result {
             EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),

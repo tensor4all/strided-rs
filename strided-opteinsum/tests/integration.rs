@@ -128,7 +128,7 @@ fn assert_complex_arrays_close(
 fn test_matmul_e2e() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -146,7 +146,7 @@ fn test_nested_chain_e2e() {
     let a = make_f64(&[2, 3], vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     let b = make_f64(&[3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let c = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
-    let result = einsum("(ij,jk),kl->il", vec![a, b, c]).unwrap();
+    let result = einsum("(ij,jk),kl->il", vec![a, b, c], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -165,7 +165,7 @@ fn test_nested_chain_e2e() {
 #[test]
 fn test_trace_e2e() {
     let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
-    let result = einsum("ii->", vec![a]).unwrap();
+    let result = einsum("ii->", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             assert_abs_diff_eq!(data.as_array().data()[0], 6.0);
@@ -180,7 +180,7 @@ fn test_partial_trace_e2e() {
     let a = make_f64(&[2, 2, 3], (0..12).map(|x| x as f64).collect());
     // A[0,0,:] = [0,1,2], A[1,1,:] = [9,10,11]
     // result = [9, 11, 13]
-    let result = einsum("iij->j", vec![a]).unwrap();
+    let result = einsum("iij->j", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let d = data.as_array().data().to_vec();
@@ -204,7 +204,7 @@ fn test_mixed_f64_c64_e2e() {
         Complex64::new(3.0, 0.0),
     ];
     let b = make_c64(&[2, 2], b_data);
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     // I * B = B
     assert!(result.is_c64());
     match result {
@@ -235,7 +235,7 @@ fn test_batch_matmul_e2e() {
             5.0, 6.0, 7.0, 8.0, // batch 1
         ],
     );
-    let result = einsum("bij,bjk->bik", vec![a, b]).unwrap();
+    let result = einsum("bij,bjk->bik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -258,7 +258,7 @@ fn test_flat_three_tensor_e2e() {
     let b = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
     let c = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     // A*I = A, A*C = [[19,22],[43,50]]
-    let result = einsum("ij,jk,kl->il", vec![a, b, c]).unwrap();
+    let result = einsum("ij,jk,kl->il", vec![a, b, c], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -330,8 +330,9 @@ fn run_differential_case(
     let (loop_ops, eins_ops) = build_random_case(notation, rng, mode, allow_zero_dim);
     let expected =
         loop_einsum_complex(notation, &loop_ops).expect("reference evaluator should succeed");
-    let actual =
-        to_complex_array(einsum(notation, eins_ops).expect("strided-opteinsum should succeed"));
+    let actual = to_complex_array(
+        einsum(notation, eins_ops, None).expect("strided-opteinsum should succeed"),
+    );
     let ctx = format!("notation={notation}, mode={mode}");
     assert_complex_arrays_close(&actual, &expected, eps, &ctx);
 }
@@ -364,7 +365,7 @@ fn test_differential_loop_einsum_c64() {
 fn test_einsum_simple_matmul() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -380,7 +381,7 @@ fn test_einsum_simple_matmul() {
 #[test]
 fn test_einsum_single_tensor_permute() {
     let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let result = einsum("ij->ji", vec![a]).unwrap();
+    let result = einsum("ij->ji", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -395,7 +396,7 @@ fn test_einsum_single_tensor_permute() {
 #[test]
 fn test_einsum_scalar_output_trace() {
     let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
-    let result = einsum("ii->", vec![a]).unwrap();
+    let result = einsum("ii->", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             assert_abs_diff_eq!(data.as_array().data()[0], 6.0);
@@ -407,7 +408,7 @@ fn test_einsum_scalar_output_trace() {
 #[test]
 fn test_einsum_parse_error() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
-    let err = einsum("ij,jk", vec![a]).unwrap_err();
+    let err = einsum("ij,jk", vec![a], None).unwrap_err();
     assert!(
         matches!(err, strided_opteinsum::EinsumError::ParseError(_)),
         "expected ParseError, got {:?}",
@@ -418,7 +419,7 @@ fn test_einsum_parse_error() {
 #[test]
 fn test_einsum_operand_count_mismatch() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
-    let err = einsum("ij,jk->ik", vec![a]).unwrap_err();
+    let err = einsum("ij,jk->ik", vec![a], None).unwrap_err();
     assert!(matches!(
         err,
         strided_opteinsum::EinsumError::OperandCountMismatch {
@@ -434,7 +435,7 @@ fn test_einsum_nested_notation() {
     let a = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
     let b = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let c = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-    let result = einsum("(ij,jk),kl->il", vec![a, b, c]).unwrap();
+    let result = einsum("(ij,jk),kl->il", vec![a, b, c], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -457,7 +458,7 @@ fn test_einsum_c64() {
         &[2, 2],
         vec![c64(2.0, 0.0), c64(3.0, 0.0), c64(4.0, 0.0), c64(5.0, 0.0)],
     );
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -479,7 +480,7 @@ fn test_einsum_mixed_f64_c64() {
         &[2, 2],
         vec![c64(1.0, 2.0), c64(3.0, 4.0), c64(5.0, 6.0), c64(7.0, 8.0)],
     );
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     // I * B = B, result should be C64
     assert!(result.is_c64());
     match result {
@@ -501,7 +502,7 @@ fn test_einsum_into_f64_basic() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     let mut c = StridedArray::<f64>::col_major(&[2, 2]);
-    einsum_into("ij,jk->ik", vec![a, b], c.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ij,jk->ik", vec![a, b], c.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(c.get(&[0, 0]), 19.0);
     assert_abs_diff_eq!(c.get(&[0, 1]), 22.0);
     assert_abs_diff_eq!(c.get(&[1, 0]), 43.0);
@@ -518,7 +519,7 @@ fn test_einsum_into_f64_alpha_beta() {
     for v in c.data_mut().iter_mut() {
         *v = 1.0;
     }
-    einsum_into("ij,jk->ik", vec![a, b], c.view_mut(), 2.0, 3.0).unwrap();
+    einsum_into("ij,jk->ik", vec![a, b], c.view_mut(), 2.0, 3.0, None).unwrap();
     // 2*19+3 = 41, 2*22+3 = 47, 2*43+3 = 89, 2*50+3 = 103
     assert_abs_diff_eq!(c.get(&[0, 0]), 41.0, epsilon = 1e-10);
     assert_abs_diff_eq!(c.get(&[0, 1]), 47.0, epsilon = 1e-10);
@@ -538,6 +539,7 @@ fn test_einsum_into_c64_basic() {
         out.view_mut(),
         c64(1.0),
         Complex64::zero(),
+        None,
     )
     .unwrap();
     assert_abs_diff_eq!(out.get(&[0, 0]).re, 19.0);
@@ -557,6 +559,7 @@ fn test_einsum_into_mixed_types_c64_output() {
         out.view_mut(),
         c64(1.0),
         Complex64::zero(),
+        None,
     )
     .unwrap();
     // I * B = B
@@ -570,7 +573,7 @@ fn test_einsum_into_mixed_types_c64_output() {
 fn test_einsum_into_parse_error() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-    let err = einsum_into("ij,jk", vec![a], out.view_mut(), 1.0, 0.0).unwrap_err();
+    let err = einsum_into("ij,jk", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap_err();
     assert!(matches!(err, strided_opteinsum::EinsumError::ParseError(_)));
 }
 
@@ -580,7 +583,7 @@ fn test_einsum_into_type_mismatch_f64_output_c64_operand() {
     let a = make_c64(&[2, 2], vec![c64(1.0), c64(2.0), c64(3.0), c64(4.0)]);
     let b = make_c64(&[2, 2], vec![c64(5.0), c64(6.0), c64(7.0), c64(8.0)]);
     let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-    let err = einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0).unwrap_err();
+    let err = einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0, None).unwrap_err();
     assert!(matches!(
         err,
         strided_opteinsum::EinsumError::TypeMismatch { .. }
@@ -592,7 +595,7 @@ fn test_einsum_into_shape_mismatch() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     let mut out = StridedArray::<f64>::col_major(&[3, 3]); // wrong shape
-    let err = einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0).unwrap_err();
+    let err = einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0, None).unwrap_err();
     assert!(matches!(
         err,
         strided_opteinsum::EinsumError::OutputShapeMismatch { .. }
@@ -603,7 +606,7 @@ fn test_einsum_into_shape_mismatch() {
 fn test_einsum_into_operand_count_mismatch() {
     let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-    let err = einsum_into("ij,jk->ik", vec![a], out.view_mut(), 1.0, 0.0).unwrap_err();
+    let err = einsum_into("ij,jk->ik", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap_err();
     assert!(matches!(
         err,
         strided_opteinsum::EinsumError::OperandCountMismatch {
@@ -618,7 +621,7 @@ fn test_einsum_into_single_tensor_identity() {
     // ij->ij is identity (no permute, no trace)
     let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let mut out = StridedArray::<f64>::col_major(&[2, 3]);
-    einsum_into("ij->ij", vec![a], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ij->ij", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.get(&[0, 0]), 1.0);
     assert_abs_diff_eq!(out.get(&[0, 2]), 3.0);
     assert_abs_diff_eq!(out.get(&[1, 0]), 4.0);
@@ -629,7 +632,7 @@ fn test_einsum_into_single_tensor_identity() {
 fn test_einsum_into_single_tensor_permute() {
     let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let mut out = StridedArray::<f64>::col_major(&[3, 2]);
-    einsum_into("ij->ji", vec![a], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ij->ji", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.get(&[0, 0]), 1.0);
     assert_abs_diff_eq!(out.get(&[0, 1]), 4.0);
     assert_abs_diff_eq!(out.get(&[1, 0]), 2.0);
@@ -640,7 +643,7 @@ fn test_einsum_into_single_tensor_permute() {
 fn test_einsum_into_single_tensor_trace() {
     let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
     let mut out = StridedArray::<f64>::col_major(&[]);
-    einsum_into("ii->", vec![a], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ii->", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.data()[0], 6.0);
 }
 
@@ -650,7 +653,15 @@ fn test_einsum_into_three_tensor_omeco() {
     let b = make_f64(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
     let c_op = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-    einsum_into("ij,jk,kl->il", vec![a, b, c_op], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into(
+        "ij,jk,kl->il",
+        vec![a, b, c_op],
+        out.view_mut(),
+        1.0,
+        0.0,
+        None,
+    )
+    .unwrap();
     // A*I = A, A*C = [[19,22],[43,50]]
     assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);
     assert_abs_diff_eq!(out.get(&[1, 1]), 50.0, epsilon = 1e-10);
@@ -662,7 +673,15 @@ fn test_einsum_into_nested_notation() {
     let b = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let c_op = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     let mut out = StridedArray::<f64>::col_major(&[2, 2]);
-    einsum_into("(ij,jk),kl->il", vec![a, b, c_op], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into(
+        "(ij,jk),kl->il",
+        vec![a, b, c_op],
+        out.view_mut(),
+        1.0,
+        0.0,
+        None,
+    )
+    .unwrap();
     // I*B = B, B*C = [[19,22],[43,50]]
     assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);
     assert_abs_diff_eq!(out.get(&[1, 1]), 50.0, epsilon = 1e-10);
@@ -673,7 +692,7 @@ fn test_einsum_into_dot_product() {
     let a = make_f64(&[3], vec![1.0, 2.0, 3.0]);
     let b = make_f64(&[3], vec![4.0, 5.0, 6.0]);
     let mut out = StridedArray::<f64>::col_major(&[]);
-    einsum_into("i,i->", vec![a, b], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("i,i->", vec![a, b], out.view_mut(), 1.0, 0.0, None).unwrap();
     // 1*4 + 2*5 + 3*6 = 32
     assert_abs_diff_eq!(out.data()[0], 32.0);
 }
@@ -683,7 +702,7 @@ fn test_einsum_into_outer_product() {
     let a = make_f64(&[2], vec![3.0, 5.0]);
     let b = make_f64(&[3], vec![10.0, 20.0, 30.0]);
     let mut out = StridedArray::<f64>::col_major(&[2, 3]);
-    einsum_into("i,j->ij", vec![a, b], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("i,j->ij", vec![a, b], out.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.get(&[0, 0]), 30.0);
     assert_abs_diff_eq!(out.get(&[0, 2]), 90.0);
     assert_abs_diff_eq!(out.get(&[1, 0]), 50.0);
@@ -697,7 +716,7 @@ fn test_einsum_into_single_tensor_trace_alpha_beta() {
     let mut out = StridedArray::<f64>::col_major(&[]);
     out.data_mut()[0] = 10.0;
     // out = alpha * trace(A) + beta * out = 2 * 3 + 5 * 10 = 56
-    einsum_into("ii->", vec![a], out.view_mut(), 2.0, 5.0).unwrap();
+    einsum_into("ii->", vec![a], out.view_mut(), 2.0, 5.0, None).unwrap();
     assert_abs_diff_eq!(out.data()[0], 56.0, epsilon = 1e-10);
 }
 
@@ -717,7 +736,7 @@ fn test_einsum_operand_from_view_f64_roundtrip() {
     assert_eq!(op.dims(), &[2, 3]);
 
     // Use it in an einsum to prove it works through the pipeline
-    let result = einsum("ij->ji", vec![op]).unwrap();
+    let result = einsum("ij->ji", vec![op], None).unwrap();
     assert!(result.is_f64());
     assert_eq!(result.dims(), &[3, 2]);
 }
@@ -734,7 +753,7 @@ fn test_einsum_operand_from_view_c64_roundtrip() {
     assert!(op.is_c64());
     assert_eq!(op.dims(), &[2, 2]);
 
-    let result = einsum("ij->ji", vec![op]).unwrap();
+    let result = einsum("ij->ji", vec![op], None).unwrap();
     assert!(result.is_c64());
     assert_eq!(result.dims(), &[2, 2]);
 }
@@ -755,7 +774,7 @@ fn test_eval_pair_c64_c64_matmul() {
         &[2, 2],
         vec![c64(1.0, 0.0), c64(0.0, 1.0), c64(-1.0, 0.0), c64(2.0, 0.0)],
     );
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     assert!(result.is_c64());
     // Verify correct complex multiplication
     // C[0,0] = (1+i)*1 + 2*(-1) = 1+i-2 = -1+i
@@ -792,7 +811,7 @@ fn test_eval_single_c64_trace() {
             c64(3.0, 2.0),
         ],
     );
-    let result = einsum("ii->", vec![a]).unwrap();
+    let result = einsum("ii->", vec![a], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -820,7 +839,7 @@ fn test_eval_single_c64_permute() {
             c64(6.0, 3.0),
         ],
     );
-    let result = einsum("ij->ji", vec![a]).unwrap();
+    let result = einsum("ij->ji", vec![a], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -849,7 +868,7 @@ fn test_eval_single_c64_sum_axis() {
             c64(6.0, -3.0),
         ],
     );
-    let result = einsum("ij->i", vec![a]).unwrap();
+    let result = einsum("ij->i", vec![a], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -877,7 +896,7 @@ fn test_mixed_f64_c64_eval_pair_promotion() {
         vec![c64(1.0, 2.0), c64(3.0, 4.0), c64(5.0, 6.0), c64(7.0, 8.0)],
     );
     // I * B = B
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -906,7 +925,7 @@ fn test_accumulate_into_copy_scale_path() {
     let mut out = StridedArray::<f64>::col_major(&[]);
     out.data_mut()[0] = 999.0; // should be overwritten
                                // out = 3 * trace(A) + 0 * out = 3 * 3 = 9
-    einsum_into("ii->", vec![a], out.view_mut(), 3.0, 0.0).unwrap();
+    einsum_into("ii->", vec![a], out.view_mut(), 3.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.data()[0], 9.0, epsilon = 1e-10);
 }
 
@@ -920,7 +939,7 @@ fn test_accumulate_into_general_path() {
         *v = (i + 1) as f64;
     }
     // out = 2 * transpose(A) + 3 * out_old
-    einsum_into("ij->ji", vec![a], out.view_mut(), 2.0, 3.0).unwrap();
+    einsum_into("ij->ji", vec![a], out.view_mut(), 2.0, 3.0, None).unwrap();
     // Verify: out[0,0] = 2*A[0,0] + 3*old[0,0]
     // A transposed: [[1,4],[2,5],[3,6]]
     // old (col-major [3,2]): data = [1,2,3,4,5,6] -> col-major: [0,0]=1, [1,0]=2, [2,0]=3, [0,1]=4, [1,1]=5, [2,1]=6
@@ -942,7 +961,7 @@ fn test_evaluate_into_single_child_contract_trace() {
     let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
     // Use parenthesized notation that creates a nested Contract around the trace
     let mut out = StridedArray::<f64>::col_major(&[]);
-    einsum_into("ii->", vec![a], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ii->", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.data()[0], 6.0, epsilon = 1e-10);
 }
 
@@ -952,7 +971,7 @@ fn test_evaluate_into_single_child_contract_sum_axis() {
     let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let mut out = StridedArray::<f64>::col_major(&[2]);
     // ij->i : sum over j
-    einsum_into("ij->i", vec![a], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ij->i", vec![a], out.view_mut(), 1.0, 0.0, None).unwrap();
     // row 0: 1+2+3 = 6, row 1: 4+5+6 = 15
     assert_abs_diff_eq!(out.data()[0], 6.0, epsilon = 1e-10);
     assert_abs_diff_eq!(out.data()[1], 15.0, epsilon = 1e-10);
@@ -975,7 +994,7 @@ fn test_c64_three_tensor_omeco() {
         vec![c64(1.0, 0.0), c64(0.0, 0.0), c64(0.0, 0.0), c64(1.0, 0.0)], // identity
     );
     // I * B * I = B
-    let result = einsum("ij,jk,kl->il", vec![a, b, c_op]).unwrap();
+    let result = einsum("ij,jk,kl->il", vec![a, b, c_op], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -1007,6 +1026,7 @@ fn test_evaluate_into_c64_alpha_beta() {
         out.view_mut(),
         c64(2.0, 1.0),
         c64(1.0, 0.0),
+        None,
     )
     .unwrap();
     assert_abs_diff_eq!(out.data()[0].re, 16.0, epsilon = 1e-10);
@@ -1025,7 +1045,7 @@ fn test_single_tensor_c64_trace() {
         &[2, 2],
         vec![c64(1.0, 1.0), c64(0.0, 0.0), c64(0.0, 0.0), c64(3.0, -2.0)],
     );
-    let result = einsum("ii->", vec![a]).unwrap();
+    let result = einsum("ii->", vec![a], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -1063,7 +1083,7 @@ fn test_single_tensor_c64_partial_trace() {
             c64(6.0, -1.0),
         ],
     );
-    let result = einsum("iij->j", vec![a]).unwrap();
+    let result = einsum("iij->j", vec![a], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -1097,7 +1117,7 @@ fn test_single_tensor_multi_pair_diagonal() {
     let data: Vec<f64> = (0..total).map(|x| x as f64).collect();
     let a = make_f64(&[n, n, n, n], data);
     // iijj -> : sum of A[i,i,j,j] for all i,j
-    let result = einsum("iijj->", vec![a]).unwrap();
+    let result = einsum("iijj->", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -1121,7 +1141,7 @@ fn test_single_tensor_identity_copy() {
     // Exercise the identity case at line 279-291 of single_tensor.rs
     // where current_ids == output_ids, no diagonal, no reduction => copy src
     let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let result = einsum("ij->ij", vec![a]).unwrap();
+    let result = einsum("ij->ij", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -1144,7 +1164,7 @@ fn test_single_tensor_diagonal_and_reduce() {
     let data: Vec<f64> = (0..18).map(|x| x as f64).collect();
     let a = make_f64(&[2, 3, 3], data);
     // A[i,j,j] -> result[i] = sum_j A[i,j,j]
-    let result = einsum("ijj->i", vec![a]).unwrap();
+    let result = einsum("ijj->i", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(rdata) => {
             let arr = rdata.as_array();
@@ -1164,7 +1184,7 @@ fn test_single_tensor_diagonal_no_reduce() {
     let data: Vec<f64> = (0..18).map(|x| x as f64).collect();
     let a = make_f64(&[2, 3, 3], data);
     // ijj->ij: just extract diagonal (no reduction)
-    let result = einsum("ijj->ij", vec![a]).unwrap();
+    let result = einsum("ijj->ij", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(rdata) => {
             let arr = rdata.as_array();
@@ -1189,7 +1209,7 @@ fn test_single_tensor_diagonal_and_reduce_with_permute() {
     let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
     let a = make_f64(&[3, 2, 2], data);
     // jii-> : sum over diagonal i of A[j,i,i], result is vector of j
-    let result = einsum("jii->j", vec![a]).unwrap();
+    let result = einsum("jii->j", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(rdata) => {
             let arr = rdata.as_array();
@@ -1212,7 +1232,7 @@ fn test_single_tensor_reduce_without_diagonal() {
     // Exercise the reduction-only path (no diagonal, lines 222-234) in single_tensor.rs
     // ij->j: sum over first axis. No repeated indices.
     let a = make_f64(&[3, 4], (0..12).map(|x| x as f64).collect());
-    let result = einsum("ij->j", vec![a]).unwrap();
+    let result = einsum("ij->j", vec![a], None).unwrap();
     match result {
         EinsumOperand::F64(rdata) => {
             let arr = rdata.as_array();
@@ -1246,7 +1266,7 @@ fn test_mixed_c64_f64_dot_product() {
     let a = make_c64(&[3], vec![c64(1.0, 1.0), c64(2.0, 0.0), c64(0.0, 3.0)]);
     let b = make_f64(&[3], vec![1.0, 2.0, 3.0]);
     // dot = (1+i)*1 + 2*2 + (0+3i)*3 = (1+i) + 4 + 9i = 5 + 10i
-    let result = einsum("i,i->", vec![a, b]).unwrap();
+    let result = einsum("i,i->", vec![a, b], None).unwrap();
     assert!(result.is_c64());
     match result {
         EinsumOperand::C64(data) => {
@@ -1274,7 +1294,7 @@ fn test_eval_pair_view_view_f64() {
     });
     let a = EinsumOperand::from_view(&a_arr.view());
     let b = EinsumOperand::from_view(&b_arr.view());
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -1293,7 +1313,7 @@ fn test_eval_pair_owned_view_f64() {
         [5.0, 6.0, 7.0, 8.0][idx[0] * 2 + idx[1]]
     });
     let b = EinsumOperand::from_view(&b_arr.view());
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -1311,7 +1331,7 @@ fn test_eval_pair_view_owned_f64() {
     });
     let a = EinsumOperand::from_view(&a_arr.view());
     let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::F64(data) => {
             let arr = data.as_array();
@@ -1333,7 +1353,7 @@ fn test_eval_pair_view_view_c64() {
     });
     let a = EinsumOperand::from_view(&a_arr.view());
     let b = EinsumOperand::from_view(&b_arr.view());
-    let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
+    let result = einsum("ij,jk->ik", vec![a, b], None).unwrap();
     match result {
         EinsumOperand::C64(data) => {
             let arr = data.as_array();
@@ -1359,7 +1379,15 @@ fn test_einsum_into_three_tensor_flat_omeco() {
     let c = make_f64(&[4, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
     let mut out = StridedArray::<f64>::row_major(&[2, 2]);
-    einsum_into("ij,jk,kl->il", vec![a, b, c], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into(
+        "ij,jk,kl->il",
+        vec![a, b, c],
+        out.view_mut(),
+        1.0,
+        0.0,
+        None,
+    )
+    .unwrap();
 
     // A*B = [[1,2,3,0],[4,5,6,0]], (A*B)*C = [[1*1+2*3+3*5, 1*2+2*4+3*6],[4*1+5*3+6*5, 4*2+5*4+6*6]]
     //     = [[1+6+15, 2+8+18],[4+15+30, 8+20+36]] = [[22,28],[49,64]]
@@ -1385,7 +1413,7 @@ fn test_einsum_into_view_operands() {
     let a = EinsumOperand::from_view(&a_arr.view());
     let b = EinsumOperand::from_view(&b_arr.view());
     let mut out = StridedArray::<f64>::row_major(&[2, 2]);
-    einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0).unwrap();
+    einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0, None).unwrap();
     assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);
     assert_abs_diff_eq!(out.get(&[1, 1]), 50.0, epsilon = 1e-10);
 }
@@ -1402,8 +1430,8 @@ fn test_einsum_unicode_matmul() {
     let a2 = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let b2 = make_f64(&[3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
 
-    let result_unicode = einsum("αβ,βγ->αγ", vec![a, b]).unwrap();
-    let result_ascii = einsum("ij,jk->ik", vec![a2, b2]).unwrap();
+    let result_unicode = einsum("αβ,βγ->αγ", vec![a, b], None).unwrap();
+    let result_ascii = einsum("ij,jk->ik", vec![a2, b2], None).unwrap();
 
     // Both should produce the same 2x2 result
     assert_eq!(result_unicode.dims(), &[2, 2]);
@@ -1425,11 +1453,164 @@ fn test_einsum_unicode_matmul() {
 fn test_einsum_unicode_trace() {
     // Trace: "αα->" (scalar output)
     let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
-    let result = einsum("αα->", vec![a]).unwrap();
+    let result = einsum("αα->", vec![a], None).unwrap();
     assert_eq!(result.dims(), &[] as &[usize]);
     match &result {
         EinsumOperand::F64(data) => {
             assert_abs_diff_eq!(data.as_view().get(&[]), 6.0, epsilon = 1e-10);
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+// ==========================================================================
+// Generative einsum outputs (issue #45)
+// ==========================================================================
+
+#[test]
+fn test_einsum_scalar_to_identity_matrix() {
+    // "->ii" with scalar 1.0 and size_dict i=4 → 4×4 identity matrix
+    use std::collections::HashMap;
+    let scalar = make_f64(&[], vec![1.0]);
+    let sizes = HashMap::from([('i', 4)]);
+    let result = einsum("->ii", vec![scalar], Some(&sizes)).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[4, 4]);
+            for i in 0..4 {
+                for j in 0..4 {
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert_abs_diff_eq!(arr.get(&[i, j]), expected, epsilon = 1e-10);
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_scalar_broadcast_to_matrix() {
+    // "->ij" with scalar 3.0 and size_dict i=2, j=3 → 2×3 matrix filled with 3.0
+    use std::collections::HashMap;
+    let scalar = make_f64(&[], vec![3.0]);
+    let sizes = HashMap::from([('i', 2), ('j', 3)]);
+    let result = einsum("->ij", vec![scalar], Some(&sizes)).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[2, 3]);
+            for v in arr.data() {
+                assert_abs_diff_eq!(*v, 3.0, epsilon = 1e-10);
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_vector_to_diagonal() {
+    // "i->ii" with vector [1,2,3] → 3×3 diagonal matrix
+    let v = make_f64(&[3], vec![1.0, 2.0, 3.0]);
+    let result = einsum("i->ii", vec![v], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3, 3]);
+            for i in 0..3 {
+                for j in 0..3 {
+                    let expected = if i == j { (i + 1) as f64 } else { 0.0 };
+                    assert_abs_diff_eq!(arr.get(&[i, j]), expected, epsilon = 1e-10);
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_vector_broadcast_new_axis() {
+    // "i->ij" with vector [1,2,3] and size_dict j=4 → 3×4 matrix, each row = [1,1,1,1] etc
+    use std::collections::HashMap;
+    let v = make_f64(&[3], vec![1.0, 2.0, 3.0]);
+    let sizes = HashMap::from([('j', 4)]);
+    let result = einsum("i->ij", vec![v], Some(&sizes)).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3, 4]);
+            for i in 0..3 {
+                for j in 0..4 {
+                    assert_abs_diff_eq!(arr.get(&[i, j]), (i + 1) as f64, epsilon = 1e-10);
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_trace_then_diagonal_roundtrip() {
+    // "ii->i" extracts diagonal, then "i->ii" builds diagonal matrix
+    // Roundtrip: diagonal matrix → extract → rebuild should give back the same
+    let v = make_f64(&[3], vec![5.0, 10.0, 15.0]);
+    let diag = einsum("i->ii", vec![v], None).unwrap();
+    let extracted = einsum("ii->i", vec![diag], None).unwrap();
+    match &extracted {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3]);
+            assert_abs_diff_eq!(arr.data()[0], 5.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(arr.data()[1], 10.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(arr.data()[2], 15.0, epsilon = 1e-10);
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_generative_missing_size_dict_error() {
+    // "->ii" without size_dict should fail with OrphanOutputAxis
+    let scalar = make_f64(&[], vec![1.0]);
+    let err = einsum("->ii", vec![scalar], None).unwrap_err();
+    assert!(matches!(
+        err,
+        strided_opteinsum::EinsumError::OrphanOutputAxis(_)
+    ));
+}
+
+#[test]
+fn test_einsum_size_dict_conflict_error() {
+    // size_dict says i=5 but operand has i=3 → DimensionMismatch
+    use std::collections::HashMap;
+    let v = make_f64(&[3], vec![1.0, 2.0, 3.0]);
+    let sizes = HashMap::from([('i', 5)]);
+    let err = einsum("i->i", vec![v], Some(&sizes)).unwrap_err();
+    assert!(matches!(
+        err,
+        strided_opteinsum::EinsumError::DimensionMismatch { .. }
+    ));
+}
+
+#[test]
+fn test_einsum_scalar_to_3d_diagonal() {
+    // "->iii" with scalar 2.0 and size_dict i=3 → 3×3×3 tensor, only [k,k,k]=2.0
+    use std::collections::HashMap;
+    let scalar = make_f64(&[], vec![2.0]);
+    let sizes = HashMap::from([('i', 3)]);
+    let result = einsum("->iii", vec![scalar], Some(&sizes)).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3, 3, 3]);
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        let expected = if i == j && j == k { 2.0 } else { 0.0 };
+                        assert_abs_diff_eq!(arr.get(&[i, j, k]), expected, epsilon = 1e-10);
+                    }
+                }
+            }
         }
         _ => panic!("expected F64"),
     }

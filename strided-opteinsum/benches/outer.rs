@@ -55,10 +55,13 @@ fn run_outer_case(
         3,
         || {
             let result = code
-                .evaluate(vec![
-                    EinsumOperand::from_view(&a_view),
-                    EinsumOperand::from_view(&b_view),
-                ])
+                .evaluate(
+                    vec![
+                        EinsumOperand::from_view(&a_view),
+                        EinsumOperand::from_view(&b_view),
+                    ],
+                    None,
+                )
                 .unwrap();
             match result {
                 EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
@@ -84,10 +87,13 @@ fn run_outer_case(
         3,
         || {
             let result = code
-                .evaluate(vec![
-                    EinsumOperand::from_view(&ac_view),
-                    EinsumOperand::from_view(&bc_view),
-                ])
+                .evaluate(
+                    vec![
+                        EinsumOperand::from_view(&ac_view),
+                        EinsumOperand::from_view(&bc_view),
+                    ],
+                    None,
+                )
                 .unwrap();
             match result {
                 EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),
