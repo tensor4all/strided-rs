@@ -85,6 +85,18 @@ strided-rs ties operations to the type itself via `ScalarBase: Zero + One + Add 
 | Pluggable backend trait | Yes (`BgemmBackend<T>`) | No (fixed dispatch) |
 | CUDA (cuTENSOR) | No | Yes (optional feature) |
 
+**Current limitation in strided-rs:** GEMM backends are selected at
+**compile time** via mutually exclusive Cargo features (`faer`, `blas`,
+`blas-inject`). The `ActiveBackend` type alias resolves to exactly one
+backend, and enabling multiple features simultaneously triggers
+`compile_error!`. This prevents runtime backend selection and complicates
+downstream integration (see [issue #86](https://github.com/tensor4all/strided-rs/issues/86)).
+
+The `einsum2_with_backend_into` function already accepts an explicit
+backend type parameter `B: BgemmBackend<T>`, which is the foundation for
+runtime selection — but the compile-time exclusivity of feature flags
+prevents multiple backends from coexisting in the same binary.
+
 ### 2.4 Contraction Tree Optimization
 
 Both use **omeco** for contraction order optimization. The difference is
@@ -205,27 +217,83 @@ forcing Arc onto the CPU path.
                     │    omeco optimizer) │
                     └─────────┬─────────┘
                               │
-                    ┌─────────┴─────────┐
-                    │   strided-einsum2  │  ← BgemmBackend<A: Algebra>
-                    │   (binary contract,│
-                    │    fast paths)     │
-                    └────┬─────────┬────┘
-                         │         │
-              ┌──────────┴──┐  ┌───┴──────────┐
-              │ CPU path    │  │ GPU path      │
-              │             │  │               │
-              │ strided-    │  │ cuTENSOR /    │
-              │ cpu-kernel  │  │ cuBLAS        │
-              │ (map/reduce/│  │ (device-side  │
-              │  broadcast) │  │  contraction) │
-              │      +      │  │               │
-              │ faer / BLAS │  │               │
-              │ tropical-   │  │               │
-              │ gemm        │  │               │
-              └─────────────┘  └───────────────┘
+                    ┌─────────┴──────────────────┐
+                    │   strided-einsum2           │
+                    │   einsum2_with_backend_into │  ← primary API
+                    │   (binary contract,         │
+                    │    fast paths)              │
+                    └────┬─────────┬─────────┬───┘
+                         │         │         │
+              ┌──────────┴──┐  ┌───┴───┐  ┌──┴───────────┐
+              │ CPU path    │  │  ...   │  │ GPU path     │
+              │             │  │       │  │              │
+              │ strided-    │  │ other │  │ cuTENSOR /   │
+              │ cpu-kernel  │  │ BgemmB│  │ cuBLAS       │
+              │ (map/reduce/│  │ impls │  │ (device-side │
+              │  broadcast) │  │       │  │  contraction)│
+              │      +      │  │       │  │              │
+              │  ┌────────┐ │  └───────┘  └──────────────┘
+              │  │Runtime │ │
+              │  │backend │ │
+              │  │select: │ │
+              │  │ faer   │ │ (#86: coexist in same binary,
+              │  │ BLAS   │ │  runtime match at call site)
+              │  │tropical│ │
+              │  │ naive  │ │
+              │  └────────┘ │
+              └─────────────┘
 ```
 
 ### 5.2 Specific Changes
+
+#### Phase 0: Runtime GEMM Backend Selection ([#86](https://github.com/tensor4all/strided-rs/issues/86)) (Small-Medium effort)
+
+**Problem:** strided-einsum2 currently enforces mutually exclusive Cargo
+features (`faer` vs `blas` vs `blas-inject`). This prevents multiple GEMM
+backends from coexisting in the same binary and blocks runtime backend
+selection.
+
+**Changes:**
+
+1. **Allow `faer` + `cblas-inject` simultaneous compilation.** Remove the
+   `compile_error!` for this combination. Both `FaerBackend` and
+   `BlasBackend` (with their `BgemmBackend<T>` impls) coexist in the same
+   binary. Default features become `faer` + `cblas-inject`.
+
+   ```toml
+   [features]
+   default = ["faer", "cblas-inject"]
+   faer = ["dep:faer", "dep:faer-traits"]
+   cblas-inject = ["dep:cblas-inject", "dep:num-complex"]
+   blas = ["dep:cblas-sys", "dep:num-complex"]  # exclusive with cblas-inject
+   ```
+
+   `blas` + `cblas-inject` remains `compile_error!` (symbol conflict).
+
+2. **Deprecate `ActiveBackend` type alias.** `ActiveBackend` is a
+   compile-time-only concept that selects a single backend. Keep it for
+   backward compatibility but mark as `#[deprecated]`. Downstream users
+   should migrate to `einsum2_with_backend_into` with explicit backend type.
+
+3. **`einsum2_with_backend_into` becomes the primary API.** It already
+   accepts `B: BgemmBackend<T> + BackendConfig` as a type parameter.
+   Downstream libraries perform runtime dispatch at the call site via match:
+
+   ```rust
+   match preferred_backend {
+       EinsumBackend::Faer => einsum2_with_backend_into::<T, FaerBackend, _>(...),
+       EinsumBackend::Blas => einsum2_with_backend_into::<T, BlasBackend, _>(...),
+       EinsumBackend::Naive => einsum2_naive_into(...),
+   }
+   ```
+
+   Each branch is monomorphized — no dynamic dispatch overhead in the
+   GEMM hot loop.
+
+**Impact on later phases:** This change is a prerequisite for the merged
+architecture. When tropical-gemm is added (Phase 1), it becomes another
+`BgemmBackend` impl that coexists with faer and BLAS. The runtime dispatch
+pattern naturally extends to new backends.
 
 #### Phase 1: Algebra Trait Introduction (Medium effort)
 
@@ -292,7 +360,7 @@ implementation begins.
 - Integer types: Route through naive backend (no BLAS/faer GEMM for
   integers). The `BgemmBackend` pluggable trait already supports this.
 
-#### Phase 4: Rename strided-kernel (Small effort, do with Phase 5)
+#### Phase 4: Rename strided-kernel (Small effort, do with Phase 6)
 
 Rename `strided-kernel` → `strided-cpu-kernel` to clarify the architectural
 boundary. Only necessary when a GPU kernel crate is actually introduced.
@@ -319,6 +387,7 @@ differs.
 
 #### Phase 6: Gradient Support (Medium effort, optional)
 
+
 Import `einsum_with_grad` from omeinsum-rs as an optional feature. This
 depends on the Algebra trait's `add_backward`/`mul_backward` methods and
 argmax tracking. For standard linear algebra, gradient is not needed, so
@@ -340,15 +409,15 @@ the merge.
 
 ## 6. Risk Assessment
 
-| Change | Risk | Mitigation |
-|--------|------|------------|
-| Algebra trait introduction | Low | Additive change; existing `Scalar`/`ScalarBase` paths continue to work |
-| EinsumOperand generalization | **High** | Mixed-type promotion design must be resolved first |
-| f32 support | Low | faer already supports f32; mostly plumbing |
-| Integer support | Low | Naive backend handles it |
-| Kernel rename | Low | Mechanical rename |
-| GPU backend | Medium | Independent from CPU path; risk is in cuTENSOR integration |
-| Gradient support | Medium | Optional feature; can be deferred |
+| Phase | Change | Risk | Mitigation |
+|-------|--------|------|------------|
+| 0 | Runtime backend selection ([#86](https://github.com/tensor4all/strided-rs/issues/86)) | Low-Medium | `einsum2_with_backend_into` already exists; main work is removing `compile_error!` and testing coexistence |
+| 1 | Algebra trait introduction | Low | Additive change; existing `Scalar`/`ScalarBase` paths continue to work |
+| 2 | EinsumOperand generalization | **High** | Mixed-type promotion design must be resolved first |
+| 3 | f32 / integer support | Low | faer already supports f32; integers route through naive backend |
+| 4 | Kernel rename | Low | Mechanical rename; defer until Phase 5 |
+| 5 | GPU backend | Medium | Independent from CPU path; risk is in cuTENSOR integration |
+| 6 | Gradient support | Medium | Optional feature; can be deferred |
 
 ---
 
