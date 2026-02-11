@@ -38,29 +38,22 @@ pub fn parse_einsum(s: &str) -> crate::Result<EinsumCode> {
     }
 
     // Parse LHS as args_list.
-    // Empty LHS (e.g. "->ii") means a single scalar operand with no indices.
+    // Empty LHS (e.g. "->ii") is a single scalar operand with no indices.
+    // Leading/trailing commas (e.g. ",k->k") produce scalar operands too.
     let mut counter: usize = 0;
-    let root = if lhs.is_empty() {
-        let tensor_index = counter;
-        let _ = counter; // counter not read after this point when LHS is empty
-        EinsumNode::Contract {
-            args: vec![EinsumNode::Leaf {
-                ids: vec![],
-                tensor_index,
-            }],
-        }
-    } else {
-        parse_args_list(lhs, &mut counter)?
-    };
+    let root = parse_args_list(lhs, &mut counter)?;
 
     Ok(EinsumCode { root, output_ids })
 }
 
 /// Parse a comma-separated args list at the current level, returning a `Contract` node.
+///
+/// An empty string produces a single scalar Leaf (0-index operand).
 fn parse_args_list(s: &str, counter: &mut usize) -> crate::Result<EinsumNode> {
     let parts = split_top_level(s)?;
     if parts.is_empty() {
-        return Err(crate::EinsumError::ParseError("empty args list".into()));
+        // Empty string (no commas, no chars) → single scalar operand
+        return parse_arg("", counter).map(|leaf| EinsumNode::Contract { args: vec![leaf] });
     }
     let mut args = Vec::with_capacity(parts.len());
     for part in parts {
@@ -84,11 +77,7 @@ fn parse_arg(s: &str, counter: &mut usize) -> crate::Result<EinsumNode> {
         let inner = &s[1..s.len() - 1];
         parse_args_list(inner, counter)
     } else {
-        if s.is_empty() {
-            return Err(crate::EinsumError::ParseError(
-                "empty operand in args list".into(),
-            ));
-        }
+        // Empty string is a valid scalar operand (0-index tensor).
         // Leaf: validate all chars are alphabetic (ASCII or Unicode letters)
         for c in s.chars() {
             if !c.is_alphabetic() {
@@ -124,11 +113,7 @@ fn split_top_level(s: &str) -> crate::Result<Vec<String>> {
                 current.push(c);
             }
             ',' if depth == 0 => {
-                if current.is_empty() {
-                    return Err(crate::EinsumError::ParseError(
-                        "empty operand in args list".into(),
-                    ));
-                }
+                // Empty `current` is valid: it represents a scalar (0-index) operand.
                 parts.push(std::mem::take(&mut current));
             }
             _ => {
@@ -139,13 +124,8 @@ fn split_top_level(s: &str) -> crate::Result<Vec<String>> {
     if depth != 0 {
         return Err(crate::EinsumError::ParseError("unbalanced '('".into()));
     }
-    if current.is_empty() {
-        if !parts.is_empty() {
-            return Err(crate::EinsumError::ParseError(
-                "empty operand in args list".into(),
-            ));
-        }
-    } else {
+    if !current.is_empty() || !parts.is_empty() {
+        // Push final segment. Empty `current` after a comma is a valid scalar operand.
         parts.push(current);
     }
     Ok(parts)
@@ -320,13 +300,138 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_error_empty_operand_double_comma() {
-        assert!(parse_einsum("ij,,jk->ik").is_err());
+    fn test_parse_scalar_operand_leading_comma() {
+        // ",k->k" = scalar (tensor 0) + vector k (tensor 1)
+        let code = parse_einsum(",k->k").unwrap();
+        assert_eq!(code.output_ids, vec!['k']);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec![],
+                        tensor_index: 0
+                    }
+                );
+                assert_eq!(
+                    args[1],
+                    EinsumNode::Leaf {
+                        ids: vec!['k'],
+                        tensor_index: 1
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
     }
 
     #[test]
-    fn test_parse_error_empty_operand_trailing_comma() {
-        assert!(parse_einsum("ij,->i").is_err());
+    fn test_parse_scalar_operand_trailing_comma() {
+        // "i,->i" = vector i (tensor 0) + scalar (tensor 1)
+        let code = parse_einsum("i,->i").unwrap();
+        assert_eq!(code.output_ids, vec!['i']);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec!['i'],
+                        tensor_index: 0
+                    }
+                );
+                assert_eq!(
+                    args[1],
+                    EinsumNode::Leaf {
+                        ids: vec![],
+                        tensor_index: 1
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
+    }
+
+    #[test]
+    fn test_parse_two_scalars() {
+        // ",->": two scalar operands
+        let code = parse_einsum(",->").unwrap();
+        assert_eq!(code.output_ids, vec![]);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec![],
+                        tensor_index: 0
+                    }
+                );
+                assert_eq!(
+                    args[1],
+                    EinsumNode::Leaf {
+                        ids: vec![],
+                        tensor_index: 1
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_between_tensors() {
+        // "ij,,jk->ik" = tensor 0 (ij) + scalar (tensor 1) + tensor 2 (jk)
+        let code = parse_einsum("ij,,jk->ik").unwrap();
+        assert_eq!(code.output_ids, vec!['i', 'k']);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 3);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec!['i', 'j'],
+                        tensor_index: 0
+                    }
+                );
+                assert_eq!(
+                    args[1],
+                    EinsumNode::Leaf {
+                        ids: vec![],
+                        tensor_index: 1
+                    }
+                );
+                assert_eq!(
+                    args[2],
+                    EinsumNode::Leaf {
+                        ids: vec!['j', 'k'],
+                        tensor_index: 2
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_lhs_scalar() {
+        // "->ii" = single scalar operand with generative output
+        let code = parse_einsum("->ii").unwrap();
+        assert_eq!(code.output_ids, vec!['i', 'i']);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 1);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec![],
+                        tensor_index: 0
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
     }
 
     #[test]

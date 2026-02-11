@@ -1464,7 +1464,7 @@ fn test_einsum_unicode_trace() {
 }
 
 // ==========================================================================
-// Generative einsum outputs (issue #45)
+// Generative einsum outputs (issue #45) and OMEinsum.jl parity
 // ==========================================================================
 
 #[test]
@@ -1608,6 +1608,291 @@ fn test_einsum_scalar_to_3d_diagonal() {
                     for k in 0..3 {
                         let expected = if i == j && j == k { 2.0 } else { 0.0 };
                         assert_abs_diff_eq!(arr.get(&[i, j, k]), expected, epsilon = 1e-10);
+                    }
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+// ==========================================================================
+// OMEinsum.jl parity: empty operands (scalar tensors in multi-tensor exprs)
+// ==========================================================================
+
+#[test]
+fn test_einsum_scalar_times_vector() {
+    // ",k->k" : scalar * vector = scaled vector
+    let scalar = make_f64(&[], vec![3.0]);
+    let v = make_f64(&[4], vec![1.0, 2.0, 3.0, 4.0]);
+    let result = einsum(",k->k", vec![scalar, v], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[4]);
+            for i in 0..4 {
+                assert_abs_diff_eq!(arr.data()[i], 3.0 * (i + 1) as f64, epsilon = 1e-10);
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_vector_times_scalar() {
+    // "i,->i" : vector * scalar = scaled vector
+    let v = make_f64(&[3], vec![10.0, 20.0, 30.0]);
+    let scalar = make_f64(&[], vec![2.0]);
+    let result = einsum("i,->i", vec![v, scalar], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3]);
+            assert_abs_diff_eq!(arr.data()[0], 20.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(arr.data()[1], 40.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(arr.data()[2], 60.0, epsilon = 1e-10);
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_scalar_times_scalar() {
+    // ",->" : scalar * scalar = scalar
+    let a = make_f64(&[], vec![3.0]);
+    let b = make_f64(&[], vec![7.0]);
+    let result = einsum(",->", vec![a, b], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_abs_diff_eq!(arr.data()[0], 21.0, epsilon = 1e-10);
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+// ==========================================================================
+// OMEinsum.jl parity: complex duplicate patterns
+// ==========================================================================
+
+#[test]
+fn test_einsum_duplicate_ij_to_ijij() {
+    // "ij->ijij" : 2x3 matrix -> 2x3x2x3 tensor with C[i,j,i,j] = A[i,j], rest 0
+    let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let result = einsum("ij->ijij", vec![a], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[2, 3, 2, 3]);
+            for i in 0..2 {
+                for j in 0..3 {
+                    for k in 0..2 {
+                        for l in 0..3 {
+                            let expected = if i == k && j == l {
+                                (i * 3 + j + 1) as f64
+                            } else {
+                                0.0
+                            };
+                            assert_abs_diff_eq!(arr.get(&[i, j, k, l]), expected, epsilon = 1e-10);
+                        }
+                    }
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_duplicate_a_to_aaaa() {
+    // "a->aaaa" : vector -> 4D super-diagonal tensor
+    let v = make_f64(&[3], vec![1.0, 2.0, 3.0]);
+    let result = einsum("a->aaaa", vec![v], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3, 3, 3, 3]);
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        for l in 0..3 {
+                            let expected = if i == j && j == k && k == l {
+                                (i + 1) as f64
+                            } else {
+                                0.0
+                            };
+                            assert_abs_diff_eq!(arr.get(&[i, j, k, l]), expected, epsilon = 1e-10);
+                        }
+                    }
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_duplicate_ac_to_acc() {
+    // "ac->acc" : matrix -> 3D tensor with C[a,c,c] = A[a,c], rest 0
+    let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let result = einsum("ac->acc", vec![a], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[2, 3, 3]);
+            for ai in 0..2 {
+                for ci in 0..3 {
+                    for cj in 0..3 {
+                        let expected = if ci == cj {
+                            (ai * 3 + ci + 1) as f64
+                        } else {
+                            0.0
+                        };
+                        assert_abs_diff_eq!(arr.get(&[ai, ci, cj]), expected, epsilon = 1e-10);
+                    }
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+// ==========================================================================
+// OMEinsum.jl parity: binary + generative outputs
+// ==========================================================================
+
+#[test]
+fn test_einsum_binary_generative_ab_bc_to_ace() {
+    // "ab,bc->ace" : contraction on b, then broadcast to new axis e
+    use std::collections::HashMap;
+    let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b = make_f64(&[3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+    let sizes = HashMap::from([('e', 4)]);
+    let result = einsum("ab,bc->ace", vec![a, b], Some(&sizes)).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[2, 2, 4]);
+            // A*B = [[58,64],[139,154]] (standard matmul)
+            // ace: for each e, result[a,c,e] = (A*B)[a,c] (broadcast along e)
+            let ab = [[58.0, 64.0], [139.0, 154.0]];
+            for ai in 0..2 {
+                for ci in 0..2 {
+                    for ei in 0..4 {
+                        assert_abs_diff_eq!(arr.get(&[ai, ci, ei]), ab[ai][ci], epsilon = 1e-10);
+                    }
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+// ==========================================================================
+// OMEinsum.jl parity: binary + duplicate outputs
+// ==========================================================================
+
+#[test]
+fn test_einsum_binary_duplicate_ab_bc_to_acc() {
+    // "ab,bc->acc" : contraction on b, then duplicate c
+    let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b = make_f64(&[3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+    let result = einsum("ab,bc->acc", vec![a, b], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[2, 2, 2]);
+            // A*B = [[58,64],[139,154]]
+            // acc: result[a,c1,c2] = (A*B)[a,c1] if c1==c2, else 0
+            let ab = [[58.0, 64.0], [139.0, 154.0]];
+            for ai in 0..2 {
+                for c1 in 0..2 {
+                    for c2 in 0..2 {
+                        let expected = if c1 == c2 { ab[ai][c1] } else { 0.0 };
+                        assert_abs_diff_eq!(arr.get(&[ai, c1, c2]), expected, epsilon = 1e-10);
+                    }
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_binary_duplicate_c_c_to_cc() {
+    // "c,c->cc" : element-wise product on c, then duplicate to diagonal
+    let a = make_f64(&[3], vec![2.0, 3.0, 4.0]);
+    let b = make_f64(&[3], vec![5.0, 6.0, 7.0]);
+    let result = einsum("c,c->cc", vec![a, b], None).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_eq!(arr.dims(), &[3, 3]);
+            // c,c->c = [10,18,28], then c->cc = diagonal
+            let products = [10.0, 18.0, 28.0];
+            for i in 0..3 {
+                for j in 0..3 {
+                    let expected = if i == j { products[i] } else { 0.0 };
+                    assert_abs_diff_eq!(arr.get(&[i, j]), expected, epsilon = 1e-10);
+                }
+            }
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+// ==========================================================================
+// OMEinsum.jl parity: complex multi-diagonal
+// ==========================================================================
+
+#[test]
+fn test_einsum_complex_multi_diagonal() {
+    // "illljkk->kij" : input has triple-l diagonal and double-k diagonal
+    // Extract diag l (dim 2), extract diag k (dim 2), sum over l, output kij
+    let n = 2;
+    let total = n * n * n * n * n * n * n; // i,l,l,l,j,k,k = 7 dims, each size 2
+    let data: Vec<f64> = (0..total).map(|x| x as f64).collect();
+    let a = make_f64(&[n, n, n, n, n, n, n], data.clone());
+    // illljkk->kij
+    // Reference: iterate over i,j,k,l where input indices are (i,l,l,l,j,k,k)
+    // result[k,i,j] = sum_l A[i,l,l,l,j,k,k]
+    let mut expected = vec![0.0f64; n * n * n];
+    for i in 0..n {
+        for j in 0..n {
+            for k in 0..n {
+                let mut sum = 0.0;
+                for l in 0..n {
+                    // Row-major strides for [n,n,n,n,n,n,n]:
+                    // stride = [n^6, n^5, n^4, n^3, n^2, n, 1]
+                    let flat = i * n * n * n * n * n * n
+                        + l * n * n * n * n * n
+                        + l * n * n * n * n
+                        + l * n * n * n
+                        + j * n * n
+                        + k * n
+                        + k;
+                    sum += flat as f64;
+                }
+                // Row-major strides for output [n,n,n] (kij):
+                let out_flat = k * n * n + i * n + j;
+                expected[out_flat] = sum;
+            }
+        }
+    }
+    let result = einsum("illljkk->kij", vec![a], None).unwrap();
+    match &result {
+        EinsumOperand::F64(rdata) => {
+            let arr = rdata.as_array();
+            assert_eq!(arr.dims(), &[n, n, n]);
+            for k in 0..n {
+                for i in 0..n {
+                    for j in 0..n {
+                        let out_flat = k * n * n + i * n + j;
+                        assert_abs_diff_eq!(
+                            arr.get(&[k, i, j]),
+                            expected[out_flat],
+                            epsilon = 1e-10
+                        );
                     }
                 }
             }
