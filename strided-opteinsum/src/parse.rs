@@ -29,7 +29,7 @@ pub fn parse_einsum(s: &str) -> crate::Result<EinsumCode> {
     // Parse output indices
     let output_ids: Vec<char> = rhs.chars().collect();
     for &c in &output_ids {
-        if !c.is_ascii_lowercase() {
+        if !c.is_alphabetic() {
             return Err(crate::EinsumError::ParseError(format!(
                 "invalid character '{}' in output indices",
                 c
@@ -77,9 +77,9 @@ fn parse_arg(s: &str, counter: &mut usize) -> crate::Result<EinsumNode> {
                 "empty operand in args list".into(),
             ));
         }
-        // Leaf: validate all chars are lowercase ascii
+        // Leaf: validate all chars are alphabetic (ASCII or Unicode letters)
         for c in s.chars() {
-            if !c.is_ascii_lowercase() {
+            if !c.is_alphabetic() {
                 return Err(crate::EinsumError::ParseError(format!(
                     "invalid character '{}' in index labels",
                     c
@@ -315,5 +315,63 @@ mod tests {
     #[test]
     fn test_parse_error_empty_operand_trailing_comma() {
         assert!(parse_einsum("ij,->i").is_err());
+    }
+
+    #[test]
+    fn test_parse_unicode_greek() {
+        let code = parse_einsum("αβ,βγ->αγ").unwrap();
+        assert_eq!(code.output_ids, vec!['α', 'γ']);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec!['α', 'β'],
+                        tensor_index: 0
+                    }
+                );
+                assert_eq!(
+                    args[1],
+                    EinsumNode::Leaf {
+                        ids: vec!['β', 'γ'],
+                        tensor_index: 1
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unicode_mixed() {
+        let code = parse_einsum("αi,iβ->αβ").unwrap();
+        assert_eq!(code.output_ids, vec!['α', 'β']);
+        match &code.root {
+            EinsumNode::Contract { args } => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(
+                    args[0],
+                    EinsumNode::Leaf {
+                        ids: vec!['α', 'i'],
+                        tensor_index: 0
+                    }
+                );
+                assert_eq!(
+                    args[1],
+                    EinsumNode::Leaf {
+                        ids: vec!['i', 'β'],
+                        tensor_index: 1
+                    }
+                );
+            }
+            _ => panic!("expected Contract"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unicode_nested() {
+        let code = parse_einsum("(αβ,βγ),γδ->αδ").unwrap();
+        assert_eq!(code.output_ids, vec!['α', 'δ']);
     }
 }

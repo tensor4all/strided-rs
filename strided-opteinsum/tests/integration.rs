@@ -1389,3 +1389,48 @@ fn test_einsum_into_view_operands() {
     assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);
     assert_abs_diff_eq!(out.get(&[1, 1]), 50.0, epsilon = 1e-10);
 }
+
+// ==========================================================================
+// Unicode index labels (issue #44)
+// ==========================================================================
+
+#[test]
+fn test_einsum_unicode_matmul() {
+    // Same as ASCII "ij,jk->ik" but with Greek labels
+    let a = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b = make_f64(&[3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+    let a2 = make_f64(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b2 = make_f64(&[3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+
+    let result_unicode = einsum("αβ,βγ->αγ", vec![a, b]).unwrap();
+    let result_ascii = einsum("ij,jk->ik", vec![a2, b2]).unwrap();
+
+    // Both should produce the same 2x2 result
+    assert_eq!(result_unicode.dims(), &[2, 2]);
+    match (&result_unicode, &result_ascii) {
+        (EinsumOperand::F64(u), EinsumOperand::F64(a)) => {
+            let uv = u.as_view();
+            let av = a.as_view();
+            for i in 0..2 {
+                for j in 0..2 {
+                    assert_abs_diff_eq!(uv.get(&[i, j]), av.get(&[i, j]), epsilon = 1e-10);
+                }
+            }
+        }
+        _ => panic!("expected F64 results"),
+    }
+}
+
+#[test]
+fn test_einsum_unicode_trace() {
+    // Trace: "αα->" (scalar output)
+    let a = make_f64(&[3, 3], vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
+    let result = einsum("αα->", vec![a]).unwrap();
+    assert_eq!(result.dims(), &[] as &[usize]);
+    match &result {
+        EinsumOperand::F64(data) => {
+            assert_abs_diff_eq!(data.as_view().get(&[]), 6.0, epsilon = 1e-10);
+        }
+        _ => panic!("expected F64"),
+    }
+}
