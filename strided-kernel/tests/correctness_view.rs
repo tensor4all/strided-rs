@@ -1346,3 +1346,189 @@ fn test_reduce_axis_4d_blocked() {
         }
     }
 }
+
+// ============================================================================
+// Mixed scalar type tests (Issue #5)
+// ============================================================================
+
+fn c(re: f64, im: f64) -> Complex64 {
+    Complex64::new(re, im)
+}
+
+// 37. map_into: f64 → Complex64
+#[test]
+fn test_map_into_mixed_f64_to_c64() {
+    let src = StridedArray::<f64>::from_fn_row_major(&[3, 4], |idx| (idx[0] * 4 + idx[1]) as f64);
+    let mut dest = StridedArray::<Complex64>::row_major(&[3, 4]);
+
+    map_into(&mut dest.view_mut(), &src.view(), |x| {
+        Complex64::new(x, x * 2.0)
+    })
+    .unwrap();
+
+    for i in 0..3 {
+        for j in 0..4 {
+            let v = (i * 4 + j) as f64;
+            assert_eq!(dest.get(&[i, j]), c(v, v * 2.0));
+        }
+    }
+}
+
+// 38. zip_map2_into: (f64, Complex64) → Complex64
+#[test]
+fn test_zip_map2_into_mixed_f64_c64() {
+    let a = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+    let b = StridedArray::<Complex64>::from_fn_row_major(&[2, 3], |idx| {
+        c((idx[0] + 1) as f64, (idx[1] + 1) as f64)
+    });
+    let mut dest = StridedArray::<Complex64>::row_major(&[2, 3]);
+
+    zip_map2_into(&mut dest.view_mut(), &a.view(), &b.view(), |x, y| {
+        Complex64::new(x, 0.0) + y
+    })
+    .unwrap();
+
+    for i in 0..2 {
+        for j in 0..3 {
+            let x = (i * 3 + j + 1) as f64;
+            let y = c((i + 1) as f64, (j + 1) as f64);
+            assert_eq!(dest.get(&[i, j]), Complex64::new(x, 0.0) + y);
+        }
+    }
+}
+
+// 39. add: Complex64 += f64
+#[test]
+fn test_add_mixed_c64_plus_f64() {
+    let mut dest = StridedArray::<Complex64>::from_fn_row_major(&[3, 3], |idx| {
+        c(idx[0] as f64, idx[1] as f64)
+    });
+    let src =
+        StridedArray::<f64>::from_fn_row_major(&[3, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+
+    let orig: Vec<Complex64> = dest.iter().copied().collect();
+    add(&mut dest.view_mut(), &src.view()).unwrap();
+
+    for i in 0..3 {
+        for j in 0..3 {
+            let flat = i * 3 + j;
+            let expected = orig[flat] + (flat + 1) as f64;
+            assert_eq!(dest.get(&[i, j]), expected);
+        }
+    }
+}
+
+// 40. mul: Complex64 *= f64
+#[test]
+fn test_mul_mixed_c64_times_f64() {
+    let mut dest = StridedArray::<Complex64>::from_fn_row_major(&[2, 3], |idx| {
+        c(idx[0] as f64, idx[1] as f64)
+    });
+    let src = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] + idx[1] + 1) as f64);
+
+    let orig: Vec<Complex64> = dest.iter().copied().collect();
+    mul(&mut dest.view_mut(), &src.view()).unwrap();
+
+    for i in 0..2 {
+        for j in 0..3 {
+            let flat = i * 3 + j;
+            let scale = (i + j + 1) as f64;
+            assert_eq!(dest.get(&[i, j]), orig[flat] * scale);
+        }
+    }
+}
+
+// 41. axpy: Complex64 += f64 * f64 (alpha: f64, src: f64, dest: Complex64)
+#[test]
+fn test_axpy_mixed() {
+    let mut dest = StridedArray::<Complex64>::from_fn_row_major(&[2, 4], |idx| {
+        c((idx[0] * 4 + idx[1]) as f64, 1.0)
+    });
+    let src = StridedArray::<f64>::from_fn_row_major(&[2, 4], |idx| (idx[0] + idx[1] + 1) as f64);
+    let alpha = 2.5_f64;
+
+    let orig: Vec<Complex64> = dest.iter().copied().collect();
+    // alpha * src[i] -> f64, then Complex64 + f64 -> Complex64
+    // Note: alpha and src are both f64, so A*S -> f64, and D + D needs Complex64
+    // Actually this won't work directly since alpha*src produces f64, not Complex64.
+    // We need alpha: Complex64 to produce Complex64 output.
+    // Let's use Complex64 alpha instead:
+    let alpha_c = Complex64::new(alpha, 0.0);
+    axpy(&mut dest.view_mut(), &src.view(), alpha_c).unwrap();
+
+    for i in 0..2 {
+        for j in 0..4 {
+            let flat = i * 4 + j;
+            let s = (i + j + 1) as f64;
+            let expected = orig[flat] + alpha_c * s;
+            assert_eq!(dest.get(&[i, j]), expected);
+        }
+    }
+}
+
+// 42. fma: Complex64 += f64 * Complex64
+#[test]
+fn test_fma_mixed_f64_c64() {
+    let mut dest = StridedArray::<Complex64>::from_fn_row_major(&[3, 2], |_| c(0.0, 0.0));
+    let a = StridedArray::<f64>::from_fn_row_major(&[3, 2], |idx| (idx[0] * 2 + idx[1] + 1) as f64);
+    let b = StridedArray::<Complex64>::from_fn_row_major(&[3, 2], |idx| {
+        c(idx[0] as f64, idx[1] as f64)
+    });
+
+    fma(&mut dest.view_mut(), &a.view(), &b.view()).unwrap();
+
+    for i in 0..3 {
+        for j in 0..2 {
+            let av = (i * 2 + j + 1) as f64;
+            let bv = c(i as f64, j as f64);
+            // f64 * Complex64 -> Complex64
+            assert_eq!(dest.get(&[i, j]), av * bv);
+        }
+    }
+}
+
+// 43. dot: f64 · Complex64 → Complex64
+#[test]
+fn test_dot_mixed_f64_c64() {
+    let a = StridedArray::<f64>::from_fn_row_major(&[4], |idx| (idx[0] + 1) as f64);
+    let b = StridedArray::<Complex64>::from_fn_row_major(&[4], |idx| c(idx[0] as f64, 1.0));
+
+    let result: Complex64 = dot(&a.view(), &b.view()).unwrap();
+
+    // Expected: sum(a[i] * b[i]) = 1*(0+i) + 2*(1+i) + 3*(2+i) + 4*(3+i)
+    //         = (0+2+6+12) + (1+2+3+4)i = 20 + 10i
+    assert_eq!(result, c(20.0, 10.0));
+}
+
+// 44. dot same-type still works (regression guard for SIMD path)
+#[test]
+fn test_dot_same_type_simd_regression() {
+    let n = 1000;
+    let a = StridedArray::<f64>::from_fn_row_major(&[n], |idx| (idx[0] + 1) as f64);
+    let b = StridedArray::<f64>::from_fn_row_major(&[n], |idx| (idx[0] + 1) as f64);
+
+    let result: f64 = dot(&a.view(), &b.view()).unwrap();
+
+    // sum(i^2, i=1..1000) = n*(n+1)*(2n+1)/6
+    let expected = (n * (n + 1) * (2 * n + 1)) as f64 / 6.0;
+    assert_relative_eq!(result, expected, epsilon = 1e-6);
+}
+
+// 45. copy_scale with different scale type
+#[test]
+fn test_copy_scale_mixed() {
+    let src =
+        StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+    let mut dest = StridedArray::<Complex64>::row_major(&[2, 3]);
+    let scale = c(0.0, 1.0); // multiply by i
+
+    copy_scale(&mut dest.view_mut(), &src.view(), scale).unwrap();
+
+    for i in 0..2 {
+        for j in 0..3 {
+            let v = (i * 3 + j + 1) as f64;
+            // scale * v = i * v (purely imaginary)
+            assert_eq!(dest.get(&[i, j]), c(0.0, v));
+        }
+    }
+}
