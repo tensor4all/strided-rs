@@ -6,7 +6,7 @@
 
 use crate::backend::{ActiveBackend, BackendConfig};
 use crate::util::try_fuse_group;
-use crate::Scalar;
+use crate::{Scalar, ScalarBase};
 use strided_view::{StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.
@@ -113,7 +113,7 @@ impl<T> ContiguousOperandMut<T> {
     }
 }
 
-impl<T: Scalar> ContiguousOperandMut<T> {
+impl<T: Copy + Send + Sync> ContiguousOperandMut<T> {
     /// After GEMM: copy the internal buffer back to `dest` if needed.
     ///
     /// This is a no-op when the GEMM wrote directly to the destination
@@ -494,6 +494,207 @@ pub fn prepare_output_owned<T: Scalar>(
             needs_writeback: false,
             _buf: None,
         })
+    }
+}
+
+/// Prepare a borrowed input view for a generic GEMM backend.
+///
+/// Like [`prepare_input_view`] but works with any `ScalarBase` type and
+/// does not handle conjugation materialization. The `conj` field of the
+/// returned operand is always `false`.
+pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
+    view: &StridedView<T>,
+    n_batch: usize,
+    n_group1: usize,
+    n_group2: usize,
+) -> crate::Result<ContiguousOperand<T>> {
+    let dims = view.dims();
+    let strides = view.strides();
+
+    let group1_dims = &dims[n_batch..n_batch + n_group1];
+    let group1_strides = &strides[n_batch..n_batch + n_group1];
+    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+
+    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
+    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
+
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    if B::REQUIRES_UNIT_STRIDE && !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
+
+    if needs_copy {
+        let m: usize = group1_dims.iter().product::<usize>().max(1);
+        let mut buf = alloc_batched_col_major(dims, n_batch);
+        strided_kernel::copy_into(&mut buf.view_mut(), view)?;
+        let ptr = buf.view().ptr();
+        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let row_stride = if m == 0 { 0 } else { 1isize };
+        let col_stride = m as isize;
+        Ok(ContiguousOperand {
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
+            conj: false,
+            _buf: Some(buf),
+        })
+    } else {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        let batch_strides = strides[..n_batch].to_vec();
+        Ok(ContiguousOperand {
+            ptr: view.ptr(),
+            row_stride: rs,
+            col_stride: cs,
+            batch_strides,
+            conj: false,
+            _buf: None,
+        })
+    }
+}
+
+/// Prepare a borrowed mutable output view for a generic GEMM backend.
+///
+/// Like [`prepare_output_view`] but works with any `ScalarBase` type.
+pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
+    view: &mut StridedViewMut<T>,
+    n_batch: usize,
+    n_group1: usize,
+    n_group2: usize,
+    beta: T,
+) -> crate::Result<ContiguousOperandMut<T>> {
+    let dims = view.dims().to_vec();
+    let strides = view.strides().to_vec();
+
+    let group1_dims = &dims[n_batch..n_batch + n_group1];
+    let group1_strides = &strides[n_batch..n_batch + n_group1];
+    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+
+    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
+    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
+
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    if B::REQUIRES_UNIT_STRIDE && !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
+
+    if needs_copy {
+        let m: usize = group1_dims.iter().product::<usize>().max(1);
+        let mut buf = alloc_batched_col_major(&dims, n_batch);
+        if beta != T::zero() {
+            strided_kernel::copy_into(&mut buf.view_mut(), &view.as_view())?;
+        }
+        let ptr = buf.view_mut().as_mut_ptr();
+        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let row_stride = if m == 0 { 0 } else { 1isize };
+        let col_stride = m as isize;
+        Ok(ContiguousOperandMut {
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
+            needs_writeback: true,
+            _buf: Some(buf),
+        })
+    } else {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        let batch_strides = strides[..n_batch].to_vec();
+        Ok(ContiguousOperandMut {
+            ptr: view.as_mut_ptr(),
+            row_stride: rs,
+            col_stride: cs,
+            batch_strides,
+            needs_writeback: false,
+            _buf: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests_generic_backend {
+    use super::*;
+    use crate::backend::NaiveBackend;
+
+    #[test]
+    fn test_input_for_backend_contiguous() {
+        let a = StridedArray::<f64>::col_major(&[2, 3]);
+        let view = a.view();
+        let op = prepare_input_view_for_backend::<f64, NaiveBackend>(&view, 0, 1, 1).unwrap();
+        // Contiguous col-major: no copy
+        assert!(op._buf.is_none());
+        assert_eq!(op.row_stride(), 1);
+        assert_eq!(op.col_stride(), 2);
+        assert!(!op.conj());
+    }
+
+    #[test]
+    fn test_input_for_backend_non_contiguous() {
+        let data = vec![0.0f64; 100];
+        let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
+        let view = a.view();
+        let op = prepare_input_view_for_backend::<f64, NaiveBackend>(&view, 0, 2, 1).unwrap();
+        assert!(op._buf.is_some());
+        assert_eq!(op.row_stride(), 1);
+        assert_eq!(op.col_stride(), 6);
+    }
+
+    #[test]
+    fn test_output_for_backend_contiguous() {
+        let mut c = StridedArray::<f64>::col_major(&[2, 3]);
+        let mut view = c.view_mut();
+        let op =
+            prepare_output_view_for_backend::<f64, NaiveBackend>(&mut view, 0, 1, 1, 0.0).unwrap();
+        assert!(!op.needs_writeback);
+        assert!(op._buf.is_none());
+        assert_eq!(op.row_stride(), 1);
+        assert_eq!(op.col_stride(), 2);
+    }
+
+    #[test]
+    fn test_output_for_backend_non_contiguous_beta_zero() {
+        let data = vec![0.0f64; 100];
+        let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
+        let mut view = c.view_mut();
+        let op =
+            prepare_output_view_for_backend::<f64, NaiveBackend>(&mut view, 0, 2, 1, 0.0).unwrap();
+        assert!(op.needs_writeback);
+        assert!(op._buf.is_some());
+        assert_eq!(op.row_stride(), 1);
+        assert_eq!(op.col_stride(), 6);
+    }
+
+    #[test]
+    fn test_output_for_backend_non_contiguous_beta_nonzero_and_finalize() {
+        let mut data = vec![0.0f64; 30];
+        data[0] = 10.0;
+        data[1] = 20.0;
+        data[10] = 40.0;
+        let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 1], &[10, 1, 1], 0).unwrap();
+        let mut view = c.view_mut();
+        let op =
+            prepare_output_view_for_backend::<f64, NaiveBackend>(&mut view, 0, 2, 1, 1.0).unwrap();
+        assert!(op.needs_writeback);
+        // beta != 0 -> existing data copied into buffer
+        let buf = op._buf.as_ref().unwrap();
+        assert_eq!(buf.get(&[0, 0, 0]), 10.0);
+        assert_eq!(buf.get(&[0, 1, 0]), 20.0);
+        assert_eq!(buf.get(&[1, 0, 0]), 40.0);
+        // finalize copies back
+        op.finalize_into(&mut view).unwrap();
     }
 }
 

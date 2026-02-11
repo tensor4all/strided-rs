@@ -25,7 +25,9 @@ pub mod view;
 // ============================================================================
 // Element operations
 // ============================================================================
-pub use element_op::{Adjoint, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose};
+pub use element_op::{
+    Adjoint, ComposableElementOp, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose,
+};
 
 // ============================================================================
 // View-based types

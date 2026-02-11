@@ -31,7 +31,7 @@ use crate::threading::{
 
 /// Inner loop for add: `dst[i] += Op::apply(src[i])`.
 #[inline(always)]
-unsafe fn inner_loop_add<D: Copy + Add<S, Output = D>, S: Copy + ElementOpApply, Op: ElementOp>(
+unsafe fn inner_loop_add<D: Copy + Add<S, Output = D>, S: Copy, Op: ElementOp<S>>(
     dp: *mut D,
     ds: isize,
     sp: *const S,
@@ -59,7 +59,7 @@ unsafe fn inner_loop_add<D: Copy + Add<S, Output = D>, S: Copy + ElementOpApply,
 
 /// Inner loop for mul: `dst[i] *= Op::apply(src[i])`.
 #[inline(always)]
-unsafe fn inner_loop_mul<D: Copy + Mul<S, Output = D>, S: Copy + ElementOpApply, Op: ElementOp>(
+unsafe fn inner_loop_mul<D: Copy + Mul<S, Output = D>, S: Copy, Op: ElementOp<S>>(
     dp: *mut D,
     ds: isize,
     sp: *const S,
@@ -89,9 +89,9 @@ unsafe fn inner_loop_mul<D: Copy + Mul<S, Output = D>, S: Copy + ElementOpApply,
 #[inline(always)]
 unsafe fn inner_loop_axpy<
     D: Copy + Add<D, Output = D>,
-    S: Copy + ElementOpApply,
+    S: Copy,
     A: Copy + Mul<S, Output = D>,
-    Op: ElementOp,
+    Op: ElementOp<S>,
 >(
     dp: *mut D,
     ds: isize,
@@ -123,10 +123,10 @@ unsafe fn inner_loop_axpy<
 #[inline(always)]
 unsafe fn inner_loop_fma<
     D: Copy + Add<D, Output = D>,
-    A: Copy + ElementOpApply + Mul<B, Output = D>,
-    B: Copy + ElementOpApply,
-    OpA: ElementOp,
-    OpB: ElementOp,
+    A: Copy + Mul<B, Output = D>,
+    B: Copy,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
 >(
     dp: *mut D,
     ds: isize,
@@ -161,11 +161,11 @@ unsafe fn inner_loop_fma<
 /// Inner loop for dot: `acc += OpA::apply(a[i]) * OpB::apply(b[i])`.
 #[inline(always)]
 unsafe fn inner_loop_dot<
-    A: Copy + ElementOpApply + Mul<B, Output = R>,
-    B: Copy + ElementOpApply,
+    A: Copy + Mul<B, Output = R>,
+    B: Copy,
     R: Copy + Add<R, Output = R>,
-    OpA: ElementOp,
-    OpB: ElementOp,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
 >(
     ap: *const A,
     a_s: isize,
@@ -195,7 +195,7 @@ unsafe fn inner_loop_dot<
 }
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
-pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
+pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
 ) -> Result<()> {
@@ -244,8 +244,8 @@ pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
 /// Source may have a different element type from destination.
 pub fn add<
     D: Copy + Add<S, Output = D> + MaybeSendSync,
-    S: Copy + ElementOpApply + MaybeSendSync,
-    Op: ElementOp,
+    S: Copy + MaybeSendSync,
+    Op: ElementOp<S>,
 >(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
@@ -346,8 +346,8 @@ pub fn add<
 /// Source may have a different element type from destination.
 pub fn mul<
     D: Copy + Mul<S, Output = D> + MaybeSendSync,
-    S: Copy + ElementOpApply + MaybeSendSync,
-    Op: ElementOp,
+    S: Copy + MaybeSendSync,
+    Op: ElementOp<S>,
 >(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
@@ -454,8 +454,8 @@ pub fn axpy<D, S, A, Op>(
 where
     A: Copy + Mul<S, Output = D> + MaybeSync,
     D: Copy + Add<D, Output = D> + MaybeSendSync,
-    S: Copy + ElementOpApply + MaybeSendSync,
-    Op: ElementOp,
+    S: Copy + MaybeSendSync,
+    Op: ElementOp<S>,
 {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -559,11 +559,11 @@ pub fn fma<D, A, B, OpA, OpB>(
     b: &StridedView<B, OpB>,
 ) -> Result<()>
 where
-    A: Copy + ElementOpApply + Mul<B, Output = D> + MaybeSendSync,
-    B: Copy + ElementOpApply + MaybeSendSync,
+    A: Copy + Mul<B, Output = D> + MaybeSendSync,
+    B: Copy + MaybeSendSync,
     D: Copy + Add<D, Output = D> + MaybeSendSync,
-    OpA: ElementOp,
-    OpB: ElementOp,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
 {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -687,8 +687,8 @@ fn parallel_simd_sum<T: Copy + Zero + Add<Output = T> + simd::MaybeSimdOps + Sen
 
 /// Sum all elements: `sum(src)`.
 pub fn sum<
-    T: Copy + ElementOpApply + Zero + Add<Output = T> + MaybeSendSync + simd::MaybeSimdOps,
-    Op: ElementOp,
+    T: Copy + Zero + Add<Output = T> + MaybeSendSync + simd::MaybeSimdOps,
+    Op: ElementOp<T>,
 >(
     src: &StridedView<T, Op>,
 ) -> Result<T> {
@@ -719,11 +719,11 @@ pub fn sum<
 /// SIMD fast path fires only when `A == B == R` (same type) and both Identity ops.
 pub fn dot<A, B, R, OpA, OpB>(a: &StridedView<A, OpA>, b: &StridedView<B, OpB>) -> Result<R>
 where
-    A: Copy + ElementOpApply + Mul<B, Output = R> + MaybeSendSync + 'static,
-    B: Copy + ElementOpApply + MaybeSendSync + 'static,
+    A: Copy + Mul<B, Output = R> + MaybeSendSync + 'static,
+    B: Copy + MaybeSendSync + 'static,
     R: Copy + Zero + Add<Output = R> + MaybeSendSync + simd::MaybeSimdOps + 'static,
-    OpA: ElementOp,
-    OpB: ElementOp,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
 {
     ensure_same_shape(a.dims(), b.dims())?;
 
@@ -798,7 +798,6 @@ where
 pub fn symmetrize_into<T>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()>
 where
     T: Copy
-        + ElementOpApply
         + Add<Output = T>
         + Mul<Output = T>
         + num_traits::FromPrimitive
@@ -858,8 +857,8 @@ pub fn copy_scale<D, S, A, Op>(
 where
     A: Copy + Mul<S, Output = D> + MaybeSync,
     D: Copy + MaybeSendSync,
-    S: Copy + ElementOpApply + MaybeSendSync,
-    Op: ElementOp,
+    S: Copy + MaybeSendSync,
+    Op: ElementOp<S>,
 {
     map_into(dest, src, |x| scale * x)
 }

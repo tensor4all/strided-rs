@@ -9,7 +9,7 @@ use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{col_major_strides, StridedArray, StridedView};
 use crate::{Result, StridedError};
-use strided_view::{ElementOp, ElementOpApply};
+use strided_view::ElementOp;
 
 #[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
@@ -19,7 +19,7 @@ use crate::threading::{
 };
 
 /// Full reduction with map function: `reduce(init, op, map.(src))`.
-pub fn reduce<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp, M, R, U>(
+pub fn reduce<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
@@ -181,7 +181,7 @@ where
 }
 
 /// Reduce along a single axis, returning a new StridedArray.
-pub fn reduce_axis<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp, M, R, U>(
+pub fn reduce_axis<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,

@@ -1,63 +1,69 @@
-# Tropical Newtype Design
+# Custom Scalar Type Support: Trait Refactoring Design
 
 ## Goal
 
-Support non-standard semirings (starting with tropical/max-plus algebra) in the existing einsum stack with zero changes to existing code.
+Make strided-rs's trait/type system flexible enough for custom scalar types (e.g., tropical semiring from `tropical-gemm`) to work with einsum, without requiring `ElementOpApply` for types that only need `Identity` views.
 
-## Approach: Newtype Wrapper
+## Problems with Current Design
 
-Define a newtype `Tropical(f64)` that implements Rust's standard arithmetic traits with tropical semantics. The existing type system handles everything:
-
-- `Tropical` satisfies `ScalarBase` (the existing einsum trait bound)
-- `Tropical` does NOT satisfy `faer::ComplexField` or `BlasGemm` -- GEMM is automatically excluded by the type system, falling back to naive loops
-- No API changes, no new parameters, no refactoring
+1. **`ElementOp::apply<T: ElementOpApply>`** requires `ElementOpApply` even for `Identity` (which just returns the value), forcing all kernel functions to require it.
+2. **`ScalarBase` includes `ElementOpApply`** — custom types that don't need conj/transpose/adjoint can't satisfy it.
+3. **`Scalar` (with faer) requires `ComplexField`** — custom types can't be used with einsum at all.
+4. **Orphan rule** — `ElementOpApply` in `strided-view` means external crates can't implement it for their types.
 
 ## Design
 
-### Crate: `strided-traits`
+### New Crate: `strided-traits`
 
-New lightweight crate for types and traits supporting the strided ecosystem.
+Lightweight crate with shared traits. External crates (e.g., `tropical-gemm`) can depend on it.
 
 ```
 strided-traits/
-  Cargo.toml      # deps: num-traits, strided-view
+  Cargo.toml      # deps: num-traits, num-complex
   src/
-    lib.rs         # pub mod tropical;
-    tropical.rs    # Tropical type + tests
+    lib.rs
+    element_op.rs  # ElementOp<T>, ComposableElementOp<T>, ElementOpApply, marker types
+    scalar.rs      # ScalarBase
 ```
 
-### Tropical Type
+### `ElementOp<T>` — Generic Over T
+
+The key change: make `ElementOp` generic over the element type.
 
 ```rust
-/// Tropical semiring element (max-plus algebra).
-///
-/// - Addition: max(a, b)
-/// - Multiplication: a + b (standard)
-/// - Zero (additive identity): -inf
-/// - One (multiplicative identity): 0.0
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct Tropical(pub f64);
+pub trait ElementOp<T>: Copy + Default + 'static {
+    const IS_IDENTITY: bool = false;
+    fn apply(value: T) -> T;
+}
+
+// Identity: works with ANY Copy type (no ElementOpApply needed)
+impl<T: Copy> ElementOp<T> for Identity {
+    const IS_IDENTITY: bool = true;
+    fn apply(value: T) -> T { value }
+}
+
+// Conj/Transpose/Adjoint: only work with ElementOpApply types
+impl<T: ElementOpApply> ElementOp<T> for Conj {
+    fn apply(value: T) -> T { value.conj() }
+}
 ```
 
-`#[repr(transparent)]` ensures identical memory layout to `f64`, enabling potential zero-cost view transmutation in the future.
+### `ComposableElementOp<T>` — Composition for Complex Types
 
-### Trait Implementations
+Composition associated types are separated into a supertrait, only available when `T: ElementOpApply`:
 
-| Trait | Implementation | Notes |
-|-------|---------------|-------|
-| `Add` | `Tropical(self.0.max(rhs.0))` | Tropical addition = max |
-| `Mul` | `Tropical(self.0 + rhs.0)` | Tropical multiplication = standard addition |
-| `Zero` | `Tropical(f64::NEG_INFINITY)` | Additive identity |
-| `One` | `Tropical(0.0)` | Multiplicative identity |
-| `Copy`, `Clone` | derive | Required by `ScalarBase` |
-| `PartialEq` | derive (inner f64 comparison) | Required by `ScalarBase` for optimization branches (`beta == zero`) |
-| `Send + Sync` | auto-derived | `f64` is Send+Sync |
-| `ElementOpApply` | identity (default impl) | Real-valued; conj/transpose/adjoint = self |
+```rust
+pub trait ComposableElementOp<T: ElementOpApply>: ElementOp<T> {
+    type Inverse: ComposableElementOp<T>;
+    type ComposeConj: ComposableElementOp<T>;
+    type ComposeTranspose: ComposableElementOp<T>;
+    type ComposeAdjoint: ComposableElementOp<T>;
+}
+```
 
-### ElementOpApply Default Implementation
+This means `.conj()`, `.transpose_2d()`, `.adjoint_2d()` on `StridedView` are only available when the element type supports complex operations.
 
-Change in `strided-view/src/element_op.rs` -- add default methods:
+### `ElementOpApply` — Default Identity Methods
 
 ```rust
 pub trait ElementOpApply: Copy {
@@ -67,54 +73,102 @@ pub trait ElementOpApply: Copy {
 }
 ```
 
-Backwards compatible: existing explicit impls (f64, Complex) override defaults. New real-valued newtypes need only `impl ElementOpApply for MyType {}`.
+External crates can write `impl ElementOpApply for TropicalMaxPlus<f64> {}` with zero code. Existing explicit impls (f64, Complex64) override the defaults.
 
-### Usage
+### `ScalarBase` — Without `ElementOpApply`
 
 ```rust
-use strided_traits::Tropical;
-use strided_einsum2::einsum2_into;
-
-// Tropical matrix multiply: C_ik = max_j (A_ij + B_jk)
-einsum2_into(
-    c.view_mut(), &a.view(), &b.view(),
-    &['i','k'], &['i','j'], &['j','k'],
-    Tropical::one(),   // alpha = 0.0 (multiplicative identity)
-    Tropical::zero(),  // beta = -inf (additive identity = overwrite)
-)?;
+pub trait ScalarBase:
+    Copy + Send + Sync
+    + Mul<Output = Self> + Add<Output = Self>
+    + num_traits::Zero + num_traits::One
+    + PartialEq
+{ }
 ```
 
-### PartialEq Note
-
-`PartialEq` is not a semiring axiom. It is required by the current `ScalarBase` trait bound for performance optimizations in `bgemm_naive` (`beta == T::zero()`, `alpha == T::one()` checks). For `Tropical`, derived `PartialEq` compares inner f64 values and works correctly with these checks.
-
-## Tests
-
-Verify semiring laws using a shared helper:
+### Impact on `StridedView`
 
 ```rust
-fn assert_semiring_laws<T: Copy + PartialEq + Debug>(
-    a: T, b: T, c: T,
-    add: impl Fn(T, T) -> T,
-    mul: impl Fn(T, T) -> T,
-    zero: T, one: T,
-) {
-    // Additive identity: a + 0 = a
-    // Multiplicative identity: a * 1 = a
-    // Additive commutativity: a + b = b + a
-    // Additive associativity: (a + b) + c = a + (b + c)
-    // Multiplicative associativity: (a * b) * c = a * (b * c)
-    // Distributivity: a * (b + c) = a*b + a*c
-    // Zero annihilation: a * 0 = 0
+// Struct: no Op bound
+pub struct StridedView<'a, T, Op = Identity> { ... }
+
+// Metadata methods: no bounds needed
+impl<'a, T, Op> StridedView<'a, T, Op> {
+    pub fn dims(&self) -> &[usize] { ... }
+    pub fn permute(&self, ...) -> StridedView<'a, T, Op> { ... }
+}
+
+// Element access: needs Op: ElementOp<T>
+impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
+    pub fn get(&self, indices: &[usize]) -> T { Op::apply(raw) }
+}
+
+// Composition: needs T: ElementOpApply, Op: ComposableElementOp<T>
+impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T, Op> {
+    pub fn conj(&self) -> StridedView<'a, T, Op::ComposeConj> { ... }
+    pub fn transpose_2d(&self) -> Result<StridedView<'a, T, Op::ComposeTranspose>> { ... }
 }
 ```
 
-Test cases:
-- `test_tropical_semiring_laws` -- verify all 7 laws with representative values
-- `test_tropical_zero_one` -- identity elements
-- `test_tropical_special_values` -- NEG_INFINITY, 0.0, positive, negative values
+### Impact on Kernel Functions
+
+Mechanical: `Op: ElementOp` → `Op: ElementOp<T>`, remove `T: ElementOpApply`:
+
+```rust
+// Before
+pub fn map_into<D, A: Copy + ElementOpApply, Op: ElementOp, F>(...)
+// After
+pub fn map_into<D, A: Copy, Op: ElementOp<A>, F>(...)
+```
+
+### Impact on Einsum
+
+- `Scalar` keeps `ElementOpApply` in its bounds (backward compatible for f64/Complex64)
+- New `einsum2_naive_into<T: ScalarBase>`: closure-based element mapping, naive GEMM, works with custom types
+- `bgemm_naive` gets closure-based variant (no `ElementOpApply` in bounds)
+
+### Usage with Tropical Types
+
+```rust
+use tropical_gemm::TropicalMaxPlus;
+use strided_einsum2::einsum2_naive_into;
+
+// Tropical matrix multiply: C_ik = max_j (A_ij + B_jk)
+einsum2_naive_into(
+    c.view_mut(), &a.view(), &b.view(),
+    &['i','k'], &['i','j'], &['j','k'],
+    TropicalMaxPlus::one(),    // alpha = multiplicative identity
+    TropicalMaxPlus::zero(),   // beta = additive identity (overwrite)
+    |x| x,                    // map_a: identity
+    |x| x,                    // map_b: identity
+)?;
+```
+
+### Orphan Rule Analysis
+
+| Scenario | Trait location | Type location | Valid? |
+|----------|---------------|---------------|--------|
+| `impl ElementOpApply for TropicalMaxPlus` | strided-traits | tropical-gemm | Yes (local type) |
+| `impl ScalarBase for TropicalMaxPlus` | strided-traits | tropical-gemm | Yes (blanket impl) |
+| Future `impl FastGemm for TropicalMaxPlus` | strided-traits | tropical-gemm | Yes (local type) |
+
+### Dependency Graph
+
+```
+strided-traits (NEW, no strided-* deps)
+    ↑
+strided-view
+    ↑
+strided-kernel
+    ↑
+strided-einsum2
+    ↑
+strided-opteinsum
+
+tropical-gemm ──→ strided-traits (optional dep)
+```
 
 ## Scope
 
-- **In scope:** `Tropical` newtype, trait impls, semiring law tests, `ElementOpApply` default impl
-- **Out of scope:** Integration tests with einsum2/opteinsum, TropicalMin, zero-cost view transmutation, benchmarks
+- **In scope:** `strided-traits` crate, `ElementOp<T>` refactor, `ComposableElementOp<T>`, `ScalarBase` without `ElementOpApply`, `einsum2_naive_into`, kernel bound relaxation, tests with local custom types
+- **Out of scope:** tropical-gemm integration (separate PR), `EinsumScalar`/`EinsumOperand` extension for custom types, `FastGemm` trait, benchmarks

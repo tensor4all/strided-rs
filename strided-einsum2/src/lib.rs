@@ -59,61 +59,39 @@ pub mod trace;
 pub mod util;
 
 /// Backend abstraction for batched GEMM dispatch.
-pub(crate) mod backend;
+pub mod backend;
 
 use std::any::TypeId;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
-use backend::BgemmBackend;
 use strided_kernel::zip_map2_into;
 #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
 use strided_view::StridedArray;
 use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
+pub use strided_traits::ScalarBase;
+
+pub use backend::{BackendConfig, BgemmBackend};
 pub use plan::Einsum2Plan;
 
 /// Trait alias for axis label types.
 pub trait AxisId: Clone + Eq + Hash + Debug {}
 impl<T: Clone + Eq + Hash + Debug> AxisId for T {}
 
-/// Shared trait bounds for all element types, independent of GEMM backend.
-pub trait ScalarBase:
-    Copy
-    + ElementOpApply
-    + Send
-    + Sync
-    + std::ops::Mul<Output = Self>
-    + std::ops::Add<Output = Self>
-    + num_traits::Zero
-    + num_traits::One
-    + PartialEq
-{
-}
-
-impl<T> ScalarBase for T where
-    T: Copy
-        + ElementOpApply
-        + Send
-        + Sync
-        + std::ops::Mul<Output = T>
-        + std::ops::Add<Output = T>
-        + num_traits::Zero
-        + num_traits::One
-        + PartialEq
-{
-}
+// ScalarBase is re-exported from strided_traits (see above).
+// It no longer requires ElementOpApply, enabling custom scalar types
+// (e.g., tropical semiring) to work with Identity-only views.
 
 /// Trait alias for element types supported by einsum operations.
 ///
 /// When the `faer` feature is enabled, this additionally requires `faer::ComplexField`
 /// so that the faer GEMM backend can be used.
 #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
-pub trait Scalar: ScalarBase + faer_traits::ComplexField {}
+pub trait Scalar: ScalarBase + ElementOpApply + faer_traits::ComplexField {}
 
 #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
-impl<T> Scalar for T where T: ScalarBase + faer_traits::ComplexField {}
+impl<T> Scalar for T where T: ScalarBase + ElementOpApply + faer_traits::ComplexField {}
 
 /// Trait alias for element types (with `blas` or `blas-inject` feature).
 ///
@@ -125,7 +103,7 @@ impl<T> Scalar for T where T: ScalarBase + faer_traits::ComplexField {}
         all(feature = "blas-inject", not(feature = "blas"))
     )
 ))]
-pub trait Scalar: ScalarBase + bgemm_blas::BlasGemm {}
+pub trait Scalar: ScalarBase + ElementOpApply + bgemm_blas::BlasGemm {}
 
 #[cfg(all(
     not(feature = "faer"),
@@ -134,14 +112,14 @@ pub trait Scalar: ScalarBase + bgemm_blas::BlasGemm {}
         all(feature = "blas-inject", not(feature = "blas"))
     )
 ))]
-impl<T> Scalar for T where T: ScalarBase + bgemm_blas::BlasGemm {}
+impl<T> Scalar for T where T: ScalarBase + ElementOpApply + bgemm_blas::BlasGemm {}
 
 /// Trait alias for element types (without `faer` or BLAS features).
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
-pub trait Scalar: ScalarBase {}
+pub trait Scalar: ScalarBase + ElementOpApply {}
 
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
-impl<T> Scalar for T where T: ScalarBase {}
+impl<T> Scalar for T where T: ScalarBase + ElementOpApply {}
 
 /// Placeholder trait definition for invalid mutually-exclusive feature combinations.
 ///
@@ -151,13 +129,13 @@ impl<T> Scalar for T where T: ScalarBase {}
     all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
     all(feature = "blas", feature = "blas-inject")
 ))]
-pub trait Scalar: ScalarBase {}
+pub trait Scalar: ScalarBase + ElementOpApply {}
 
 #[cfg(any(
     all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
     all(feature = "blas", feature = "blas-inject")
 ))]
-impl<T> Scalar for T where T: ScalarBase {}
+impl<T> Scalar for T where T: ScalarBase + ElementOpApply {}
 
 /// Errors specific to einsum operations.
 #[derive(Debug, thiserror::Error)]
@@ -187,7 +165,7 @@ pub type Result<T> = std::result::Result<T, EinsumError>;
 /// For scalar types, `Transpose::apply(x) = x` (identity) and the dimension
 /// swap is already reflected in the view's strides/dims.  Similarly,
 /// `Adjoint::apply(x) = x.conj()` with the dimension swap in the view.
-fn op_is_conj<Op: ElementOp + 'static>() -> bool {
+fn op_is_conj<Op: 'static>() -> bool {
     TypeId::of::<Op>() == TypeId::of::<Conj>() || TypeId::of::<Op>() == TypeId::of::<Adjoint>()
 }
 
@@ -212,8 +190,8 @@ pub fn einsum2_into<T: Scalar, OpA, OpB, ID: AxisId>(
     beta: T,
 ) -> Result<()>
 where
-    OpA: ElementOp + 'static,
-    OpB: ElementOp + 'static,
+    OpA: ElementOp<T> + 'static,
+    OpB: ElementOp<T> + 'static,
 {
     // 1. Build plan
     let plan = Einsum2Plan::new(ia, ib, ic)?;
@@ -294,6 +272,207 @@ where
             conj_b,
         )?;
     }
+
+    Ok(())
+}
+
+/// Binary einsum for custom scalar types using naive GEMM.
+///
+/// Like [`einsum2_into`] but works with any `ScalarBase` type (no `ElementOpApply` required).
+/// Uses closures `map_a` and `map_b` for per-element transformation instead of
+/// conjugation flags. Always dispatches to the naive GEMM kernel.
+///
+/// Views must use `Identity` element operations (the default).
+pub fn einsum2_naive_into<T, ID, MapA, MapB>(
+    c: StridedViewMut<T>,
+    a: &StridedView<T>,
+    b: &StridedView<T>,
+    ic: &[ID],
+    ia: &[ID],
+    ib: &[ID],
+    alpha: T,
+    beta: T,
+    map_a: MapA,
+    map_b: MapB,
+) -> Result<()>
+where
+    T: ScalarBase,
+    ID: AxisId,
+    MapA: Fn(T) -> T,
+    MapB: Fn(T) -> T,
+{
+    let plan = Einsum2Plan::new(ia, ib, ic)?;
+    validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
+
+    // Reduce trace axes if present.
+    // When trace reduction occurs, map is applied via map_into before reduction,
+    // so we use identity map for GEMM. Otherwise, pass through the original map.
+    let (a_buf, use_map_a) = if !plan.left_trace.is_empty() {
+        let trace_indices = plan.left_trace_indices(ia);
+        let mut mapped = unsafe { strided_view::StridedArray::<T>::col_major_uninit(a.dims()) };
+        strided_kernel::map_into(&mut mapped.view_mut(), a, &map_a)?;
+        let reduced = trace::reduce_trace_axes(&mapped.view(), &trace_indices)?;
+        (Some(reduced), false)
+    } else {
+        (None, true)
+    };
+    let a_view: StridedView<T> = match a_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => a.clone(),
+    };
+
+    let (b_buf, use_map_b) = if !plan.right_trace.is_empty() {
+        let trace_indices = plan.right_trace_indices(ib);
+        let mut mapped = unsafe { strided_view::StridedArray::<T>::col_major_uninit(b.dims()) };
+        strided_kernel::map_into(&mut mapped.view_mut(), b, &map_b)?;
+        let reduced = trace::reduce_trace_axes(&mapped.view(), &trace_indices)?;
+        (Some(reduced), false)
+    } else {
+        (None, true)
+    };
+    let b_view: StridedView<T> = match b_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => b.clone(),
+    };
+
+    let a_perm = a_view.permute(&plan.left_perm)?;
+    let b_perm = b_view.permute(&plan.right_perm)?;
+    let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+    // Element-wise fast path
+    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+        let mul_fn = move |a_val: T, b_val: T| -> T {
+            let a_c = if use_map_a { map_a(a_val) } else { a_val };
+            let b_c = if use_map_b { map_b(b_val) } else { b_val };
+            alpha * a_c * b_c
+        };
+        zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        return Ok(());
+    }
+
+    let final_map_a: Box<dyn Fn(T) -> T> = if use_map_a {
+        Box::new(map_a)
+    } else {
+        Box::new(|x| x)
+    };
+    let final_map_b: Box<dyn Fn(T) -> T> = if use_map_b {
+        Box::new(map_b)
+    } else {
+        Box::new(|x| x)
+    };
+
+    bgemm_naive::bgemm_strided_into_with_map(
+        &mut c_perm,
+        &a_perm,
+        &b_perm,
+        plan.batch.len(),
+        plan.lo.len(),
+        plan.ro.len(),
+        plan.sum.len(),
+        alpha,
+        beta,
+        final_map_a,
+        final_map_b,
+    )?;
+
+    Ok(())
+}
+
+/// Binary einsum with a pluggable GEMM backend.
+///
+/// Like [`einsum2_into`] but works with any `ScalarBase` type and dispatches
+/// to the caller-provided GEMM backend `B`. Views must use `Identity` element
+/// operations (the default).
+///
+/// External crates can implement [`BgemmBackend`] for custom scalar types
+/// (e.g., tropical semiring) and pass the backend here.
+pub fn einsum2_with_backend_into<T, B, ID>(
+    c: StridedViewMut<T>,
+    a: &StridedView<T>,
+    b: &StridedView<T>,
+    ic: &[ID],
+    ia: &[ID],
+    ib: &[ID],
+    alpha: T,
+    beta: T,
+) -> Result<()>
+where
+    T: ScalarBase,
+    B: BgemmBackend<T> + BackendConfig,
+    ID: AxisId,
+{
+    let plan = Einsum2Plan::new(ia, ib, ic)?;
+    validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
+
+    // Trace reduction (plain sum, Identity views)
+    let a_buf = if !plan.left_trace.is_empty() {
+        let trace_indices = plan.left_trace_indices(ia);
+        Some(trace::reduce_trace_axes(a, &trace_indices)?)
+    } else {
+        None
+    };
+    let a_view: StridedView<T> = match a_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => a.clone(),
+    };
+
+    let b_buf = if !plan.right_trace.is_empty() {
+        let trace_indices = plan.right_trace_indices(ib);
+        Some(trace::reduce_trace_axes(b, &trace_indices)?)
+    } else {
+        None
+    };
+    let b_view: StridedView<T> = match b_buf.as_ref() {
+        Some(buf) => buf.view(),
+        None => b.clone(),
+    };
+
+    // Permute to canonical order
+    let a_perm = a_view.permute(&plan.left_perm)?;
+    let b_perm = b_view.permute(&plan.right_perm)?;
+    let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+    let n_batch = plan.batch.len();
+    let n_lo = plan.lo.len();
+    let n_ro = plan.ro.len();
+    let n_sum = plan.sum.len();
+
+    // Element-wise fast path (all batch, no contraction)
+    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
+        if alpha == T::one() {
+            zip_map2_into(&mut c_perm, &a_perm, &b_perm, |a_val, b_val| a_val * b_val)?;
+        } else {
+            let mul_fn = move |a_val: T, b_val: T| -> T { alpha * a_val * b_val };
+            zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
+        }
+        return Ok(());
+    }
+
+    // Prepare contiguous operands for GEMM
+    let a_op = contiguous::prepare_input_view_for_backend::<T, B>(&a_perm, n_batch, n_lo, n_sum)?;
+    let b_op = contiguous::prepare_input_view_for_backend::<T, B>(&b_perm, n_batch, n_sum, n_ro)?;
+    let mut c_op = contiguous::prepare_output_view_for_backend::<T, B>(
+        &mut c_perm,
+        n_batch,
+        n_lo,
+        n_ro,
+        beta,
+    )?;
+
+    // Dimension sizes
+    let batch_dims = &a_perm.dims()[..n_batch];
+    let lo_dims = &a_perm.dims()[n_batch..n_batch + n_lo];
+    let sum_dims = &a_perm.dims()[n_batch + n_lo..n_batch + n_lo + n_sum];
+    let ro_dims = &b_perm.dims()[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let m: usize = lo_dims.iter().product::<usize>().max(1);
+    let k: usize = sum_dims.iter().product::<usize>().max(1);
+    let n: usize = ro_dims.iter().product::<usize>().max(1);
+
+    // GEMM via backend
+    B::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta)?;
+
+    // Finalize (copy-back if needed)
+    c_op.finalize_into(&mut c_perm)?;
 
     Ok(())
 }
@@ -1208,5 +1387,432 @@ mod tests {
         // C[1] = 5*2 + 7*4 + 9*6 = 10 + 28 + 54 = 92
         assert_eq!(c.get(&[0]), 71.0);
         assert_eq!(c.get(&[1]), 92.0);
+    }
+
+    #[test]
+    fn test_einsum2_naive_matmul() {
+        // einsum2_naive_into with identity maps = regular matmul
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[1.0, 2.0], [3.0, 4.0]][idx[0]][idx[1]]
+        });
+        let b = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[5.0, 6.0], [7.0, 8.0]][idx[0]][idx[1]]
+        });
+        let mut c = StridedArray::<f64>::row_major(&[2, 2]);
+
+        einsum2_naive_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            1.0,
+            0.0,
+            |x| x,
+            |x| x,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 19.0);
+        assert_eq!(c.get(&[0, 1]), 22.0);
+        assert_eq!(c.get(&[1, 0]), 43.0);
+        assert_eq!(c.get(&[1, 1]), 50.0);
+    }
+
+    #[test]
+    fn test_einsum2_naive_elementwise() {
+        // Element-wise (all batch) with identity maps
+        let a =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let b =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let mut c = StridedArray::<f64>::row_major(&[2, 3]);
+
+        einsum2_naive_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'j'],
+            &['i', 'j'],
+            &['i', 'j'],
+            2.0,
+            0.0,
+            |x| x,
+            |x| x,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 2.0); // 2 * 1 * 1
+        assert_eq!(c.get(&[1, 2]), 72.0); // 2 * 6 * 6
+    }
+
+    #[test]
+    fn test_einsum2_naive_custom_type() {
+        // Custom scalar type that does NOT implement ElementOpApply.
+        // This demonstrates that einsum2_naive_into works with custom types.
+        use num_traits::{One, Zero};
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct MyVal(f64);
+
+        impl Default for MyVal {
+            fn default() -> Self {
+                MyVal(0.0)
+            }
+        }
+
+        impl std::ops::Add for MyVal {
+            type Output = Self;
+            fn add(self, rhs: Self) -> Self {
+                MyVal(self.0 + rhs.0)
+            }
+        }
+
+        impl std::ops::Mul for MyVal {
+            type Output = Self;
+            fn mul(self, rhs: Self) -> Self {
+                MyVal(self.0 * rhs.0)
+            }
+        }
+
+        impl Zero for MyVal {
+            fn zero() -> Self {
+                MyVal(0.0)
+            }
+            fn is_zero(&self) -> bool {
+                self.0 == 0.0
+            }
+        }
+
+        impl One for MyVal {
+            fn one() -> Self {
+                MyVal(1.0)
+            }
+        }
+
+        // C_ik = A_ij * B_jk (matrix multiply with custom type)
+        let a = StridedArray::from_parts(
+            vec![MyVal(1.0), MyVal(2.0), MyVal(3.0), MyVal(4.0)],
+            &[2, 2],
+            &[2, 1],
+            0,
+        )
+        .unwrap();
+        let b = StridedArray::from_parts(
+            vec![MyVal(5.0), MyVal(6.0), MyVal(7.0), MyVal(8.0)],
+            &[2, 2],
+            &[2, 1],
+            0,
+        )
+        .unwrap();
+        let mut c = StridedArray::<MyVal>::col_major(&[2, 2]);
+
+        einsum2_naive_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            MyVal(1.0),
+            MyVal(0.0),
+            |x| x,
+            |x| x,
+        )
+        .unwrap();
+
+        // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]]
+        //   = [[19, 22], [43, 50]]
+        assert_eq!(c.get(&[0, 0]), MyVal(19.0));
+        assert_eq!(c.get(&[0, 1]), MyVal(22.0));
+        assert_eq!(c.get(&[1, 0]), MyVal(43.0));
+        assert_eq!(c.get(&[1, 1]), MyVal(50.0));
+    }
+
+    #[test]
+    fn test_einsum2_naive_left_trace() {
+        // C_k = sum_j (sum_i A_ij) * B_jk with map_a = identity
+        let a =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let b =
+            StridedArray::<f64>::from_fn_row_major(&[3, 2], |idx| (idx[0] * 2 + idx[1] + 1) as f64);
+        let mut c = StridedArray::<f64>::row_major(&[2]);
+
+        einsum2_naive_into(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            1.0,
+            0.0,
+            |x| x,
+            |x| x,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0]), 71.0);
+        assert_eq!(c.get(&[1]), 92.0);
+    }
+
+    /// Test backend that delegates to naive GEMM loops.
+    struct TestNaiveBackend;
+
+    impl BackendConfig for TestNaiveBackend {
+        const MATERIALIZES_CONJ: bool = false;
+        const REQUIRES_UNIT_STRIDE: bool = false;
+    }
+
+    impl BgemmBackend<f64> for TestNaiveBackend {
+        fn bgemm_contiguous_into(
+            c: &mut contiguous::ContiguousOperandMut<f64>,
+            a: &contiguous::ContiguousOperand<f64>,
+            b: &contiguous::ContiguousOperand<f64>,
+            batch_dims: &[usize],
+            m: usize,
+            n: usize,
+            k: usize,
+            alpha: f64,
+            beta: f64,
+        ) -> strided_view::Result<()> {
+            // Delegate to the contiguous naive GEMM loop
+            let a_ptr = a.ptr();
+            let b_ptr = b.ptr();
+            let c_ptr = c.ptr();
+            let a_rs = a.row_stride();
+            let a_cs = a.col_stride();
+            let b_rs = b.row_stride();
+            let b_cs = b.col_stride();
+            let c_rs = c.row_stride();
+            let c_cs = c.col_stride();
+
+            let mut batch_idx = crate::util::MultiIndex::new(batch_dims);
+            while batch_idx.next().is_some() {
+                let a_base = batch_idx.offset(a.batch_strides());
+                let b_base = batch_idx.offset(b.batch_strides());
+                let c_base = batch_idx.offset(c.batch_strides());
+
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0.0f64;
+                        for l in 0..k {
+                            let a_val = unsafe {
+                                *a_ptr.offset(a_base + i as isize * a_rs + l as isize * a_cs)
+                            };
+                            let b_val = unsafe {
+                                *b_ptr.offset(b_base + l as isize * b_rs + j as isize * b_cs)
+                            };
+                            acc += a_val * b_val;
+                        }
+                        unsafe {
+                            let c_elem =
+                                c_ptr.offset(c_base + i as isize * c_rs + j as isize * c_cs);
+                            if beta == 0.0 {
+                                *c_elem = alpha * acc;
+                            } else {
+                                *c_elem = alpha * acc + beta * (*c_elem);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_einsum2_with_backend_matmul() {
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[1.0, 2.0], [3.0, 4.0]][idx[0]][idx[1]]
+        });
+        let b = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
+            [[5.0, 6.0], [7.0, 8.0]][idx[0]][idx[1]]
+        });
+        let mut c = StridedArray::<f64>::row_major(&[2, 2]);
+
+        einsum2_with_backend_into::<_, TestNaiveBackend, _>(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 19.0);
+        assert_eq!(c.get(&[0, 1]), 22.0);
+        assert_eq!(c.get(&[1, 0]), 43.0);
+        assert_eq!(c.get(&[1, 1]), 50.0);
+    }
+
+    #[test]
+    fn test_einsum2_with_backend_elementwise() {
+        let a =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let b =
+            StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
+        let mut c = StridedArray::<f64>::row_major(&[2, 3]);
+
+        einsum2_with_backend_into::<_, TestNaiveBackend, _>(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'j'],
+            &['i', 'j'],
+            &['i', 'j'],
+            2.0,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 2.0); // 2 * 1 * 1
+        assert_eq!(c.get(&[1, 2]), 72.0); // 2 * 6 * 6
+    }
+
+    #[test]
+    fn test_einsum2_with_backend_custom_type() {
+        use num_traits::{One, Zero};
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct Tropical(f64);
+
+        impl Default for Tropical {
+            fn default() -> Self {
+                Tropical(0.0)
+            }
+        }
+
+        impl std::ops::Add for Tropical {
+            type Output = Self;
+            fn add(self, rhs: Self) -> Self {
+                Tropical(self.0 + rhs.0)
+            }
+        }
+
+        impl std::ops::Mul for Tropical {
+            type Output = Self;
+            fn mul(self, rhs: Self) -> Self {
+                Tropical(self.0 * rhs.0)
+            }
+        }
+
+        impl Zero for Tropical {
+            fn zero() -> Self {
+                Tropical(0.0)
+            }
+            fn is_zero(&self) -> bool {
+                self.0 == 0.0
+            }
+        }
+
+        impl One for Tropical {
+            fn one() -> Self {
+                Tropical(1.0)
+            }
+        }
+
+        struct TropicalBackend;
+
+        impl BackendConfig for TropicalBackend {
+            const MATERIALIZES_CONJ: bool = false;
+            const REQUIRES_UNIT_STRIDE: bool = false;
+        }
+
+        impl BgemmBackend<Tropical> for TropicalBackend {
+            fn bgemm_contiguous_into(
+                c: &mut contiguous::ContiguousOperandMut<Tropical>,
+                a: &contiguous::ContiguousOperand<Tropical>,
+                b: &contiguous::ContiguousOperand<Tropical>,
+                batch_dims: &[usize],
+                m: usize,
+                n: usize,
+                k: usize,
+                alpha: Tropical,
+                beta: Tropical,
+            ) -> strided_view::Result<()> {
+                // Simple naive GEMM for Tropical type
+                let a_ptr = a.ptr();
+                let b_ptr = b.ptr();
+                let c_ptr = c.ptr();
+                let a_rs = a.row_stride();
+                let a_cs = a.col_stride();
+                let b_rs = b.row_stride();
+                let b_cs = b.col_stride();
+                let c_rs = c.row_stride();
+                let c_cs = c.col_stride();
+
+                let mut batch_idx = crate::util::MultiIndex::new(batch_dims);
+                while batch_idx.next().is_some() {
+                    let a_base = batch_idx.offset(a.batch_strides());
+                    let b_base = batch_idx.offset(b.batch_strides());
+                    let c_base = batch_idx.offset(c.batch_strides());
+
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut acc = Tropical::zero();
+                            for l in 0..k {
+                                let a_val = unsafe {
+                                    *a_ptr.offset(a_base + i as isize * a_rs + l as isize * a_cs)
+                                };
+                                let b_val = unsafe {
+                                    *b_ptr.offset(b_base + l as isize * b_rs + j as isize * b_cs)
+                                };
+                                acc = acc + a_val * b_val;
+                            }
+                            unsafe {
+                                let c_elem =
+                                    c_ptr.offset(c_base + i as isize * c_rs + j as isize * c_cs);
+                                if beta == Tropical::zero() {
+                                    *c_elem = alpha * acc;
+                                } else {
+                                    *c_elem = alpha * acc + beta * (*c_elem);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let a = StridedArray::from_parts(
+            vec![Tropical(1.0), Tropical(2.0), Tropical(3.0), Tropical(4.0)],
+            &[2, 2],
+            &[2, 1],
+            0,
+        )
+        .unwrap();
+        let b = StridedArray::from_parts(
+            vec![Tropical(5.0), Tropical(6.0), Tropical(7.0), Tropical(8.0)],
+            &[2, 2],
+            &[2, 1],
+            0,
+        )
+        .unwrap();
+        let mut c = StridedArray::<Tropical>::col_major(&[2, 2]);
+
+        einsum2_with_backend_into::<_, TropicalBackend, _>(
+            c.view_mut(),
+            &a.view(),
+            &b.view(),
+            &['i', 'k'],
+            &['i', 'j'],
+            &['j', 'k'],
+            Tropical(1.0),
+            Tropical(0.0),
+        )
+        .unwrap();
+
+        // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]]
+        //   = [[19, 22], [43, 50]]
+        assert_eq!(c.get(&[0, 0]), Tropical(19.0));
+        assert_eq!(c.get(&[0, 1]), Tropical(22.0));
+        assert_eq!(c.get(&[1, 0]), Tropical(43.0));
+        assert_eq!(c.get(&[1, 1]), Tropical(50.0));
     }
 }

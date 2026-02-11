@@ -75,8 +75,9 @@ mod reduce_view;
 // ============================================================================
 pub use strided_view::view;
 pub use strided_view::{
-    col_major_strides, row_major_strides, Adjoint, Compose, Conj, ElementOp, ElementOpApply,
-    Identity, Result, StridedArray, StridedError, StridedView, StridedViewMut, Transpose,
+    col_major_strides, row_major_strides, Adjoint, ComposableElementOp, Compose, Conj, ElementOp,
+    ElementOpApply, Identity, Result, StridedArray, StridedError, StridedView, StridedViewMut,
+    Transpose,
 };
 
 // ============================================================================

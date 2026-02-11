@@ -21,10 +21,12 @@ pub trait BackendConfig {
 
 /// Trait for backends that can execute batched GEMM on contiguous operands.
 ///
-/// Implementations are provided by each backend module (faer, blas)
-/// in subsequent tasks. The trait is parameterized on the scalar type `T`.
-#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
-pub trait BgemmBackend<T: crate::Scalar> {
+/// Implementations are provided by each backend module (faer, blas).
+/// External crates can implement this trait for custom scalar types
+/// (e.g., tropical semiring) and pass the backend to [`einsum2_with_backend_into`].
+///
+/// [`einsum2_with_backend_into`]: crate::einsum2_with_backend_into
+pub trait BgemmBackend<T> {
     /// Execute batched GEMM: `C = alpha * A * B + beta * C` for each batch.
     ///
     /// - `c`: mutable output operand (batch x m x n)

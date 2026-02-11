@@ -10,7 +10,7 @@ use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::Result;
-use strided_view::{ElementOp, ElementOpApply};
+use strided_view::ElementOp;
 
 #[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
@@ -27,7 +27,7 @@ use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MI
 
 /// Unary inner loop: `dest[i] = f(Op::apply(src[i]))` for `len` elements.
 #[inline(always)]
-unsafe fn inner_loop_map1<D: Copy, A: Copy + ElementOpApply, Op: ElementOp>(
+unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>>(
     dp: *mut D,
     ds: isize,
     sp: *const A,
@@ -56,13 +56,7 @@ unsafe fn inner_loop_map1<D: Copy, A: Copy + ElementOpApply, Op: ElementOp>(
 
 /// Binary inner loop: `dest[i] = f(OpA::apply(a[i]), OpB::apply(b[i]))`.
 #[inline(always)]
-unsafe fn inner_loop_map2<
-    D: Copy,
-    A: Copy + ElementOpApply,
-    B: Copy + ElementOpApply,
-    OpA: ElementOp,
-    OpB: ElementOp,
->(
+unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: ElementOp<B>>(
     dp: *mut D,
     ds: isize,
     ap: *const A,
@@ -98,12 +92,12 @@ unsafe fn inner_loop_map2<
 #[inline(always)]
 unsafe fn inner_loop_map3<
     D: Copy,
-    A: Copy + ElementOpApply,
-    B: Copy + ElementOpApply,
-    C: Copy + ElementOpApply,
-    OpA: ElementOp,
-    OpB: ElementOp,
-    OpC: ElementOp,
+    A: Copy,
+    B: Copy,
+    C: Copy,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    OpC: ElementOp<C>,
 >(
     dp: *mut D,
     ds: isize,
@@ -149,14 +143,14 @@ unsafe fn inner_loop_map3<
 #[inline(always)]
 unsafe fn inner_loop_map4<
     D: Copy,
-    A: Copy + ElementOpApply,
-    B: Copy + ElementOpApply,
-    C: Copy + ElementOpApply,
-    E: Copy + ElementOpApply,
-    OpA: ElementOp,
-    OpB: ElementOp,
-    OpC: ElementOp,
-    OpE: ElementOp,
+    A: Copy,
+    B: Copy,
+    C: Copy,
+    E: Copy,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    OpC: ElementOp<C>,
+    OpE: ElementOp<E>,
 >(
     dp: *mut D,
     ds: isize,
@@ -213,11 +207,7 @@ unsafe fn inner_loop_map4<
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
 /// Source and destination may have different element types.
-pub fn map_into<
-    D: Copy + MaybeSendSync,
-    A: Copy + ElementOpApply + MaybeSendSync,
-    Op: ElementOp,
->(
+pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
     f: impl Fn(A) -> D + MaybeSync,
@@ -310,10 +300,10 @@ pub fn map_into<
 /// and from `dest`. The closure `f` handles per-element type conversion.
 pub fn zip_map2_into<
     D: Copy + MaybeSendSync,
-    A: Copy + ElementOpApply + MaybeSendSync,
-    B: Copy + ElementOpApply + MaybeSendSync,
-    OpA: ElementOp,
-    OpB: ElementOp,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
@@ -421,12 +411,12 @@ pub fn zip_map2_into<
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
 pub fn zip_map3_into<
     D: Copy + MaybeSendSync,
-    A: Copy + ElementOpApply + MaybeSendSync,
-    B: Copy + ElementOpApply + MaybeSendSync,
-    C: Copy + ElementOpApply + MaybeSendSync,
-    OpA: ElementOp,
-    OpB: ElementOp,
-    OpC: ElementOp,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    C: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    OpC: ElementOp<C>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
@@ -546,14 +536,14 @@ pub fn zip_map3_into<
 /// Quaternary element-wise operation: `dest[i] = f(a[i], b[i], c[i], e[i])`.
 pub fn zip_map4_into<
     D: Copy + MaybeSendSync,
-    A: Copy + ElementOpApply + MaybeSendSync,
-    B: Copy + ElementOpApply + MaybeSendSync,
-    C: Copy + ElementOpApply + MaybeSendSync,
-    E: Copy + ElementOpApply + MaybeSendSync,
-    OpA: ElementOp,
-    OpB: ElementOp,
-    OpC: ElementOp,
-    OpE: ElementOp,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    C: Copy + MaybeSendSync,
+    E: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    OpC: ElementOp<C>,
+    OpE: ElementOp<E>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
