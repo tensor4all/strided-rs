@@ -41,8 +41,8 @@ fn run_dot_case(case_name: &str, n1: usize, n2: usize, n3: usize, seed_f64: u64,
     bench_n(&format!("{case_name}_f64_{n1}x{n2}x{n3}"), 2, 5, || {
         let result = code
             .evaluate(vec![
-                EinsumOperand::from_view_f64(&a_view),
-                EinsumOperand::from_view_f64(&b_view),
+                EinsumOperand::from_view(&a_view),
+                EinsumOperand::from_view(&b_view),
             ])
             .unwrap();
         match result {
@@ -69,8 +69,8 @@ fn run_dot_case(case_name: &str, n1: usize, n2: usize, n3: usize, seed_f64: u64,
         || {
             let result = code
                 .evaluate(vec![
-                    EinsumOperand::from_view_c64(&a_c_view),
-                    EinsumOperand::from_view_c64(&b_c_view),
+                    EinsumOperand::from_view(&a_c_view),
+                    EinsumOperand::from_view(&b_c_view),
                 ])
                 .unwrap();
             match result {

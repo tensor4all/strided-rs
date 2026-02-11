@@ -43,7 +43,7 @@ fn main() {
     println!("indexsum (Float64):");
     bench_n("indexsum_f64_large", 1, 3, || {
         let result = code
-            .evaluate(vec![EinsumOperand::from_view_f64(&a_view)])
+            .evaluate(vec![EinsumOperand::from_view(&a_view)])
             .unwrap();
         match result {
             EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
@@ -59,7 +59,7 @@ fn main() {
     println!("indexsum (ComplexF64):");
     bench_n("indexsum_Complex64_large", 1, 3, || {
         let result = code
-            .evaluate(vec![EinsumOperand::from_view_c64(&ac_view)])
+            .evaluate(vec![EinsumOperand::from_view(&ac_view)])
             .unwrap();
         match result {
             EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),
