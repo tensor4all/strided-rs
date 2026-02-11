@@ -1532,3 +1532,26 @@ fn test_copy_scale_mixed() {
         }
     }
 }
+
+/// Custom Copy type that does NOT implement ElementOpApply.
+/// Verifies that Identity views work with map_into, reduce, etc.
+#[test]
+fn test_custom_type_map_into_without_element_op_apply() {
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    struct Wrapper(f64);
+
+    let src_data = vec![Wrapper(1.0), Wrapper(2.0), Wrapper(3.0), Wrapper(4.0)];
+    let src = StridedArray::from_parts(src_data, &[2, 2], &[2, 1], 0).unwrap();
+    let mut dest = StridedArray::<Wrapper>::col_major(&[2, 2]);
+
+    // map_into with Identity view on custom type
+    map_into(&mut dest.view_mut(), &src.view(), |Wrapper(x)| {
+        Wrapper(x * 2.0)
+    })
+    .unwrap();
+
+    assert_eq!(dest.get(&[0, 0]), Wrapper(2.0));
+    assert_eq!(dest.get(&[0, 1]), Wrapper(4.0));
+    assert_eq!(dest.get(&[1, 0]), Wrapper(6.0));
+    assert_eq!(dest.get(&[1, 1]), Wrapper(8.0));
+}

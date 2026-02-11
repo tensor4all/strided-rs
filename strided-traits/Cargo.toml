@@ -1,15 +1,13 @@
 [package]
-name = "strided-view"
+name = "strided-traits"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/strided-rs"
-description = "Device-agnostic strided view types and metadata operations (ported from Julia StridedViews.jl)."
+description = "Shared traits for strided-rs: element operations, scalar bounds, and type-level composition."
 publish = false
 
 [dependencies]
-strided-traits = { path = "../strided-traits" }
 num-traits = "0.2"
 num-complex = "0.4"
-thiserror = "1.0"

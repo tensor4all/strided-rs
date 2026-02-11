@@ -4,7 +4,7 @@
 //! They must be summed out (reduced) before the main contraction.
 
 use strided_kernel::reduce_axis;
-use strided_view::{ElementOp, ElementOpApply, StridedArray, StridedView};
+use strided_view::{ElementOp, StridedArray, StridedView};
 
 /// Reduce all trace axes from a view by summing them out.
 ///
@@ -18,8 +18,8 @@ pub fn reduce_trace_axes<T, Op>(
     trace_axes: &[usize],
 ) -> strided_view::Result<StridedArray<T>>
 where
-    T: Copy + ElementOpApply + Send + Sync + std::ops::Add<Output = T> + num_traits::Zero,
-    Op: ElementOp,
+    T: Copy + Send + Sync + std::ops::Add<Output = T> + num_traits::Zero,
+    Op: ElementOp<T>,
 {
     if trace_axes.is_empty() {
         // No trace axes — this shouldn't happen in practice since the caller checks.

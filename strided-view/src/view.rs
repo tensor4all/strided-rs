@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
-use crate::element_op::{ElementOp, ElementOpApply, Identity};
+use crate::element_op::{ComposableElementOp, ElementOp, ElementOpApply, Identity};
 use crate::{Result, StridedError};
 
 // ============================================================================
@@ -96,7 +96,7 @@ pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
 /// - `'a`: Lifetime of the underlying data
 /// - `T`: Element type
 /// - `Op`: Element operation applied lazily on access (default: `Identity`)
-pub struct StridedView<'a, T, Op: ElementOp = Identity> {
+pub struct StridedView<'a, T, Op = Identity> {
     ptr: *const T,
     data: &'a [T],
     dims: Arc<[usize]>,
@@ -105,10 +105,10 @@ pub struct StridedView<'a, T, Op: ElementOp = Identity> {
     _op: PhantomData<Op>,
 }
 
-unsafe impl<T: Send, Op: ElementOp> Send for StridedView<'_, T, Op> {}
-unsafe impl<T: Sync, Op: ElementOp> Sync for StridedView<'_, T, Op> {}
+unsafe impl<T: Send, Op: Send> Send for StridedView<'_, T, Op> {}
+unsafe impl<T: Sync, Op: Sync> Sync for StridedView<'_, T, Op> {}
 
-impl<T, Op: ElementOp> Clone for StridedView<'_, T, Op> {
+impl<T, Op> Clone for StridedView<'_, T, Op> {
     fn clone(&self) -> Self {
         Self {
             ptr: self.ptr,
@@ -121,7 +121,7 @@ impl<T, Op: ElementOp> Clone for StridedView<'_, T, Op> {
     }
 }
 
-impl<T: std::fmt::Debug, Op: ElementOp> std::fmt::Debug for StridedView<'_, T, Op> {
+impl<T: std::fmt::Debug, Op> std::fmt::Debug for StridedView<'_, T, Op> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StridedView")
             .field("dims", &self.dims)
@@ -131,7 +131,7 @@ impl<T: std::fmt::Debug, Op: ElementOp> std::fmt::Debug for StridedView<'_, T, O
     }
 }
 
-impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
+impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Create a new immutable strided view from a borrowed slice.
     pub fn new(data: &'a [T], dims: &[usize], strides: &[isize], offset: isize) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
@@ -243,63 +243,6 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
         })
     }
 
-    /// Transpose a 2D view: reverses dimensions and composes the Transpose element op.
-    ///
-    /// Julia equivalent: `Base.transpose(a::AbstractStridedView{<:Any, 2})`
-    pub fn transpose_2d(&self) -> Result<StridedView<'a, T, Op::ComposeTranspose>>
-    where
-        Op::ComposeTranspose: ElementOp,
-    {
-        if self.dims.len() != 2 {
-            return Err(StridedError::RankMismatch(self.dims.len(), 2));
-        }
-        Ok(StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::new([self.dims[1], self.dims[0]]),
-            strides: Arc::new([self.strides[1], self.strides[0]]),
-            offset: self.offset,
-            _op: PhantomData,
-        })
-    }
-
-    /// Adjoint (conjugate transpose) of a 2D view.
-    ///
-    /// Julia equivalent: `Base.adjoint(a::AbstractStridedView{<:Any, 2})`
-    pub fn adjoint_2d(&self) -> Result<StridedView<'a, T, Op::ComposeAdjoint>>
-    where
-        Op::ComposeAdjoint: ElementOp,
-    {
-        if self.dims.len() != 2 {
-            return Err(StridedError::RankMismatch(self.dims.len(), 2));
-        }
-        Ok(StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::new([self.dims[1], self.dims[0]]),
-            strides: Arc::new([self.strides[1], self.strides[0]]),
-            offset: self.offset,
-            _op: PhantomData,
-        })
-    }
-
-    /// Complex conjugate (compose Conj without changing dims/strides).
-    ///
-    /// Julia equivalent: `Base.conj(a::AbstractStridedView)`
-    pub fn conj(&self) -> StridedView<'a, T, Op::ComposeConj>
-    where
-        Op::ComposeConj: ElementOp,
-    {
-        StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
-            offset: self.offset,
-            _op: PhantomData,
-        }
-    }
-
     /// Create a diagonal view by fusing repeated axis pairs via stride trick (zero-copy).
     ///
     /// For each pair `(a, b)`:
@@ -386,7 +329,59 @@ impl<'a, T, Op: ElementOp> StridedView<'a, T, Op> {
     }
 }
 
-impl<'a, T: Copy + ElementOpApply, Op: ElementOp> StridedView<'a, T, Op> {
+/// Composition methods: require `T: ElementOpApply` and `Op: ComposableElementOp<T>`.
+impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T, Op> {
+    /// Transpose a 2D view: reverses dimensions and composes the Transpose element op.
+    ///
+    /// Julia equivalent: `Base.transpose(a::AbstractStridedView{<:Any, 2})`
+    pub fn transpose_2d(&self) -> Result<StridedView<'a, T, Op::ComposeTranspose>> {
+        if self.dims.len() != 2 {
+            return Err(StridedError::RankMismatch(self.dims.len(), 2));
+        }
+        Ok(StridedView {
+            ptr: self.ptr,
+            data: self.data,
+            dims: Arc::new([self.dims[1], self.dims[0]]),
+            strides: Arc::new([self.strides[1], self.strides[0]]),
+            offset: self.offset,
+            _op: PhantomData,
+        })
+    }
+
+    /// Adjoint (conjugate transpose) of a 2D view.
+    ///
+    /// Julia equivalent: `Base.adjoint(a::AbstractStridedView{<:Any, 2})`
+    pub fn adjoint_2d(&self) -> Result<StridedView<'a, T, Op::ComposeAdjoint>> {
+        if self.dims.len() != 2 {
+            return Err(StridedError::RankMismatch(self.dims.len(), 2));
+        }
+        Ok(StridedView {
+            ptr: self.ptr,
+            data: self.data,
+            dims: Arc::new([self.dims[1], self.dims[0]]),
+            strides: Arc::new([self.strides[1], self.strides[0]]),
+            offset: self.offset,
+            _op: PhantomData,
+        })
+    }
+
+    /// Complex conjugate (compose Conj without changing dims/strides).
+    ///
+    /// Julia equivalent: `Base.conj(a::AbstractStridedView)`
+    pub fn conj(&self) -> StridedView<'a, T, Op::ComposeConj> {
+        StridedView {
+            ptr: self.ptr,
+            data: self.data,
+            dims: self.dims.clone(),
+            strides: self.strides.clone(),
+            offset: self.offset,
+            _op: PhantomData,
+        }
+    }
+}
+
+/// Element access: requires `Op: ElementOp<T>`.
+impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
     /// Get an element with the element operation applied.
     pub fn get(&self, indices: &[usize]) -> T {
         assert_eq!(indices.len(), self.dims.len(), "wrong number of indices");
@@ -911,7 +906,7 @@ impl<T: Copy> StridedArray<T> {
     }
 }
 
-impl<T: Copy + ElementOpApply> StridedArray<T> {
+impl<T: Copy> StridedArray<T> {
     /// Get an element by multi-dimensional index.
     pub fn get(&self, indices: &[usize]) -> T {
         self.view().get(indices)
@@ -929,7 +924,7 @@ impl<T: Copy + ElementOpApply> StridedArray<T> {
     }
 }
 
-impl<T: Copy + ElementOpApply> Index<&[usize]> for StridedArray<T> {
+impl<T: Copy> Index<&[usize]> for StridedArray<T> {
     type Output = T;
 
     fn index(&self, indices: &[usize]) -> &T {
@@ -942,7 +937,7 @@ impl<T: Copy + ElementOpApply> Index<&[usize]> for StridedArray<T> {
     }
 }
 
-impl<T: Copy + ElementOpApply> IndexMut<&[usize]> for StridedArray<T> {
+impl<T: Copy> IndexMut<&[usize]> for StridedArray<T> {
     fn index_mut(&mut self, indices: &[usize]) -> &mut T {
         let mut idx = self.offset;
         for (i, &index) in indices.iter().enumerate() {
@@ -1238,5 +1233,36 @@ mod tests {
         assert_eq!(diag.strides(), &[21, 7]);
         assert_eq!(diag.get(&[0, 0]), 0.0);
         assert_eq!(diag.get(&[1, 1]), 28.0);
+    }
+
+    #[test]
+    fn test_custom_type_without_element_op_apply() {
+        // Custom Copy type that does NOT implement ElementOpApply.
+        // Should work with Identity views (StridedView<T> default).
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct MyScalar(f64);
+
+        impl Default for MyScalar {
+            fn default() -> Self {
+                MyScalar(0.0)
+            }
+        }
+
+        // Create array with custom type
+        let data = vec![MyScalar(1.0), MyScalar(2.0), MyScalar(3.0), MyScalar(4.0)];
+        let arr = StridedArray::from_parts(data, &[2, 2], &[2, 1], 0).unwrap();
+
+        // Access via Identity view (default)
+        assert_eq!(arr.get(&[0, 0]), MyScalar(1.0));
+        assert_eq!(arr.get(&[1, 0]), MyScalar(3.0));
+
+        // Create view and access elements
+        let view: StridedView<MyScalar> = arr.view();
+        assert_eq!(view.get(&[0, 1]), MyScalar(2.0));
+
+        // Permute view (metadata-only, no ElementOpApply needed)
+        let perm = view.permute(&[1, 0]).unwrap();
+        assert_eq!(perm.get(&[0, 0]), MyScalar(1.0));
+        assert_eq!(perm.get(&[0, 1]), MyScalar(3.0)); // transposed
     }
 }
