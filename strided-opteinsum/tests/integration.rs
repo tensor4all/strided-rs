@@ -706,13 +706,13 @@ fn test_einsum_into_single_tensor_trace_alpha_beta() {
 // ==========================================================================
 
 #[test]
-fn test_einsum_operand_from_view_roundtrip() {
+fn test_einsum_operand_from_view_f64_roundtrip() {
     let mut arr = StridedArray::<f64>::col_major(&[2, 3]);
     for (i, v) in arr.data_mut().iter_mut().enumerate() {
         *v = (i as f64) * 10.0;
     }
     let view = arr.view();
-    let op = EinsumOperand::from_view_f64(&view);
+    let op = EinsumOperand::from_view(&view);
     assert!(op.is_f64());
     assert_eq!(op.dims(), &[2, 3]);
 
@@ -730,7 +730,7 @@ fn test_einsum_operand_from_view_c64_roundtrip() {
     arr.data_mut()[2] = Complex64::new(5.0, 6.0);
     arr.data_mut()[3] = Complex64::new(7.0, 8.0);
     let view = arr.view();
-    let op = EinsumOperand::from_view_c64(&view);
+    let op = EinsumOperand::from_view(&view);
     assert!(op.is_c64());
     assert_eq!(op.dims(), &[2, 2]);
 
@@ -1272,8 +1272,8 @@ fn test_eval_pair_view_view_f64() {
     let b_arr = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
         [5.0, 6.0, 7.0, 8.0][idx[0] * 2 + idx[1]]
     });
-    let a = EinsumOperand::from_view_f64(&a_arr.view());
-    let b = EinsumOperand::from_view_f64(&b_arr.view());
+    let a = EinsumOperand::from_view(&a_arr.view());
+    let b = EinsumOperand::from_view(&b_arr.view());
     let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
     match result {
         EinsumOperand::F64(data) => {
@@ -1292,7 +1292,7 @@ fn test_eval_pair_owned_view_f64() {
     let b_arr = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
         [5.0, 6.0, 7.0, 8.0][idx[0] * 2 + idx[1]]
     });
-    let b = EinsumOperand::from_view_f64(&b_arr.view());
+    let b = EinsumOperand::from_view(&b_arr.view());
     let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
     match result {
         EinsumOperand::F64(data) => {
@@ -1309,7 +1309,7 @@ fn test_eval_pair_view_owned_f64() {
     let a_arr = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
         [1.0, 2.0, 3.0, 4.0][idx[0] * 2 + idx[1]]
     });
-    let a = EinsumOperand::from_view_f64(&a_arr.view());
+    let a = EinsumOperand::from_view(&a_arr.view());
     let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
     match result {
@@ -1331,8 +1331,8 @@ fn test_eval_pair_view_view_c64() {
     let b_arr = StridedArray::<Complex64>::from_fn_row_major(&[2, 2], |idx| {
         [c64(5.0, 0.0), c64(6.0, 0.0), c64(7.0, 0.0), c64(8.0, 0.0)][idx[0] * 2 + idx[1]]
     });
-    let a = EinsumOperand::from_view_c64(&a_arr.view());
-    let b = EinsumOperand::from_view_c64(&b_arr.view());
+    let a = EinsumOperand::from_view(&a_arr.view());
+    let b = EinsumOperand::from_view(&b_arr.view());
     let result = einsum("ij,jk->ik", vec![a, b]).unwrap();
     match result {
         EinsumOperand::C64(data) => {
@@ -1382,8 +1382,8 @@ fn test_einsum_into_view_operands() {
     let b_arr = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
         [5.0, 6.0, 7.0, 8.0][idx[0] * 2 + idx[1]]
     });
-    let a = EinsumOperand::from_view_f64(&a_arr.view());
-    let b = EinsumOperand::from_view_f64(&b_arr.view());
+    let a = EinsumOperand::from_view(&a_arr.view());
+    let b = EinsumOperand::from_view(&b_arr.view());
     let mut out = StridedArray::<f64>::row_major(&[2, 2]);
     einsum_into("ij,jk->ik", vec![a, b], out.view_mut(), 1.0, 0.0).unwrap();
     assert_abs_diff_eq!(out.get(&[0, 0]), 19.0, epsilon = 1e-10);

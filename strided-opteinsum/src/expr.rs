@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use num_complex::Complex64;
+#[cfg(test)]
 use num_traits::Zero;
 use strided_einsum2::{einsum2_into, einsum2_into_owned};
 use strided_kernel::copy_scale;
@@ -31,36 +32,60 @@ impl BufferPool {
             c64_pool: HashMap::new(),
         }
     }
+}
 
-    fn acquire_col_major_f64(&mut self, dims: &[usize]) -> StridedArray<f64> {
+// ---------------------------------------------------------------------------
+// PoolOps — private trait for type-dispatched buffer pool access
+// ---------------------------------------------------------------------------
+
+/// Private sealed trait for buffer pool acquire/release, implemented for f64
+/// and Complex64. Enables generic `eval_pair_alloc` without exposing
+/// `BufferPool` in the public API.
+trait PoolOps: EinsumScalar {
+    /// Acquire a col-major buffer from the pool (or allocate fresh).
+    ///
+    /// # Safety contract
+    /// The returned array may contain uninitialized data. Callers must write
+    /// every element before reading (e.g. via `einsum2_into` with `beta=0`).
+    fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<Self>;
+
+    /// Release an owned buffer back to the pool for reuse.
+    /// Views are silently dropped (nothing to recycle).
+    fn pool_release(pool: &mut BufferPool, data: StridedData<'_, Self>);
+}
+
+impl PoolOps for f64 {
+    fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<f64> {
         let total: usize = dims.iter().product();
         // SAFETY: einsum2_into with beta=0 writes every output element before reading.
-        match self.f64_pool.get_mut(&total).and_then(|v| v.pop()) {
+        match pool.f64_pool.get_mut(&total).and_then(|v| v.pop()) {
             Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
             None => unsafe { StridedArray::col_major_uninit(dims) },
         }
     }
 
-    fn acquire_col_major_c64(&mut self, dims: &[usize]) -> StridedArray<Complex64> {
+    fn pool_release(pool: &mut BufferPool, data: StridedData<'_, f64>) {
+        if let StridedData::Owned(arr) = data {
+            let buf = arr.into_data();
+            pool.f64_pool.entry(buf.len()).or_default().push(buf);
+        }
+    }
+}
+
+impl PoolOps for Complex64 {
+    fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<Complex64> {
         let total: usize = dims.iter().product();
         // SAFETY: einsum2_into with beta=0 writes every output element before reading.
-        match self.c64_pool.get_mut(&total).and_then(|v| v.pop()) {
+        match pool.c64_pool.get_mut(&total).and_then(|v| v.pop()) {
             Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
             None => unsafe { StridedArray::col_major_uninit(dims) },
         }
     }
 
-    fn release_f64(&mut self, data: StridedData<'_, f64>) {
+    fn pool_release(pool: &mut BufferPool, data: StridedData<'_, Complex64>) {
         if let StridedData::Owned(arr) = data {
             let buf = arr.into_data();
-            self.f64_pool.entry(buf.len()).or_default().push(buf);
-        }
-    }
-
-    fn release_c64(&mut self, data: StridedData<'_, Complex64>) {
-        if let StridedData::Owned(arr) = data {
-            let buf = arr.into_data();
-            self.c64_pool.entry(buf.len()).or_default().push(buf);
+            pool.c64_pool.entry(buf.len()).or_default().push(buf);
         }
     }
 }
@@ -191,6 +216,39 @@ fn out_dims_from_ids(
     Ok(out_dims)
 }
 
+/// Generic inner function for pairwise contraction with buffer pool.
+///
+/// Acquires an output buffer, runs `einsum2_into`, and releases input buffers
+/// back to the pool.
+fn eval_pair_alloc<T: PoolOps>(
+    ld: StridedData<'_, T>,
+    left_ids: &[char],
+    rd: StridedData<'_, T>,
+    right_ids: &[char],
+    output_ids: &[char],
+    pool: &mut BufferPool,
+) -> crate::Result<EinsumOperand<'static>> {
+    let out_dims = out_dims_from_ids(left_ids, ld.dims(), right_ids, rd.dims(), output_ids)?;
+    let mut c_arr = T::pool_acquire(pool, &out_dims);
+    {
+        let a_view = ld.as_view();
+        let b_view = rd.as_view();
+        einsum2_into(
+            c_arr.view_mut(),
+            &a_view,
+            &b_view,
+            output_ids,
+            left_ids,
+            right_ids,
+            T::one(),
+            T::zero(),
+        )?;
+    }
+    T::pool_release(pool, ld);
+    T::pool_release(pool, rd);
+    Ok(T::wrap_array(c_arr))
+}
+
 /// Contract two operands, consuming them by value. Promotes to c64 if types are mixed.
 ///
 /// Uses view-based `einsum2_into` so that owned input buffers can be released
@@ -205,52 +263,10 @@ fn eval_pair(
 ) -> crate::Result<EinsumOperand<'static>> {
     match (left, right) {
         (EinsumOperand::F64(ld), EinsumOperand::F64(rd)) => {
-            let a_dims: Vec<usize> = ld.dims().to_vec();
-            let b_dims: Vec<usize> = rd.dims().to_vec();
-            let out_dims = out_dims_from_ids(left_ids, &a_dims, right_ids, &b_dims, output_ids)?;
-            let mut c_arr = pool.acquire_col_major_f64(&out_dims);
-
-            {
-                let a_view = ld.as_view();
-                let b_view = rd.as_view();
-                einsum2_into(
-                    c_arr.view_mut(),
-                    &a_view,
-                    &b_view,
-                    output_ids,
-                    left_ids,
-                    right_ids,
-                    1.0,
-                    0.0,
-                )?;
-            }
-            pool.release_f64(ld);
-            pool.release_f64(rd);
-            Ok(EinsumOperand::F64(StridedData::Owned(c_arr)))
+            eval_pair_alloc(ld, left_ids, rd, right_ids, output_ids, pool)
         }
         (EinsumOperand::C64(ld), EinsumOperand::C64(rd)) => {
-            let a_dims: Vec<usize> = ld.dims().to_vec();
-            let b_dims: Vec<usize> = rd.dims().to_vec();
-            let out_dims = out_dims_from_ids(left_ids, &a_dims, right_ids, &b_dims, output_ids)?;
-            let mut c_arr = pool.acquire_col_major_c64(&out_dims);
-
-            {
-                let a_view = ld.as_view();
-                let b_view = rd.as_view();
-                einsum2_into(
-                    c_arr.view_mut(),
-                    &a_view,
-                    &b_view,
-                    output_ids,
-                    left_ids,
-                    right_ids,
-                    Complex64::new(1.0, 0.0),
-                    Complex64::zero(),
-                )?;
-            }
-            pool.release_c64(ld);
-            pool.release_c64(rd);
-            Ok(EinsumOperand::C64(StridedData::Owned(c_arr)))
+            eval_pair_alloc(ld, left_ids, rd, right_ids, output_ids, pool)
         }
         (left, right) => {
             // Mixed types: promote both to c64 by consuming, then recurse (hits C64/C64 branch)
@@ -371,22 +387,25 @@ fn accumulate_into<T: EinsumScalar>(
 // Single-tensor dispatch (borrows operand)
 // ---------------------------------------------------------------------------
 
+/// Generic inner function for single-tensor einsum.
+fn eval_single_typed<T: EinsumScalar>(
+    data: &StridedData<'_, T>,
+    input_ids: &[char],
+    output_ids: &[char],
+) -> crate::Result<EinsumOperand<'static>> {
+    let view = data.as_view();
+    let result = single_tensor_einsum(&view, input_ids, output_ids)?;
+    Ok(T::wrap_array(result))
+}
+
 fn eval_single(
     operand: &EinsumOperand<'_>,
     input_ids: &[char],
     output_ids: &[char],
 ) -> crate::Result<EinsumOperand<'static>> {
     match operand {
-        EinsumOperand::F64(data) => {
-            let view = data.as_view();
-            let result = single_tensor_einsum(&view, input_ids, output_ids)?;
-            Ok(EinsumOperand::F64(StridedData::Owned(result)))
-        }
-        EinsumOperand::C64(data) => {
-            let view = data.as_view();
-            let result = single_tensor_einsum(&view, input_ids, output_ids)?;
-            Ok(EinsumOperand::C64(StridedData::Owned(result)))
-        }
+        EinsumOperand::F64(data) => eval_single_typed(data, input_ids, output_ids),
+        EinsumOperand::C64(data) => eval_single_typed(data, input_ids, output_ids),
     }
 }
 

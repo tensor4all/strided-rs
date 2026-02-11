@@ -56,8 +56,8 @@ fn run_outer_case(
         || {
             let result = code
                 .evaluate(vec![
-                    EinsumOperand::from_view_f64(&a_view),
-                    EinsumOperand::from_view_f64(&b_view),
+                    EinsumOperand::from_view(&a_view),
+                    EinsumOperand::from_view(&b_view),
                 ])
                 .unwrap();
             match result {
@@ -85,8 +85,8 @@ fn run_outer_case(
         || {
             let result = code
                 .evaluate(vec![
-                    EinsumOperand::from_view_c64(&ac_view),
-                    EinsumOperand::from_view_c64(&bc_view),
+                    EinsumOperand::from_view(&ac_view),
+                    EinsumOperand::from_view(&bc_view),
                 ])
                 .unwrap();
             match result {

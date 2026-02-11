@@ -74,19 +74,19 @@ fn to_einsum_operand<'a>(op: &NdOperand<'a>) -> EinsumOperand<'a> {
     match op {
         NdOperand::F64Array(arr) => {
             let sv = array_to_strided_view(arr);
-            EinsumOperand::from_view_f64(&sv)
+            EinsumOperand::from_view(&sv)
         }
         NdOperand::C64Array(arr) => {
             let sv = array_to_strided_view(arr);
-            EinsumOperand::from_view_c64(&sv)
+            EinsumOperand::from_view(&sv)
         }
         NdOperand::F64View(view) => {
             let sv = view_to_strided_view(view);
-            EinsumOperand::from_view_f64(&sv)
+            EinsumOperand::from_view(&sv)
         }
         NdOperand::C64View(view) => {
             let sv = view_to_strided_view(view);
-            EinsumOperand::from_view_c64(&sv)
+            EinsumOperand::from_view(&sv)
         }
     }
 }

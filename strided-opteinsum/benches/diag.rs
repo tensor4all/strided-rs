@@ -45,7 +45,7 @@ fn main() {
     println!("diag: Float64");
     bench_n("diag_f64", 2, 5, || {
         let result = code
-            .evaluate(vec![EinsumOperand::from_view_f64(&a_view)])
+            .evaluate(vec![EinsumOperand::from_view(&a_view)])
             .unwrap();
         match result {
             EinsumOperand::F64(data) => black_box(data.as_array().data().as_ptr()),
@@ -63,7 +63,7 @@ fn main() {
     println!("diag: ComplexF64");
     bench_n("diag_Complex64", 2, 5, || {
         let result = code
-            .evaluate(vec![EinsumOperand::from_view_c64(&a_c_view)])
+            .evaluate(vec![EinsumOperand::from_view(&a_c_view)])
             .unwrap();
         match result {
             EinsumOperand::C64(data) => black_box(data.as_array().data().as_ptr()),

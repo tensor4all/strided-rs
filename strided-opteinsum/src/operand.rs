@@ -4,6 +4,8 @@ use strided_einsum2::Scalar;
 use strided_kernel::copy_into;
 use strided_view::{col_major_strides, ElementOpApply, StridedArray, StridedView};
 
+use crate::typed_tensor::TypedTensor;
+
 /// Type-erased strided data that can be either owned or borrowed.
 #[derive(Debug)]
 pub enum StridedData<'a, T> {
@@ -106,14 +108,11 @@ impl<'a> EinsumOperand<'a> {
         }
     }
 
-    /// Create an `EinsumOperand` from a borrowed f64 strided view.
-    pub fn from_view_f64(view: &StridedView<'a, f64>) -> Self {
-        EinsumOperand::F64(StridedData::View(view.clone()))
-    }
-
-    /// Create an `EinsumOperand` from a borrowed Complex64 strided view.
-    pub fn from_view_c64(view: &StridedView<'a, Complex64>) -> Self {
-        EinsumOperand::C64(StridedData::View(view.clone()))
+    /// Create an `EinsumOperand` from a borrowed strided view.
+    ///
+    /// Type inference selects the correct variant (`F64` or `C64`) from the view's element type.
+    pub fn from_view<T: EinsumScalar>(view: &StridedView<'a, T>) -> Self {
+        T::wrap_data(StridedData::View(view.clone()))
     }
 
     /// Promote to an owned Complex64 operand by borrowing the data.
@@ -211,6 +210,15 @@ pub trait EinsumScalar: private::Sealed + Scalar + Default + 'static {
     /// Human-readable type name for error messages.
     fn type_name() -> &'static str;
 
+    /// Wrap typed `StridedData` into a type-erased `EinsumOperand`.
+    fn wrap_data(data: StridedData<'_, Self>) -> EinsumOperand<'_>;
+
+    /// Wrap an owned `StridedArray` into a type-erased `EinsumOperand`.
+    fn wrap_array(arr: StridedArray<Self>) -> EinsumOperand<'static>;
+
+    /// Wrap an owned `StridedArray` into a `TypedTensor`.
+    fn wrap_typed_tensor(arr: StridedArray<Self>) -> TypedTensor;
+
     /// Extract typed data from a type-erased `EinsumOperand`, promoting if needed.
     ///
     /// For `f64`: returns error if operand is `C64`.
@@ -225,6 +233,18 @@ pub trait EinsumScalar: private::Sealed + Scalar + Default + 'static {
 impl EinsumScalar for f64 {
     fn type_name() -> &'static str {
         "f64"
+    }
+
+    fn wrap_data(data: StridedData<'_, Self>) -> EinsumOperand<'_> {
+        EinsumOperand::F64(data)
+    }
+
+    fn wrap_array(arr: StridedArray<Self>) -> EinsumOperand<'static> {
+        EinsumOperand::F64(StridedData::Owned(arr))
+    }
+
+    fn wrap_typed_tensor(arr: StridedArray<Self>) -> TypedTensor {
+        TypedTensor::F64(arr)
     }
 
     fn extract_data<'a>(op: EinsumOperand<'a>) -> crate::Result<StridedData<'a, f64>> {
@@ -253,6 +273,18 @@ impl EinsumScalar for f64 {
 impl EinsumScalar for Complex64 {
     fn type_name() -> &'static str {
         "Complex64"
+    }
+
+    fn wrap_data(data: StridedData<'_, Self>) -> EinsumOperand<'_> {
+        EinsumOperand::C64(data)
+    }
+
+    fn wrap_array(arr: StridedArray<Self>) -> EinsumOperand<'static> {
+        EinsumOperand::C64(StridedData::Owned(arr))
+    }
+
+    fn wrap_typed_tensor(arr: StridedArray<Self>) -> TypedTensor {
+        TypedTensor::C64(arr)
     }
 
     fn extract_data<'a>(op: EinsumOperand<'a>) -> crate::Result<StridedData<'a, Complex64>> {
@@ -312,7 +344,7 @@ mod tests {
     fn test_f64_view() {
         let arr = StridedArray::<f64>::col_major(&[2, 3]);
         let view = arr.view();
-        let op = EinsumOperand::from_view_f64(&view);
+        let op = EinsumOperand::from_view(&view);
         assert!(op.is_f64());
         assert_eq!(op.dims(), &[2, 3]);
     }
@@ -370,7 +402,7 @@ mod tests {
         arr.data_mut()[2] = 7.0;
         arr.data_mut()[3] = 8.0;
         let view = arr.view();
-        let op = EinsumOperand::from_view_f64(&view);
+        let op = EinsumOperand::from_view(&view);
         let promoted = op.to_c64_owned_ref();
         assert!(promoted.is_c64());
         match &promoted {
@@ -414,7 +446,7 @@ mod tests {
         arr.data_mut()[1] = Complex64::new(2.0, -2.0);
         arr.data_mut()[2] = Complex64::new(3.0, -3.0);
         let view = arr.view();
-        let op = EinsumOperand::from_view_c64(&view);
+        let op = EinsumOperand::from_view(&view);
         let copied = op.to_c64_owned_ref();
         assert!(copied.is_c64());
         match &copied {
@@ -713,7 +745,7 @@ mod tests {
         arr.data_mut()[2] = Complex64::new(3.0, -3.0);
         arr.data_mut()[3] = Complex64::new(4.0, -4.0);
         let view = arr.view();
-        let op = EinsumOperand::from_view_c64(&view);
+        let op = EinsumOperand::from_view(&view);
         let owned = op.to_c64_owned();
         assert!(owned.is_c64());
         match &owned {
@@ -752,7 +784,7 @@ mod tests {
         arr.data_mut()[1] = 20.0;
         arr.data_mut()[2] = 30.0;
         let view = arr.view();
-        let op = EinsumOperand::from_view_f64(&view);
+        let op = EinsumOperand::from_view(&view);
         let promoted = op.to_c64_owned();
         assert!(promoted.is_c64());
         match &promoted {

@@ -48,9 +48,9 @@ fn main() {
     bench_n("starandcontract_f64_large", 1, 3, || {
         let result = code
             .evaluate(vec![
-                EinsumOperand::from_view_f64(&a_view),
-                EinsumOperand::from_view_f64(&b_view),
-                EinsumOperand::from_view_f64(&c_view),
+                EinsumOperand::from_view(&a_view),
+                EinsumOperand::from_view(&b_view),
+                EinsumOperand::from_view(&c_view),
             ])
             .unwrap();
         match result {
@@ -76,9 +76,9 @@ fn main() {
     bench_n("starandcontract_Complex64_large", 1, 3, || {
         let result = code
             .evaluate(vec![
-                EinsumOperand::from_view_c64(&ac_view),
-                EinsumOperand::from_view_c64(&bc_view),
-                EinsumOperand::from_view_c64(&cc_view),
+                EinsumOperand::from_view(&ac_view),
+                EinsumOperand::from_view(&bc_view),
+                EinsumOperand::from_view(&cc_view),
             ])
             .unwrap();
         match result {
