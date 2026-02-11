@@ -27,13 +27,13 @@ use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MI
 
 /// Unary inner loop: `dest[i] = f(Op::apply(src[i]))` for `len` elements.
 #[inline(always)]
-unsafe fn inner_loop_map1<T: Copy + ElementOpApply, Op: ElementOp>(
-    dp: *mut T,
+unsafe fn inner_loop_map1<D: Copy, A: Copy + ElementOpApply, Op: ElementOp>(
+    dp: *mut D,
     ds: isize,
-    sp: *const T,
+    sp: *const A,
     ss: isize,
     len: usize,
-    f: &impl Fn(T) -> T,
+    f: &impl Fn(A) -> D,
 ) {
     if ds == 1 && ss == 1 {
         let src = std::slice::from_raw_parts(sp, len);
@@ -56,15 +56,21 @@ unsafe fn inner_loop_map1<T: Copy + ElementOpApply, Op: ElementOp>(
 
 /// Binary inner loop: `dest[i] = f(OpA::apply(a[i]), OpB::apply(b[i]))`.
 #[inline(always)]
-unsafe fn inner_loop_map2<T: Copy + ElementOpApply, OpA: ElementOp, OpB: ElementOp>(
-    dp: *mut T,
+unsafe fn inner_loop_map2<
+    D: Copy,
+    A: Copy + ElementOpApply,
+    B: Copy + ElementOpApply,
+    OpA: ElementOp,
+    OpB: ElementOp,
+>(
+    dp: *mut D,
     ds: isize,
-    ap: *const T,
+    ap: *const A,
     a_s: isize,
-    bp: *const T,
+    bp: *const B,
     b_s: isize,
     len: usize,
-    f: &impl Fn(T, T) -> T,
+    f: &impl Fn(A, B) -> D,
 ) {
     if ds == 1 && a_s == 1 && b_s == 1 {
         let src_a = std::slice::from_raw_parts(ap, len);
@@ -91,21 +97,24 @@ unsafe fn inner_loop_map2<T: Copy + ElementOpApply, OpA: ElementOp, OpB: Element
 /// Ternary inner loop: `dest[i] = f(a[i], b[i], c[i])`.
 #[inline(always)]
 unsafe fn inner_loop_map3<
-    T: Copy + ElementOpApply,
+    D: Copy,
+    A: Copy + ElementOpApply,
+    B: Copy + ElementOpApply,
+    C: Copy + ElementOpApply,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
 >(
-    dp: *mut T,
+    dp: *mut D,
     ds: isize,
-    ap: *const T,
+    ap: *const A,
     a_s: isize,
-    bp: *const T,
+    bp: *const B,
     b_s: isize,
-    cp: *const T,
+    cp: *const C,
     c_s: isize,
     len: usize,
-    f: &impl Fn(T, T, T) -> T,
+    f: &impl Fn(A, B, C) -> D,
 ) {
     if ds == 1 && a_s == 1 && b_s == 1 && c_s == 1 {
         let src_a = std::slice::from_raw_parts(ap, len);
@@ -139,24 +148,28 @@ unsafe fn inner_loop_map3<
 /// Quaternary inner loop: `dest[i] = f(a[i], b[i], c[i], e[i])`.
 #[inline(always)]
 unsafe fn inner_loop_map4<
-    T: Copy + ElementOpApply,
+    D: Copy,
+    A: Copy + ElementOpApply,
+    B: Copy + ElementOpApply,
+    C: Copy + ElementOpApply,
+    E: Copy + ElementOpApply,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
     OpE: ElementOp,
 >(
-    dp: *mut T,
+    dp: *mut D,
     ds: isize,
-    ap: *const T,
+    ap: *const A,
     a_s: isize,
-    bp: *const T,
+    bp: *const B,
     b_s: isize,
-    cp: *const T,
+    cp: *const C,
     c_s: isize,
-    ep: *const T,
+    ep: *const E,
     e_s: isize,
     len: usize,
-    f: &impl Fn(T, T, T, T) -> T,
+    f: &impl Fn(A, B, C, E) -> D,
 ) {
     if ds == 1 && a_s == 1 && b_s == 1 && c_s == 1 && e_s == 1 {
         let src_a = std::slice::from_raw_parts(ap, len);
@@ -199,10 +212,15 @@ unsafe fn inner_loop_map4<
 /// Apply a function element-wise from source to destination.
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
-pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T, Op>,
-    f: impl Fn(T) -> T + MaybeSync,
+/// Source and destination may have different element types.
+pub fn map_into<
+    D: Copy + MaybeSendSync,
+    A: Copy + ElementOpApply + MaybeSendSync,
+    Op: ElementOp,
+>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<A, Op>,
+    f: impl Fn(A) -> D + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -225,9 +243,10 @@ pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
+    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<A>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
@@ -235,7 +254,7 @@ pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
         if total > MINTHREADLENGTH {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut T);
+            let src_send = SendPtr(src_ptr as *mut A);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -260,7 +279,7 @@ pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
                             let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
                             let sp = unsafe { src_send.as_const().offset(offsets[1]) };
                             unsafe {
-                                inner_loop_map1::<T, Op>(dp, strides[0], sp, strides[1], len, &f)
+                                inner_loop_map1::<D, A, Op>(dp, strides[0], sp, strides[1], len, &f)
                             };
                             Ok(())
                         },
@@ -279,18 +298,27 @@ pub fn map_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let sp = unsafe { src_ptr.offset(offsets[1]) };
-            unsafe { inner_loop_map1::<T, Op>(dp, strides[0], sp, strides[1], len, &f) };
+            unsafe { inner_loop_map1::<D, A, Op>(dp, strides[0], sp, strides[1], len, &f) };
             Ok(())
         },
     )
 }
 
 /// Binary element-wise operation: `dest[i] = f(a[i], b[i])`.
-pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, OpB: ElementOp>(
-    dest: &mut StridedViewMut<T>,
-    a: &StridedView<T, OpA>,
-    b: &StridedView<T, OpB>,
-    f: impl Fn(T, T) -> T + MaybeSync,
+///
+/// Source operands `a` and `b` may have different element types from each other
+/// and from `dest`. The closure `f` handles per-element type conversion.
+pub fn zip_map2_into<
+    D: Copy + MaybeSendSync,
+    A: Copy + ElementOpApply + MaybeSendSync,
+    B: Copy + ElementOpApply + MaybeSendSync,
+    OpA: ElementOp,
+    OpB: ElementOp,
+>(
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    f: impl Fn(A, B) -> D + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -318,9 +346,12 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
+    let elem_size = std::mem::size_of::<D>()
+        .max(std::mem::size_of::<A>())
+        .max(std::mem::size_of::<B>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
@@ -328,8 +359,8 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
         if total > MINTHREADLENGTH {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut T);
-            let b_send = SendPtr(b_ptr as *mut T);
+            let a_send = SendPtr(a_ptr as *mut A);
+            let b_send = SendPtr(b_ptr as *mut B);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -355,7 +386,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
                             let ap = unsafe { a_send.as_const().offset(offsets[1]) };
                             let bp = unsafe { b_send.as_const().offset(offsets[2]) };
                             unsafe {
-                                inner_loop_map2::<T, OpA, OpB>(
+                                inner_loop_map2::<D, A, B, OpA, OpB>(
                                     dp, strides[0], ap, strides[1], bp, strides[2], len, &f,
                                 )
                             };
@@ -378,7 +409,7 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
             let ap = unsafe { a_ptr.offset(offsets[1]) };
             let bp = unsafe { b_ptr.offset(offsets[2]) };
             unsafe {
-                inner_loop_map2::<T, OpA, OpB>(
+                inner_loop_map2::<D, A, B, OpA, OpB>(
                     dp, strides[0], ap, strides[1], bp, strides[2], len, &f,
                 )
             };
@@ -389,16 +420,19 @@ pub fn zip_map2_into<T: Copy + ElementOpApply + MaybeSendSync, OpA: ElementOp, O
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
 pub fn zip_map3_into<
-    T: Copy + ElementOpApply + MaybeSendSync,
+    D: Copy + MaybeSendSync,
+    A: Copy + ElementOpApply + MaybeSendSync,
+    B: Copy + ElementOpApply + MaybeSendSync,
+    C: Copy + ElementOpApply + MaybeSendSync,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
 >(
-    dest: &mut StridedViewMut<T>,
-    a: &StridedView<T, OpA>,
-    b: &StridedView<T, OpB>,
-    c: &StridedView<T, OpC>,
-    f: impl Fn(T, T, T) -> T + MaybeSync,
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    c: &StridedView<C, OpC>,
+    f: impl Fn(A, B, C) -> D + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -432,9 +466,13 @@ pub fn zip_map3_into<
     }
 
     let strides_list: [&[isize]; 4] = [dst_strides, a.strides(), b.strides(), c.strides()];
+    let elem_size = std::mem::size_of::<D>()
+        .max(std::mem::size_of::<A>())
+        .max(std::mem::size_of::<B>())
+        .max(std::mem::size_of::<C>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
@@ -442,9 +480,9 @@ pub fn zip_map3_into<
         if total > MINTHREADLENGTH {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut T);
-            let b_send = SendPtr(b_ptr as *mut T);
-            let c_send = SendPtr(c_ptr as *mut T);
+            let a_send = SendPtr(a_ptr as *mut A);
+            let b_send = SendPtr(b_ptr as *mut B);
+            let c_send = SendPtr(c_ptr as *mut C);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -471,7 +509,7 @@ pub fn zip_map3_into<
                             let bp = unsafe { b_send.as_const().offset(offsets[2]) };
                             let cp = unsafe { c_send.as_const().offset(offsets[3]) };
                             unsafe {
-                                inner_loop_map3::<T, OpA, OpB, OpC>(
+                                inner_loop_map3::<D, A, B, C, OpA, OpB, OpC>(
                                     dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
                                     len, &f,
                                 )
@@ -496,7 +534,7 @@ pub fn zip_map3_into<
             let bp = unsafe { b_ptr.offset(offsets[2]) };
             let cp = unsafe { c_ptr.offset(offsets[3]) };
             unsafe {
-                inner_loop_map3::<T, OpA, OpB, OpC>(
+                inner_loop_map3::<D, A, B, C, OpA, OpB, OpC>(
                     dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3], len, &f,
                 )
             };
@@ -507,18 +545,22 @@ pub fn zip_map3_into<
 
 /// Quaternary element-wise operation: `dest[i] = f(a[i], b[i], c[i], e[i])`.
 pub fn zip_map4_into<
-    T: Copy + ElementOpApply + MaybeSendSync,
+    D: Copy + MaybeSendSync,
+    A: Copy + ElementOpApply + MaybeSendSync,
+    B: Copy + ElementOpApply + MaybeSendSync,
+    C: Copy + ElementOpApply + MaybeSendSync,
+    E: Copy + ElementOpApply + MaybeSendSync,
     OpA: ElementOp,
     OpB: ElementOp,
     OpC: ElementOp,
     OpE: ElementOp,
 >(
-    dest: &mut StridedViewMut<T>,
-    a: &StridedView<T, OpA>,
-    b: &StridedView<T, OpB>,
-    c: &StridedView<T, OpC>,
-    e: &StridedView<T, OpE>,
-    f: impl Fn(T, T, T, T) -> T + MaybeSync,
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    c: &StridedView<C, OpC>,
+    e: &StridedView<E, OpE>,
+    f: impl Fn(A, B, C, E) -> D + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -572,9 +614,14 @@ pub fn zip_map4_into<
         c.strides(),
         e.strides(),
     ];
+    let elem_size = std::mem::size_of::<D>()
+        .max(std::mem::size_of::<A>())
+        .max(std::mem::size_of::<B>())
+        .max(std::mem::size_of::<C>())
+        .max(std::mem::size_of::<E>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
@@ -582,10 +629,10 @@ pub fn zip_map4_into<
         if total > MINTHREADLENGTH {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut T);
-            let b_send = SendPtr(b_ptr as *mut T);
-            let c_send = SendPtr(c_ptr as *mut T);
-            let e_send = SendPtr(e_ptr as *mut T);
+            let a_send = SendPtr(a_ptr as *mut A);
+            let b_send = SendPtr(b_ptr as *mut B);
+            let c_send = SendPtr(c_ptr as *mut C);
+            let e_send = SendPtr(e_ptr as *mut E);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -613,7 +660,7 @@ pub fn zip_map4_into<
                             let cp = unsafe { c_send.as_const().offset(offsets[3]) };
                             let ep = unsafe { e_send.as_const().offset(offsets[4]) };
                             unsafe {
-                                inner_loop_map4::<T, OpA, OpB, OpC, OpE>(
+                                inner_loop_map4::<D, A, B, C, E, OpA, OpB, OpC, OpE>(
                                     dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
                                     ep, strides[4], len, &f,
                                 )
@@ -639,7 +686,7 @@ pub fn zip_map4_into<
             let cp = unsafe { c_ptr.offset(offsets[3]) };
             let ep = unsafe { e_ptr.offset(offsets[4]) };
             unsafe {
-                inner_loop_map4::<T, OpA, OpB, OpC, OpE>(
+                inner_loop_map4::<D, A, B, C, E, OpA, OpB, OpC, OpE>(
                     dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3], ep, strides[4],
                     len, &f,
                 )

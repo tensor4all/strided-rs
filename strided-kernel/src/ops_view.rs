@@ -5,7 +5,7 @@ use crate::kernel::{
     sequential_contiguous_layout, total_len,
 };
 use crate::map_view::{map_into, zip_map2_into};
-use crate::maybe_sync::MaybeSendSync;
+use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -31,10 +31,10 @@ use crate::threading::{
 
 /// Inner loop for add: `dst[i] += Op::apply(src[i])`.
 #[inline(always)]
-unsafe fn inner_loop_add<T: Copy + ElementOpApply + Add<Output = T>, Op: ElementOp>(
-    dp: *mut T,
+unsafe fn inner_loop_add<D: Copy + Add<S, Output = D>, S: Copy + ElementOpApply, Op: ElementOp>(
+    dp: *mut D,
     ds: isize,
-    sp: *const T,
+    sp: *const S,
     ss: isize,
     len: usize,
 ) {
@@ -59,10 +59,10 @@ unsafe fn inner_loop_add<T: Copy + ElementOpApply + Add<Output = T>, Op: Element
 
 /// Inner loop for mul: `dst[i] *= Op::apply(src[i])`.
 #[inline(always)]
-unsafe fn inner_loop_mul<T: Copy + ElementOpApply + Mul<Output = T>, Op: ElementOp>(
-    dp: *mut T,
+unsafe fn inner_loop_mul<D: Copy + Mul<S, Output = D>, S: Copy + ElementOpApply, Op: ElementOp>(
+    dp: *mut D,
     ds: isize,
-    sp: *const T,
+    sp: *const S,
     ss: isize,
     len: usize,
 ) {
@@ -88,15 +88,17 @@ unsafe fn inner_loop_mul<T: Copy + ElementOpApply + Mul<Output = T>, Op: Element
 /// Inner loop for axpy: `dst[i] = alpha * Op::apply(src[i]) + dst[i]`.
 #[inline(always)]
 unsafe fn inner_loop_axpy<
-    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>,
+    D: Copy + Add<D, Output = D>,
+    S: Copy + ElementOpApply,
+    A: Copy + Mul<S, Output = D>,
     Op: ElementOp,
 >(
-    dp: *mut T,
+    dp: *mut D,
     ds: isize,
-    sp: *const T,
+    sp: *const S,
     ss: isize,
     len: usize,
-    alpha: T,
+    alpha: A,
 ) {
     if ds == 1 && ss == 1 {
         let dst = std::slice::from_raw_parts_mut(dp, len);
@@ -117,14 +119,20 @@ unsafe fn inner_loop_axpy<
     }
 }
 
-/// Inner loop for fma: `dst[i] += a[i] * b[i]`.
+/// Inner loop for fma: `dst[i] += OpA::apply(a[i]) * OpB::apply(b[i])`.
 #[inline(always)]
-unsafe fn inner_loop_fma<T: Copy + Mul<Output = T> + Add<Output = T>>(
-    dp: *mut T,
+unsafe fn inner_loop_fma<
+    D: Copy + Add<D, Output = D>,
+    A: Copy + ElementOpApply + Mul<B, Output = D>,
+    B: Copy + ElementOpApply,
+    OpA: ElementOp,
+    OpB: ElementOp,
+>(
+    dp: *mut D,
     ds: isize,
-    ap: *const T,
+    ap: *const A,
     a_s: isize,
-    bp: *const T,
+    bp: *const B,
     b_s: isize,
     len: usize,
 ) {
@@ -134,7 +142,7 @@ unsafe fn inner_loop_fma<T: Copy + Mul<Output = T> + Add<Output = T>>(
         let sb = std::slice::from_raw_parts(bp, len);
         simd::dispatch_if_large(len, || {
             for i in 0..len {
-                dst[i] = dst[i] + sa[i] * sb[i];
+                dst[i] = dst[i] + OpA::apply(sa[i]) * OpB::apply(sb[i]);
             }
         });
     } else {
@@ -142,7 +150,7 @@ unsafe fn inner_loop_fma<T: Copy + Mul<Output = T> + Add<Output = T>>(
         let mut ap = ap;
         let mut bp = bp;
         for _ in 0..len {
-            *dp = *dp + *ap * *bp;
+            *dp = *dp + OpA::apply(*ap) * OpB::apply(*bp);
             dp = dp.offset(ds);
             ap = ap.offset(a_s);
             bp = bp.offset(b_s);
@@ -153,17 +161,19 @@ unsafe fn inner_loop_fma<T: Copy + Mul<Output = T> + Add<Output = T>>(
 /// Inner loop for dot: `acc += OpA::apply(a[i]) * OpB::apply(b[i])`.
 #[inline(always)]
 unsafe fn inner_loop_dot<
-    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T>,
+    A: Copy + ElementOpApply + Mul<B, Output = R>,
+    B: Copy + ElementOpApply,
+    R: Copy + Add<R, Output = R>,
     OpA: ElementOp,
     OpB: ElementOp,
 >(
-    ap: *const T,
+    ap: *const A,
     a_s: isize,
-    bp: *const T,
+    bp: *const B,
     b_s: isize,
     len: usize,
-    mut acc: T,
-) -> T {
+    mut acc: R,
+) -> R {
     if a_s == 1 && b_s == 1 {
         let sa = std::slice::from_raw_parts(ap, len);
         let sb = std::slice::from_raw_parts(bp, len);
@@ -230,9 +240,15 @@ pub fn copy_into<T: Copy + ElementOpApply + MaybeSendSync, Op: ElementOp>(
 }
 
 /// Element-wise addition: `dest[i] += src[i]`.
-pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: ElementOp>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T, Op>,
+///
+/// Source may have a different element type from destination.
+pub fn add<
+    D: Copy + Add<S, Output = D> + MaybeSendSync,
+    S: Copy + ElementOpApply + MaybeSendSync,
+    Op: ElementOp,
+>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<S, Op>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -255,16 +271,17 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: Eleme
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
+    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
         if total > MINTHREADLENGTH {
             let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut T);
+            let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -287,7 +304,7 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: Eleme
                         offsets,
                         |offsets, len, strides| {
                             unsafe {
-                                inner_loop_add::<T, Op>(
+                                inner_loop_add::<D, S, Op>(
                                     dst_send.as_ptr().offset(offsets[0]),
                                     strides[0],
                                     src_send.as_const().offset(offsets[1]),
@@ -311,7 +328,7 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: Eleme
         &initial_offsets,
         |offsets, len, strides| {
             unsafe {
-                inner_loop_add::<T, Op>(
+                inner_loop_add::<D, S, Op>(
                     dst_ptr.offset(offsets[0]),
                     strides[0],
                     src_ptr.offset(offsets[1]),
@@ -325,9 +342,15 @@ pub fn add<T: Copy + ElementOpApply + Add<Output = T> + MaybeSendSync, Op: Eleme
 }
 
 /// Element-wise multiplication: `dest[i] *= src[i]`.
-pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: ElementOp>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T, Op>,
+///
+/// Source may have a different element type from destination.
+pub fn mul<
+    D: Copy + Mul<S, Output = D> + MaybeSendSync,
+    S: Copy + ElementOpApply + MaybeSendSync,
+    Op: ElementOp,
+>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<S, Op>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -350,16 +373,17 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: Eleme
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
+    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
         if total > MINTHREADLENGTH {
             let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut T);
+            let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -382,7 +406,7 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: Eleme
                         offsets,
                         |offsets, len, strides| {
                             unsafe {
-                                inner_loop_mul::<T, Op>(
+                                inner_loop_mul::<D, S, Op>(
                                     dst_send.as_ptr().offset(offsets[0]),
                                     strides[0],
                                     src_send.as_const().offset(offsets[1]),
@@ -406,7 +430,7 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: Eleme
         &initial_offsets,
         |offsets, len, strides| {
             unsafe {
-                inner_loop_mul::<T, Op>(
+                inner_loop_mul::<D, S, Op>(
                     dst_ptr.offset(offsets[0]),
                     strides[0],
                     src_ptr.offset(offsets[1]),
@@ -420,14 +444,19 @@ pub fn mul<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: Eleme
 }
 
 /// AXPY: `dest[i] = alpha * src[i] + dest[i]`.
-pub fn axpy<
-    T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeSendSync,
+///
+/// Alpha, source, and destination may have different element types.
+pub fn axpy<D, S, A, Op>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<S, Op>,
+    alpha: A,
+) -> Result<()>
+where
+    A: Copy + Mul<S, Output = D> + MaybeSync,
+    D: Copy + Add<D, Output = D> + MaybeSendSync,
+    S: Copy + ElementOpApply + MaybeSendSync,
     Op: ElementOp,
->(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T, Op>,
-    alpha: T,
-) -> Result<()> {
+{
     ensure_same_shape(dest.dims(), src.dims())?;
 
     let dst_ptr = dest.as_mut_ptr();
@@ -449,16 +478,17 @@ pub fn axpy<
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
+    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
         if total > MINTHREADLENGTH {
             let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut T);
+            let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -481,7 +511,7 @@ pub fn axpy<
                         offsets,
                         |offsets, len, strides| {
                             unsafe {
-                                inner_loop_axpy::<T, Op>(
+                                inner_loop_axpy::<D, S, A, Op>(
                                     dst_send.as_ptr().offset(offsets[0]),
                                     strides[0],
                                     src_send.as_const().offset(offsets[1]),
@@ -506,7 +536,7 @@ pub fn axpy<
         &initial_offsets,
         |offsets, len, strides| {
             unsafe {
-                inner_loop_axpy::<T, Op>(
+                inner_loop_axpy::<D, S, A, Op>(
                     dst_ptr.offset(offsets[0]),
                     strides[0],
                     src_ptr.offset(offsets[1]),
@@ -520,12 +550,21 @@ pub fn axpy<
     )
 }
 
-/// Fused multiply-add: `dest[i] += a[i] * b[i]`.
-pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeSendSync>(
-    dest: &mut StridedViewMut<T>,
-    a: &StridedView<T>,
-    b: &StridedView<T>,
-) -> Result<()> {
+/// Fused multiply-add: `dest[i] += OpA::apply(a[i]) * OpB::apply(b[i])`.
+///
+/// Operands may have different element types. Element operations are applied lazily.
+pub fn fma<D, A, B, OpA, OpB>(
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+) -> Result<()>
+where
+    A: Copy + ElementOpApply + Mul<B, Output = D> + MaybeSendSync,
+    B: Copy + ElementOpApply + MaybeSendSync,
+    D: Copy + Add<D, Output = D> + MaybeSendSync,
+    OpA: ElementOp,
+    OpB: ElementOp,
+{
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
 
@@ -544,24 +583,27 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeS
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         simd::dispatch_if_large(len, || {
             for i in 0..len {
-                dst[i] = dst[i] + sa[i] * sb[i];
+                dst[i] = dst[i] + OpA::apply(sa[i]) * OpB::apply(sb[i]);
             }
         });
         return Ok(());
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
+    let elem_size = std::mem::size_of::<D>()
+        .max(std::mem::size_of::<A>())
+        .max(std::mem::size_of::<B>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), std::mem::size_of::<T>());
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
 
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
         if total > MINTHREADLENGTH {
             let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut T);
-            let b_send = SendPtr(b_ptr as *mut T);
+            let a_send = SendPtr(a_ptr as *mut A);
+            let b_send = SendPtr(b_ptr as *mut B);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
@@ -584,7 +626,7 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeS
                         offsets,
                         |offsets, len, strides| {
                             unsafe {
-                                inner_loop_fma::<T>(
+                                inner_loop_fma::<D, A, B, OpA, OpB>(
                                     dst_send.as_ptr().offset(offsets[0]),
                                     strides[0],
                                     a_send.as_const().offset(offsets[1]),
@@ -610,7 +652,7 @@ pub fn fma<T: Copy + ElementOpApply + Mul<Output = T> + Add<Output = T> + MaybeS
         &initial_offsets,
         |offsets, len, strides| {
             unsafe {
-                inner_loop_fma::<T>(
+                inner_loop_fma::<D, A, B, OpA, OpB>(
                     dst_ptr.offset(offsets[0]),
                     strides[0],
                     a_ptr.offset(offsets[1]),
@@ -671,21 +713,18 @@ pub fn sum<
     reduce(src, |x| x, |a, b| a + b, T::zero())
 }
 
-/// Dot product: `sum(a[i] * b[i])`.
-pub fn dot<
-    T: Copy
-        + ElementOpApply
-        + Zero
-        + Mul<Output = T>
-        + Add<Output = T>
-        + MaybeSendSync
-        + simd::MaybeSimdOps,
+/// Dot product: `sum(OpA::apply(a[i]) * OpB::apply(b[i]))`.
+///
+/// Operands may have different element types. Result type `R` must be `A * B`.
+/// SIMD fast path fires only when `A == B == R` (same type) and both Identity ops.
+pub fn dot<A, B, R, OpA, OpB>(a: &StridedView<A, OpA>, b: &StridedView<B, OpB>) -> Result<R>
+where
+    A: Copy + ElementOpApply + Mul<B, Output = R> + MaybeSendSync + 'static,
+    B: Copy + ElementOpApply + MaybeSendSync + 'static,
+    R: Copy + Zero + Add<Output = R> + MaybeSendSync + simd::MaybeSimdOps + 'static,
     OpA: ElementOp,
     OpB: ElementOp,
->(
-    a: &StridedView<T, OpA>,
-    b: &StridedView<T, OpB>,
-) -> Result<T> {
+{
     ensure_same_shape(a.dims(), b.dims())?;
 
     let a_ptr = a.ptr();
@@ -697,11 +736,15 @@ pub fn dot<
     if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
         let len = total_len(a_dims);
 
-        // SIMD fast path: both contiguous, both Identity ops
-        if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
-            let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
-            let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-            if let Some(result) = T::try_simd_dot(sa, sb) {
+        // SIMD fast path: both contiguous, both Identity ops, same type
+        if OpA::IS_IDENTITY
+            && OpB::IS_IDENTITY
+            && std::any::TypeId::of::<A>() == std::any::TypeId::of::<R>()
+            && std::any::TypeId::of::<B>() == std::any::TypeId::of::<R>()
+        {
+            let sa = unsafe { std::slice::from_raw_parts(a_ptr as *const R, len) };
+            let sb = unsafe { std::slice::from_raw_parts(b_ptr as *const R, len) };
+            if let Some(result) = R::try_simd_dot(sa, sb) {
                 return Ok(result);
             }
         }
@@ -709,7 +752,7 @@ pub fn dot<
         // Generic contiguous fast path
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-        let mut acc = T::zero();
+        let mut acc = R::zero();
         simd::dispatch_if_large(len, || {
             for i in 0..len {
                 acc = acc + OpA::apply(sa[i]) * OpB::apply(sb[i]);
@@ -719,11 +762,14 @@ pub fn dot<
     }
 
     let strides_list: [&[isize]; 2] = [a_strides, b_strides];
+    let elem_size = std::mem::size_of::<A>()
+        .max(std::mem::size_of::<B>())
+        .max(std::mem::size_of::<R>());
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(a_dims, &strides_list, None, std::mem::size_of::<T>());
+        build_plan_fused(a_dims, &strides_list, None, elem_size);
 
-    let mut acc = T::zero();
+    let mut acc = R::zero();
     let initial_offsets = vec![0isize; ordered_strides.len()];
     for_each_inner_block_preordered(
         &fused_dims,
@@ -732,7 +778,7 @@ pub fn dot<
         &initial_offsets,
         |offsets, len, strides| {
             acc = unsafe {
-                inner_loop_dot::<T, OpA, OpB>(
+                inner_loop_dot::<A, B, R, OpA, OpB>(
                     a_ptr.offset(offsets[0]),
                     strides[0],
                     b_ptr.offset(offsets[1]),
@@ -802,11 +848,19 @@ where
 }
 
 /// Copy with scaling: `dest[i] = scale * src[i]`.
-pub fn copy_scale<T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync, Op: ElementOp>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T, Op>,
-    scale: T,
-) -> Result<()> {
+///
+/// Scale, source, and destination may have different element types.
+pub fn copy_scale<D, S, A, Op>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<S, Op>,
+    scale: A,
+) -> Result<()>
+where
+    A: Copy + Mul<S, Output = D> + MaybeSync,
+    D: Copy + MaybeSendSync,
+    S: Copy + ElementOpApply + MaybeSendSync,
+    Op: ElementOp,
+{
     map_into(dest, src, |x| scale * x)
 }
 
