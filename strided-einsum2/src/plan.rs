@@ -23,11 +23,11 @@ pub struct Einsum2Plan<ID: AxisId> {
     /// Right trace axes: present only in B.
     pub right_trace: Vec<ID>,
 
-    /// Permutation to reorder A to [batch, lo, sum] after trace reduction.
+    /// Permutation to reorder A to [lo, sum, batch] after trace reduction.
     pub left_perm: Vec<usize>,
-    /// Permutation to reorder B to [batch, sum, ro] after trace reduction.
+    /// Permutation to reorder B to [sum, ro, batch] after trace reduction.
     pub right_perm: Vec<usize>,
-    /// Permutation to reorder C from IC order to [batch, lo, ro] order.
+    /// Permutation to reorder C from IC order to [lo, ro, batch] order.
     pub c_to_internal_perm: Vec<usize>,
 }
 
@@ -101,13 +101,13 @@ impl<ID: AxisId> Einsum2Plan<ID> {
             }
         }
 
-        // Build left_perm: maps positions in ia (after trace removal) to [batch, lo, sum] order
+        // Build left_perm: maps positions in ia (after trace removal) to [lo, sum, batch] order
         // Use linear scan instead of HashMap — faster for small label sets.
         let ia_after_trace: Vec<&ID> = ia.iter().filter(|id| !left_trace.contains(id)).collect();
-        let left_perm: Vec<usize> = batch
+        let left_perm: Vec<usize> = lo
             .iter()
-            .chain(lo.iter())
             .chain(sum.iter())
+            .chain(batch.iter())
             .map(|id| {
                 ia_after_trace
                     .iter()
@@ -116,12 +116,12 @@ impl<ID: AxisId> Einsum2Plan<ID> {
             })
             .collect();
 
-        // Build right_perm: maps positions in ib (after trace removal) to [batch, sum, ro] order
+        // Build right_perm: maps positions in ib (after trace removal) to [sum, ro, batch] order
         let ib_after_trace: Vec<&ID> = ib.iter().filter(|id| !right_trace.contains(id)).collect();
-        let right_perm: Vec<usize> = batch
+        let right_perm: Vec<usize> = sum
             .iter()
-            .chain(sum.iter())
             .chain(ro.iter())
+            .chain(batch.iter())
             .map(|id| {
                 ib_after_trace
                     .iter()
@@ -130,11 +130,11 @@ impl<ID: AxisId> Einsum2Plan<ID> {
             })
             .collect();
 
-        // Build c_to_internal_perm: maps IC order to [batch, lo, ro] order
-        let c_to_internal_perm: Vec<usize> = batch
+        // Build c_to_internal_perm: maps IC order to [lo, ro, batch] order
+        let c_to_internal_perm: Vec<usize> = lo
             .iter()
-            .chain(lo.iter())
             .chain(ro.iter())
+            .chain(batch.iter())
             .map(|id| {
                 ic.iter()
                     .position(|c_id| c_id == id)
@@ -237,9 +237,9 @@ mod tests {
     #[test]
     fn test_perm_matmul() {
         // ij,jk->ik
-        // A: [i, j] -> [batch=[], lo=[i], sum=[j]] = [i, j] => perm [0, 1]
-        // B: [j, k] -> [batch=[], sum=[j], ro=[k]] = [j, k] => perm [0, 1]
-        // C: [i, k] -> [batch=[], lo=[i], ro=[k]] = [i, k] => perm [0, 1]
+        // A: [i, j] -> [lo=[i], sum=[j], batch=[]] = [i, j] => perm [0, 1]
+        // B: [j, k] -> [sum=[j], ro=[k], batch=[]] = [j, k] => perm [0, 1]
+        // C: [i, k] -> [lo=[i], ro=[k], batch=[]] = [i, k] => perm [0, 1]
         let plan = Einsum2Plan::new(&[0u32, 1], &[1u32, 2], &[0u32, 2]).unwrap();
         assert_eq!(plan.left_perm, vec![0, 1]);
         assert_eq!(plan.right_perm, vec![0, 1]);
@@ -254,13 +254,15 @@ mod tests {
         assert_eq!(plan.lo, vec![1]);
         assert_eq!(plan.ro, vec![3]);
         assert_eq!(plan.sum, vec![2]);
-        // C internal order: [b, i, k] = [0, 1, 3]
-        // C IC order: [b, k, i] = [0, 3, 1]
-        // c_to_internal_perm: maps IC positions to internal
-        // internal[0]=b -> IC position 0
-        // internal[1]=i -> IC position 2
-        // internal[2]=k -> IC position 1
-        assert_eq!(plan.c_to_internal_perm, vec![0, 2, 1]);
+        // A: ia=[b=0, i=1, j=2], after trace removal=[b, i, j]
+        // target [lo, sum, batch] = [i=1, j=2, b=0] -> positions in ia_after_trace: [1, 2, 0]
+        assert_eq!(plan.left_perm, vec![1, 2, 0]);
+        // B: ib=[b=0, j=2, k=3], after trace removal=[b, j, k]
+        // target [sum, ro, batch] = [j=2, k=3, b=0] -> positions: [1, 2, 0]
+        assert_eq!(plan.right_perm, vec![1, 2, 0]);
+        // C IC order: [b=0, k=3, i=1]
+        // target [lo, ro, batch] = [i=1, k=3, b=0] -> IC positions: [2, 1, 0]
+        assert_eq!(plan.c_to_internal_perm, vec![2, 1, 0]);
     }
 
     #[test]

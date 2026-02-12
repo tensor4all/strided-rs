@@ -4,7 +4,7 @@
 //! When dimension groups cannot be fused into 2D matrices (non-contiguous strides),
 //! copies operands to contiguous column-major buffers before calling faer.
 
-use crate::contiguous::{alloc_batched_col_major, ContiguousOperand, ContiguousOperandMut};
+use crate::contiguous::{alloc_col_major_uninit, ContiguousOperand, ContiguousOperandMut};
 use crate::util::{try_fuse_group, MultiIndex};
 use faer::linalg::matmul::matmul_with_conj;
 use faer::mat::{MatMut, MatRef};
@@ -21,7 +21,7 @@ pub fn bgemm_strided_into<T>(
     c: &mut StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_lo: usize,
     n_ro: usize,
     n_sum: usize,
@@ -48,24 +48,25 @@ where
     let b_strides = b.strides();
     let c_strides = c.strides();
 
-    // Extract dimension groups
-    let batch_dims = &a_dims[..n_batch];
-    let lo_dims = &a_dims[n_batch..n_batch + n_lo];
-    let sum_dims = &a_dims[n_batch + n_lo..n_batch + n_lo + n_sum];
-    let ro_dims = &b_dims[n_batch + n_sum..n_batch + n_sum + n_ro];
+    // Extract dimension groups (batch-last canonical order)
+    // A: [lo, sum, batch], B: [sum, ro, batch], C: [lo, ro, batch]
+    let lo_dims = &a_dims[..n_lo];
+    let sum_dims = &a_dims[n_lo..n_lo + n_sum];
+    let batch_dims = &a_dims[n_lo + n_sum..];
+    let ro_dims = &b_dims[n_sum..n_sum + n_ro];
 
     // Fused sizes for the matrix multiply
     let m: usize = lo_dims.iter().product::<usize>().max(1);
     let k: usize = sum_dims.iter().product::<usize>().max(1);
     let n: usize = ro_dims.iter().product::<usize>().max(1);
 
-    // Extract stride groups
-    let a_lo_strides = &a_strides[n_batch..n_batch + n_lo];
-    let a_sum_strides = &a_strides[n_batch + n_lo..n_batch + n_lo + n_sum];
-    let b_sum_strides = &b_strides[n_batch..n_batch + n_sum];
-    let b_ro_strides = &b_strides[n_batch + n_sum..n_batch + n_sum + n_ro];
-    let c_lo_strides = &c_strides[n_batch..n_batch + n_lo];
-    let c_ro_strides = &c_strides[n_batch + n_lo..n_batch + n_lo + n_ro];
+    // Extract stride groups (batch-last)
+    let a_lo_strides = &a_strides[..n_lo];
+    let a_sum_strides = &a_strides[n_lo..n_lo + n_sum];
+    let b_sum_strides = &b_strides[..n_sum];
+    let b_ro_strides = &b_strides[n_sum..n_sum + n_ro];
+    let c_lo_strides = &c_strides[..n_lo];
+    let c_ro_strides = &c_strides[n_lo..n_lo + n_ro];
 
     // Try to fuse each dimension group
     let fused_a_lo = try_fuse_group(lo_dims, a_lo_strides);
@@ -79,11 +80,15 @@ where
     let b_needs_copy = fused_b_sum.is_none() || fused_b_ro.is_none();
     let c_needs_copy = fused_c_lo.is_none() || fused_c_ro.is_none();
 
+    let n_a_inner = n_lo + n_sum;
+    let n_b_inner = n_sum + n_ro;
+    let n_c_inner = n_lo + n_ro;
+
     // Copy A to contiguous column-major if inner dims aren't fusable
     let a_contig_buf: Option<StridedArray<T>>;
     let (a_ptr, a_row_stride, a_col_stride);
     if a_needs_copy {
-        let mut buf = alloc_batched_col_major(a.dims(), n_batch);
+        let mut buf = alloc_col_major_uninit(a.dims());
         strided_kernel::copy_into(&mut buf.view_mut(), a)?;
         a_ptr = buf.view().ptr();
         // Col-major inner A [lo..., sum...]: lo stride = 1, sum stride = m
@@ -99,15 +104,15 @@ where
         a_contig_buf = None;
     }
     let a_batch_strides: &[isize] = match a_contig_buf.as_ref() {
-        Some(buf) => &buf.strides()[..n_batch],
-        None => &a_strides[..n_batch],
+        Some(buf) => &buf.strides()[n_a_inner..],
+        None => &a_strides[n_a_inner..],
     };
 
     // Copy B to contiguous column-major if inner dims aren't fusable
     let b_contig_buf: Option<StridedArray<T>>;
     let (b_ptr, b_row_stride, b_col_stride);
     if b_needs_copy {
-        let mut buf = alloc_batched_col_major(b.dims(), n_batch);
+        let mut buf = alloc_col_major_uninit(b.dims());
         strided_kernel::copy_into(&mut buf.view_mut(), b)?;
         b_ptr = buf.view().ptr();
         // Col-major inner B [sum..., ro...]: sum stride = 1, ro stride = k
@@ -123,15 +128,15 @@ where
         b_contig_buf = None;
     }
     let b_batch_strides: &[isize] = match b_contig_buf.as_ref() {
-        Some(buf) => &buf.strides()[..n_batch],
-        None => &b_strides[..n_batch],
+        Some(buf) => &buf.strides()[n_b_inner..],
+        None => &b_strides[n_b_inner..],
     };
 
     // Copy C to contiguous column-major if inner dims aren't fusable
     let c_contig_buf: Option<StridedArray<T>>;
     let (c_ptr, c_row_stride, c_col_stride);
     if c_needs_copy {
-        let mut buf = alloc_batched_col_major(c.dims(), n_batch);
+        let mut buf = alloc_col_major_uninit(c.dims());
         if beta != T::zero() {
             strided_kernel::copy_into(&mut buf.view_mut(), &c.as_view())?;
         }
@@ -149,8 +154,8 @@ where
         c_contig_buf = None;
     }
     let c_batch_strides: &[isize] = match c_contig_buf.as_ref() {
-        Some(buf) => &buf.strides()[..n_batch],
-        None => &c_strides[..n_batch],
+        Some(buf) => &buf.strides()[n_c_inner..],
+        None => &c_strides[n_c_inner..],
     };
 
     let is_beta_zero = beta == T::zero();
@@ -453,11 +458,12 @@ mod tests {
 
     #[test]
     fn test_faer_bgemm_batched() {
-        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2, 3], |idx| {
-            (idx[0] * 6 + idx[1] * 3 + idx[2] + 1) as f64
+        // Batch-last: A: [lo, sum, batch]=[2,3,2], B: [sum, ro, batch]=[3,2,2], C: [lo, ro, batch]=[2,2,2]
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
+            (idx[2] * 6 + idx[0] * 3 + idx[1] + 1) as f64
         });
-        let b = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
-            (idx[0] * 6 + idx[1] * 2 + idx[2] + 1) as f64
+        let b = StridedArray::<f64>::from_fn_row_major(&[3, 2, 2], |idx| {
+            (idx[2] * 6 + idx[0] * 2 + idx[1] + 1) as f64
         });
         let mut c = StridedArray::<f64>::row_major(&[2, 2, 2]);
 
@@ -476,6 +482,7 @@ mod tests {
         )
         .unwrap();
 
+        // C: [lo, ro, batch]
         // Batch 0: A0=[[1,2,3],[4,5,6]], B0=[[1,2],[3,4],[5,6]]
         // C0[0,0] = 1*1+2*3+3*5 = 22
         assert_eq!(c.get(&[0, 0, 0]), 22.0);
@@ -767,11 +774,12 @@ mod tests {
     #[test]
     fn test_bgemm_contiguous_batched() {
         // Batched: 2 x (2x3) * (3x2) matmul
-        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2, 3], |idx| {
-            (idx[0] * 6 + idx[1] * 3 + idx[2] + 1) as f64
+        // Batch-last: A: [lo, sum, batch]=[2,3,2], B: [sum, ro, batch]=[3,2,2], C: [lo, ro, batch]=[2,2,2]
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
+            (idx[2] * 6 + idx[0] * 3 + idx[1] + 1) as f64
         });
-        let b = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
-            (idx[0] * 6 + idx[1] * 2 + idx[2] + 1) as f64
+        let b = StridedArray::<f64>::from_fn_row_major(&[3, 2, 2], |idx| {
+            (idx[2] * 6 + idx[0] * 2 + idx[1] + 1) as f64
         });
         let mut c = StridedArray::<f64>::row_major(&[2, 2, 2]);
 
@@ -785,19 +793,20 @@ mod tests {
 
         c_op.finalize_into(&mut c_view).unwrap();
 
+        // C: [lo, ro, batch]
         // Batch 0: A0=[[1,2,3],[4,5,6]], B0=[[1,2],[3,4],[5,6]]
         // C0[0,0] = 1*1+2*3+3*5 = 22
         assert_eq!(c.get(&[0, 0, 0]), 22.0);
         // C0[0,1] = 1*2+2*4+3*6 = 28
-        assert_eq!(c.get(&[0, 0, 1]), 28.0);
+        assert_eq!(c.get(&[0, 1, 0]), 28.0);
         // C0[1,0] = 4*1+5*3+6*5 = 49
-        assert_eq!(c.get(&[0, 1, 0]), 49.0);
+        assert_eq!(c.get(&[1, 0, 0]), 49.0);
         // C0[1,1] = 4*2+5*4+6*6 = 64
-        assert_eq!(c.get(&[0, 1, 1]), 64.0);
+        assert_eq!(c.get(&[1, 1, 0]), 64.0);
 
         // Batch 1: A1=[[7,8,9],[10,11,12]], B1=[[7,8],[9,10],[11,12]]
         // C1[0,0] = 7*7+8*9+9*11 = 49+72+99 = 220
-        assert_eq!(c.get(&[1, 0, 0]), 220.0);
+        assert_eq!(c.get(&[0, 0, 1]), 220.0);
     }
 
     #[test]

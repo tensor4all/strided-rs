@@ -459,11 +459,11 @@ where
         beta,
     )?;
 
-    // Dimension sizes
-    let batch_dims = &a_perm.dims()[..n_batch];
-    let lo_dims = &a_perm.dims()[n_batch..n_batch + n_lo];
-    let sum_dims = &a_perm.dims()[n_batch + n_lo..n_batch + n_lo + n_sum];
-    let ro_dims = &b_perm.dims()[n_batch + n_sum..n_batch + n_sum + n_ro];
+    // Dimension sizes (batch-last canonical order)
+    let lo_dims = &a_perm.dims()[..n_lo];
+    let sum_dims = &a_perm.dims()[n_lo..n_lo + n_sum];
+    let batch_dims = &a_perm.dims()[n_lo + n_sum..];
+    let ro_dims = &b_perm.dims()[n_sum..n_sum + n_ro];
     let m: usize = lo_dims.iter().product::<usize>().max(1);
     let k: usize = sum_dims.iter().product::<usize>().max(1);
     let n: usize = ro_dims.iter().product::<usize>().max(1);
@@ -546,10 +546,10 @@ where
     let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
 
     // Compute fused dimension sizes
-    let batch_dims = &a_perm.dims()[..n_batch];
-    let lo_dims = &a_perm.dims()[n_batch..n_batch + n_lo];
-    let sum_dims = &a_perm.dims()[n_batch + n_lo..n_batch + n_lo + n_sum];
-    let ro_dims = &b_perm.dims()[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let lo_dims = &a_perm.dims()[..n_lo];
+    let sum_dims = &a_perm.dims()[n_lo..n_lo + n_sum];
+    let batch_dims = &a_perm.dims()[n_lo + n_sum..];
+    let ro_dims = &b_perm.dims()[n_sum..n_sum + n_ro];
     let m: usize = lo_dims.iter().product::<usize>().max(1);
     let k: usize = sum_dims.iter().product::<usize>().max(1);
     let n: usize = ro_dims.iter().product::<usize>().max(1);
@@ -654,10 +654,10 @@ where
     let a_dims_perm = a_perm.dims().to_vec();
     let b_dims_perm = b_perm.dims().to_vec();
 
-    let batch_dims = a_dims_perm[..n_batch].to_vec();
-    let lo_dims = &a_dims_perm[n_batch..n_batch + n_lo];
-    let sum_dims = &a_dims_perm[n_batch + n_lo..];
-    let ro_dims = &b_dims_perm[n_batch + n_sum..];
+    let lo_dims = &a_dims_perm[..n_lo];
+    let sum_dims = &a_dims_perm[n_lo..n_lo + n_sum];
+    let batch_dims = a_dims_perm[n_lo + n_sum..].to_vec();
+    let ro_dims = &b_dims_perm[n_sum..n_sum + n_ro];
     let m: usize = lo_dims.iter().product::<usize>().max(1);
     let k: usize = sum_dims.iter().product::<usize>().max(1);
     let n: usize = ro_dims.iter().product::<usize>().max(1);
