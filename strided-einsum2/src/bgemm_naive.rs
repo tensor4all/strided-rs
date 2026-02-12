@@ -1,26 +1,27 @@
 //! Naive batched GEMM kernel on strided views.
 //!
 //! Operates on N-dimensional permuted views where dimensions are grouped as:
-//! - A: [batch..., lo..., sum...]
-//! - B: [batch..., sum..., ro...]
-//! - C: [batch..., lo..., ro...]
+//! - A: [lo..., sum..., batch...]
+//! - B: [sum..., ro..., batch...]
+//! - C: [lo..., ro..., batch...]
 
 use crate::util::MultiIndex;
 use strided_view::{ElementOp, ElementOpApply, StridedView, StridedViewMut};
 
 /// Batched strided GEMM: C = alpha * A * B + beta * C
 ///
-/// The views must be pre-permuted so that their dimensions are grouped as:
-/// - A: `n_batch` batch dims, then `n_lo` dims, then `n_sum` dims
-/// - B: `n_batch` batch dims, then `n_sum` dims, then `n_ro` dims
-/// - C: `n_batch` batch dims, then `n_lo` dims, then `n_ro` dims
+/// The views must be pre-permuted so that their dimensions are grouped as
+/// (batch-last canonical order):
+/// - A: `n_lo` dims, then `n_sum` dims, then `n_batch` batch dims
+/// - B: `n_sum` dims, then `n_ro` dims, then `n_batch` batch dims
+/// - C: `n_lo` dims, then `n_ro` dims, then `n_batch` batch dims
 ///
 /// Dimension sizes must match across operands within each group.
 pub fn bgemm_strided_into<T>(
     c: &mut StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_lo: usize,
     n_ro: usize,
     n_sum: usize,
@@ -45,31 +46,31 @@ where
     let b_strides = b.strides();
     let c_strides = c.strides();
 
-    // Extract dimension groups
-    let batch_dims = &a_dims[..n_batch];
-    let lo_dims = &a_dims[n_batch..n_batch + n_lo];
-    let sum_dims = &a_dims[n_batch + n_lo..n_batch + n_lo + n_sum];
-    let ro_dims = &b_dims[n_batch + n_sum..n_batch + n_sum + n_ro];
+    // Extract dimension groups (batch-last canonical order)
+    let lo_dims = &a_dims[..n_lo];
+    let sum_dims = &a_dims[n_lo..n_lo + n_sum];
+    let batch_dims = &a_dims[n_lo + n_sum..];
+    let ro_dims = &b_dims[n_sum..n_sum + n_ro];
 
-    // Extract stride groups
-    let a_batch_strides = &a_strides[..n_batch];
-    let a_lo_strides = &a_strides[n_batch..n_batch + n_lo];
-    let a_sum_strides = &a_strides[n_batch + n_lo..n_batch + n_lo + n_sum];
+    // Extract stride groups (batch-last)
+    let a_lo_strides = &a_strides[..n_lo];
+    let a_sum_strides = &a_strides[n_lo..n_lo + n_sum];
+    let a_batch_strides = &a_strides[n_lo + n_sum..];
 
-    let b_batch_strides = &b_strides[..n_batch];
-    let b_sum_strides = &b_strides[n_batch..n_batch + n_sum];
-    let b_ro_strides = &b_strides[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let b_sum_strides = &b_strides[..n_sum];
+    let b_ro_strides = &b_strides[n_sum..n_sum + n_ro];
+    let b_batch_strides = &b_strides[n_sum + n_ro..];
 
-    let c_batch_strides = &c_strides[..n_batch];
-    let c_lo_strides = &c_strides[n_batch..n_batch + n_lo];
-    let c_ro_strides = &c_strides[n_batch + n_lo..n_batch + n_lo + n_ro];
+    let c_lo_strides = &c_strides[..n_lo];
+    let c_ro_strides = &c_strides[n_lo..n_lo + n_ro];
+    let c_batch_strides = &c_strides[n_lo + n_ro..];
 
     // Validate dimension consistency
-    debug_assert_eq!(&c_dims[..n_batch], batch_dims);
-    debug_assert_eq!(&c_dims[n_batch..n_batch + n_lo], lo_dims);
-    debug_assert_eq!(&c_dims[n_batch + n_lo..], ro_dims);
-    debug_assert_eq!(&b_dims[..n_batch], batch_dims);
-    debug_assert_eq!(&b_dims[n_batch..n_batch + n_sum], sum_dims);
+    debug_assert_eq!(&c_dims[..n_lo], lo_dims);
+    debug_assert_eq!(&c_dims[n_lo..n_lo + n_ro], ro_dims);
+    debug_assert_eq!(&c_dims[n_lo + n_ro..], batch_dims);
+    debug_assert_eq!(&b_dims[..n_sum], sum_dims);
+    debug_assert_eq!(&b_dims[n_sum + n_ro..], batch_dims);
 
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
@@ -153,7 +154,7 @@ pub fn bgemm_strided_into_with_map<T, MapA, MapB>(
     c: &mut StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_lo: usize,
     n_ro: usize,
     n_sum: usize,
@@ -179,28 +180,28 @@ where
     let b_strides = b.strides();
     let c_strides = c.strides();
 
-    let batch_dims = &a_dims[..n_batch];
-    let lo_dims = &a_dims[n_batch..n_batch + n_lo];
-    let sum_dims = &a_dims[n_batch + n_lo..n_batch + n_lo + n_sum];
-    let ro_dims = &b_dims[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let lo_dims = &a_dims[..n_lo];
+    let sum_dims = &a_dims[n_lo..n_lo + n_sum];
+    let batch_dims = &a_dims[n_lo + n_sum..];
+    let ro_dims = &b_dims[n_sum..n_sum + n_ro];
 
-    let a_batch_strides = &a_strides[..n_batch];
-    let a_lo_strides = &a_strides[n_batch..n_batch + n_lo];
-    let a_sum_strides = &a_strides[n_batch + n_lo..n_batch + n_lo + n_sum];
+    let a_lo_strides = &a_strides[..n_lo];
+    let a_sum_strides = &a_strides[n_lo..n_lo + n_sum];
+    let a_batch_strides = &a_strides[n_lo + n_sum..];
 
-    let b_batch_strides = &b_strides[..n_batch];
-    let b_sum_strides = &b_strides[n_batch..n_batch + n_sum];
-    let b_ro_strides = &b_strides[n_batch + n_sum..n_batch + n_sum + n_ro];
+    let b_sum_strides = &b_strides[..n_sum];
+    let b_ro_strides = &b_strides[n_sum..n_sum + n_ro];
+    let b_batch_strides = &b_strides[n_sum + n_ro..];
 
-    let c_batch_strides = &c_strides[..n_batch];
-    let c_lo_strides = &c_strides[n_batch..n_batch + n_lo];
-    let c_ro_strides = &c_strides[n_batch + n_lo..n_batch + n_lo + n_ro];
+    let c_lo_strides = &c_strides[..n_lo];
+    let c_ro_strides = &c_strides[n_lo..n_lo + n_ro];
+    let c_batch_strides = &c_strides[n_lo + n_ro..];
 
-    debug_assert_eq!(&c_dims[..n_batch], batch_dims);
-    debug_assert_eq!(&c_dims[n_batch..n_batch + n_lo], lo_dims);
-    debug_assert_eq!(&c_dims[n_batch + n_lo..], ro_dims);
-    debug_assert_eq!(&b_dims[..n_batch], batch_dims);
-    debug_assert_eq!(&b_dims[n_batch..n_batch + n_sum], sum_dims);
+    debug_assert_eq!(&c_dims[..n_lo], lo_dims);
+    debug_assert_eq!(&c_dims[n_lo..n_lo + n_ro], ro_dims);
+    debug_assert_eq!(&c_dims[n_lo + n_ro..], batch_dims);
+    debug_assert_eq!(&b_dims[..n_sum], sum_dims);
+    debug_assert_eq!(&b_dims[n_sum + n_ro..], batch_dims);
 
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
@@ -337,12 +338,15 @@ mod tests {
 
     #[test]
     fn test_bgemm_batched() {
-        // Batch=2, A: [2,2,3], B: [2,3,2], C: [2,2,2]
-        let a = StridedArray::<f64>::from_fn_row_major(&[2, 2, 3], |idx| {
-            (idx[0] * 6 + idx[1] * 3 + idx[2] + 1) as f64
+        // Batch=2, lo=2, sum=3, ro=2
+        // Batch-last: A: [lo, sum, batch]=[2,3,2], B: [sum, ro, batch]=[3,2,2], C: [lo, ro, batch]=[2,2,2]
+        let a = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
+            // idx=[lo, sum, batch] → same values as batch*6 + lo*3 + sum + 1
+            (idx[2] * 6 + idx[0] * 3 + idx[1] + 1) as f64
         });
-        let b = StridedArray::<f64>::from_fn_row_major(&[2, 3, 2], |idx| {
-            (idx[0] * 6 + idx[1] * 2 + idx[2] + 1) as f64
+        let b = StridedArray::<f64>::from_fn_row_major(&[3, 2, 2], |idx| {
+            // idx=[sum, ro, batch] → same values as batch*6 + sum*2 + ro + 1
+            (idx[2] * 6 + idx[0] * 2 + idx[1] + 1) as f64
         });
         let mut c = StridedArray::<f64>::row_major(&[2, 2, 2]);
 
@@ -361,6 +365,7 @@ mod tests {
         )
         .unwrap();
 
+        // C: [lo, ro, batch]
         // Batch 0: A0=[[1,2,3],[4,5,6]], B0=[[1,2],[3,4],[5,6]]
         // C0[0,0] = 1*1+2*3+3*5 = 22
         assert_eq!(c.get(&[0, 0, 0]), 22.0);

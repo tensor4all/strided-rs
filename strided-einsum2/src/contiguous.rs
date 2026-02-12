@@ -128,13 +128,12 @@ impl<T: Copy + Send + Sync> ContiguousOperandMut<T> {
     }
 }
 
-/// Allocate a StridedArray with column-major inner dims and row-major batch dims.
+/// Allocate a column-major StridedArray with uninitialized data.
 ///
-/// For dims `[batch..., inner...]`, the inner dimensions are stored column-major
-/// (first inner dim has stride 1), while batch dimensions are stored row-major
-/// (outermost batch dim has the largest stride). This ensures each batch slice
-/// is a contiguous column-major matrix, suitable for both faer and CBLAS.
-pub(crate) fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -> StridedArray<T> {
+/// With batch-last canonical order `[inner..., batch...]`, pure column-major
+/// naturally gives batch dims the largest strides — each batch slice is a
+/// contiguous column-major matrix.
+pub(crate) fn alloc_col_major_uninit<T: Copy>(dims: &[usize]) -> StridedArray<T> {
     let total: usize = dims.iter().product::<usize>().max(1);
     // SAFETY: `T: Copy` guarantees no drop glue, so leaving elements
     // uninitialised is safe. Every call-site writes all elements before
@@ -143,49 +142,41 @@ pub(crate) fn alloc_batched_col_major<T: Copy>(dims: &[usize], n_batch: usize) -
     let mut data = Vec::with_capacity(total);
     unsafe { data.set_len(total) };
 
-    // Inner dims: column-major (stride 1 for first inner dim)
-    let inner_dims = &dims[n_batch..];
+    // Pure column-major: stride 1 for first dim, each subsequent dim
+    // has stride = previous stride * previous dim size.
     let mut strides = vec![0isize; dims.len()];
-    if !inner_dims.is_empty() {
-        strides[n_batch] = 1;
-        for i in 1..inner_dims.len() {
-            strides[n_batch + i] = strides[n_batch + i - 1] * inner_dims[i - 1] as isize;
+    if !dims.is_empty() {
+        strides[0] = 1;
+        for i in 1..dims.len() {
+            strides[i] = strides[i - 1] * dims[i - 1] as isize;
         }
     }
 
-    // Batch dims: row-major (outermost has largest stride)
-    let inner_size: usize = inner_dims.iter().product::<usize>().max(1);
-    if n_batch > 0 {
-        strides[n_batch - 1] = inner_size as isize;
-        for i in (0..n_batch - 1).rev() {
-            strides[i] = strides[i + 1] * dims[i + 1] as isize;
-        }
-    }
-
-    let arr =
-        StridedArray::from_parts(data, dims, &strides, 0).expect("batched col-major allocation");
+    let arr = StridedArray::from_parts(data, dims, &strides, 0).expect("col-major allocation");
     arr
 }
 
 /// Prepare a borrowed input view for GEMM.
 ///
+/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Checks if the two inner dimension groups are fusable.
 /// If not, copies to a contiguous col-major buffer.
 pub fn prepare_input_view<T: Scalar>(
     view: &StridedView<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     conj: bool,
 ) -> crate::Result<ContiguousOperand<T>> {
     let dims = view.dims();
     let strides = view.strides();
+    let n_inner = n_group1 + n_group2;
 
-    // Extract dimension/stride groups
-    let group1_dims = &dims[n_batch..n_batch + n_group1];
-    let group1_strides = &strides[n_batch..n_batch + n_group1];
-    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
-    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    // Extract dimension/stride groups (batch-last: inner first, batch at end)
+    let group1_dims = &dims[..n_group1];
+    let group1_strides = &strides[..n_group1];
+    let group2_dims = &dims[n_group1..n_inner];
+    let group2_strides = &strides[n_group1..n_inner];
 
     // For backends that cannot pass conjugation flags to GEMM (e.g., CBLAS),
     // materialize conj into the data before the GEMM call.
@@ -194,10 +185,10 @@ pub fn prepare_input_view<T: Scalar>(
         use strided_view::ElementOp;
 
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(dims, n_batch);
+        let mut buf = alloc_col_major_uninit(dims);
         strided_kernel::map_into(&mut buf.view_mut(), view, |x| ConjOp::apply(x))?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         return Ok(ContiguousOperand {
@@ -228,10 +219,10 @@ pub fn prepare_input_view<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(dims, n_batch);
+        let mut buf = alloc_col_major_uninit(dims);
         strided_kernel::copy_into(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         Ok(ContiguousOperand {
@@ -245,7 +236,7 @@ pub fn prepare_input_view<T: Scalar>(
     } else {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[..n_batch].to_vec();
+        let batch_strides = strides[n_inner..].to_vec();
         Ok(ContiguousOperand {
             ptr: view.ptr(),
             row_stride: rs,
@@ -259,23 +250,25 @@ pub fn prepare_input_view<T: Scalar>(
 
 /// Prepare an owned input array for GEMM.
 ///
+/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// If already contiguous after dimension grouping, transfers ownership without copying.
 /// Otherwise, copies to a new col-major buffer.
 pub fn prepare_input_owned<T: Scalar>(
     arr: StridedArray<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     conj: bool,
 ) -> crate::Result<ContiguousOperand<T>> {
     let dims = arr.dims().to_vec();
     let strides = arr.strides().to_vec();
+    let n_inner = n_group1 + n_group2;
 
-    // Extract dimension/stride groups
-    let group1_dims = &dims[n_batch..n_batch + n_group1];
-    let group1_strides = &strides[n_batch..n_batch + n_group1];
-    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
-    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    // Extract dimension/stride groups (batch-last)
+    let group1_dims = &dims[..n_group1];
+    let group1_strides = &strides[..n_group1];
+    let group2_dims = &dims[n_group1..n_inner];
+    let group2_strides = &strides[n_group1..n_inner];
 
     // For backends that cannot pass conjugation flags to GEMM,
     // materialize conj into the data before the GEMM call.
@@ -284,10 +277,10 @@ pub fn prepare_input_owned<T: Scalar>(
         use strided_view::ElementOp;
 
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(&dims, n_batch);
+        let mut buf = alloc_col_major_uninit(&dims);
         strided_kernel::map_into(&mut buf.view_mut(), &arr.view(), |x| ConjOp::apply(x))?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         return Ok(ContiguousOperand {
@@ -316,10 +309,10 @@ pub fn prepare_input_owned<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(&dims, n_batch);
+        let mut buf = alloc_col_major_uninit(&dims);
         strided_kernel::copy_into(&mut buf.view_mut(), &arr.view())?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         Ok(ContiguousOperand {
@@ -333,7 +326,7 @@ pub fn prepare_input_owned<T: Scalar>(
     } else {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[..n_batch].to_vec();
+        let batch_strides = strides[n_inner..].to_vec();
         let ptr = arr.view().ptr();
         Ok(ContiguousOperand {
             ptr,
@@ -348,6 +341,7 @@ pub fn prepare_input_owned<T: Scalar>(
 
 /// Prepare a borrowed mutable output view for GEMM.
 ///
+/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Checks if the two inner dimension groups (lo, ro) are fusable.
 /// If not, allocates a col-major buffer and copies the existing data into it
 /// when `beta` is non-zero (so the GEMM accumulation is correct).
@@ -362,18 +356,19 @@ pub fn prepare_input_owned<T: Scalar>(
 /// the returned operand and that no aliasing mutable references exist during GEMM.
 pub fn prepare_output_view<T: Scalar>(
     view: &mut StridedViewMut<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     beta: T,
 ) -> crate::Result<ContiguousOperandMut<T>> {
     let dims = view.dims().to_vec();
     let strides = view.strides().to_vec();
+    let n_inner = n_group1 + n_group2;
 
-    let group1_dims = &dims[n_batch..n_batch + n_group1];
-    let group1_strides = &strides[n_batch..n_batch + n_group1];
-    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
-    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    let group1_dims = &dims[..n_group1];
+    let group1_strides = &strides[..n_group1];
+    let group2_dims = &dims[n_group1..n_inner];
+    let group2_strides = &strides[n_group1..n_inner];
 
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
@@ -391,13 +386,13 @@ pub fn prepare_output_view<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(&dims, n_batch);
+        let mut buf = alloc_col_major_uninit(&dims);
         if beta != T::zero() {
             // Need to preserve existing values for accumulation
             strided_kernel::copy_into(&mut buf.view_mut(), &view.as_view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         Ok(ContiguousOperandMut {
@@ -411,7 +406,7 @@ pub fn prepare_output_view<T: Scalar>(
     } else {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[..n_batch].to_vec();
+        let batch_strides = strides[n_inner..].to_vec();
         Ok(ContiguousOperandMut {
             ptr: view.as_mut_ptr(),
             row_stride: rs,
@@ -425,6 +420,7 @@ pub fn prepare_output_view<T: Scalar>(
 
 /// Prepare an owned mutable output array for GEMM.
 ///
+/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// If already contiguous after dimension grouping, uses the array in-place.
 /// Otherwise, allocates a col-major buffer and copies existing data when
 /// `beta` is non-zero.
@@ -437,18 +433,19 @@ pub fn prepare_output_view<T: Scalar>(
 #[allow(dead_code)]
 pub fn prepare_output_owned<T: Scalar>(
     arr: &mut StridedArray<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     beta: T,
 ) -> crate::Result<ContiguousOperandMut<T>> {
     let dims = arr.dims().to_vec();
     let strides = arr.strides().to_vec();
+    let n_inner = n_group1 + n_group2;
 
-    let group1_dims = &dims[n_batch..n_batch + n_group1];
-    let group1_strides = &strides[n_batch..n_batch + n_group1];
-    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
-    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    let group1_dims = &dims[..n_group1];
+    let group1_strides = &strides[..n_group1];
+    let group2_dims = &dims[n_group1..n_inner];
+    let group2_strides = &strides[n_group1..n_inner];
 
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
@@ -466,12 +463,12 @@ pub fn prepare_output_owned<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(&dims, n_batch);
+        let mut buf = alloc_col_major_uninit(&dims);
         if beta != T::zero() {
             strided_kernel::copy_into(&mut buf.view_mut(), &arr.view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         Ok(ContiguousOperandMut {
@@ -485,7 +482,7 @@ pub fn prepare_output_owned<T: Scalar>(
     } else {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[..n_batch].to_vec();
+        let batch_strides = strides[n_inner..].to_vec();
         Ok(ContiguousOperandMut {
             ptr: arr.view_mut().as_mut_ptr(),
             row_stride: rs,
@@ -499,22 +496,24 @@ pub fn prepare_output_owned<T: Scalar>(
 
 /// Prepare a borrowed input view for a generic GEMM backend.
 ///
+/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Like [`prepare_input_view`] but works with any `ScalarBase` type and
 /// does not handle conjugation materialization. The `conj` field of the
 /// returned operand is always `false`.
 pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
     view: &StridedView<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
 ) -> crate::Result<ContiguousOperand<T>> {
     let dims = view.dims();
     let strides = view.strides();
+    let n_inner = n_group1 + n_group2;
 
-    let group1_dims = &dims[n_batch..n_batch + n_group1];
-    let group1_strides = &strides[n_batch..n_batch + n_group1];
-    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
-    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    let group1_dims = &dims[..n_group1];
+    let group1_strides = &strides[..n_group1];
+    let group2_dims = &dims[n_group1..n_inner];
+    let group2_strides = &strides[n_group1..n_inner];
 
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
@@ -531,10 +530,10 @@ pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(dims, n_batch);
+        let mut buf = alloc_col_major_uninit(dims);
         strided_kernel::copy_into(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         Ok(ContiguousOperand {
@@ -548,7 +547,7 @@ pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
     } else {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[..n_batch].to_vec();
+        let batch_strides = strides[n_inner..].to_vec();
         Ok(ContiguousOperand {
             ptr: view.ptr(),
             row_stride: rs,
@@ -562,21 +561,23 @@ pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
 
 /// Prepare a borrowed mutable output view for a generic GEMM backend.
 ///
+/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Like [`prepare_output_view`] but works with any `ScalarBase` type.
 pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
     view: &mut StridedViewMut<T>,
-    n_batch: usize,
+    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     beta: T,
 ) -> crate::Result<ContiguousOperandMut<T>> {
     let dims = view.dims().to_vec();
     let strides = view.strides().to_vec();
+    let n_inner = n_group1 + n_group2;
 
-    let group1_dims = &dims[n_batch..n_batch + n_group1];
-    let group1_strides = &strides[n_batch..n_batch + n_group1];
-    let group2_dims = &dims[n_batch + n_group1..n_batch + n_group1 + n_group2];
-    let group2_strides = &strides[n_batch + n_group1..n_batch + n_group1 + n_group2];
+    let group1_dims = &dims[..n_group1];
+    let group1_strides = &strides[..n_group1];
+    let group2_dims = &dims[n_group1..n_inner];
+    let group2_strides = &strides[n_group1..n_inner];
 
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
@@ -593,12 +594,12 @@ pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_batched_col_major(&dims, n_batch);
+        let mut buf = alloc_col_major_uninit(&dims);
         if beta != T::zero() {
             strided_kernel::copy_into(&mut buf.view_mut(), &view.as_view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
-        let batch_strides = buf.strides()[..n_batch].to_vec();
+        let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
         let col_stride = m as isize;
         Ok(ContiguousOperandMut {
@@ -612,7 +613,7 @@ pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
     } else {
         let (_, rs) = fused_g1.unwrap();
         let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[..n_batch].to_vec();
+        let batch_strides = strides[n_inner..].to_vec();
         Ok(ContiguousOperandMut {
             ptr: view.as_mut_ptr(),
             row_stride: rs,
