@@ -6,6 +6,11 @@
 use crate::fuse::{compress_dims, fuse_dims};
 use crate::{block, order, Result};
 
+/// Maximum total elements for the small tensor fast path.
+/// Tensors at or below this size skip `compute_order` and `compute_block_sizes`
+/// since they fit in L1 cache and blocking provides no benefit.
+pub(crate) const SMALL_TENSOR_THRESHOLD: usize = 1024;
+
 pub(crate) struct KernelPlan {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) order: Vec<usize>, // outer -> inner
@@ -79,6 +84,38 @@ pub(crate) fn build_plan_fused(
     (
         compressed_dims,
         compressed_strides,
+        KernelPlan {
+            order: identity,
+            block,
+        },
+    )
+}
+
+/// Simplified plan for small tensors that fit in L1 cache.
+///
+/// Skips `compute_order` and `compute_block_sizes` since blocking is
+/// unnecessary for small data. Only fuses and compresses dimensions
+/// to reduce loop depth.
+///
+/// Returns `(fused_dims, fused_strides, KernelPlan)` where the plan's
+/// order is identity and block sizes equal the full dimension sizes.
+pub(crate) fn build_plan_fused_small(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+) -> (Vec<usize>, Vec<Vec<isize>>, KernelPlan) {
+    let strides_owned: Vec<Vec<isize>> = strides_list.iter().map(|s| s.to_vec()).collect();
+
+    // Single fuse + compress pass (no ordering needed)
+    let fused = fuse_dims(dims, strides_list);
+    let (fused_dims, fused_strides) = compress_dims(&fused, &strides_owned);
+
+    // Block = full dimension (no tiling)
+    let block = fused_dims.clone();
+    let identity: Vec<usize> = (0..fused_dims.len()).collect();
+
+    (
+        fused_dims,
+        fused_strides,
         KernelPlan {
             order: identity,
             block,

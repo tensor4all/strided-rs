@@ -3,8 +3,8 @@
 //! These are the canonical view-based map functions, equivalent to Julia's `Base.map!`.
 
 use crate::kernel::{
-    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered,
-    sequential_contiguous_layout, total_len,
+    build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
+    sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
@@ -234,9 +234,14 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
     let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<A>());
+    let total = total_len(dst_dims);
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    // Small tensor fast path: skip compute_order and compute_block_sizes
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -339,9 +344,14 @@ pub fn zip_map2_into<
     let elem_size = std::mem::size_of::<D>()
         .max(std::mem::size_of::<A>())
         .max(std::mem::size_of::<B>());
+    let total = total_len(dst_dims);
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    // Small tensor fast path: skip compute_order and compute_block_sizes
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -460,9 +470,14 @@ pub fn zip_map3_into<
         .max(std::mem::size_of::<A>())
         .max(std::mem::size_of::<B>())
         .max(std::mem::size_of::<C>());
+    let total = total_len(dst_dims);
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    // Small tensor fast path: skip compute_order and compute_block_sizes
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -609,9 +624,14 @@ pub fn zip_map4_into<
         .max(std::mem::size_of::<B>())
         .max(std::mem::size_of::<C>())
         .max(std::mem::size_of::<E>());
+    let total = total_len(dst_dims);
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    // Small tensor fast path: skip compute_order and compute_block_sizes
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
