@@ -5,11 +5,11 @@
 //! the writeback for borrowed output operands.
 
 use crate::backend::{ActiveBackend, BackendConfig};
-use crate::util::try_fuse_group;
 use crate::{Scalar, ScalarBase};
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use strided_perm::try_fuse_group;
 use strided_view::{StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.

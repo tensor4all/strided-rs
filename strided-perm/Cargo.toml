@@ -1,0 +1,29 @@
+[package]
+name = "strided-perm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
+repository = "https://github.com/tensor4all/strided-rs"
+description = "Cache-efficient tensor permutation / transpose (HPTT-inspired)."
+publish = false
+
+[dependencies]
+strided-view = { path = "../strided-view" }
+rayon = { version = "1.10", optional = true }
+
+[features]
+parallel = ["rayon"]
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "permute"
+harness = false

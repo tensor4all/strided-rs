@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 strided-view = { path = "../strided-view" }
+strided-perm = { path = "../strided-perm" }
 num-traits = "0.2"
 num-complex = "0.4"
 rayon = { version = "1.10", optional = true }
@@ -18,7 +19,7 @@ pulp = { version = "0.22", optional = true }
 
 [features]
 default = ["simd"]
-parallel = ["rayon", "smallvec"]
+parallel = ["rayon", "smallvec", "strided-perm/parallel"]
 simd = ["dep:pulp"]
 
 [dev-dependencies]
