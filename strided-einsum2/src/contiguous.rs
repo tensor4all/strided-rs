@@ -340,7 +340,7 @@ pub fn prepare_input_view<T: Scalar + 'static>(
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
         let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(dims);
-        strided_kernel::copy_into(&mut buf.view_mut(), view)?;
+        strided_kernel::copy_into_col_major(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
@@ -433,7 +433,7 @@ pub fn prepare_input_owned<T: Scalar + 'static>(
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
         let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
-        strided_kernel::copy_into(&mut buf.view_mut(), &arr.view())?;
+        strided_kernel::copy_into_col_major(&mut buf.view_mut(), &arr.view())?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
@@ -514,7 +514,7 @@ pub fn prepare_output_view<T: Scalar + 'static>(
         let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
         if beta != T::zero() {
             // Need to preserve existing values for accumulation
-            strided_kernel::copy_into(&mut buf.view_mut(), &view.as_view())?;
+            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
@@ -592,7 +592,7 @@ pub fn prepare_output_owned<T: Scalar + 'static>(
         let m: usize = group1_dims.iter().product::<usize>().max(1);
         let mut buf = alloc_col_major_uninit(&dims);
         if beta != T::zero() {
-            strided_kernel::copy_into(&mut buf.view_mut(), &arr.view())?;
+            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &arr.view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
@@ -660,7 +660,7 @@ pub fn prepare_input_view_for_backend<T: ScalarBase + 'static, B: BackendConfig>
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
         let mut buf = alloc_col_major_uninit(dims);
-        strided_kernel::copy_into(&mut buf.view_mut(), view)?;
+        strided_kernel::copy_into_col_major(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
         let row_stride = if m == 0 { 0 } else { 1isize };
@@ -727,7 +727,7 @@ pub fn prepare_output_view_for_backend<T: ScalarBase + 'static, B: BackendConfig
         let m: usize = group1_dims.iter().product::<usize>().max(1);
         let mut buf = alloc_col_major_uninit(&dims);
         if beta != T::zero() {
-            strided_kernel::copy_into(&mut buf.view_mut(), &view.as_view())?;
+            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
