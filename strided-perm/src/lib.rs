@@ -14,6 +14,7 @@
 pub mod block;
 pub mod copy;
 pub mod fuse;
+pub mod hptt;
 pub mod kernel;
 pub mod order;
 

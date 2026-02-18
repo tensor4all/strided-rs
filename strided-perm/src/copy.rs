@@ -1,10 +1,7 @@
 //! Copy/permutation operations on strided views.
 
-use crate::block;
-use crate::fuse::{compress_dims, fuse_dims};
-use crate::kernel::{
-    build_plan_fused, for_each_inner_block_preordered, total_len, SMALL_TENSOR_THRESHOLD,
-};
+use crate::hptt::{build_permute_plan, execute_permute_blocked};
+use crate::kernel::total_len;
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
 
 /// Check if all strides indicate contiguous column-major or row-major layout.
@@ -52,6 +49,9 @@ fn is_both_contiguous(dims: &[usize], dst_strides: &[isize], src_strides: &[isiz
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
 ///
+/// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
+/// cache-aware blocking, and optimal loop ordering.
+///
 /// This is a simple copy without ElementOp support. For copies with
 /// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
 pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()> {
@@ -79,113 +79,25 @@ pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) ->
         return Ok(());
     }
 
-    // General path: use blocked iteration
-    let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
+    // HPTT-inspired blocked permutation
     let elem_size = std::mem::size_of::<T>();
-
-    let total = total_len(dst_dims);
-    let (fused_dims, fused_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        crate::kernel::build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
-
-    let initial_offsets = vec![0isize; 2];
-    for_each_inner_block_preordered(
-        &fused_dims,
-        &plan.block,
-        &fused_strides,
-        &initial_offsets,
-        |offsets, len, inner_strides| {
-            let dp = unsafe { dst_ptr.offset(offsets[0]) };
-            let sp = unsafe { src_ptr.offset(offsets[1]) };
-            if inner_strides[0] == 1 && inner_strides[1] == 1 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(sp, dp, len);
-                }
-            } else {
-                let mut dp = dp;
-                let mut sp = sp;
-                for _ in 0..len {
-                    unsafe { *dp = *sp };
-                    dp = unsafe { dp.offset(inner_strides[0]) };
-                    sp = unsafe { sp.offset(inner_strides[1]) };
-                }
-            }
-            Ok(())
-        },
-    )
+    let plan = build_permute_plan(dst_dims, src_strides, dst_strides, elem_size);
+    unsafe {
+        execute_permute_blocked(src_ptr, dst_ptr, &plan);
+    }
+    Ok(())
 }
 
-/// Copy elements to a col-major destination, skipping compute_order.
+/// Copy elements to a col-major destination.
 ///
-/// When the destination is column-major, identity order (dim 0 innermost) is
-/// already optimal. This avoids the overhead of compute_order.
+/// This now delegates to the same HPTT-inspired blocked permutation as
+/// `copy_into`. The HPTT planner automatically handles the col-major
+/// destination case optimally.
 pub fn copy_into_col_major<T: Copy>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
-    let dst_dims = dst.dims();
-    let src_dims = src.dims();
-    if dst_dims.len() != src_dims.len() {
-        return Err(StridedError::RankMismatch(dst_dims.len(), src_dims.len()));
-    }
-    if dst_dims != src_dims {
-        return Err(StridedError::ShapeMismatch(
-            dst_dims.to_vec(),
-            src_dims.to_vec(),
-        ));
-    }
-
-    let dst_ptr = dst.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_strides = dst.strides();
-    let src_strides = src.strides();
-
-    // Fast path: both contiguous
-    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
-        let len = total_len(dst_dims);
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
-        return Ok(());
-    }
-
-    // Non-contiguous: fuse + compress, skip compute_order (col-major dst is already optimal)
-    let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
-    let strides_owned: Vec<Vec<isize>> = strides_list.iter().map(|s| s.to_vec()).collect();
-    let elem_size = std::mem::size_of::<T>();
-
-    let fused = fuse_dims(dst_dims, &strides_list);
-    let (fused_dims, fused_strides) = compress_dims(&fused, &strides_owned);
-    let fused_refs: Vec<&[isize]> = fused_strides.iter().map(|s| s.as_slice()).collect();
-
-    let identity: Vec<usize> = (0..fused_dims.len()).collect();
-    let block = block::compute_block_sizes(&fused_dims, &identity, &fused_refs, elem_size);
-
-    let initial_offsets = vec![0isize; 2];
-    for_each_inner_block_preordered(
-        &fused_dims,
-        &block,
-        &fused_strides,
-        &initial_offsets,
-        |offsets, len, inner_strides| {
-            let dp = unsafe { dst_ptr.offset(offsets[0]) };
-            let sp = unsafe { src_ptr.offset(offsets[1]) };
-            if inner_strides[0] == 1 && inner_strides[1] == 1 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(sp, dp, len);
-                }
-            } else {
-                let mut dp = dp;
-                let mut sp = sp;
-                for _ in 0..len {
-                    unsafe { *dp = *sp };
-                    dp = unsafe { dp.offset(inner_strides[0]) };
-                    sp = unsafe { sp.offset(inner_strides[1]) };
-                }
-            }
-            Ok(())
-        },
-    )
+    copy_into(dst, src)
 }
 
 /// Try to fuse a contiguous dimension group into a single (total_size, innermost_stride).
