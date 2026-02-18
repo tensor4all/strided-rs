@@ -463,65 +463,70 @@ fn kernel_nd_inner<F>(
 where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
-    // Inner strides are for dim 0 (highest importance)
-    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
-    let last = dims.len() - 1;
-    kernel_nd_inner_level(last, dims, blocks, strides, &inner_strides, offsets, f)
+    kernel_nd_inner_iterative(dims, blocks, strides, offsets, f)
 }
 
-/// Recursive level handler.
-/// `level` counts down from `rank-1` (outermost) to `0` (innermost callback).
+/// N-dimensional kernel with inner block callback (iterative form).
+///
+/// This is equivalent to `kernel_nd_inner_level` recursion, but avoids
+/// recursive calls and repeated level checks in the hot path.
 #[inline]
-fn kernel_nd_inner_level<F>(
-    level: usize,
+fn kernel_nd_inner_iterative<F>(
     dims: &[usize],
     blocks: &[usize],
     strides: &[Vec<isize>],
-    inner_strides: &[isize],
     offsets: &mut [isize],
     f: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
-    let d = dims[level];
-    let b = blocks[level].max(1).min(d);
+    let rank = dims.len();
+    debug_assert!(rank >= 5);
 
-    if level == 0 {
-        // Innermost level (highest importance) - call callback with block info
-        let mut j = 0usize;
-        while j < d {
-            let blen = b.min(d - j);
-            f(offsets, blen, inner_strides)?;
+    let d0 = dims[0];
+    let b0 = blocks[0].max(1).min(d0);
+    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
+
+    // Current position for each outer level (1..rank-1). Level 0 uses block loop.
+    let mut idx = vec![0usize; rank];
+
+    loop {
+        // Level 0: callback over contiguous block fragments.
+        let mut j0 = 0usize;
+        while j0 < d0 {
+            let blen0 = b0.min(d0 - j0);
+            f(offsets, blen0, &inner_strides)?;
             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset += (blen as isize) * s[0];
+                *offset += (blen0 as isize) * s[0];
             }
-            j += blen;
+            j0 += blen0;
         }
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-            *offset -= (d as isize) * s[0];
+            *offset -= (d0 as isize) * s[0];
         }
-    } else {
-        // Outer level — block loop then element loop stepping through this dimension
-        let mut j = 0usize;
-        while j < d {
-            let blen = b.min(d - j);
 
-            // Element loop for this dimension, recurse into next-inner level
-            for _ in 0..blen {
-                kernel_nd_inner_level(level - 1, dims, blocks, strides, inner_strides, offsets, f)?;
-                for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                    *offset += s[level];
-                }
+        // Carry-style increment for outer levels.
+        let mut level = 1usize;
+        loop {
+            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                *offset += s[level];
             }
-            j += blen;
-        }
-        for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-            *offset -= (d as isize) * s[level];
+            idx[level] += 1;
+            if idx[level] < dims[level] {
+                break;
+            }
+
+            idx[level] = 0;
+            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                *offset -= (dims[level] as isize) * s[level];
+            }
+            level += 1;
+            if level == rank {
+                return Ok(());
+            }
         }
     }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -860,5 +865,23 @@ mod tests {
         assert_eq!(fused_strides.len(), 1);
         assert_eq!(fused_strides[0], vec![1]);
         assert_eq!(plan.block.len(), 1);
+    }
+
+    #[test]
+    fn test_kernel_nd_iterative_total_elements_match() {
+        let dims = vec![3usize, 2, 2, 2, 2];
+        let blocks = vec![2usize, 1, 1, 1, 1];
+        let strides = vec![vec![1isize, 3, 6, 12, 24], vec![1isize, 3, 6, 12, 24]];
+        let mut offsets = vec![0isize, 0isize];
+        let mut total = 0usize;
+
+        kernel_nd_inner_iterative(&dims, &blocks, &strides, &mut offsets, &mut |_off, len, _s| {
+            total += len;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(total, dims.iter().product::<usize>());
+        assert_eq!(offsets, vec![0isize, 0isize]);
     }
 }
