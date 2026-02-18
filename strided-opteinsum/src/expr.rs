@@ -235,7 +235,11 @@ fn out_dims_from_ids(
 /// - lo: ids only in left and needed
 /// - ro: ids only in right and needed
 /// - batch: ids in both and needed
-fn compute_binary_output_ids(left_ids: &[char], right_ids: &[char], needed_ids: &[char]) -> Vec<char> {
+fn compute_binary_output_ids(
+    left_ids: &[char],
+    right_ids: &[char],
+    needed_ids: &[char],
+) -> Vec<char> {
     let mut out = Vec::new();
     for &id in left_ids {
         if needed_ids.contains(&id) && !right_ids.contains(&id) && !out.contains(&id) {
