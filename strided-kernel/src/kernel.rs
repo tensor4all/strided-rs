@@ -336,14 +336,56 @@ macro_rules! make_kernel {
     };
 }
 
-make_kernel!(kernel_1d_inner, rank=1);
-make_kernel!(kernel_2d_inner, rank=2, block=[1, 0], elem=[1], top=1);
-make_kernel!(kernel_3d_inner, rank=3, block=[2, 1, 0], elem=[2, 1], top=2);
-make_kernel!(kernel_4d_inner, rank=4, block=[3, 2, 1, 0], elem=[3, 2, 1], top=3);
-make_kernel!(kernel_5d_inner, rank=5, block=[4, 3, 2, 1, 0], elem=[4, 3, 2, 1], top=4);
-make_kernel!(kernel_6d_inner, rank=6, block=[5, 4, 3, 2, 1, 0], elem=[5, 4, 3, 2, 1], top=5);
-make_kernel!(kernel_7d_inner, rank=7, block=[6, 5, 4, 3, 2, 1, 0], elem=[6, 5, 4, 3, 2, 1], top=6);
-make_kernel!(kernel_8d_inner, rank=8, block=[7, 6, 5, 4, 3, 2, 1, 0], elem=[7, 6, 5, 4, 3, 2, 1], top=7);
+make_kernel!(kernel_1d_inner, rank = 1);
+make_kernel!(
+    kernel_2d_inner,
+    rank = 2,
+    block = [1, 0],
+    elem = [1],
+    top = 1
+);
+make_kernel!(
+    kernel_3d_inner,
+    rank = 3,
+    block = [2, 1, 0],
+    elem = [2, 1],
+    top = 2
+);
+make_kernel!(
+    kernel_4d_inner,
+    rank = 4,
+    block = [3, 2, 1, 0],
+    elem = [3, 2, 1],
+    top = 3
+);
+make_kernel!(
+    kernel_5d_inner,
+    rank = 5,
+    block = [4, 3, 2, 1, 0],
+    elem = [4, 3, 2, 1],
+    top = 4
+);
+make_kernel!(
+    kernel_6d_inner,
+    rank = 6,
+    block = [5, 4, 3, 2, 1, 0],
+    elem = [5, 4, 3, 2, 1],
+    top = 5
+);
+make_kernel!(
+    kernel_7d_inner,
+    rank = 7,
+    block = [6, 5, 4, 3, 2, 1, 0],
+    elem = [6, 5, 4, 3, 2, 1],
+    top = 6
+);
+make_kernel!(
+    kernel_8d_inner,
+    rank = 8,
+    block = [7, 6, 5, 4, 3, 2, 1, 0],
+    elem = [7, 6, 5, 4, 3, 2, 1],
+    top = 7
+);
 
 /// N-dimensional kernel with inner block callback (iterative form).
 ///
@@ -955,7 +997,10 @@ mod tests {
         // Expected: all offsets 0..total
         let total: usize = dims.iter().product();
         let expected: std::collections::HashSet<isize> = (0..total as isize).collect();
-        assert_eq!(visited, expected, "rank={rank}: not all elements visited exactly once");
+        assert_eq!(
+            visited, expected,
+            "rank={rank}: not all elements visited exactly once"
+        );
     }
 
     #[test]
