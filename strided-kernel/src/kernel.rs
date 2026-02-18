@@ -875,10 +875,16 @@ mod tests {
         let mut offsets = vec![0isize, 0isize];
         let mut total = 0usize;
 
-        kernel_nd_inner_iterative(&dims, &blocks, &strides, &mut offsets, &mut |_off, len, _s| {
-            total += len;
-            Ok(())
-        })
+        kernel_nd_inner_iterative(
+            &dims,
+            &blocks,
+            &strides,
+            &mut offsets,
+            &mut |_off, len, _s| {
+                total += len;
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(total, dims.iter().product::<usize>());
