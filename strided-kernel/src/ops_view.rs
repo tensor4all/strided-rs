@@ -1,7 +1,5 @@
 //! High-level operations on dynamic-rank strided views.
 
-use crate::block;
-use crate::fuse::{compress_dims, fuse_dims};
 use crate::kernel::{
     build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, same_contiguous_layout,
     sequential_contiguous_layout, total_len,
@@ -243,87 +241,12 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
 ///
-/// Skips `compute_order` since the destination is col-major and identity
-/// order (dim 0 innermost) is already optimal. Still performs dimension
-/// fusion and compression to reduce loop depth.
-///
-/// Produces identical results to [`copy_into`]. Use this variant only when
-/// the destination is known to be col-major at the call site.
+/// Delegates to `strided_perm::copy_into_col_major` for the actual work.
 pub fn copy_into_col_major<T: Copy + MaybeSendSync>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
-    ensure_same_shape(dst.dims(), src.dims())?;
-
-    let dst_ptr = dst.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_dims = dst.dims();
-    let dst_strides = dst.strides();
-    let src_strides = src.strides();
-
-    // Fast path: both contiguous (same as copy_into)
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
-        let len = total_len(dst_dims);
-        debug_assert!(
-            {
-                let nbytes = len
-                    .checked_mul(std::mem::size_of::<T>())
-                    .expect("copy size must not overflow");
-                let dst_start = dst_ptr as usize;
-                let src_start = src_ptr as usize;
-                let dst_end = dst_start.saturating_add(nbytes);
-                let src_end = src_start.saturating_add(nbytes);
-                dst_end <= src_start || src_end <= dst_start
-            },
-            "overlapping src/dest is not supported"
-        );
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
-        return Ok(());
-    }
-
-    // Non-contiguous path: fuse + compress, but skip compute_order.
-    // Since dst is col-major, identity order (dim 0 innermost) is already optimal.
-    let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
-    let strides_owned: Vec<Vec<isize>> = strides_list.iter().map(|s| s.to_vec()).collect();
-    let elem_size = std::mem::size_of::<T>();
-
-    // Fuse contiguous dimensions
-    let fused = fuse_dims(dst_dims, &strides_list);
-    // Compress: remove size-1 dims
-    let (fused_dims, fused_strides) = compress_dims(&fused, &strides_owned);
-    let fused_refs: Vec<&[isize]> = fused_strides.iter().map(|s| s.as_slice()).collect();
-
-    // Compute block sizes with identity ordering (already optimal for col-major dst)
-    let identity: Vec<usize> = (0..fused_dims.len()).collect();
-    let block = block::compute_block_sizes(&fused_dims, &identity, &fused_refs, elem_size);
-
-    let initial_offsets = vec![0isize; 2];
-    for_each_inner_block_preordered(
-        &fused_dims,
-        &block,
-        &fused_strides,
-        &initial_offsets,
-        |offsets, len, inner_strides| {
-            let dp = unsafe { dst_ptr.offset(offsets[0]) };
-            let sp = unsafe { src_ptr.offset(offsets[1]) };
-            if inner_strides[0] == 1 && inner_strides[1] == 1 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(sp, dp, len);
-                }
-            } else {
-                let mut dp = dp;
-                let mut sp = sp;
-                for _ in 0..len {
-                    unsafe {
-                        *dp = *sp;
-                    }
-                    dp = unsafe { dp.offset(inner_strides[0]) };
-                    sp = unsafe { sp.offset(inner_strides[1]) };
-                }
-            }
-            Ok(())
-        },
-    )
+    strided_perm::copy_into_col_major(dst, src)
 }
 
 /// Element-wise addition: `dest[i] += src[i]`.

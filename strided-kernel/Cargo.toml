@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 strided-view = { path = "../strided-view" }
+strided-perm = { path = "../strided-perm" }
 num-traits = "0.2"
 num-complex = "0.4"
 rayon = { version = "1.10", optional = true }
