@@ -281,22 +281,40 @@ fn eval_pair_alloc<T: PoolOps>(
         size_dict,
     )?;
     let mut c_arr = T::pool_acquire(pool, &out_dims);
-    {
-        let a_view = ld.as_view();
-        let b_view = rd.as_view();
-        einsum2_into(
-            c_arr.view_mut(),
-            &a_view,
-            &b_view,
-            output_ids,
-            left_ids,
-            right_ids,
-            T::one(),
-            T::zero(),
-        )?;
+    match (ld, rd) {
+        // Preserve ownership so strided-einsum2 can use prepare_input_owned
+        // and avoid extra materialization in prepare_input_view.
+        (StridedData::Owned(a), StridedData::Owned(b)) => {
+            einsum2_into_owned(
+                c_arr.view_mut(),
+                a,
+                b,
+                output_ids,
+                left_ids,
+                right_ids,
+                T::one(),
+                T::zero(),
+                false,
+                false,
+            )?;
+        }
+        (ld, rd) => {
+            let a_view = ld.as_view();
+            let b_view = rd.as_view();
+            einsum2_into(
+                c_arr.view_mut(),
+                &a_view,
+                &b_view,
+                output_ids,
+                left_ids,
+                right_ids,
+                T::one(),
+                T::zero(),
+            )?;
+            T::pool_release(pool, ld);
+            T::pool_release(pool, rd);
+        }
     }
-    T::pool_release(pool, ld);
-    T::pool_release(pool, rd);
     Ok(T::wrap_array(c_arr))
 }
 

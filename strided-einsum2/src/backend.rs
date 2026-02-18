@@ -26,7 +26,7 @@ pub trait BackendConfig {
 /// (e.g., tropical semiring) and pass the backend to [`einsum2_with_backend_into`].
 ///
 /// [`einsum2_with_backend_into`]: crate::einsum2_with_backend_into
-pub trait BgemmBackend<T> {
+pub trait BgemmBackend<T: crate::ScalarBase> {
     /// Execute batched GEMM: `C = alpha * A * B + beta * C` for each batch.
     ///
     /// - `c`: mutable output operand (batch x m x n)
