@@ -89,8 +89,8 @@ pub use map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 // High-level operations
 // ============================================================================
 pub use ops_view::{
-    add, axpy, copy_conj, copy_into, copy_into_col_major, copy_scale,
-    copy_transpose_scale_into, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
+    add, axpy, copy_conj, copy_into, copy_into_col_major, copy_scale, copy_transpose_scale_into,
+    dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
 };
 
 // ============================================================================
