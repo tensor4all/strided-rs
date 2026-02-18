@@ -10,11 +10,16 @@ publish = false
 
 [dependencies]
 strided-view = { path = "../strided-view" }
+rayon = { version = "1.10", optional = true }
+
+[features]
+parallel = ["rayon"]
 
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"
 rand_distr = "0.4"
+rayon = "1.10"
 
 [lib]
 bench = false

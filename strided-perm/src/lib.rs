@@ -20,6 +20,8 @@ pub mod order;
 
 // Re-export primary API
 pub use copy::{copy_into, copy_into_col_major, try_fuse_group};
+#[cfg(feature = "parallel")]
+pub use copy::{copy_into_col_major_par, copy_into_par};
 pub use fuse::{compress_dims, compute_costs, compute_importance, fuse_dims, sort_by_importance};
 pub use kernel::{
     build_plan_fused, build_plan_fused_small, for_each_inner_block_preordered, total_len,

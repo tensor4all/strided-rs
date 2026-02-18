@@ -8,9 +8,16 @@
 use crate::fuse::fuse_dims_bilateral;
 use crate::{BLOCK_MEMORY_SIZE, CACHE_LINE_SIZE};
 
+#[cfg(feature = "parallel")]
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 /// Target tile size for permutation blocking.
 /// Use full L1 (32KB) since permutation is pure copy with no computation.
 const TILE_TARGET: usize = BLOCK_MEMORY_SIZE;
+
+/// Minimum number of elements to justify multi-threaded execution.
+#[cfg(feature = "parallel")]
+const MINTHREADLENGTH: usize = 1 << 15; // 32768
 
 /// Plan for a blocked permutation copy.
 #[derive(Debug)]
@@ -279,6 +286,83 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
     }
 
     blocked_copy_ordered(src, dst, &o_dims, &o_src_s, &o_dst_s, &o_blocks);
+}
+
+/// Execute the blocked permutation copy with Rayon parallelism.
+///
+/// Parallelizes the outermost block loop using `rayon::par_iter`.
+/// Falls back to single-threaded for small tensors (< MINTHREADLENGTH elements).
+///
+/// # Safety
+/// Same requirements as `execute_permute_blocked`.
+#[cfg(feature = "parallel")]
+pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
+    src: *const T,
+    dst: *mut T,
+    plan: &PermutePlan,
+) {
+    let rank = plan.fused_dims.len();
+    let total: usize = plan.fused_dims.iter().product();
+
+    // Fall back to single-threaded for small tensors or rank 0
+    if rank == 0 || total < MINTHREADLENGTH {
+        execute_permute_blocked(src, dst, plan);
+        return;
+    }
+
+    let dims = &plan.fused_dims;
+    let src_s = &plan.src_strides;
+    let dst_s = &plan.dst_strides;
+    let blocks = &plan.block_sizes;
+    let order = &plan.loop_order;
+
+    // Reorder to loop_order
+    let mut o_dims = vec![0usize; rank];
+    let mut o_blocks = vec![0usize; rank];
+    let mut o_src_s = vec![0isize; rank];
+    let mut o_dst_s = vec![0isize; rank];
+    for (i, &d) in order.iter().enumerate() {
+        o_dims[i] = dims[d];
+        o_blocks[i] = blocks[d];
+        o_src_s[i] = src_s[d];
+        o_dst_s[i] = dst_s[d];
+    }
+
+    // Parallelize over outermost block loop (dim 0).
+    let n_outer = (o_dims[0] + o_blocks[0] - 1) / o_blocks[0];
+
+    if n_outer <= 1 || rank <= 1 {
+        // Not enough outer blocks to parallelize
+        blocked_copy_ordered(src, dst, &o_dims, &o_src_s, &o_dst_s, &o_blocks);
+        return;
+    }
+
+    // Convert pointers to usize to avoid raw-pointer Send/Sync issues in closures.
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
+    let outer_block = o_blocks[0];
+    let outer_dim = o_dims[0];
+    let outer_src_stride = o_src_s[0];
+    let outer_dst_stride = o_dst_s[0];
+    let elem_size = std::mem::size_of::<T>();
+
+    (0..n_outer).into_par_iter().for_each(|block_idx| {
+        let start = block_idx * outer_block;
+        let extent = outer_block.min(outer_dim - start);
+
+        // Compute byte offsets and reconstruct pointers
+        let src_byte_off = (start as isize) * outer_src_stride * (elem_size as isize);
+        let dst_byte_off = (start as isize) * outer_dst_stride * (elem_size as isize);
+        let sub_src = (src_addr as isize + src_byte_off) as *const T;
+        let sub_dst = (dst_addr as isize + dst_byte_off) as *mut T;
+
+        let mut sub_dims = o_dims.clone();
+        sub_dims[0] = extent;
+
+        unsafe {
+            blocked_copy_ordered(sub_src, sub_dst, &sub_dims, &o_src_s, &o_dst_s, &o_blocks);
+        }
+    });
 }
 
 /// Blocked copy with dimensions already in iteration order.
@@ -675,5 +759,52 @@ mod tests {
         assert_eq!(plan.fused_dims.len(), 3);
         // Inner dim should be dim 0 (both have stride 1)
         assert_eq!(*plan.loop_order.last().unwrap(), 0);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_execute_par_transpose_2d() {
+        let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut dst = vec![0.0f64; 6];
+        let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8);
+        unsafe {
+            execute_permute_blocked_par(src.as_ptr(), dst.as_mut_ptr(), &plan);
+        }
+        assert_eq!(dst, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_execute_par_large() {
+        // Large enough to trigger parallel execution (> MINTHREADLENGTH)
+        let n = 256;
+        let total = n * n * n;
+        let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
+        let mut dst = vec![0.0f64; total];
+
+        // [256, 256, 256] col-major, transpose [2, 0, 1]
+        // src strides: [1, 256, 65536]
+        // permuted dims: [256, 256, 256], strides: [65536, 1, 256]
+        // dst col-major: [1, 256, 65536]
+        let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8);
+        unsafe {
+            execute_permute_blocked_par(src.as_ptr(), dst.as_mut_ptr(), &plan);
+        }
+
+        // Verify: for multi-index (i0, i1, i2),
+        //   src offset = i0*65536 + i1*1 + i2*256
+        //   dst offset = i0*1 + i1*256 + i2*65536
+        for i0 in [0, 1, 127, 255] {
+            for i1 in [0, 1, 127, 255] {
+                for i2 in [0, 1, 127, 255] {
+                    let dst_idx = i0 + i1 * n + i2 * n * n;
+                    let src_idx = i0 * 65536 + i1 + i2 * 256;
+                    assert_eq!(
+                        dst[dst_idx], src[src_idx],
+                        "mismatch at i0={i0}, i1={i1}, i2={i2}"
+                    );
+                }
+            }
+        }
     }
 }

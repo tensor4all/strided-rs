@@ -1,5 +1,7 @@
 //! Copy/permutation operations on strided views.
 
+#[cfg(feature = "parallel")]
+use crate::hptt::execute_permute_blocked_par;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
 use crate::kernel::total_len;
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
@@ -98,6 +100,56 @@ pub fn copy_into_col_major<T: Copy>(
     src: &StridedView<T>,
 ) -> Result<()> {
     copy_into(dst, src)
+}
+
+/// Copy elements from source to destination with Rayon parallelism.
+///
+/// Parallelizes the outermost block loop of the HPTT-inspired permutation.
+/// Falls back to single-threaded for small tensors.
+#[cfg(feature = "parallel")]
+pub fn copy_into_par<T: Copy + Send + Sync>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    let dst_dims = dest.dims();
+    let src_dims = src.dims();
+    if dst_dims.len() != src_dims.len() {
+        return Err(StridedError::RankMismatch(dst_dims.len(), src_dims.len()));
+    }
+    if dst_dims != src_dims {
+        return Err(StridedError::ShapeMismatch(
+            dst_dims.to_vec(),
+            src_dims.to_vec(),
+        ));
+    }
+
+    let dst_ptr = dest.as_mut_ptr();
+    let src_ptr = src.ptr();
+    let dst_strides = dest.strides();
+    let src_strides = src.strides();
+
+    // Fast path: both contiguous (memcpy is already bandwidth-limited)
+    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
+        let len = total_len(dst_dims);
+        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
+        return Ok(());
+    }
+
+    let elem_size = std::mem::size_of::<T>();
+    let plan = build_permute_plan(dst_dims, src_strides, dst_strides, elem_size);
+    unsafe {
+        execute_permute_blocked_par(src_ptr, dst_ptr, &plan);
+    }
+    Ok(())
+}
+
+/// Copy elements to a col-major destination with Rayon parallelism.
+#[cfg(feature = "parallel")]
+pub fn copy_into_col_major_par<T: Copy + Send + Sync>(
+    dst: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    copy_into_par(dst, src)
 }
 
 /// Try to fuse a contiguous dimension group into a single (total_size, innermost_stride).

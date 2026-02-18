@@ -2,6 +2,11 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+#[allow(unused_imports)]
+#[cfg(feature = "parallel")]
+use strided_perm::copy_into_col_major_par;
+#[cfg(feature = "parallel")]
+use strided_perm::copy_into_par;
 use strided_perm::{copy_into, copy_into_col_major};
 use strided_view::{col_major_strides, StridedArray};
 
@@ -162,6 +167,19 @@ fn scenario_scattered_to_colmajor() {
         black_box(dst.data().as_ptr());
     });
 
+    // Parallel variants
+    #[cfg(feature = "parallel")]
+    {
+        bench_n("copy_into_par", 2, 30, bytes, || {
+            copy_into_par(&mut dst.view_mut(), &src_perm).unwrap();
+            black_box(dst.data().as_ptr());
+        });
+        bench_n("copy_into_col_major_par", 2, 30, bytes, || {
+            copy_into_col_major_par(&mut dst.view_mut(), &src_perm).unwrap();
+            black_box(dst.data().as_ptr());
+        });
+    }
+
     println!();
 }
 
@@ -204,6 +222,16 @@ fn scenario_contig_to_contig_perm() {
         bench_n("naive_odometer", 2, 30, bytes, || {
             unsafe { naive_permute_colmajor(a_ptr, b_ptr, &dims, &perm_inv) };
             black_box(b_ptr);
+        });
+    }
+
+    // Parallel variants
+    #[cfg(feature = "parallel")]
+    {
+        let src_perm = src.view().permute(&perm_inv).unwrap();
+        bench_n("copy_into_par", 2, 30, bytes, || {
+            copy_into_par(&mut dst.view_mut(), &src_perm).unwrap();
+            black_box(dst.data().as_ptr());
         });
     }
 
@@ -288,6 +316,15 @@ fn scenario_small_tensor() {
         });
     }
 
+    // Parallel
+    #[cfg(feature = "parallel")]
+    {
+        bench_n("copy_into_par (reverse)", 5, 30, bytes, || {
+            copy_into_par(&mut dst.view_mut(), &src_perm).unwrap();
+            black_box(dst.data().as_ptr());
+        });
+    }
+
     println!();
 }
 
@@ -336,6 +373,19 @@ fn scenario_large_dims() {
         copy_into(&mut dst.view_mut(), &src_perm2).unwrap();
         black_box(dst.data().as_ptr());
     });
+
+    // Parallel
+    #[cfg(feature = "parallel")]
+    {
+        bench_n("copy_into_par [2,0,1]", 2, 30, bytes, || {
+            copy_into_par(&mut dst.view_mut(), &src_perm).unwrap();
+            black_box(dst.data().as_ptr());
+        });
+        bench_n("copy_into_par [1,0,2]", 2, 30, bytes, || {
+            copy_into_par(&mut dst.view_mut(), &src_perm2).unwrap();
+            black_box(dst.data().as_ptr());
+        });
+    }
 
     println!();
 }
@@ -432,6 +482,13 @@ fn main() {
         std::mem::size_of::<f64>(),
         (1 << 24) * std::mem::size_of::<f64>() / (1024 * 1024)
     );
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = rayon::current_num_threads();
+        println!("Parallel feature: enabled ({nthreads} threads)");
+    }
+    #[cfg(not(feature = "parallel"))]
+    println!("Parallel feature: disabled (single-threaded only)");
     println!("Format: label  median_ms  (p25 / p75)  bandwidth_GB/s");
     println!();
 
