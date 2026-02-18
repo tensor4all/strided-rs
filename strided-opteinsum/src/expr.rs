@@ -127,6 +127,12 @@ fn collect_all_ids_inner(node: &EinsumNode, result: &mut Vec<char>) {
 /// needs from this node) AND it is actually present in at least one child
 /// subtree.
 fn compute_contract_output_ids(args: &[EinsumNode], needed_ids: &[char]) -> Vec<char> {
+    if args.len() == 2 {
+        let left_ids = collect_all_ids(&args[0]);
+        let right_ids = collect_all_ids(&args[1]);
+        return compute_binary_output_ids(&left_ids, &right_ids, needed_ids);
+    }
+
     // Walk args in order and collect ids preserving first-seen order
     let mut all_ids_ordered = Vec::new();
     for arg in args {
@@ -221,6 +227,36 @@ fn out_dims_from_ids(
         }
     }
     Ok(out_dims)
+}
+
+/// Compute binary contraction output id order.
+///
+/// Uses canonical `[lo, ro, batch]` order:
+/// - lo: ids only in left and needed
+/// - ro: ids only in right and needed
+/// - batch: ids in both and needed
+fn compute_binary_output_ids(
+    left_ids: &[char],
+    right_ids: &[char],
+    needed_ids: &[char],
+) -> Vec<char> {
+    let mut out = Vec::new();
+    for &id in left_ids {
+        if needed_ids.contains(&id) && !right_ids.contains(&id) && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    for &id in right_ids {
+        if needed_ids.contains(&id) && !left_ids.contains(&id) && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    for &id in left_ids {
+        if needed_ids.contains(&id) && right_ids.contains(&id) && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Generic inner function for pairwise contraction with buffer pool.
@@ -1003,6 +1039,12 @@ mod tests {
         StridedArray::from_parts(data, dims, &strides, 0)
             .unwrap()
             .into()
+    }
+
+    #[test]
+    fn test_binary_output_ids_canonical_lo_ro_batch_order() {
+        let out = compute_binary_output_ids(&['b', 'a', 'x'], &['x', 'c', 'a'], &['b', 'c', 'a']);
+        assert_eq!(out, vec!['b', 'c', 'a']);
     }
 
     #[test]
