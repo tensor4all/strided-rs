@@ -83,7 +83,7 @@ pub fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize
     match dims.len() {
         0 => Some((1, 0)),
         1 => Some((dims[0], strides[0])),
-        n => {
+        _ => {
             if dims.len() != strides.len() {
                 return None;
             }
@@ -92,24 +92,53 @@ pub fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize
                     return None;
                 }
             }
-
-            let mut pairs: Vec<(usize, isize)> =
-                dims.iter().copied().zip(strides.iter().copied()).collect();
-            pairs.sort_by_key(|&(d, s)| (s.unsigned_abs(), d));
-
-            for i in 0..n - 1 {
-                let (dim_i, stride_i) = pairs[i];
-                let (dim_next, stride_next) = pairs[i + 1];
-                if dim_i <= 1 || dim_next <= 1 {
+            // Ignore size-1 axes for contiguity checks; they do not constrain layout.
+            // Find the first non-singleton axis with minimum absolute stride.
+            let mut base_idx: Option<usize> = None;
+            let mut base_abs = usize::MAX;
+            for (i, (&d, &s)) in dims.iter().zip(strides.iter()).enumerate() {
+                if d <= 1 {
                     continue;
                 }
-                let expected = stride_i.unsigned_abs().checked_mul(dim_i)?;
-                if stride_next.unsigned_abs() != expected {
-                    return None;
+                let abs = s.unsigned_abs();
+                if abs < base_abs {
+                    base_abs = abs;
+                    base_idx = Some(i);
                 }
             }
 
-            Some((dims.iter().product(), pairs[0].1))
+            // All singleton axes: trivially fusable.
+            let Some(base) = base_idx else {
+                let stride = *strides
+                    .iter()
+                    .min_by_key(|s| s.unsigned_abs())
+                    .unwrap_or(&0);
+                return Some((dims.iter().product(), stride));
+            };
+
+            let mut used = vec![false; dims.len()];
+            used[base] = true;
+            let mut expected_abs = base_abs.checked_mul(dims[base])?;
+
+            // Reconstruct increasing-stride contiguous chain without sorting.
+            let non_singleton = dims.iter().filter(|&&d| d > 1).count();
+            for _ in 1..non_singleton {
+                let mut next = None;
+                for i in 0..dims.len() {
+                    if used[i] || dims[i] <= 1 {
+                        continue;
+                    }
+                    if strides[i].unsigned_abs() == expected_abs {
+                        next = Some(i);
+                        break;
+                    }
+                }
+                let i = next?;
+                used[i] = true;
+                expected_abs = expected_abs.checked_mul(dims[i])?;
+            }
+
+            Some((dims.iter().product(), strides[base]))
         }
     }
 }

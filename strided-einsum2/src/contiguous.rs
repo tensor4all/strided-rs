@@ -7,10 +7,13 @@
 use crate::backend::{ActiveBackend, BackendConfig};
 use crate::util::try_fuse_group;
 use crate::{Scalar, ScalarBase};
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use strided_view::{StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.
-pub struct ContiguousOperand<T> {
+pub struct ContiguousOperand<T: Copy + 'static> {
     ptr: *const T,
     row_stride: isize,
     col_stride: isize,
@@ -18,10 +21,11 @@ pub struct ContiguousOperand<T> {
     conj: bool,
     /// Owns the buffer if a copy was made or input was consumed.
     pub(crate) _buf: Option<StridedArray<T>>,
+    buf_is_pooled: bool,
 }
 
 /// GEMM-ready output operand with contiguous data.
-pub struct ContiguousOperandMut<T> {
+pub struct ContiguousOperandMut<T: Copy + 'static> {
     ptr: *mut T,
     row_stride: isize,
     col_stride: isize,
@@ -31,9 +35,104 @@ pub struct ContiguousOperandMut<T> {
     needs_writeback: bool,
     /// Owns the buffer if a copy was made.
     pub(crate) _buf: Option<StridedArray<T>>,
+    buf_is_pooled: bool,
 }
 
-impl<T> ContiguousOperand<T> {
+thread_local! {
+    static BUFFER_POOL: RefCell<HashMap<TypeId, Box<dyn Any>>> = RefCell::new(HashMap::new());
+}
+
+const MAX_POOL_PER_TYPE: usize = 16;
+const MAX_POOLED_BYTES: usize = 64 * 1024 * 1024;
+
+fn take_pooled_vec_uninit<T: Copy + 'static>(len: usize) -> Vec<T> {
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let entry = pool
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(Vec::<Vec<T>>::new()));
+        let vecs = entry
+            .downcast_mut::<Vec<Vec<T>>>()
+            .expect("buffer pool type mismatch");
+
+        let mut best_idx = None;
+        let mut best_cap = usize::MAX;
+        for (idx, v) in vecs.iter().enumerate() {
+            let cap = v.capacity();
+            if cap >= len && cap < best_cap {
+                best_idx = Some(idx);
+                best_cap = cap;
+            }
+        }
+
+        let mut data = best_idx
+            .map(|idx| vecs.swap_remove(idx))
+            .unwrap_or_else(|| Vec::with_capacity(len));
+        if data.capacity() < len {
+            data.reserve(len - data.capacity());
+        }
+        unsafe { data.set_len(len) };
+        data
+    })
+}
+
+fn return_pooled_vec<T: Copy + 'static>(mut data: Vec<T>) {
+    let bytes = data.capacity().saturating_mul(std::mem::size_of::<T>());
+    if bytes == 0 || bytes > MAX_POOLED_BYTES {
+        return;
+    }
+    data.clear();
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let entry = pool
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(Vec::<Vec<T>>::new()));
+        let vecs = entry
+            .downcast_mut::<Vec<Vec<T>>>()
+            .expect("buffer pool type mismatch");
+        if vecs.len() >= MAX_POOL_PER_TYPE {
+            if let Some((min_idx, min_cap)) = vecs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, v.capacity()))
+                .min_by_key(|(_, cap)| *cap)
+            {
+                if min_cap < data.capacity() {
+                    vecs.swap_remove(min_idx);
+                    vecs.push(data);
+                }
+            }
+        } else {
+            vecs.push(data);
+        }
+    });
+}
+
+fn alloc_col_major_uninit_with_pool<T: Copy + 'static>(dims: &[usize]) -> (StridedArray<T>, bool) {
+    let total: usize = dims.iter().product::<usize>().max(1);
+    let bytes = total.saturating_mul(std::mem::size_of::<T>());
+    if bytes == 0 || bytes > MAX_POOLED_BYTES {
+        return (alloc_col_major_uninit(dims), false);
+    }
+    let data = take_pooled_vec_uninit::<T>(total);
+    let arr = unsafe { StridedArray::col_major_from_buffer_uninit(data, dims) };
+    (arr, true)
+}
+
+#[cfg(test)]
+fn pooled_count_for_type<T: 'static>() -> usize {
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let Some(entry) = pool.get_mut(&TypeId::of::<T>()) else {
+            return 0;
+        };
+        entry
+            .downcast_mut::<Vec<Vec<T>>>()
+            .map_or(0, |vecs| vecs.len())
+    })
+}
+
+impl<T: Copy + 'static> ContiguousOperand<T> {
     /// Raw const pointer to the operand data at the base offset.
     #[inline]
     pub fn ptr(&self) -> *const T {
@@ -72,7 +171,7 @@ impl<T> ContiguousOperand<T> {
     }
 }
 
-impl<T> ContiguousOperandMut<T> {
+impl<T: Copy + 'static> ContiguousOperandMut<T> {
     /// Raw mutable pointer to the operand data at the base offset.
     #[inline]
     pub fn ptr(&self) -> *mut T {
@@ -128,6 +227,26 @@ impl<T: Copy + Send + Sync> ContiguousOperandMut<T> {
     }
 }
 
+impl<T: Copy + 'static> Drop for ContiguousOperand<T> {
+    fn drop(&mut self) {
+        if self.buf_is_pooled {
+            if let Some(arr) = self._buf.take() {
+                return_pooled_vec(arr.into_data());
+            }
+        }
+    }
+}
+
+impl<T: Copy + 'static> Drop for ContiguousOperandMut<T> {
+    fn drop(&mut self) {
+        if self.buf_is_pooled {
+            if let Some(arr) = self._buf.take() {
+                return_pooled_vec(arr.into_data());
+            }
+        }
+    }
+}
+
 /// Allocate a column-major StridedArray with uninitialized data.
 ///
 /// With batch-last canonical order `[inner..., batch...]`, pure column-major
@@ -161,7 +280,7 @@ pub(crate) fn alloc_col_major_uninit<T: Copy>(dims: &[usize]) -> StridedArray<T>
 /// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Checks if the two inner dimension groups are fusable.
 /// If not, copies to a contiguous col-major buffer.
-pub fn prepare_input_view<T: Scalar>(
+pub fn prepare_input_view<T: Scalar + 'static>(
     view: &StridedView<T>,
     _n_batch: usize,
     n_group1: usize,
@@ -185,7 +304,7 @@ pub fn prepare_input_view<T: Scalar>(
         use strided_view::ElementOp;
 
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(dims);
+        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(dims);
         strided_kernel::map_into(&mut buf.view_mut(), view, |x| ConjOp::apply(x))?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
@@ -198,6 +317,7 @@ pub fn prepare_input_view<T: Scalar>(
             batch_strides,
             conj: false,
             _buf: Some(buf),
+            buf_is_pooled,
         });
     }
 
@@ -219,7 +339,7 @@ pub fn prepare_input_view<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(dims);
+        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(dims);
         strided_kernel::copy_into(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
@@ -232,6 +352,7 @@ pub fn prepare_input_view<T: Scalar>(
             batch_strides,
             conj,
             _buf: Some(buf),
+            buf_is_pooled,
         })
     } else {
         let (_, rs) = fused_g1.unwrap();
@@ -244,6 +365,7 @@ pub fn prepare_input_view<T: Scalar>(
             batch_strides,
             conj,
             _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
@@ -253,7 +375,7 @@ pub fn prepare_input_view<T: Scalar>(
 /// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// If already contiguous after dimension grouping, transfers ownership without copying.
 /// Otherwise, copies to a new col-major buffer.
-pub fn prepare_input_owned<T: Scalar>(
+pub fn prepare_input_owned<T: Scalar + 'static>(
     arr: StridedArray<T>,
     _n_batch: usize,
     n_group1: usize,
@@ -277,7 +399,7 @@ pub fn prepare_input_owned<T: Scalar>(
         use strided_view::ElementOp;
 
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(&dims);
+        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
         strided_kernel::map_into(&mut buf.view_mut(), &arr.view(), |x| ConjOp::apply(x))?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
@@ -290,6 +412,7 @@ pub fn prepare_input_owned<T: Scalar>(
             batch_strides,
             conj: false,
             _buf: Some(buf),
+            buf_is_pooled,
         });
     }
 
@@ -309,7 +432,7 @@ pub fn prepare_input_owned<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(&dims);
+        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
         strided_kernel::copy_into(&mut buf.view_mut(), &arr.view())?;
         let ptr = buf.view().ptr();
         let batch_strides = buf.strides()[n_inner..].to_vec();
@@ -322,6 +445,7 @@ pub fn prepare_input_owned<T: Scalar>(
             batch_strides,
             conj,
             _buf: Some(buf),
+            buf_is_pooled,
         })
     } else {
         let (_, rs) = fused_g1.unwrap();
@@ -335,6 +459,7 @@ pub fn prepare_input_owned<T: Scalar>(
             batch_strides,
             conj,
             _buf: Some(arr),
+            buf_is_pooled: false,
         })
     }
 }
@@ -354,7 +479,7 @@ pub fn prepare_input_owned<T: Scalar>(
 /// When inner dims are fusable (no copy needed), the returned `ContiguousOperandMut`
 /// holds a raw pointer into `view`'s data. The caller must ensure `view` outlives
 /// the returned operand and that no aliasing mutable references exist during GEMM.
-pub fn prepare_output_view<T: Scalar>(
+pub fn prepare_output_view<T: Scalar + 'static>(
     view: &mut StridedViewMut<T>,
     _n_batch: usize,
     n_group1: usize,
@@ -386,7 +511,7 @@ pub fn prepare_output_view<T: Scalar>(
 
     if needs_copy {
         let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(&dims);
+        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
         if beta != T::zero() {
             // Need to preserve existing values for accumulation
             strided_kernel::copy_into(&mut buf.view_mut(), &view.as_view())?;
@@ -402,6 +527,7 @@ pub fn prepare_output_view<T: Scalar>(
             batch_strides,
             needs_writeback: true,
             _buf: Some(buf),
+            buf_is_pooled,
         })
     } else {
         let (_, rs) = fused_g1.unwrap();
@@ -414,6 +540,7 @@ pub fn prepare_output_view<T: Scalar>(
             batch_strides,
             needs_writeback: false,
             _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
@@ -431,7 +558,7 @@ pub fn prepare_output_view<T: Scalar>(
 /// Currently unused in production (C is always a `StridedViewMut` from the caller).
 /// Kept for future use when `einsum2_into` accepts owned output arrays.
 #[allow(dead_code)]
-pub fn prepare_output_owned<T: Scalar>(
+pub fn prepare_output_owned<T: Scalar + 'static>(
     arr: &mut StridedArray<T>,
     _n_batch: usize,
     n_group1: usize,
@@ -478,6 +605,7 @@ pub fn prepare_output_owned<T: Scalar>(
             batch_strides,
             needs_writeback: false,
             _buf: Some(buf),
+            buf_is_pooled: false,
         })
     } else {
         let (_, rs) = fused_g1.unwrap();
@@ -490,6 +618,7 @@ pub fn prepare_output_owned<T: Scalar>(
             batch_strides,
             needs_writeback: false,
             _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
@@ -500,7 +629,7 @@ pub fn prepare_output_owned<T: Scalar>(
 /// Like [`prepare_input_view`] but works with any `ScalarBase` type and
 /// does not handle conjugation materialization. The `conj` field of the
 /// returned operand is always `false`.
-pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
+pub fn prepare_input_view_for_backend<T: ScalarBase + 'static, B: BackendConfig>(
     view: &StridedView<T>,
     _n_batch: usize,
     n_group1: usize,
@@ -543,6 +672,7 @@ pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
             batch_strides,
             conj: false,
             _buf: Some(buf),
+            buf_is_pooled: false,
         })
     } else {
         let (_, rs) = fused_g1.unwrap();
@@ -555,6 +685,7 @@ pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
             batch_strides,
             conj: false,
             _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
@@ -563,7 +694,7 @@ pub fn prepare_input_view_for_backend<T: ScalarBase, B: BackendConfig>(
 ///
 /// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Like [`prepare_output_view`] but works with any `ScalarBase` type.
-pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
+pub fn prepare_output_view_for_backend<T: ScalarBase + 'static, B: BackendConfig>(
     view: &mut StridedViewMut<T>,
     _n_batch: usize,
     n_group1: usize,
@@ -609,6 +740,7 @@ pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
             batch_strides,
             needs_writeback: true,
             _buf: Some(buf),
+            buf_is_pooled: false,
         })
     } else {
         let (_, rs) = fused_g1.unwrap();
@@ -621,6 +753,7 @@ pub fn prepare_output_view_for_backend<T: ScalarBase, B: BackendConfig>(
             batch_strides,
             needs_writeback: false,
             _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
@@ -882,5 +1015,21 @@ mod tests {
         assert!(op.has_buf());
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 6);
+    }
+
+    #[test]
+    fn test_prepare_input_view_temp_buffer_is_recycled() {
+        let before = pooled_count_for_type::<f64>();
+        let data = vec![0.0f64; 100];
+        let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
+        let view = a.view();
+
+        {
+            let op = prepare_input_view(&view, 0, 2, 1, false).unwrap();
+            assert!(op.has_buf());
+        }
+
+        let after = pooled_count_for_type::<f64>();
+        assert!(after >= before.saturating_add(1));
     }
 }

@@ -11,6 +11,7 @@ pub trait ScalarBase:
     Copy
     + Send
     + Sync
+    + 'static
     + std::ops::Mul<Output = Self>
     + std::ops::Add<Output = Self>
     + num_traits::Zero
@@ -23,6 +24,7 @@ impl<T> ScalarBase for T where
     T: Copy
         + Send
         + Sync
+        + 'static
         + std::ops::Mul<Output = T>
         + std::ops::Add<Output = T>
         + num_traits::Zero
