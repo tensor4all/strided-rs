@@ -748,6 +748,130 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_4d_permute() {
+        // 4D: dims [2, 3, 4, 5], col-major src, permute [3, 1, 0, 2]
+        let dims = [2usize, 3, 4, 5];
+        let total: usize = dims.iter().product();
+        let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
+        let mut dst = vec![0.0f64; total];
+
+        // src col-major strides: [1, 2, 6, 24]
+        // permuted dims: [5, 3, 2, 4], strides: [24, 2, 1, 6]
+        // dst col-major for [5, 3, 2, 4]: [1, 5, 15, 30]
+        let plan = build_permute_plan(&[5, 3, 2, 4], &[24, 2, 1, 6], &[1, 5, 15, 30], 8);
+        unsafe {
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+        }
+
+        // Verify sample: multi-index (i0, i1, i2, i3)
+        // src offset = i0*24 + i1*2 + i2*1 + i3*6
+        // dst offset = i0*1 + i1*5 + i2*15 + i3*30
+        for i0 in 0..5 {
+            for i1 in 0..3 {
+                for i2 in 0..2 {
+                    for i3 in 0..4 {
+                        let src_idx = i0 * 24 + i1 * 2 + i2 + i3 * 6;
+                        let dst_idx = i0 + i1 * 5 + i2 * 15 + i3 * 30;
+                        assert_eq!(
+                            dst[dst_idx], src[src_idx],
+                            "4D mismatch at ({i0},{i1},{i2},{i3})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_5d_permute() {
+        // 5D: dims [2, 2, 2, 2, 3], permute [4, 0, 1, 2, 3]
+        let dims = [2usize, 2, 2, 2, 3];
+        let total: usize = dims.iter().product();
+        let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
+        let mut dst = vec![0.0f64; total];
+
+        // src col-major: [1, 2, 4, 8, 16]
+        // permuted: dims [3, 2, 2, 2, 2], strides [16, 1, 2, 4, 8]
+        // dst col-major for [3, 2, 2, 2, 2]: [1, 3, 6, 12, 24]
+        let plan = build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8);
+        unsafe {
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+        }
+
+        // Verify all elements
+        for i0 in 0..3 {
+            for i1 in 0..2 {
+                for i2 in 0..2 {
+                    for i3 in 0..2 {
+                        for i4 in 0..2 {
+                            let src_idx = i0 * 16 + i1 + i2 * 2 + i3 * 4 + i4 * 8;
+                            let dst_idx = i0 + i1 * 3 + i2 * 6 + i3 * 12 + i4 * 24;
+                            assert_eq!(
+                                dst[dst_idx], src[src_idx],
+                                "5D mismatch at ({i0},{i1},{i2},{i3},{i4})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_rank0_scalar() {
+        let src = vec![42.0f64];
+        let mut dst = vec![0.0f64];
+        let plan = build_permute_plan(&[], &[], &[], 8);
+        unsafe {
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+        }
+        assert_eq!(dst[0], 42.0);
+    }
+
+    #[test]
+    fn test_tile_memory_footprint_basic() {
+        // 2D tile [8, 8], strides [1, 8] and [8, 1], elem 8 bytes
+        let blocks = [8usize, 8];
+        let src_s = [1isize, 8];
+        let dst_s = [8isize, 1];
+        let fp = tile_memory_footprint(&blocks, &src_s, &dst_s, 8);
+        assert!(fp > 0);
+    }
+
+    #[test]
+    fn test_stride_footprint_contiguous() {
+        // Contiguous: blocks [100], stride [1], elem 8
+        let fp = stride_footprint(&[100], &[1], 8);
+        // 99 * 8 = 792 bytes in contiguous region → 792/64 + 1 = 13 cache lines
+        assert_eq!(fp, 64 * 13);
+    }
+
+    #[test]
+    fn test_stride_footprint_large_stride() {
+        // Large stride >= cache line: each block element is a separate cache line block
+        let fp = stride_footprint(&[10], &[100], 8);
+        // stride 100*8 = 800 bytes >= 64 → cache_line_blocks = 10
+        // contiguous_bytes = 0 → lines = 1
+        assert_eq!(fp, 64 * 1 * 10);
+    }
+
+    #[test]
+    fn test_compute_perm_order_single_dim() {
+        let order = compute_perm_order(&[10], &[1], &[1]);
+        assert_eq!(order, vec![0]);
+    }
+
+    #[test]
+    fn test_compute_perm_order_3d() {
+        // 3D: src [1, 10, 100], dst [100, 10, 1]
+        // Min strides: dim 0 → min(1,100)=1, dim 1 → min(10,10)=10, dim 2 → min(100,1)=1
+        // Dim 0 and 2 tie with min=1. Dim 0: dst=100>src=1 → bonus=1. Dim 2: dst=1<=src=100 → bonus=0.
+        // Dim 2 wins (lower score).
+        let order = compute_perm_order(&[5, 5, 5], &[1, 10, 100], &[100, 10, 1]);
+        assert_eq!(*order.last().unwrap(), 2);
+    }
+
+    #[test]
     fn test_scattered_strides_plan() {
         // Simplified scattered case: 4 dims of size 2
         let dims = vec![2, 2, 2, 2];
