@@ -220,7 +220,7 @@ impl<T: Copy + Send + Sync> ContiguousOperandMut<T> {
     pub fn finalize_into(self, dest: &mut StridedViewMut<T>) -> crate::Result<()> {
         if self.needs_writeback {
             if let Some(ref buf) = self._buf {
-                strided_kernel::copy_into(dest, &buf.view())?;
+                strided_perm::copy_into(dest, &buf.view())?;
             }
         }
         Ok(())
