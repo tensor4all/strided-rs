@@ -67,82 +67,76 @@ directly instead of going through `strided_kernel::copy_into` (which fell back
 to the non-HPTT `map_into` path). This ensures the HPTT-optimized permutation
 is used when copying GEMM results back to non-contiguous destinations.
 
-## Current Strategy: Still Lazy, but with Fast Permutation
+## Current Strategy: Lazy Permutation + Source-Stride-Order Copy
 
-strided-rs currently **does NOT** always materialize like OMEinsum.jl. Instead,
-it keeps the lazy (metadata-only) permutation but ensures that when a subsequent
-step needs to copy the scattered tensor, it uses the HPTT-optimized path.
+strided-rs keeps the lazy (metadata-only) permutation but uses two optimized
+copy strategies when a subsequent step needs contiguous data:
 
-This is a pragmatic middle ground:
+### 1. Source-stride-order copy in `prepare_input_owned`
+
+Since einsum2 always produces col-major output, the source of
+`prepare_input_owned` is physically contiguous in memory — only the
+dims/strides metadata is permuted. The function `copy_strided_src_order`
+iterates in **source-stride order** (smallest source stride innermost), giving
+sequential reads that exploit the hardware prefetcher on cold-cache data.
+Scattered writes are absorbed by hardware write-combining buffers.
+
+This replaces HPTT for this specific path because HPTT iterates in
+*destination*-stride order — sequential writes, scattered reads. For large
+cold-cache data with many small dimensions (e.g. 24 binary dims), the scattered
+reads dominate performance. Additionally, HPTT's bilateral fusion can only merge
+consecutive dimensions; for 24 binary dims with scattered strides this leaves
+~17 fused dims with a 2×2 inner tile and 15 recursion levels — high per-element
+overhead.
+
+With `--features parallel`, a rayon-parallelized variant
+(`copy_strided_src_order_par`) splits the outer source-stride dimensions across
+threads, with automatic fallback to single-threaded when `RAYON_NUM_THREADS=1`
+or the tensor is small (< 1M elements).
+
+### 2. HPTT for other copy paths
+
+The rest of the pipeline (`finalize_into`, `bgemm_faer` pack, `single_tensor`,
+`operand`) still uses HPTT via `strided_kernel::copy_into` /
+`strided_perm::copy_into`. These paths typically operate on warm-cache data or
+have different stride patterns where HPTT's blocked approach remains effective.
+
+### Why not always-materialize?
 
 - **No extra copy when not needed** — if the next step's canonical order aligns,
   `try_fuse_group` succeeds and no copy occurs (truly zero cost)
-- **Fast copy when needed** — HPTT permutation runs at ~25 GB/s instead of
-  4 GB/s for the scattered case
-
-### When lazy permutation wins
-
-- Few dimensions with large sizes (e.g., `[1000, 1000, 1000]`) — even scattered
-  reads have good cache line utilization
-- Next step's access pattern aligns with current strides — no copy at all
-- Final output — no subsequent step pays the deferred cost
-
-### When eager materialization would win
-
-- Many small dimensions (e.g., 24 dims of size 2) where the scattered copy,
-  even with HPTT, is slower than two contiguous-to-contiguous copies
-- Long chains of steps where the deferred cost propagates
+- **Source-order copy is fast enough** — sequential reads on contiguous source
+  achieve near-memcpy bandwidth
 
 ## Benchmark Results
 
-`tensornetwork_permutation_light_415` (415 tensors, 24 binary dims, Apple M2):
+`tensornetwork_permutation_light_415` (415 tensors, 24 binary dims, AMD EPYC
+7713P):
 
-| Threads | strided-rs faer | OMEinsum.jl | Ratio |
-|---------|----------------:|------------:|------:|
-| 1T | 208 ms | 166 ms (IQR 83) | 1.25x |
-| 4T | 142 ms | 172 ms (IQR 40) | **0.83x** |
+| Configuration | opt_flops (ms) | vs OMEinsum.jl (388 ms) |
+|---------------|---------------:|------------------------:|
+| Original (HPTT) 1T | 455 | 1.17x slower |
+| Source-order copy 1T | 298 | **1.30x faster** |
+| Source-order copy + parallel 4T | 228 | **1.70x faster** |
 
-strided-rs is now competitive (faster at 4T), with dramatically lower variance
-(IQR < 4 ms vs 40-84 ms for OMEinsum.jl).
+The source-order copy alone yields a 34% improvement over HPTT. Adding
+parallel copy with 4 threads provides a further 24% speedup.
 
 ## Open Questions
 
-### Always-materialize as a future option
+### Extending source-order copy to other paths
 
-Issue #109 proposed always materializing output permutations (matching
-OMEinsum.jl). With HPTT-style permutation, the cost of eager materialization is
-low (~7 ms for 16M elements). The remaining question is whether the benefit
-outweighs the cost across all workload types:
+Currently only `prepare_input_owned` uses source-stride-order copy. Other copy
+paths (`finalize_into`, etc.) could also benefit when source data is contiguous
+but strides are scattered. This would require detecting contiguous-source
+patterns at each call site.
 
-- For tensor networks with many small dimensions: likely beneficial
-- For workloads with large contiguous dimensions: likely wasteful
-- A heuristic based on dimension count/sizes could be added
+### Thread scaling
 
-### Two-stage permutation
-
-When a lazy permutation is followed by another permutation (e.g., from the next
-step's input preparation), and the combined result is still non-contiguous,
-strided-rs currently performs a single scattered-to-contiguous copy. An
-alternative would be to split this into two stages:
-
-1. First: permute the lazy tensor to contiguous (HPTT, fast)
-2. Second: permute the contiguous result to the target layout (HPTT, fast)
-
-Two contiguous-to-contiguous permutations can be faster than one
-scattered-to-contiguous permutation because sequential reads have full cache
-line utilization and the hardware prefetcher works effectively. This is exactly
-the pattern that makes OMEinsum.jl's eager strategy work well.
-
-This two-stage approach could be implemented as:
-- Detect when the source has non-contiguous strides before calling
-  `copy_into_col_major` or `strided_perm::copy_into`
-- If so, first materialize to a temporary contiguous buffer, then permute from
-  the temporary to the destination
-- Only apply when the total element count exceeds a threshold (to avoid overhead
-  for small tensors)
-
-This would give the benefits of eager materialization without changing the
-overall lazy architecture.
+With 4 threads the parallel copy helps significantly, but the improvement may
+plateau with more threads as memory bandwidth saturates. Benchmarking with
+higher thread counts on different architectures would clarify the scaling
+characteristics.
 
 ## Related Issues and PRs
 
