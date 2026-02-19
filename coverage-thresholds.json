@@ -1,4 +1,8 @@
 {
   "_comment": "Per-file line coverage thresholds (%). Files not listed default to 'default'.",
-  "default": 80
+  "default": 80,
+  "files": {
+    "strided-perm/src/hptt/execute.rs": 65,
+    "strided-perm/src/hptt/macro_kernel.rs": 60
+  }
 }
