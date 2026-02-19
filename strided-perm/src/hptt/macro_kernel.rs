@@ -52,8 +52,7 @@ pub unsafe fn macro_kernel_f64(
             let i = (full_a * MICRO) as isize;
             for jj in 0..MICRO as isize {
                 for ii in 0..rem_a as isize {
-                    *dst.offset((j + jj) + (i + ii) * ldb) =
-                        *src.offset((i + ii) + (j + jj) * lda);
+                    *dst.offset((j + jj) + (i + ii) * ldb) = *src.offset((i + ii) + (j + jj) * lda);
                 }
             }
         }
@@ -66,8 +65,7 @@ pub unsafe fn macro_kernel_f64(
             let i = (ia * MICRO) as isize;
             for jj in 0..rem_b as isize {
                 for ii in 0..MICRO as isize {
-                    *dst.offset((j + jj) + (i + ii) * ldb) =
-                        *src.offset((i + ii) + (j + jj) * lda);
+                    *dst.offset((j + jj) + (i + ii) * ldb) = *src.offset((i + ii) + (j + jj) * lda);
                 }
             }
         }
@@ -76,8 +74,7 @@ pub unsafe fn macro_kernel_f64(
             let i = (full_a * MICRO) as isize;
             for jj in 0..rem_b as isize {
                 for ii in 0..rem_a as isize {
-                    *dst.offset((j + jj) + (i + ii) * ldb) =
-                        *src.offset((i + ii) + (j + jj) * lda);
+                    *dst.offset((j + jj) + (i + ii) * ldb) = *src.offset((i + ii) + (j + jj) * lda);
                 }
             }
         }
@@ -116,8 +113,7 @@ pub unsafe fn macro_kernel_f32(
             let i = (full_a * MICRO) as isize;
             for jj in 0..MICRO as isize {
                 for ii in 0..rem_a as isize {
-                    *dst.offset((j + jj) + (i + ii) * ldb) =
-                        *src.offset((i + ii) + (j + jj) * lda);
+                    *dst.offset((j + jj) + (i + ii) * ldb) = *src.offset((i + ii) + (j + jj) * lda);
                 }
             }
         }
@@ -129,8 +125,7 @@ pub unsafe fn macro_kernel_f32(
             let i = (ia * MICRO) as isize;
             for jj in 0..rem_b as isize {
                 for ii in 0..MICRO as isize {
-                    *dst.offset((j + jj) + (i + ii) * ldb) =
-                        *src.offset((i + ii) + (j + jj) * lda);
+                    *dst.offset((j + jj) + (i + ii) * ldb) = *src.offset((i + ii) + (j + jj) * lda);
                 }
             }
         }
@@ -138,8 +133,7 @@ pub unsafe fn macro_kernel_f32(
             let i = (full_a * MICRO) as isize;
             for jj in 0..rem_b as isize {
                 for ii in 0..rem_a as isize {
-                    *dst.offset((j + jj) + (i + ii) * ldb) =
-                        *src.offset((i + ii) + (j + jj) * lda);
+                    *dst.offset((j + jj) + (i + ii) * ldb) = *src.offset((i + ii) + (j + jj) * lda);
                 }
             }
         }
@@ -223,11 +217,7 @@ mod tests {
 
         for j in 0..n {
             for i in 0..n {
-                assert_eq!(
-                    dst[j + i * n],
-                    src[i + j * n],
-                    "mismatch at i={i}, j={j}"
-                );
+                assert_eq!(dst[j + i * n], src[i + j * n], "mismatch at i={i}, j={j}");
             }
         }
     }

@@ -54,11 +54,7 @@ mod tests {
         // B[4] = A[1] = 1, B[5] = A[5] = 5, ...
         for j in 0..4 {
             for i in 0..4 {
-                assert_eq!(
-                    dst[i + j * 4],
-                    src[i * 4 + j],
-                    "mismatch at i={i}, j={j}"
-                );
+                assert_eq!(dst[i + j * 4], src[i * 4 + j], "mismatch at i={i}, j={j}");
             }
         }
     }
@@ -80,11 +76,7 @@ mod tests {
 
         for j in 0..4 {
             for i in 0..4 {
-                assert_eq!(
-                    dst[i + j * 6],
-                    src[i * 5 + j],
-                    "mismatch at i={i}, j={j}"
-                );
+                assert_eq!(dst[i + j * 6], src[i * 5 + j], "mismatch at i={i}, j={j}");
             }
         }
     }
@@ -100,11 +92,7 @@ mod tests {
 
         for j in 0..8 {
             for i in 0..8 {
-                assert_eq!(
-                    dst[i + j * 8],
-                    src[i * 8 + j],
-                    "mismatch at i={i}, j={j}"
-                );
+                assert_eq!(dst[i + j * 8], src[i * 8 + j], "mismatch at i={i}, j={j}");
             }
         }
     }

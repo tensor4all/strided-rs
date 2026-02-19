@@ -158,7 +158,7 @@ fn block_for_elem_size(elem_size: usize) -> usize {
     match elem_size {
         8 => <ScalarKernel as MicroKernel<f64>>::BLOCK, // 16
         4 => <ScalarKernel as MicroKernel<f32>>::BLOCK, // 32
-        _ => 16,                                         // default
+        _ => 16,                                        // default
     }
 }
 
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(plan.block, 16); // f64 BLOCK
         assert_eq!(plan.lda_inner, 4); // src stride along dim_b
         assert_eq!(plan.ldb_inner, 5); // dst stride along dim_a
-        // No loop nodes (only 2 dims, both consumed by macro_kernel)
+                                       // No loop nodes (only 2 dims, both consumed by macro_kernel)
         assert!(plan.root.is_none());
     }
 
@@ -317,7 +317,7 @@ mod tests {
             ExecMode::Transpose { .. } | ExecMode::ConstStride1 { .. } => {
                 // After bilateral fusion, the mode depends on which dims fuse
             }
-            _ => panic!("unexpected mode")
+            _ => panic!("unexpected mode"),
         }
     }
 

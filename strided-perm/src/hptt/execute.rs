@@ -49,9 +49,7 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
 
             match &plan.root {
                 Some(root) => {
-                    transpose_recursive(
-                        src, dst, root, size_a, size_b, lda, ldb, block, elem_size,
-                    );
+                    transpose_recursive(src, dst, root, size_a, size_b, lda, ldb, block, elem_size);
                 }
                 None => {
                     // No outer loops — just the 2D blocked transpose
@@ -114,13 +112,15 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
             (0..outer_dim).into_par_iter().for_each(|i| {
                 let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
                     as *const T;
-                let d = (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize))
-                    as *mut T;
+                let d =
+                    (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
                     match &inner {
                         Some(next) => {
-                            transpose_recursive(s, d, next, size_a, size_b, lda, ldb, block, elem_size);
+                            transpose_recursive(
+                                s, d, next, size_a, size_b, lda, ldb, block, elem_size,
+                            );
                         }
                         None => {
                             dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block, elem_size);
@@ -137,8 +137,8 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
             (0..outer_dim).into_par_iter().for_each(|i| {
                 let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
                     as *const T;
-                let d = (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize))
-                    as *mut T;
+                let d =
+                    (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
                     match &inner {
@@ -219,8 +219,24 @@ unsafe fn dispatch_blocked_2d<T: Copy>(
     elem_size: usize,
 ) {
     match elem_size {
-        8 => blocked_transpose_2d_f64(src as *const f64, dst as *mut f64, size_a, size_b, lda, ldb, block),
-        4 => blocked_transpose_2d_f32(src as *const f32, dst as *mut f32, size_a, size_b, lda, ldb, block),
+        8 => blocked_transpose_2d_f64(
+            src as *const f64,
+            dst as *mut f64,
+            size_a,
+            size_b,
+            lda,
+            ldb,
+            block,
+        ),
+        4 => blocked_transpose_2d_f32(
+            src as *const f32,
+            dst as *mut f32,
+            size_a,
+            size_b,
+            lda,
+            ldb,
+            block,
+        ),
         _ => blocked_transpose_2d_fallback(src, dst, size_a, size_b, lda, ldb, block),
     }
 }
@@ -453,8 +469,7 @@ mod tests {
         let mut dst = vec![0.0f64; total];
 
         // Permuted [4,0,1,2,3]: dims [3,2,2,2,2], strides [16,1,2,4,8], dst [1,3,6,12,24]
-        let plan =
-            build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8);
+        let plan = build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8);
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
