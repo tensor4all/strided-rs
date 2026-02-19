@@ -15,7 +15,7 @@ thiserror = "1.0"
 [features]
 default = ["faer"]
 faer = ["strided-einsum2/faer", "strided-einsum2/faer-traits"]
-parallel = ["strided-einsum2/parallel"]
+parallel = ["strided-einsum2/parallel", "strided-kernel/parallel"]
 blas = ["strided-einsum2/blas"]
 blas-inject = ["strided-einsum2/blas-inject"]
 

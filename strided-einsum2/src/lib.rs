@@ -298,8 +298,8 @@ pub fn einsum2_naive_into<T, ID, MapA, MapB>(
 where
     T: ScalarBase,
     ID: AxisId,
-    MapA: Fn(T) -> T,
-    MapB: Fn(T) -> T,
+    MapA: Fn(T) -> T + strided_kernel::MaybeSync,
+    MapB: Fn(T) -> T + strided_kernel::MaybeSync,
 {
     let plan = Einsum2Plan::new(ia, ib, ic)?;
     validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
