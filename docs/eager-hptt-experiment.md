@@ -69,3 +69,15 @@ data copy at every permutation step, paying the cost unnecessarily.
 
 **Decision**: Keep lazy permutation as the default strategy. The `eager-permute`
 feature flag remains available for future investigation.
+
+## Implications for tenferro-rs
+
+These results motivated promoting `Contract` (fused permute + GEMM) to a
+**core operation** in `tenferro-prims`, rather than keeping it as an extended
+operation. When contraction is a core primitive, the backend controls internal
+data movement — it can use lazy permutation, source-stride-order copy, or
+`try_fuse_group` elision without the einsum layer needing to decompose into
+separate `Permute` + `BatchedGemm` calls.
+
+See `tenferro-rs/docs/design/contract-as-core-op.md` for the full design
+rationale.
