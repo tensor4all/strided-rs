@@ -27,6 +27,8 @@ default = ["faer", "faer-traits"]
 parallel = ["rayon", "strided-kernel/parallel"]
 blas = ["dep:cblas-sys", "dep:num-complex"]
 blas-inject = ["dep:cblas-inject", "dep:num-complex"]
+force-copy = []
+hptt-input-copy = []
 
 [dev-dependencies]
 approx = "0.5"

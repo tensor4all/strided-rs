@@ -18,6 +18,8 @@ faer = ["strided-einsum2/faer", "strided-einsum2/faer-traits"]
 parallel = ["strided-einsum2/parallel", "strided-kernel/parallel"]
 blas = ["strided-einsum2/blas"]
 blas-inject = ["strided-einsum2/blas-inject"]
+force-copy = ["strided-einsum2/force-copy"]
+hptt-input-copy = ["strided-einsum2/hptt-input-copy"]
 
 [dev-dependencies]
 approx = "0.5"

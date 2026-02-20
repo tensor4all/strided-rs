@@ -327,7 +327,10 @@ pub fn prepare_input_view<T: Scalar + 'static>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
+    #[cfg(not(feature = "force-copy"))]
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    #[cfg(feature = "force-copy")]
+    let mut needs_copy = true;
 
     // Backends requiring unit stride (e.g., CBLAS) need one of {row_stride, col_stride}
     // to be 1 (or 0 for size-1 dims). Batched multi-dim arrays may fuse successfully
@@ -589,7 +592,10 @@ pub fn prepare_input_owned<T: Scalar + 'static>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
+    #[cfg(not(feature = "force-copy"))]
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    #[cfg(feature = "force-copy")]
+    let mut needs_copy = true;
 
     // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
     if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
@@ -609,6 +615,13 @@ pub fn prepare_input_owned<T: Scalar + 'static>(
         // scattered strides.  HPTT iterates in destination order → scattered reads
         // from cold L3 cache.  Source-order iteration gives sequential reads that
         // exploit the hardware prefetcher.  See doc comment on copy_strided_src_order.
+        //
+        // When `hptt-input-copy` feature is enabled, use HPTT instead (for A/B comparison).
+        #[cfg(feature = "hptt-input-copy")]
+        {
+            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &arr.view())?;
+        }
+        #[cfg(not(feature = "hptt-input-copy"))]
         {
             let dst_strides = buf.strides().to_vec();
             unsafe {
@@ -698,7 +711,10 @@ pub fn prepare_output_view<T: Scalar + 'static>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
+    #[cfg(not(feature = "force-copy"))]
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    #[cfg(feature = "force-copy")]
+    let mut needs_copy = true;
 
     // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
     if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
@@ -777,7 +793,10 @@ pub fn prepare_output_owned<T: Scalar + 'static>(
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
+    #[cfg(not(feature = "force-copy"))]
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    #[cfg(feature = "force-copy")]
+    let mut needs_copy = true;
 
     // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
     if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
@@ -847,7 +866,10 @@ pub fn prepare_input_view_for_backend<T: ScalarBase + 'static, B: BackendConfig>
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
+    #[cfg(not(feature = "force-copy"))]
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    #[cfg(feature = "force-copy")]
+    let mut needs_copy = true;
 
     if B::REQUIRES_UNIT_STRIDE && !needs_copy {
         let (_, rs) = fused_g1.unwrap();
@@ -913,7 +935,10 @@ pub fn prepare_output_view_for_backend<T: ScalarBase + 'static, B: BackendConfig
     let fused_g1 = try_fuse_group(group1_dims, group1_strides);
     let fused_g2 = try_fuse_group(group2_dims, group2_strides);
 
+    #[cfg(not(feature = "force-copy"))]
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+    #[cfg(feature = "force-copy")]
+    let mut needs_copy = true;
 
     if B::REQUIRES_UNIT_STRIDE && !needs_copy {
         let (_, rs) = fused_g1.unwrap();
