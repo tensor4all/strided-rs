@@ -1074,8 +1074,7 @@ impl EinsumCode {
                     let mut children: Vec<Option<(EinsumOperand<'_>, Vec<char>)>> = Vec::new();
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
-                        let (op, ids) =
-                            eval_node(arg, &mut ops, &child_needed, pool, &unified)?;
+                        let (op, ids) = eval_node(arg, &mut ops, &child_needed, pool, &unified)?;
                         children.push(Some((op, ids)));
                     }
 

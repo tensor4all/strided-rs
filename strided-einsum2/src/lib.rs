@@ -519,13 +519,30 @@ where
     let materialize = if B::MATERIALIZES_CONJ { conj_fn } else { None };
 
     let a_op = contiguous::prepare_input_view(
-        &a_perm, n_lo, n_sum, conj_a, B::REQUIRES_UNIT_STRIDE, use_pool, materialize,
+        &a_perm,
+        n_lo,
+        n_sum,
+        conj_a,
+        B::REQUIRES_UNIT_STRIDE,
+        use_pool,
+        materialize,
     )?;
     let b_op = contiguous::prepare_input_view(
-        &b_perm, n_sum, n_ro, conj_b, B::REQUIRES_UNIT_STRIDE, use_pool, materialize,
+        &b_perm,
+        n_sum,
+        n_ro,
+        conj_b,
+        B::REQUIRES_UNIT_STRIDE,
+        use_pool,
+        materialize,
     )?;
     let mut c_op = contiguous::prepare_output_view(
-        &mut c_perm, n_lo, n_ro, beta, B::REQUIRES_UNIT_STRIDE, use_pool,
+        &mut c_perm,
+        n_lo,
+        n_ro,
+        beta,
+        B::REQUIRES_UNIT_STRIDE,
+        use_pool,
     )?;
 
     // Compute fused dimension sizes
@@ -644,18 +661,33 @@ where
 
     // 7. Prepare contiguous operands (owned path -- avoids extra copies)
     let conj_fn = make_conj_fn::<T>();
-    let materialize = if <backend::ActiveBackend as Backend<T>>::MATERIALIZES_CONJ { conj_fn } else { None };
+    let materialize = if <backend::ActiveBackend as Backend<T>>::MATERIALIZES_CONJ {
+        conj_fn
+    } else {
+        None
+    };
     let use_pool = true;
     let unit_stride = <backend::ActiveBackend as Backend<T>>::REQUIRES_UNIT_STRIDE;
     let a_op = contiguous::prepare_input_owned(
-        a_perm, n_lo, n_sum, conj_a_final, unit_stride, use_pool, materialize,
+        a_perm,
+        n_lo,
+        n_sum,
+        conj_a_final,
+        unit_stride,
+        use_pool,
+        materialize,
     )?;
     let b_op = contiguous::prepare_input_owned(
-        b_perm, n_sum, n_ro, conj_b_final, unit_stride, use_pool, materialize,
+        b_perm,
+        n_sum,
+        n_ro,
+        conj_b_final,
+        unit_stride,
+        use_pool,
+        materialize,
     )?;
-    let mut c_op = contiguous::prepare_output_view(
-        &mut c_perm, n_lo, n_ro, beta, unit_stride, use_pool,
-    )?;
+    let mut c_op =
+        contiguous::prepare_output_view(&mut c_perm, n_lo, n_ro, beta, unit_stride, use_pool)?;
 
     // 8. GEMM — dispatched through trait
     backend::ActiveBackend::bgemm_contiguous_into(

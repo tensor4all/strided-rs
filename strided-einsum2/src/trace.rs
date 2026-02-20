@@ -9,11 +9,7 @@ use strided_view::{ElementOp, StridedArray, StridedView};
 /// Find indices of trace axes: axes in `labels` that don't appear in `other` or `output`.
 ///
 /// Returns a (possibly empty) vector of positions in `labels`.
-pub fn find_trace_indices<ID: PartialEq>(
-    labels: &[ID],
-    other: &[ID],
-    output: &[ID],
-) -> Vec<usize> {
+pub fn find_trace_indices<ID: PartialEq>(labels: &[ID], other: &[ID], output: &[ID]) -> Vec<usize> {
     labels
         .iter()
         .enumerate()

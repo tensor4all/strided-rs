@@ -397,22 +397,37 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
         if c_is_col_major {
             let ldc = c.col_stride().max(m as isize).max(1) as i32;
             T::gemm(
-                trans_a, trans_b, m_i32, n_i32, k_i32, alpha,
-                a_ptr.offset(a_off), lda,
-                b_ptr.offset(b_off), ldb,
+                trans_a,
+                trans_b,
+                m_i32,
+                n_i32,
+                k_i32,
+                alpha,
+                a_ptr.offset(a_off),
+                lda,
+                b_ptr.offset(b_off),
+                ldb,
                 beta,
-                c_ptr.offset(c_off), ldc,
+                c_ptr.offset(c_off),
+                ldc,
             );
         } else {
             // C is row-major: rewrite as C^T = alpha * B^T * A^T + beta * C^T
             let ldc = c.row_stride().max(n as isize).max(1) as i32;
             T::gemm(
-                flip_transpose(trans_b), flip_transpose(trans_a),
-                n_i32, m_i32, k_i32, alpha,
-                b_ptr.offset(b_off), ldb,
-                a_ptr.offset(a_off), lda,
+                flip_transpose(trans_b),
+                flip_transpose(trans_a),
+                n_i32,
+                m_i32,
+                k_i32,
+                alpha,
+                b_ptr.offset(b_off),
+                ldb,
+                a_ptr.offset(a_off),
+                lda,
                 beta,
-                c_ptr.offset(c_off), ldc,
+                c_ptr.offset(c_off),
+                ldc,
             );
         }
     };

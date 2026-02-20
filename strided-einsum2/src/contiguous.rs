@@ -119,7 +119,10 @@ fn alloc_col_major_uninit_with_pool<T: Copy + 'static>(dims: &[usize]) -> (Strid
 }
 
 /// Allocate a col-major buffer, optionally reusing from the thread-local pool.
-fn alloc_maybe_pooled<T: Copy + 'static>(dims: &[usize], use_pool: bool) -> (StridedArray<T>, bool) {
+fn alloc_maybe_pooled<T: Copy + 'static>(
+    dims: &[usize],
+    use_pool: bool,
+) -> (StridedArray<T>, bool) {
     if use_pool {
         alloc_col_major_uninit_with_pool(dims)
     } else {
@@ -296,7 +299,11 @@ fn check_contiguity(
 /// Compute col-major layout parameters from a freshly-allocated col-major buffer.
 ///
 /// Returns `(row_stride, col_stride, batch_strides)`.
-fn col_major_layout(buf: &StridedArray<impl Copy>, n_group1: usize, n_inner: usize) -> (isize, isize, Vec<isize>) {
+fn col_major_layout(
+    buf: &StridedArray<impl Copy>,
+    n_group1: usize,
+    n_inner: usize,
+) -> (isize, isize, Vec<isize>) {
     let m: usize = buf.dims()[..n_group1].iter().product::<usize>().max(1);
     let row_stride = if m == 0 { 0 } else { 1isize };
     let col_stride = m as isize;
@@ -362,18 +369,24 @@ pub fn prepare_input_view<T: ScalarBase + 'static>(
             let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
             strided_kernel::map_into(&mut buf.view_mut(), view, conj_fn)?;
             let ptr = buf.view().ptr();
-            let (row_stride, col_stride, batch_strides) =
-                col_major_layout(&buf, n_group1, n_inner);
+            let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
             return Ok(ContiguousOperand {
-                ptr, row_stride, col_stride, batch_strides,
-                conj: false, _buf: Some(buf), buf_is_pooled,
+                ptr,
+                row_stride,
+                col_stride,
+                batch_strides,
+                conj: false,
+                _buf: Some(buf),
+                buf_is_pooled,
             });
         }
     }
 
     let check = check_contiguity(
-        &dims[..n_group1], &strides[..n_group1],
-        &dims[n_group1..n_inner], &strides[n_group1..n_inner],
+        &dims[..n_group1],
+        &strides[..n_group1],
+        &dims[n_group1..n_inner],
+        &strides[n_group1..n_inner],
         requires_unit_stride,
     );
 
@@ -383,17 +396,25 @@ pub fn prepare_input_view<T: ScalarBase + 'static>(
         let ptr = buf.view().ptr();
         let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
         Ok(ContiguousOperand {
-            ptr, row_stride, col_stride, batch_strides, conj,
-            _buf: Some(buf), buf_is_pooled,
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
+            conj,
+            _buf: Some(buf),
+            buf_is_pooled,
         })
     } else {
         let (_, rs) = check.fused_g1.unwrap();
         let (_, cs) = check.fused_g2.unwrap();
         Ok(ContiguousOperand {
             ptr: view.ptr(),
-            row_stride: rs, col_stride: cs,
+            row_stride: rs,
+            col_stride: cs,
             batch_strides: strides[n_inner..].to_vec(),
-            conj, _buf: None, buf_is_pooled: false,
+            conj,
+            _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
@@ -425,18 +446,24 @@ pub fn prepare_input_owned<T: ScalarBase + 'static>(
             let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
             strided_kernel::map_into(&mut buf.view_mut(), &arr.view(), conj_fn)?;
             let ptr = buf.view().ptr();
-            let (row_stride, col_stride, batch_strides) =
-                col_major_layout(&buf, n_group1, n_inner);
+            let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
             return Ok(ContiguousOperand {
-                ptr, row_stride, col_stride, batch_strides,
-                conj: false, _buf: Some(buf), buf_is_pooled,
+                ptr,
+                row_stride,
+                col_stride,
+                batch_strides,
+                conj: false,
+                _buf: Some(buf),
+                buf_is_pooled,
             });
         }
     }
 
     let check = check_contiguity(
-        &dims[..n_group1], &strides[..n_group1],
-        &dims[n_group1..n_inner], &strides[n_group1..n_inner],
+        &dims[..n_group1],
+        &strides[..n_group1],
+        &dims[n_group1..n_inner],
+        &strides[n_group1..n_inner],
         requires_unit_stride,
     );
 
@@ -446,18 +473,26 @@ pub fn prepare_input_owned<T: ScalarBase + 'static>(
         let ptr = buf.view().ptr();
         let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
         Ok(ContiguousOperand {
-            ptr, row_stride, col_stride, batch_strides, conj,
-            _buf: Some(buf), buf_is_pooled,
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
+            conj,
+            _buf: Some(buf),
+            buf_is_pooled,
         })
     } else {
         let (_, rs) = check.fused_g1.unwrap();
         let (_, cs) = check.fused_g2.unwrap();
         let ptr = arr.view().ptr();
         Ok(ContiguousOperand {
-            ptr, row_stride: rs, col_stride: cs,
+            ptr,
+            row_stride: rs,
+            col_stride: cs,
             batch_strides: strides[n_inner..].to_vec(),
             conj,
-            _buf: Some(arr), buf_is_pooled: false,
+            _buf: Some(arr),
+            buf_is_pooled: false,
         })
     }
 }
@@ -490,8 +525,10 @@ pub fn prepare_output_view<T: ScalarBase + 'static>(
     let n_inner = n_group1 + n_group2;
 
     let check = check_contiguity(
-        &dims[..n_group1], &strides[..n_group1],
-        &dims[n_group1..n_inner], &strides[n_group1..n_inner],
+        &dims[..n_group1],
+        &strides[..n_group1],
+        &dims[n_group1..n_inner],
+        &strides[n_group1..n_inner],
         requires_unit_stride,
     );
 
@@ -503,23 +540,28 @@ pub fn prepare_output_view<T: ScalarBase + 'static>(
         let ptr = buf.view_mut().as_mut_ptr();
         let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
         Ok(ContiguousOperandMut {
-            ptr, row_stride, col_stride, batch_strides,
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
             needs_writeback: true,
-            _buf: Some(buf), buf_is_pooled,
+            _buf: Some(buf),
+            buf_is_pooled,
         })
     } else {
         let (_, rs) = check.fused_g1.unwrap();
         let (_, cs) = check.fused_g2.unwrap();
         Ok(ContiguousOperandMut {
             ptr: view.as_mut_ptr(),
-            row_stride: rs, col_stride: cs,
+            row_stride: rs,
+            col_stride: cs,
             batch_strides: strides[n_inner..].to_vec(),
             needs_writeback: false,
-            _buf: None, buf_is_pooled: false,
+            _buf: None,
+            buf_is_pooled: false,
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests_generic_backend {
@@ -531,8 +573,15 @@ mod tests_generic_backend {
         let a = StridedArray::<f64>::col_major(&[2, 3]);
         let view = a.view();
         let op = prepare_input_view(
-            &view, 1, 1, false, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false, None,
-        ).unwrap();
+            &view,
+            1,
+            1,
+            false,
+            <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(op._buf.is_none());
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 2);
@@ -545,8 +594,15 @@ mod tests_generic_backend {
         let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
         let view = a.view();
         let op = prepare_input_view(
-            &view, 2, 1, false, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false, None,
-        ).unwrap();
+            &view,
+            2,
+            1,
+            false,
+            <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(op._buf.is_some());
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 6);
@@ -557,8 +613,14 @@ mod tests_generic_backend {
         let mut c = StridedArray::<f64>::col_major(&[2, 3]);
         let mut view = c.view_mut();
         let op = prepare_output_view(
-            &mut view, 1, 1, 0.0, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false,
-        ).unwrap();
+            &mut view,
+            1,
+            1,
+            0.0,
+            <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE,
+            false,
+        )
+        .unwrap();
         assert!(!op.needs_writeback);
         assert!(op._buf.is_none());
         assert_eq!(op.row_stride(), 1);
@@ -571,8 +633,14 @@ mod tests_generic_backend {
         let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
         let mut view = c.view_mut();
         let op = prepare_output_view(
-            &mut view, 2, 1, 0.0, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false,
-        ).unwrap();
+            &mut view,
+            2,
+            1,
+            0.0,
+            <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE,
+            false,
+        )
+        .unwrap();
         assert!(op.needs_writeback);
         assert!(op._buf.is_some());
         assert_eq!(op.row_stride(), 1);
@@ -588,8 +656,14 @@ mod tests_generic_backend {
         let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 1], &[10, 1, 1], 0).unwrap();
         let mut view = c.view_mut();
         let op = prepare_output_view(
-            &mut view, 2, 1, 1.0, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false,
-        ).unwrap();
+            &mut view,
+            2,
+            1,
+            1.0,
+            <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE,
+            false,
+        )
+        .unwrap();
         assert!(op.needs_writeback);
         let buf = op._buf.as_ref().unwrap();
         assert_eq!(buf.get(&[0, 0, 0]), 10.0);
