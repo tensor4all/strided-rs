@@ -371,12 +371,15 @@ where
     Ok(())
 }
 
-use crate::backend::{BgemmBackend, FaerBackend};
+use crate::backend::{Backend, FaerBackend};
 
-impl<T> BgemmBackend<T> for FaerBackend
+impl<T> Backend<T> for FaerBackend
 where
     T: crate::Scalar + ComplexField,
 {
+    const MATERIALIZES_CONJ: bool = false;
+    const REQUIRES_UNIT_STRIDE: bool = false;
+
     fn bgemm_contiguous_into(
         c: &mut ContiguousOperandMut<T>,
         a: &ContiguousOperand<T>,
@@ -740,11 +743,13 @@ mod tests {
 
     // ---- bgemm_contiguous_into tests ----
 
+    use crate::backend::{ActiveBackend, Backend};
     use crate::contiguous::{prepare_input_view, prepare_output_view};
+
+    const US: bool = <ActiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE;
 
     #[test]
     fn test_bgemm_contiguous_2x2() {
-        // Basic 2x2 matmul: C = A * B
         let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| {
             [[1.0, 2.0], [3.0, 4.0]][idx[0]][idx[1]]
         });
@@ -753,13 +758,10 @@ mod tests {
         });
         let mut c = StridedArray::<f64>::row_major(&[2, 2]);
 
-        // n_batch=0, A: n_group1=1 (lo), n_group2=1 (sum)
-        //             B: n_group1=1 (sum), n_group2=1 (ro)
-        //             C: n_group1=1 (lo), n_group2=1 (ro)
-        let a_op = prepare_input_view(&a.view(), 0, 1, 1, false).unwrap();
-        let b_op = prepare_input_view(&b.view(), 0, 1, 1, false).unwrap();
+        let a_op = prepare_input_view(&a.view(), 1, 1, false, US, true, None).unwrap();
+        let b_op = prepare_input_view(&b.view(), 1, 1, false, US, true, None).unwrap();
         let mut c_view = c.view_mut();
-        let mut c_op = prepare_output_view(&mut c_view, 0, 1, 1, 0.0).unwrap();
+        let mut c_op = prepare_output_view(&mut c_view, 1, 1, 0.0, US, true).unwrap();
 
         bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &[], 2, 2, 2, 1.0, 0.0).unwrap();
 
@@ -784,10 +786,10 @@ mod tests {
         let mut c = StridedArray::<f64>::row_major(&[2, 2, 2]);
 
         // n_batch=1, A: n_group1=1 (lo), n_group2=1 (sum)
-        let a_op = prepare_input_view(&a.view(), 1, 1, 1, false).unwrap();
-        let b_op = prepare_input_view(&b.view(), 1, 1, 1, false).unwrap();
+        let a_op = prepare_input_view(&a.view(), 1, 1, false, US, true, None).unwrap();
+        let b_op = prepare_input_view(&b.view(), 1, 1, false, US, true, None).unwrap();
         let mut c_view = c.view_mut();
-        let mut c_op = prepare_output_view(&mut c_view, 1, 1, 1, 0.0).unwrap();
+        let mut c_op = prepare_output_view(&mut c_view, 1, 1, 0.0, US, true).unwrap();
 
         bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &[2], 2, 2, 3, 1.0, 0.0).unwrap();
 
@@ -822,10 +824,10 @@ mod tests {
             [[10.0, 20.0], [30.0, 40.0]][idx[0]][idx[1]]
         });
 
-        let a_op = prepare_input_view(&a.view(), 0, 1, 1, false).unwrap();
-        let b_op = prepare_input_view(&b.view(), 0, 1, 1, false).unwrap();
+        let a_op = prepare_input_view(&a.view(), 1, 1, false, US, true, None).unwrap();
+        let b_op = prepare_input_view(&b.view(), 1, 1, false, US, true, None).unwrap();
         let mut c_view = c.view_mut();
-        let mut c_op = prepare_output_view(&mut c_view, 0, 1, 1, 3.0).unwrap();
+        let mut c_op = prepare_output_view(&mut c_view, 1, 1, 3.0, US, true).unwrap();
 
         bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &[], 2, 2, 2, 2.0, 3.0).unwrap();
 
@@ -852,10 +854,10 @@ mod tests {
         });
         let mut c = StridedArray::<f64>::row_major(&[2, 2]);
 
-        let a_op = prepare_input_view(&a.view(), 0, 1, 1, false).unwrap();
-        let b_op = prepare_input_view(&b.view(), 0, 1, 1, false).unwrap();
+        let a_op = prepare_input_view(&a.view(), 1, 1, false, US, true, None).unwrap();
+        let b_op = prepare_input_view(&b.view(), 1, 1, false, US, true, None).unwrap();
         let mut c_view = c.view_mut();
-        let mut c_op = prepare_output_view(&mut c_view, 0, 1, 1, 0.0).unwrap();
+        let mut c_op = prepare_output_view(&mut c_view, 1, 1, 0.0, US, true).unwrap();
 
         bgemm_contiguous_into(&mut c_op, &a_op, &b_op, &[], 2, 2, 2, 1.0, 0.0).unwrap();
 

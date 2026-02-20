@@ -4,7 +4,7 @@
 //! Operands must already have contiguous inner dimensions (prepared via
 //! `prepare_input_*` and `prepare_output_*` in the `contiguous` module).
 
-use crate::backend::{BgemmBackend, BlasBackend};
+use crate::backend::{Backend, BlasBackend};
 use crate::contiguous::{ContiguousOperand, ContiguousOperandMut};
 use crate::util::{try_fuse_group, MultiIndex};
 use crate::Scalar;
@@ -295,6 +295,17 @@ impl BlasGemm for num_complex::Complex64 {
     }
 }
 
+/// Flip a CBLAS transpose flag: NoTrans ↔ Trans.
+///
+/// Used when C is row-major and we rewrite C = A·B as C^T = B^T · A^T.
+fn flip_transpose(t: cblas_sys::CBLAS_TRANSPOSE) -> cblas_sys::CBLAS_TRANSPOSE {
+    match t {
+        cblas_sys::CBLAS_TRANSPOSE::CblasNoTrans => cblas_sys::CBLAS_TRANSPOSE::CblasTrans,
+        cblas_sys::CBLAS_TRANSPOSE::CblasTrans => cblas_sys::CBLAS_TRANSPOSE::CblasNoTrans,
+        other => other,
+    }
+}
+
 /// Determine transpose flag and leading dimension for a contiguous operand.
 ///
 /// CBLAS CblasColMajor expects:
@@ -366,10 +377,6 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     debug_assert!(!a.conj());
     debug_assert!(!b.conj());
 
-    let a_batch_strides = a.batch_strides();
-    let b_batch_strides = b.batch_strides();
-    let c_batch_strides = c.batch_strides();
-
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
     let c_ptr = c.ptr();
@@ -383,66 +390,38 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     let n_i32 = n as i32;
     let k_i32 = k as i32;
 
-    // Inline closure for per-batch GEMM (shared between fast and slow paths)
-    let mut do_batch = |a_off: isize, b_off: isize, c_off: isize| unsafe {
+    // Per-batch GEMM dispatch closure (individual cblas_dgemm calls).
+    // Using individual calls instead of cblas_dgemm_batch avoids Vec allocation
+    // overhead and is faster for many small GEMMs (e.g. str_mps, matrix_chain).
+    let do_batch = |a_off: isize, b_off: isize, c_off: isize| unsafe {
         if c_is_col_major {
-            // Standard: C (col-major) = alpha * op(A) * op(B) + beta * C
-            // ldc must be >= m for col-major C
             let ldc = c.col_stride().max(m as isize).max(1) as i32;
             T::gemm(
-                trans_a,
-                trans_b,
-                m_i32,
-                n_i32,
-                k_i32,
-                alpha,
-                a_ptr.offset(a_off),
-                lda,
-                b_ptr.offset(b_off),
-                ldb,
+                trans_a, trans_b, m_i32, n_i32, k_i32, alpha,
+                a_ptr.offset(a_off), lda,
+                b_ptr.offset(b_off), ldb,
                 beta,
-                c_ptr.offset(c_off),
-                ldc,
+                c_ptr.offset(c_off), ldc,
             );
         } else {
-            // C is row-major (col_stride=1, row_stride>=n).
-            // Rewrite as: C^T = alpha * B^T * A^T + beta * C^T
-            // where C^T is col-major n×m with ldc >= n.
+            // C is row-major: rewrite as C^T = alpha * B^T * A^T + beta * C^T
             let ldc = c.row_stride().max(n as isize).max(1) as i32;
-            let flip = |t: cblas_sys::CBLAS_TRANSPOSE| -> cblas_sys::CBLAS_TRANSPOSE {
-                match t {
-                    cblas_sys::CBLAS_TRANSPOSE::CblasNoTrans => {
-                        cblas_sys::CBLAS_TRANSPOSE::CblasTrans
-                    }
-                    cblas_sys::CBLAS_TRANSPOSE::CblasTrans => {
-                        cblas_sys::CBLAS_TRANSPOSE::CblasNoTrans
-                    }
-                    other => other,
-                }
-            };
             T::gemm(
-                flip(trans_b),
-                flip(trans_a),
-                n_i32,
-                m_i32,
-                k_i32,
-                alpha,
-                b_ptr.offset(b_off),
-                ldb,
-                a_ptr.offset(a_off),
-                lda,
+                flip_transpose(trans_b), flip_transpose(trans_a),
+                n_i32, m_i32, k_i32, alpha,
+                b_ptr.offset(b_off), ldb,
+                a_ptr.offset(a_off), lda,
                 beta,
-                c_ptr.offset(c_off),
-                ldc,
+                c_ptr.offset(c_off), ldc,
             );
         }
     };
 
     // Fast path: when batch dims are contiguous for all operands, use pointer
     // increments instead of MultiIndex carry-based iteration.
-    let fused_a = try_fuse_group(batch_dims, a_batch_strides);
-    let fused_b = try_fuse_group(batch_dims, b_batch_strides);
-    let fused_c = try_fuse_group(batch_dims, c_batch_strides);
+    let fused_a = try_fuse_group(batch_dims, a.batch_strides());
+    let fused_b = try_fuse_group(batch_dims, b.batch_strides());
+    let fused_c = try_fuse_group(batch_dims, c.batch_strides());
 
     if let (Some((total, a_step)), Some((_, b_step)), Some((_, c_step))) =
         (fused_a, fused_b, fused_c)
@@ -459,9 +438,9 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     } else {
         let mut batch_iter = MultiIndex::new(batch_dims);
         while batch_iter.next().is_some() {
-            let a_off = batch_iter.offset(a_batch_strides);
-            let b_off = batch_iter.offset(b_batch_strides);
-            let c_off = batch_iter.offset(c_batch_strides);
+            let a_off = batch_iter.offset(a.batch_strides());
+            let b_off = batch_iter.offset(b.batch_strides());
+            let c_off = batch_iter.offset(c.batch_strides());
             do_batch(a_off, b_off, c_off);
         }
     }
@@ -469,10 +448,13 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
     Ok(())
 }
 
-impl<T> BgemmBackend<T> for BlasBackend
+impl<T> Backend<T> for BlasBackend
 where
     T: Scalar + BlasGemm,
 {
+    const MATERIALIZES_CONJ: bool = true;
+    const REQUIRES_UNIT_STRIDE: bool = true;
+
     fn bgemm_contiguous_into(
         c: &mut ContiguousOperandMut<T>,
         a: &ContiguousOperand<T>,

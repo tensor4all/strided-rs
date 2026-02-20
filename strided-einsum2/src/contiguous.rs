@@ -4,8 +4,7 @@
 //! checking fusability, copying to col-major buffers when needed, and managing
 //! the writeback for borrowed output operands.
 
-use crate::backend::{ActiveBackend, BackendConfig};
-use crate::{Scalar, ScalarBase};
+use crate::ScalarBase;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -117,6 +116,15 @@ fn alloc_col_major_uninit_with_pool<T: Copy + 'static>(dims: &[usize]) -> (Strid
     let data = take_pooled_vec_uninit::<T>(total);
     let arr = unsafe { StridedArray::col_major_from_buffer_uninit(data, dims) };
     (arr, true)
+}
+
+/// Allocate a col-major buffer, optionally reusing from the thread-local pool.
+fn alloc_maybe_pooled<T: Copy + 'static>(dims: &[usize], use_pool: bool) -> (StridedArray<T>, bool) {
+    if use_pool {
+        alloc_col_major_uninit_with_pool(dims)
+    } else {
+        (alloc_col_major_uninit(dims), false)
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +255,55 @@ impl<T: Copy + 'static> Drop for ContiguousOperandMut<T> {
     }
 }
 
+/// Result of checking whether dimension groups are contiguous enough for GEMM.
+struct ContiguityCheck {
+    fused_g1: Option<(usize, isize)>,
+    fused_g2: Option<(usize, isize)>,
+    needs_copy: bool,
+}
+
+/// Check if two dimension groups are fusable (contiguous) for GEMM.
+///
+/// When `requires_unit_stride` is true (e.g., CBLAS backend), also checks that
+/// at least one of the fused strides is 0 or 1.
+fn check_contiguity(
+    group1_dims: &[usize],
+    group1_strides: &[isize],
+    group2_dims: &[usize],
+    group2_strides: &[isize],
+    requires_unit_stride: bool,
+) -> ContiguityCheck {
+    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
+    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
+
+    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
+
+    if requires_unit_stride && !needs_copy {
+        let (_, rs) = fused_g1.unwrap();
+        let (_, cs) = fused_g2.unwrap();
+        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
+            needs_copy = true;
+        }
+    }
+
+    ContiguityCheck {
+        fused_g1,
+        fused_g2,
+        needs_copy,
+    }
+}
+
+/// Compute col-major layout parameters from a freshly-allocated col-major buffer.
+///
+/// Returns `(row_stride, col_stride, batch_strides)`.
+fn col_major_layout(buf: &StridedArray<impl Copy>, n_group1: usize, n_inner: usize) -> (isize, isize, Vec<isize>) {
+    let m: usize = buf.dims()[..n_group1].iter().product::<usize>().max(1);
+    let row_stride = if m == 0 { 0 } else { 1isize };
+    let col_stride = m as isize;
+    let batch_strides = buf.strides()[n_inner..].to_vec();
+    (row_stride, col_stride, batch_strides)
+}
+
 /// Allocate a column-major StridedArray with uninitialized data.
 ///
 /// With batch-last canonical order `[inner..., batch...]`, pure column-major
@@ -280,92 +337,63 @@ pub(crate) fn alloc_col_major_uninit<T: Copy>(dims: &[usize]) -> StridedArray<T>
 /// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// Checks if the two inner dimension groups are fusable.
 /// If not, copies to a contiguous col-major buffer.
-pub fn prepare_input_view<T: Scalar + 'static>(
+///
+/// - `requires_unit_stride`: backend needs at least one unit stride (e.g. CBLAS).
+/// - `use_pool`: reuse thread-local buffers to avoid repeated allocation.
+/// - `materialize_conj_fn`: when `Some(f)` and `conj == true`, applies `f` to each
+///   element during copy (for backends that cannot pass conj flags to GEMM).
+pub fn prepare_input_view<T: ScalarBase + 'static>(
     view: &StridedView<T>,
-    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     conj: bool,
+    requires_unit_stride: bool,
+    use_pool: bool,
+    materialize_conj_fn: Option<fn(T) -> T>,
 ) -> crate::Result<ContiguousOperand<T>> {
     let dims = view.dims();
     let strides = view.strides();
     let n_inner = n_group1 + n_group2;
 
-    // Extract dimension/stride groups (batch-last: inner first, batch at end)
-    let group1_dims = &dims[..n_group1];
-    let group1_strides = &strides[..n_group1];
-    let group2_dims = &dims[n_group1..n_inner];
-    let group2_strides = &strides[n_group1..n_inner];
-
     // For backends that cannot pass conjugation flags to GEMM (e.g., CBLAS),
     // materialize conj into the data before the GEMM call.
-    if ActiveBackend::MATERIALIZES_CONJ && conj {
-        use strided_view::Conj as ConjOp;
-        use strided_view::ElementOp;
-
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(dims);
-        strided_kernel::map_into(&mut buf.view_mut(), view, |x| ConjOp::apply(x))?;
-        let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
-        return Ok(ContiguousOperand {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            conj: false,
-            _buf: Some(buf),
-            buf_is_pooled,
-        });
-    }
-
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
-
-    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
-
-    // Backends requiring unit stride (e.g., CBLAS) need one of {row_stride, col_stride}
-    // to be 1 (or 0 for size-1 dims). Batched multi-dim arrays may fuse successfully
-    // but still have non-unit strides in both groups. Force a copy in that case.
-    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
-            needs_copy = true;
+    if let Some(conj_fn) = materialize_conj_fn {
+        if conj {
+            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+            strided_kernel::map_into(&mut buf.view_mut(), view, conj_fn)?;
+            let ptr = buf.view().ptr();
+            let (row_stride, col_stride, batch_strides) =
+                col_major_layout(&buf, n_group1, n_inner);
+            return Ok(ContiguousOperand {
+                ptr, row_stride, col_stride, batch_strides,
+                conj: false, _buf: Some(buf), buf_is_pooled,
+            });
         }
     }
 
-    if needs_copy {
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(dims);
+    let check = check_contiguity(
+        &dims[..n_group1], &strides[..n_group1],
+        &dims[n_group1..n_inner], &strides[n_group1..n_inner],
+        requires_unit_stride,
+    );
+
+    if check.needs_copy {
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
         strided_kernel::copy_into_col_major(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
+        let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
         Ok(ContiguousOperand {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            conj,
-            _buf: Some(buf),
-            buf_is_pooled,
+            ptr, row_stride, col_stride, batch_strides, conj,
+            _buf: Some(buf), buf_is_pooled,
         })
     } else {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[n_inner..].to_vec();
+        let (_, rs) = check.fused_g1.unwrap();
+        let (_, cs) = check.fused_g2.unwrap();
         Ok(ContiguousOperand {
             ptr: view.ptr(),
-            row_stride: rs,
-            col_stride: cs,
-            batch_strides,
-            conj,
-            _buf: None,
-            buf_is_pooled: false,
+            row_stride: rs, col_stride: cs,
+            batch_strides: strides[n_inner..].to_vec(),
+            conj, _buf: None, buf_is_pooled: false,
         })
     }
 }
@@ -375,91 +403,61 @@ pub fn prepare_input_view<T: Scalar + 'static>(
 /// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
 /// If already contiguous after dimension grouping, transfers ownership without copying.
 /// Otherwise, copies to a new col-major buffer.
-pub fn prepare_input_owned<T: Scalar + 'static>(
+///
+/// Parameters are the same as [`prepare_input_view`].
+pub fn prepare_input_owned<T: ScalarBase + 'static>(
     arr: StridedArray<T>,
-    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     conj: bool,
+    requires_unit_stride: bool,
+    use_pool: bool,
+    materialize_conj_fn: Option<fn(T) -> T>,
 ) -> crate::Result<ContiguousOperand<T>> {
     let dims = arr.dims().to_vec();
     let strides = arr.strides().to_vec();
     let n_inner = n_group1 + n_group2;
 
-    // Extract dimension/stride groups (batch-last)
-    let group1_dims = &dims[..n_group1];
-    let group1_strides = &strides[..n_group1];
-    let group2_dims = &dims[n_group1..n_inner];
-    let group2_strides = &strides[n_group1..n_inner];
-
     // For backends that cannot pass conjugation flags to GEMM,
     // materialize conj into the data before the GEMM call.
-    if ActiveBackend::MATERIALIZES_CONJ && conj {
-        use strided_view::Conj as ConjOp;
-        use strided_view::ElementOp;
-
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
-        strided_kernel::map_into(&mut buf.view_mut(), &arr.view(), |x| ConjOp::apply(x))?;
-        let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
-        return Ok(ContiguousOperand {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            conj: false,
-            _buf: Some(buf),
-            buf_is_pooled,
-        });
-    }
-
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
-
-    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
-
-    // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
-    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
-            needs_copy = true;
+    if let Some(conj_fn) = materialize_conj_fn {
+        if conj {
+            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
+            strided_kernel::map_into(&mut buf.view_mut(), &arr.view(), conj_fn)?;
+            let ptr = buf.view().ptr();
+            let (row_stride, col_stride, batch_strides) =
+                col_major_layout(&buf, n_group1, n_inner);
+            return Ok(ContiguousOperand {
+                ptr, row_stride, col_stride, batch_strides,
+                conj: false, _buf: Some(buf), buf_is_pooled,
+            });
         }
     }
 
-    if needs_copy {
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
+    let check = check_contiguity(
+        &dims[..n_group1], &strides[..n_group1],
+        &dims[n_group1..n_inner], &strides[n_group1..n_inner],
+        requires_unit_stride,
+    );
+
+    if check.needs_copy {
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
         strided_kernel::copy_into_col_major(&mut buf.view_mut(), &arr.view())?;
         let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
+        let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
         Ok(ContiguousOperand {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            conj,
-            _buf: Some(buf),
-            buf_is_pooled,
+            ptr, row_stride, col_stride, batch_strides, conj,
+            _buf: Some(buf), buf_is_pooled,
         })
     } else {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[n_inner..].to_vec();
+        let (_, rs) = check.fused_g1.unwrap();
+        let (_, cs) = check.fused_g2.unwrap();
         let ptr = arr.view().ptr();
         Ok(ContiguousOperand {
-            ptr,
-            row_stride: rs,
-            col_stride: cs,
-            batch_strides,
+            ptr, row_stride: rs, col_stride: cs,
+            batch_strides: strides[n_inner..].to_vec(),
             conj,
-            _buf: Some(arr),
-            buf_is_pooled: false,
+            _buf: Some(arr), buf_is_pooled: false,
         })
     }
 }
@@ -479,296 +477,62 @@ pub fn prepare_input_owned<T: Scalar + 'static>(
 /// When inner dims are fusable (no copy needed), the returned `ContiguousOperandMut`
 /// holds a raw pointer into `view`'s data. The caller must ensure `view` outlives
 /// the returned operand and that no aliasing mutable references exist during GEMM.
-pub fn prepare_output_view<T: Scalar + 'static>(
+pub fn prepare_output_view<T: ScalarBase + 'static>(
     view: &mut StridedViewMut<T>,
-    _n_batch: usize,
     n_group1: usize,
     n_group2: usize,
     beta: T,
+    requires_unit_stride: bool,
+    use_pool: bool,
 ) -> crate::Result<ContiguousOperandMut<T>> {
     let dims = view.dims().to_vec();
     let strides = view.strides().to_vec();
     let n_inner = n_group1 + n_group2;
 
-    let group1_dims = &dims[..n_group1];
-    let group1_strides = &strides[..n_group1];
-    let group2_dims = &dims[n_group1..n_inner];
-    let group2_strides = &strides[n_group1..n_inner];
+    let check = check_contiguity(
+        &dims[..n_group1], &strides[..n_group1],
+        &dims[n_group1..n_inner], &strides[n_group1..n_inner],
+        requires_unit_stride,
+    );
 
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
-
-    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
-
-    // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
-    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
-            needs_copy = true;
-        }
-    }
-
-    if needs_copy {
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let (mut buf, buf_is_pooled) = alloc_col_major_uninit_with_pool(&dims);
-        if beta != T::zero() {
-            // Need to preserve existing values for accumulation
-            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
-        }
-        let ptr = buf.view_mut().as_mut_ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
-        Ok(ContiguousOperandMut {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            needs_writeback: true,
-            _buf: Some(buf),
-            buf_is_pooled,
-        })
-    } else {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[n_inner..].to_vec();
-        Ok(ContiguousOperandMut {
-            ptr: view.as_mut_ptr(),
-            row_stride: rs,
-            col_stride: cs,
-            batch_strides,
-            needs_writeback: false,
-            _buf: None,
-            buf_is_pooled: false,
-        })
-    }
-}
-
-/// Prepare an owned mutable output array for GEMM.
-///
-/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
-/// If already contiguous after dimension grouping, uses the array in-place.
-/// Otherwise, allocates a col-major buffer and copies existing data when
-/// `beta` is non-zero.
-///
-/// Unlike [`prepare_output_view`], `needs_writeback` is always `false` for owned
-/// arrays because the caller owns the buffer and can use it directly.
-///
-/// Currently unused in production (C is always a `StridedViewMut` from the caller).
-/// Kept for future use when `einsum2_into` accepts owned output arrays.
-#[allow(dead_code)]
-pub fn prepare_output_owned<T: Scalar + 'static>(
-    arr: &mut StridedArray<T>,
-    _n_batch: usize,
-    n_group1: usize,
-    n_group2: usize,
-    beta: T,
-) -> crate::Result<ContiguousOperandMut<T>> {
-    let dims = arr.dims().to_vec();
-    let strides = arr.strides().to_vec();
-    let n_inner = n_group1 + n_group2;
-
-    let group1_dims = &dims[..n_group1];
-    let group1_strides = &strides[..n_group1];
-    let group2_dims = &dims[n_group1..n_inner];
-    let group2_strides = &strides[n_group1..n_inner];
-
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
-
-    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
-
-    // Backends requiring unit stride need one of {row_stride, col_stride} to be 1 (or 0).
-    if ActiveBackend::REQUIRES_UNIT_STRIDE && !needs_copy {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
-            needs_copy = true;
-        }
-    }
-
-    if needs_copy {
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(&dims);
-        if beta != T::zero() {
-            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &arr.view())?;
-        }
-        let ptr = buf.view_mut().as_mut_ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
-        Ok(ContiguousOperandMut {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            needs_writeback: false,
-            _buf: Some(buf),
-            buf_is_pooled: false,
-        })
-    } else {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[n_inner..].to_vec();
-        Ok(ContiguousOperandMut {
-            ptr: arr.view_mut().as_mut_ptr(),
-            row_stride: rs,
-            col_stride: cs,
-            batch_strides,
-            needs_writeback: false,
-            _buf: None,
-            buf_is_pooled: false,
-        })
-    }
-}
-
-/// Prepare a borrowed input view for a generic GEMM backend.
-///
-/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
-/// Like [`prepare_input_view`] but works with any `ScalarBase` type and
-/// does not handle conjugation materialization. The `conj` field of the
-/// returned operand is always `false`.
-pub fn prepare_input_view_for_backend<T: ScalarBase + 'static, B: BackendConfig>(
-    view: &StridedView<T>,
-    _n_batch: usize,
-    n_group1: usize,
-    n_group2: usize,
-) -> crate::Result<ContiguousOperand<T>> {
-    let dims = view.dims();
-    let strides = view.strides();
-    let n_inner = n_group1 + n_group2;
-
-    let group1_dims = &dims[..n_group1];
-    let group1_strides = &strides[..n_group1];
-    let group2_dims = &dims[n_group1..n_inner];
-    let group2_strides = &strides[n_group1..n_inner];
-
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
-
-    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
-
-    if B::REQUIRES_UNIT_STRIDE && !needs_copy {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
-            needs_copy = true;
-        }
-    }
-
-    if needs_copy {
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(dims);
-        strided_kernel::copy_into_col_major(&mut buf.view_mut(), view)?;
-        let ptr = buf.view().ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
-        Ok(ContiguousOperand {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
-            conj: false,
-            _buf: Some(buf),
-            buf_is_pooled: false,
-        })
-    } else {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[n_inner..].to_vec();
-        Ok(ContiguousOperand {
-            ptr: view.ptr(),
-            row_stride: rs,
-            col_stride: cs,
-            batch_strides,
-            conj: false,
-            _buf: None,
-            buf_is_pooled: false,
-        })
-    }
-}
-
-/// Prepare a borrowed mutable output view for a generic GEMM backend.
-///
-/// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
-/// Like [`prepare_output_view`] but works with any `ScalarBase` type.
-pub fn prepare_output_view_for_backend<T: ScalarBase + 'static, B: BackendConfig>(
-    view: &mut StridedViewMut<T>,
-    _n_batch: usize,
-    n_group1: usize,
-    n_group2: usize,
-    beta: T,
-) -> crate::Result<ContiguousOperandMut<T>> {
-    let dims = view.dims().to_vec();
-    let strides = view.strides().to_vec();
-    let n_inner = n_group1 + n_group2;
-
-    let group1_dims = &dims[..n_group1];
-    let group1_strides = &strides[..n_group1];
-    let group2_dims = &dims[n_group1..n_inner];
-    let group2_strides = &strides[n_group1..n_inner];
-
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
-
-    let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
-
-    if B::REQUIRES_UNIT_STRIDE && !needs_copy {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        if rs != 0 && rs != 1 && cs != 0 && cs != 1 {
-            needs_copy = true;
-        }
-    }
-
-    if needs_copy {
-        let m: usize = group1_dims.iter().product::<usize>().max(1);
-        let mut buf = alloc_col_major_uninit(&dims);
+    if check.needs_copy {
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
         if beta != T::zero() {
             strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
         }
         let ptr = buf.view_mut().as_mut_ptr();
-        let batch_strides = buf.strides()[n_inner..].to_vec();
-        let row_stride = if m == 0 { 0 } else { 1isize };
-        let col_stride = m as isize;
+        let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
         Ok(ContiguousOperandMut {
-            ptr,
-            row_stride,
-            col_stride,
-            batch_strides,
+            ptr, row_stride, col_stride, batch_strides,
             needs_writeback: true,
-            _buf: Some(buf),
-            buf_is_pooled: false,
+            _buf: Some(buf), buf_is_pooled,
         })
     } else {
-        let (_, rs) = fused_g1.unwrap();
-        let (_, cs) = fused_g2.unwrap();
-        let batch_strides = strides[n_inner..].to_vec();
+        let (_, rs) = check.fused_g1.unwrap();
+        let (_, cs) = check.fused_g2.unwrap();
         Ok(ContiguousOperandMut {
             ptr: view.as_mut_ptr(),
-            row_stride: rs,
-            col_stride: cs,
-            batch_strides,
+            row_stride: rs, col_stride: cs,
+            batch_strides: strides[n_inner..].to_vec(),
             needs_writeback: false,
-            _buf: None,
-            buf_is_pooled: false,
+            _buf: None, buf_is_pooled: false,
         })
     }
 }
+
 
 #[cfg(test)]
 mod tests_generic_backend {
     use super::*;
-    use crate::backend::NaiveBackend;
+    use crate::backend::{Backend, NaiveBackend};
 
     #[test]
     fn test_input_for_backend_contiguous() {
         let a = StridedArray::<f64>::col_major(&[2, 3]);
         let view = a.view();
-        let op = prepare_input_view_for_backend::<f64, NaiveBackend>(&view, 0, 1, 1).unwrap();
-        // Contiguous col-major: no copy
+        let op = prepare_input_view(
+            &view, 1, 1, false, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false, None,
+        ).unwrap();
         assert!(op._buf.is_none());
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 2);
@@ -780,7 +544,9 @@ mod tests_generic_backend {
         let data = vec![0.0f64; 100];
         let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
         let view = a.view();
-        let op = prepare_input_view_for_backend::<f64, NaiveBackend>(&view, 0, 2, 1).unwrap();
+        let op = prepare_input_view(
+            &view, 2, 1, false, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false, None,
+        ).unwrap();
         assert!(op._buf.is_some());
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 6);
@@ -790,8 +556,9 @@ mod tests_generic_backend {
     fn test_output_for_backend_contiguous() {
         let mut c = StridedArray::<f64>::col_major(&[2, 3]);
         let mut view = c.view_mut();
-        let op =
-            prepare_output_view_for_backend::<f64, NaiveBackend>(&mut view, 0, 1, 1, 0.0).unwrap();
+        let op = prepare_output_view(
+            &mut view, 1, 1, 0.0, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false,
+        ).unwrap();
         assert!(!op.needs_writeback);
         assert!(op._buf.is_none());
         assert_eq!(op.row_stride(), 1);
@@ -803,8 +570,9 @@ mod tests_generic_backend {
         let data = vec![0.0f64; 100];
         let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
         let mut view = c.view_mut();
-        let op =
-            prepare_output_view_for_backend::<f64, NaiveBackend>(&mut view, 0, 2, 1, 0.0).unwrap();
+        let op = prepare_output_view(
+            &mut view, 2, 1, 0.0, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false,
+        ).unwrap();
         assert!(op.needs_writeback);
         assert!(op._buf.is_some());
         assert_eq!(op.row_stride(), 1);
@@ -819,43 +587,32 @@ mod tests_generic_backend {
         data[10] = 40.0;
         let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 1], &[10, 1, 1], 0).unwrap();
         let mut view = c.view_mut();
-        let op =
-            prepare_output_view_for_backend::<f64, NaiveBackend>(&mut view, 0, 2, 1, 1.0).unwrap();
+        let op = prepare_output_view(
+            &mut view, 2, 1, 1.0, <NaiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE, false,
+        ).unwrap();
         assert!(op.needs_writeback);
-        // beta != 0 -> existing data copied into buffer
         let buf = op._buf.as_ref().unwrap();
         assert_eq!(buf.get(&[0, 0, 0]), 10.0);
         assert_eq!(buf.get(&[0, 1, 0]), 20.0);
         assert_eq!(buf.get(&[1, 0, 0]), 40.0);
-        // finalize copies back
         op.finalize_into(&mut view).unwrap();
     }
 }
 
 #[cfg(test)]
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
 mod tests {
     use super::*;
+    use crate::backend::{ActiveBackend, Backend};
+
+    // Helper to construct prepare_input_view params matching the active backend.
+    const UNIT_STRIDE: bool = <ActiveBackend as Backend<f64>>::REQUIRES_UNIT_STRIDE;
 
     #[test]
     fn test_borrowed_contiguous_no_copy() {
-        // Col-major [2,3]: strides [1,2]. n_batch=0, n_group1=1, n_group2=1.
-        // Group1 = dim [2], stride [1] -> fuses to (2, 1).
-        // Group2 = dim [3], stride [2] -> fuses to (3, 2).
-        // Both fuse -> no copy needed.
         let a = StridedArray::<f64>::col_major(&[2, 3]);
         let view = a.view();
 
-        let op = prepare_input_view(&view, 0, 1, 1, false).unwrap();
+        let op = prepare_input_view(&view, 1, 1, false, UNIT_STRIDE, true, None).unwrap();
 
         assert!(!op.has_buf());
         assert_eq!(op.row_stride(), 1);
@@ -865,30 +622,23 @@ mod tests {
 
     #[test]
     fn test_borrowed_non_contiguous_copies() {
-        // dims [2,3,4] with strides [20,4,1], n_batch=0, n_group1=2, n_group2=1.
-        // Group1 = dims [2,3], strides [20,4]. Try fuse: sorted by |stride| -> [(3,4),(2,20)].
-        // Check: 4*3=12 != 20, so fusion fails -> needs copy.
         let data = vec![0.0f64; 100];
         let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
         let view = a.view();
 
-        let op = prepare_input_view(&view, 0, 2, 1, false).unwrap();
+        let op = prepare_input_view(&view, 2, 1, false, UNIT_STRIDE, true, None).unwrap();
 
         assert!(op.has_buf());
-        // After copy to col-major: row_stride=1, col_stride = m = 2*3 = 6
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 6);
     }
 
     #[test]
     fn test_owned_contiguous_no_copy() {
-        // Col-major [2,3]: strides [1,2]. n_batch=0, n_group1=1, n_group2=1.
-        // Fusable -> ownership transferred, no copy.
         let a = StridedArray::<f64>::col_major(&[2, 3]);
 
-        let op = prepare_input_owned(a, 0, 1, 1, false).unwrap();
+        let op = prepare_input_owned(a, 1, 1, false, UNIT_STRIDE, true, None).unwrap();
 
-        // Ownership transferred: _buf = Some (the original array).
         assert!(op.has_buf());
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 2);
@@ -896,29 +646,22 @@ mod tests {
 
     #[test]
     fn test_owned_non_contiguous_copies() {
-        // dims [2,3,4] with strides [20,4,1], n_batch=0, n_group1=2, n_group2=1.
-        // Non-fusable -> copies to new buffer.
         let data = vec![0.0f64; 100];
         let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
 
-        let op = prepare_input_owned(a, 0, 2, 1, false).unwrap();
+        let op = prepare_input_owned(a, 2, 1, false, UNIT_STRIDE, true, None).unwrap();
 
         assert!(op.has_buf());
-        // After copy: row_stride=1, col_stride = m = 2*3 = 6
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 6);
     }
 
-    // ---- Output preparation tests ----
-
     #[test]
     fn test_output_view_contiguous() {
-        // Col-major [2,3]: strides [1,2]. n_batch=0, n_group1=1, n_group2=1.
-        // Both groups fuse -> no copy, no writeback.
         let mut c = StridedArray::<f64>::col_major(&[2, 3]);
         let mut view = c.view_mut();
 
-        let op = prepare_output_view(&mut view, 0, 1, 1, 0.0).unwrap();
+        let op = prepare_output_view(&mut view, 1, 1, 0.0, UNIT_STRIDE, true).unwrap();
 
         assert!(!op.needs_writeback());
         assert!(!op.has_buf());
@@ -928,93 +671,60 @@ mod tests {
 
     #[test]
     fn test_output_view_non_contiguous_beta_zero() {
-        // dims [2,3,4] with strides [20,4,1], n_batch=0, n_group1=2, n_group2=1.
-        // Group1 = dims [2,3], strides [20,4] -> non-fusable -> needs copy.
-        // beta=0 -> no copy-in of existing data, but writeback needed.
         let data = vec![0.0f64; 100];
         let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
         let mut view = c.view_mut();
 
-        let op = prepare_output_view(&mut view, 0, 2, 1, 0.0).unwrap();
+        let op = prepare_output_view(&mut view, 2, 1, 0.0, UNIT_STRIDE, true).unwrap();
 
         assert!(op.needs_writeback());
         assert!(op.has_buf());
-        // After alloc col-major: row_stride=1, col_stride = m = 2*3 = 6
         assert_eq!(op.row_stride(), 1);
         assert_eq!(op.col_stride(), 6);
     }
 
     #[test]
     fn test_output_view_non_contiguous_beta_nonzero_and_finalize() {
-        // Use 3D: dims [2,3,1] with strides [10,1,1], group1=2 dims, group2=1 dim.
-        // group1 = dims [2,3], strides [10,1]. Sorted: [(3,1),(2,10)]. 1*3=3 != 10 -> non-fusable!
-
-        // Pre-populate a data buffer with known values at the right offsets.
-        // With strides [10,1,1], element [i,j,0] is at offset i*10 + j*1.
         let mut data = vec![0.0f64; 30];
-        data[0] = 10.0; // [0,0,0]
-        data[1] = 20.0; // [0,1,0]
-        data[2] = 30.0; // [0,2,0]
-        data[10] = 40.0; // [1,0,0]
-        data[11] = 50.0; // [1,1,0]
-        data[12] = 60.0; // [1,2,0]
+        data[0] = 10.0;
+        data[1] = 20.0;
+        data[2] = 30.0;
+        data[10] = 40.0;
+        data[11] = 50.0;
+        data[12] = 60.0;
         let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 1], &[10, 1, 1], 0).unwrap();
 
-        // Verify the known values
         assert_eq!(c.get(&[0, 0, 0]), 10.0);
         assert_eq!(c.get(&[1, 1, 0]), 50.0);
 
         let mut view = c.view_mut();
 
-        // group1 dims [2,3], group2 dims [1] -> group1 is non-fusable.
-        let mut op = prepare_output_view(&mut view, 0, 2, 1, 1.0).unwrap();
+        let mut op = prepare_output_view(&mut view, 2, 1, 1.0, UNIT_STRIDE, true).unwrap();
 
         assert!(op.needs_writeback());
         assert!(op.has_buf());
 
-        // beta=1.0 -> existing data should have been copied into the buffer.
-        // Verify by reading from the buffer via the internal _buf.
         let buf = op._buf.as_ref().unwrap();
         assert_eq!(buf.get(&[0, 0, 0]), 10.0);
         assert_eq!(buf.get(&[1, 1, 0]), 50.0);
 
-        // Simulate GEMM by writing to the buffer through copy_into.
         {
             let result_data = vec![100.0f64; 6];
             let result =
                 StridedArray::<f64>::from_parts(result_data, &[2, 3, 1], &[3, 1, 1], 0).unwrap();
             strided_kernel::copy_into(&mut op._buf.as_mut().unwrap().view_mut(), &result.view())
                 .unwrap();
-            // Update ptr to the buffer (in case of reallocation)
             op.ptr = op._buf.as_mut().unwrap().view_mut().as_mut_ptr();
         }
 
-        // finalize_into should copy the buffer back to the original view.
         op.finalize_into(&mut view).unwrap();
 
-        // All elements should now be 100.0 in the original non-contiguous array.
         assert_eq!(c.get(&[0, 0, 0]), 100.0);
         assert_eq!(c.get(&[0, 1, 0]), 100.0);
         assert_eq!(c.get(&[0, 2, 0]), 100.0);
         assert_eq!(c.get(&[1, 0, 0]), 100.0);
         assert_eq!(c.get(&[1, 1, 0]), 100.0);
         assert_eq!(c.get(&[1, 2, 0]), 100.0);
-    }
-
-    #[test]
-    fn test_output_owned_no_writeback() {
-        // Non-fusable owned array: needs_writeback should be false.
-        // dims [2,3,4] with strides [20,4,1], n_batch=0, n_group1=2, n_group2=1.
-        let data = vec![0.0f64; 100];
-        let mut c = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();
-
-        let op = prepare_output_owned(&mut c, 0, 2, 1, 0.0).unwrap();
-
-        // Non-fusable -> has buffer, but owned -> no writeback.
-        assert!(!op.needs_writeback());
-        assert!(op.has_buf());
-        assert_eq!(op.row_stride(), 1);
-        assert_eq!(op.col_stride(), 6);
     }
 
     #[test]
@@ -1025,7 +735,7 @@ mod tests {
         let view = a.view();
 
         {
-            let op = prepare_input_view(&view, 0, 2, 1, false).unwrap();
+            let op = prepare_input_view(&view, 2, 1, false, UNIT_STRIDE, true, None).unwrap();
             assert!(op.has_buf());
         }
 

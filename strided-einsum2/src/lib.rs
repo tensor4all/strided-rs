@@ -72,7 +72,7 @@ use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, Stride
 
 pub use strided_traits::ScalarBase;
 
-pub use backend::{BackendConfig, BgemmBackend};
+pub use backend::Backend;
 pub use plan::Einsum2Plan;
 
 /// Trait alias for axis label types.
@@ -177,8 +177,8 @@ fn op_is_conj<Op: 'static>() -> bool {
 /// - **lo** (left-output): in A and C, not B
 /// - **ro** (right-output): in B and C, not A
 /// - **sum** (contraction): in A and B, not C
-/// - **left_trace**: only in A (summed out before contraction)
-/// - **right_trace**: only in B (summed out before contraction)
+///
+/// Trace axes (only in A or only in B) are detected and reduced lazily.
 pub fn einsum2_into<T: Scalar, OpA, OpB, ID: AxisId>(
     c: StridedViewMut<T>,
     a: &StridedView<T, OpA>,
@@ -203,9 +203,9 @@ where
     //    When trace reduction occurs, Op is already applied during the reduction,
     //    so conj flag is false. Otherwise, we strip the Op and pass a conj flag
     //    to the GEMM kernel (avoiding materialization).
-    let (a_buf, conj_a) = if !plan.left_trace.is_empty() {
-        let trace_indices = plan.left_trace_indices(ia);
-        (Some(trace::reduce_trace_axes(a, &trace_indices)?), false)
+    let left_trace = trace::find_trace_indices(ia, ib, ic);
+    let (a_buf, conj_a) = if !left_trace.is_empty() {
+        (Some(trace::reduce_trace_axes(a, &left_trace)?), false)
     } else {
         (None, op_is_conj::<OpA>())
     };
@@ -216,9 +216,9 @@ where
             .expect("strip_op_view: metadata already validated"),
     };
 
-    let (b_buf, conj_b) = if !plan.right_trace.is_empty() {
-        let trace_indices = plan.right_trace_indices(ib);
-        (Some(trace::reduce_trace_axes(b, &trace_indices)?), false)
+    let right_trace = trace::find_trace_indices(ib, ia, ic);
+    let (b_buf, conj_b) = if !right_trace.is_empty() {
+        (Some(trace::reduce_trace_axes(b, &right_trace)?), false)
     } else {
         (None, op_is_conj::<OpB>())
     };
@@ -240,7 +240,12 @@ where
             )
         )
     ))]
-    einsum2_gemm_dispatch(c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b)?;
+    {
+        let conj_fn = make_conj_fn::<T>();
+        einsum2_dispatch::<T, backend::ActiveBackend, _>(
+            c, &a_view, &b_view, &plan, alpha, beta, conj_a, conj_b, conj_fn,
+        )?;
+    }
 
     #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
     {
@@ -307,11 +312,11 @@ where
     // Reduce trace axes if present.
     // When trace reduction occurs, map is applied via map_into before reduction,
     // so we use identity map for GEMM. Otherwise, pass through the original map.
-    let (a_buf, use_map_a) = if !plan.left_trace.is_empty() {
-        let trace_indices = plan.left_trace_indices(ia);
+    let left_trace = trace::find_trace_indices(ia, ib, ic);
+    let (a_buf, use_map_a) = if !left_trace.is_empty() {
         let mut mapped = unsafe { strided_view::StridedArray::<T>::col_major_uninit(a.dims()) };
         strided_kernel::map_into(&mut mapped.view_mut(), a, &map_a)?;
-        let reduced = trace::reduce_trace_axes(&mapped.view(), &trace_indices)?;
+        let reduced = trace::reduce_trace_axes(&mapped.view(), &left_trace)?;
         (Some(reduced), false)
     } else {
         (None, true)
@@ -321,11 +326,11 @@ where
         None => a.clone(),
     };
 
-    let (b_buf, use_map_b) = if !plan.right_trace.is_empty() {
-        let trace_indices = plan.right_trace_indices(ib);
+    let right_trace = trace::find_trace_indices(ib, ia, ic);
+    let (b_buf, use_map_b) = if !right_trace.is_empty() {
         let mut mapped = unsafe { strided_view::StridedArray::<T>::col_major_uninit(b.dims()) };
         strided_kernel::map_into(&mut mapped.view_mut(), b, &map_b)?;
-        let reduced = trace::reduce_trace_axes(&mapped.view(), &trace_indices)?;
+        let reduced = trace::reduce_trace_axes(&mapped.view(), &right_trace)?;
         (Some(reduced), false)
     } else {
         (None, true)
@@ -384,7 +389,7 @@ where
 /// to the caller-provided GEMM backend `B`. Views must use `Identity` element
 /// operations (the default).
 ///
-/// External crates can implement [`BgemmBackend`] for custom scalar types
+/// External crates can implement [`Backend`] for custom scalar types
 /// (e.g., tropical semiring) and pass the backend here.
 pub fn einsum2_with_backend_into<T, B, ID>(
     c: StridedViewMut<T>,
@@ -398,16 +403,16 @@ pub fn einsum2_with_backend_into<T, B, ID>(
 ) -> Result<()>
 where
     T: ScalarBase,
-    B: BgemmBackend<T> + BackendConfig,
+    B: Backend<T>,
     ID: AxisId,
 {
     let plan = Einsum2Plan::new(ia, ib, ic)?;
     validate_dimensions::<ID>(&plan, a.dims(), b.dims(), c.dims(), ia, ib, ic)?;
 
     // Trace reduction (plain sum, Identity views)
-    let a_buf = if !plan.left_trace.is_empty() {
-        let trace_indices = plan.left_trace_indices(ia);
-        Some(trace::reduce_trace_axes(a, &trace_indices)?)
+    let left_trace = trace::find_trace_indices(ia, ib, ic);
+    let a_buf = if !left_trace.is_empty() {
+        Some(trace::reduce_trace_axes(a, &left_trace)?)
     } else {
         None
     };
@@ -416,9 +421,9 @@ where
         None => a.clone(),
     };
 
-    let b_buf = if !plan.right_trace.is_empty() {
-        let trace_indices = plan.right_trace_indices(ib);
-        Some(trace::reduce_trace_axes(b, &trace_indices)?)
+    let right_trace = trace::find_trace_indices(ib, ia, ic);
+    let b_buf = if !right_trace.is_empty() {
+        Some(trace::reduce_trace_axes(b, &right_trace)?)
     } else {
         None
     };
@@ -427,64 +432,15 @@ where
         None => b.clone(),
     };
 
-    // Permute to canonical order
-    let a_perm = a_view.permute(&plan.left_perm)?;
-    let b_perm = b_view.permute(&plan.right_perm)?;
-    let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
-
-    let n_batch = plan.batch.len();
-    let n_lo = plan.lo.len();
-    let n_ro = plan.ro.len();
-    let n_sum = plan.sum.len();
-
-    // Element-wise fast path (all batch, no contraction)
-    if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
-        if alpha == T::one() {
-            zip_map2_into(&mut c_perm, &a_perm, &b_perm, |a_val, b_val| a_val * b_val)?;
-        } else {
-            let mul_fn = move |a_val: T, b_val: T| -> T { alpha * a_val * b_val };
-            zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
-        }
-        return Ok(());
-    }
-
-    // Prepare contiguous operands for GEMM
-    let a_op = contiguous::prepare_input_view_for_backend::<T, B>(&a_perm, n_batch, n_lo, n_sum)?;
-    let b_op = contiguous::prepare_input_view_for_backend::<T, B>(&b_perm, n_batch, n_sum, n_ro)?;
-    let mut c_op = contiguous::prepare_output_view_for_backend::<T, B>(
-        &mut c_perm,
-        n_batch,
-        n_lo,
-        n_ro,
-        beta,
-    )?;
-
-    // Dimension sizes (batch-last canonical order)
-    let lo_dims = &a_perm.dims()[..n_lo];
-    let sum_dims = &a_perm.dims()[n_lo..n_lo + n_sum];
-    let batch_dims = &a_perm.dims()[n_lo + n_sum..];
-    let ro_dims = &b_perm.dims()[n_sum..n_sum + n_ro];
-    let m: usize = lo_dims.iter().product::<usize>().max(1);
-    let k: usize = sum_dims.iter().product::<usize>().max(1);
-    let n: usize = ro_dims.iter().product::<usize>().max(1);
-
-    // GEMM via backend
-    B::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta)?;
-
-    // Finalize (copy-back if needed)
-    c_op.finalize_into(&mut c_perm)?;
-
-    Ok(())
+    // No conjugation for generic backend path
+    einsum2_dispatch::<T, B, _>(c, &a_view, &b_view, &plan, alpha, beta, false, false, None)
 }
 
-/// Internal GEMM dispatch using ContiguousOperand types.
+/// Build the conj materialization function pointer for the active backend.
 ///
-/// Called after trace reduction and Op stripping. Handles:
-/// 1. Permutation to canonical order
-/// 2. Element-wise fast path (if applicable)
-/// 3. Contiguous preparation via `prepare_input_view`
-/// 4. GEMM via `ActiveBackend::bgemm_contiguous_into`
-/// 5. Finalize (copy-back if needed)
+/// When the backend requires conj to be materialized into data (e.g. CBLAS),
+/// returns `Some(conj_apply)`. Otherwise returns `None` (backend handles conj
+/// via transpose flags or similar).
 #[cfg(any(
     all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
     all(
@@ -495,18 +451,41 @@ where
         )
     )
 ))]
-fn einsum2_gemm_dispatch<T: Scalar>(
+fn make_conj_fn<T: Scalar>() -> Option<fn(T) -> T> {
+    if <backend::ActiveBackend as Backend<T>>::MATERIALIZES_CONJ {
+        Some(|x| Conj::apply(x))
+    } else {
+        None
+    }
+}
+
+/// Internal GEMM dispatch, generic over backend.
+///
+/// Called after trace reduction with plain Identity views. Handles:
+/// 1. Permutation to canonical order
+/// 2. Element-wise fast path (if applicable)
+/// 3. Contiguous preparation via `prepare_input_view`
+/// 4. GEMM via `B::bgemm_contiguous_into`
+/// 5. Finalize (copy-back if needed)
+///
+/// `conj_fn` is the materialization function for backends that need conj
+/// applied to data before GEMM. Pass `None` when conj_a/conj_b are both false
+/// or when the backend handles conj natively (via flags).
+fn einsum2_dispatch<T, B, ID>(
     c: StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
-    plan: &Einsum2Plan<impl AxisId>,
+    plan: &Einsum2Plan<ID>,
     alpha: T,
     beta: T,
     conj_a: bool,
     conj_b: bool,
+    conj_fn: Option<fn(T) -> T>,
 ) -> Result<()>
 where
-    backend::ActiveBackend: BgemmBackend<T>,
+    T: ScalarBase,
+    B: Backend<T>,
+    ID: AxisId,
 {
     // 1. Permute to canonical order
     let a_perm = a.permute(&plan.left_perm)?;
@@ -515,19 +494,16 @@ where
 
     // 2. Fast path: element-wise (all batch, no contraction)
     if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
-        if alpha == T::one() && !conj_a && !conj_b {
+        if !conj_a && !conj_b && alpha == T::one() {
             zip_map2_into(&mut c_perm, &a_perm, &b_perm, |a_val, b_val| a_val * b_val)?;
-        } else if alpha == T::one() {
-            let mul_fn = move |a_val: T, b_val: T| -> T {
-                let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
-                let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
-                a_c * b_c
-            };
+        } else if !conj_a && !conj_b {
+            let mul_fn = move |a_val: T, b_val: T| -> T { alpha * a_val * b_val };
             zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
         } else {
+            let conj_fn = conj_fn.unwrap_or(|x| x);
             let mul_fn = move |a_val: T, b_val: T| -> T {
-                let a_c = if conj_a { Conj::apply(a_val) } else { a_val };
-                let b_c = if conj_b { Conj::apply(b_val) } else { b_val };
+                let a_c = if conj_a { conj_fn(a_val) } else { a_val };
+                let b_c = if conj_b { conj_fn(b_val) } else { b_val };
                 alpha * a_c * b_c
             };
             zip_map2_into(&mut c_perm, &a_perm, &b_perm, mul_fn)?;
@@ -536,14 +512,21 @@ where
     }
 
     // 3. Prepare contiguous operands
-    let n_batch = plan.batch.len();
     let n_lo = plan.lo.len();
     let n_ro = plan.ro.len();
     let n_sum = plan.sum.len();
+    let use_pool = true;
+    let materialize = if B::MATERIALIZES_CONJ { conj_fn } else { None };
 
-    let a_op = contiguous::prepare_input_view(&a_perm, n_batch, n_lo, n_sum, conj_a)?;
-    let b_op = contiguous::prepare_input_view(&b_perm, n_batch, n_sum, n_ro, conj_b)?;
-    let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
+    let a_op = contiguous::prepare_input_view(
+        &a_perm, n_lo, n_sum, conj_a, B::REQUIRES_UNIT_STRIDE, use_pool, materialize,
+    )?;
+    let b_op = contiguous::prepare_input_view(
+        &b_perm, n_sum, n_ro, conj_b, B::REQUIRES_UNIT_STRIDE, use_pool, materialize,
+    )?;
+    let mut c_op = contiguous::prepare_output_view(
+        &mut c_perm, n_lo, n_ro, beta, B::REQUIRES_UNIT_STRIDE, use_pool,
+    )?;
 
     // Compute fused dimension sizes
     let lo_dims = &a_perm.dims()[..n_lo];
@@ -555,9 +538,7 @@ where
     let n: usize = ro_dims.iter().product::<usize>().max(1);
 
     // 4. GEMM — dispatched through trait
-    backend::ActiveBackend::bgemm_contiguous_into(
-        &mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta,
-    )?;
+    B::bgemm_contiguous_into(&mut c_op, &a_op, &b_op, batch_dims, m, n, k, alpha, beta)?;
 
     // 5. Finalize
     c_op.finalize_into(&mut c_perm)?;
@@ -596,7 +577,7 @@ pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
     conj_b: bool,
 ) -> Result<()>
 where
-    backend::ActiveBackend: BgemmBackend<T>,
+    backend::ActiveBackend: Backend<T>,
 {
     // 1. Build plan
     let plan = Einsum2Plan::new(ia, ib, ic)?;
@@ -607,16 +588,16 @@ where
     // 3. Trace reduction: reduce trace axes if present.
     //    When trace reduction occurs, conjugation is applied during reduction,
     //    so the conj flag becomes false. Otherwise keep the caller's flag.
-    let (a_for_gemm, conj_a_final) = if !plan.left_trace.is_empty() {
-        let trace_indices = plan.left_trace_indices(ia);
-        (trace::reduce_trace_axes(&a.view(), &trace_indices)?, false)
+    let left_trace = trace::find_trace_indices(ia, ib, ic);
+    let (a_for_gemm, conj_a_final) = if !left_trace.is_empty() {
+        (trace::reduce_trace_axes(&a.view(), &left_trace)?, false)
     } else {
         (a, conj_a)
     };
 
-    let (b_for_gemm, conj_b_final) = if !plan.right_trace.is_empty() {
-        let trace_indices = plan.right_trace_indices(ib);
-        (trace::reduce_trace_axes(&b.view(), &trace_indices)?, false)
+    let right_trace = trace::find_trace_indices(ib, ia, ic);
+    let (b_for_gemm, conj_b_final) = if !right_trace.is_empty() {
+        (trace::reduce_trace_axes(&b.view(), &right_trace)?, false)
     } else {
         (b, conj_b)
     };
@@ -626,7 +607,6 @@ where
     let b_perm = b_for_gemm.permuted(&plan.right_perm)?;
     let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
 
-    let n_batch = plan.batch.len();
     let n_lo = plan.lo.len();
     let n_ro = plan.ro.len();
     let n_sum = plan.sum.len();
@@ -663,9 +643,19 @@ where
     let n: usize = ro_dims.iter().product::<usize>().max(1);
 
     // 7. Prepare contiguous operands (owned path -- avoids extra copies)
-    let a_op = contiguous::prepare_input_owned(a_perm, n_batch, n_lo, n_sum, conj_a_final)?;
-    let b_op = contiguous::prepare_input_owned(b_perm, n_batch, n_sum, n_ro, conj_b_final)?;
-    let mut c_op = contiguous::prepare_output_view(&mut c_perm, n_batch, n_lo, n_ro, beta)?;
+    let conj_fn = make_conj_fn::<T>();
+    let materialize = if <backend::ActiveBackend as Backend<T>>::MATERIALIZES_CONJ { conj_fn } else { None };
+    let use_pool = true;
+    let unit_stride = <backend::ActiveBackend as Backend<T>>::REQUIRES_UNIT_STRIDE;
+    let a_op = contiguous::prepare_input_owned(
+        a_perm, n_lo, n_sum, conj_a_final, unit_stride, use_pool, materialize,
+    )?;
+    let b_op = contiguous::prepare_input_owned(
+        b_perm, n_sum, n_ro, conj_b_final, unit_stride, use_pool, materialize,
+    )?;
+    let mut c_op = contiguous::prepare_output_view(
+        &mut c_perm, n_lo, n_ro, beta, unit_stride, use_pool,
+    )?;
 
     // 8. GEMM — dispatched through trait
     backend::ActiveBackend::bgemm_contiguous_into(
@@ -1560,12 +1550,10 @@ mod tests {
     /// Test backend that delegates to naive GEMM loops.
     struct TestNaiveBackend;
 
-    impl BackendConfig for TestNaiveBackend {
+    impl Backend<f64> for TestNaiveBackend {
         const MATERIALIZES_CONJ: bool = false;
         const REQUIRES_UNIT_STRIDE: bool = false;
-    }
 
-    impl BgemmBackend<f64> for TestNaiveBackend {
         fn bgemm_contiguous_into(
             c: &mut contiguous::ContiguousOperandMut<f64>,
             a: &contiguous::ContiguousOperand<f64>,
@@ -1718,12 +1706,10 @@ mod tests {
 
         struct TropicalBackend;
 
-        impl BackendConfig for TropicalBackend {
+        impl Backend<Tropical> for TropicalBackend {
             const MATERIALIZES_CONJ: bool = false;
             const REQUIRES_UNIT_STRIDE: bool = false;
-        }
 
-        impl BgemmBackend<Tropical> for TropicalBackend {
             fn bgemm_contiguous_into(
                 c: &mut contiguous::ContiguousOperandMut<Tropical>,
                 a: &contiguous::ContiguousOperand<Tropical>,

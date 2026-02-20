@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use num_complex::Complex64;
 #[cfg(test)]
@@ -20,16 +20,33 @@ use crate::single_tensor::single_tensor_einsum;
 /// Tracks freed `Vec<f64>` and `Vec<Complex64>` buffers indexed by length.
 /// When a contraction step completes, its input buffers are returned to the
 /// pool. Subsequent steps can reuse these buffers instead of allocating fresh.
-struct BufferPool {
-    f64_pool: HashMap<usize, Vec<Vec<f64>>>,
-    c64_pool: HashMap<usize, Vec<Vec<Complex64>>>,
+///
+/// Uses `BTreeMap` so `pool_acquire` can find the **smallest buffer ≥ requested
+/// size** (best-fit), improving reuse when intermediate sizes vary slightly.
+///
+/// # Usage
+///
+/// Create a pool and pass it to [`EinsumCode::evaluate_with_pool`] to reuse
+/// buffers across multiple einsum calls:
+///
+/// ```ignore
+/// let mut pool = BufferPool::new();
+/// code.evaluate_with_pool(operands1, None, Some(&mut pool))?;
+/// code.evaluate_with_pool(operands2, None, Some(&mut pool))?;
+/// ```
+///
+/// Pass `None` to let each call allocate and free independently (no pooling).
+pub struct BufferPool {
+    f64_pool: BTreeMap<usize, Vec<Vec<f64>>>,
+    c64_pool: BTreeMap<usize, Vec<Vec<Complex64>>>,
 }
 
 impl BufferPool {
-    fn new() -> Self {
+    /// Create an empty buffer pool.
+    pub fn new() -> Self {
         Self {
-            f64_pool: HashMap::new(),
-            c64_pool: HashMap::new(),
+            f64_pool: BTreeMap::new(),
+            c64_pool: BTreeMap::new(),
         }
     }
 }
@@ -54,11 +71,23 @@ trait PoolOps: EinsumScalar {
     fn pool_release(pool: &mut BufferPool, data: StridedData<'_, Self>);
 }
 
+/// Take the best-fit buffer (smallest capacity >= `total`) from a BTreeMap pool.
+fn take_best_fit<T>(pool: &mut BTreeMap<usize, Vec<Vec<T>>>, total: usize) -> Option<Vec<T>> {
+    // Find the smallest key >= total using BTreeMap range search.
+    let key = *pool.range(total..).next()?.0;
+    let vecs = pool.get_mut(&key)?;
+    let buf = vecs.pop();
+    if vecs.is_empty() {
+        pool.remove(&key);
+    }
+    buf
+}
+
 impl PoolOps for f64 {
     fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<f64> {
         let total: usize = dims.iter().product();
         // SAFETY: einsum2_into with beta=0 writes every output element before reading.
-        match pool.f64_pool.get_mut(&total).and_then(|v| v.pop()) {
+        match take_best_fit(&mut pool.f64_pool, total) {
             Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
             None => unsafe { StridedArray::col_major_uninit(dims) },
         }
@@ -76,7 +105,7 @@ impl PoolOps for Complex64 {
     fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<Complex64> {
         let total: usize = dims.iter().product();
         // SAFETY: einsum2_into with beta=0 writes every output element before reading.
-        match pool.c64_pool.get_mut(&total).and_then(|v| v.pop()) {
+        match take_best_fit(&mut pool.c64_pool, total) {
             Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
             None => unsafe { StridedArray::col_major_uninit(dims) },
         }
@@ -776,10 +805,26 @@ impl EinsumCode {
     ///
     /// Pass `size_dict` to specify sizes for output indices not present in any
     /// input (generative outputs like `"->ii"` or `"i->ij"`).
+    /// Evaluate the einsum contraction tree with the given operands.
+    ///
+    /// Equivalent to `evaluate_with_pool(operands, size_dict, None)`.
     pub fn evaluate<'a>(
         &self,
         operands: Vec<EinsumOperand<'a>>,
         size_dict: Option<&HashMap<char, usize>>,
+    ) -> crate::Result<EinsumOperand<'a>> {
+        self.evaluate_with_pool(operands, size_dict, None)
+    }
+
+    /// Evaluate the einsum contraction tree, optionally reusing a buffer pool.
+    ///
+    /// Pass `Some(&mut pool)` to reuse intermediate buffers across calls.
+    /// Pass `None` to use a fresh temporary pool (buffers freed on return).
+    pub fn evaluate_with_pool<'a>(
+        &self,
+        operands: Vec<EinsumOperand<'a>>,
+        size_dict: Option<&HashMap<char, usize>>,
+        pool: Option<&mut BufferPool>,
     ) -> crate::Result<EinsumOperand<'a>> {
         let expected = leaf_count(&self.root);
         if operands.len() != expected {
@@ -790,7 +835,14 @@ impl EinsumCode {
         }
 
         let mut ops: Vec<Option<EinsumOperand<'a>>> = operands.into_iter().map(Some).collect();
-        let mut pool = BufferPool::new();
+        let mut temp_pool;
+        let pool = match pool {
+            Some(p) => p,
+            None => {
+                temp_pool = BufferPool::new();
+                &mut temp_pool
+            }
+        };
 
         // Build unified size_dict: operand-inferred sizes + user-provided overrides
         let mut unified = build_dim_map(&self.root, &ops);
@@ -799,7 +851,7 @@ impl EinsumCode {
         }
 
         let (result, result_ids) =
-            eval_node(&self.root, &mut ops, &self.output_ids, &mut pool, &unified)?;
+            eval_node(&self.root, &mut ops, &self.output_ids, pool, &unified)?;
 
         // If the result ids already match the desired output, we're done.
         if result_ids == self.output_ids {
@@ -898,10 +950,30 @@ impl EinsumCode {
     pub fn evaluate_into<T: EinsumScalar>(
         &self,
         operands: Vec<EinsumOperand<'_>>,
+        output: StridedViewMut<T>,
+        alpha: T,
+        beta: T,
+        size_dict: Option<&HashMap<char, usize>>,
+    ) -> crate::Result<()> {
+        self.evaluate_into_with_pool(operands, output, alpha, beta, size_dict, None)
+    }
+
+    /// Evaluate the einsum contraction tree, writing the result into a
+    /// pre-allocated output buffer with alpha/beta scaling and optional
+    /// buffer pool reuse.
+    ///
+    /// `output = alpha * einsum(operands) + beta * output`
+    ///
+    /// Pass `Some(&mut pool)` to reuse intermediate buffers across calls.
+    /// Pass `None` to use a fresh temporary pool (buffers freed on return).
+    pub fn evaluate_into_with_pool<T: EinsumScalar>(
+        &self,
+        operands: Vec<EinsumOperand<'_>>,
         mut output: StridedViewMut<T>,
         alpha: T,
         beta: T,
         size_dict: Option<&HashMap<char, usize>>,
+        pool: Option<&mut BufferPool>,
     ) -> crate::Result<()> {
         let expected = leaf_count(&self.root);
         if operands.len() != expected {
@@ -930,7 +1002,14 @@ impl EinsumCode {
             });
         }
 
-        let mut pool = BufferPool::new();
+        let mut temp_pool;
+        let pool = match pool {
+            Some(p) => p,
+            None => {
+                temp_pool = BufferPool::new();
+                &mut temp_pool
+            }
+        };
 
         match &self.root {
             EinsumNode::Leaf { ids, tensor_index } => {
@@ -948,7 +1027,7 @@ impl EinsumCode {
                     // Single child: evaluate, then accumulate
                     let child_needed = compute_child_needed_ids(&self.output_ids, 0, args);
                     let (child_op, child_ids) =
-                        eval_node(&args[0], &mut ops, &child_needed, &mut pool, &unified)?;
+                        eval_node(&args[0], &mut ops, &child_needed, pool, &unified)?;
 
                     if child_ids == self.output_ids {
                         // Identity: just accumulate
@@ -974,9 +1053,9 @@ impl EinsumCode {
                     let left_needed = compute_child_needed_ids(&self.output_ids, 0, args);
                     let right_needed = compute_child_needed_ids(&self.output_ids, 1, args);
                     let (left, left_ids) =
-                        eval_node(&args[0], &mut ops, &left_needed, &mut pool, &unified)?;
+                        eval_node(&args[0], &mut ops, &left_needed, pool, &unified)?;
                     let (right, right_ids) =
-                        eval_node(&args[1], &mut ops, &right_needed, &mut pool, &unified)?;
+                        eval_node(&args[1], &mut ops, &right_needed, pool, &unified)?;
                     eval_pair_into(
                         left,
                         &left_ids,
@@ -996,7 +1075,7 @@ impl EinsumCode {
                     for (i, arg) in args.iter().enumerate() {
                         let child_needed = compute_child_needed_ids(&node_output_ids, i, args);
                         let (op, ids) =
-                            eval_node(arg, &mut ops, &child_needed, &mut pool, &unified)?;
+                            eval_node(arg, &mut ops, &child_needed, pool, &unified)?;
                         children.push(Some((op, ids)));
                     }
 
@@ -1030,7 +1109,7 @@ impl EinsumCode {
                         &self.output_ids,
                         alpha,
                         beta,
-                        &mut pool,
+                        pool,
                         &unified,
                     )?;
                 }

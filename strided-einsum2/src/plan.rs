@@ -18,10 +18,6 @@ pub struct Einsum2Plan<ID: AxisId> {
     pub ro: Vec<ID>,
     /// Contraction axes: present in A and B, not in C.
     pub sum: Vec<ID>,
-    /// Left trace axes: present only in A.
-    pub left_trace: Vec<ID>,
-    /// Right trace axes: present only in B.
-    pub right_trace: Vec<ID>,
 
     /// Permutation to reorder A to [lo, sum, batch] after trace reduction.
     pub left_perm: Vec<usize>,
@@ -147,28 +143,10 @@ impl<ID: AxisId> Einsum2Plan<ID> {
             lo,
             ro,
             sum,
-            left_trace,
-            right_trace,
             left_perm,
             right_perm,
             c_to_internal_perm,
         })
-    }
-
-    /// Get the indices of left_trace axes in the original `ia` array.
-    pub fn left_trace_indices(&self, ia: &[ID]) -> Vec<usize> {
-        self.left_trace
-            .iter()
-            .filter_map(|id| ia.iter().position(|x| x == id))
-            .collect()
-    }
-
-    /// Get the indices of right_trace axes in the original `ib` array.
-    pub fn right_trace_indices(&self, ib: &[ID]) -> Vec<usize> {
-        self.right_trace
-            .iter()
-            .filter_map(|id| ib.iter().position(|x| x == id))
-            .collect()
     }
 
     /// Get the inverse of c_to_internal_perm (maps `\[batch, lo, ro\]` back to IC order).
@@ -189,8 +167,6 @@ mod tests {
         assert_eq!(plan.lo, vec![0]);
         assert_eq!(plan.ro, vec![2]);
         assert_eq!(plan.sum, vec![1]);
-        assert!(plan.left_trace.is_empty());
-        assert!(plan.right_trace.is_empty());
     }
 
     #[test]
@@ -225,13 +201,13 @@ mod tests {
 
     #[test]
     fn test_classify_left_trace() {
-        // ij,jk->k: lo=[], ro=[k], sum=[j], left_trace=[i]
+        // ij,jk->k: lo=[], ro=[k], sum=[j]
+        // Trace axis i is detected lazily at runtime
         let plan = Einsum2Plan::new(&[0u32, 1], &[1u32, 2], &[2u32]).unwrap();
         assert!(plan.batch.is_empty());
         assert!(plan.lo.is_empty());
         assert_eq!(plan.ro, vec![2]);
         assert_eq!(plan.sum, vec![1]);
-        assert_eq!(plan.left_trace, vec![0]);
     }
 
     #[test]

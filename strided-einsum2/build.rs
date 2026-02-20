@@ -1,6 +1,9 @@
 fn main() {
     #[cfg(feature = "blas")]
     {
+        // Re-run if the library path changes.
+        println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
+
         // Link against system OpenBLAS which provides CBLAS symbols.
         // On macOS: brew install openblas
         // On Ubuntu: apt install libopenblas-dev

@@ -30,6 +30,7 @@ pub mod single_tensor;
 pub mod typed_tensor;
 
 pub use error::{EinsumError, Result};
+pub use expr::BufferPool;
 pub use operand::{EinsumOperand, EinsumScalar, StridedData};
 pub use parse::{parse_einsum, EinsumCode, EinsumNode};
 pub use typed_tensor::{needs_c64_promotion, TypedTensor};
@@ -50,6 +51,20 @@ pub fn einsum<'a>(
 ) -> Result<EinsumOperand<'a>> {
     let code = parse_einsum(notation)?;
     code.evaluate(operands, size_dict)
+}
+
+/// Parse and evaluate an einsum expression with optional buffer pool reuse.
+///
+/// Pass `Some(&mut pool)` to reuse intermediate buffers across calls.
+/// Pass `None` for independent allocation (equivalent to [`einsum`]).
+pub fn einsum_with_pool<'a>(
+    notation: &str,
+    operands: Vec<EinsumOperand<'a>>,
+    size_dict: Option<&HashMap<char, usize>>,
+    pool: Option<&mut BufferPool>,
+) -> Result<EinsumOperand<'a>> {
+    let code = parse_einsum(notation)?;
+    code.evaluate_with_pool(operands, size_dict, pool)
 }
 
 /// Parse and evaluate an einsum expression, writing the result into a
@@ -77,4 +92,24 @@ pub fn einsum_into<T: EinsumScalar>(
 ) -> Result<()> {
     let code = parse_einsum(notation)?;
     code.evaluate_into(operands, output, alpha, beta, size_dict)
+}
+
+/// Parse and evaluate an einsum expression into an output buffer with
+/// optional buffer pool reuse.
+///
+/// `output = alpha * einsum(operands) + beta * output`
+///
+/// Pass `Some(&mut pool)` to reuse intermediate buffers across calls.
+/// Pass `None` for independent allocation (equivalent to [`einsum_into`]).
+pub fn einsum_into_with_pool<T: EinsumScalar>(
+    notation: &str,
+    operands: Vec<EinsumOperand<'_>>,
+    output: strided_view::StridedViewMut<T>,
+    alpha: T,
+    beta: T,
+    size_dict: Option<&HashMap<char, usize>>,
+    pool: Option<&mut BufferPool>,
+) -> Result<()> {
+    let code = parse_einsum(notation)?;
+    code.evaluate_into_with_pool(operands, output, alpha, beta, size_dict, pool)
 }

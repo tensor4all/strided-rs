@@ -6,6 +6,22 @@
 use strided_kernel::reduce_axis;
 use strided_view::{ElementOp, StridedArray, StridedView};
 
+/// Find indices of trace axes: axes in `labels` that don't appear in `other` or `output`.
+///
+/// Returns a (possibly empty) vector of positions in `labels`.
+pub fn find_trace_indices<ID: PartialEq>(
+    labels: &[ID],
+    other: &[ID],
+    output: &[ID],
+) -> Vec<usize> {
+    labels
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| !other.contains(id) && !output.contains(id))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Reduce all trace axes from a view by summing them out.
 ///
 /// `trace_axes` are indices into the original view's dimensions, given in
