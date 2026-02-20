@@ -1,12 +1,62 @@
-//! Execution engine: recursive loop nest dispatching to macro_kernel.
+//! Execution engine: flat odometer loop dispatching to macro_kernel.
 //!
-//! Mirrors HPTT C++'s `transpose_int` (lines 602-681) and
-//! `transpose_int_constStride1` (lines 683-720).
+//! Originally used recursive ComputeNode traversal (mirroring HPTT C++).
+//! Now uses a flat iterative odometer to eliminate function call overhead,
+//! which is significant when many small dimensions (e.g., 24 binary dims)
+//! produce 15+ recursion levels with only 2 iterations each.
 
 use crate::hptt::macro_kernel::{
     const_stride1_copy, macro_kernel_f32, macro_kernel_f64, macro_kernel_fallback,
 };
 use crate::hptt::plan::{ComputeNode, ExecMode, PermutePlan};
+
+/// Flattened loop dimensions extracted from the ComputeNode linked list.
+///
+/// Stores outer-loop dimensions as parallel arrays for cache-friendly
+/// iteration, ordered from innermost to outermost.
+struct FlatLoops {
+    /// Loop extents (innermost first).
+    ends: Vec<usize>,
+    /// Source strides per dimension.
+    src_strides: Vec<isize>,
+    /// Destination strides per dimension.
+    dst_strides: Vec<isize>,
+    /// Total number of leaf invocations.
+    total: usize,
+}
+
+/// Flatten a ComputeNode chain into parallel arrays.
+///
+/// The linked list is traversed outermost→innermost; the resulting arrays
+/// are stored innermost-first (index 0 = innermost) so the odometer
+/// increments the fastest-changing index first.
+fn flatten_nodes(root: &ComputeNode) -> FlatLoops {
+    // Collect outermost-first
+    let mut ends_rev = Vec::new();
+    let mut src_rev = Vec::new();
+    let mut dst_rev = Vec::new();
+    let mut node = root;
+    loop {
+        ends_rev.push(node.end);
+        src_rev.push(node.lda);
+        dst_rev.push(node.ldb);
+        match &node.next {
+            Some(next) => node = next,
+            None => break,
+        }
+    }
+    // Reverse to innermost-first
+    ends_rev.reverse();
+    src_rev.reverse();
+    dst_rev.reverse();
+    let total: usize = ends_rev.iter().product::<usize>().max(1);
+    FlatLoops {
+        ends: ends_rev,
+        src_strides: src_rev,
+        dst_strides: dst_rev,
+        total,
+    }
+}
 
 #[cfg(feature = "parallel")]
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -32,7 +82,8 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
             let dst_stride = plan.dst_strides[inner_dim];
             match &plan.root {
                 Some(root) => {
-                    const_stride1_recursive(src, dst, root, count, src_stride, dst_stride);
+                    let loops = flatten_nodes(root);
+                    const_stride1_flat(src, dst, &loops, count, src_stride, dst_stride);
                 }
                 None => {
                     const_stride1_copy(src, dst, count, src_stride, dst_stride);
@@ -49,7 +100,8 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
 
             match &plan.root {
                 Some(root) => {
-                    transpose_recursive(src, dst, root, size_a, size_b, lda, ldb, block, elem_size);
+                    let loops = flatten_nodes(root);
+                    transpose_flat(src, dst, &loops, size_a, size_b, lda, ldb, block, elem_size);
                 }
                 None => {
                     // No outer loops — just the 2D blocked transpose
@@ -109,6 +161,8 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
             let ldb = plan.ldb_inner;
             let block = plan.block;
 
+            let inner_loops = inner.as_ref().map(|n| flatten_nodes(n));
+
             (0..outer_dim).into_par_iter().for_each(|i| {
                 let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
                     as *const T;
@@ -116,10 +170,10 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
                     (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
-                    match &inner {
-                        Some(next) => {
-                            transpose_recursive(
-                                s, d, next, size_a, size_b, lda, ldb, block, elem_size,
+                    match &inner_loops {
+                        Some(loops) => {
+                            transpose_flat(
+                                s, d, loops, size_a, size_b, lda, ldb, block, elem_size,
                             );
                         }
                         None => {
@@ -133,6 +187,7 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
             let count = plan.fused_dims[inner_dim];
             let src_stride = plan.src_strides[inner_dim];
             let dst_stride = plan.dst_strides[inner_dim];
+            let inner_loops = inner.as_ref().map(|n| flatten_nodes(n));
 
             (0..outer_dim).into_par_iter().for_each(|i| {
                 let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
@@ -141,9 +196,9 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
                     (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
-                    match &inner {
-                        Some(next) => {
-                            const_stride1_recursive(s, d, next, count, src_stride, dst_stride);
+                    match &inner_loops {
+                        Some(loops) => {
+                            const_stride1_flat(s, d, loops, count, src_stride, dst_stride);
                         }
                         None => {
                             const_stride1_copy(s, d, count, src_stride, dst_stride);
@@ -159,17 +214,18 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
 }
 
 // ---------------------------------------------------------------------------
-// Transpose mode: recursive execution
+// Transpose mode: flat odometer execution
 // ---------------------------------------------------------------------------
 
-/// Recursive loop nest for Transpose mode.
+/// Flat odometer loop for Transpose mode.
 ///
-/// Mirrors HPTT's `transpose_int`. Each ComputeNode iterates its dimension
-/// with inc=1. At the leaf, runs the 2D blocked transpose over dim_A × dim_B.
-unsafe fn transpose_recursive<T: Copy>(
+/// Replaces the recursive `transpose_int` from HPTT C++. All outer
+/// dimensions are iterated via a single flat loop with odometer
+/// increment, eliminating function-call overhead for deep recursion.
+unsafe fn transpose_flat<T: Copy>(
     src: *const T,
     dst: *mut T,
-    node: &ComputeNode,
+    loops: &FlatLoops,
     size_a: usize,
     size_b: usize,
     lda: isize,
@@ -177,28 +233,24 @@ unsafe fn transpose_recursive<T: Copy>(
     block: usize,
     elem_size: usize,
 ) {
-    let end = node.end;
-    let node_lda = node.lda;
-    let node_ldb = node.ldb;
+    let nd = loops.ends.len();
+    let mut idx = vec![0usize; nd];
+    let mut so: isize = 0;
+    let mut do_: isize = 0;
 
-    match &node.next {
-        Some(next) => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                transpose_recursive(s, d, next, size_a, size_b, lda, ldb, block, elem_size);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
-        }
-        None => {
-            // Leaf: iterate this dim, calling blocked 2D transpose at each position
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block, elem_size);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
+    for _ in 0..loops.total {
+        dispatch_blocked_2d(src.offset(so), dst.offset(do_), size_a, size_b, lda, ldb, block, elem_size);
+
+        for d in 0..nd {
+            idx[d] += 1;
+            if idx[d] < loops.ends[d] {
+                so += loops.src_strides[d];
+                do_ += loops.dst_strides[d];
+                break;
+            } else {
+                so -= loops.src_strides[d] * (loops.ends[d] as isize - 1);
+                do_ -= loops.dst_strides[d] * (loops.ends[d] as isize - 1);
+                idx[d] = 0;
             }
         }
     }
@@ -335,39 +387,35 @@ unsafe fn blocked_transpose_2d_fallback<T: Copy>(
 // ConstStride1 mode: recursive execution
 // ---------------------------------------------------------------------------
 
-/// Recursive loop nest for ConstStride1 mode.
+/// Flat odometer loop for ConstStride1 mode.
 ///
-/// Mirrors HPTT's `transpose_int_constStride1`. Each ComputeNode iterates
-/// its dimension. At the leaf, calls `const_stride1_copy` for the inner dim.
-unsafe fn const_stride1_recursive<T: Copy>(
+/// Replaces the recursive `transpose_int_constStride1` from HPTT C++.
+unsafe fn const_stride1_flat<T: Copy>(
     src: *const T,
     dst: *mut T,
-    node: &ComputeNode,
+    loops: &FlatLoops,
     count: usize,
     src_stride: isize,
     dst_stride: isize,
 ) {
-    let end = node.end;
-    let node_lda = node.lda;
-    let node_ldb = node.ldb;
+    let nd = loops.ends.len();
+    let mut idx = vec![0usize; nd];
+    let mut so: isize = 0;
+    let mut do_: isize = 0;
 
-    match &node.next {
-        Some(next) => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                const_stride1_recursive(s, d, next, count, src_stride, dst_stride);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
-        }
-        None => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                const_stride1_copy(s, d, count, src_stride, dst_stride);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
+    for _ in 0..loops.total {
+        const_stride1_copy(src.offset(so), dst.offset(do_), count, src_stride, dst_stride);
+
+        for d in 0..nd {
+            idx[d] += 1;
+            if idx[d] < loops.ends[d] {
+                so += loops.src_strides[d];
+                do_ += loops.dst_strides[d];
+                break;
+            } else {
+                so -= loops.src_strides[d] * (loops.ends[d] as isize - 1);
+                do_ -= loops.dst_strides[d] * (loops.ends[d] as isize - 1);
+                idx[d] = 0;
             }
         }
     }
