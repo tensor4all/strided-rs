@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use strided_perm::try_fuse_group;
 use strided_view::{StridedArray, StridedView, StridedViewMut};
 
-
 /// GEMM-ready input operand with contiguous data.
 pub struct ContiguousOperand<T: Copy + 'static> {
     ptr: *const T,
