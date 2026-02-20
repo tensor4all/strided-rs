@@ -3,6 +3,8 @@
   "default": 80,
   "files": {
     "strided-perm/src/hptt/execute.rs": 65,
-    "strided-perm/src/hptt/macro_kernel.rs": 60
+    "strided-perm/src/hptt/macro_kernel.rs": 60,
+    "strided-einsum2/src/backend.rs": 0,
+    "strided-opteinsum/src/lib.rs": 40
   }
 }

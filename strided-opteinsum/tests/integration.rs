@@ -2,7 +2,10 @@ use approx::assert_abs_diff_eq;
 use num_complex::Complex64;
 use num_traits::Zero;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use strided_opteinsum::{einsum, einsum_into, parse_einsum, EinsumNode, EinsumOperand};
+use strided_opteinsum::{
+    einsum, einsum_into, einsum_into_with_pool, einsum_with_pool, parse_einsum, BufferPool,
+    EinsumNode, EinsumOperand,
+};
 use strided_view::{row_major_strides, StridedArray};
 
 #[path = "support/loop_einsum.rs"]
@@ -1899,4 +1902,44 @@ fn test_einsum_complex_multi_diagonal() {
         }
         _ => panic!("expected F64"),
     }
+}
+
+#[test]
+fn test_einsum_with_pool() {
+    let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+    let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+    let mut pool = BufferPool::new();
+    let result = einsum_with_pool("ij,jk->ik", vec![a, b], None, Some(&mut pool)).unwrap();
+    match &result {
+        EinsumOperand::F64(data) => {
+            let arr = data.as_array();
+            assert_abs_diff_eq!(arr.get(&[0, 0]), 19.0);
+            assert_abs_diff_eq!(arr.get(&[0, 1]), 22.0);
+            assert_abs_diff_eq!(arr.get(&[1, 0]), 43.0);
+            assert_abs_diff_eq!(arr.get(&[1, 1]), 50.0);
+        }
+        _ => panic!("expected F64"),
+    }
+}
+
+#[test]
+fn test_einsum_into_with_pool() {
+    let a = make_f64(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+    let b = make_f64(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+    let mut c = StridedArray::<f64>::col_major(&[2, 2]);
+    let mut pool = BufferPool::new();
+    einsum_into_with_pool(
+        "ij,jk->ik",
+        vec![a, b],
+        c.view_mut(),
+        1.0,
+        0.0,
+        None,
+        Some(&mut pool),
+    )
+    .unwrap();
+    assert_abs_diff_eq!(c.get(&[0, 0]), 19.0);
+    assert_abs_diff_eq!(c.get(&[0, 1]), 22.0);
+    assert_abs_diff_eq!(c.get(&[1, 0]), 43.0);
+    assert_abs_diff_eq!(c.get(&[1, 1]), 50.0);
 }
