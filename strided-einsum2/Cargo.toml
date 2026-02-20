@@ -24,7 +24,7 @@ rayon = { version = "1.10", optional = true }
 
 [features]
 default = ["faer", "faer-traits"]
-parallel = ["rayon", "strided-kernel/parallel"]
+parallel = ["rayon", "strided-kernel/parallel", "strided-perm/parallel"]
 blas = ["dep:cblas-sys", "dep:num-complex"]
 blas-inject = ["dep:cblas-inject", "dep:num-complex"]
 
