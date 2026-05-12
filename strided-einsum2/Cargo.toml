@@ -1,37 +1,36 @@
 [package]
 name = "strided-einsum2"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
-repository = "https://github.com/tensor4all/strided-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "Binary einsum (pairwise tensor contraction) on strided views."
-publish = false
 
 [dependencies]
-strided-traits = { path = "../strided-traits" }
-strided-view = { path = "../strided-view" }
-strided-kernel = { path = "../strided-kernel" }
-strided-perm = { path = "../strided-perm" }
-num-traits = "0.2"
-thiserror = "1.0"
-faer = { version = "0.24", optional = true }
-faer-traits = { version = "0.24", optional = true }
-cblas-sys = { version = "0.2", optional = true }
-cblas-inject = { version = "0.1", optional = true }
-num-complex = { version = "0.4", optional = true }
-rayon = { version = "1.10", optional = true }
+strided-traits.workspace = true
+strided-view.workspace = true
+strided-kernel.workspace = true
+strided-perm.workspace = true
+num-traits.workspace = true
+thiserror.workspace = true
+faer = { workspace = true, optional = true }
+faer-traits = { workspace = true, optional = true }
+cblas-sys = { workspace = true, optional = true }
+cblas-inject = { workspace = true, optional = true }
+num-complex = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 
 [features]
 default = ["faer", "faer-traits"]
-parallel = ["rayon", "strided-kernel/parallel", "strided-perm/parallel"]
+parallel = ["dep:rayon", "strided-kernel/parallel", "strided-perm/parallel"]
 blas = ["dep:cblas-sys", "dep:num-complex"]
 blas-inject = ["dep:cblas-inject", "dep:num-complex"]
 
 [dev-dependencies]
-approx = "0.5"
-num-complex = "0.4"
-rand = "0.8"
+approx.workspace = true
+num-complex.workspace = true
+rand.workspace = true
 
 [lib]
 bench = false

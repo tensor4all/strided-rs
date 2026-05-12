@@ -1,0 +1,53 @@
+[package]
+name = "strided-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "User-facing facade crate for the strided-rs workspace."
+readme = "README.md"
+
+[dependencies]
+strided-traits.workspace = true
+strided-view.workspace = true
+strided-perm.workspace = true
+strided-kernel.workspace = true
+strided-einsum2 = { workspace = true, default-features = false, optional = true }
+strided-opteinsum = { workspace = true, default-features = false, optional = true }
+mdarray-opteinsum = { workspace = true, default-features = false, optional = true }
+ndarray-opteinsum = { workspace = true, default-features = false, optional = true }
+
+[features]
+default = ["faer"]
+faer = [
+    "dep:strided-einsum2",
+    "dep:strided-opteinsum",
+    "strided-einsum2/faer",
+    "strided-einsum2/faer-traits",
+    "strided-opteinsum/faer",
+    "mdarray-opteinsum?/faer",
+    "ndarray-opteinsum?/faer",
+]
+parallel = [
+    "strided-perm/parallel",
+    "strided-kernel/parallel",
+    "strided-einsum2?/parallel",
+    "strided-opteinsum?/parallel",
+]
+blas = [
+    "dep:strided-einsum2",
+    "dep:strided-opteinsum",
+    "strided-einsum2/blas",
+    "strided-opteinsum/blas",
+    "mdarray-opteinsum?/blas",
+    "ndarray-opteinsum?/blas",
+]
+blas-inject = [
+    "dep:strided-einsum2",
+    "dep:strided-opteinsum",
+    "strided-einsum2/blas-inject",
+    "strided-opteinsum/blas-inject",
+]
+mdarray = ["dep:mdarray-opteinsum"]
+ndarray = ["dep:ndarray-opteinsum"]

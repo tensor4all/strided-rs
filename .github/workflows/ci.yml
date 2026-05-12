@@ -40,6 +40,9 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run facade README doctests
+        run: cargo test -p strided-rs --doc
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

@@ -1,7 +1,7 @@
 //! Backend abstraction for batched GEMM dispatch.
 //!
 //! This module defines the [`Backend`] trait, marker structs for each backend,
-//! and the [`ActiveBackend`] type alias that serves as the single point of
+//! and the `ActiveBackend` type alias that serves as the single point of
 //! backend selection based on Cargo features.
 
 /// Trait for backends that can execute batched GEMM on contiguous operands.
@@ -95,10 +95,10 @@ impl<T: crate::ScalarBase> Backend<T> for NaiveBackend {
 
 /// The active GEMM backend, selected by Cargo features.
 ///
-/// - `faer` (without blas/blas-inject) -> [`FaerBackend`]
-/// - `blas` or `blas-inject` (without faer) -> [`BlasBackend`]
-/// - no backend feature -> [`NaiveBackend`]
-/// - invalid combos -> [`NaiveBackend`] (placeholder; `compile_error!` fires first)
+/// - `faer` (without blas/blas-inject) -> `FaerBackend`
+/// - `blas` or `blas-inject` (without faer) -> `BlasBackend`
+/// - no backend feature -> `NaiveBackend`
+/// - invalid combos -> `NaiveBackend` (placeholder; `compile_error!` fires first)
 #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 pub type ActiveBackend = FaerBackend;
 

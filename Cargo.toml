@@ -1,3 +1,49 @@
 [workspace]
-members = ["strided-traits", "strided-view", "strided-perm", "strided-kernel", "strided-einsum2", "strided-opteinsum", "mdarray-opteinsum", "ndarray-opteinsum"]
+members = [
+    "strided-rs",
+    "strided-traits",
+    "strided-view",
+    "strided-perm",
+    "strided-kernel",
+    "strided-einsum2",
+    "strided-opteinsum",
+    "mdarray-opteinsum",
+    "ndarray-opteinsum",
+]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
+repository = "https://github.com/tensor4all/strided-rs"
+
+[workspace.dependencies]
+strided-rs = { version = "0.1.0", path = "strided-rs" }
+strided-traits = { version = "0.1.0", path = "strided-traits" }
+strided-view = { version = "0.1.0", path = "strided-view" }
+strided-perm = { version = "0.1.0", path = "strided-perm" }
+strided-kernel = { version = "0.1.0", path = "strided-kernel" }
+strided-einsum2 = { version = "0.1.0", path = "strided-einsum2", default-features = false }
+strided-opteinsum = { version = "0.1.0", path = "strided-opteinsum", default-features = false }
+mdarray-opteinsum = { version = "0.1.0", path = "mdarray-opteinsum", default-features = false }
+ndarray-opteinsum = { version = "0.1.0", path = "ndarray-opteinsum", default-features = false }
+
+approx = "0.5"
+cblas-inject = "0.1"
+cblas-sys = "0.2"
+criterion = "0.5"
+faer = "0.24"
+faer-traits = "0.24"
+mdarray = "0.8.0"
+ndarray = "0.17"
+num-complex = "0.4"
+num-traits = "0.2"
+omeco = "0.2"
+pulp = "0.22"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+smallvec = "1"
+thiserror = "1.0"

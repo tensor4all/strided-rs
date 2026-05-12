@@ -5,9 +5,17 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 [StridedViews.jl](https://github.com/Jutho/StridedViews.jl), and
 [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl).
 
+The recommended user-facing crate is [`strided-rs`](strided-rs/README.md).
+Use individual crates such as `strided-perm`, `strided-view`, or
+`strided-kernel` directly when you need a smaller dependency surface or a
+lower-level API.
+
 ## Workspace Layout
 
+- [`strided-rs`](strided-rs/README.md): facade crate that re-exports the main workspace APIs
+- [`strided-traits`](strided-traits/): shared scalar and element-operation traits
 - [`strided-view`](strided-view/README.md): core dynamic-rank strided view/array types and metadata ops
+- [`strided-perm`](strided-perm/README.md): cache-efficient tensor permutation / transpose
 - [`strided-kernel`](strided-kernel/README.md): cache-optimized elementwise/reduction kernels over strided views
 - [`strided-einsum2`](strided-einsum2/README.md): binary einsum (`einsum2_into`) on strided tensors
 - [`strided-opteinsum`](strided-opteinsum/README.md): N-ary einsum frontend with nested notation and contraction-order optimization
@@ -25,15 +33,20 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 
 ## Installation
 
-These crates are currently **not published to crates.io** (`publish = false`).
-Use workspace path dependencies:
+These crates are being prepared for crates.io publication, but this repository
+does not publish them automatically. Until a release is published, use workspace
+path dependencies:
 
 ```toml
 [dependencies]
-strided-view = { path = "../strided-rs/strided-view" }
-strided-kernel = { path = "../strided-rs/strided-kernel" }
-strided-einsum2 = { path = "../strided-rs/strided-einsum2" }
-strided-opteinsum = { path = "../strided-rs/strided-opteinsum" }
+strided-rs = { path = "../strided-rs/strided-rs" }
+```
+
+After publication, use:
+
+```toml
+[dependencies]
+strided-rs = "0.1"
 ```
 
 ## Documentation
@@ -54,22 +67,13 @@ CI also builds rustdoc on PRs and deploys workspace docs to GitHub Pages on `mai
 
 ## Quick Start
 
-```rust
-use strided_kernel::{StridedArray, map_into};
-
-// Create a row-major 2D array
-let src = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| {
-    (idx[0] * 10 + idx[1]) as f64
-});
-let mut dest = StridedArray::<f64>::row_major(&[2, 3]);
-
-// Element-wise map: dest[i] = src[i] * 2
-map_into(&mut dest.view_mut(), &src.view(), |x| x * 2.0).unwrap();
-assert_eq!(dest.get(&[1, 2]), 24.0); // (1*10 + 2) * 2
-```
+See the [`strided-rs` Quick Start](strided-rs/README.md#quick-start). The Rust
+example there is included in crate docs and verified by doctests in CI.
 
 See each sub-crate README for detailed API examples and benchmarks:
+- [`strided-rs`](strided-rs/README.md) — recommended facade crate and executable Quick Start
 - [`strided-view`](strided-view/README.md) — types, view operations
+- [`strided-perm`](strided-perm/README.md) — permutation and transpose kernels
 - [`strided-kernel`](strided-kernel/README.md) — map/reduce/broadcast kernels, [benchmarks](strided-kernel/README.md#benchmarks)
 - [`strided-einsum2`](strided-einsum2/README.md) — binary einsum with GEMM backend
 - [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum, [benchmarks](strided-opteinsum/README.md#benchmarks)
