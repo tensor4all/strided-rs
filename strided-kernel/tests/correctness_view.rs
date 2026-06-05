@@ -1,10 +1,13 @@
 use approx::assert_relative_eq;
 use num_complex::Complex64;
 use strided_kernel::{
-    add, axpy, copy_conj, copy_into, copy_scale, copy_transpose_scale_into, dot, fma, map_into,
-    mul, reduce, reduce_axis, sum, symmetrize_conj_into, symmetrize_into, zip_map2_into,
-    zip_map3_into, zip_map4_into, StridedArray, StridedError,
+    add, axpy, batched_outer_product_into, copy_conj, copy_into, copy_scale,
+    copy_transpose_scale_into, dot, fma, map_into, mul, reduce, reduce_axis, sum,
+    symmetrize_conj_into, symmetrize_into, zip_map2_into, zip_map3_into, zip_map4_into,
+    StridedArray, StridedError,
 };
+#[cfg(feature = "parallel")]
+use strided_kernel::{batched_outer_product_into_auto, batched_outer_product_into_par};
 
 fn make_tensor(rows: usize, cols: usize) -> StridedArray<f64> {
     StridedArray::from_fn_row_major(&[rows, cols], |idx| (idx[0] * cols + idx[1]) as f64)
@@ -43,6 +46,81 @@ fn test_zip_map2_mixed_strides() {
         for j in 0..6 {
             let expected = a.get(&[j, i]) + b.get(&[j, i]);
             assert_relative_eq!(out.get(&[i, j]), expected, epsilon = 1e-10);
+        }
+    }
+}
+
+#[test]
+fn test_batched_outer_product_into_compact() {
+    let lhs =
+        StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (1 + idx[0] + 10 * idx[1]) as f64);
+    let rhs =
+        StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let mut out = StridedArray::<f64>::col_major(&[2, 4, 3]);
+
+    batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1).unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                assert_relative_eq!(
+                    out.get(&[j, o, t]),
+                    lhs.get(&[j, t]) * rhs.get(&[o, t]),
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_batched_outer_product_into_noncompact() {
+    let lhs_base =
+        StridedArray::<f64>::from_fn_col_major(&[3, 2], |idx| (1 + idx[0] + 10 * idx[1]) as f64);
+    let rhs_base =
+        StridedArray::<f64>::from_fn_col_major(&[3, 4], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let lhs = lhs_base.view().permute(&[1, 0]).unwrap(); // [j,t] with non-compact j group
+    let rhs = rhs_base.view().permute(&[1, 0]).unwrap(); // [o,t] with non-compact o group
+    let mut out_base = StridedArray::<f64>::col_major(&[3, 4, 2]);
+    let mut out = out_base.view_mut().permute(&[2, 1, 0]).unwrap(); // [j,o,t]
+
+    batched_outer_product_into(&mut out, &lhs, &rhs, 1, 1).unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                assert_relative_eq!(
+                    out.get(&[j, o, t]),
+                    lhs.get(&[j, t]) * rhs.get(&[o, t]),
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_batched_outer_product_into_parallel_apis() {
+    let lhs =
+        StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (1 + idx[0] + 10 * idx[1]) as f64);
+    let rhs =
+        StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let mut par_out = StridedArray::<f64>::col_major(&[2, 4, 3]);
+    let mut auto_out = StridedArray::<f64>::col_major(&[2, 4, 3]);
+
+    batched_outer_product_into_par(&mut par_out.view_mut(), &lhs.view(), &rhs.view(), 1, 1)
+        .unwrap();
+    batched_outer_product_into_auto(&mut auto_out.view_mut(), &lhs.view(), &rhs.view(), 1, 1, 1)
+        .unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                let expected = lhs.get(&[j, t]) * rhs.get(&[o, t]);
+                assert_relative_eq!(par_out.get(&[j, o, t]), expected, epsilon = 1e-10);
+                assert_relative_eq!(auto_out.get(&[j, o, t]), expected, epsilon = 1e-10);
+            }
         }
     }
 }

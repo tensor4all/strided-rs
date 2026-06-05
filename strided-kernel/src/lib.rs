@@ -68,6 +68,7 @@ pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 // View-based operation modules
 mod map_view;
 mod ops_view;
+mod outer_product;
 mod reduce_view;
 
 // ============================================================================
@@ -84,6 +85,13 @@ pub use strided_view::{
 // Map operations
 // ============================================================================
 pub use map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
+
+// ============================================================================
+// Outer-product operations
+// ============================================================================
+pub use outer_product::{batched_outer_product_into, batched_outer_product_into_seq};
+#[cfg(feature = "parallel")]
+pub use outer_product::{batched_outer_product_into_auto, batched_outer_product_into_par};
 
 // ============================================================================
 // High-level operations

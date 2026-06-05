@@ -75,6 +75,33 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
                 dst[i] = f(OpA::apply(src_a[i]), OpB::apply(src_b[i]));
             }
         });
+    } else if ds == 1 && a_s == 1 && b_s == 0 {
+        let src_a = std::slice::from_raw_parts(ap, len);
+        let b = OpB::apply(*bp);
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = f(OpA::apply(src_a[i]), b);
+            }
+        });
+    } else if ds == 1 && a_s == 0 && b_s == 1 {
+        let a = OpA::apply(*ap);
+        let src_b = std::slice::from_raw_parts(bp, len);
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                dst[i] = f(a, OpB::apply(src_b[i]));
+            }
+        });
+    } else if ds == 1 && a_s == 0 && b_s == 0 {
+        let a = OpA::apply(*ap);
+        let b = OpB::apply(*bp);
+        let dst = std::slice::from_raw_parts_mut(dp, len);
+        simd::dispatch_if_large(len, || {
+            for d in dst.iter_mut() {
+                *d = f(a, b);
+            }
+        });
     } else {
         let mut dp = dp;
         let mut ap = ap;

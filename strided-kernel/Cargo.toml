@@ -47,3 +47,7 @@ required-features = ["parallel"]
 [[bench]]
 name = "rank25_permute"
 harness = false
+
+[[bench]]
+name = "outer_product"
+harness = false
