@@ -8,7 +8,6 @@ use crate::ScalarBase;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use strided_perm::try_fuse_group;
 use strided_view::{StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.
@@ -265,10 +264,55 @@ struct ContiguityCheck {
     needs_copy: bool,
 }
 
+/// Try to fuse a GEMM dimension group while preserving canonical col-major
+/// logical order. GEMM sees each group as a single 1D index, so independently
+/// fusing row-major and col-major groups would pair different logical indices.
+fn try_fuse_col_major_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
+    if dims.len() != strides.len() {
+        return None;
+    }
+    let total = dims
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+    if dims.is_empty() {
+        return Some((1, 0));
+    }
+
+    let mut base_stride = None;
+    let mut expected_stride = None;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        if dim <= 1 {
+            continue;
+        }
+        if stride == 0 {
+            return None;
+        }
+        if let Some(expected) = expected_stride {
+            if stride != expected {
+                return None;
+            }
+        } else {
+            base_stride = Some(stride);
+        }
+        let dim = isize::try_from(dim).ok()?;
+        expected_stride = Some(stride.checked_mul(dim)?);
+    }
+
+    let stride = base_stride.unwrap_or_else(|| {
+        strides
+            .iter()
+            .copied()
+            .min_by_key(|stride| stride.unsigned_abs())
+            .unwrap_or(0)
+    });
+    Some((total, stride))
+}
+
 /// Check if two dimension groups are fusable (contiguous) for GEMM.
 ///
-/// When `requires_unit_stride` is true (e.g., CBLAS backend), also checks that
-/// at least one of the fused strides is 0 or 1.
+/// The fused logical dimension order must match the canonical axis order used
+/// by the plan. When `requires_unit_stride` is true (e.g., CBLAS backend), also
+/// checks that at least one of the fused strides is 0 or 1.
 fn check_contiguity(
     group1_dims: &[usize],
     group1_strides: &[isize],
@@ -276,8 +320,8 @@ fn check_contiguity(
     group2_strides: &[isize],
     requires_unit_stride: bool,
 ) -> ContiguityCheck {
-    let fused_g1 = try_fuse_group(group1_dims, group1_strides);
-    let fused_g2 = try_fuse_group(group2_dims, group2_strides);
+    let fused_g1 = try_fuse_col_major_group(group1_dims, group1_strides);
+    let fused_g2 = try_fuse_col_major_group(group2_dims, group2_strides);
 
     let mut needs_copy = fused_g1.is_none() || fused_g2.is_none();
 
