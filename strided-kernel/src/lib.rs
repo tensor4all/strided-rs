@@ -84,14 +84,14 @@ pub use strided_view::{
 // ============================================================================
 // Map operations
 // ============================================================================
-pub use map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
+pub use map_view::{
+    broadcast_mul_into, map_into, mul_into, zip_map2_into, zip_map3_into, zip_map4_into,
+};
 
 // ============================================================================
 // Outer-product operations
 // ============================================================================
-pub use outer_product::{batched_outer_product_into, batched_outer_product_into_seq};
-#[cfg(feature = "parallel")]
-pub use outer_product::{batched_outer_product_into_auto, batched_outer_product_into_par};
+pub use outer_product::batched_outer_product_into;
 
 // ============================================================================
 // High-level operations

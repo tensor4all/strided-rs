@@ -23,6 +23,9 @@ faer = ["strided-einsum2/faer", "strided-einsum2/faer-traits"]
 parallel = ["strided-einsum2/parallel", "strided-kernel/parallel"]
 blas = ["strided-einsum2/blas"]
 blas-inject = ["strided-einsum2/blas-inject"]
+blas-accelerate = ["blas", "strided-einsum2/blas-accelerate"]
+blas-openblas = ["blas", "strided-einsum2/blas-openblas"]
+blas-mkl = ["blas", "strided-einsum2/blas-mkl"]
 
 [dev-dependencies]
 approx.workspace = true

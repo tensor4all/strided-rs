@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "outer_product"
 harness = false
+
+[[bench]]
+name = "mul_pytorch_compare"
+harness = false

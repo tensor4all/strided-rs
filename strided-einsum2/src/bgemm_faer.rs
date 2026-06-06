@@ -375,7 +375,7 @@ use crate::backend::{Backend, FaerBackend};
 
 impl<T> Backend<T> for FaerBackend
 where
-    T: crate::Scalar + ComplexField,
+    T: crate::ScalarBase + strided_view::ElementOpApply + ComplexField,
 {
     const MATERIALIZES_CONJ: bool = false;
     const REQUIRES_UNIT_STRIDE: bool = false;

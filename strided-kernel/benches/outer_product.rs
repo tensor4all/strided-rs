@@ -2,8 +2,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use strided_kernel::{
-    batched_outer_product_into_seq, zip_map2_into, Identity, StridedArray, StridedView,
-    StridedViewMut,
+    batched_outer_product_into, zip_map2_into, Identity, StridedArray, StridedView, StridedViewMut,
 };
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -58,13 +57,13 @@ fn main() {
     println!();
 
     bench_n("batched_outer compact", 20, 100, || {
-        batched_outer_product_into_seq(&mut out.view_mut(), &lhs_compact.view(), &rhs.view(), 2, 1)
+        batched_outer_product_into(&mut out.view_mut(), &lhs_compact.view(), &rhs.view(), 2, 1)
             .unwrap();
         black_box(out.data().as_ptr());
     });
 
     bench_n("batched_outer noncompact", 20, 100, || {
-        batched_outer_product_into_seq(&mut out.view_mut(), &lhs_noncompact, &rhs.view(), 2, 1)
+        batched_outer_product_into(&mut out.view_mut(), &lhs_noncompact, &rhs.view(), 2, 1)
             .unwrap();
         black_box(out.data().as_ptr());
     });
@@ -77,7 +76,7 @@ fn main() {
             0,
         )
         .unwrap();
-        batched_outer_product_into_seq(&mut out_view, &lhs_noncompact, &rhs.view(), 2, 1).unwrap();
+        batched_outer_product_into(&mut out_view, &lhs_noncompact, &rhs.view(), 2, 1).unwrap();
         black_box(out_torchlike.data().as_ptr());
     });
 
@@ -174,6 +173,54 @@ fn main() {
             }
         }
         black_box(out_torchlike.data().as_ptr());
+    });
+
+    bench_n("manual colmajor output j-inner", 20, 100, || {
+        let rows = j * k;
+        for batch in 0..t {
+            let lhs_batch = batch * rows;
+            let rhs_batch = batch * o;
+            let dst_batch = batch * rows * o;
+            for col in 0..o {
+                let rhs_value = unsafe { *rhs_ptr.add(rhs_batch + col) };
+                let dst_col = dst_batch + col * rows;
+                for row_k in 0..k {
+                    let lhs_k = lhs_batch + row_k;
+                    let dst_k = dst_col + row_k * j;
+                    for row_j in 0..j {
+                        unsafe {
+                            *out_ptr.add(dst_k + row_j) =
+                                *lhs_ptr.add(lhs_k + row_j * k) * rhs_value;
+                        }
+                    }
+                }
+            }
+        }
+        black_box(out_ptr);
+    });
+
+    bench_n("manual colmajor output k-inner", 20, 100, || {
+        let rows = j * k;
+        for batch in 0..t {
+            let lhs_batch = batch * rows;
+            let rhs_batch = batch * o;
+            let dst_batch = batch * rows * o;
+            for col in 0..o {
+                let rhs_value = unsafe { *rhs_ptr.add(rhs_batch + col) };
+                let dst_col = dst_batch + col * rows;
+                for row_j in 0..j {
+                    let lhs_j = lhs_batch + row_j * k;
+                    let dst_j = dst_col + row_j;
+                    for row_k in 0..k {
+                        unsafe {
+                            *out_ptr.add(dst_j + row_k * j) =
+                                *lhs_ptr.add(lhs_j + row_k) * rhs_value;
+                        }
+                    }
+                }
+            }
+        }
+        black_box(out_ptr);
     });
 
     let lhs_broadcast_seed: StridedView<'_, f64, Identity> = StridedView::new(

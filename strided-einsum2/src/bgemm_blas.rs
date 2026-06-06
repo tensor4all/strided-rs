@@ -7,7 +7,7 @@
 use crate::backend::{Backend, BlasBackend};
 use crate::contiguous::{ContiguousOperand, ContiguousOperandMut};
 use crate::util::{try_fuse_group, MultiIndex};
-use crate::Scalar;
+use crate::ScalarBase;
 
 #[cfg(all(feature = "blas-inject", not(feature = "blas")))]
 mod inject_fallback {
@@ -191,7 +191,7 @@ mod inject_fallback {
 
 /// Type-level dispatch trait for CBLAS GEMM.
 ///
-/// Implemented for `f64` (via `cblas_dgemm`) and `Complex64` (via `cblas_zgemm`).
+/// Implemented for `f32`/`f64` and `Complex32`/`Complex64`.
 /// The `trans_a` and `trans_b` parameters accept `cblas_sys::CBLAS_TRANSPOSE` values.
 pub trait BlasGemm: Sized {
     /// Call the appropriate CBLAS GEMM routine.
@@ -219,6 +219,43 @@ pub trait BlasGemm: Sized {
         c: *mut Self,
         ldc: i32,
     );
+}
+
+impl BlasGemm for f32 {
+    unsafe fn gemm(
+        trans_a: cblas_sys::CBLAS_TRANSPOSE,
+        trans_b: cblas_sys::CBLAS_TRANSPOSE,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    ) {
+        unsafe {
+            cblas_sys::cblas_sgemm(
+                cblas_sys::CBLAS_LAYOUT::CblasColMajor,
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                alpha,
+                a,
+                lda,
+                b,
+                ldb,
+                beta,
+                c,
+                ldc,
+            );
+        }
+    }
 }
 
 impl BlasGemm for f64 {
@@ -252,6 +289,43 @@ impl BlasGemm for f64 {
                 ldb,
                 beta,
                 c,
+                ldc,
+            );
+        }
+    }
+}
+
+impl BlasGemm for num_complex::Complex32 {
+    unsafe fn gemm(
+        trans_a: cblas_sys::CBLAS_TRANSPOSE,
+        trans_b: cblas_sys::CBLAS_TRANSPOSE,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: num_complex::Complex32,
+        a: *const num_complex::Complex32,
+        lda: i32,
+        b: *const num_complex::Complex32,
+        ldb: i32,
+        beta: num_complex::Complex32,
+        c: *mut num_complex::Complex32,
+        ldc: i32,
+    ) {
+        unsafe {
+            cblas_sys::cblas_cgemm(
+                cblas_sys::CBLAS_LAYOUT::CblasColMajor,
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                (&alpha) as *const _ as *const _,
+                a as *const _ as *const _,
+                lda,
+                b as *const _ as *const _,
+                ldb,
+                (&beta) as *const _ as *const _,
+                c as *mut _ as *mut _,
                 ldc,
             );
         }
@@ -358,7 +432,7 @@ fn operand_layout(
 ///
 /// CBLAS handles `beta` internally, so no pre-scaling loop is needed
 /// (unlike the faer backend which requires explicit pre-scaling for beta not in {0, 1}).
-pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
+pub(crate) fn bgemm_contiguous_into<T: ScalarBase + strided_view::ElementOpApply + BlasGemm>(
     c: &mut ContiguousOperandMut<T>,
     a: &ContiguousOperand<T>,
     b: &ContiguousOperand<T>,
@@ -465,7 +539,7 @@ pub(crate) fn bgemm_contiguous_into<T: Scalar + BlasGemm>(
 
 impl<T> Backend<T> for BlasBackend
 where
-    T: Scalar + BlasGemm,
+    T: ScalarBase + strided_view::ElementOpApply + BlasGemm,
 {
     const MATERIALIZES_CONJ: bool = true;
     const REQUIRES_UNIT_STRIDE: bool = true;

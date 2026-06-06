@@ -608,15 +608,15 @@ pub(crate) fn total_len(dims: &[usize]) -> usize {
 /// Whether the sequential contiguous fast path should be used.
 ///
 /// When the `parallel` feature is enabled and the total element count exceeds
-/// the threading threshold, we must *not* take the contiguous fast path so that
-/// the parallel kernel path can be reached.  Julia has no separate contiguous
-/// fast path -- everything flows through fuse -> order -> block -> threaded ->
-/// kernel, so skipping it here matches Julia's branching.
+/// the threading threshold, we normally must *not* take the contiguous fast path
+/// so that the parallel kernel path can be reached. If the active Rayon pool has
+/// only one worker, however, there is no threaded path to reach and the
+/// sequential slice loop is the right kernel.
 #[inline]
 pub(crate) fn use_sequential_fast_path(total: usize) -> bool {
     #[cfg(feature = "parallel")]
     {
-        total <= crate::threading::MINTHREADLENGTH
+        total <= crate::threading::MINTHREADLENGTH || rayon::current_num_threads() <= 1
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -827,6 +827,22 @@ mod tests {
         assert_eq!(fused_strides.len(), 1);
         assert_eq!(fused_strides[0], vec![1]);
         assert_eq!(plan.block.len(), 1);
+    }
+
+    #[test]
+    fn test_build_plan_fused_keeps_broadcast_compact_inner_loop() {
+        let dims = [16usize, 16, 64, 64];
+        let out = [1isize, 16, 256, 16_384];
+        let lhs = [1isize, 16, 0, 256];
+        let rhs = [0isize, 0, 1, 64];
+        let strides_list: Vec<&[isize]> = vec![&out, &lhs, &rhs];
+
+        let (fused_dims, fused_strides, _) = build_plan_fused(&dims, &strides_list, Some(0), 8);
+
+        assert_eq!(fused_dims[0], 256);
+        assert_eq!(fused_strides[0][0], 1);
+        assert_eq!(fused_strides[1][0], 1);
+        assert_eq!(fused_strides[2][0], 0);
     }
 
     #[test]

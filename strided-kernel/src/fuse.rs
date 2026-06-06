@@ -48,8 +48,14 @@ pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
     for i in (1..n).rev() {
         let mut can_merge = true;
 
-        // Check all arrays for contiguity
+        // Check all arrays for contiguity. An operand broadcast across both
+        // axes has stride 0 for both axes and does not prevent fusing the
+        // iteration space.
         for strides in all_strides {
+            if strides[i - 1] == 0 && strides[i] == 0 {
+                continue;
+            }
+
             // s[i] should equal dims[i-1] * s[i-1] for fusion
             let expected = result[i - 1] as isize * strides[i - 1];
             if strides[i] != expected {
@@ -100,17 +106,9 @@ pub fn compress_dims(dims: &[usize], all_strides: &[Vec<isize>]) -> (Vec<usize>,
 /// Compute the "importance" of each dimension for loop ordering.
 ///
 /// This encodes stride order information into importance scores that determine
-/// the optimal iteration order. The output array's strides are weighted 2x.
-///
-/// # Julia equivalent
-/// ```julia
-/// g = 8 * sizeof(Int) - leading_zeros(M + 1)  # ceil(log2(M+2))
-/// importance = 2 .* (1 .<< (g .* (N .- indexorder(strides[1]))))
-/// for k in 2:M
-///     importance = importance .+ (1 .<< (g .* (N .- indexorder(strides[k]))))
-/// end
-/// importance = importance .* (dims .> 1)
-/// ```
+/// the optimal iteration order. Zero-stride broadcast axes do not contribute to
+/// importance, and the output array gets strong weight so contiguous stores
+/// remain in the inner loop.
 ///
 /// # Arguments
 /// * `dims` - The dimensions
@@ -136,18 +134,27 @@ pub fn compute_importance(
 
     let mut importance = vec![0u64; n];
 
-    // First array (output) is weighted 2x
+    let output_weight = 1u64 << (g + 1);
+
+    // First array (output) gets a strong weight. For elementwise kernels the
+    // store stream determines whether the inner loop can be emitted as a
+    // contiguous vector loop, so a broadcasted input's local stride should not
+    // break a contiguous output group.
     for i in 0..n {
-        let shift = g * (n - index_orders[0][i]) as u64;
-        importance[i] = 2 * (1u64 << shift);
+        if all_strides[0][i] != 0 {
+            let shift = g * (n - index_orders[0][i]) as u64;
+            importance[i] = output_weight * (1u64 << shift);
+        }
     }
 
     // Add contributions from remaining arrays
     #[allow(clippy::needless_range_loop)]
     for k in 1..m {
         for i in 0..n {
-            let shift = g * (n - index_orders[k][i]) as u64;
-            importance[i] += 1u64 << shift;
+            if all_strides[k][i] != 0 {
+                let shift = g * (n - index_orders[k][i]) as u64;
+                importance[i] += 1u64 << shift;
+            }
         }
     }
 
@@ -215,6 +222,19 @@ mod tests {
 
         let fused = fuse_dims(&dims, &all_strides);
         assert_eq!(fused, vec![12, 1]);
+    }
+
+    #[test]
+    fn test_fuse_dims_allows_broadcast_operand_across_fused_axes() {
+        let dims = [16usize, 16, 64, 64];
+        let out = [1isize, 16, 256, 16_384];
+        let lhs = [1isize, 16, 0, 256];
+        let rhs = [0isize, 0, 1, 64];
+        let all_strides: Vec<&[isize]> = vec![&out, &lhs, &rhs];
+
+        let fused = fuse_dims(&dims, &all_strides);
+
+        assert_eq!(fused, vec![256, 1, 64, 64]);
     }
 
     #[test]
@@ -290,7 +310,8 @@ mod tests {
 
     #[test]
     fn test_compute_importance_with_zero_stride() {
-        // Zero stride (broadcast) gets index_order = 1
+        // Zero stride (broadcast) still gets index_order = 1 for compatibility,
+        // but it does not contribute to ordering importance.
         let dims = [4usize, 5];
         let strides1 = [0isize, 1]; // First dim is broadcast
         let all_strides: Vec<&[isize]> = vec![&strides1];
@@ -303,9 +324,8 @@ mod tests {
         let index_orders = vec![order1];
         let importance = compute_importance(&dims, &all_strides, &index_orders);
 
-        // Both dimensions have same index_order, so same importance
-        // (before size-1 filtering)
-        assert_eq!(importance[0], importance[1]);
+        assert_eq!(importance[0], 0);
+        assert!(importance[1] > 0);
     }
 
     #[test]
@@ -327,8 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_importance_output_2x_weight() {
-        // Output (first array) is weighted 2x
+    fn test_compute_importance_output_weight() {
+        // Output (first array) is strongly weighted
         // With same strides, dimension with smaller stride in output wins
         let dims = [4usize, 5];
         let out_strides = [1isize, 4]; // Column-major output
@@ -341,7 +361,7 @@ mod tests {
 
         let importance = compute_importance(&dims, &all_strides, &index_orders);
 
-        // Output has 2x weight, so dimension 0 (smaller stride in output) wins
+        // Output weighting makes dimension 0 (smaller stride in output) win.
         assert!(importance[0] > importance[1]);
     }
 
