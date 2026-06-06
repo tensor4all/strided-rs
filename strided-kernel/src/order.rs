@@ -1,36 +1,30 @@
-//! Loop ordering algorithm ported from Strided.jl
+//! Loop ordering algorithm derived from Strided.jl
 //!
 //! This module computes the optimal dimension iteration order using
-//! the index_order + importance bit-packing algorithm from Julia.
+//! an index_order + importance bit-packing algorithm.
 
 use crate::fuse::{compute_importance, sort_by_importance};
 use strided_view::auxiliary::index_order;
 
 /// Compute the optimal iteration order for dimensions.
 ///
-/// This implementation follows Julia's `_mapreduce_order!` algorithm:
+/// This implementation follows Julia's `_mapreduce_order!` structure:
 /// 1. Compute `index_order` for each array's strides
-/// 2. Compute importance scores using bit-packing with output weighted 2x
+/// 2. Compute importance scores using bit-packing, with strong output locality
+///    preference and zero-stride broadcast axes ignored for ordering
 /// 3. Sort dimensions by importance (descending)
 ///
 /// # Arguments
 /// * `dims` - The dimensions of the arrays
 /// * `strides_list` - Slice of stride arrays, one per array
-/// * `dest_index` - Index of the destination array (weighted 2x, typically 0)
+/// * `dest_index` - Index of the destination array (strongly weighted, typically 0)
 ///
 /// # Returns
 /// Permutation of dimension indices in optimal iteration order
 ///
-/// # Julia equivalent
-/// ```julia
-/// g = 8 * sizeof(Int) - leading_zeros(M + 1)
-/// importance = 2 .* (1 .<< (g .* (N .- indexorder(strides[1]))))
-/// for k in 2:M
-///     importance = importance .+ (1 .<< (g .* (N .- indexorder(strides[k]))))
-/// end
-/// importance = importance .* (dims .> 1)
-/// p = sortperm(importance; rev=true)
-/// ```
+/// The baseline comes from Strided.jl. This version differs by ignoring
+/// zero-stride broadcast axes for ordering and giving the destination a
+/// stronger weight so contiguous stores stay in the inner loop.
 pub(crate) fn compute_order(
     dims: &[usize],
     strides_list: &[&[isize]],
@@ -51,7 +45,7 @@ pub(crate) fn compute_order(
         index_orders.push(index_order(strides));
     }
 
-    // Reorder so destination array is first (gets 2x weight)
+    // Reorder so destination array is first (gets strong store-locality weight)
     let reordered_strides: Vec<&[isize]>;
     let reordered_orders: Vec<Vec<usize>>;
 
@@ -171,20 +165,14 @@ mod tests {
 
     #[test]
     fn test_compute_order_with_zero_stride_broadcast() {
-        // Zero stride indicates broadcasting
-        // Julia: zero strides get index_order = 1 (highest priority for iteration)
+        // Zero stride indicates broadcasting and should not pull an axis inward.
         let dims = [4usize, 5, 3];
         let strides = [0isize, 1, 5]; // First dim is broadcast (stride 0)
         let strides_list: Vec<&[isize]> = vec![&strides];
 
         let order = compute_order(&dims, &strides_list, Some(0));
 
-        // With index_order: [1, 1, 2] for strides [0, 1, 5]
-        // importance for dim 0: shift = g * (3 - 1) = high
-        // importance for dim 1: shift = g * (3 - 1) = high (same as dim 0)
-        // importance for dim 2: shift = g * (3 - 2) = lower
-        // So dim 2 (largest stride) should be last
-        assert_eq!(order[2], 2);
+        assert_eq!(order, vec![1, 2, 0]);
     }
 
     #[test]
@@ -211,10 +199,10 @@ mod tests {
 
         let order = compute_order(&dims, &strides_list, Some(0));
 
-        // Output is weighted 2x, so its stride order dominates
+        // Output is strongly weighted, so its stride order dominates
         // Output index_order: [4, 3, 2, 1] (60 > 20 > 5 > 1)
         // Input index_order: [1, 2, 3, 4] (1 < 2 < 6 < 24)
-        // With output 2x weight, dimension 3 (stride 1 in output) should be first
+        // With output weighting, dimension 3 (stride 1 in output) should be first
         assert_eq!(order[0], 3);
     }
 }

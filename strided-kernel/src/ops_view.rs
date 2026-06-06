@@ -289,7 +289,7 @@ pub fn add<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH {
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut S);
 
@@ -391,7 +391,7 @@ pub fn mul<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH {
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut S);
 
@@ -496,7 +496,7 @@ where
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH {
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut S);
 
@@ -610,7 +610,7 @@ where
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH {
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
             let dst_send = SendPtr(dst_ptr);
             let a_send = SendPtr(a_ptr as *mut A);
             let b_send = SendPtr(b_ptr as *mut B);

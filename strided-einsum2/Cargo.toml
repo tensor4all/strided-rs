@@ -20,12 +20,18 @@ cblas-sys = { workspace = true, optional = true }
 cblas-inject = { workspace = true, optional = true }
 num-complex = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
+smallvec.workspace = true
 
 [features]
-default = ["faer", "faer-traits"]
+default = ["faer"]
+faer = ["dep:faer", "dep:faer-traits"]
+faer-traits = ["dep:faer-traits"]
 parallel = ["dep:rayon", "strided-kernel/parallel", "strided-perm/parallel"]
 blas = ["dep:cblas-sys", "dep:num-complex"]
 blas-inject = ["dep:cblas-inject", "dep:num-complex"]
+blas-accelerate = ["blas"]
+blas-openblas = ["blas"]
+blas-mkl = ["blas"]
 
 [dev-dependencies]
 approx.workspace = true
@@ -34,3 +40,7 @@ rand.workspace = true
 
 [lib]
 bench = false
+
+[[bench]]
+name = "dot_general_pytorch_compare"
+harness = false

@@ -695,6 +695,33 @@ mod tests {
     }
 
     #[test]
+    fn test_borrowed_transposed_matrix_no_copy() {
+        let data = vec![0.0f64; 6];
+        let a_t = StridedArray::<f64>::from_parts(data, &[2, 3], &[3, 1], 0).unwrap();
+        let view = a_t.view();
+
+        let op = prepare_input_view(&view, 1, 1, false, UNIT_STRIDE, true, None).unwrap();
+
+        assert!(!op.has_buf());
+        assert_eq!(op.row_stride(), 3);
+        assert_eq!(op.col_stride(), 1);
+    }
+
+    #[test]
+    fn test_borrowed_batched_transposed_matrix_no_copy() {
+        let data = vec![0.0f64; 2 * 3 * 5];
+        let a_t = StridedArray::<f64>::from_parts(data, &[2, 3, 5], &[3, 1, 6], 0).unwrap();
+        let view = a_t.view();
+
+        let op = prepare_input_view(&view, 1, 1, false, UNIT_STRIDE, true, None).unwrap();
+
+        assert!(!op.has_buf());
+        assert_eq!(op.row_stride(), 3);
+        assert_eq!(op.col_stride(), 1);
+        assert_eq!(op.batch_strides(), &[6]);
+    }
+
+    #[test]
     fn test_borrowed_non_contiguous_copies() {
         let data = vec![0.0f64; 100];
         let a = StridedArray::<f64>::from_parts(data, &[2, 3, 4], &[20, 4, 1], 0).unwrap();

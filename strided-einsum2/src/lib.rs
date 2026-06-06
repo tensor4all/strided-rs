@@ -21,26 +21,24 @@
 //! ).unwrap();
 //! ```
 
-#[cfg(all(feature = "faer", feature = "blas"))]
-compile_error!("Features `faer` and `blas` are mutually exclusive. Use one or the other.");
-
-#[cfg(all(feature = "faer", feature = "blas-inject"))]
-compile_error!("Features `faer` and `blas-inject` are mutually exclusive.");
-
 #[cfg(all(feature = "blas", feature = "blas-inject"))]
 compile_error!("Features `blas` and `blas-inject` are mutually exclusive.");
+
+#[cfg(any(
+    all(feature = "blas-accelerate", feature = "blas-openblas"),
+    all(feature = "blas-accelerate", feature = "blas-mkl"),
+    all(feature = "blas-openblas", feature = "blas-mkl")
+))]
+compile_error!("Select at most one explicit BLAS provider feature.");
 
 #[cfg(all(feature = "blas-inject", not(feature = "blas")))]
 extern crate cblas_inject as cblas_sys;
 #[cfg(all(feature = "blas", not(feature = "blas-inject")))]
 extern crate cblas_sys;
 
-#[cfg(all(
-    not(feature = "faer"),
-    any(
-        all(feature = "blas", not(feature = "blas-inject")),
-        all(feature = "blas-inject", not(feature = "blas"))
-    )
+#[cfg(any(
+    all(feature = "blas", not(feature = "blas-inject")),
+    all(feature = "blas-inject", not(feature = "blas"))
 ))]
 pub mod bgemm_blas;
 
@@ -51,6 +49,8 @@ pub mod bgemm_faer;
 pub mod bgemm_naive;
 /// GEMM-ready operand types and preparation functions for contiguous data.
 pub mod contiguous;
+/// Axis-based general dot product API.
+pub mod dot_general;
 /// Contraction planning: axis classification and permutation computation.
 pub mod plan;
 /// Trace-axis reduction (summing axes that appear only in one operand).
@@ -68,11 +68,13 @@ use std::hash::Hash;
 use strided_kernel::zip_map2_into;
 #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
 use strided_view::StridedArray;
-use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply, StridedView, StridedViewMut};
+use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply};
 
 pub use strided_traits::ScalarBase;
+pub use strided_view::{col_major_strides, StridedView, StridedViewMut};
 
 pub use backend::Backend;
+pub use dot_general::{dot_general_into, dot_general_with_backend_into, DotGeneralConfig};
 pub use plan::Einsum2Plan;
 
 /// Trait alias for axis label types.
@@ -85,34 +87,29 @@ impl<T: Clone + Eq + Hash + Debug> AxisId for T {}
 
 /// Trait alias for element types supported by einsum operations.
 ///
-/// When the `faer` feature is enabled, this additionally requires `faer::ComplexField`
+/// When BLAS is enabled, `Scalar` follows the active backend and requires
+/// `BlasGemm`, even if faer is also compiled for explicit backend use.
+#[cfg(any(
+    all(feature = "blas", not(feature = "blas-inject")),
+    all(feature = "blas-inject", not(feature = "blas"))
+))]
+pub trait Scalar: ScalarBase + ElementOpApply + bgemm_blas::BlasGemm {}
+
+#[cfg(any(
+    all(feature = "blas", not(feature = "blas-inject")),
+    all(feature = "blas-inject", not(feature = "blas"))
+))]
+impl<T> Scalar for T where T: ScalarBase + ElementOpApply + bgemm_blas::BlasGemm {}
+
+/// Trait alias for element types supported by the faer active backend.
+///
+/// When only faer is enabled, this additionally requires `faer::ComplexField`
 /// so that the faer GEMM backend can be used.
 #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 pub trait Scalar: ScalarBase + ElementOpApply + faer_traits::ComplexField {}
 
 #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 impl<T> Scalar for T where T: ScalarBase + ElementOpApply + faer_traits::ComplexField {}
-
-/// Trait alias for element types (with `blas` or `blas-inject` feature).
-///
-/// Includes `BlasGemm` so that all `Scalar` types can be dispatched to CBLAS.
-#[cfg(all(
-    not(feature = "faer"),
-    any(
-        all(feature = "blas", not(feature = "blas-inject")),
-        all(feature = "blas-inject", not(feature = "blas"))
-    )
-))]
-pub trait Scalar: ScalarBase + ElementOpApply + bgemm_blas::BlasGemm {}
-
-#[cfg(all(
-    not(feature = "faer"),
-    any(
-        all(feature = "blas", not(feature = "blas-inject")),
-        all(feature = "blas-inject", not(feature = "blas"))
-    )
-))]
-impl<T> Scalar for T where T: ScalarBase + ElementOpApply + bgemm_blas::BlasGemm {}
 
 /// Trait alias for element types (without `faer` or BLAS features).
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
@@ -125,16 +122,10 @@ impl<T> Scalar for T where T: ScalarBase + ElementOpApply {}
 ///
 /// The crate emits `compile_error!` above for these combinations. This trait only
 /// avoids cascading type-resolution errors so users see the intended diagnostics.
-#[cfg(any(
-    all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
-    all(feature = "blas", feature = "blas-inject")
-))]
+#[cfg(all(feature = "blas", feature = "blas-inject"))]
 pub trait Scalar: ScalarBase + ElementOpApply {}
 
-#[cfg(any(
-    all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
-    all(feature = "blas", feature = "blas-inject")
-))]
+#[cfg(all(feature = "blas", feature = "blas-inject"))]
 impl<T> Scalar for T where T: ScalarBase + ElementOpApply {}
 
 /// Errors specific to einsum operations.
@@ -149,6 +140,13 @@ pub enum EinsumError {
         axis: String,
         dim_a: usize,
         dim_b: usize,
+    },
+    #[error("invalid dot-general config: {0}")]
+    InvalidDotGeneralConfig(String),
+    #[error("output shape mismatch: expected {expected:?}, got {got:?}")]
+    OutputShapeMismatch {
+        expected: Vec<usize>,
+        got: Vec<usize>,
     },
     #[error(transparent)]
     Strided(#[from] strided_view::StridedError),
@@ -230,16 +228,7 @@ where
     };
 
     // 4. Dispatch to GEMM
-    #[cfg(any(
-        all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-        all(
-            not(feature = "faer"),
-            any(
-                all(feature = "blas", not(feature = "blas-inject")),
-                all(feature = "blas-inject", not(feature = "blas"))
-            )
-        )
-    ))]
+    #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
     {
         let conj_fn = make_conj_fn::<T>();
         einsum2_dispatch::<T, backend::ActiveBackend, _>(
@@ -441,22 +430,60 @@ where
 /// When the backend requires conj to be materialized into data (e.g. CBLAS),
 /// returns `Some(conj_apply)`. Otherwise returns `None` (backend handles conj
 /// via transpose flags or similar).
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
+#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
 fn make_conj_fn<T: Scalar>() -> Option<fn(T) -> T> {
     if <backend::ActiveBackend as Backend<T>>::MATERIALIZES_CONJ {
         Some(|x| Conj::apply(x))
     } else {
         None
     }
+}
+
+fn scale_or_zero_strided_mut<T: ScalarBase>(c: &mut StridedViewMut<T>, beta: T) {
+    if c.is_empty() {
+        return;
+    }
+
+    let dims = c.dims().to_vec();
+    let strides = c.strides().to_vec();
+    let ptr = c.as_mut_ptr();
+    let zero = T::zero();
+
+    fn visit<T: ScalarBase>(
+        ptr: *mut T,
+        dims: &[usize],
+        strides: &[isize],
+        axis: usize,
+        offset: isize,
+        beta: T,
+        zero: T,
+    ) {
+        if axis == dims.len() {
+            unsafe {
+                let dst = ptr.offset(offset);
+                if beta == zero {
+                    *dst = zero;
+                } else {
+                    *dst = beta * *dst;
+                }
+            }
+            return;
+        }
+
+        for i in 0..dims[axis] {
+            visit(
+                ptr,
+                dims,
+                strides,
+                axis + 1,
+                offset + i as isize * strides[axis],
+                beta,
+                zero,
+            );
+        }
+    }
+
+    visit(ptr, &dims, &strides, 0, 0, beta, zero);
 }
 
 /// Internal GEMM dispatch, generic over backend.
@@ -471,7 +498,7 @@ fn make_conj_fn<T: Scalar>() -> Option<fn(T) -> T> {
 /// `conj_fn` is the materialization function for backends that need conj
 /// applied to data before GEMM. Pass `None` when conj_a/conj_b are both false
 /// or when the backend handles conj natively (via flags).
-fn einsum2_dispatch<T, B, ID>(
+pub(crate) fn einsum2_dispatch<T, B, ID>(
     c: StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
@@ -491,6 +518,10 @@ where
     let a_perm = a.permute(&plan.left_perm)?;
     let b_perm = b.permute(&plan.right_perm)?;
     let mut c_perm = c.permute(&plan.c_to_internal_perm)?;
+
+    if c_perm.is_empty() {
+        return Ok(());
+    }
 
     // 2. Fast path: element-wise (all batch, no contraction)
     if plan.sum.is_empty() && plan.lo.is_empty() && plan.ro.is_empty() && beta == T::zero() {
@@ -550,6 +581,10 @@ where
     let sum_dims = &a_perm.dims()[n_lo..n_lo + n_sum];
     let batch_dims = &a_perm.dims()[n_lo + n_sum..];
     let ro_dims = &b_perm.dims()[n_sum..n_sum + n_ro];
+    if sum_dims.iter().any(|&dim| dim == 0) {
+        scale_or_zero_strided_mut(&mut c_perm, beta);
+        return Ok(());
+    }
     let m: usize = lo_dims.iter().product::<usize>().max(1);
     let k: usize = sum_dims.iter().product::<usize>().max(1);
     let n: usize = ro_dims.iter().product::<usize>().max(1);
@@ -571,16 +606,7 @@ where
 /// the behavior is identical.
 ///
 /// `conj_a` and `conj_b` indicate whether to conjugate elements of A/B.
-#[cfg(any(
-    all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))),
-    all(
-        not(feature = "faer"),
-        any(
-            all(feature = "blas", not(feature = "blas-inject")),
-            all(feature = "blas-inject", not(feature = "blas"))
-        )
-    )
-))]
+#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
 pub fn einsum2_into_owned<T: Scalar, ID: AxisId>(
     c: StridedViewMut<T>,
     a: StridedArray<T>,

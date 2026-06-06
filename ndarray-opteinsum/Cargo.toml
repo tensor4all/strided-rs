@@ -21,6 +21,9 @@ thiserror.workspace = true
 default = ["faer"]
 faer = ["strided-opteinsum/faer"]
 blas = ["strided-opteinsum/blas"]
+blas-accelerate = ["blas", "strided-opteinsum/blas-accelerate"]
+blas-openblas = ["blas", "strided-opteinsum/blas-openblas"]
+blas-mkl = ["blas", "strided-opteinsum/blas-mkl"]
 
 [dev-dependencies]
 approx.workspace = true

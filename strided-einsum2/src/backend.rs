@@ -95,21 +95,18 @@ impl<T: crate::ScalarBase> Backend<T> for NaiveBackend {
 
 /// The active GEMM backend, selected by Cargo features.
 ///
-/// - `faer` (without blas/blas-inject) -> `FaerBackend`
-/// - `blas` or `blas-inject` (without faer) -> `BlasBackend`
+/// - `blas` or `blas-inject` -> `BlasBackend`
+/// - `faer` without BLAS -> `FaerBackend`
 /// - no backend feature -> `NaiveBackend`
 /// - invalid combos -> `NaiveBackend` (placeholder; `compile_error!` fires first)
-#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
-pub type ActiveBackend = FaerBackend;
-
-#[cfg(all(
-    not(feature = "faer"),
-    any(
-        all(feature = "blas", not(feature = "blas-inject")),
-        all(feature = "blas-inject", not(feature = "blas"))
-    )
+#[cfg(any(
+    all(feature = "blas", not(feature = "blas-inject")),
+    all(feature = "blas-inject", not(feature = "blas"))
 ))]
 pub type ActiveBackend = BlasBackend;
+
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+pub type ActiveBackend = FaerBackend;
 
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
 pub type ActiveBackend = NaiveBackend;
@@ -118,8 +115,5 @@ pub type ActiveBackend = NaiveBackend;
 ///
 /// The crate emits `compile_error!` for these combinations (in `lib.rs`), so this
 /// alias only suppresses cascading type-resolution errors.
-#[cfg(any(
-    all(feature = "faer", any(feature = "blas", feature = "blas-inject")),
-    all(feature = "blas", feature = "blas-inject")
-))]
+#[cfg(all(feature = "blas", feature = "blas-inject"))]
 pub type ActiveBackend = NaiveBackend;

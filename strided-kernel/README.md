@@ -109,6 +109,15 @@ RAYON_NUM_THREADS=1 cargo bench --bench rank25_permute --manifest-path strided-k
 
 # Rank-25 Julia comparison
 JULIA_NUM_THREADS=1 julia --project=strided-kernel/benches strided-kernel/benches/julia_rank25_compare.jl
+
+# Mul kernel comparison against PyTorch CPU at 1T and 4T.
+# Requires uv; the script uses uv run --with torch --with numpy so PyTorch
+# is installed only in the benchmark environment.
+# The PyTorch runner uses torch.mul(..., out=...) to avoid allocator/autograd overhead.
+# Noncompact batched outer product includes both compact output and a
+# torchlike_output case whose non-contiguous output strides match torch.einsum.
+uv --version
+STRIDED_KERNEL_MUL_BENCH_PROFILE=full bash strided-kernel/benches/run_mul_pytorch_compare.sh 1 4
 ```
 
 ### Single-Threaded Results

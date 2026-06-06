@@ -80,6 +80,10 @@ See each sub-crate README for detailed API examples and benchmarks:
 - [`mdarray-opteinsum`](mdarray-opteinsum/README.md) — einsum wrapper for `mdarray` arrays
 - [`ndarray-opteinsum`](ndarray-opteinsum/README.md) — einsum wrapper for `ndarray` arrays
 
+Performance design notes:
+- [`faer-kernel-writing-guide`](docs/faer-kernel-writing-guide.md) — practical rules for writing hot strided kernels based on faer
+- [`faer_design`](docs/faer_design.md) — SIMD design analysis and optimization plan
+
 ## Acknowledgments
 
 This crate is inspired by and ports functionality from:

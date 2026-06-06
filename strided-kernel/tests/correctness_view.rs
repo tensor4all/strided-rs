@@ -1,9 +1,10 @@
 use approx::assert_relative_eq;
 use num_complex::Complex64;
 use strided_kernel::{
-    add, axpy, copy_conj, copy_into, copy_scale, copy_transpose_scale_into, dot, fma, map_into,
-    mul, reduce, reduce_axis, sum, symmetrize_conj_into, symmetrize_into, zip_map2_into,
-    zip_map3_into, zip_map4_into, StridedArray, StridedError,
+    add, axpy, batched_outer_product_into, broadcast_mul_into, copy_conj, copy_into, copy_scale,
+    copy_transpose_scale_into, dot, fma, map_into, mul, mul_into, reduce, reduce_axis, sum,
+    symmetrize_conj_into, symmetrize_into, zip_map2_into, zip_map3_into, zip_map4_into,
+    StridedArray, StridedError,
 };
 
 fn make_tensor(rows: usize, cols: usize) -> StridedArray<f64> {
@@ -45,6 +46,274 @@ fn test_zip_map2_mixed_strides() {
             assert_relative_eq!(out.get(&[i, j]), expected, epsilon = 1e-10);
         }
     }
+}
+
+#[test]
+fn test_mul_into_contiguous() {
+    let a = make_tensor(4, 5);
+    let b = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| (1 + idx[0] + 2 * idx[1]) as f64);
+    let mut out = StridedArray::<f64>::row_major(&[4, 5]);
+
+    mul_into(&mut out.view_mut(), &a.view(), &b.view()).unwrap();
+
+    for i in 0..4 {
+        for j in 0..5 {
+            assert_relative_eq!(
+                out.get(&[i, j]),
+                a.get(&[i, j]) * b.get(&[i, j]),
+                epsilon = 1e-10
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mul_into_broadcast_stride_zero() {
+    let a = StridedArray::<f64>::from_fn_row_major(&[3, 1], |idx| (1 + idx[0]) as f64);
+    let b = StridedArray::<f64>::from_fn_row_major(&[1, 4], |idx| (10 + idx[1]) as f64);
+    let a_broadcast = a.view().broadcast(&[3, 4]).unwrap();
+    let b_broadcast = b.view().broadcast(&[3, 4]).unwrap();
+    let mut out = StridedArray::<f64>::row_major(&[3, 4]);
+
+    mul_into(&mut out.view_mut(), &a_broadcast, &b_broadcast).unwrap();
+
+    for i in 0..3 {
+        for j in 0..4 {
+            assert_relative_eq!(
+                out.get(&[i, j]),
+                a.get(&[i, 0]) * b.get(&[0, j]),
+                epsilon = 1e-10
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mul_into_permuted_noncompact() {
+    let a =
+        StridedArray::<f64>::from_fn_row_major(&[5, 4], |idx| (1 + idx[0] * 10 + idx[1]) as f64);
+    let b = StridedArray::<f64>::from_fn_row_major(&[5, 4], |idx| (2 + idx[0] * 7 + idx[1]) as f64);
+    let a_t = a.view().permute(&[1, 0]).unwrap();
+    let b_t = b.view().permute(&[1, 0]).unwrap();
+    let mut out_base = StridedArray::<f64>::row_major(&[5, 4]);
+    let mut out_t = out_base.view_mut().permute(&[1, 0]).unwrap();
+
+    mul_into(&mut out_t, &a_t, &b_t).unwrap();
+
+    for i in 0..4 {
+        for j in 0..5 {
+            assert_relative_eq!(
+                out_t.get(&[i, j]),
+                a_t.get(&[i, j]) * b_t.get(&[i, j]),
+                epsilon = 1e-10
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mul_into_rejects_shape_mismatch() {
+    let a = StridedArray::<f64>::row_major(&[2, 3]);
+    let b = StridedArray::<f64>::row_major(&[3, 2]);
+    let mut out = StridedArray::<f64>::row_major(&[2, 3]);
+
+    let err = mul_into(&mut out.view_mut(), &a.view(), &b.view()).unwrap_err();
+
+    assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
+}
+
+#[test]
+fn test_broadcast_mul_into_maps_source_axes_without_copy() {
+    let lhs =
+        StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (1 + idx[0] + 10 * idx[1]) as f64);
+    let rhs =
+        StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let mut out = StridedArray::<f64>::col_major(&[2, 4, 3]);
+
+    broadcast_mul_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &[0, 2],
+        &rhs.view(),
+        &[1, 2],
+    )
+    .unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                assert_relative_eq!(
+                    out.get(&[j, o, t]),
+                    lhs.get(&[j, t]) * rhs.get(&[o, t]),
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_broadcast_mul_into_broadcasts_mapped_size_one_axes() {
+    let lhs = StridedArray::<f64>::from_fn_row_major(&[3, 1], |idx| (1 + idx[0]) as f64);
+    let rhs = StridedArray::<f64>::from_fn_row_major(&[1, 4], |idx| (10 + idx[1]) as f64);
+    let mut out = StridedArray::<f64>::row_major(&[3, 4]);
+
+    broadcast_mul_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &[0, 1],
+        &rhs.view(),
+        &[0, 1],
+    )
+    .unwrap();
+
+    for i in 0..3 {
+        for j in 0..4 {
+            assert_relative_eq!(
+                out.get(&[i, j]),
+                lhs.get(&[i, 0]) * rhs.get(&[0, j]),
+                epsilon = 1e-10
+            );
+        }
+    }
+}
+
+#[test]
+fn test_broadcast_mul_into_rejects_invalid_axis_map() {
+    let lhs = StridedArray::<f64>::row_major(&[2, 3]);
+    let rhs = StridedArray::<f64>::row_major(&[4]);
+    let mut out = StridedArray::<f64>::row_major(&[2, 4, 3]);
+
+    let err = broadcast_mul_into(&mut out.view_mut(), &lhs.view(), &[0, 3], &rhs.view(), &[1])
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StridedError::InvalidAxis { axis: 3, rank: 3 }
+    ));
+}
+
+#[test]
+fn test_batched_outer_product_into_compact() {
+    let lhs =
+        StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (1 + idx[0] + 10 * idx[1]) as f64);
+    let rhs =
+        StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let mut out = StridedArray::<f64>::col_major(&[2, 4, 3]);
+
+    batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1).unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                assert_relative_eq!(
+                    out.get(&[j, o, t]),
+                    lhs.get(&[j, t]) * rhs.get(&[o, t]),
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_batched_outer_product_into_mixed_types() {
+    let lhs = StridedArray::<Complex64>::from_fn_col_major(&[2, 3], |idx| {
+        Complex64::new((1 + idx[0] + 10 * idx[1]) as f64, (2 + idx[0]) as f64)
+    });
+    let rhs =
+        StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let mut out = StridedArray::<Complex64>::col_major(&[2, 4, 3]);
+
+    batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1).unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                let expected = lhs.get(&[j, t]) * rhs.get(&[o, t]);
+                assert_relative_eq!(out.get(&[j, o, t]).re, expected.re, epsilon = 1e-10);
+                assert_relative_eq!(out.get(&[j, o, t]).im, expected.im, epsilon = 1e-10);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_batched_outer_product_into_noncompact() {
+    let lhs_base =
+        StridedArray::<f64>::from_fn_col_major(&[3, 2], |idx| (1 + idx[0] + 10 * idx[1]) as f64);
+    let rhs_base =
+        StridedArray::<f64>::from_fn_col_major(&[3, 4], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let lhs = lhs_base.view().permute(&[1, 0]).unwrap(); // [j,t] with non-compact j group
+    let rhs = rhs_base.view().permute(&[1, 0]).unwrap(); // [o,t] with non-compact o group
+    let mut out_base = StridedArray::<f64>::col_major(&[3, 4, 2]);
+    let mut out = out_base.view_mut().permute(&[2, 1, 0]).unwrap(); // [j,o,t]
+
+    batched_outer_product_into(&mut out, &lhs, &rhs, 1, 1).unwrap();
+
+    for j in 0..2 {
+        for o in 0..4 {
+            for t in 0..3 {
+                assert_relative_eq!(
+                    out.get(&[j, o, t]),
+                    lhs.get(&[j, t]) * rhs.get(&[o, t]),
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_batched_outer_product_into_matches_broadcast_mul_into() {
+    let lhs_base = StridedArray::<f64>::from_fn_col_major(&[3, 2, 5], |idx| {
+        (1 + idx[0] + 10 * idx[1] + 100 * idx[2]) as f64
+    });
+    let lhs = lhs_base.view().permute(&[1, 0, 2]).unwrap();
+    let rhs =
+        StridedArray::<f64>::from_fn_col_major(&[4, 5], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
+    let mut outer_out = StridedArray::<f64>::col_major(&[2, 3, 4, 5]);
+    let mut broadcast_out = StridedArray::<f64>::col_major(&[2, 3, 4, 5]);
+
+    batched_outer_product_into(&mut outer_out.view_mut(), &lhs, &rhs.view(), 2, 1).unwrap();
+    broadcast_mul_into(
+        &mut broadcast_out.view_mut(),
+        &lhs,
+        &[0, 1, 3],
+        &rhs.view(),
+        &[2, 3],
+    )
+    .unwrap();
+
+    for j in 0..2 {
+        for k in 0..3 {
+            for o in 0..4 {
+                for t in 0..5 {
+                    assert_relative_eq!(
+                        outer_out.get(&[j, k, o, t]),
+                        broadcast_out.get(&[j, k, o, t]),
+                        epsilon = 1e-10
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_batched_outer_product_into_rejects_mismatched_batch_dims() {
+    let lhs = StridedArray::<f64>::col_major(&[2, 3]);
+    let rhs = StridedArray::<f64>::col_major(&[4, 5]);
+    let mut out = StridedArray::<f64>::col_major(&[2, 4, 3]);
+
+    let err = batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StridedError::ShapeMismatch(actual, expected)
+            if actual == vec![3] && expected == vec![5]
+    ));
 }
 
 #[test]

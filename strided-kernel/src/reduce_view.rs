@@ -52,7 +52,10 @@ where
     #[cfg(feature = "parallel")]
     {
         let total = total_len(src_dims);
-        if total > MINTHREADLENGTH && same_contiguous_layout(src_dims, &[src_strides]).is_some() {
+        if total > MINTHREADLENGTH
+            && rayon::current_num_threads() > 1
+            && same_contiguous_layout(src_dims, &[src_strides]).is_some()
+        {
             let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total) };
             use rayon::prelude::*;
             let nthreads = rayon::current_num_threads();
@@ -81,7 +84,7 @@ where
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH {
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
             let nthreads = rayon::current_num_threads();
             // False sharing avoidance: space output slots by cache line size
             let spacing = (64 / std::mem::size_of::<U>()).max(1);

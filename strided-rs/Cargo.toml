@@ -49,5 +49,26 @@ blas-inject = [
     "strided-einsum2/blas-inject",
     "strided-opteinsum/blas-inject",
 ]
+blas-accelerate = [
+    "blas",
+    "strided-einsum2/blas-accelerate",
+    "strided-opteinsum/blas-accelerate",
+    "mdarray-opteinsum?/blas-accelerate",
+    "ndarray-opteinsum?/blas-accelerate",
+]
+blas-openblas = [
+    "blas",
+    "strided-einsum2/blas-openblas",
+    "strided-opteinsum/blas-openblas",
+    "mdarray-opteinsum?/blas-openblas",
+    "ndarray-opteinsum?/blas-openblas",
+]
+blas-mkl = [
+    "blas",
+    "strided-einsum2/blas-mkl",
+    "strided-opteinsum/blas-mkl",
+    "mdarray-opteinsum?/blas-mkl",
+    "ndarray-opteinsum?/blas-mkl",
+]
 mdarray = ["dep:mdarray-opteinsum"]
 ndarray = ["dep:ndarray-opteinsum"]

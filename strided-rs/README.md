@@ -35,6 +35,11 @@ assert_eq!(dest.get(&[1, 2]), 24.0);
 - `faer` (default): enables the `faer` backend for einsum contractions.
 - `parallel`: enables Rayon-backed parallel kernels where available.
 - `blas`: enables the CBLAS backend for einsum contractions.
+- `blas-accelerate`: enables the CBLAS backend and links Apple's Accelerate
+  provider.
+- `blas-openblas`: enables the CBLAS backend and links OpenBLAS.
+- `blas-mkl`: enables the CBLAS backend and links Intel MKL dynamic parallel
+  libraries.
 - `blas-inject`: enables BLAS through `cblas-inject`.
 - `mdarray`: re-exports the `mdarray-opteinsum` frontend as `strided_rs::mdarray`.
 - `ndarray`: re-exports the `ndarray-opteinsum` frontend as `strided_rs::ndarray`.
@@ -47,6 +52,13 @@ features are disabled, enable one backend feature when using einsum APIs or the
 ```toml
 [dependencies]
 strided-rs = { version = "0.1", default-features = false, features = ["blas"] }
+```
+
+Use a provider feature when the BLAS provider should be fixed explicitly:
+
+```toml
+[dependencies]
+strided-rs = { version = "0.1", default-features = false, features = ["blas-openblas"] }
 ```
 
 ## Namespaced APIs
