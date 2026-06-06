@@ -25,6 +25,8 @@ type AxisVec<T> = SmallVec<[T; 8]>;
 #[cfg(not(feature = "parallel"))]
 type AxisVec<T> = Vec<T>;
 
+const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
+
 // ============================================================================
 // Stride-specialized inner loop helpers
 //
@@ -218,7 +220,6 @@ unsafe fn inner_loop_mul2<
     }
 }
 
-#[cfg(feature = "parallel")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ContiguousMulRangePlan {
     axis_order: AxisVec<usize>,
@@ -262,7 +263,6 @@ fn transposed_scalar_tile_kind(plan: &ContiguousMulRangePlan) -> Option<Transpos
     None
 }
 
-#[cfg(feature = "parallel")]
 fn compact_axis_order(dims: &[usize], strides: &[isize]) -> Option<AxisVec<usize>> {
     if dims.len() != strides.len() {
         return None;
@@ -295,12 +295,10 @@ fn compact_axis_order(dims: &[usize], strides: &[isize]) -> Option<AxisVec<usize
     Some(active)
 }
 
-#[cfg(feature = "parallel")]
 fn can_fuse_contiguous_range_axis(dim: usize, prev_stride: isize, next_stride: isize) -> bool {
     dim <= 1 || (prev_stride == 0 && next_stride == 0) || next_stride == prev_stride * dim as isize
 }
 
-#[cfg(feature = "parallel")]
 fn contiguous_mul_range_plan(
     dims: &[usize],
     dst_strides: &[isize],
@@ -385,18 +383,16 @@ fn contiguous_mul_range_plan(
     })
 }
 
-#[cfg(feature = "parallel")]
 struct ContiguousMulOuterCursor<'a> {
     dims: &'a [usize],
     a_strides: &'a [isize],
     b_strides: &'a [isize],
-    axes: SmallVec<[usize; 8]>,
-    coords: SmallVec<[usize; 8]>,
+    axes: AxisVec<usize>,
+    coords: AxisVec<usize>,
     a_offset: isize,
     b_offset: isize,
 }
 
-#[cfg(feature = "parallel")]
 impl<'a> ContiguousMulOuterCursor<'a> {
     fn new(
         dims: &'a [usize],
@@ -405,13 +401,13 @@ impl<'a> ContiguousMulOuterCursor<'a> {
         plan: &ContiguousMulRangePlan,
         outer_group: usize,
     ) -> Self {
-        let axes: SmallVec<[usize; 8]> = plan
+        let axes: AxisVec<usize> = plan
             .axis_order
             .iter()
             .skip(plan.outer_axis_start)
             .copied()
             .collect();
-        let mut coords = SmallVec::<[usize; 8]>::with_capacity(axes.len());
+        let mut coords = AxisVec::<usize>::with_capacity(axes.len());
         let mut rem = outer_group;
         let mut a_offset = 0isize;
         let mut b_offset = 0isize;
@@ -458,7 +454,6 @@ impl<'a> ContiguousMulOuterCursor<'a> {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[inline(always)]
 unsafe fn run_contiguous_mul_row_block<
     D: Copy + 'static,
@@ -476,8 +471,10 @@ unsafe fn run_contiguous_mul_row_block<
 ) {
     let inner_len = plan.inner_len.max(1);
     let row_len = plan.row_len.max(1);
+    #[cfg(feature = "parallel")]
     let block_len = inner_len.saturating_mul(row_len);
 
+    #[cfg(feature = "parallel")]
     if total.saturating_sub(base_index) >= block_len {
         match transposed_scalar_tile_kind(plan) {
             Some(TransposedScalarTileKind::RhsScalar) => {
@@ -554,7 +551,6 @@ fn strided_offset_for_contiguous_linear_index(
     offset
 }
 
-#[cfg(feature = "parallel")]
 fn try_contiguous_range_mul<
     D: Copy + MaybeSendSync + 'static,
     A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
@@ -572,7 +568,7 @@ fn try_contiguous_range_mul<
     if total == 0 {
         return true;
     }
-    if total <= MINTHREADLENGTH {
+    if total <= CONTIGUOUS_RANGE_MIN_LEN {
         return false;
     }
 
@@ -584,106 +580,155 @@ fn try_contiguous_range_mul<
     let row_len = plan.row_len.max(1);
     let block_len = inner_len.saturating_mul(row_len).max(1);
     let outer_groups = total.div_ceil(block_len);
-    let nthreads = rayon::current_num_threads();
 
-    if nthreads <= 1 {
-        let mut cursor = ContiguousMulOuterCursor::new(dims, a_strides, b_strides, &plan, 0);
-        for group in 0..outer_groups {
-            let index = group * block_len;
-            unsafe {
-                run_contiguous_mul_row_block::<D, A, B>(
-                    dst_ptr,
-                    a_ptr,
-                    b_ptr,
-                    &plan,
-                    index,
-                    total,
-                    cursor.a_offset,
-                    cursor.b_offset,
-                );
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = rayon::current_num_threads();
+        if nthreads > 1 {
+            use crate::threading::SendPtr;
+            use rayon::prelude::*;
+
+            let dst = SendPtr(dst_ptr);
+            let a = SendPtr(a_ptr as *mut A);
+            let b = SendPtr(b_ptr as *mut B);
+
+            if outer_groups < nthreads {
+                let chunk_len = total.div_ceil(nthreads);
+                let nchunks = total.div_ceil(chunk_len);
+
+                (0..nchunks).into_par_iter().for_each(|chunk| {
+                    let start = chunk * chunk_len;
+                    let end = (start + chunk_len).min(total);
+                    let mut index = start;
+
+                    while index < end {
+                        let in_inner = index % inner_len;
+                        let len = (inner_len - in_inner).min(end - index);
+                        let a_offset = strided_offset_for_contiguous_linear_index(
+                            dims,
+                            a_strides,
+                            &plan.axis_order,
+                            index,
+                        );
+                        let b_offset = strided_offset_for_contiguous_linear_index(
+                            dims,
+                            b_strides,
+                            &plan.axis_order,
+                            index,
+                        );
+
+                        unsafe {
+                            inner_loop_mul2::<D, A, B>(
+                                dst.as_ptr().add(index),
+                                1,
+                                a.as_const().offset(a_offset),
+                                plan.a_fast_stride,
+                                b.as_const().offset(b_offset),
+                                plan.b_fast_stride,
+                                len,
+                            );
+                        }
+                        index += len;
+                    }
+                });
+
+                return true;
             }
-            cursor.advance();
-        }
-        return true;
-    }
 
-    use crate::threading::SendPtr;
-    use rayon::prelude::*;
+            let groups_per_chunk = outer_groups.div_ceil(nthreads);
+            let nchunks = outer_groups.div_ceil(groups_per_chunk);
 
-    let dst = SendPtr(dst_ptr);
-    let a = SendPtr(a_ptr as *mut A);
-    let b = SendPtr(b_ptr as *mut B);
+            (0..nchunks).into_par_iter().for_each(|chunk| {
+                let group_start = chunk * groups_per_chunk;
+                let group_end = (group_start + groups_per_chunk).min(outer_groups);
+                let mut cursor =
+                    ContiguousMulOuterCursor::new(dims, a_strides, b_strides, &plan, group_start);
 
-    if outer_groups < nthreads {
-        let chunk_len = total.div_ceil(nthreads);
-        let nchunks = total.div_ceil(chunk_len);
-
-        (0..nchunks).into_par_iter().for_each(|chunk| {
-            let start = chunk * chunk_len;
-            let end = (start + chunk_len).min(total);
-            let mut index = start;
-
-            while index < end {
-                let in_inner = index % inner_len;
-                let len = (inner_len - in_inner).min(end - index);
-                let a_offset = strided_offset_for_contiguous_linear_index(
-                    dims,
-                    a_strides,
-                    &plan.axis_order,
-                    index,
-                );
-                let b_offset = strided_offset_for_contiguous_linear_index(
-                    dims,
-                    b_strides,
-                    &plan.axis_order,
-                    index,
-                );
-
-                unsafe {
-                    inner_loop_mul2::<D, A, B>(
-                        dst.as_ptr().add(index),
-                        1,
-                        a.as_const().offset(a_offset),
-                        plan.a_fast_stride,
-                        b.as_const().offset(b_offset),
-                        plan.b_fast_stride,
-                        len,
-                    );
+                for group in group_start..group_end {
+                    let index = group * block_len;
+                    unsafe {
+                        run_contiguous_mul_row_block::<D, A, B>(
+                            dst.as_ptr(),
+                            a.as_const(),
+                            b.as_const(),
+                            &plan,
+                            index,
+                            total,
+                            cursor.a_offset,
+                            cursor.b_offset,
+                        );
+                    }
+                    cursor.advance();
                 }
-                index += len;
-            }
-        });
+            });
 
-        return true;
+            true
+        } else {
+            run_contiguous_range_mul_single_thread(
+                dst_ptr,
+                dims,
+                a_ptr,
+                a_strides,
+                b_ptr,
+                b_strides,
+                &plan,
+                total,
+                block_len,
+                outer_groups,
+            )
+        }
     }
 
-    let groups_per_chunk = outer_groups.div_ceil(nthreads);
-    let nchunks = outer_groups.div_ceil(groups_per_chunk);
+    #[cfg(not(feature = "parallel"))]
+    {
+        run_contiguous_range_mul_single_thread(
+            dst_ptr,
+            dims,
+            a_ptr,
+            a_strides,
+            b_ptr,
+            b_strides,
+            &plan,
+            total,
+            block_len,
+            outer_groups,
+        )
+    }
+}
 
-    (0..nchunks).into_par_iter().for_each(|chunk| {
-        let group_start = chunk * groups_per_chunk;
-        let group_end = (group_start + groups_per_chunk).min(outer_groups);
-        let mut cursor =
-            ContiguousMulOuterCursor::new(dims, a_strides, b_strides, &plan, group_start);
-
-        for group in group_start..group_end {
-            let index = group * block_len;
-            unsafe {
-                run_contiguous_mul_row_block::<D, A, B>(
-                    dst.as_ptr(),
-                    a.as_const(),
-                    b.as_const(),
-                    &plan,
-                    index,
-                    total,
-                    cursor.a_offset,
-                    cursor.b_offset,
-                );
-            }
-            cursor.advance();
+fn run_contiguous_range_mul_single_thread<
+    D: Copy + MaybeSendSync + 'static,
+    A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
+    B: Copy + MaybeSendSync + 'static,
+>(
+    dst_ptr: *mut D,
+    dims: &[usize],
+    a_ptr: *const A,
+    a_strides: &[isize],
+    b_ptr: *const B,
+    b_strides: &[isize],
+    plan: &ContiguousMulRangePlan,
+    total: usize,
+    block_len: usize,
+    outer_groups: usize,
+) -> bool {
+    let mut cursor = ContiguousMulOuterCursor::new(dims, a_strides, b_strides, plan, 0);
+    for group in 0..outer_groups {
+        let index = group * block_len;
+        unsafe {
+            run_contiguous_mul_row_block::<D, A, B>(
+                dst_ptr,
+                a_ptr,
+                b_ptr,
+                plan,
+                index,
+                total,
+                cursor.a_offset,
+                cursor.b_offset,
+            );
         }
-    });
-
+        cursor.advance();
+    }
     true
 }
 
@@ -1054,19 +1099,16 @@ fn mul_identity_into_raw<
         .max(std::mem::size_of::<B>());
     let total = total_len(dst_dims);
 
-    #[cfg(feature = "parallel")]
-    {
-        if try_contiguous_range_mul(
-            dst_ptr,
-            dst_dims,
-            dst_strides,
-            a_ptr,
-            a_strides,
-            b_ptr,
-            b_strides,
-        ) {
-            return Ok(());
-        }
+    if try_contiguous_range_mul(
+        dst_ptr,
+        dst_dims,
+        dst_strides,
+        a_ptr,
+        a_strides,
+        b_ptr,
+        b_strides,
+    ) {
+        return Ok(());
     }
 
     let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
@@ -1735,6 +1777,53 @@ mod scalar_branch_tests {
             &[0, 1],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn contiguous_mul_range_plan_available_without_parallel_feature() {
+        let dims = [3usize; 16];
+        let dst = [
+            1, 3, 9, 27, 81, 243, 729, 2187, 6561, 19683, 59049, 177147, 531441, 1594323, 4782969,
+            14348907,
+        ];
+        let lhs = [1isize, 3, 9, 27, 81, 243, 729, 2187, 0, 0, 0, 0, 0, 0, 0, 0];
+        let rhs = [0isize, 0, 0, 0, 0, 0, 0, 0, 1, 3, 9, 27, 81, 243, 729, 2187];
+
+        let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
+
+        assert_eq!(plan.inner_len, 6561);
+        assert_eq!(plan.row_len, 3);
+        assert_eq!(plan.fast_axis, 0);
+    }
+
+    #[test]
+    fn contiguous_range_mul_single_thread_computes_large_broadcast_mul() {
+        let dims = [3usize; 10];
+        let dst = [1isize, 3, 9, 27, 81, 243, 729, 2187, 6561, 19683];
+        let lhs = [1isize, 3, 9, 27, 81, 0, 0, 0, 0, 0];
+        let rhs = [0isize, 0, 0, 0, 0, 1, 3, 9, 27, 81];
+        let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
+        let total = total_len(&dims);
+        let block_len = plan.inner_len.max(1).saturating_mul(plan.row_len.max(1));
+        let outer_groups = total.div_ceil(block_len);
+
+        let a = vec![2.0; 243];
+        let b = vec![3.0; 243];
+        let mut out = vec![0.0; total];
+
+        assert!(run_contiguous_range_mul_single_thread::<f64, f64, f64>(
+            out.as_mut_ptr(),
+            &dims,
+            a.as_ptr(),
+            &lhs,
+            b.as_ptr(),
+            &rhs,
+            &plan,
+            total,
+            block_len,
+            outer_groups,
+        ));
+        assert!(out.iter().all(|&x| x == 6.0));
     }
 }
 
