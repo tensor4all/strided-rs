@@ -1547,6 +1547,197 @@ pub fn zip_map4_into<
     )
 }
 
+#[cfg(test)]
+mod scalar_branch_tests {
+    use super::*;
+    use crate::StridedArray;
+    use strided_view::Identity;
+
+    #[test]
+    fn test_inner_loop_map2_stride_specializations() {
+        let a = [2.0, 3.0, 5.0, 7.0, 11.0, 13.0];
+        let b = [17.0, 19.0, 23.0, 29.0, 31.0, 37.0];
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_map2::<f64, f64, f64, Identity, Identity>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                1,
+                3,
+                &|x, y| x + y,
+            );
+        }
+        assert_eq!(out, [19.0, 22.0, 28.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_map2::<f64, f64, f64, Identity, Identity>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                0,
+                3,
+                &|x, y| x * y,
+            );
+        }
+        assert_eq!(out, [34.0, 51.0, 85.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_map2::<f64, f64, f64, Identity, Identity>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                1,
+                3,
+                &|x, y| x * y,
+            );
+        }
+        assert_eq!(out, [34.0, 38.0, 46.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_map2::<f64, f64, f64, Identity, Identity>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                0,
+                3,
+                &|x, y| x + y,
+            );
+        }
+        assert_eq!(out, [19.0, 19.0, 19.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_map2::<f64, f64, f64, Identity, Identity>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                2,
+                b.as_ptr(),
+                0,
+                3,
+                &|x, y| x + y,
+            );
+        }
+        assert_eq!(out, [19.0, 22.0, 28.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_map2::<f64, f64, f64, Identity, Identity>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                2,
+                3,
+                &|x, y| x + y,
+            );
+        }
+        assert_eq!(out, [19.0, 25.0, 33.0]);
+    }
+
+    #[test]
+    fn test_inner_loop_mul2_stride_specializations() {
+        let a = [2.0, 3.0, 5.0, 7.0, 11.0, 13.0];
+        let b = [17.0, 19.0, 23.0, 29.0, 31.0, 37.0];
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 1, b.as_ptr(), 1, 3);
+        }
+        assert_eq!(out, [34.0, 57.0, 115.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 0, b.as_ptr(), 1, 3);
+        }
+        assert_eq!(out, [34.0, 38.0, 46.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 0, b.as_ptr(), 0, 3);
+        }
+        assert_eq!(out, [34.0, 34.0, 34.0]);
+
+        let mut out = [0.0; 3];
+        unsafe {
+            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 0, b.as_ptr(), 2, 3);
+        }
+        assert_eq!(out, [34.0, 46.0, 62.0]);
+    }
+
+    #[test]
+    fn test_broadcast_mul_into_error_branches_and_non_identity_ops() {
+        let lhs = StridedArray::<f64>::row_major(&[2, 3]);
+        let rhs = StridedArray::<f64>::row_major(&[2, 3]);
+        let mut out = StridedArray::<f64>::row_major(&[2, 3]);
+
+        let err = broadcast_mul_into(&mut out.view_mut(), &lhs.view(), &[0], &rhs.view(), &[0, 1])
+            .unwrap_err();
+        assert!(matches!(err, StridedError::RankMismatch(2, 1)));
+
+        let err = broadcast_mul_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &[0, 3],
+            &rhs.view(),
+            &[0, 1],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StridedError::InvalidAxis { axis: 3, rank: 2 }
+        ));
+
+        let err = broadcast_mul_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &[0, 0],
+            &rhs.view(),
+            &[0, 1],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StridedError::InvalidAxis { axis: 0, rank: 2 }
+        ));
+
+        let rhs_bad = StridedArray::<f64>::row_major(&[2, 4]);
+        let err = broadcast_mul_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &[0, 1],
+            &rhs_bad.view(),
+            &[0, 1],
+        )
+        .unwrap_err();
+        assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
+
+        let lhs_conj = lhs.view().conj();
+        broadcast_mul_into(
+            &mut out.view_mut(),
+            &lhs_conj,
+            &[0, 1],
+            &rhs.view(),
+            &[0, 1],
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(all(test, feature = "parallel"))]
 mod tests {
     use super::*;
