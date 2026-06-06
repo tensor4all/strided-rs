@@ -197,6 +197,30 @@ fn dot_general_inner_product_returns_rank0_scalar() {
 }
 
 #[test]
+fn dot_general_full_contract_respects_rhs_contracting_order() {
+    let a = col_major_array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let b = col_major_array(vec![36.0, 42.0, 48.0, 136.0, 158.0, 180.0], &[3, 2]);
+    let mut c = StridedArray::<f64>::col_major(&[]);
+
+    dot_general_into(
+        c.view_mut(),
+        &a.view(),
+        &b.view(),
+        &DotGeneralConfig {
+            lhs_contracting_dims: &[0, 1],
+            rhs_contracting_dims: &[1, 0],
+            lhs_batch_dims: &[],
+            rhs_batch_dims: &[],
+        },
+        1.0,
+        0.0,
+    )
+    .unwrap();
+
+    assert_eq!(c.data(), &[2386.0]);
+}
+
+#[test]
 fn dot_general_zero_contracting_dim_zero_fills_output() {
     let a = col_major_array(Vec::new(), &[2, 0]);
     let b = col_major_array(Vec::new(), &[0, 3]);
