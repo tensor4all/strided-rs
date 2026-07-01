@@ -11,20 +11,20 @@ use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
 /// Mirrors HPTT's ComputeNode linked list. Each node represents one
 /// loop level in the execution nest.
 #[derive(Debug, Clone)]
-pub struct ComputeNode {
+pub(crate) struct ComputeNode {
     /// End index for this loop (loop runs 0..end).
-    pub end: usize,
+    pub(crate) end: usize,
     /// Source stride for this dimension.
-    pub lda: isize,
+    pub(crate) lda: isize,
     /// Destination stride for this dimension.
-    pub ldb: isize,
+    pub(crate) ldb: isize,
     /// Next node in the chain (None = leaf → calls macro_kernel or memcpy).
-    pub next: Option<Box<ComputeNode>>,
+    pub(crate) next: Option<Box<ComputeNode>>,
 }
 
 /// Execution mode determined at plan time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecMode {
+pub(crate) enum ExecMode {
     /// dim_A != dim_B: 2D micro-kernel transpose path.
     Transpose {
         /// Dimension with smallest |src_stride| (stride-1 in source).
@@ -37,38 +37,57 @@ pub enum ExecMode {
         /// The shared stride-1 dimension.
         inner_dim: usize,
     },
+    /// High-rank transpose path using two virtual flattened tile groups.
+    GroupedTranspose,
     /// Rank 0: single element copy.
     Scalar,
 }
 
+/// One virtual flattened tile group.
+#[derive(Debug, Clone)]
+pub(crate) struct OffsetGroup {
+    pub(crate) src_offsets: Vec<isize>,
+    pub(crate) dst_offsets: Vec<isize>,
+    pub(crate) len: usize,
+}
+
+/// Offset-table tile plan for high-rank scattered permutations.
+#[derive(Debug, Clone)]
+pub(crate) struct GroupedTilePlan {
+    pub(crate) group_a: OffsetGroup,
+    pub(crate) group_b: OffsetGroup,
+}
+
 /// Complete permutation plan.
 #[derive(Debug)]
-pub struct PermutePlan {
+pub(crate) struct PermutePlan {
     /// Fused dimensions (after bilateral fusion).
-    pub fused_dims: Vec<usize>,
+    pub(crate) fused_dims: Vec<usize>,
     /// Fused source strides.
-    pub src_strides: Vec<isize>,
+    pub(crate) src_strides: Vec<isize>,
     /// Fused destination strides.
-    pub dst_strides: Vec<isize>,
+    pub(crate) dst_strides: Vec<isize>,
     /// Root of the recursive loop structure (None for Scalar mode).
-    pub root: Option<ComputeNode>,
+    pub(crate) root: Option<ComputeNode>,
     /// Execution mode.
-    pub mode: ExecMode,
+    pub(crate) mode: ExecMode,
     /// Source stride along dim_B — the "lda" for macro_kernel.
     /// (In the 2D view for the macro-kernel, this is the stride that
     /// steps between columns of the source tile.)
-    pub lda_inner: isize,
+    pub(crate) lda_inner: isize,
     /// Dest stride along dim_A — the "ldb" for macro_kernel.
-    pub ldb_inner: isize,
+    pub(crate) ldb_inner: isize,
     /// Macro-kernel tile size (= BLOCK, e.g. 16 for f64).
-    pub block: usize,
+    pub(crate) block: usize,
+    /// Optional grouped tile metadata for high-rank scattered permutations.
+    pub(crate) grouped_tile: Option<GroupedTilePlan>,
 }
 
 /// Build a permutation plan using bilateral fusion and HPTT-style blocking.
 ///
 /// This is the main entry point. The returned plan is consumed by
 /// `execute_permute_blocked`.
-pub fn build_permute_plan(
+pub(crate) fn build_permute_plan(
     dims: &[usize],
     src_strides: &[isize],
     dst_strides: &[isize],
@@ -88,6 +107,7 @@ pub fn build_permute_plan(
             lda_inner: 0,
             ldb_inner: 0,
             block: 0,
+            grouped_tile: None,
         };
     }
 
@@ -115,9 +135,29 @@ pub fn build_permute_plan(
             lda_inner: fused_src[inner_dim],
             ldb_inner: fused_dst[inner_dim],
             block: 0,
+            grouped_tile: None,
         }
     } else {
         // Transpose path: 2D micro-kernel
+        let legacy_area = fused_dims[dim_a].saturating_mul(fused_dims[dim_b]);
+        if legacy_area < block.saturating_mul(block) {
+            if let Some((root, grouped_tile)) =
+                try_build_grouped_tile_plan(&fused_dims, &fused_src, &fused_dst, block, legacy_area)
+            {
+                return PermutePlan {
+                    fused_dims,
+                    src_strides: fused_src,
+                    dst_strides: fused_dst,
+                    root,
+                    mode: ExecMode::GroupedTranspose,
+                    lda_inner: 0,
+                    ldb_inner: 0,
+                    block,
+                    grouped_tile: Some(grouped_tile),
+                };
+            }
+        }
+
         let mode = ExecMode::Transpose { dim_a, dim_b };
 
         // lda_inner = src stride along dim_B (steps between rows in the 2D micro-kernel view)
@@ -138,6 +178,7 @@ pub fn build_permute_plan(
             lda_inner,
             ldb_inner,
             block,
+            grouped_tile: None,
         }
     }
 }
@@ -159,6 +200,140 @@ fn block_for_elem_size(elem_size: usize) -> usize {
         8 => <ScalarKernel as MicroKernel<f64>>::BLOCK, // 16
         4 => <ScalarKernel as MicroKernel<f32>>::BLOCK, // 32
         _ => 16,                                        // default
+    }
+}
+
+fn try_build_grouped_tile_plan(
+    dims: &[usize],
+    src_strides: &[isize],
+    dst_strides: &[isize],
+    target: usize,
+    legacy_area: usize,
+) -> Option<(Option<ComputeNode>, GroupedTilePlan)> {
+    let group_a = select_contiguous_group(dims, src_strides, &[], target)?;
+    let group_a_len = group_len(dims, &group_a);
+    if group_a_len < 4 {
+        return None;
+    }
+
+    let group_b = select_contiguous_group(dims, dst_strides, &group_a, target)?;
+    let group_b_len = group_len(dims, &group_b);
+    let area = group_a_len.saturating_mul(group_b_len);
+    if group_b_len < 4 || area < 128 || area <= legacy_area.saturating_mul(4) {
+        return None;
+    }
+
+    let mut consumed = vec![false; dims.len()];
+    for &d in group_a.iter().chain(group_b.iter()) {
+        consumed[d] = true;
+    }
+
+    let mut outer: Vec<usize> = (0..dims.len())
+        .filter(|&d| !consumed[d] && dims[d] > 1)
+        .collect();
+    outer.sort_by(|&a, &b| {
+        let cost_a = src_strides[a].unsigned_abs() + dst_strides[a].unsigned_abs();
+        let cost_b = src_strides[b].unsigned_abs() + dst_strides[b].unsigned_abs();
+        cost_b.cmp(&cost_a)
+    });
+
+    let root = build_compute_nodes(dims, src_strides, dst_strides, &outer);
+    let grouped_tile = GroupedTilePlan {
+        group_a: build_offset_group(dims, src_strides, dst_strides, &group_a),
+        group_b: build_offset_group(dims, src_strides, dst_strides, &group_b),
+    };
+    Some((root, grouped_tile))
+}
+
+fn select_contiguous_group(
+    dims: &[usize],
+    strides: &[isize],
+    excluded: &[usize],
+    target: usize,
+) -> Option<Vec<usize>> {
+    let mut is_excluded = vec![false; dims.len()];
+    for &d in excluded {
+        is_excluded[d] = true;
+    }
+
+    let mut order: Vec<usize> = (0..dims.len())
+        .filter(|&d| dims[d] > 1 && !is_excluded[d] && strides[d] > 0)
+        .collect();
+    order.sort_by_key(|&d| strides[d].unsigned_abs());
+
+    let mut best = Vec::new();
+    let mut best_len = 0usize;
+
+    for start in 0..order.len() {
+        let first = order[start];
+        let base = strides[first];
+        let mut group = vec![first];
+        let mut len = dims[first];
+        let mut expected = base.saturating_mul(len as isize);
+
+        for &d in &order[start + 1..] {
+            match strides[d].cmp(&expected) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    group.push(d);
+                    len = len.saturating_mul(dims[d]);
+                    if len >= target {
+                        break;
+                    }
+                    expected = base.saturating_mul(len as isize);
+                }
+                std::cmp::Ordering::Greater => break,
+            }
+        }
+
+        if len > best_len {
+            best_len = len;
+            best = group;
+        }
+        if best_len >= target {
+            break;
+        }
+    }
+
+    if best.is_empty() {
+        None
+    } else {
+        Some(best)
+    }
+}
+
+fn group_len(dims: &[usize], group: &[usize]) -> usize {
+    group.iter().map(|&d| dims[d]).product()
+}
+
+fn build_offset_group(
+    dims: &[usize],
+    src_strides: &[isize],
+    dst_strides: &[isize],
+    group: &[usize],
+) -> OffsetGroup {
+    let len = group_len(dims, group);
+    let mut src_offsets = Vec::with_capacity(len);
+    let mut dst_offsets = Vec::with_capacity(len);
+
+    for flat in 0..len {
+        let mut rem = flat;
+        let mut src_offset = 0isize;
+        let mut dst_offset = 0isize;
+        for &d in group {
+            let coord = rem % dims[d];
+            rem /= dims[d];
+            src_offset += coord as isize * src_strides[d];
+            dst_offset += coord as isize * dst_strides[d];
+        }
+        src_offsets.push(src_offset);
+        dst_offsets.push(dst_offset);
+    }
+
+    OffsetGroup {
+        src_offsets,
+        dst_offsets,
+        len,
     }
 }
 
@@ -319,6 +494,36 @@ mod tests {
             }
             _ => panic!("unexpected mode"),
         }
+    }
+
+    #[test]
+    fn test_build_plan_step408_uses_grouped_tile() {
+        let dims = vec![2usize; 24];
+        let src_strides = vec![
+            16, 1024, 8388608, 4096, 1048576, 1, 8, 131072, 2, 4, 64, 128, 256, 512, 2048, 8192,
+            16384, 32768, 262144, 2097152, 4194304, 32, 65536, 524288,
+        ];
+        let dst_strides = (0..24).map(|i| 1isize << i).collect::<Vec<_>>();
+
+        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8);
+
+        assert!(matches!(plan.mode, ExecMode::GroupedTranspose));
+        let grouped = plan.grouped_tile.as_ref().expect("grouped tile plan");
+        assert!(grouped.group_a.len >= 16);
+        assert!(grouped.group_b.len >= 16);
+        assert!(grouped.group_a.len * grouped.group_b.len >= 256);
+    }
+
+    #[test]
+    fn test_build_plan_large_3d_transpose_uses_legacy_tile() {
+        let dims = vec![256usize, 256, 256];
+        let src_strides = vec![256isize, 1, 65536];
+        let dst_strides = vec![1isize, 256, 65536];
+
+        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8);
+
+        assert!(matches!(plan.mode, ExecMode::Transpose { .. }));
+        assert!(plan.grouped_tile.is_none());
     }
 
     #[test]

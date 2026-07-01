@@ -11,7 +11,7 @@ need for an adaptive copy strategy — HPTT can be the universal default.
 ## Setup
 
 - **Rust**: strided-opteinsum with `blas` + `hptt-input-copy` features.
-  Copy elision (`try_fuse_group`) is enabled; when a copy is needed, HPTT
+  Internal copy elision is enabled; when a copy is needed, HPTT
   (destination-stride-order) is used. GEMM backend: OpenBLAS 0.3.29.
 - **Julia**: OMEinsum.jl v0.9.3 with pre-computed contraction paths
   (`omeinsum_path` mode). Julia 1.10.0, BLAS vendor: lbt (OpenBLAS).
@@ -93,7 +93,7 @@ Rust with HPTT is **equal or faster than Julia on every instance**, in both
 
 Even `tn_focus` and `tn_light` — the instances where HPTT is slower than
 source-stride-order in isolation (see `src-vs-dst-order-experiment.md`) —
-still outperform Julia. The copy elision (`try_fuse_group`) compensates for
+still outperform Julia. The internal copy elision compensates for
 HPTT's overhead on these degenerate many-small-dims cases.
 
 ## Conclusion

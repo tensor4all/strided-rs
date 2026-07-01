@@ -157,6 +157,64 @@ Design documentation:
 
 - Explore explicit SIMD intrinsics to close remaining gap with Julia's `@simd`
 
+## strided-rs Repository Rules
+
+The durable repository rules live in [`REPOSITORY_RULES.md`](REPOSITORY_RULES.md).
+The summary below highlights rules most often needed during local edits.
+
+### Public Surface Discipline
+
+- Keep public APIs intentionally small. Implementation modules, planning
+  helpers, loop-order utilities, macro kernels, and execution trees should be
+  private or `pub(crate)` unless external users are expected to call them
+  directly.
+- Public APIs are durable contracts. If an item exists primarily for tests,
+  benchmarks, internal planning, execution dispatch, or sibling-crate
+  reach-through, keep it private and expose the narrowest high-level operation.
+- When changing public APIs, audit README, rustdoc, examples, and benchmark
+  code for stale names or capability claims.
+
+### Unsafe And Fast-Path Boundaries
+
+- Validate rank, shape, stride/layout preconditions, dtype dispatch
+  conditions, and output shape before entering unsafe pointer loops.
+- Keep unsafe pointer arithmetic close to the validation that proves it safe,
+  and cover new unsafe branches with focused tests.
+- Fast paths must have explicit fallback behavior. For copy/transpose/scale
+  paths, cover zero, identity/copy, tiled/specialized, parallel, and generic
+  fallback branches where applicable.
+- Do not preserve a fast path that is systematically slower than the raw
+  pointer naive baseline for the same layout and dtype without documenting why
+  it remains useful.
+
+### Performance And Benchmark Discipline
+
+- Use release-mode benchmarks for performance claims, and pin thread counts and
+  backend configuration. Benchmark runs must not be run concurrently.
+- Keep setup and allocation out of timed regions unless the benchmark name and
+  documentation explicitly say setup cost is included.
+- Naive baselines must be credible. For contiguous hot loops, prefer raw
+  pointer baselines over high-level indexing baselines.
+- Record representative sizes, layouts, dtypes, and thread counts when an
+  algorithmic path changes. A single fixed-size benchmark is not enough for a
+  public performance claim.
+- Large tensor fast paths should use the repository threading threshold
+  consistently. Do not introduce a second unrelated threshold for parallelism.
+- When the active thread count is one, use the serial kernel directly instead
+  of entering Rayon/OpenMP parallel machinery.
+
+### Layout And Copy Semantics
+
+- Preserve column-major semantics unless a function explicitly documents a
+  different layout contract.
+- Prefer metadata-only views and strided/backend-native operations over hidden
+  dense materialization.
+- Do not zero-initialize buffers that are immediately fully overwritten.
+- Avoid per-element flat-to-multi-index decoding in tensor-sized loops when
+  incremental offsets or blocked traversal can be used.
+
 ## Performance Notes
 
-See `README.md` for benchmark results comparing Rust strided vs naive baselines and Julia Strided.jl.
+Keep benchmark programs and published benchmark results in
+`tensor4all/strided-rs-benchmark-suite`. Crate READMEs should document usage,
+features, and API contracts rather than carrying stale performance tables.

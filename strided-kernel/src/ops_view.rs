@@ -10,7 +10,7 @@ use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use std::ops::{Add, Mul};
 use strided_view::{ElementOp, ElementOpApply};
 
@@ -20,6 +20,8 @@ use crate::fuse::compute_costs;
 use crate::threading::{
     for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
 };
+#[cfg(feature = "parallel")]
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 // ============================================================================
 // Stride-specialized inner loop helpers for ops_view
@@ -882,6 +884,637 @@ pub fn copy_conj<T: Copy + ElementOpApply + MaybeSendSync>(
     copy_into(dest, &src_conj)
 }
 
+#[inline]
+fn element_transpose_is_identity<T: 'static>() -> bool {
+    use std::any::TypeId;
+
+    macro_rules! matches_type {
+        ($($ty:ty),* $(,)?) => {{
+            let id = TypeId::of::<T>();
+            false $(|| id == TypeId::of::<$ty>())*
+        }};
+    }
+
+    matches_type!(
+        f32,
+        f64,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        num_complex::Complex32,
+        num_complex::Complex64,
+    )
+}
+
+#[inline]
+fn element_zero_is_all_bits_zero<T: 'static>() -> bool {
+    use std::any::TypeId;
+
+    macro_rules! matches_type {
+        ($($ty:ty),* $(,)?) => {{
+            let id = TypeId::of::<T>();
+            false $(|| id == TypeId::of::<$ty>())*
+        }};
+    }
+
+    matches_type!(
+        f32,
+        f64,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        num_complex::Complex32,
+        num_complex::Complex64,
+    )
+}
+
+#[inline]
+unsafe fn fill_2d<T: Copy + MaybeSendSync>(
+    dst: *mut T,
+    dim0: usize,
+    dim1: usize,
+    dst_stride0: isize,
+    dst_stride1: isize,
+    value: T,
+) {
+    #[cfg(feature = "parallel")]
+    {
+        let total = dim0.saturating_mul(dim1);
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+            let dst_send = SendPtr(dst);
+            if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
+                (0..dim1).into_par_iter().for_each(|j| {
+                    let dst = dst_send.as_ptr();
+                    unsafe {
+                        let base = j as isize * dst_stride1;
+                        for i in 0..dim0 {
+                            *dst.offset(base + i as isize * dst_stride0) = value;
+                        }
+                    }
+                });
+            } else {
+                (0..dim0).into_par_iter().for_each(|i| {
+                    let dst = dst_send.as_ptr();
+                    unsafe {
+                        let base = i as isize * dst_stride0;
+                        for j in 0..dim1 {
+                            *dst.offset(base + j as isize * dst_stride1) = value;
+                        }
+                    }
+                });
+            }
+            return;
+        }
+    }
+
+    if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
+        for j in 0..dim1 {
+            let base = j as isize * dst_stride1;
+            for i in 0..dim0 {
+                *dst.offset(base + i as isize * dst_stride0) = value;
+            }
+        }
+    } else {
+        for i in 0..dim0 {
+            let base = i as isize * dst_stride0;
+            for j in 0..dim1 {
+                *dst.offset(base + j as isize * dst_stride1) = value;
+            }
+        }
+    }
+}
+
+#[inline]
+unsafe fn fill_contiguous<T>(dst: *mut T, len: usize, value: T)
+where
+    T: Copy + Zero + PartialEq + MaybeSendSync + 'static,
+{
+    if element_zero_is_all_bits_zero::<T>() && value == T::zero() {
+        std::ptr::write_bytes(dst, 0, len);
+        return;
+    }
+
+    let dst = std::slice::from_raw_parts_mut(dst, len);
+    dst.fill(value);
+}
+
+#[inline(always)]
+unsafe fn transpose_scale_4x4_f64(
+    dst: *mut f64,
+    dst_stride0: isize,
+    dst_stride1: isize,
+    src: *const f64,
+    src_stride0: isize,
+    src_stride1: isize,
+    i: usize,
+    j: usize,
+    scale: f64,
+) {
+    let src_base = src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+
+    let s00 = *src_base;
+    let s10 = *src_base.offset(src_stride0);
+    let s20 = *src_base.offset(2 * src_stride0);
+    let s30 = *src_base.offset(3 * src_stride0);
+
+    let src_col1 = src_base.offset(src_stride1);
+    let s01 = *src_col1;
+    let s11 = *src_col1.offset(src_stride0);
+    let s21 = *src_col1.offset(2 * src_stride0);
+    let s31 = *src_col1.offset(3 * src_stride0);
+
+    let src_col2 = src_base.offset(2 * src_stride1);
+    let s02 = *src_col2;
+    let s12 = *src_col2.offset(src_stride0);
+    let s22 = *src_col2.offset(2 * src_stride0);
+    let s32 = *src_col2.offset(3 * src_stride0);
+
+    let src_col3 = src_base.offset(3 * src_stride1);
+    let s03 = *src_col3;
+    let s13 = *src_col3.offset(src_stride0);
+    let s23 = *src_col3.offset(2 * src_stride0);
+    let s33 = *src_col3.offset(3 * src_stride0);
+
+    let dst_row0 = dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1);
+    *dst_row0 = scale * s00;
+    *dst_row0.offset(dst_stride0) = scale * s01;
+    *dst_row0.offset(2 * dst_stride0) = scale * s02;
+    *dst_row0.offset(3 * dst_stride0) = scale * s03;
+
+    let dst_row1 = dst_row0.offset(dst_stride1);
+    *dst_row1 = scale * s10;
+    *dst_row1.offset(dst_stride0) = scale * s11;
+    *dst_row1.offset(2 * dst_stride0) = scale * s12;
+    *dst_row1.offset(3 * dst_stride0) = scale * s13;
+
+    let dst_row2 = dst_row0.offset(2 * dst_stride1);
+    *dst_row2 = scale * s20;
+    *dst_row2.offset(dst_stride0) = scale * s21;
+    *dst_row2.offset(2 * dst_stride0) = scale * s22;
+    *dst_row2.offset(3 * dst_stride0) = scale * s23;
+
+    let dst_row3 = dst_row0.offset(3 * dst_stride1);
+    *dst_row3 = scale * s30;
+    *dst_row3.offset(dst_stride0) = scale * s31;
+    *dst_row3.offset(2 * dst_stride0) = scale * s32;
+    *dst_row3.offset(3 * dst_stride0) = scale * s33;
+}
+
+#[inline]
+unsafe fn copy_transpose_scale_2d_f64_tiled_raw(
+    dst: *mut f64,
+    dst_stride0: isize,
+    dst_stride1: isize,
+    src: *const f64,
+    src_stride0: isize,
+    src_stride1: isize,
+    src_rows: usize,
+    src_cols: usize,
+    scale: f64,
+) {
+    const TILE: usize = 4;
+    let row_full = src_rows / TILE * TILE;
+    let col_full = src_cols / TILE * TILE;
+
+    #[cfg(feature = "parallel")]
+    {
+        let total = src_rows.saturating_mul(src_cols);
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+            let dst_send = SendPtr(dst);
+            let src_send = SendPtr(src as *mut f64);
+            let row_tiles = row_full / TILE;
+            (0..row_tiles).into_par_iter().for_each(|tile_i| {
+                let i = tile_i * TILE;
+                let dst = dst_send.as_ptr();
+                let src = src_send.as_const();
+                unsafe {
+                    let mut j = 0;
+                    while j < col_full {
+                        transpose_scale_4x4_f64(
+                            dst,
+                            dst_stride0,
+                            dst_stride1,
+                            src,
+                            src_stride0,
+                            src_stride1,
+                            i,
+                            j,
+                            scale,
+                        );
+                        j += TILE;
+                    }
+                    for j in col_full..src_cols {
+                        for ii in i..i + TILE {
+                            *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                                scale
+                                    * *src.offset(
+                                        ii as isize * src_stride0 + j as isize * src_stride1,
+                                    );
+                        }
+                    }
+                }
+            });
+            for i in row_full..src_rows {
+                for j in 0..src_cols {
+                    *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                        scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+                }
+            }
+            return;
+        }
+    }
+
+    let mut i = 0;
+    while i < row_full {
+        let mut j = 0;
+        while j < col_full {
+            transpose_scale_4x4_f64(
+                dst,
+                dst_stride0,
+                dst_stride1,
+                src,
+                src_stride0,
+                src_stride1,
+                i,
+                j,
+                scale,
+            );
+            j += TILE;
+        }
+        for j in col_full..src_cols {
+            for ii in i..i + TILE {
+                *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                    scale * *src.offset(ii as isize * src_stride0 + j as isize * src_stride1);
+            }
+        }
+        i += TILE;
+    }
+    for i in row_full..src_rows {
+        for j in 0..src_cols {
+            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+        }
+    }
+}
+
+#[inline]
+#[cfg(test)]
+unsafe fn try_copy_transpose_scale_2d_f64_tiled(
+    dest: &mut StridedViewMut<f64>,
+    src: &StridedView<f64>,
+    scale: f64,
+) -> bool {
+    if src.ndim() != 2 || dest.ndim() != 2 {
+        return false;
+    }
+    let src_dims = src.dims();
+    if dest.dims() != [src_dims[1], src_dims[0]] {
+        return false;
+    }
+    if src.strides()[0] != 1 || dest.strides()[0] != 1 {
+        return false;
+    }
+
+    copy_transpose_scale_2d_f64_tiled_raw(
+        dest.as_mut_ptr(),
+        dest.strides()[0],
+        dest.strides()[1],
+        src.ptr(),
+        src.strides()[0],
+        src.strides()[1],
+        src_dims[0],
+        src_dims[1],
+        scale,
+    );
+    true
+}
+
+#[inline]
+unsafe fn try_copy_transpose_scale_2d_f64_tiled_typed<T>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+    scale: T,
+) -> bool
+where
+    T: Copy + 'static,
+{
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f64>() {
+        return false;
+    }
+
+    let scale = *(&scale as *const T).cast::<f64>();
+    if src.ndim() != 2 || dest.ndim() != 2 {
+        return false;
+    }
+    let src_dims = src.dims();
+    if dest.dims() != [src_dims[1], src_dims[0]] {
+        return false;
+    }
+    if src.strides()[0] != 1 || dest.strides()[0] != 1 {
+        return false;
+    }
+
+    copy_transpose_scale_2d_f64_tiled_raw(
+        dest.as_mut_ptr().cast::<f64>(),
+        dest.strides()[0],
+        dest.strides()[1],
+        src.ptr().cast::<f64>(),
+        src.strides()[0],
+        src.strides()[1],
+        src_dims[0],
+        src_dims[1],
+        scale,
+    );
+    true
+}
+
+#[inline(always)]
+unsafe fn transpose_scale_4x4_identity<T>(
+    dst: *mut T,
+    dst_stride0: isize,
+    dst_stride1: isize,
+    src: *const T,
+    src_stride0: isize,
+    src_stride1: isize,
+    i: usize,
+    j: usize,
+    scale: T,
+) where
+    T: Copy + Mul<Output = T>,
+{
+    let src_base = src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+
+    let s00 = *src_base;
+    let s10 = *src_base.offset(src_stride0);
+    let s20 = *src_base.offset(2 * src_stride0);
+    let s30 = *src_base.offset(3 * src_stride0);
+
+    let src_col1 = src_base.offset(src_stride1);
+    let s01 = *src_col1;
+    let s11 = *src_col1.offset(src_stride0);
+    let s21 = *src_col1.offset(2 * src_stride0);
+    let s31 = *src_col1.offset(3 * src_stride0);
+
+    let src_col2 = src_base.offset(2 * src_stride1);
+    let s02 = *src_col2;
+    let s12 = *src_col2.offset(src_stride0);
+    let s22 = *src_col2.offset(2 * src_stride0);
+    let s32 = *src_col2.offset(3 * src_stride0);
+
+    let src_col3 = src_base.offset(3 * src_stride1);
+    let s03 = *src_col3;
+    let s13 = *src_col3.offset(src_stride0);
+    let s23 = *src_col3.offset(2 * src_stride0);
+    let s33 = *src_col3.offset(3 * src_stride0);
+
+    let dst_row0 = dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1);
+    *dst_row0 = scale * s00;
+    *dst_row0.offset(dst_stride0) = scale * s01;
+    *dst_row0.offset(2 * dst_stride0) = scale * s02;
+    *dst_row0.offset(3 * dst_stride0) = scale * s03;
+
+    let dst_row1 = dst_row0.offset(dst_stride1);
+    *dst_row1 = scale * s10;
+    *dst_row1.offset(dst_stride0) = scale * s11;
+    *dst_row1.offset(2 * dst_stride0) = scale * s12;
+    *dst_row1.offset(3 * dst_stride0) = scale * s13;
+
+    let dst_row2 = dst_row0.offset(2 * dst_stride1);
+    *dst_row2 = scale * s20;
+    *dst_row2.offset(dst_stride0) = scale * s21;
+    *dst_row2.offset(2 * dst_stride0) = scale * s22;
+    *dst_row2.offset(3 * dst_stride0) = scale * s23;
+
+    let dst_row3 = dst_row0.offset(3 * dst_stride1);
+    *dst_row3 = scale * s30;
+    *dst_row3.offset(dst_stride0) = scale * s31;
+    *dst_row3.offset(2 * dst_stride0) = scale * s32;
+    *dst_row3.offset(3 * dst_stride0) = scale * s33;
+}
+
+#[inline]
+unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
+    dst: *mut T,
+    dst_stride0: isize,
+    dst_stride1: isize,
+    src: *const T,
+    src_stride0: isize,
+    src_stride1: isize,
+    src_rows: usize,
+    src_cols: usize,
+    scale: T,
+) where
+    T: Copy + Mul<Output = T> + MaybeSendSync,
+{
+    const TILE: usize = 4;
+    let row_full = src_rows / TILE * TILE;
+    let col_full = src_cols / TILE * TILE;
+
+    #[cfg(feature = "parallel")]
+    {
+        let total = src_rows.saturating_mul(src_cols);
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+            let dst_send = SendPtr(dst);
+            let src_send = SendPtr(src as *mut T);
+            let row_tiles = row_full / TILE;
+            (0..row_tiles).into_par_iter().for_each(|tile_i| {
+                let i = tile_i * TILE;
+                let dst = dst_send.as_ptr();
+                let src = src_send.as_const();
+                unsafe {
+                    let mut j = 0;
+                    while j < col_full {
+                        transpose_scale_4x4_identity(
+                            dst,
+                            dst_stride0,
+                            dst_stride1,
+                            src,
+                            src_stride0,
+                            src_stride1,
+                            i,
+                            j,
+                            scale,
+                        );
+                        j += TILE;
+                    }
+                    for j in col_full..src_cols {
+                        for ii in i..i + TILE {
+                            *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                                scale
+                                    * *src.offset(
+                                        ii as isize * src_stride0 + j as isize * src_stride1,
+                                    );
+                        }
+                    }
+                }
+            });
+            for i in row_full..src_rows {
+                for j in 0..src_cols {
+                    *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                        scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+                }
+            }
+            return;
+        }
+    }
+
+    let mut i = 0;
+    while i < row_full {
+        let mut j = 0;
+        while j < col_full {
+            transpose_scale_4x4_identity(
+                dst,
+                dst_stride0,
+                dst_stride1,
+                src,
+                src_stride0,
+                src_stride1,
+                i,
+                j,
+                scale,
+            );
+            j += TILE;
+        }
+        for j in col_full..src_cols {
+            for ii in i..i + TILE {
+                *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                    scale * *src.offset(ii as isize * src_stride0 + j as isize * src_stride1);
+            }
+        }
+        i += TILE;
+    }
+    for i in row_full..src_rows {
+        for j in 0..src_cols {
+            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+        }
+    }
+}
+
+#[inline]
+unsafe fn try_copy_transpose_scale_2d_identity_tiled<T>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+    scale: T,
+) -> bool
+where
+    T: Copy + Mul<Output = T> + MaybeSendSync,
+{
+    if src.ndim() != 2 || dest.ndim() != 2 {
+        return false;
+    }
+    let src_dims = src.dims();
+    if dest.dims() != [src_dims[1], src_dims[0]] {
+        return false;
+    }
+    if src.strides()[0] != 1 || dest.strides()[0] != 1 {
+        return false;
+    }
+
+    copy_transpose_scale_2d_identity_tiled_raw(
+        dest.as_mut_ptr(),
+        dest.strides()[0],
+        dest.strides()[1],
+        src.ptr(),
+        src.strides()[0],
+        src.strides()[1],
+        src_dims[0],
+        src_dims[1],
+        scale,
+    );
+    true
+}
+
+#[inline]
+unsafe fn copy_transpose_scale_2d_loop<T>(
+    dst: *mut T,
+    dst_stride0: isize,
+    dst_stride1: isize,
+    src: *const T,
+    src_stride0: isize,
+    src_stride1: isize,
+    src_rows: usize,
+    src_cols: usize,
+    scale: T,
+) where
+    T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync,
+{
+    #[cfg(feature = "parallel")]
+    {
+        let total = src_rows.saturating_mul(src_cols);
+        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+            let dst_send = SendPtr(dst);
+            let src_send = SendPtr(src as *mut T);
+            if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
+                (0..src_rows).into_par_iter().for_each(|i| {
+                    let dst = dst_send.as_ptr();
+                    let src = src_send.as_const();
+                    unsafe {
+                        for j in 0..src_cols {
+                            let value = (*src
+                                .offset(i as isize * src_stride0 + j as isize * src_stride1))
+                            .transpose();
+                            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                                scale * value;
+                        }
+                    }
+                });
+            } else {
+                (0..src_cols).into_par_iter().for_each(|j| {
+                    let dst = dst_send.as_ptr();
+                    let src = src_send.as_const();
+                    unsafe {
+                        for i in 0..src_rows {
+                            let value = (*src
+                                .offset(i as isize * src_stride0 + j as isize * src_stride1))
+                            .transpose();
+                            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                                scale * value;
+                        }
+                    }
+                });
+            }
+            return;
+        }
+    }
+
+    if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
+        for i in 0..src_rows {
+            for j in 0..src_cols {
+                let value =
+                    (*src.offset(i as isize * src_stride0 + j as isize * src_stride1)).transpose();
+                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) = scale * value;
+            }
+        }
+    } else {
+        for j in 0..src_cols {
+            for i in 0..src_rows {
+                let value =
+                    (*src.offset(i as isize * src_stride0 + j as isize * src_stride1)).transpose();
+                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) = scale * value;
+            }
+        }
+    }
+}
+
 /// Copy with transpose and scaling: `dest[j,i] = scale * src[i,j]`.
 pub fn copy_transpose_scale_into<T>(
     dest: &mut StridedViewMut<T>,
@@ -889,11 +1522,139 @@ pub fn copy_transpose_scale_into<T>(
     scale: T,
 ) -> Result<()>
 where
-    T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync,
+    T: Copy + ElementOpApply + Mul<Output = T> + Zero + One + PartialEq + MaybeSendSync + 'static,
 {
     if src.ndim() != 2 || dest.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
     }
-    let src_t = src.transpose_2d()?;
-    map_into(dest, &src_t, |x| scale * x)
+
+    let src_dims = src.dims();
+    let expected_dims = [src_dims[1], src_dims[0]];
+    ensure_same_shape(dest.dims(), &expected_dims)?;
+
+    if scale == T::zero() {
+        unsafe {
+            if same_contiguous_layout(dest.dims(), &[dest.strides()]).is_some() {
+                fill_contiguous(dest.as_mut_ptr(), total_len(dest.dims()), T::zero());
+            } else {
+                fill_2d(
+                    dest.as_mut_ptr(),
+                    dest.dims()[0],
+                    dest.dims()[1],
+                    dest.strides()[0],
+                    dest.strides()[1],
+                    T::zero(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let transpose_is_identity = element_transpose_is_identity::<T>();
+
+    unsafe {
+        if transpose_is_identity && try_copy_transpose_scale_2d_f64_tiled_typed(dest, src, scale) {
+            return Ok(());
+        }
+        if transpose_is_identity && try_copy_transpose_scale_2d_identity_tiled(dest, src, scale) {
+            return Ok(());
+        }
+    }
+
+    if scale == T::one() && transpose_is_identity {
+        let src_t = src.permute(&[1, 0])?;
+        #[cfg(feature = "parallel")]
+        {
+            if total_len(dest.dims()) > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+                return strided_perm::copy_into_par(dest, &src_t);
+            }
+        }
+        return strided_perm::copy_into(dest, &src_t);
+    }
+
+    unsafe {
+        copy_transpose_scale_2d_loop(
+            dest.as_mut_ptr(),
+            dest.strides()[0],
+            dest.strides()[1],
+            src.ptr(),
+            src.strides()[0],
+            src.strides()[1],
+            src_dims[0],
+            src_dims[1],
+            scale,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tiled_tests {
+    use super::*;
+    use crate::view::StridedArray;
+
+    #[test]
+    fn test_f64_tiled_transpose_scale_handles_remainders() {
+        let rows = 7;
+        let cols = 9;
+        let a = StridedArray::<f64>::from_fn_col_major(&[rows, cols], |idx| {
+            (idx[0] * 100 + idx[1]) as f64
+        });
+        let mut out = StridedArray::<f64>::col_major(&[cols, rows]);
+
+        let used_tiled = {
+            let src = a.view();
+            let mut dst = out.view_mut();
+            unsafe { try_copy_transpose_scale_2d_f64_tiled(&mut dst, &src, 3.0) }
+        };
+
+        assert!(used_tiled);
+        for i in 0..rows {
+            for j in 0..cols {
+                assert_eq!(out.get(&[j, i]), 3.0 * a.get(&[i, j]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_identity_tiled_transpose_scale_handles_integer_remainders() {
+        let rows = 6;
+        let cols = 5;
+        let a = StridedArray::<u64>::from_fn_col_major(&[rows, cols], |idx| {
+            (idx[0] * 100 + idx[1]) as u64
+        });
+        let mut out = StridedArray::<u64>::col_major(&[cols, rows]);
+
+        let used_tiled = {
+            let src = a.view();
+            let mut dst = out.view_mut();
+            unsafe { try_copy_transpose_scale_2d_identity_tiled(&mut dst, &src, 2) }
+        };
+
+        assert!(used_tiled);
+        for i in 0..rows {
+            for j in 0..cols {
+                assert_eq!(out.get(&[j, i]), 2 * a.get(&[i, j]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_zero_scale_fills_non_contiguous_destination() {
+        let rows = 3;
+        let cols = 4;
+        let a = StridedArray::<u64>::from_fn_col_major(&[rows, cols], |idx| {
+            (idx[0] * 10 + idx[1] + 1) as u64
+        });
+        let mut out_base = StridedArray::<u64>::from_fn_col_major(&[rows, cols], |_| 99);
+        let mut out_t = out_base.view_mut().permute(&[1, 0]).unwrap();
+
+        copy_transpose_scale_into(&mut out_t, &a.view(), 0).unwrap();
+
+        for i in 0..cols {
+            for j in 0..rows {
+                assert_eq!(out_t.get(&[i, j]), 0);
+            }
+        }
+    }
 }

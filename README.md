@@ -70,19 +70,25 @@ CI also builds rustdoc on PRs and deploys workspace docs to GitHub Pages on `mai
 See the [`strided-rs` Quick Start](strided-rs/README.md#quick-start). The Rust
 example there is included in crate docs and verified by doctests in CI.
 
-See each sub-crate README for detailed API examples and benchmarks:
+See each sub-crate README for usage examples:
 - [`strided-rs`](strided-rs/README.md) — recommended facade crate and executable Quick Start
 - [`strided-view`](strided-view/README.md) — types, view operations
 - [`strided-perm`](strided-perm/README.md) — permutation and transpose kernels
-- [`strided-kernel`](strided-kernel/README.md) — map/reduce/broadcast kernels, [benchmarks](strided-kernel/README.md#benchmarks)
+- [`strided-kernel`](strided-kernel/README.md) — map/reduce/broadcast kernels
 - [`strided-einsum2`](strided-einsum2/README.md) — binary einsum with GEMM backend
-- [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum, [benchmarks](strided-opteinsum/README.md#benchmarks)
+- [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum
 - [`mdarray-opteinsum`](mdarray-opteinsum/README.md) — einsum wrapper for `mdarray` arrays
 - [`ndarray-opteinsum`](ndarray-opteinsum/README.md) — einsum wrapper for `ndarray` arrays
 
 Performance design notes:
 - [`faer-kernel-writing-guide`](docs/faer-kernel-writing-guide.md) — practical rules for writing hot strided kernels based on faer
 - [`faer_design`](docs/faer_design.md) — SIMD design analysis and optimization plan
+
+Published benchmark programs and current measured results live in
+[`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite).
+Reports of bottlenecks, failure cases, or workloads where a strided path loses
+to a credible naive baseline are welcome; please include shape, strides,
+element type, thread count, and a minimal reproducer when possible.
 
 ## Acknowledgments
 

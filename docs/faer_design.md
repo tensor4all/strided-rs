@@ -232,7 +232,7 @@ Julia uses optimized `memcpy` for contiguous array copy. Rust's `strided-kernel:
 
 ### Gap 5: small array overhead — Rust 3-5x slower
 
-4D permute s=4 (256 elements): Julia 0.33μs vs Rust 1.58μs. The `build_plan_fused` function allocates multiple `Vec`s for dimension/stride reordering, dominating the cost for small arrays.
+4D permute s=4 (256 elements): Julia 0.33μs vs Rust 1.58μs. The internal fused-plan builder allocates multiple `Vec`s for dimension/stride reordering, dominating the cost for small arrays.
 
 ## Why `#[inline(always)]` + `impl Fn` is necessary but not sufficient
 
@@ -382,7 +382,7 @@ for _ in 0..len {
 
 ### Priority 6 (Low Impact): small-array overhead reduction
 
-Replace `Vec` allocations in `build_plan_fused` with `SmallVec<[_; 8]>` or stack arrays for rank ≤ 8 (covers the vast majority of use cases).
+Replace `Vec` allocations in the internal fused-plan builder with `SmallVec<[_; 8]>` or stack arrays for rank ≤ 8 (covers the vast majority of use cases).
 
 **Expected improvement**: 2-5x for arrays with < 1K elements.
 
