@@ -3,8 +3,11 @@
 #[cfg(feature = "parallel")]
 use crate::hptt::execute_permute_blocked_par;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
-use crate::kernel::total_len;
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
+
+fn total_len(dims: &[usize]) -> usize {
+    dims.iter().product()
+}
 
 /// Check if all strides indicate contiguous column-major or row-major layout.
 fn is_both_contiguous(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> bool {
@@ -156,7 +159,8 @@ pub fn copy_into_col_major_par<T: Copy + Send + Sync>(
 ///
 /// For the group to be fusable, consecutive dimensions must have contiguous strides.
 /// Returns `None` if strides are not contiguous within the group.
-pub fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
+#[cfg(test)]
+fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
     match dims.len() {
         0 => Some((1, 0)),
         1 => Some((dims[0], strides[0])),
@@ -286,6 +290,34 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_copy_into_grouped_high_rank_binary_permutation() {
+        let dims = vec![2usize; 12];
+        let total: usize = dims.iter().product();
+        let src = StridedArray::<u32>::from_fn_col_major(&dims, |idx| {
+            idx.iter()
+                .enumerate()
+                .map(|(axis, &coord)| (coord as u32) << axis)
+                .sum::<u32>()
+        });
+        let perm = vec![2, 4, 5, 6, 0, 3, 7, 1, 8, 9, 10, 11];
+        let src_view = src.view().permute(&perm).unwrap();
+        let mut dst = StridedArray::<u32>::col_major(&dims);
+
+        copy_into(&mut dst.view_mut(), &src_view).unwrap();
+
+        for flat in 0..total {
+            let mut rem = flat;
+            let mut src_offset = 0usize;
+            for &stride in src_view.strides() {
+                let coord = rem & 1;
+                rem >>= 1;
+                src_offset += coord * stride as usize;
+            }
+            assert_eq!(dst.data()[flat], src.data()[src_offset], "flat={flat}");
         }
     }
 

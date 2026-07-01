@@ -104,7 +104,7 @@ have different stride patterns where HPTT's blocked approach remains effective.
 ### Why not always-materialize?
 
 - **No extra copy when not needed** — if the next step's canonical order aligns,
-  `try_fuse_group` succeeds and no copy occurs (truly zero cost)
+  the internal copy-elision check succeeds and no copy occurs (truly zero cost)
 - **Source-order copy is fast enough** — sequential reads on contiguous source
   achieve near-memcpy bandwidth
 

@@ -14,15 +14,5 @@ rayon = { workspace = true, optional = true }
 [features]
 parallel = ["dep:rayon"]
 
-[dev-dependencies]
-criterion.workspace = true
-rand.workspace = true
-rand_distr.workspace = true
-rayon.workspace = true
-
 [lib]
 bench = false
-
-[[bench]]
-name = "permute"
-harness = false

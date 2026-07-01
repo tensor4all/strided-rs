@@ -6,7 +6,7 @@ Branch: `perf/src-vs-dst-order`
 
 The eager-HPTT experiment showed a 26–31% regression on `mera_open` when
 permutations are eagerly materialized. However, that experiment conflated two
-factors: **copy elision** (`try_fuse_group`) and **copy strategy** (source-order
+factors: **copy elision** and **copy strategy** (source-order
 vs destination-order). This experiment isolates the copy strategy factor by
 disabling copy elision (`force-copy` feature) and comparing source-stride-order
 copy vs HPTT (destination-stride-order) copy.
@@ -16,7 +16,7 @@ copy vs HPTT (destination-stride-order) copy.
 Two feature flags added to `strided-einsum2`:
 
 - `force-copy`: Forces `needs_copy = true` in all `prepare_input_*` and
-  `prepare_output_*` functions, disabling `try_fuse_group` elision.
+  `prepare_output_*` functions, disabling internal copy elision.
 - `hptt-input-copy`: Switches `prepare_input_owned` from source-stride-order
   copy to HPTT (`strided_kernel::copy_into_col_major`).
 
@@ -86,12 +86,12 @@ eager-HPTT experiment was caused by copy elision, not by HPTT's copy strategy.
 
 All instances are faster with copy elision enabled (baseline) than with either
 forced copy strategy. The biggest gaps are on lm_* and str_* instances (up to
-99% regression with forced copies). Copy elision (`try_fuse_group`) should
+99% regression with forced copies). Copy elision should
 always be the first priority.
 
 ## Conclusions
 
-1. **Copy elision (`try_fuse_group`) is the most important optimization** —
+1. **Copy elision is the most important optimization** —
    responsible for the majority of performance gains across all instances.
 
 2. **HPTT is the better default copy strategy** when copies cannot be avoided.
@@ -101,7 +101,7 @@ always be the first priority.
    (size 2), where HPTT's recursion structure becomes overhead-heavy.
 
 4. **The optimal `Contract` implementation should use adaptive copy strategy**:
-   - Always try copy elision first (`try_fuse_group`)
+   - Always try copy elision first
    - Use HPTT for general cases
    - Consider source-order for tensors with many small dimensions (heuristic
      needed)
@@ -110,7 +110,7 @@ always be the first priority.
 
 The priority order in `contract-as-core-op.md` should be updated:
 
-1. **Copy elision** (`try_fuse_group`) — dominant optimization, always first
+1. **Copy elision** — dominant optimization, always first
 2. **HPTT (destination-stride-order)** — default copy strategy when elision fails
 3. **Source-stride-order** — fallback for degenerate many-small-dims cases
 

@@ -17,7 +17,7 @@ mod macro_kernel;
 pub(crate) mod micro_kernel;
 mod plan;
 
-pub use execute::execute_permute_blocked;
+pub(crate) use execute::execute_permute_blocked;
 #[cfg(feature = "parallel")]
-pub use execute::execute_permute_blocked_par;
-pub use plan::{build_permute_plan, PermutePlan};
+pub(crate) use execute::execute_permute_blocked_par;
+pub(crate) use plan::build_permute_plan;

@@ -130,7 +130,7 @@ These optimizations exist in strided-rs and are absent from omeinsum-rs:
   overhead for Hadamard products
 - **Single-tensor fast paths:** Direct trace loop (diagonal stride trick),
   partial trace optimization, zero-copy permutation
-- **Fusability-aware Reshape-to-GEMM:** `try_fuse_group` checks whether
+- **Fusability-aware Reshape-to-GEMM:** an internal copy-elision check verifies whether
   dimension groups within an operand are contiguous. If fusable, the
   existing strides are used directly for GEMM (no copy). Only non-fusable
   groups trigger a copy to col-major buffer.

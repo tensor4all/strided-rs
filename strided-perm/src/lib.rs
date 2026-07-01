@@ -11,23 +11,21 @@
 //! strided-view -> strided-perm -> strided-kernel -> strided-einsum2
 //! ```
 
-pub mod block;
-pub mod copy;
-pub mod fuse;
-pub mod hptt;
-pub mod kernel;
-pub mod order;
+#[cfg(test)]
+mod block;
+mod copy;
+mod fuse;
+mod hptt;
+#[cfg(test)]
+#[allow(dead_code)]
+mod kernel;
+#[cfg(test)]
+mod order;
 
 // Re-export primary API
-pub use copy::{copy_into, copy_into_col_major, try_fuse_group};
+pub use copy::{copy_into, copy_into_col_major};
 #[cfg(feature = "parallel")]
 pub use copy::{copy_into_col_major_par, copy_into_par};
-pub use fuse::{compress_dims, compute_costs, compute_importance, fuse_dims, sort_by_importance};
-pub use kernel::{
-    build_plan_fused, build_plan_fused_small, for_each_inner_block_preordered, total_len,
-    KernelPlan, SMALL_TENSOR_THRESHOLD,
-};
-pub use order::compute_order;
 
 // Constants
 pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;

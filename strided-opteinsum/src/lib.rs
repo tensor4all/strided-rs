@@ -17,17 +17,17 @@
 use std::collections::HashMap;
 
 /// Error types for einsum operations.
-pub mod error;
+mod error;
 /// Recursive contraction-tree evaluation.
-pub mod expr;
+mod expr;
 /// Type-erased einsum operands (`f64` / `Complex64`, owned / borrowed).
-pub mod operand;
+mod operand;
 /// Nested einsum string parser.
-pub mod parse;
+mod parse;
 /// Single-tensor operations (permute, trace, diagonal extraction).
-pub mod single_tensor;
+mod single_tensor;
 /// Runtime type dispatch over `f64` and `Complex64` tensors.
-pub mod typed_tensor;
+mod typed_tensor;
 
 pub use error::{EinsumError, Result};
 pub use expr::BufferPool;

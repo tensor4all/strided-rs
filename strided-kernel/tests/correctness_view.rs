@@ -395,6 +395,20 @@ fn test_copy_transpose_scale_into() {
 }
 
 #[test]
+fn test_copy_transpose_scale_into_zero_does_not_read_source_values() {
+    let a = StridedArray::<f64>::from_fn_col_major(&[2, 3], |_| f64::NAN);
+    let mut out = StridedArray::<f64>::from_fn_col_major(&[3, 2], |_| 1.0);
+
+    copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 0.0).unwrap();
+
+    for i in 0..3 {
+        for j in 0..2 {
+            assert_eq!(out.get(&[i, j]), 0.0);
+        }
+    }
+}
+
+#[test]
 fn test_symmetrize_into() {
     let n = 4;
     let a = StridedArray::<f64>::from_fn_row_major(&[n, n], |idx| (idx[0] * 10 + idx[1]) as f64);

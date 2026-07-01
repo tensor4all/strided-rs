@@ -3,7 +3,7 @@
 //! The micro-kernel is the innermost building block: an N×N in-register
 //! transpose where N = REGISTER_BITS / 8 / sizeof(T).
 
-pub mod scalar;
+mod scalar;
 
 /// Architecture-specific N×N transpose micro-kernel.
 ///
@@ -11,7 +11,7 @@ pub mod scalar;
 ///   `dst[i + j*ldb] = src[i*lda + j]` for i,j in 0..MICRO
 ///
 /// BLOCK = MICRO * 4 defines the macro-kernel tile size.
-pub trait MicroKernel<T: Copy> {
+pub(crate) trait MicroKernel<T: Copy> {
     /// Micro-tile side length.
     /// e.g. 4 for f64 (scalar/AVX2), 8 for f32 (scalar/AVX2).
     const MICRO: usize;
@@ -28,4 +28,4 @@ pub trait MicroKernel<T: Copy> {
 }
 
 /// Marker type for scalar (non-SIMD) micro-kernels.
-pub struct ScalarKernel;
+pub(crate) struct ScalarKernel;

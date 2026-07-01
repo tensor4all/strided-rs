@@ -6,7 +6,7 @@
 use crate::hptt::macro_kernel::{
     const_stride1_copy, macro_kernel_f32, macro_kernel_f64, macro_kernel_fallback,
 };
-use crate::hptt::plan::{ComputeNode, ExecMode, PermutePlan};
+use crate::hptt::plan::{ComputeNode, ExecMode, GroupedTilePlan, PermutePlan};
 
 #[cfg(feature = "parallel")]
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -36,6 +36,20 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
                 }
                 None => {
                     const_stride1_copy(src, dst, count, src_stride, dst_stride);
+                }
+            }
+        }
+        ExecMode::GroupedTranspose => {
+            let grouped = plan
+                .grouped_tile
+                .as_ref()
+                .expect("grouped transpose mode requires grouped tile plan");
+            match &plan.root {
+                Some(root) => {
+                    grouped_recursive(src, dst, root, grouped);
+                }
+                None => {
+                    grouped_tile_copy(src, dst, grouped);
                 }
             }
         }
@@ -75,7 +89,7 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
 ) {
     let total: usize = plan.fused_dims.iter().product();
 
-    if total < MINTHREADLENGTH {
+    if total < MINTHREADLENGTH || rayon::current_num_threads() <= 1 {
         execute_permute_blocked(src, dst, plan);
         return;
     }
@@ -83,6 +97,19 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
     let root = match &plan.root {
         Some(r) => r,
         None => {
+            if let ExecMode::Transpose { dim_a, dim_b } = plan.mode {
+                dispatch_blocked_2d_par(
+                    src,
+                    dst,
+                    plan.fused_dims[dim_a],
+                    plan.fused_dims[dim_b],
+                    plan.lda_inner,
+                    plan.ldb_inner,
+                    plan.block,
+                    std::mem::size_of::<T>(),
+                );
+                return;
+            }
             execute_permute_blocked(src, dst, plan);
             return;
         }
@@ -152,8 +179,82 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
                 }
             });
         }
+        ExecMode::GroupedTranspose => {
+            let grouped = plan
+                .grouped_tile
+                .as_ref()
+                .expect("grouped transpose mode requires grouped tile plan");
+
+            (0..outer_dim).into_par_iter().for_each(|i| {
+                let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
+                    as *const T;
+                let d =
+                    (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
+
+                unsafe {
+                    match &inner {
+                        Some(next) => {
+                            grouped_recursive(s, d, next, grouped);
+                        }
+                        None => {
+                            grouped_tile_copy(s, d, grouped);
+                        }
+                    }
+                }
+            });
+        }
         ExecMode::Scalar => {
             execute_permute_blocked(src, dst, plan);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped transpose mode: recursive execution
+// ---------------------------------------------------------------------------
+
+unsafe fn grouped_recursive<T: Copy>(
+    src: *const T,
+    dst: *mut T,
+    node: &ComputeNode,
+    grouped: &GroupedTilePlan,
+) {
+    let end = node.end;
+    let node_lda = node.lda;
+    let node_ldb = node.ldb;
+
+    match &node.next {
+        Some(next) => {
+            let mut s = src;
+            let mut d = dst;
+            for _ in 0..end {
+                grouped_recursive(s, d, next, grouped);
+                s = s.offset(node_lda);
+                d = d.offset(node_ldb);
+            }
+        }
+        None => {
+            let mut s = src;
+            let mut d = dst;
+            for _ in 0..end {
+                grouped_tile_copy(s, d, grouped);
+                s = s.offset(node_lda);
+                d = d.offset(node_ldb);
+            }
+        }
+    }
+}
+
+#[inline]
+unsafe fn grouped_tile_copy<T: Copy>(src: *const T, dst: *mut T, grouped: &GroupedTilePlan) {
+    let group_a = &grouped.group_a;
+    let group_b = &grouped.group_b;
+
+    for a in 0..group_a.len {
+        let src_a = src.offset(group_a.src_offsets[a]);
+        let dst_a = dst.offset(group_a.dst_offsets[a]);
+        for b in 0..group_b.len {
+            *dst_a.offset(group_b.dst_offsets[b]) = *src_a.offset(group_b.src_offsets[b]);
         }
     }
 }
@@ -329,6 +430,166 @@ unsafe fn blocked_transpose_2d_fallback<T: Copy>(
         }
         ib += block;
     }
+}
+
+#[cfg(feature = "parallel")]
+#[inline]
+fn transpose_tile_rows(size: usize, block: usize) -> usize {
+    debug_assert!(block > 0);
+    if size == 0 {
+        0
+    } else {
+        (size + block - 1) / block
+    }
+}
+
+#[cfg(feature = "parallel")]
+#[inline]
+unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync>(
+    src: *const T,
+    dst: *mut T,
+    size_a: usize,
+    size_b: usize,
+    lda: isize,
+    ldb: isize,
+    block: usize,
+    elem_size: usize,
+) {
+    match elem_size {
+        8 => parallel_blocked_transpose_2d_f64(
+            src as *const f64,
+            dst as *mut f64,
+            size_a,
+            size_b,
+            lda,
+            ldb,
+            block,
+        ),
+        4 => parallel_blocked_transpose_2d_f32(
+            src as *const f32,
+            dst as *mut f32,
+            size_a,
+            size_b,
+            lda,
+            ldb,
+            block,
+        ),
+        _ => parallel_blocked_transpose_2d_fallback(src, dst, size_a, size_b, lda, ldb, block),
+    }
+}
+
+#[cfg(feature = "parallel")]
+#[inline]
+unsafe fn parallel_blocked_transpose_2d_f64(
+    src: *const f64,
+    dst: *mut f64,
+    size_a: usize,
+    size_b: usize,
+    lda: isize,
+    ldb: isize,
+    block: usize,
+) {
+    let row_tiles = transpose_tile_rows(size_a, block);
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
+
+    (0..row_tiles).into_par_iter().for_each(|tile_a| {
+        let ia = tile_a * block;
+        let ba = block.min(size_a - ia);
+        let src_base = src_addr as *const f64;
+        let dst_base = dst_addr as *mut f64;
+        let mut ib = 0usize;
+        while ib < size_b {
+            let bb = block.min(size_b - ib);
+            unsafe {
+                macro_kernel_f64(
+                    src_base.offset(ia as isize + ib as isize * lda),
+                    lda,
+                    ba,
+                    dst_base.offset(ib as isize + ia as isize * ldb),
+                    ldb,
+                    bb,
+                );
+            }
+            ib += block;
+        }
+    });
+}
+
+#[cfg(feature = "parallel")]
+#[inline]
+unsafe fn parallel_blocked_transpose_2d_f32(
+    src: *const f32,
+    dst: *mut f32,
+    size_a: usize,
+    size_b: usize,
+    lda: isize,
+    ldb: isize,
+    block: usize,
+) {
+    let row_tiles = transpose_tile_rows(size_a, block);
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
+
+    (0..row_tiles).into_par_iter().for_each(|tile_a| {
+        let ia = tile_a * block;
+        let ba = block.min(size_a - ia);
+        let src_base = src_addr as *const f32;
+        let dst_base = dst_addr as *mut f32;
+        let mut ib = 0usize;
+        while ib < size_b {
+            let bb = block.min(size_b - ib);
+            unsafe {
+                macro_kernel_f32(
+                    src_base.offset(ia as isize + ib as isize * lda),
+                    lda,
+                    ba,
+                    dst_base.offset(ib as isize + ia as isize * ldb),
+                    ldb,
+                    bb,
+                );
+            }
+            ib += block;
+        }
+    });
+}
+
+#[cfg(feature = "parallel")]
+#[inline]
+unsafe fn parallel_blocked_transpose_2d_fallback<T: Copy + Send + Sync>(
+    src: *const T,
+    dst: *mut T,
+    size_a: usize,
+    size_b: usize,
+    lda: isize,
+    ldb: isize,
+    block: usize,
+) {
+    let row_tiles = transpose_tile_rows(size_a, block);
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
+
+    (0..row_tiles).into_par_iter().for_each(|tile_a| {
+        let ia = tile_a * block;
+        let ba = block.min(size_a - ia);
+        let src_base = src_addr as *const T;
+        let dst_base = dst_addr as *mut T;
+        let mut ib = 0usize;
+        while ib < size_b {
+            let bb = block.min(size_b - ib);
+            unsafe {
+                macro_kernel_fallback(
+                    src_base.offset(ia as isize + ib as isize * lda),
+                    lda,
+                    ba,
+                    dst_base.offset(ib as isize + ia as isize * ldb),
+                    ldb,
+                    bb,
+                );
+            }
+            ib += block;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -541,5 +802,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_transpose_tile_rows_cover_rootless_3d_transpose() {
+        let n = 256;
+        let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8);
+        assert!(plan.root.is_none());
+
+        let ExecMode::Transpose { dim_a, dim_b } = plan.mode else {
+            panic!("expected transpose mode");
+        };
+        assert_eq!(
+            transpose_tile_rows(plan.fused_dims[dim_a], plan.block),
+            4096
+        );
+        assert_eq!(transpose_tile_rows(plan.fused_dims[dim_b], plan.block), 16);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_execute_par_one_thread_pool_uses_serial_path() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let n = 128;
+            let total = n * n;
+            let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
+            let mut dst_par = vec![0.0f64; total];
+            let mut dst_serial = vec![0.0f64; total];
+            let plan = build_permute_plan(&[n, n], &[n as isize, 1], &[1, n as isize], 8);
+
+            unsafe {
+                execute_permute_blocked_par(src.as_ptr(), dst_par.as_mut_ptr(), &plan);
+                execute_permute_blocked(src.as_ptr(), dst_serial.as_mut_ptr(), &plan);
+            }
+
+            assert_eq!(dst_par, dst_serial);
+        });
     }
 }

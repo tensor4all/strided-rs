@@ -8,6 +8,7 @@
 /// This function fuses subsequent dimensions that are contiguous in memory
 /// for all arrays. If `strides[k][i] == dims[i-1] * strides[k][i-1]` for all k,
 /// dimensions i-1 and i can be merged.
+#[cfg(test)]
 pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
     let n = dims.len();
     if n <= 1 || all_strides.is_empty() {
@@ -48,6 +49,7 @@ pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
 ///
 /// If ALL dimensions are 1 (scalar-like), a single dimension of size 1
 /// is preserved so the kernel has something to iterate over.
+#[cfg(test)]
 pub fn compress_dims(dims: &[usize], all_strides: &[Vec<isize>]) -> (Vec<usize>, Vec<Vec<isize>>) {
     let kept: Vec<usize> = (0..dims.len()).filter(|&i| dims[i] != 1).collect();
 
@@ -73,6 +75,7 @@ pub fn compress_dims(dims: &[usize], all_strides: &[Vec<isize>]) -> (Vec<usize>,
 ///
 /// This encodes stride order information into importance scores that determine
 /// the optimal iteration order. The output array's strides are weighted 2x.
+#[cfg(test)]
 pub fn compute_importance(
     dims: &[usize],
     all_strides: &[&[isize]],
@@ -116,6 +119,7 @@ pub fn compute_importance(
 }
 
 /// Get the permutation that sorts by importance (descending).
+#[cfg(test)]
 pub fn sort_by_importance(importance: &[u64]) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..importance.len()).collect();
     indices.sort_by(|&a, &b| importance[b].cmp(&importance[a]));
@@ -123,6 +127,7 @@ pub fn sort_by_importance(importance: &[u64]) -> Vec<usize> {
 }
 
 /// Compute the minimum stride cost for each dimension.
+#[cfg(test)]
 pub fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
     if all_strides.is_empty() {
         return vec![];
