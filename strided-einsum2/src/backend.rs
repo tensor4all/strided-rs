@@ -4,6 +4,8 @@
 //! and the `ActiveBackend` type alias that serves as the single point of
 //! backend selection based on Cargo features.
 
+use strided_view::ElementOp;
+
 /// Trait for backends that can execute batched GEMM on contiguous operands.
 ///
 /// Each backend declares its configuration (conjugation materialization,
@@ -70,22 +72,70 @@ pub struct BlasBackend;
 #[allow(dead_code)]
 pub struct NaiveBackend;
 
-impl<T: crate::ScalarBase> Backend<T> for NaiveBackend {
+impl<T> Backend<T> for NaiveBackend
+where
+    T: crate::ScalarBase + strided_view::ElementOpApply,
+{
     const MATERIALIZES_CONJ: bool = false;
     const REQUIRES_UNIT_STRIDE: bool = false;
 
     fn bgemm_contiguous_into(
-        _c: &mut crate::contiguous::ContiguousOperandMut<T>,
-        _a: &crate::contiguous::ContiguousOperand<T>,
-        _b: &crate::contiguous::ContiguousOperand<T>,
-        _batch_dims: &[usize],
-        _m: usize,
-        _n: usize,
-        _k: usize,
-        _alpha: T,
-        _beta: T,
+        c: &mut crate::contiguous::ContiguousOperandMut<T>,
+        a: &crate::contiguous::ContiguousOperand<T>,
+        b: &crate::contiguous::ContiguousOperand<T>,
+        batch_dims: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: T,
+        beta: T,
     ) -> strided_view::Result<()> {
-        unreachable!("NaiveBackend GEMM is dispatched directly, not through Backend trait")
+        let a_ptr = a.ptr();
+        let b_ptr = b.ptr();
+        let c_ptr = c.ptr();
+        let a_rs = a.row_stride();
+        let a_cs = a.col_stride();
+        let b_rs = b.row_stride();
+        let b_cs = b.col_stride();
+        let c_rs = c.row_stride();
+        let c_cs = c.col_stride();
+
+        let mut batch_iter = crate::util::MultiIndex::new(batch_dims);
+        while batch_iter.next().is_some() {
+            let a_base = batch_iter.offset(a.batch_strides());
+            let b_base = batch_iter.offset(b.batch_strides());
+            let c_base = batch_iter.offset(c.batch_strides());
+
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = T::zero();
+                    for l in 0..k {
+                        let mut a_val = unsafe {
+                            *a_ptr.offset(a_base + i as isize * a_rs + l as isize * a_cs)
+                        };
+                        let mut b_val = unsafe {
+                            *b_ptr.offset(b_base + l as isize * b_rs + j as isize * b_cs)
+                        };
+                        if a.conj() {
+                            a_val = strided_view::Conj::apply(a_val);
+                        }
+                        if b.conj() {
+                            b_val = strided_view::Conj::apply(b_val);
+                        }
+                        acc = acc + a_val * b_val;
+                    }
+                    unsafe {
+                        let c_elem = c_ptr.offset(c_base + i as isize * c_rs + j as isize * c_cs);
+                        if beta == T::zero() {
+                            *c_elem = alpha * acc;
+                        } else {
+                            *c_elem = alpha * acc + beta * (*c_elem);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -19,7 +19,12 @@ use crate::{Result, StridedError};
 // ============================================================================
 
 /// Validate that all accessed offsets stay within `[0, len)`.
-fn validate_bounds(len: usize, dims: &[usize], strides: &[isize], offset: isize) -> Result<()> {
+pub(crate) fn validate_bounds(
+    len: usize,
+    dims: &[usize],
+    strides: &[isize],
+    offset: isize,
+) -> Result<()> {
     if dims.len() != strides.len() {
         return Err(StridedError::StrideLengthMismatch);
     }

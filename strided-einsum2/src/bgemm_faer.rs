@@ -10,120 +10,7 @@ use faer::linalg::matmul::matmul_with_conj;
 use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Conj, Par};
 use faer_traits::ComplexField;
-use strided_view::{StridedArray, StridedView, StridedViewMut};
-
-/// Borrowed raw strided input for GEMM.
-///
-/// Unlike [`StridedView`], this does not allocate owned shape/stride metadata.
-/// Use [`RawStridedRef::new`] for checked construction, or
-/// [`RawStridedRef::new_unchecked`] when a higher-level compiled plan has
-/// already validated the layout.
-#[derive(Clone, Copy, Debug)]
-pub struct RawStridedRef<'a, T> {
-    data: &'a [T],
-    dims: &'a [usize],
-    strides: &'a [isize],
-    offset: isize,
-}
-
-impl<'a, T> RawStridedRef<'a, T> {
-    pub fn new(
-        data: &'a [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
-        offset: isize,
-    ) -> strided_view::Result<Self> {
-        validate_raw_bounds(data.len(), dims, strides, offset)?;
-        Ok(Self {
-            data,
-            dims,
-            strides,
-            offset,
-        })
-    }
-
-    /// Create a raw strided input without bounds checking.
-    ///
-    /// # Safety
-    /// The caller must ensure every index reachable by `dims`/`strides` from
-    /// `offset` lies inside `data`.
-    pub unsafe fn new_unchecked(
-        data: &'a [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
-        offset: isize,
-    ) -> Self {
-        Self {
-            data,
-            dims,
-            strides,
-            offset,
-        }
-    }
-
-    #[inline]
-    fn ptr(&self) -> *const T {
-        unsafe { self.data.as_ptr().offset(self.offset) }
-    }
-
-    #[inline]
-    unsafe fn as_view(&self) -> StridedView<'a, T> {
-        StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset)
-    }
-}
-
-/// Borrowed raw strided output for GEMM.
-///
-/// This is the mutable counterpart to [`RawStridedRef`]. It avoids allocating
-/// owned shape/stride metadata in prepared replay paths.
-#[derive(Debug)]
-pub struct RawStridedMut<'a, T> {
-    data: &'a mut [T],
-    dims: &'a [usize],
-    strides: &'a [isize],
-    offset: isize,
-}
-
-impl<'a, T> RawStridedMut<'a, T> {
-    pub fn new(
-        data: &'a mut [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
-        offset: isize,
-    ) -> strided_view::Result<Self> {
-        validate_raw_bounds(data.len(), dims, strides, offset)?;
-        Ok(Self {
-            data,
-            dims,
-            strides,
-            offset,
-        })
-    }
-
-    /// Create a raw strided output without bounds checking.
-    ///
-    /// # Safety
-    /// The caller must ensure every index reachable by `dims`/`strides` from
-    /// `offset` lies inside `data`, and no aliases violate mutable access.
-    pub unsafe fn new_unchecked(
-        data: &'a mut [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
-        offset: isize,
-    ) -> Self {
-        Self {
-            data,
-            dims,
-            strides,
-            offset,
-        }
-    }
-
-    #[inline]
-    fn ptr(&mut self) -> *mut T {
-        unsafe { self.data.as_mut_ptr().offset(self.offset) }
-    }
-}
+use strided_view::{RawStridedMut, RawStridedRef, StridedArray, StridedView, StridedViewMut};
 
 /// Batched strided GEMM using faer: C = alpha * A * B + beta * C
 ///
@@ -172,7 +59,7 @@ where
 /// [`StridedView`] wrappers when the caller already has borrowed
 /// dims/strides/offset metadata.
 #[allow(clippy::too_many_arguments)]
-pub fn bgemm_raw_strided_into<T>(
+pub(crate) fn bgemm_raw_strided_into<T>(
     c: RawStridedMut<'_, T>,
     a: RawStridedRef<'_, T>,
     b: RawStridedRef<'_, T>,
@@ -215,7 +102,7 @@ where
 /// - matching dimension groups have identical extents,
 /// - `c` does not alias `a` or `b` in a way that violates Rust's mutable access.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn bgemm_raw_strided_into_unchecked<T>(
+pub(crate) unsafe fn bgemm_raw_strided_into_unchecked<T>(
     mut c: RawStridedMut<'_, T>,
     a: RawStridedRef<'_, T>,
     b: RawStridedRef<'_, T>,
@@ -240,11 +127,11 @@ where
         + num_traits::One
         + PartialEq,
 {
-    let a_dims = a.dims;
-    let b_dims = b.dims;
-    let a_strides = a.strides;
-    let b_strides = b.strides;
-    let c_strides = c.strides;
+    let a_dims = a.dims();
+    let b_dims = b.dims();
+    let a_strides = a.strides();
+    let b_strides = b.strides();
+    let c_strides = c.strides();
 
     // Extract dimension groups (batch-last canonical order)
     // A: [lo, sum, batch], B: [sum, ro, batch], C: [lo, ro, batch]
@@ -286,7 +173,7 @@ where
     let a_contig_buf: Option<StridedArray<T>>;
     let (a_ptr, a_row_stride, a_col_stride);
     if a_needs_copy {
-        let mut buf = alloc_col_major_uninit(a.dims);
+        let mut buf = alloc_col_major_uninit(a.dims());
         strided_kernel::copy_into(&mut buf.view_mut(), &a.as_view())?;
         a_ptr = buf.view().ptr();
         // Col-major inner A [lo..., sum...]: lo stride = 1, sum stride = m
@@ -310,7 +197,7 @@ where
     let b_contig_buf: Option<StridedArray<T>>;
     let (b_ptr, b_row_stride, b_col_stride);
     if b_needs_copy {
-        let mut buf = alloc_col_major_uninit(b.dims);
+        let mut buf = alloc_col_major_uninit(b.dims());
         strided_kernel::copy_into(&mut buf.view_mut(), &b.as_view())?;
         b_ptr = buf.view().ptr();
         // Col-major inner B [sum..., ro...]: sum stride = 1, ro stride = k
@@ -334,10 +221,9 @@ where
     let c_contig_buf: Option<StridedArray<T>>;
     let (c_ptr, c_row_stride, c_col_stride);
     if c_needs_copy {
-        let mut buf = alloc_col_major_uninit(c.dims);
+        let mut buf = alloc_col_major_uninit(c.dims());
         if beta != T::zero() {
-            let c_view: StridedView<'_, T> =
-                StridedView::new_unchecked(&*c.data, c.dims, c.strides, c.offset);
+            let c_view: StridedView<'_, T> = c.as_view();
             strided_kernel::copy_into(&mut buf.view_mut(), &c_view)?;
         }
         c_ptr = buf.view_mut().as_mut_ptr();
@@ -348,7 +234,7 @@ where
     } else {
         let (_, rs) = fused_c_lo.unwrap();
         let (_, cs) = fused_c_ro.unwrap();
-        c_ptr = c.ptr();
+        c_ptr = c.as_mut_ptr();
         c_row_stride = rs;
         c_col_stride = cs;
         c_contig_buf = None;
@@ -434,51 +320,10 @@ where
 
     // If C was copied to a temp buffer, copy the result back
     if let Some(ref c_buf) = c_contig_buf {
-        let mut c_view = StridedViewMut::new_unchecked(c.data, c.dims, c.strides, c.offset);
+        let mut c_view = c.as_view_mut();
         strided_kernel::copy_into(&mut c_view, &c_buf.view())?;
     }
 
-    Ok(())
-}
-
-fn validate_raw_bounds(
-    len: usize,
-    dims: &[usize],
-    strides: &[isize],
-    offset: isize,
-) -> strided_view::Result<()> {
-    if dims.len() != strides.len() {
-        return Err(strided_view::StridedError::StrideLengthMismatch);
-    }
-    if dims.iter().any(|&dim| dim == 0) {
-        return Ok(());
-    }
-
-    let mut min_offset = offset;
-    let mut max_offset = offset;
-    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
-        if dim <= 1 {
-            continue;
-        }
-        let end = stride
-            .checked_mul(dim as isize - 1)
-            .ok_or(strided_view::StridedError::OffsetOverflow)?;
-        if end >= 0 {
-            max_offset = max_offset
-                .checked_add(end)
-                .ok_or(strided_view::StridedError::OffsetOverflow)?;
-        } else {
-            min_offset = min_offset
-                .checked_add(end)
-                .ok_or(strided_view::StridedError::OffsetOverflow)?;
-        }
-    }
-    if min_offset < 0 || max_offset < 0 {
-        return Err(strided_view::StridedError::OffsetOverflow);
-    }
-    if max_offset as usize >= len {
-        return Err(strided_view::StridedError::OffsetOverflow);
-    }
     Ok(())
 }
 
@@ -494,58 +339,58 @@ fn validate_bgemm_shapes<T>(
     let a_rank = n_lo + n_sum + n_batch;
     let b_rank = n_sum + n_ro + n_batch;
     let c_rank = n_lo + n_ro + n_batch;
-    if a.dims.len() != a_rank {
+    if a.dims().len() != a_rank {
         return Err(strided_view::StridedError::RankMismatch(
             a_rank,
-            a.dims.len(),
+            a.dims().len(),
         ));
     }
-    if b.dims.len() != b_rank {
+    if b.dims().len() != b_rank {
         return Err(strided_view::StridedError::RankMismatch(
             b_rank,
-            b.dims.len(),
+            b.dims().len(),
         ));
     }
-    if c.dims.len() != c_rank {
+    if c.dims().len() != c_rank {
         return Err(strided_view::StridedError::RankMismatch(
             c_rank,
-            c.dims.len(),
+            c.dims().len(),
         ));
     }
 
-    let lo_dims = &a.dims[..n_lo];
-    let sum_dims = &a.dims[n_lo..n_lo + n_sum];
-    let batch_dims = &a.dims[n_lo + n_sum..];
-    let ro_dims = &b.dims[n_sum..n_sum + n_ro];
+    let lo_dims = &a.dims()[..n_lo];
+    let sum_dims = &a.dims()[n_lo..n_lo + n_sum];
+    let batch_dims = &a.dims()[n_lo + n_sum..];
+    let ro_dims = &b.dims()[n_sum..n_sum + n_ro];
 
-    if &b.dims[..n_sum] != sum_dims {
+    if &b.dims()[..n_sum] != sum_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             sum_dims.to_vec(),
-            b.dims[..n_sum].to_vec(),
+            b.dims()[..n_sum].to_vec(),
         ));
     }
-    if &b.dims[n_sum + n_ro..] != batch_dims {
+    if &b.dims()[n_sum + n_ro..] != batch_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             batch_dims.to_vec(),
-            b.dims[n_sum + n_ro..].to_vec(),
+            b.dims()[n_sum + n_ro..].to_vec(),
         ));
     }
-    if &c.dims[..n_lo] != lo_dims {
+    if &c.dims()[..n_lo] != lo_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             lo_dims.to_vec(),
-            c.dims[..n_lo].to_vec(),
+            c.dims()[..n_lo].to_vec(),
         ));
     }
-    if &c.dims[n_lo..n_lo + n_ro] != ro_dims {
+    if &c.dims()[n_lo..n_lo + n_ro] != ro_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             ro_dims.to_vec(),
-            c.dims[n_lo..n_lo + n_ro].to_vec(),
+            c.dims()[n_lo..n_lo + n_ro].to_vec(),
         ));
     }
-    if &c.dims[n_lo + n_ro..] != batch_dims {
+    if &c.dims()[n_lo + n_ro..] != batch_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             batch_dims.to_vec(),
-            c.dims[n_lo + n_ro..].to_vec(),
+            c.dims()[n_lo + n_ro..].to_vec(),
         ));
     }
     Ok(())
