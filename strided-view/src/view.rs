@@ -527,6 +527,18 @@ impl<'a, T> StridedViewMut<'a, T> {
         self.ptr
     }
 
+    /// Returns a reference to the backing data slice.
+    #[inline]
+    pub fn data(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Returns a mutable reference to the backing data slice.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [T] {
+        &mut self.data
+    }
+
     /// Permute dimensions, consuming the mutable view.
     ///
     /// Returns a new mutable view with reordered dimensions and strides.
