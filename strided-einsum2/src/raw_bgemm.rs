@@ -390,4 +390,92 @@ mod tests {
             crate::EinsumError::Strided(strided_view::StridedError::ShapeMismatch(_, _))
         ));
     }
+
+    #[test]
+    fn raw_bgemm_explicit_backend_checked_rank_mismatch() {
+        let a_dims = [2, 2];
+        let b_dims = [2, 2];
+        let c_dims = [2];
+        let strides = [2, 1];
+        let c_strides = [1];
+        let a_data = [1.0, 2.0, 3.0, 4.0];
+        let b_data = [5.0, 6.0, 7.0, 8.0];
+        let mut c_data = [0.0; 2];
+        let a = RawStridedRef::new(&a_data, &a_dims, &strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &b_dims, &strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &c_dims, &c_strides, 0).unwrap();
+        let err = bgemm_raw_with_backend_into::<f64, crate::backend::ActiveBackend>(
+            c, a, b, 0, 1, 1, 1, 1.0, 0.0, false, false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::EinsumError::Strided(strided_view::StridedError::RankMismatch(2, 1))
+        ));
+    }
+
+    #[test]
+    fn raw_bgemm_zero_sum_scales_destination() {
+        let a_dims = [2, 0];
+        let b_dims = [0, 2];
+        let c_dims = [2, 2];
+        let a_strides = [0, 0];
+        let b_strides = [0, 0];
+        let c_strides = [2, 1];
+        let a_data = [0.0; 1];
+        let b_data = [0.0; 1];
+        let mut c_data = [1.0, 2.0, 3.0, 4.0];
+        let a = RawStridedRef::new(&a_data, &a_dims, &a_strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &b_dims, &b_strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &c_dims, &c_strides, 0).unwrap();
+
+        bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, 1.0, 2.0, false, false).unwrap();
+
+        assert_eq!(c_data, [2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn raw_bgemm_zero_sum_beta_zero_clears_destination() {
+        let a_dims = [2, 0];
+        let b_dims = [0, 2];
+        let c_dims = [2, 2];
+        let a_strides = [0, 0];
+        let b_strides = [0, 0];
+        let c_strides = [2, 1];
+        let a_data = [0.0; 1];
+        let b_data = [0.0; 1];
+        let mut c_data = [1.0, 2.0, 3.0, 4.0];
+        let a = RawStridedRef::new(&a_data, &a_dims, &a_strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &b_dims, &b_strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &c_dims, &c_strides, 0).unwrap();
+
+        bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, 1.0, 0.0, false, false).unwrap();
+
+        assert_eq!(c_data, [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn raw_bgemm_noncontiguous_output_writes_back() {
+        let a_dims = [2, 2];
+        let b_dims = [2, 2];
+        let c_dims = [2, 2];
+        let a_strides = [2, 1];
+        let b_strides = [2, 1];
+        let c_strides = [1, 3];
+        let a_data = [1.0, 2.0, 3.0, 4.0];
+        let b_data = [5.0, 6.0, 7.0, 8.0];
+        let mut c_data = [0.0; 8];
+        let a = RawStridedRef::new(&a_data, &a_dims, &a_strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &b_dims, &b_strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &c_dims, &c_strides, 1).unwrap();
+
+        bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, 1.0, 0.0, false, false).unwrap();
+
+        assert_eq!(c_data[1], 19.0);
+        assert_eq!(c_data[4], 22.0);
+        assert_eq!(c_data[2], 43.0);
+        assert_eq!(c_data[5], 50.0);
+        assert_eq!(c_data[0], 0.0);
+        assert_eq!(c_data[3], 0.0);
+    }
 }
