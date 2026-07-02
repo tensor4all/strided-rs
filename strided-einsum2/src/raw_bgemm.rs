@@ -134,6 +134,9 @@ where
     let batch_dims = &a_dims[n_lo + n_sum..];
     let ro_dims = &b_dims[n_sum..n_sum + n_ro];
 
+    if c.dims().iter().any(|&dim| dim == 0) {
+        return Ok(());
+    }
     if sum_dims.iter().any(|&dim| dim == 0) {
         scale_or_zero_raw_mut(&mut c, beta);
         return Ok(());
@@ -452,6 +455,27 @@ mod tests {
         bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, 1.0, 0.0, false, false).unwrap();
 
         assert_eq!(c_data, [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn raw_bgemm_empty_output_is_noop() {
+        let a_dims = [0, 2];
+        let b_dims = [2, 2];
+        let c_dims = [0, 2];
+        let a_strides = [2, 1];
+        let b_strides = [2, 1];
+        let c_strides = [2, 1];
+        let a_data = [1.0, 2.0];
+        let b_data = [3.0, 4.0, 5.0, 6.0];
+        let mut c_data = [7.0, 8.0, 9.0, 10.0];
+        let expected = c_data;
+        let a = RawStridedRef::new(&a_data, &a_dims, &a_strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &b_dims, &b_strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &c_dims, &c_strides, 0).unwrap();
+
+        bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, 1.0, 1.0, false, false).unwrap();
+
+        assert_eq!(c_data, expected);
     }
 
     #[test]

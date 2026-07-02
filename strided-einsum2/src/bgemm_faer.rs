@@ -140,6 +140,10 @@ where
     let batch_dims = &a_dims[n_lo + n_sum..];
     let ro_dims = &b_dims[n_sum..n_sum + n_ro];
 
+    if c.dims().iter().any(|&dim| dim == 0) {
+        return Ok(());
+    }
+
     // Fused sizes for the matrix multiply
     let m: usize = lo_dims.iter().product::<usize>().max(1);
     let k: usize = sum_dims.iter().product::<usize>().max(1);
