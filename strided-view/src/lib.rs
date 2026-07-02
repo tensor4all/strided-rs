@@ -20,6 +20,7 @@
 
 pub mod auxiliary;
 mod element_op;
+mod raw;
 pub mod view;
 
 // ============================================================================
@@ -32,6 +33,7 @@ pub use element_op::{
 // ============================================================================
 // View-based types
 // ============================================================================
+pub use raw::{RawStridedMut, RawStridedRef};
 pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 
 // ============================================================================

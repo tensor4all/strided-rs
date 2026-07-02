@@ -8,7 +8,7 @@ use crate::ScalarBase;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use strided_view::{StridedArray, StridedView, StridedViewMut};
+use strided_view::{RawStridedMut, RawStridedRef, StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.
 pub struct ContiguousOperand<T: Copy + 'static> {
@@ -231,6 +231,20 @@ impl<T: Copy + Send + Sync> ContiguousOperandMut<T> {
         if self.needs_writeback {
             if let Some(ref buf) = self._buf {
                 strided_perm::copy_into(dest, &buf.view())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After GEMM: copy the internal buffer back to a raw destination if needed.
+    ///
+    /// This mirrors [`Self::finalize_into`] for prepared replay paths that use
+    /// borrowed raw layout metadata instead of owned-metadata views.
+    pub fn finalize_raw_into(self, dest: &mut RawStridedMut<'_, T>) -> crate::Result<()> {
+        if self.needs_writeback {
+            if let Some(ref buf) = self._buf {
+                let mut dest_view = dest.as_view_mut();
+                strided_perm::copy_into(&mut dest_view, &buf.view())?;
             }
         }
         Ok(())
@@ -463,6 +477,79 @@ pub fn prepare_input_view<T: ScalarBase + 'static>(
     }
 }
 
+/// Prepare a borrowed raw input layout for GEMM.
+///
+/// This is the raw-layout counterpart to [`prepare_input_view`]. Direct
+/// fusable layouts do not construct `StridedView` wrappers; a view is created
+/// only when a copy/materialization path needs to call a generic strided kernel.
+pub fn prepare_input_raw<T: ScalarBase + 'static>(
+    view: &RawStridedRef<'_, T>,
+    n_group1: usize,
+    n_group2: usize,
+    conj: bool,
+    requires_unit_stride: bool,
+    use_pool: bool,
+    materialize_conj_fn: Option<fn(T) -> T>,
+) -> crate::Result<ContiguousOperand<T>> {
+    let dims = view.dims();
+    let strides = view.strides();
+    let n_inner = n_group1 + n_group2;
+
+    if let Some(conj_fn) = materialize_conj_fn {
+        if conj {
+            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+            strided_kernel::map_into(&mut buf.view_mut(), &view.as_view(), conj_fn)?;
+            let ptr = buf.view().ptr();
+            let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
+            return Ok(ContiguousOperand {
+                ptr,
+                row_stride,
+                col_stride,
+                batch_strides,
+                conj: false,
+                _buf: Some(buf),
+                buf_is_pooled,
+            });
+        }
+    }
+
+    let check = check_contiguity(
+        &dims[..n_group1],
+        &strides[..n_group1],
+        &dims[n_group1..n_inner],
+        &strides[n_group1..n_inner],
+        requires_unit_stride,
+    );
+
+    if check.needs_copy {
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+        strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
+        let ptr = buf.view().ptr();
+        let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
+        Ok(ContiguousOperand {
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
+            conj,
+            _buf: Some(buf),
+            buf_is_pooled,
+        })
+    } else {
+        let (_, rs) = check.fused_g1.unwrap();
+        let (_, cs) = check.fused_g2.unwrap();
+        Ok(ContiguousOperand {
+            ptr: view.ptr(),
+            row_stride: rs,
+            col_stride: cs,
+            batch_strides: strides[n_inner..].to_vec(),
+            conj,
+            _buf: None,
+            buf_is_pooled: false,
+        })
+    }
+}
+
 /// Prepare an owned input array for GEMM.
 ///
 /// Expects batch-last canonical order: `[group1..., group2..., batch...]`.
@@ -558,6 +645,62 @@ pub fn prepare_input_owned<T: ScalarBase + 'static>(
 /// the returned operand and that no aliasing mutable references exist during GEMM.
 pub fn prepare_output_view<T: ScalarBase + 'static>(
     view: &mut StridedViewMut<T>,
+    n_group1: usize,
+    n_group2: usize,
+    beta: T,
+    requires_unit_stride: bool,
+    use_pool: bool,
+) -> crate::Result<ContiguousOperandMut<T>> {
+    let dims = view.dims().to_vec();
+    let strides = view.strides().to_vec();
+    let n_inner = n_group1 + n_group2;
+
+    let check = check_contiguity(
+        &dims[..n_group1],
+        &strides[..n_group1],
+        &dims[n_group1..n_inner],
+        &strides[n_group1..n_inner],
+        requires_unit_stride,
+    );
+
+    if check.needs_copy {
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
+        if beta != T::zero() {
+            strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
+        }
+        let ptr = buf.view_mut().as_mut_ptr();
+        let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
+        Ok(ContiguousOperandMut {
+            ptr,
+            row_stride,
+            col_stride,
+            batch_strides,
+            needs_writeback: true,
+            _buf: Some(buf),
+            buf_is_pooled,
+        })
+    } else {
+        let (_, rs) = check.fused_g1.unwrap();
+        let (_, cs) = check.fused_g2.unwrap();
+        Ok(ContiguousOperandMut {
+            ptr: view.as_mut_ptr(),
+            row_stride: rs,
+            col_stride: cs,
+            batch_strides: strides[n_inner..].to_vec(),
+            needs_writeback: false,
+            _buf: None,
+            buf_is_pooled: false,
+        })
+    }
+}
+
+/// Prepare a borrowed raw output layout for GEMM.
+///
+/// This is the raw-layout counterpart to [`prepare_output_view`]. Direct
+/// fusable layouts do not construct `StridedViewMut` wrappers; a view is
+/// created only when a copy/writeback path needs a generic strided kernel.
+pub fn prepare_output_raw<T: ScalarBase + 'static>(
+    view: &mut RawStridedMut<'_, T>,
     n_group1: usize,
     n_group2: usize,
     beta: T,

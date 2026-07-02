@@ -53,6 +53,8 @@ pub mod contiguous;
 pub mod dot_general;
 /// Contraction planning: axis classification and permutation computation.
 pub mod plan;
+/// Raw borrowed-layout batched GEMM entry points.
+pub mod raw_bgemm;
 /// Trace-axis reduction (summing axes that appear only in one operand).
 pub mod trace;
 /// Shared helpers (permutation inversion, multi-index iteration, dimension fusion).
@@ -71,11 +73,17 @@ use strided_view::StridedArray;
 use strided_view::{Adjoint, Conj, ElementOp, ElementOpApply};
 
 pub use strided_traits::ScalarBase;
-pub use strided_view::{col_major_strides, StridedView, StridedViewMut};
+pub use strided_view::{
+    col_major_strides, RawStridedMut, RawStridedRef, StridedView, StridedViewMut,
+};
 
 pub use backend::Backend;
 pub use dot_general::{dot_general_into, dot_general_with_backend_into, DotGeneralConfig};
 pub use plan::Einsum2Plan;
+pub use raw_bgemm::{
+    bgemm_raw_strided_into, bgemm_raw_strided_into_unchecked, bgemm_raw_with_backend_into,
+    bgemm_raw_with_backend_into_unchecked,
+};
 
 /// Trait alias for axis label types.
 pub trait AxisId: Clone + Eq + Hash + Debug {}

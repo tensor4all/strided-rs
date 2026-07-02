@@ -10,7 +10,7 @@ use faer::linalg::matmul::matmul_with_conj;
 use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Conj, Par};
 use faer_traits::ComplexField;
-use strided_view::{StridedArray, StridedView, StridedViewMut};
+use strided_view::{RawStridedMut, RawStridedRef, StridedArray, StridedView, StridedViewMut};
 
 /// Batched strided GEMM using faer: C = alpha * A * B + beta * C
 ///
@@ -21,6 +21,91 @@ pub fn bgemm_strided_into<T>(
     c: &mut StridedViewMut<T>,
     a: &StridedView<T>,
     b: &StridedView<T>,
+    _n_batch: usize,
+    n_lo: usize,
+    n_ro: usize,
+    n_sum: usize,
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> strided_view::Result<()>
+where
+    T: ComplexField
+        + Copy
+        + strided_view::ElementOpApply
+        + Send
+        + Sync
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>
+        + num_traits::Zero
+        + num_traits::One
+        + PartialEq,
+{
+    let a = unsafe { RawStridedRef::new_unchecked(a.data(), a.dims(), a.strides(), a.offset()) };
+    let b = unsafe { RawStridedRef::new_unchecked(b.data(), b.dims(), b.strides(), b.offset()) };
+    let c_dims = c.dims().to_vec();
+    let c_strides = c.strides().to_vec();
+    let c_offset = c.offset();
+    let c = unsafe { RawStridedMut::new_unchecked(c.data_mut(), &c_dims, &c_strides, c_offset) };
+    bgemm_raw_strided_into(
+        c, a, b, _n_batch, n_lo, n_ro, n_sum, alpha, beta, conj_a, conj_b,
+    )
+}
+
+/// Batched strided GEMM on raw borrowed layout metadata.
+///
+/// This is equivalent to [`bgemm_strided_into`], but avoids constructing
+/// [`StridedView`] wrappers when the caller already has borrowed
+/// dims/strides/offset metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bgemm_raw_strided_into<T>(
+    c: RawStridedMut<'_, T>,
+    a: RawStridedRef<'_, T>,
+    b: RawStridedRef<'_, T>,
+    n_batch: usize,
+    n_lo: usize,
+    n_ro: usize,
+    n_sum: usize,
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> strided_view::Result<()>
+where
+    T: ComplexField
+        + Copy
+        + strided_view::ElementOpApply
+        + Send
+        + Sync
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>
+        + num_traits::Zero
+        + num_traits::One
+        + PartialEq,
+{
+    validate_bgemm_shapes(&c, &a, &b, n_batch, n_lo, n_ro, n_sum)?;
+    unsafe {
+        bgemm_raw_strided_into_unchecked(
+            c, a, b, n_batch, n_lo, n_ro, n_sum, alpha, beta, conj_a, conj_b,
+        )
+    }
+}
+
+/// Batched strided GEMM on raw borrowed layout metadata without validation.
+///
+/// # Safety
+/// The caller must ensure:
+/// - all raw strided operands are in bounds,
+/// - `n_lo`, `n_ro`, `n_sum`, and `n_batch` partition operand ranks as
+///   `[lo, sum, batch]`, `[sum, ro, batch]`, and `[lo, ro, batch]`,
+/// - matching dimension groups have identical extents,
+/// - `c` does not alias `a` or `b` in a way that violates Rust's mutable access.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn bgemm_raw_strided_into_unchecked<T>(
+    mut c: RawStridedMut<'_, T>,
+    a: RawStridedRef<'_, T>,
+    b: RawStridedRef<'_, T>,
     _n_batch: usize,
     n_lo: usize,
     n_ro: usize,
@@ -54,6 +139,10 @@ where
     let sum_dims = &a_dims[n_lo..n_lo + n_sum];
     let batch_dims = &a_dims[n_lo + n_sum..];
     let ro_dims = &b_dims[n_sum..n_sum + n_ro];
+
+    if c.dims().iter().any(|&dim| dim == 0) {
+        return Ok(());
+    }
 
     // Fused sizes for the matrix multiply
     let m: usize = lo_dims.iter().product::<usize>().max(1);
@@ -89,7 +178,7 @@ where
     let (a_ptr, a_row_stride, a_col_stride);
     if a_needs_copy {
         let mut buf = alloc_col_major_uninit(a.dims());
-        strided_kernel::copy_into(&mut buf.view_mut(), a)?;
+        strided_kernel::copy_into(&mut buf.view_mut(), &a.as_view())?;
         a_ptr = buf.view().ptr();
         // Col-major inner A [lo..., sum...]: lo stride = 1, sum stride = m
         a_row_stride = if m == 0 { 0 } else { 1isize };
@@ -113,7 +202,7 @@ where
     let (b_ptr, b_row_stride, b_col_stride);
     if b_needs_copy {
         let mut buf = alloc_col_major_uninit(b.dims());
-        strided_kernel::copy_into(&mut buf.view_mut(), b)?;
+        strided_kernel::copy_into(&mut buf.view_mut(), &b.as_view())?;
         b_ptr = buf.view().ptr();
         // Col-major inner B [sum..., ro...]: sum stride = 1, ro stride = k
         b_row_stride = if k == 0 { 0 } else { 1isize };
@@ -138,7 +227,8 @@ where
     if c_needs_copy {
         let mut buf = alloc_col_major_uninit(c.dims());
         if beta != T::zero() {
-            strided_kernel::copy_into(&mut buf.view_mut(), &c.as_view())?;
+            let c_view: StridedView<'_, T> = c.as_view();
+            strided_kernel::copy_into(&mut buf.view_mut(), &c_view)?;
         }
         c_ptr = buf.view_mut().as_mut_ptr();
         // Col-major inner C [lo..., ro...]: lo stride = 1, ro stride = m
@@ -234,9 +324,79 @@ where
 
     // If C was copied to a temp buffer, copy the result back
     if let Some(ref c_buf) = c_contig_buf {
-        strided_kernel::copy_into(c, &c_buf.view())?;
+        let mut c_view = c.as_view_mut();
+        strided_kernel::copy_into(&mut c_view, &c_buf.view())?;
     }
 
+    Ok(())
+}
+
+fn validate_bgemm_shapes<T>(
+    c: &RawStridedMut<'_, T>,
+    a: &RawStridedRef<'_, T>,
+    b: &RawStridedRef<'_, T>,
+    n_batch: usize,
+    n_lo: usize,
+    n_ro: usize,
+    n_sum: usize,
+) -> strided_view::Result<()> {
+    let a_rank = n_lo + n_sum + n_batch;
+    let b_rank = n_sum + n_ro + n_batch;
+    let c_rank = n_lo + n_ro + n_batch;
+    if a.dims().len() != a_rank {
+        return Err(strided_view::StridedError::RankMismatch(
+            a_rank,
+            a.dims().len(),
+        ));
+    }
+    if b.dims().len() != b_rank {
+        return Err(strided_view::StridedError::RankMismatch(
+            b_rank,
+            b.dims().len(),
+        ));
+    }
+    if c.dims().len() != c_rank {
+        return Err(strided_view::StridedError::RankMismatch(
+            c_rank,
+            c.dims().len(),
+        ));
+    }
+
+    let lo_dims = &a.dims()[..n_lo];
+    let sum_dims = &a.dims()[n_lo..n_lo + n_sum];
+    let batch_dims = &a.dims()[n_lo + n_sum..];
+    let ro_dims = &b.dims()[n_sum..n_sum + n_ro];
+
+    if &b.dims()[..n_sum] != sum_dims {
+        return Err(strided_view::StridedError::ShapeMismatch(
+            sum_dims.to_vec(),
+            b.dims()[..n_sum].to_vec(),
+        ));
+    }
+    if &b.dims()[n_sum + n_ro..] != batch_dims {
+        return Err(strided_view::StridedError::ShapeMismatch(
+            batch_dims.to_vec(),
+            b.dims()[n_sum + n_ro..].to_vec(),
+        ));
+    }
+    if &c.dims()[..n_lo] != lo_dims {
+        return Err(strided_view::StridedError::ShapeMismatch(
+            lo_dims.to_vec(),
+            c.dims()[..n_lo].to_vec(),
+        ));
+    }
+    if &c.dims()[n_lo..n_lo + n_ro] != ro_dims {
+        return Err(strided_view::StridedError::ShapeMismatch(
+            ro_dims.to_vec(),
+            c.dims()[n_lo..n_lo + n_ro].to_vec(),
+        ));
+    }
+    if &c.dims()[n_lo + n_ro..] != batch_dims {
+        return Err(strided_view::StridedError::ShapeMismatch(
+            batch_dims.to_vec(),
+            c.dims()[n_lo + n_ro..].to_vec(),
+        ));
+    }
     Ok(())
 }
 
@@ -430,6 +590,111 @@ mod tests {
         assert_eq!(c.get(&[0, 1]), 22.0);
         assert_eq!(c.get(&[1, 0]), 43.0);
         assert_eq!(c.get(&[1, 1]), 50.0);
+    }
+
+    fn raw_bgemm_2x2<T>(one: T, zero: T) -> Vec<T>
+    where
+        T: ComplexField
+            + Copy
+            + strided_view::ElementOpApply
+            + Send
+            + Sync
+            + std::ops::Mul<Output = T>
+            + std::ops::Add<Output = T>
+            + num_traits::Zero
+            + num_traits::One
+            + PartialEq
+            + From<f32>,
+    {
+        let dims = [2, 2];
+        let strides = [2, 1];
+        let a_data = [T::from(1.0), T::from(2.0), T::from(3.0), T::from(4.0)];
+        let b_data = [T::from(5.0), T::from(6.0), T::from(7.0), T::from(8.0)];
+        let mut c_data = vec![zero; 4];
+        let a = RawStridedRef::new(&a_data, &dims, &strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &dims, &strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &dims, &strides, 0).unwrap();
+        bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, one, zero, false, false).unwrap();
+        c_data
+    }
+
+    #[test]
+    fn test_faer_raw_bgemm_f64() {
+        assert_eq!(raw_bgemm_2x2(1.0f64, 0.0), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn test_faer_raw_bgemm_f32() {
+        assert_eq!(raw_bgemm_2x2(1.0f32, 0.0), vec![19.0f32, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn test_faer_raw_bgemm_complex_conj() {
+        use num_complex::Complex64;
+
+        let i = Complex64::i();
+        let dims = [2, 2];
+        let strides = [2, 1];
+        let a_data = [
+            Complex64::new(1.0, 0.0) + i,
+            Complex64::new(2.0, 0.0),
+            Complex64::new(3.0, 0.0),
+            Complex64::new(4.0, 0.0) - i,
+        ];
+        let b_data = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, 0.0),
+        ];
+        let mut c_data = vec![Complex64::new(0.0, 0.0); 4];
+        let a = RawStridedRef::new(&a_data, &dims, &strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &dims, &strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &dims, &strides, 0).unwrap();
+        bgemm_raw_strided_into(
+            c,
+            a,
+            b,
+            0,
+            1,
+            1,
+            1,
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            c_data,
+            vec![
+                Complex64::new(1.0, -1.0),
+                Complex64::new(2.0, 0.0),
+                Complex64::new(3.0, 0.0),
+                Complex64::new(4.0, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_faer_raw_bgemm_checked_shape_mismatch() {
+        let a_dims = [2, 2];
+        let b_dims = [3, 2];
+        let c_dims = [2, 2];
+        let a_strides = [2, 1];
+        let b_strides = [2, 1];
+        let c_strides = [2, 1];
+        let a_data = [1.0, 2.0, 3.0, 4.0];
+        let b_data = [0.0; 6];
+        let mut c_data = [0.0; 4];
+        let a = RawStridedRef::new(&a_data, &a_dims, &a_strides, 0).unwrap();
+        let b = RawStridedRef::new(&b_data, &b_dims, &b_strides, 0).unwrap();
+        let c = RawStridedMut::new(&mut c_data, &c_dims, &c_strides, 0).unwrap();
+        let err = bgemm_raw_strided_into(c, a, b, 0, 1, 1, 1, 1.0, 0.0, false, false).unwrap_err();
+        assert!(matches!(
+            err,
+            strided_view::StridedError::ShapeMismatch(_, _)
+        ));
     }
 
     #[test]

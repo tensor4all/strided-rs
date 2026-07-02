@@ -19,7 +19,12 @@ use crate::{Result, StridedError};
 // ============================================================================
 
 /// Validate that all accessed offsets stay within `[0, len)`.
-fn validate_bounds(len: usize, dims: &[usize], strides: &[isize], offset: isize) -> Result<()> {
+pub(crate) fn validate_bounds(
+    len: usize,
+    dims: &[usize],
+    strides: &[isize],
+    offset: isize,
+) -> Result<()> {
     if dims.len() != strides.len() {
         return Err(StridedError::StrideLengthMismatch);
     }
@@ -525,6 +530,18 @@ impl<'a, T> StridedViewMut<'a, T> {
     #[inline]
     pub fn as_mut_ptr(&self) -> *mut T {
         self.ptr
+    }
+
+    /// Returns a reference to the backing data slice.
+    #[inline]
+    pub fn data(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Returns a mutable reference to the backing data slice.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [T] {
+        &mut self.data
     }
 
     /// Permute dimensions, consuming the mutable view.
