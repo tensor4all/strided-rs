@@ -56,7 +56,23 @@ pub struct FusedPlan {
 pub trait FusedScalar: Copy + MaybeSendSync + 'static {
     fn fused_add(self, rhs: Self) -> Self;
     fn fused_multiply(self, rhs: Self) -> Self;
+    fn fused_negate(self) -> Self;
+    fn fused_conj(self) -> Self;
+    fn fused_divide(self, rhs: Self) -> Self;
+    fn fused_abs(self) -> Self;
+    fn fused_maximum(self, rhs: Self) -> Self;
+    fn fused_minimum(self, rhs: Self) -> Self;
+    fn fused_clamp(self, min: Self, max: Self) -> Self;
     fn fused_exp(self) -> Self;
+    fn fused_log(self) -> Self;
+    fn fused_sin(self) -> Self;
+    fn fused_cos(self) -> Self;
+    fn fused_tanh(self) -> Self;
+    fn fused_sqrt(self) -> Self;
+    fn fused_rsqrt(self) -> Self;
+    fn fused_pow(self, rhs: Self) -> Self;
+    fn fused_expm1(self) -> Self;
+    fn fused_log1p(self) -> Self;
 }
 
 macro_rules! impl_real_fused_scalar {
@@ -73,8 +89,88 @@ macro_rules! impl_real_fused_scalar {
             }
 
             #[inline(always)]
+            fn fused_negate(self) -> Self {
+                -self
+            }
+
+            #[inline(always)]
+            fn fused_conj(self) -> Self {
+                self
+            }
+
+            #[inline(always)]
+            fn fused_divide(self, rhs: Self) -> Self {
+                self / rhs
+            }
+
+            #[inline(always)]
+            fn fused_abs(self) -> Self {
+                self.abs()
+            }
+
+            #[inline(always)]
+            fn fused_maximum(self, rhs: Self) -> Self {
+                self.max(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_minimum(self, rhs: Self) -> Self {
+                self.min(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_clamp(self, min: Self, max: Self) -> Self {
+                self.clamp(min, max)
+            }
+
+            #[inline(always)]
             fn fused_exp(self) -> Self {
                 self.exp()
+            }
+
+            #[inline(always)]
+            fn fused_log(self) -> Self {
+                self.ln()
+            }
+
+            #[inline(always)]
+            fn fused_sin(self) -> Self {
+                self.sin()
+            }
+
+            #[inline(always)]
+            fn fused_cos(self) -> Self {
+                self.cos()
+            }
+
+            #[inline(always)]
+            fn fused_tanh(self) -> Self {
+                self.tanh()
+            }
+
+            #[inline(always)]
+            fn fused_sqrt(self) -> Self {
+                self.sqrt()
+            }
+
+            #[inline(always)]
+            fn fused_rsqrt(self) -> Self {
+                1.0 / self.sqrt()
+            }
+
+            #[inline(always)]
+            fn fused_pow(self, rhs: Self) -> Self {
+                self.powf(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_expm1(self) -> Self {
+                self.exp_m1()
+            }
+
+            #[inline(always)]
+            fn fused_log1p(self) -> Self {
+                self.ln_1p()
             }
         }
     };
@@ -94,8 +190,96 @@ macro_rules! impl_complex_fused_scalar {
             }
 
             #[inline(always)]
+            fn fused_negate(self) -> Self {
+                -self
+            }
+
+            #[inline(always)]
+            fn fused_conj(self) -> Self {
+                num_complex::Complex::conj(&self)
+            }
+
+            #[inline(always)]
+            fn fused_divide(self, rhs: Self) -> Self {
+                self / rhs
+            }
+
+            #[inline(always)]
+            fn fused_abs(self) -> Self {
+                Self::new(self.norm(), 0.0)
+            }
+
+            #[inline(always)]
+            fn fused_maximum(self, rhs: Self) -> Self {
+                if self.norm_sqr() >= rhs.norm_sqr() {
+                    self
+                } else {
+                    rhs
+                }
+            }
+
+            #[inline(always)]
+            fn fused_minimum(self, rhs: Self) -> Self {
+                if self.norm_sqr() <= rhs.norm_sqr() {
+                    self
+                } else {
+                    rhs
+                }
+            }
+
+            #[inline(always)]
+            fn fused_clamp(self, min: Self, max: Self) -> Self {
+                self.fused_maximum(min).fused_minimum(max)
+            }
+
+            #[inline(always)]
             fn fused_exp(self) -> Self {
                 self.exp()
+            }
+
+            #[inline(always)]
+            fn fused_log(self) -> Self {
+                self.ln()
+            }
+
+            #[inline(always)]
+            fn fused_sin(self) -> Self {
+                self.sin()
+            }
+
+            #[inline(always)]
+            fn fused_cos(self) -> Self {
+                self.cos()
+            }
+
+            #[inline(always)]
+            fn fused_tanh(self) -> Self {
+                self.tanh()
+            }
+
+            #[inline(always)]
+            fn fused_sqrt(self) -> Self {
+                self.sqrt()
+            }
+
+            #[inline(always)]
+            fn fused_rsqrt(self) -> Self {
+                Self::new(1.0, 0.0) / self.sqrt()
+            }
+
+            #[inline(always)]
+            fn fused_pow(self, rhs: Self) -> Self {
+                self.powc(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_expm1(self) -> Self {
+                self.exp() - Self::new(1.0, 0.0)
+            }
+
+            #[inline(always)]
+            fn fused_log1p(self) -> Self {
+                (self + Self::new(1.0, 0.0)).ln()
             }
         }
     };
@@ -193,8 +377,23 @@ fn eval_op<T: FusedScalar>(op: FusedOp, regs: &[T], inputs: &[usize]) -> T {
     match op {
         FusedOp::Add => regs[inputs[0]].fused_add(regs[inputs[1]]),
         FusedOp::Multiply => regs[inputs[0]].fused_multiply(regs[inputs[1]]),
+        FusedOp::Negate => regs[inputs[0]].fused_negate(),
+        FusedOp::Conj => regs[inputs[0]].fused_conj(),
+        FusedOp::Divide => regs[inputs[0]].fused_divide(regs[inputs[1]]),
+        FusedOp::Abs => regs[inputs[0]].fused_abs(),
+        FusedOp::Maximum => regs[inputs[0]].fused_maximum(regs[inputs[1]]),
+        FusedOp::Minimum => regs[inputs[0]].fused_minimum(regs[inputs[1]]),
+        FusedOp::Clamp => regs[inputs[0]].fused_clamp(regs[inputs[1]], regs[inputs[2]]),
         FusedOp::Exp => regs[inputs[0]].fused_exp(),
-        _ => unimplemented!("{op:?} is not implemented yet"),
+        FusedOp::Log => regs[inputs[0]].fused_log(),
+        FusedOp::Sin => regs[inputs[0]].fused_sin(),
+        FusedOp::Cos => regs[inputs[0]].fused_cos(),
+        FusedOp::Tanh => regs[inputs[0]].fused_tanh(),
+        FusedOp::Sqrt => regs[inputs[0]].fused_sqrt(),
+        FusedOp::Rsqrt => regs[inputs[0]].fused_rsqrt(),
+        FusedOp::Pow => regs[inputs[0]].fused_pow(regs[inputs[1]]),
+        FusedOp::Expm1 => regs[inputs[0]].fused_expm1(),
+        FusedOp::Log1p => regs[inputs[0]].fused_log1p(),
     }
 }
 
