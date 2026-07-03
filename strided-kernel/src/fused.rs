@@ -45,7 +45,18 @@ pub struct FusedInst {
     pub inputs: Vec<usize>,
 }
 
-/// Topologically ordered fused elementwise DAG.
+/// Topologically ordered fused elementwise SSA DAG.
+///
+/// Values are numbered in evaluation order. Input values occupy
+/// `0..input_count`; each instruction appends one value after the previous
+/// inputs/instructions. For example, with `input_count == 2`, the first
+/// instruction writes value `2`, the second writes value `3`, and so on.
+/// `outputs` contains the value ids to write to `dests` in order.
+///
+/// All inputs and destinations passed to [`fused_elementwise_into`] must have
+/// the same shape and scalar type. Broadcast inputs should be represented with
+/// `StridedView::broadcast` before building the plan; the fused API does not
+/// perform implicit broadcasting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FusedPlan {
     pub input_count: usize,
@@ -121,7 +132,7 @@ macro_rules! impl_real_fused_scalar {
 
             #[inline(always)]
             fn fused_clamp(self, min: Self, max: Self) -> Self {
-                self.clamp(min, max)
+                self.fused_maximum(min).fused_minimum(max)
             }
 
             #[inline(always)]
@@ -364,6 +375,9 @@ fn validate_shapes<T: FusedScalar>(
     inputs: &[StridedView<'_, T>],
 ) -> Result<()> {
     let dims = dests[0].dims();
+    for dest in dests {
+        validate_destination_layout(dest)?;
+    }
     for dest in &dests[1..] {
         ensure_same_shape(dims, dest.dims())?;
     }
@@ -371,6 +385,110 @@ fn validate_shapes<T: FusedScalar>(
         ensure_same_shape(dims, input.dims())?;
     }
     Ok(())
+}
+
+fn validate_destination_layout<T>(dest: &StridedViewMut<'_, T>) -> Result<()> {
+    if is_injective_layout(dest.dims(), dest.strides()) {
+        Ok(())
+    } else {
+        Err(StridedError::NonInjectiveOutputLayout)
+    }
+}
+
+fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
+    if dims.len() != strides.len() {
+        return false;
+    }
+
+    let Some(total) = dims
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+    else {
+        return false;
+    };
+    if total <= 1 {
+        return true;
+    }
+    if dims
+        .iter()
+        .zip(strides.iter())
+        .any(|(&dim, &stride)| dim > 1 && stride == 0)
+    {
+        return false;
+    }
+
+    const EXACT_CHECK_LIMIT: usize = 4096;
+    if total <= EXACT_CHECK_LIMIT {
+        return has_unique_offsets_exact(dims, strides, total);
+    }
+
+    has_disjoint_stride_spans(dims, strides)
+}
+
+fn has_unique_offsets_exact(dims: &[usize], strides: &[isize], total: usize) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(total);
+    let mut indices = vec![0usize; dims.len()];
+    let mut offset = 0isize;
+
+    for _ in 0..total {
+        if !seen.insert(offset) {
+            return false;
+        }
+
+        for axis in 0..dims.len() {
+            indices[axis] += 1;
+            offset = match offset.checked_add(strides[axis]) {
+                Some(offset) => offset,
+                None => return false,
+            };
+            if indices[axis] < dims[axis] {
+                break;
+            }
+
+            let rewind = match strides[axis].checked_mul(indices[axis] as isize) {
+                Some(rewind) => rewind,
+                None => return false,
+            };
+            offset = match offset.checked_sub(rewind) {
+                Some(offset) => offset,
+                None => return false,
+            };
+            indices[axis] = 0;
+        }
+    }
+
+    true
+}
+
+fn has_disjoint_stride_spans(dims: &[usize], strides: &[isize]) -> bool {
+    let mut axes = Vec::with_capacity(dims.len());
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        if dim <= 1 {
+            continue;
+        }
+        let stride_abs = match stride.checked_abs() {
+            Some(stride_abs) => stride_abs as u128,
+            None => return false,
+        };
+        axes.push((stride_abs, dim as u128 - 1));
+    }
+    axes.sort_unstable_by_key(|&(stride, _)| stride);
+
+    let mut covered_span = 0u128;
+    for (stride, extent) in axes {
+        if stride <= covered_span {
+            return false;
+        }
+        covered_span = match stride
+            .checked_mul(extent)
+            .and_then(|span| covered_span.checked_add(span))
+        {
+            Some(covered_span) => covered_span,
+            None => return false,
+        };
+    }
+
+    true
 }
 
 #[inline(always)]
@@ -688,6 +806,25 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
 }
 
 /// Evaluate a runtime-DAG elementwise plan into one or more destinations.
+///
+/// The plan is validated before any destination is written:
+///
+/// - `inputs.len()` must equal `plan.input_count`;
+/// - `dests.len()` must equal `plan.outputs.len()`;
+/// - instruction operands must reference earlier SSA values with the right
+///   arity for their [`FusedOp`];
+/// - every input and destination must have exactly the destination shape;
+/// - each mutable destination layout must be injective, so two logical output
+///   elements never map to the same memory address.
+///
+/// The implementation dispatches known single-output plans to existing static
+/// `map_into`/`zip_map*_into` kernels and uses a generic interpreter fallback
+/// for arbitrary validated DAGs. Overlapping source/destination memory is not
+/// supported by the strided kernels generally.
+///
+/// Real `Maximum`, `Minimum`, and `Clamp` use Rust `f32`/`f64` `max`/`min`
+/// semantics. Complex `Abs` returns the norm in the real component; complex
+/// `Maximum`, `Minimum`, and `Clamp` compare by squared norm.
 pub fn fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],

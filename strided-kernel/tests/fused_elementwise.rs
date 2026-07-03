@@ -112,6 +112,47 @@ fn fused_rejects_shape_mismatch_before_writing() {
 }
 
 #[test]
+fn fused_rejects_stride_zero_destination_before_writing() {
+    let a = input(&[1.0, 2.0, 3.0, 4.0], &[4]);
+    let mut out = StridedArray::<f64>::from_parts(vec![0.0], &[4], &[0], 0).unwrap();
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![1],
+        ops: vec![FusedInst {
+            op: FusedOp::Negate,
+            inputs: vec![0],
+        }],
+    };
+
+    let err =
+        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+
+    assert!(err.to_string().contains("output layout"));
+    assert_eq!(out.data(), &[0.0]);
+}
+
+#[test]
+fn fused_rejects_overlapping_destination_offsets_before_writing() {
+    let a = StridedArray::<f64>::from_parts(vec![1.0, 2.0, 3.0, 4.0], &[2, 2], &[1, 2], 0).unwrap();
+    let mut out =
+        StridedArray::<f64>::from_parts(vec![0.0, 0.0, 0.0], &[2, 2], &[1, 1], 0).unwrap();
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![1],
+        ops: vec![FusedInst {
+            op: FusedOp::Negate,
+            inputs: vec![0],
+        }],
+    };
+
+    let err =
+        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+
+    assert!(err.to_string().contains("output layout"));
+    assert_eq!(out.data(), &[0.0, 0.0, 0.0]);
+}
+
+#[test]
 fn fused_interprets_reused_dag_value() {
     let a = input(&[1.0, 2.0, 3.0, 4.0], &[4]);
     let b = input(&[10.0, 20.0, 30.0, 40.0], &[4]);
@@ -293,6 +334,36 @@ fn fused_real_maximum_minimum_match_nan_contract() {
 }
 
 #[test]
+fn fused_real_clamp_does_not_panic_on_unordered_or_nan_bounds() {
+    let x = input(&[1.0, 2.0, 3.0], &[3]);
+    let lo = input(&[0.0, 4.0, f64::NAN], &[3]);
+    let hi = input(&[3.0, 1.0, 2.0], &[3]);
+    let mut out = StridedArray::<f64>::col_major(&[3]);
+    let plan = FusedPlan {
+        input_count: 3,
+        outputs: vec![3],
+        ops: vec![FusedInst {
+            op: FusedOp::Clamp,
+            inputs: vec![0, 1, 2],
+        }],
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fused_elementwise_into(
+            &mut [out.view_mut()],
+            &[x.view(), lo.view(), hi.view()],
+            &plan,
+        )
+    }));
+
+    assert!(result.is_ok(), "clamp should not panic for data values");
+    result.unwrap().unwrap();
+    assert_eq!(out.get(&[0]), 1.0);
+    assert_eq!(out.get(&[1]), 1.0);
+    assert_eq!(out.get(&[2]), 2.0);
+}
+
+#[test]
 fn fused_complex_divide_matches_native_complex_division() {
     let a = StridedArray::<Complex64>::from_parts(
         vec![Complex64::new(1.0, 2.0), Complex64::new(-3.0, 0.5)],
@@ -470,7 +541,7 @@ fn fused_all_real_ops_have_basic_parity() {
         let y = y.get(&[i]);
         let expected = [
             x / y,
-            x.clamp(1.5, 2.0),
+            x.max(1.5).min(2.0),
             x.ln(),
             x.sin(),
             x.cos(),
