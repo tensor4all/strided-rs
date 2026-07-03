@@ -255,13 +255,36 @@ where
     T: ScalarBase,
     B: Backend<T>,
 {
+    dot_general_with_backend_conj_into::<T, B>(c, a, b, config, alpha, beta, false, false)
+}
+
+/// Compute `C = alpha * dot_general(op(A), op(B)) + beta * C` with an explicit
+/// backend, where `op` conjugates elementwise when the corresponding flag is
+/// set. Conjugation is folded into the kernel (BLAS conjugate-transpose forms
+/// or the strided fallback's conjugating accumulator); no operand copies are
+/// made.
+#[allow(clippy::too_many_arguments)]
+pub fn dot_general_with_backend_conj_into<T, B>(
+    c: StridedViewMut<T>,
+    a: &StridedView<T>,
+    b: &StridedView<T>,
+    config: &DotGeneralConfig<'_>,
+    alpha: T,
+    beta: T,
+    conj_a: bool,
+    conj_b: bool,
+) -> Result<()>
+where
+    T: ScalarBase,
+    B: Backend<T>,
+{
     let labels = config.labels_for_shapes(a.dims(), b.dims(), c.dims())?;
     let plan = Einsum2Plan::new(
         labels.lhs_labels.as_slice(),
         labels.rhs_labels.as_slice(),
         labels.out_labels.as_slice(),
     )?;
-    einsum2_dispatch::<T, B, _>(c, a, b, &plan, alpha, beta, false, false, None)
+    einsum2_dispatch::<T, B, _>(c, a, b, &plan, alpha, beta, conj_a, conj_b, None)
 }
 
 /// Compute `C = alpha * dot_general(A, B) + beta * C` with the active backend.
@@ -303,4 +326,76 @@ pub fn dot_general_into<T: crate::Scalar>(
         |x| x,
         |x| x,
     )
+}
+
+#[cfg(all(test, any(feature = "faer", feature = "blas")))]
+mod conj_into_tests {
+    use super::*;
+    use crate::backend::ActiveBackend;
+    use num_complex::Complex64;
+
+    fn matmul_config() -> DotGeneralConfig<'static> {
+        DotGeneralConfig {
+            lhs_contracting_dims: &[1],
+            rhs_contracting_dims: &[0],
+            lhs_batch_dims: &[],
+            rhs_batch_dims: &[],
+        }
+    }
+
+    #[test]
+    fn conj_into_matches_manual_conjugation_and_axpby() {
+        let m = 2;
+        let k = 3;
+        let n = 2;
+        let a: Vec<Complex64> = (0..m * k)
+            .map(|i| Complex64::new(i as f64 - 2.0, 0.5 * i as f64 + 1.0))
+            .collect();
+        let b: Vec<Complex64> = (0..k * n)
+            .map(|i| Complex64::new(0.25 * i as f64 + 0.5, -0.75 * i as f64))
+            .collect();
+        let c0: Vec<Complex64> = (0..m * n)
+            .map(|i| Complex64::new(1.0 - i as f64, 2.0 * i as f64))
+            .collect();
+        let alpha = Complex64::new(2.0, 0.0);
+        let beta = Complex64::new(-0.5, 0.0);
+
+        let a_shape = [m, k];
+        let a_strides = [1isize, m as isize];
+        let b_shape = [k, n];
+        let b_strides = [1isize, k as isize];
+        let c_shape = [m, n];
+        let c_strides = [1isize, m as isize];
+
+        let mut expected = c0.clone();
+        for col in 0..n {
+            for row in 0..m {
+                let mut sum = Complex64::new(0.0, 0.0);
+                for inner in 0..k {
+                    sum += a[row + inner * m].conj() * b[inner + col * k];
+                }
+                expected[row + col * m] = alpha * sum + beta * c0[row + col * m];
+            }
+        }
+
+        let mut actual = c0.clone();
+        let a_view = StridedView::new(&a, &a_shape, &a_strides, 0).unwrap();
+        let b_view = StridedView::new(&b, &b_shape, &b_strides, 0).unwrap();
+        let c_view = StridedViewMut::new(&mut actual, &c_shape, &c_strides, 0).unwrap();
+        dot_general_with_backend_conj_into::<Complex64, ActiveBackend>(
+            c_view,
+            &a_view,
+            &b_view,
+            &matmul_config(),
+            alpha,
+            beta,
+            true,
+            false,
+        )
+        .unwrap();
+
+        for (got, want) in actual.iter().zip(expected.iter()) {
+            assert!((got - want).norm() < 1.0e-10, "got {got}, want {want}");
+        }
+    }
 }

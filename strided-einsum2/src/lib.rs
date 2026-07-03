@@ -78,7 +78,10 @@ pub use strided_view::{
 };
 
 pub use backend::Backend;
-pub use dot_general::{dot_general_into, dot_general_with_backend_into, DotGeneralConfig};
+pub use dot_general::{
+    dot_general_into, dot_general_with_backend_conj_into, dot_general_with_backend_into,
+    DotGeneralConfig,
+};
 pub use plan::Einsum2Plan;
 pub use raw_bgemm::{
     bgemm_raw_strided_into, bgemm_raw_strided_into_unchecked, bgemm_raw_with_backend_into,
