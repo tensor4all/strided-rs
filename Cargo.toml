@@ -13,22 +13,22 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/strided-rs"
 
 [workspace.dependencies]
-strided-rs = { version = "0.1.0", path = "strided-rs" }
-strided-traits = { version = "0.1.0", path = "strided-traits" }
-strided-view = { version = "0.1.0", path = "strided-view" }
-strided-perm = { version = "0.1.0", path = "strided-perm" }
-strided-kernel = { version = "0.1.0", path = "strided-kernel" }
-strided-einsum2 = { version = "0.1.0", path = "strided-einsum2", default-features = false }
-strided-opteinsum = { version = "0.1.0", path = "strided-opteinsum", default-features = false }
-mdarray-opteinsum = { version = "0.1.0", path = "mdarray-opteinsum", default-features = false }
-ndarray-opteinsum = { version = "0.1.0", path = "ndarray-opteinsum", default-features = false }
+strided-rs = { version = "0.2.0", path = "strided-rs" }
+strided-traits = { version = "0.2.0", path = "strided-traits" }
+strided-view = { version = "0.2.0", path = "strided-view" }
+strided-perm = { version = "0.2.0", path = "strided-perm" }
+strided-kernel = { version = "0.2.0", path = "strided-kernel" }
+strided-einsum2 = { version = "0.2.0", path = "strided-einsum2", default-features = false }
+strided-opteinsum = { version = "0.2.0", path = "strided-opteinsum", default-features = false }
+mdarray-opteinsum = { version = "0.2.0", path = "mdarray-opteinsum", default-features = false }
+ndarray-opteinsum = { version = "0.2.0", path = "ndarray-opteinsum", default-features = false }
 
 approx = "0.5"
 cblas-inject = "0.1"
