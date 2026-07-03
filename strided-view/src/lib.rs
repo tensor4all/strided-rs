@@ -70,6 +70,10 @@ pub enum StridedError {
     /// Matrix is not square when a square matrix was required.
     #[error("non-square matrix: rows={rows}, cols={cols}")]
     NonSquare { rows: usize, cols: usize },
+
+    /// Mutable output layout maps multiple logical elements to the same memory offset.
+    #[error("mutable output layout is not injective")]
+    NonInjectiveOutputLayout,
 }
 
 /// Result type for strided array operations.
