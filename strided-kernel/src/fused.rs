@@ -4,7 +4,7 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::map_view::{map_into, zip_map2_into, zip_map3_into};
+use crate::map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
 
 #[cfg(feature = "parallel")]
@@ -527,6 +527,37 @@ fn try_static_specialization<T: FusedScalar>(
         return Ok(true);
     }
 
+    if plan.input_count == 4
+        && plan.outputs.as_slice() == [8]
+        && plan.ops.len() == 5
+        && plan.ops[0].op == FusedOp::Divide
+        && plan.ops[0].inputs.as_slice() == [0, 1]
+        && plan.ops[1].op == FusedOp::Maximum
+        && plan.ops[1].inputs.as_slice() == [4, 2]
+        && plan.ops[2].op == FusedOp::Minimum
+        && plan.ops[2].inputs.as_slice() == [5, 3]
+        && plan.ops[3].op == FusedOp::Sqrt
+        && plan.ops[3].inputs.as_slice() == [6]
+        && plan.ops[4].op == FusedOp::Rsqrt
+        && plan.ops[4].inputs.as_slice() == [7]
+    {
+        zip_map4_into(
+            &mut dests[0],
+            &inputs[0],
+            &inputs[1],
+            &inputs[2],
+            &inputs[3],
+            |a, b, lo, hi| {
+                a.fused_divide(b)
+                    .fused_maximum(lo)
+                    .fused_minimum(hi)
+                    .fused_sqrt()
+                    .fused_rsqrt()
+            },
+        )?;
+        return Ok(true);
+    }
+
     Ok(false)
 }
 
@@ -805,5 +836,41 @@ mod tests {
         };
 
         assert_static_matches_interpreter(plan, &[a, b, c]);
+    }
+
+    #[test]
+    fn specializes_divide_clamp_sqrt_rsqrt_chain() {
+        let a = input(&[4.0, 9.0, 16.0]);
+        let b = input(&[2.0, 3.0, 4.0]);
+        let lo = input(&[1.5, 1.5, 1.5]);
+        let hi = input(&[8.0, 8.0, 8.0]);
+        let plan = FusedPlan {
+            input_count: 4,
+            outputs: vec![8],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Divide,
+                    inputs: vec![0, 1],
+                },
+                FusedInst {
+                    op: FusedOp::Maximum,
+                    inputs: vec![4, 2],
+                },
+                FusedInst {
+                    op: FusedOp::Minimum,
+                    inputs: vec![5, 3],
+                },
+                FusedInst {
+                    op: FusedOp::Sqrt,
+                    inputs: vec![6],
+                },
+                FusedInst {
+                    op: FusedOp::Rsqrt,
+                    inputs: vec![7],
+                },
+            ],
+        };
+
+        assert_static_matches_interpreter(plan, &[a, b, lo, hi]);
     }
 }
