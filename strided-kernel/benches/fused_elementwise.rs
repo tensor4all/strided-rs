@@ -185,12 +185,55 @@ fn bench_long_chain(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_interpreter_fallback(c: &mut Criterion) {
+    let a = make_input(0.25);
+    let b = make_input(0.5);
+    let mut tmp_add = StridedArray::<f64>::col_major(&DIMS);
+    let mut tmp_neg = StridedArray::<f64>::col_major(&DIMS);
+    let mut out = StridedArray::<f64>::col_major(&DIMS);
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![4],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Add,
+                inputs: vec![0, 1],
+            },
+            FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![2],
+            },
+            FusedInst {
+                op: FusedOp::Exp,
+                inputs: vec![3],
+            },
+        ],
+    };
+
+    let mut group = c.benchmark_group("fused_interpreter_fallback");
+    group.bench_function("per_op_reused_buffers", |bch| {
+        bch.iter(|| {
+            zip_map2_into(&mut tmp_add.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
+            map_into(&mut tmp_neg.view_mut(), &tmp_add.view(), |x| -x).unwrap();
+            map_into(&mut out.view_mut(), &tmp_neg.view(), |x| x.exp()).unwrap();
+            black_box(out.data().as_ptr());
+        });
+    });
+    group.bench_function("fused_interpreter", |bch| {
+        bch.iter(|| {
+            fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+            black_box(out.data().as_ptr());
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(10)
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(2));
-    targets = bench_add_mul, bench_broadcast_exp_mul_add, bench_long_chain
+    targets = bench_add_mul, bench_broadcast_exp_mul_add, bench_long_chain, bench_interpreter_fallback
 }
 criterion_main!(benches);
