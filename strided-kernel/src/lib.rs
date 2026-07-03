@@ -56,6 +56,7 @@
 
 mod block;
 mod fuse;
+mod fused;
 mod kernel;
 mod order;
 mod simd;
@@ -87,6 +88,11 @@ pub use strided_view::{
 pub use map_view::{
     broadcast_mul_into, map_into, mul_into, zip_map2_into, zip_map3_into, zip_map4_into,
 };
+
+// ============================================================================
+// Runtime-DAG fused elementwise operations
+// ============================================================================
+pub use fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, FusedScalar};
 
 // ============================================================================
 // Outer-product operations
