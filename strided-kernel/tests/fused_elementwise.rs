@@ -486,3 +486,26 @@ fn fused_all_real_ops_have_basic_parity() {
         }
     }
 }
+
+#[test]
+fn fused_specialized_binary_plan_handles_broadcast_inputs() {
+    let a = input(&[1.0, 2.0, 3.0, 4.0], &[4]);
+    let b = input(&[10.0], &[1]);
+    let b_view = b.view();
+    let b_broadcast = b_view.broadcast(&[4]).unwrap();
+    let mut out = StridedArray::<f64>::col_major(&[4]);
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![2],
+        ops: vec![FusedInst {
+            op: FusedOp::Add,
+            inputs: vec![0, 1],
+        }],
+    };
+
+    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b_broadcast], &plan).unwrap();
+
+    for i in 0..4 {
+        assert_relative_eq!(out.get(&[i]), a.get(&[i]) + 10.0, epsilon = 1e-12);
+    }
+}

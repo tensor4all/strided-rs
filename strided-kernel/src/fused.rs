@@ -4,6 +4,7 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     total_len, SMALL_TENSOR_THRESHOLD,
 };
+use crate::map_view::{map_into, zip_map2_into, zip_map3_into};
 use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
 
 #[cfg(feature = "parallel")]
@@ -375,26 +376,158 @@ fn validate_shapes<T: FusedScalar>(
 #[inline(always)]
 fn eval_op<T: FusedScalar>(op: FusedOp, regs: &[T], inputs: &[usize]) -> T {
     match op {
-        FusedOp::Add => regs[inputs[0]].fused_add(regs[inputs[1]]),
-        FusedOp::Multiply => regs[inputs[0]].fused_multiply(regs[inputs[1]]),
-        FusedOp::Negate => regs[inputs[0]].fused_negate(),
-        FusedOp::Conj => regs[inputs[0]].fused_conj(),
-        FusedOp::Divide => regs[inputs[0]].fused_divide(regs[inputs[1]]),
-        FusedOp::Abs => regs[inputs[0]].fused_abs(),
-        FusedOp::Maximum => regs[inputs[0]].fused_maximum(regs[inputs[1]]),
-        FusedOp::Minimum => regs[inputs[0]].fused_minimum(regs[inputs[1]]),
-        FusedOp::Clamp => regs[inputs[0]].fused_clamp(regs[inputs[1]], regs[inputs[2]]),
-        FusedOp::Exp => regs[inputs[0]].fused_exp(),
-        FusedOp::Log => regs[inputs[0]].fused_log(),
-        FusedOp::Sin => regs[inputs[0]].fused_sin(),
-        FusedOp::Cos => regs[inputs[0]].fused_cos(),
-        FusedOp::Tanh => regs[inputs[0]].fused_tanh(),
-        FusedOp::Sqrt => regs[inputs[0]].fused_sqrt(),
-        FusedOp::Rsqrt => regs[inputs[0]].fused_rsqrt(),
-        FusedOp::Pow => regs[inputs[0]].fused_pow(regs[inputs[1]]),
-        FusedOp::Expm1 => regs[inputs[0]].fused_expm1(),
-        FusedOp::Log1p => regs[inputs[0]].fused_log1p(),
+        FusedOp::Negate
+        | FusedOp::Conj
+        | FusedOp::Abs
+        | FusedOp::Exp
+        | FusedOp::Log
+        | FusedOp::Sin
+        | FusedOp::Cos
+        | FusedOp::Tanh
+        | FusedOp::Sqrt
+        | FusedOp::Rsqrt
+        | FusedOp::Expm1
+        | FusedOp::Log1p => eval_unary(op, regs[inputs[0]]),
+        FusedOp::Add
+        | FusedOp::Multiply
+        | FusedOp::Divide
+        | FusedOp::Maximum
+        | FusedOp::Minimum
+        | FusedOp::Pow => eval_binary(op, regs[inputs[0]], regs[inputs[1]]),
+        FusedOp::Clamp => eval_ternary(op, regs[inputs[0]], regs[inputs[1]], regs[inputs[2]]),
     }
+}
+
+#[inline(always)]
+fn eval_unary<T: FusedScalar>(op: FusedOp, x: T) -> T {
+    match op {
+        FusedOp::Negate => x.fused_negate(),
+        FusedOp::Conj => x.fused_conj(),
+        FusedOp::Abs => x.fused_abs(),
+        FusedOp::Exp => x.fused_exp(),
+        FusedOp::Log => x.fused_log(),
+        FusedOp::Sin => x.fused_sin(),
+        FusedOp::Cos => x.fused_cos(),
+        FusedOp::Tanh => x.fused_tanh(),
+        FusedOp::Sqrt => x.fused_sqrt(),
+        FusedOp::Rsqrt => x.fused_rsqrt(),
+        FusedOp::Expm1 => x.fused_expm1(),
+        FusedOp::Log1p => x.fused_log1p(),
+        _ => unreachable!("not a unary fused op: {op:?}"),
+    }
+}
+
+#[inline(always)]
+fn eval_binary<T: FusedScalar>(op: FusedOp, a: T, b: T) -> T {
+    match op {
+        FusedOp::Add => a.fused_add(b),
+        FusedOp::Multiply => a.fused_multiply(b),
+        FusedOp::Divide => a.fused_divide(b),
+        FusedOp::Maximum => a.fused_maximum(b),
+        FusedOp::Minimum => a.fused_minimum(b),
+        FusedOp::Pow => a.fused_pow(b),
+        _ => unreachable!("not a binary fused op: {op:?}"),
+    }
+}
+
+#[inline(always)]
+fn eval_ternary<T: FusedScalar>(op: FusedOp, a: T, b: T, c: T) -> T {
+    match op {
+        FusedOp::Clamp => a.fused_clamp(b, c),
+        _ => unreachable!("not a ternary fused op: {op:?}"),
+    }
+}
+
+fn try_static_specialization<T: FusedScalar>(
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+) -> Result<bool> {
+    if dests.len() != 1 || plan.outputs.len() != 1 {
+        return Ok(false);
+    }
+
+    if let [inst] = plan.ops.as_slice() {
+        let output_id = plan.input_count;
+        if plan.outputs[0] != output_id {
+            return Ok(false);
+        }
+
+        match op_arity(inst.op) {
+            1 => {
+                map_into(&mut dests[0], &inputs[inst.inputs[0]], |x| {
+                    eval_unary(inst.op, x)
+                })?;
+                return Ok(true);
+            }
+            2 => {
+                zip_map2_into(
+                    &mut dests[0],
+                    &inputs[inst.inputs[0]],
+                    &inputs[inst.inputs[1]],
+                    |a, b| eval_binary(inst.op, a, b),
+                )?;
+                return Ok(true);
+            }
+            3 => {
+                zip_map3_into(
+                    &mut dests[0],
+                    &inputs[inst.inputs[0]],
+                    &inputs[inst.inputs[1]],
+                    &inputs[inst.inputs[2]],
+                    |a, b, c| eval_ternary(inst.op, a, b, c),
+                )?;
+                return Ok(true);
+            }
+            _ => unreachable!("unsupported fused op arity"),
+        }
+    }
+
+    if plan.input_count == 2
+        && plan.outputs.as_slice() == [3]
+        && plan.ops.len() == 2
+        && plan.ops[0].op == FusedOp::Add
+        && plan.ops[0].inputs.as_slice() == [0, 1]
+        && plan.ops[1].op == FusedOp::Multiply
+    {
+        match plan.ops[1].inputs.as_slice() {
+            [2, 0] => {
+                zip_map2_into(&mut dests[0], &inputs[0], &inputs[1], |a, b| {
+                    a.fused_add(b).fused_multiply(a)
+                })?;
+                return Ok(true);
+            }
+            [0, 2] => {
+                zip_map2_into(&mut dests[0], &inputs[0], &inputs[1], |a, b| {
+                    a.fused_multiply(a.fused_add(b))
+                })?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
+    if plan.input_count == 3
+        && plan.outputs.as_slice() == [5]
+        && plan.ops.len() == 3
+        && plan.ops[0].op == FusedOp::Multiply
+        && plan.ops[0].inputs.as_slice() == [0, 1]
+        && plan.ops[1].op == FusedOp::Add
+        && plan.ops[1].inputs.as_slice() == [3, 2]
+        && plan.ops[2].op == FusedOp::Exp
+        && plan.ops[2].inputs.as_slice() == [4]
+    {
+        zip_map3_into(
+            &mut dests[0],
+            &inputs[0],
+            &inputs[1],
+            &inputs[2],
+            |a, b, c| a.fused_multiply(b).fused_add(c).fused_exp(),
+        )?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 unsafe fn interpret_inner_loop<T: FusedScalar>(
@@ -531,5 +664,146 @@ pub fn fused_elementwise_into<T: FusedScalar>(
 ) -> Result<()> {
     validate_plan(plan, inputs.len(), dests.len())?;
     validate_shapes(dests, inputs)?;
+    if try_static_specialization(dests, inputs, plan)? {
+        return Ok(());
+    }
     interpret_fused_elementwise_into(dests, inputs, plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StridedArray;
+
+    fn input(values: &[f64]) -> StridedArray<f64> {
+        StridedArray::from_parts(values.to_vec(), &[values.len()], &[1], 0).unwrap()
+    }
+
+    fn run_static(plan: &FusedPlan, arrays: &[StridedArray<f64>]) -> (bool, Vec<f64>) {
+        let inputs: Vec<_> = arrays.iter().map(|array| array.view()).collect();
+        let mut out = StridedArray::<f64>::col_major(arrays[0].dims());
+        let used_static = {
+            let mut dests = [out.view_mut()];
+            try_static_specialization(&mut dests, &inputs, plan).unwrap()
+        };
+        (used_static, out.iter().copied().collect())
+    }
+
+    fn run_interpreter(plan: &FusedPlan, arrays: &[StridedArray<f64>]) -> Vec<f64> {
+        let inputs: Vec<_> = arrays.iter().map(|array| array.view()).collect();
+        let mut out = StridedArray::<f64>::col_major(arrays[0].dims());
+        {
+            let mut dests = [out.view_mut()];
+            interpret_fused_elementwise_into(&mut dests, &inputs, plan).unwrap();
+        }
+        out.iter().copied().collect()
+    }
+
+    fn assert_static_matches_interpreter(plan: FusedPlan, arrays: &[StridedArray<f64>]) {
+        let (used_static, static_values) = run_static(&plan, arrays);
+        let interpreter_values = run_interpreter(&plan, arrays);
+
+        assert!(used_static, "plan should use static specialization");
+        assert_eq!(static_values.len(), interpreter_values.len());
+        for (actual, expected) in static_values.iter().zip(interpreter_values.iter()) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn specializes_unary_exp() {
+        let a = input(&[1.0, 2.0, 3.0]);
+        let plan = FusedPlan {
+            input_count: 1,
+            outputs: vec![1],
+            ops: vec![FusedInst {
+                op: FusedOp::Exp,
+                inputs: vec![0],
+            }],
+        };
+
+        assert_static_matches_interpreter(plan, &[a]);
+    }
+
+    #[test]
+    fn specializes_binary_add() {
+        let a = input(&[1.0, 2.0, 3.0]);
+        let b = input(&[10.0, 20.0, 30.0]);
+        let plan = FusedPlan {
+            input_count: 2,
+            outputs: vec![2],
+            ops: vec![FusedInst {
+                op: FusedOp::Add,
+                inputs: vec![0, 1],
+            }],
+        };
+
+        assert_static_matches_interpreter(plan, &[a, b]);
+    }
+
+    #[test]
+    fn specializes_ternary_clamp() {
+        let x = input(&[1.0, 2.0, 3.0]);
+        let lo = input(&[1.5, 1.5, 1.5]);
+        let hi = input(&[2.5, 2.5, 2.5]);
+        let plan = FusedPlan {
+            input_count: 3,
+            outputs: vec![3],
+            ops: vec![FusedInst {
+                op: FusedOp::Clamp,
+                inputs: vec![0, 1, 2],
+            }],
+        };
+
+        assert_static_matches_interpreter(plan, &[x, lo, hi]);
+    }
+
+    #[test]
+    fn specializes_add_then_multiply_reusing_input() {
+        let a = input(&[1.0, 2.0, 3.0]);
+        let b = input(&[10.0, 20.0, 30.0]);
+        let plan = FusedPlan {
+            input_count: 2,
+            outputs: vec![3],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Add,
+                    inputs: vec![0, 1],
+                },
+                FusedInst {
+                    op: FusedOp::Multiply,
+                    inputs: vec![2, 0],
+                },
+            ],
+        };
+
+        assert_static_matches_interpreter(plan, &[a, b]);
+    }
+
+    #[test]
+    fn specializes_exp_of_multiply_add_chain() {
+        let a = input(&[1.0, 2.0, 3.0]);
+        let b = input(&[0.5, 1.5, 2.5]);
+        let c = input(&[2.0, 2.0, 2.0]);
+        let plan = FusedPlan {
+            input_count: 3,
+            outputs: vec![5],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Multiply,
+                    inputs: vec![0, 1],
+                },
+                FusedInst {
+                    op: FusedOp::Add,
+                    inputs: vec![3, 2],
+                },
+                FusedInst {
+                    op: FusedOp::Exp,
+                    inputs: vec![4],
+                },
+            ],
+        };
+
+        assert_static_matches_interpreter(plan, &[a, b, c]);
+    }
 }
