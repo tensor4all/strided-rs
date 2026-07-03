@@ -55,3 +55,7 @@ harness = false
 [[bench]]
 name = "mul_pytorch_compare"
 harness = false
+
+[[bench]]
+name = "fused_elementwise"
+harness = false
