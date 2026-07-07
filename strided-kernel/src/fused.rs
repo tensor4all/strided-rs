@@ -878,6 +878,18 @@ mod tests {
         }
     }
 
+    // Single-instruction plan whose sole output is the instruction result. Such
+    // plans always hit `try_static_specialization`, and both the static and the
+    // interpreter path dispatch through the scalar `FusedScalar` methods, so
+    // iterating every op exercises each scalar implementation.
+    fn single_op(input_count: usize, op: FusedOp, inputs: Vec<usize>) -> FusedPlan {
+        FusedPlan {
+            input_count,
+            outputs: vec![input_count],
+            ops: vec![FusedInst { op, inputs }],
+        }
+    }
+
     #[test]
     fn specializes_unary_exp() {
         let a = input(&[1.0, 2.0, 3.0]);
@@ -1009,5 +1021,113 @@ mod tests {
         };
 
         assert_static_matches_interpreter(plan, &[a, b, lo, hi]);
+    }
+
+    // Real negate/conj/abs were the only real scalar ops not reached by the
+    // chains above; cover them so the real `FusedScalar` impl is fully exercised.
+    #[test]
+    fn specializes_real_negate_conj_abs() {
+        for op in [FusedOp::Negate, FusedOp::Conj, FusedOp::Abs] {
+            let x = input(&[-1.5, 2.0, -3.5]);
+            assert_static_matches_interpreter(single_op(1, op, vec![0]), &[x]);
+        }
+    }
+
+    // The complex `FusedScalar` impl had no coverage at all (every existing test
+    // used f64). Run every op over Complex64 so both the static and interpreter
+    // paths dispatch through the complex scalar methods.
+    #[test]
+    fn specializes_every_op_over_complex() {
+        use num_complex::Complex64;
+
+        let c = |re: f64, im: f64| Complex64::new(re, im);
+        let cinput = |values: &[Complex64]| {
+            StridedArray::from_parts(values.to_vec(), &[values.len()], &[1], 0).unwrap()
+        };
+        let assert_complex_match = |plan: FusedPlan, arrays: &[StridedArray<Complex64>]| {
+            let inputs: Vec<_> = arrays.iter().map(|array| array.view()).collect();
+            let mut static_out = StridedArray::<Complex64>::col_major(arrays[0].dims());
+            let used_static = {
+                let mut dests = [static_out.view_mut()];
+                try_static_specialization(&mut dests, &inputs, &plan).unwrap()
+            };
+            let mut interp_out = StridedArray::<Complex64>::col_major(arrays[0].dims());
+            {
+                let mut dests = [interp_out.view_mut()];
+                interpret_fused_elementwise_into(&mut dests, &inputs, &plan).unwrap();
+            }
+            assert!(used_static, "single-op plan should specialize");
+            for (actual, expected) in static_out.iter().zip(interp_out.iter()) {
+                assert!((actual - expected).norm() < 1e-9, "{actual} vs {expected}");
+            }
+        };
+
+        // Positive-real-part, nonzero operands keep div/log/sqrt/pow well defined.
+        let a = cinput(&[c(1.5, 0.5), c(2.0, -1.0), c(0.7, 0.3)]);
+        let b = cinput(&[c(1.1, 0.2), c(0.9, 0.4), c(1.3, -0.6)]);
+        let d = cinput(&[c(2.0, 0.0), c(2.0, 0.0), c(2.0, 0.0)]);
+
+        for op in [
+            FusedOp::Negate,
+            FusedOp::Conj,
+            FusedOp::Abs,
+            FusedOp::Exp,
+            FusedOp::Log,
+            FusedOp::Sin,
+            FusedOp::Cos,
+            FusedOp::Tanh,
+            FusedOp::Sqrt,
+            FusedOp::Rsqrt,
+            FusedOp::Expm1,
+            FusedOp::Log1p,
+        ] {
+            assert_complex_match(single_op(1, op, vec![0]), std::slice::from_ref(&a));
+        }
+        for op in [
+            FusedOp::Add,
+            FusedOp::Multiply,
+            FusedOp::Divide,
+            FusedOp::Maximum,
+            FusedOp::Minimum,
+            FusedOp::Pow,
+        ] {
+            assert_complex_match(single_op(2, op, vec![0, 1]), &[a.clone(), b.clone()]);
+        }
+        assert_complex_match(
+            single_op(3, FusedOp::Clamp, vec![0, 1, 2]),
+            &[a.clone(), b.clone(), d.clone()],
+        );
+    }
+
+    // Error branches in plan/layout validation that the positive tests skip.
+    #[test]
+    fn validate_plan_rejects_out_of_range_output() {
+        // output id refers to a value that no instruction produces.
+        let plan = FusedPlan {
+            input_count: 1,
+            outputs: vec![5],
+            ops: vec![FusedInst {
+                op: FusedOp::Exp,
+                inputs: vec![0],
+            }],
+        };
+        assert!(validate_plan(&plan, 1, 1).is_err());
+    }
+
+    #[test]
+    fn validate_plan_rejects_zero_outputs() {
+        let plan = FusedPlan {
+            input_count: 1,
+            outputs: vec![],
+            ops: vec![],
+        };
+        assert!(validate_plan(&plan, 1, 0).is_err());
+    }
+
+    #[test]
+    fn is_injective_layout_rejects_rank_and_broadcast_mismatch() {
+        assert!(!is_injective_layout(&[2, 3], &[1]));
+        assert!(!is_injective_layout(&[2, 2], &[0, 1]));
+        assert!(is_injective_layout(&[1], &[0]));
     }
 }
