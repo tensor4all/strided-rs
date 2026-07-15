@@ -17,15 +17,18 @@ use crate::maybe_sync::MaybeSendSync;
 /// Maximum rank fused on the stack before falling back to the view kernels.
 pub const RAW_FUSED_RANK_LIMIT: usize = 8;
 
+/// Stack-allocated fused stride pair (dims ordered by destination stride,
+/// adjacent contiguous axes merged). Built once and replayed by both the
+/// per-call raw kernels and the prepared [`crate::CopyPlan`].
 #[derive(Clone, Copy, Debug)]
-struct FusedPairLayout {
-    rank: usize,
-    dims: [usize; RAW_FUSED_RANK_LIMIT],
-    dst_strides: [isize; RAW_FUSED_RANK_LIMIT],
-    src_strides: [isize; RAW_FUSED_RANK_LIMIT],
+pub(crate) struct FusedPairLayout {
+    pub(crate) rank: usize,
+    pub(crate) dims: [usize; RAW_FUSED_RANK_LIMIT],
+    pub(crate) dst_strides: [isize; RAW_FUSED_RANK_LIMIT],
+    pub(crate) src_strides: [isize; RAW_FUSED_RANK_LIMIT],
 }
 
-fn fuse_pair_layout(
+pub(crate) fn fuse_pair_layout(
     dims: &[usize],
     dst_strides: &[isize],
     src_strides: &[isize],
@@ -85,7 +88,7 @@ fn fuse_pair_layout(
     Some(layout)
 }
 
-fn apply_fused_pair<D, S, Apply, Op>(
+pub(crate) fn apply_fused_pair<D, S, Apply, Op>(
     dst: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
     layout: &FusedPairLayout,
