@@ -70,6 +70,7 @@ pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 mod map_view;
 mod ops_view;
 mod outer_product;
+mod raw_ops;
 mod reduce_view;
 
 // ============================================================================
@@ -78,8 +79,8 @@ mod reduce_view;
 pub use strided_view::view;
 pub use strided_view::{
     col_major_strides, row_major_strides, Adjoint, ComposableElementOp, Compose, Conj, ElementOp,
-    ElementOpApply, Identity, Result, StridedArray, StridedError, StridedView, StridedViewMut,
-    Transpose,
+    ElementOpApply, Identity, RawStridedMut, RawStridedRef, Result, StridedArray, StridedError,
+    StridedView, StridedViewMut, Transpose,
 };
 
 // ============================================================================
@@ -105,6 +106,13 @@ pub use outer_product::batched_outer_product_into;
 pub use ops_view::{
     add, axpy, copy_conj, copy_into, copy_into_col_major, copy_scale, copy_transpose_scale_into,
     dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
+};
+
+// ============================================================================
+// Raw (borrowed-metadata, allocation-free) operations
+// ============================================================================
+pub use raw_ops::{
+    axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,
 };
 
 // ============================================================================
