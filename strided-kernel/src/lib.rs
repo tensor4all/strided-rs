@@ -67,6 +67,7 @@ mod maybe_sync;
 pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 
 // View-based operation modules
+mod copy_plan;
 mod map_view;
 mod ops_view;
 mod outer_product;
@@ -114,6 +115,11 @@ pub use ops_view::{
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,
 };
+
+// ============================================================================
+// Prepared (compile-once, execute-many) plans
+// ============================================================================
+pub use copy_plan::CopyPlan;
 
 // ============================================================================
 // Reduce operations
