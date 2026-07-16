@@ -395,7 +395,7 @@ fn validate_destination_layout<T>(dest: &StridedViewMut<'_, T>) -> Result<()> {
     }
 }
 
-fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
+pub(crate) fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
     if dims.len() != strides.len() {
         return false;
     }
