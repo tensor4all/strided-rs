@@ -34,7 +34,7 @@ approx = "0.5"
 cblas-inject = "0.1"
 cblas-sys = "0.2"
 criterion = "0.5"
-faer = "0.24"
+faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }
 faer-traits = "0.24"
 mdarray = "0.8.0"
 ndarray = "0.17"
