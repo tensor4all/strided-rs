@@ -6,9 +6,12 @@ HPTT — High-Performance Tensor Transpose
 https://github.com/springer13/hptt
 ================================================================================
 
-The strided-perm/src/hptt/ module implements an algorithm based on the HPTT
-library by Paul Springer, Tong Su, and Paolo Bientinesi. This is an
-independent Rust reimplementation; no C++ source code was copied.
+The strided-perm/src/hptt/ module reimplements in Rust the algorithm of the
+HPTT library by Paul Springer, Tong Su, and Paolo Bientinesi, following the
+structure of the original C++ implementation (see the file-level comments in
+strided-perm/src/hptt/ for the correspondence). The strided-perm crate is
+therefore licensed as "(MIT OR Apache-2.0) AND BSD-3-Clause"; the BSD-3-Clause
+license of HPTT is reproduced below.
 
 Reference:
   Paul Springer, Tong Su, and Paolo Bientinesi.
