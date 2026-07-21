@@ -20,9 +20,6 @@ use crate::fuse::compute_costs;
 use crate::threading::{
     for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
 };
-#[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
 // ============================================================================
 // Stride-specialized inner loop helpers for ops_view
 //
@@ -243,12 +240,12 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
 ///
-/// Delegates to `strided_perm::copy_into_col_major` for the actual work.
+/// Delegates to the centralized permutation-copy dispatch for the actual work.
 pub fn copy_into_col_major<T: Copy + MaybeSendSync>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
-    strided_perm::copy_into_col_major(dst, src)
+    crate::threading::copy_into_col_major(dst, src)
 }
 
 /// Element-wise addition: `dest[i] += src[i]`.
@@ -291,14 +288,13 @@ pub fn add<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -393,14 +389,13 @@ pub fn mul<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -498,14 +493,13 @@ where
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -612,15 +606,14 @@ where
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
             let a_send = SendPtr(a_ptr as *mut A);
             let b_send = SendPtr(b_ptr as *mut B);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -683,17 +676,17 @@ where
 fn parallel_simd_sum<T: Copy + Zero + Add<Output = T> + simd::MaybeSimdOps + Send + Sync>(
     src: &[T],
 ) -> Option<T> {
-    use rayon::prelude::*;
     // Check that T has SIMD support
     if T::try_simd_sum(&[]).is_none() {
         return None;
     }
-    let nthreads = rayon::current_num_threads();
-    let chunk_size = (src.len() + nthreads - 1) / nthreads;
-    let result = src
-        .par_chunks(chunk_size)
-        .map(|chunk| T::try_simd_sum(chunk).unwrap())
-        .reduce(|| T::zero(), |a, b| a + b);
+    let nthreads = crate::execution_policy::rayon_threads();
+    let result = crate::threading::parallel_map_reduce(
+        0..src.len(),
+        nthreads,
+        &|range| T::try_simd_sum(&src[range]).unwrap(),
+        &|left, right| left + right,
+    );
     Some(result)
 }
 
@@ -958,25 +951,30 @@ unsafe fn fill_2d<T: Copy + MaybeSendSync>(
     #[cfg(feature = "parallel")]
     {
         let total = dim0.saturating_mul(dim1);
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst);
             if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
-                (0..dim1).into_par_iter().for_each(|j| {
-                    let dst = dst_send.as_ptr();
-                    unsafe {
-                        let base = j as isize * dst_stride1;
-                        for i in 0..dim0 {
-                            *dst.offset(base + i as isize * dst_stride0) = value;
+                crate::threading::parallel_for_each(0..dim1, nthreads, &|columns| {
+                    for j in columns {
+                        let dst = dst_send.as_ptr();
+                        unsafe {
+                            let base = j as isize * dst_stride1;
+                            for i in 0..dim0 {
+                                *dst.offset(base + i as isize * dst_stride0) = value;
+                            }
                         }
                     }
                 });
             } else {
-                (0..dim0).into_par_iter().for_each(|i| {
-                    let dst = dst_send.as_ptr();
-                    unsafe {
-                        let base = i as isize * dst_stride0;
-                        for j in 0..dim1 {
-                            *dst.offset(base + j as isize * dst_stride1) = value;
+                crate::threading::parallel_for_each(0..dim0, nthreads, &|rows| {
+                    for i in rows {
+                        let dst = dst_send.as_ptr();
+                        unsafe {
+                            let base = i as isize * dst_stride0;
+                            for j in 0..dim1 {
+                                *dst.offset(base + j as isize * dst_stride1) = value;
+                            }
                         }
                     }
                 });
@@ -1097,37 +1095,40 @@ unsafe fn copy_transpose_scale_2d_f64_tiled_raw(
     #[cfg(feature = "parallel")]
     {
         let total = src_rows.saturating_mul(src_cols);
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst);
             let src_send = SendPtr(src as *mut f64);
             let row_tiles = row_full / TILE;
-            (0..row_tiles).into_par_iter().for_each(|tile_i| {
-                let i = tile_i * TILE;
-                let dst = dst_send.as_ptr();
-                let src = src_send.as_const();
-                unsafe {
-                    let mut j = 0;
-                    while j < col_full {
-                        transpose_scale_4x4_f64(
-                            dst,
-                            dst_stride0,
-                            dst_stride1,
-                            src,
-                            src_stride0,
-                            src_stride1,
-                            i,
-                            j,
-                            scale,
-                        );
-                        j += TILE;
-                    }
-                    for j in col_full..src_cols {
-                        for ii in i..i + TILE {
-                            *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
-                                scale
-                                    * *src.offset(
-                                        ii as isize * src_stride0 + j as isize * src_stride1,
-                                    );
+            crate::threading::parallel_for_each(0..row_tiles, nthreads, &|tiles| {
+                for tile_i in tiles {
+                    let i = tile_i * TILE;
+                    let dst = dst_send.as_ptr();
+                    let src = src_send.as_const();
+                    unsafe {
+                        let mut j = 0;
+                        while j < col_full {
+                            transpose_scale_4x4_f64(
+                                dst,
+                                dst_stride0,
+                                dst_stride1,
+                                src,
+                                src_stride0,
+                                src_stride1,
+                                i,
+                                j,
+                                scale,
+                            );
+                            j += TILE;
+                        }
+                        for j in col_full..src_cols {
+                            for ii in i..i + TILE {
+                                *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                                    scale
+                                        * *src.offset(
+                                            ii as isize * src_stride0 + j as isize * src_stride1,
+                                        );
+                            }
                         }
                     }
                 }
@@ -1331,37 +1332,40 @@ unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     #[cfg(feature = "parallel")]
     {
         let total = src_rows.saturating_mul(src_cols);
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst);
             let src_send = SendPtr(src as *mut T);
             let row_tiles = row_full / TILE;
-            (0..row_tiles).into_par_iter().for_each(|tile_i| {
-                let i = tile_i * TILE;
-                let dst = dst_send.as_ptr();
-                let src = src_send.as_const();
-                unsafe {
-                    let mut j = 0;
-                    while j < col_full {
-                        transpose_scale_4x4_identity(
-                            dst,
-                            dst_stride0,
-                            dst_stride1,
-                            src,
-                            src_stride0,
-                            src_stride1,
-                            i,
-                            j,
-                            scale,
-                        );
-                        j += TILE;
-                    }
-                    for j in col_full..src_cols {
-                        for ii in i..i + TILE {
-                            *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
-                                scale
-                                    * *src.offset(
-                                        ii as isize * src_stride0 + j as isize * src_stride1,
-                                    );
+            crate::threading::parallel_for_each(0..row_tiles, nthreads, &|tiles| {
+                for tile_i in tiles {
+                    let i = tile_i * TILE;
+                    let dst = dst_send.as_ptr();
+                    let src = src_send.as_const();
+                    unsafe {
+                        let mut j = 0;
+                        while j < col_full {
+                            transpose_scale_4x4_identity(
+                                dst,
+                                dst_stride0,
+                                dst_stride1,
+                                src,
+                                src_stride0,
+                                src_stride1,
+                                i,
+                                j,
+                                scale,
+                            );
+                            j += TILE;
+                        }
+                        for j in col_full..src_cols {
+                            for ii in i..i + TILE {
+                                *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                                    scale
+                                        * *src.offset(
+                                            ii as isize * src_stride0 + j as isize * src_stride1,
+                                        );
+                            }
                         }
                     }
                 }
@@ -1460,34 +1464,39 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
     #[cfg(feature = "parallel")]
     {
         let total = src_rows.saturating_mul(src_cols);
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst);
             let src_send = SendPtr(src as *mut T);
             if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
-                (0..src_rows).into_par_iter().for_each(|i| {
-                    let dst = dst_send.as_ptr();
-                    let src = src_send.as_const();
-                    unsafe {
-                        for j in 0..src_cols {
-                            let value = (*src
-                                .offset(i as isize * src_stride0 + j as isize * src_stride1))
-                            .transpose();
-                            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
-                                scale * value;
+                crate::threading::parallel_for_each(0..src_rows, nthreads, &|rows| {
+                    for i in rows {
+                        let dst = dst_send.as_ptr();
+                        let src = src_send.as_const();
+                        unsafe {
+                            for j in 0..src_cols {
+                                let value = (*src
+                                    .offset(i as isize * src_stride0 + j as isize * src_stride1))
+                                .transpose();
+                                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                                    scale * value;
+                            }
                         }
                     }
                 });
             } else {
-                (0..src_cols).into_par_iter().for_each(|j| {
-                    let dst = dst_send.as_ptr();
-                    let src = src_send.as_const();
-                    unsafe {
-                        for i in 0..src_rows {
-                            let value = (*src
-                                .offset(i as isize * src_stride0 + j as isize * src_stride1))
-                            .transpose();
-                            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
-                                scale * value;
+                crate::threading::parallel_for_each(0..src_cols, nthreads, &|columns| {
+                    for j in columns {
+                        let dst = dst_send.as_ptr();
+                        let src = src_send.as_const();
+                        unsafe {
+                            for i in 0..src_rows {
+                                let value = (*src
+                                    .offset(i as isize * src_stride0 + j as isize * src_stride1))
+                                .transpose();
+                                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                                    scale * value;
+                            }
                         }
                     }
                 });
@@ -1565,11 +1574,10 @@ where
         let src_t = src.permute(&[1, 0])?;
         #[cfg(feature = "parallel")]
         {
-            if total_len(dest.dims()) > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
-                return strided_perm::copy_into_par(dest, &src_t);
-            }
+            return crate::threading::copy_permuted_with_active_policy(dest, &src_t);
         }
-        return strided_perm::copy_into(dest, &src_t);
+        #[cfg(not(feature = "parallel"))]
+        return crate::threading::copy_permuted_serial(dest, &src_t);
     }
 
     unsafe {
@@ -1635,6 +1643,126 @@ mod tiled_tests {
         for i in 0..rows {
             for j in 0..cols {
                 assert_eq!(out.get(&[j, i]), 2 * a.get(&[i, j]));
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_bounded_identity_tiled_transpose_uses_two_partitions_exactly_once() {
+        use std::num::NonZeroUsize;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct TileState {
+            active: AtomicUsize,
+            max_active: AtomicUsize,
+            released: AtomicBool,
+            coverage: Box<[AtomicUsize]>,
+        }
+
+        impl TileState {
+            fn observe(&self, index: usize) {
+                self.coverage[index].fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                if active >= 2 {
+                    self.released.store(true, Ordering::Release);
+                } else if !self.released.load(Ordering::Acquire) {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !self.released.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::hint::spin_loop();
+                    }
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct TrackedTile {
+            index: usize,
+            value: usize,
+            state: &'static TileState,
+        }
+
+        impl std::ops::Mul for TrackedTile {
+            type Output = Self;
+
+            fn mul(self, rhs: Self) -> Self::Output {
+                self.state.observe(rhs.index);
+                Self {
+                    index: rhs.index,
+                    value: self.value * rhs.value,
+                    state: self.state,
+                }
+            }
+        }
+
+        const ROWS: usize = 257;
+        const COLS: usize = 129;
+        const LEN: usize = ROWS * COLS;
+        let state = Box::leak(Box::new(TileState {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
+            coverage: (0..LEN)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }));
+        let source: Vec<_> = (0..LEN)
+            .map(|index| TrackedTile {
+                index,
+                value: index + 1,
+                state,
+            })
+            .collect();
+        let mut destination = vec![
+            TrackedTile {
+                index: usize::MAX,
+                value: 0,
+                state,
+            };
+            LEN
+        ];
+        let scale = TrackedTile {
+            index: usize::MAX,
+            value: 3,
+            state,
+        };
+        let two = NonZeroUsize::new(2).unwrap();
+
+        crate::threading::test_pool(4).install(|| {
+            crate::with_execution_policy(
+                crate::ExecutionPolicy::Rayon { max_threads: two },
+                || unsafe {
+                    copy_transpose_scale_2d_identity_tiled_raw(
+                        destination.as_mut_ptr(),
+                        1,
+                        COLS as isize,
+                        source.as_ptr(),
+                        1,
+                        ROWS as isize,
+                        ROWS,
+                        COLS,
+                        scale,
+                    );
+                },
+            );
+        });
+
+        assert_eq!(state.max_active.load(Ordering::SeqCst), 2);
+        for (index, count) in state.coverage.iter().enumerate() {
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "tiled transpose source index {index} did not execute exactly once"
+            );
+        }
+        for i in 0..ROWS {
+            for j in 0..COLS {
+                let source_index = i + ROWS * j;
+                assert_eq!(destination[j + COLS * i].value, 3 * (source_index + 1));
             }
         }
     }
