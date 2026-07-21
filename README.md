@@ -95,6 +95,8 @@ element type, thread count, and a minimal reproducer when possible.
 This crate is inspired by and ports functionality from:
 - [Strided.jl](https://github.com/Jutho/Strided.jl) by Jutho
 - [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) by Jutho
+- [HPTT](https://github.com/springer13/hptt) by Paul Springer, Tong Su, and
+  Paolo Bientinesi, whose transpose algorithm `strided-perm` reimplements
 - [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) for
   `strided-opteinsum` design ideas and reference test-case patterns
 
@@ -105,4 +107,7 @@ Licensed under either of:
 - Apache License, Version 2.0 (`LICENSE-APACHE`)
 - MIT license (`LICENSE-MIT`)
 
-See `NOTICE` for upstream attribution (Strided.jl / StridedViews.jl are MIT-licensed).
+See `NOTICE` for upstream attribution (Strided.jl / StridedViews.jl are
+MIT-licensed) and `THIRD-PARTY-LICENSES` for the HPTT attribution; the
+`strided-perm` crate is licensed as `(MIT OR Apache-2.0) AND BSD-3-Clause`
+because its transpose module is derived from HPTT (BSD-3-Clause).
