@@ -43,3 +43,15 @@ copy_into_par(&mut dst.view_mut(), &src.view()).unwrap();
 
 Benchmarks live in
 [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite).
+
+## Acknowledgments and License
+
+The transpose engine in `src/hptt/` reimplements the algorithm of
+[HPTT](https://github.com/springer13/hptt) by Paul Springer, Tong Su, and
+Paolo Bientinesi, following the structure of the original C++ implementation
+(P. Springer, T. Su, P. Bientinesi, "HPTT: A High-Performance Tensor
+Transposition C++ Library", ARRAY 2017). HPTT is licensed under BSD-3-Clause
+(Copyright 2018 Paul Springer); see `THIRD-PARTY-LICENSES` at the workspace
+root for the full text.
+
+This crate is therefore licensed as `(MIT OR Apache-2.0) AND BSD-3-Clause`.
