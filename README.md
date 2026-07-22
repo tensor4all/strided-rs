@@ -100,6 +100,23 @@ This crate is inspired by and ports functionality from:
 - [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) for
   `strided-opteinsum` design ideas and reference test-case patterns
 
+A per-component table of which external projects each crate builds on, and
+the algorithm-origin references, is maintained in the
+[Provenance and Citation Policy](docs/PROVENANCE_AND_CITATION_POLICY.md).
+
+## How to Cite
+
+If you use strided-rs in research, please read the
+[Provenance and Citation Policy](docs/PROVENANCE_AND_CITATION_POLICY.md)
+and cite the original papers of the algorithms your work relies on (for
+example the HPTT paper,
+[ARRAY 2017](https://doi.org/10.1145/3091966.3091968), when your work relies
+on `strided-perm`), and check the citation policies of the upstream projects
+the components you use are ported from, applying them recursively. This is
+the permanent citation style for this project: a future strided-rs software
+paper will add to, not replace, these upstream citations. Until then,
+reference strided-rs directly by repository URL and version or commit.
+
 ## License
 
 Licensed under either of:
