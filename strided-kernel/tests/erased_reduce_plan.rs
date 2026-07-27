@@ -87,6 +87,51 @@ fn erased_reduce_plan_executes_i32_sum_with_ambient_context() {
 }
 
 #[test]
+fn erased_reduce_plan_integer_full_reductions_use_wrapping_arithmetic() {
+    let dims = [2usize];
+    let strides = [1isize];
+
+    let input_i32 = [i32::MAX, 1];
+    let mut sum_output = [0i32];
+    let sum_plan =
+        ErasedReducePlan::compile(KernelDType::I32, ReduceOp::Sum, &dims, &strides).unwrap();
+    let sum_source =
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&input_i32), &dims, &strides, 0)
+            .unwrap();
+    let mut sum_dest =
+        ErasedRawStridedMut::new(KernelDType::I32, as_bytes_mut(&mut sum_output), &[], &[], 0)
+            .unwrap();
+
+    sum_plan
+        .execute(&ExecContext::serial(), &mut sum_dest, &sum_source)
+        .unwrap();
+
+    assert_eq!(sum_output, [i32::MIN]);
+
+    let input_i64 = [i64::MAX, 2];
+    let mut product_output = [0i64];
+    let product_plan =
+        ErasedReducePlan::compile(KernelDType::I64, ReduceOp::Product, &dims, &strides).unwrap();
+    let product_source =
+        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&input_i64), &dims, &strides, 0)
+            .unwrap();
+    let mut product_dest = ErasedRawStridedMut::new(
+        KernelDType::I64,
+        as_bytes_mut(&mut product_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+
+    product_plan
+        .execute(&ExecContext::serial(), &mut product_dest, &product_source)
+        .unwrap();
+
+    assert_eq!(product_output, [i64::MAX.wrapping_mul(2)]);
+}
+
+#[test]
 fn erased_reduce_plan_executes_remaining_supported_dtype_set() {
     let dims = [2usize];
     let strides = [1isize];
@@ -215,6 +260,48 @@ fn erased_reduce_plan_executes_single_axis_sum_into_strided_output() {
         .unwrap();
 
     assert_eq!(output, [1.0, 21.0, 41.0]);
+}
+
+#[test]
+fn erased_reduce_plan_integer_axis_reductions_use_wrapping_arithmetic() {
+    let src_dims = [2usize, 2];
+    let src_strides = [1isize, 2];
+    let dest_dims = [2usize];
+    let dest_strides = [1isize];
+    let input = [i32::MAX, 1, i32::MIN, -1];
+    let mut output = [0i32; 2];
+
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::I32,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::I32,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output, [i32::MIN, i32::MAX]);
 }
 
 #[test]
