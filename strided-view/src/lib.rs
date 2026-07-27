@@ -117,6 +117,13 @@ pub enum StridedError {
     #[error("unsupported dtype {dtype}")]
     UnsupportedDType { dtype: &'static str },
 
+    /// The dtype is recognized, but the selected op is not defined for it.
+    #[error("unsupported op {op} for dtype {dtype}")]
+    UnsupportedOp {
+        op: &'static str,
+        dtype: &'static str,
+    },
+
     /// The operation arity is unsupported by this entry point.
     #[error("unsupported arity {arity}; maximum supported arity is {max}")]
     UnsupportedArity { arity: usize, max: usize },

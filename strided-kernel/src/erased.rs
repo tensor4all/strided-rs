@@ -230,7 +230,7 @@ impl ErasedFusedPlan {
         if plan.outputs.len() != 1 {
             return Err(StridedError::RankMismatch(plan.outputs.len(), 1));
         }
-        crate::fused::validate_plan(&plan, plan.input_count, 1)?;
+        validate_fused_plan_for_dtype(dtype, &plan)?;
         Ok(Self { dtype, plan })
     }
 
@@ -266,6 +266,9 @@ impl ErasedFusedPlan {
         let result = match self.dtype {
             KernelDType::F32 => execute_fused::<f32>(&self.plan, ctx, dest, inputs),
             KernelDType::F64 => execute_fused::<f64>(&self.plan, ctx, dest, inputs),
+            KernelDType::I32 => execute_fused::<i32>(&self.plan, ctx, dest, inputs),
+            KernelDType::I64 => execute_fused::<i64>(&self.plan, ctx, dest, inputs),
+            KernelDType::Bool => execute_fused::<bool>(&self.plan, ctx, dest, inputs),
             KernelDType::C32 => execute_fused::<Complex32>(&self.plan, ctx, dest, inputs),
             KernelDType::C64 => execute_fused::<Complex64>(&self.plan, ctx, dest, inputs),
             _ => Err(StridedError::UnsupportedDType {
@@ -955,7 +958,42 @@ fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
 
 fn check_fused_dtype(dtype: KernelDType) -> Result<()> {
     match dtype {
-        KernelDType::F32 | KernelDType::F64 | KernelDType::C32 | KernelDType::C64 => Ok(()),
+        KernelDType::F32
+        | KernelDType::F64
+        | KernelDType::I32
+        | KernelDType::I64
+        | KernelDType::Bool
+        | KernelDType::C32
+        | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn validate_fused_plan_for_dtype(dtype: KernelDType, plan: &FusedPlan) -> Result<()> {
+    match dtype {
+        KernelDType::F32 => {
+            crate::fused::validate_plan_for_scalar::<f32>(plan, plan.input_count, 1)
+        }
+        KernelDType::F64 => {
+            crate::fused::validate_plan_for_scalar::<f64>(plan, plan.input_count, 1)
+        }
+        KernelDType::I32 => {
+            crate::fused::validate_plan_for_scalar::<i32>(plan, plan.input_count, 1)
+        }
+        KernelDType::I64 => {
+            crate::fused::validate_plan_for_scalar::<i64>(plan, plan.input_count, 1)
+        }
+        KernelDType::Bool => {
+            crate::fused::validate_plan_for_scalar::<bool>(plan, plan.input_count, 1)
+        }
+        KernelDType::C32 => {
+            crate::fused::validate_plan_for_scalar::<Complex32>(plan, plan.input_count, 1)
+        }
+        KernelDType::C64 => {
+            crate::fused::validate_plan_for_scalar::<Complex64>(plan, plan.input_count, 1)
+        }
         _ => Err(StridedError::UnsupportedDType {
             dtype: dtype.label(),
         }),

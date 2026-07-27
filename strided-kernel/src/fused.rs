@@ -38,6 +38,33 @@ pub enum FusedOp {
     Log1p,
 }
 
+impl FusedOp {
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Multiply => "multiply",
+            Self::Negate => "negate",
+            Self::Conj => "conj",
+            Self::Divide => "divide",
+            Self::Abs => "abs",
+            Self::Maximum => "maximum",
+            Self::Minimum => "minimum",
+            Self::Clamp => "clamp",
+            Self::Exp => "exp",
+            Self::Log => "log",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tanh => "tanh",
+            Self::Sqrt => "sqrt",
+            Self::Rsqrt => "rsqrt",
+            Self::Pow => "pow",
+            Self::Expm1 => "expm1",
+            Self::Log1p => "log1p",
+        }
+    }
+}
+
 /// One SSA instruction in a [`FusedPlan`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FusedInst {
@@ -66,6 +93,14 @@ pub struct FusedPlan {
 
 /// Scalar types supported by [`fused_elementwise_into`].
 pub trait FusedScalar: Copy + MaybeSendSync + 'static {
+    fn fused_dtype_label() -> &'static str {
+        core::any::type_name::<Self>()
+    }
+
+    fn supports_fused_op(_op: FusedOp) -> bool {
+        true
+    }
+
     fn fused_add(self, rhs: Self) -> Self;
     fn fused_multiply(self, rhs: Self) -> Self;
     fn fused_negate(self) -> Self;
@@ -85,6 +120,12 @@ pub trait FusedScalar: Copy + MaybeSendSync + 'static {
     fn fused_pow(self, rhs: Self) -> Self;
     fn fused_expm1(self) -> Self;
     fn fused_log1p(self) -> Self;
+}
+
+macro_rules! unsupported_fused_op {
+    ($op:literal, $ty:literal) => {
+        unreachable!("unsupported fused op {} for dtype {}", $op, $ty)
+    };
 }
 
 macro_rules! impl_real_fused_scalar {
@@ -302,6 +343,237 @@ impl_real_fused_scalar!(f64);
 impl_complex_fused_scalar!(num_complex::Complex32);
 impl_complex_fused_scalar!(num_complex::Complex64);
 
+macro_rules! impl_signed_integer_fused_scalar {
+    ($ty:ty, $label:literal) => {
+        impl FusedScalar for $ty {
+            #[inline]
+            fn fused_dtype_label() -> &'static str {
+                $label
+            }
+
+            #[inline]
+            fn supports_fused_op(op: FusedOp) -> bool {
+                matches!(
+                    op,
+                    FusedOp::Add
+                        | FusedOp::Multiply
+                        | FusedOp::Negate
+                        | FusedOp::Conj
+                        | FusedOp::Abs
+                        | FusedOp::Maximum
+                        | FusedOp::Minimum
+                        | FusedOp::Clamp
+                )
+            }
+
+            #[inline(always)]
+            fn fused_add(self, rhs: Self) -> Self {
+                self.wrapping_add(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_multiply(self, rhs: Self) -> Self {
+                self.wrapping_mul(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_negate(self) -> Self {
+                self.wrapping_neg()
+            }
+
+            #[inline(always)]
+            fn fused_conj(self) -> Self {
+                self
+            }
+
+            #[inline(always)]
+            fn fused_divide(self, _rhs: Self) -> Self {
+                unsupported_fused_op!("divide", $label)
+            }
+
+            #[inline(always)]
+            fn fused_abs(self) -> Self {
+                self.wrapping_abs()
+            }
+
+            #[inline(always)]
+            fn fused_maximum(self, rhs: Self) -> Self {
+                self.max(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_minimum(self, rhs: Self) -> Self {
+                self.min(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_clamp(self, min: Self, max: Self) -> Self {
+                self.fused_maximum(min).fused_minimum(max)
+            }
+
+            #[inline(always)]
+            fn fused_exp(self) -> Self {
+                unsupported_fused_op!("exp", $label)
+            }
+
+            #[inline(always)]
+            fn fused_log(self) -> Self {
+                unsupported_fused_op!("log", $label)
+            }
+
+            #[inline(always)]
+            fn fused_sin(self) -> Self {
+                unsupported_fused_op!("sin", $label)
+            }
+
+            #[inline(always)]
+            fn fused_cos(self) -> Self {
+                unsupported_fused_op!("cos", $label)
+            }
+
+            #[inline(always)]
+            fn fused_tanh(self) -> Self {
+                unsupported_fused_op!("tanh", $label)
+            }
+
+            #[inline(always)]
+            fn fused_sqrt(self) -> Self {
+                unsupported_fused_op!("sqrt", $label)
+            }
+
+            #[inline(always)]
+            fn fused_rsqrt(self) -> Self {
+                unsupported_fused_op!("rsqrt", $label)
+            }
+
+            #[inline(always)]
+            fn fused_pow(self, _rhs: Self) -> Self {
+                unsupported_fused_op!("pow", $label)
+            }
+
+            #[inline(always)]
+            fn fused_expm1(self) -> Self {
+                unsupported_fused_op!("expm1", $label)
+            }
+
+            #[inline(always)]
+            fn fused_log1p(self) -> Self {
+                unsupported_fused_op!("log1p", $label)
+            }
+        }
+    };
+}
+
+impl_signed_integer_fused_scalar!(i32, "i32");
+impl_signed_integer_fused_scalar!(i64, "i64");
+
+impl FusedScalar for bool {
+    #[inline]
+    fn fused_dtype_label() -> &'static str {
+        "bool"
+    }
+
+    #[inline]
+    fn supports_fused_op(op: FusedOp) -> bool {
+        matches!(op, FusedOp::Conj)
+    }
+
+    #[inline(always)]
+    fn fused_add(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("add", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_multiply(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("multiply", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_negate(self) -> Self {
+        unsupported_fused_op!("negate", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_conj(self) -> Self {
+        self
+    }
+
+    #[inline(always)]
+    fn fused_divide(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("divide", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_abs(self) -> Self {
+        unsupported_fused_op!("abs", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_maximum(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("maximum", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_minimum(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("minimum", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_clamp(self, _min: Self, _max: Self) -> Self {
+        unsupported_fused_op!("clamp", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_exp(self) -> Self {
+        unsupported_fused_op!("exp", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_log(self) -> Self {
+        unsupported_fused_op!("log", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_sin(self) -> Self {
+        unsupported_fused_op!("sin", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_cos(self) -> Self {
+        unsupported_fused_op!("cos", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_tanh(self) -> Self {
+        unsupported_fused_op!("tanh", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_sqrt(self) -> Self {
+        unsupported_fused_op!("sqrt", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_rsqrt(self) -> Self {
+        unsupported_fused_op!("rsqrt", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_pow(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("pow", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_expm1(self) -> Self {
+        unsupported_fused_op!("expm1", "bool")
+    }
+
+    #[inline(always)]
+    fn fused_log1p(self) -> Self {
+        unsupported_fused_op!("log1p", "bool")
+    }
+}
+
 #[inline]
 fn op_arity(op: FusedOp) -> usize {
     match op {
@@ -371,6 +643,23 @@ pub(crate) fn validate_plan(
         }
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_plan_for_scalar<T: FusedScalar>(
+    plan: &FusedPlan,
+    input_count: usize,
+    output_count: usize,
+) -> Result<()> {
+    validate_plan(plan, input_count, output_count)?;
+    for inst in &plan.ops {
+        if !T::supports_fused_op(inst.op) {
+            return Err(StridedError::UnsupportedOp {
+                op: inst.op.label(),
+                dtype: T::fused_dtype_label(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -845,7 +1134,7 @@ pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
 ) -> Result<()> {
-    validate_plan(plan, inputs.len(), dests.len())?;
+    validate_plan_for_scalar::<T>(plan, inputs.len(), dests.len())?;
     validate_shapes(dests, inputs)?;
     interpret_fused_elementwise_into_serial(dests, inputs, plan)
 }
@@ -869,13 +1158,16 @@ pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
 ///
 /// Real `Maximum`, `Minimum`, and `Clamp` use Rust `f32`/`f64` `max`/`min`
 /// semantics. Complex `Abs` returns the norm in the real component; complex
-/// `Maximum`, `Minimum`, and `Clamp` compare by squared norm.
+/// `Maximum`, `Minimum`, and `Clamp` compare by squared norm. Signed integer
+/// `Add`, `Multiply`, `Negate`, and `Abs` use wrapping arithmetic. `bool`
+/// supports only copy-like identity plans and `Conj`; ambiguous arithmetic and
+/// transcendental op/dtype pairs are rejected before any destination is written.
 pub fn fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
 ) -> Result<()> {
-    validate_plan(plan, inputs.len(), dests.len())?;
+    validate_plan_for_scalar::<T>(plan, inputs.len(), dests.len())?;
     validate_shapes(dests, inputs)?;
     if try_static_specialization(dests, inputs, plan)? {
         return Ok(());
