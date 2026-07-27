@@ -13,7 +13,10 @@
 //! Mutable erased descriptors only re-scan value-constrained dtypes, currently
 //! `bool`, after their raw bytes have escaped through `data_mut`.
 
+use core::ops::{Add, Mul};
+
 use num_complex::{Complex32, Complex64};
+use num_traits::{One, Zero};
 
 use crate::{
     fused_elementwise_into, CopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext,
@@ -104,6 +107,27 @@ pub struct ErasedFusedPlan {
     plan: FusedPlan,
 }
 
+/// Runtime reduction operation for dtype-erased full reductions.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReduceOp {
+    Sum,
+    Product,
+}
+
+/// Dtype-erased full-reduction wrapper.
+///
+/// This is the erased replay boundary for full-tensor reductions whose result
+/// is one scalar. It supports only operations with an unambiguous identity value
+/// in the selected dtype.
+#[derive(Clone, Debug)]
+pub struct ErasedReducePlan {
+    dtype: KernelDType,
+    op: ReduceOp,
+    dims: Vec<usize>,
+    src_strides: Vec<isize>,
+}
+
 impl ErasedFusedPlan {
     /// Validate and store a single-output fused elementwise plan for one dtype.
     pub fn compile(dtype: KernelDType, plan: FusedPlan) -> Result<Self> {
@@ -170,6 +194,77 @@ impl ErasedFusedPlan {
     }
 }
 
+impl ErasedReducePlan {
+    /// Validate and store a full-reduction plan for one dtype and source layout.
+    pub fn compile(
+        dtype: KernelDType,
+        op: ReduceOp,
+        dims: &[usize],
+        src_strides: &[isize],
+    ) -> Result<Self> {
+        check_reduce_dtype(dtype)?;
+        if dims.len() != src_strides.len() {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        checked_total_len(dims)?;
+        Ok(Self {
+            dtype,
+            op,
+            dims: dims.to_vec(),
+            src_strides: src_strides.to_vec(),
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn op(&self) -> ReduceOp {
+        self.op
+    }
+
+    /// Execute a full reduction into a scalar erased output descriptor.
+    pub fn execute(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        src: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        if src.dims() != self.dims.as_slice() || src.strides() != self.src_strides.as_slice() {
+            return Err(StridedError::PlanLayoutMismatch);
+        }
+        let dest_len = checked_total_len(dest.dims())?;
+        if dest_len != 1 {
+            return Err(StridedError::RankMismatch(dest_len, 1));
+        }
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => execute_reduce::<f32>(self.op, ctx, dest, src),
+            KernelDType::F64 => execute_reduce::<f64>(self.op, ctx, dest, src),
+            KernelDType::I32 => execute_reduce::<i32>(self.op, ctx, dest, src),
+            KernelDType::I64 => execute_reduce::<i64>(self.op, ctx, dest, src),
+            KernelDType::C32 => execute_reduce::<Complex32>(self.op, ctx, dest, src),
+            KernelDType::C64 => execute_reduce::<Complex64>(self.op, ctx, dest, src),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: supported reduction dtypes have no extra byte validity
+            // invariant beyond the typed scalar written by the kernel.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
 fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
     if actual != expected {
         return Err(StridedError::DTypeMismatch {
@@ -187,6 +282,29 @@ fn check_fused_dtype(dtype: KernelDType) -> Result<()> {
             dtype: dtype.label(),
         }),
     }
+}
+
+fn check_reduce_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::F32
+        | KernelDType::F64
+        | KernelDType::I32
+        | KernelDType::I64
+        | KernelDType::C32
+        | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn checked_total_len(dims: &[usize]) -> Result<usize> {
+    if dims.is_empty() {
+        return Ok(1);
+    }
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)
 }
 
 fn execute_copy<T>(
@@ -208,6 +326,62 @@ where
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.execute(&mut dest, &source)
+}
+
+fn execute_reduce<T>(
+    op: ReduceOp,
+    ctx: &ExecContext,
+    dest: &mut ErasedRawStridedMut<'_>,
+    src: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + Add<Output = T> + Mul<Output = T> + One + Zero + crate::MaybeSendSync,
+{
+    let source = erased_view::<T>(src);
+    let value = if ctx.is_ambient() {
+        crate::reduce(
+            &source,
+            |value| value,
+            |a, b| reduce_values(op, a, b),
+            reduce_identity(op),
+        )?
+    } else {
+        crate::reduce_view::reduce_serial(
+            &source,
+            |value| value,
+            |a, b| reduce_values(op, a, b),
+            reduce_identity(op),
+        )?
+    };
+
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    unsafe {
+        *dest_data.as_mut_ptr().offset(dest_offset) = value;
+    }
+    Ok(())
+}
+
+#[inline]
+fn reduce_identity<T>(op: ReduceOp) -> T
+where
+    T: One + Zero,
+{
+    match op {
+        ReduceOp::Sum => T::zero(),
+        ReduceOp::Product => T::one(),
+    }
+}
+
+#[inline]
+fn reduce_values<T>(op: ReduceOp, a: T, b: T) -> T
+where
+    T: Add<Output = T> + Mul<Output = T>,
+{
+    match op {
+        ReduceOp::Sum => a + b,
+        ReduceOp::Product => a * b,
+    }
 }
 
 fn execute_fused<T>(
