@@ -9,7 +9,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use num_complex::Complex64;
-use strided_kernel::{CopyPlan, RawStridedMut, RawStridedRef};
+use strided_kernel::{
+    CopyPlan, ErasedCopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType,
+    RawStridedMut, RawStridedRef,
+};
 
 struct CountingAllocator;
 
@@ -38,6 +41,24 @@ fn count_allocations(run: impl FnOnce()) -> usize {
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     run();
     ALLOCATIONS.load(Ordering::SeqCst) - before
+}
+
+fn as_bytes<T>(data: &[T]) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(
+            data.as_ptr().cast::<u8>(),
+            data.len() * core::mem::size_of::<T>(),
+        )
+    }
+}
+
+fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            data.as_mut_ptr().cast::<u8>(),
+            data.len() * core::mem::size_of::<T>(),
+        )
+    }
 }
 
 // One test function: the counter is process-global, so concurrently running
@@ -85,4 +106,33 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "execute_conj must not allocate");
+
+    let dims = [2usize; 8];
+    let dst_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
+    let src_strides: Vec<isize> = (0..8).rev().map(|axis| 1isize << axis).collect();
+    let src: Vec<f64> = (0..256).map(|value| value as f64).collect();
+    let mut dst = vec![0.0f64; 256];
+
+    let plan =
+        ErasedCopyPlan::compile(KernelDType::F64, &dims, &dst_strides, &src_strides).unwrap();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&src), &dims, &src_strides, 0).unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &dims,
+        &dst_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute(&ExecContext::serial(), &mut dest, &source)
+                .unwrap();
+        }
+    });
+    assert_eq!(allocations, 0, "erased execute must not allocate");
 }
