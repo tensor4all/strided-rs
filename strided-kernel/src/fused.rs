@@ -327,7 +327,11 @@ fn op_arity(op: FusedOp) -> usize {
     }
 }
 
-fn validate_plan(plan: &FusedPlan, input_count: usize, output_count: usize) -> Result<()> {
+pub(crate) fn validate_plan(
+    plan: &FusedPlan,
+    input_count: usize,
+    output_count: usize,
+) -> Result<()> {
     if input_count != plan.input_count {
         return Err(StridedError::RankMismatch(input_count, plan.input_count));
     }
@@ -715,32 +719,32 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
 ) -> Result<()> {
-    let dims = dests[0].dims().to_vec();
-    if total_len(&dims) == 0 {
-        return Ok(());
-    }
-
-    let dst_ptrs: Vec<*mut T> = dests.iter_mut().map(|dest| dest.as_mut_ptr()).collect();
-    let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
-
-    let mut strides_list: Vec<&[isize]> = Vec::with_capacity(dests.len() + inputs.len());
-    for dest in dests.iter() {
-        strides_list.push(dest.strides());
-    }
-    for input in inputs {
-        strides_list.push(input.strides());
-    }
-
-    let elem_size = std::mem::size_of::<T>();
-    let total = total_len(&dims);
-    let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(&dims, &strides_list)
-    } else {
-        build_plan_fused(&dims, &strides_list, Some(0), elem_size)
-    };
-
     #[cfg(feature = "parallel")]
     {
+        let dims = dests[0].dims().to_vec();
+        if total_len(&dims) == 0 {
+            return Ok(());
+        }
+
+        let dst_ptrs: Vec<*mut T> = dests.iter_mut().map(|dest| dest.as_mut_ptr()).collect();
+        let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
+
+        let mut strides_list: Vec<&[isize]> = Vec::with_capacity(dests.len() + inputs.len());
+        for dest in dests.iter() {
+            strides_list.push(dest.strides());
+        }
+        for input in inputs {
+            strides_list.push(input.strides());
+        }
+
+        let elem_size = std::mem::size_of::<T>();
+        let total = total_len(&dims);
+        let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
+            build_plan_fused_small(&dims, &strides_list)
+        } else {
+            build_plan_fused(&dims, &strides_list, Some(0), elem_size)
+        };
+
         let total: usize = fused_dims.iter().product();
         if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
             let dst_send: Vec<SendPtr<T>> = dst_ptrs.iter().map(|&ptr| SendPtr(ptr)).collect();
@@ -790,6 +794,38 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         }
     }
 
+    interpret_fused_elementwise_into_serial(dests, inputs, plan)
+}
+
+fn interpret_fused_elementwise_into_serial<T: FusedScalar>(
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+) -> Result<()> {
+    let dims = dests[0].dims().to_vec();
+    if total_len(&dims) == 0 {
+        return Ok(());
+    }
+
+    let dst_ptrs: Vec<*mut T> = dests.iter_mut().map(|dest| dest.as_mut_ptr()).collect();
+    let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
+
+    let mut strides_list: Vec<&[isize]> = Vec::with_capacity(dests.len() + inputs.len());
+    for dest in dests.iter() {
+        strides_list.push(dest.strides());
+    }
+    for input in inputs {
+        strides_list.push(input.strides());
+    }
+
+    let elem_size = std::mem::size_of::<T>();
+    let total = total_len(&dims);
+    let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(&dims, &strides_list)
+    } else {
+        build_plan_fused(&dims, &strides_list, Some(0), elem_size)
+    };
+
     let initial_offsets = vec![0isize; ordered_strides.len()];
     for_each_inner_block_preordered(
         &fused_dims,
@@ -803,6 +839,16 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
             Ok(())
         },
     )
+}
+
+pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+) -> Result<()> {
+    validate_plan(plan, inputs.len(), dests.len())?;
+    validate_shapes(dests, inputs)?;
+    interpret_fused_elementwise_into_serial(dests, inputs, plan)
 }
 
 /// Evaluate a runtime-DAG elementwise plan into one or more destinations.

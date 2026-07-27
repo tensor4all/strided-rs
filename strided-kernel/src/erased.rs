@@ -16,9 +16,12 @@
 use num_complex::{Complex32, Complex64};
 
 use crate::{
-    CopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType, RawStridedMut,
-    RawStridedRef, Result, StridedError,
+    fused_elementwise_into, CopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext,
+    FusedPlan, FusedScalar, KernelDType, RawStridedMut, RawStridedRef, Result, StridedError,
+    StridedView, StridedViewMut,
 };
+
+const ERASED_FUSED_INPUT_LIMIT: usize = 4;
 
 /// Dtype-erased wrapper around [`CopyPlan`].
 #[derive(Clone, Debug)]
@@ -90,6 +93,102 @@ impl ErasedCopyPlan {
     }
 }
 
+/// Dtype-erased single-output wrapper around [`FusedPlan`].
+///
+/// This is the erased replay boundary for unary map and zip-map elementwise
+/// families. It supports the same runtime op-code vocabulary as [`FusedPlan`],
+/// but only for the scalar dtypes currently implementing [`FusedScalar`].
+#[derive(Clone, Debug)]
+pub struct ErasedFusedPlan {
+    dtype: KernelDType,
+    plan: FusedPlan,
+}
+
+impl ErasedFusedPlan {
+    /// Validate and store a single-output fused elementwise plan for one dtype.
+    pub fn compile(dtype: KernelDType, plan: FusedPlan) -> Result<Self> {
+        check_fused_dtype(dtype)?;
+        if plan.input_count == 0 || plan.input_count > ERASED_FUSED_INPUT_LIMIT {
+            return Err(StridedError::UnsupportedArity {
+                arity: plan.input_count,
+                max: ERASED_FUSED_INPUT_LIMIT,
+            });
+        }
+        if plan.outputs.len() != 1 {
+            return Err(StridedError::RankMismatch(plan.outputs.len(), 1));
+        }
+        crate::fused::validate_plan(&plan, plan.input_count, 1)?;
+        Ok(Self { dtype, plan })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &FusedPlan {
+        &self.plan
+    }
+
+    /// Execute a single-output fused elementwise plan through erased descriptors.
+    pub fn execute(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        inputs: &[ErasedRawStridedRef<'_>],
+    ) -> Result<()> {
+        if inputs.len() != self.plan.input_count {
+            return Err(StridedError::RankMismatch(
+                inputs.len(),
+                self.plan.input_count,
+            ));
+        }
+        check_dtype(self.dtype, dest.dtype())?;
+        for input in inputs {
+            check_dtype(self.dtype, input.dtype())?;
+        }
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => execute_fused::<f32>(&self.plan, ctx, dest, inputs),
+            KernelDType::F64 => execute_fused::<f64>(&self.plan, ctx, dest, inputs),
+            KernelDType::C32 => execute_fused::<Complex32>(&self.plan, ctx, dest, inputs),
+            KernelDType::C64 => execute_fused::<Complex64>(&self.plan, ctx, dest, inputs),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: supported fused elementwise dtypes have no extra byte
+            // validity invariant beyond the typed values written by the kernel.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
+fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
+    if actual != expected {
+        return Err(StridedError::DTypeMismatch {
+            expected: expected.label(),
+            actual: actual.label(),
+        });
+    }
+    Ok(())
+}
+
+fn check_fused_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::F32 | KernelDType::F64 | KernelDType::C32 | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
 fn execute_copy<T>(
     plan: &CopyPlan,
     dest: &mut ErasedRawStridedMut<'_>,
@@ -109,6 +208,80 @@ where
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.execute(&mut dest, &source)
+}
+
+fn execute_fused<T>(
+    plan: &FusedPlan,
+    ctx: &ExecContext,
+    dest: &mut ErasedRawStridedMut<'_>,
+    inputs: &[ErasedRawStridedRef<'_>],
+) -> Result<()>
+where
+    T: FusedScalar,
+{
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_view =
+        unsafe { StridedViewMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+
+    match inputs {
+        [a] => {
+            let input_views = [erased_view::<T>(a)];
+            let mut dests = [dest_view];
+            execute_fused_views(ctx, &mut dests, &input_views, plan)
+        }
+        [a, b] => {
+            let input_views = [erased_view::<T>(a), erased_view::<T>(b)];
+            let mut dests = [dest_view];
+            execute_fused_views(ctx, &mut dests, &input_views, plan)
+        }
+        [a, b, c] => {
+            let input_views = [
+                erased_view::<T>(a),
+                erased_view::<T>(b),
+                erased_view::<T>(c),
+            ];
+            let mut dests = [dest_view];
+            execute_fused_views(ctx, &mut dests, &input_views, plan)
+        }
+        [a, b, c, d] => {
+            let input_views = [
+                erased_view::<T>(a),
+                erased_view::<T>(b),
+                erased_view::<T>(c),
+                erased_view::<T>(d),
+            ];
+            let mut dests = [dest_view];
+            execute_fused_views(ctx, &mut dests, &input_views, plan)
+        }
+        _ => Err(StridedError::UnsupportedArity {
+            arity: inputs.len(),
+            max: ERASED_FUSED_INPUT_LIMIT,
+        }),
+    }
+}
+
+fn execute_fused_views<T>(
+    ctx: &ExecContext,
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+) -> Result<()>
+where
+    T: FusedScalar,
+{
+    if ctx.is_ambient() {
+        fused_elementwise_into(dests, inputs, plan)
+    } else {
+        crate::fused::fused_elementwise_into_serial(dests, inputs, plan)
+    }
+}
+
+fn erased_view<'a, T>(src: &ErasedRawStridedRef<'a>) -> StridedView<'a, T> {
+    let data = typed_slice::<T>(src.data());
+    unsafe { StridedView::new_unchecked(data, src.dims(), src.strides(), src.offset()) }
 }
 
 fn typed_slice<T>(bytes: &[u8]) -> &[T] {

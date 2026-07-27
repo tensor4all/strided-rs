@@ -116,6 +116,10 @@ pub enum StridedError {
     /// The dtype is recognized but unsupported by the selected operation.
     #[error("unsupported dtype {dtype}")]
     UnsupportedDType { dtype: &'static str },
+
+    /// The operation arity is unsupported by this entry point.
+    #[error("unsupported arity {arity}; maximum supported arity is {max}")]
+    UnsupportedArity { arity: usize, max: usize },
 }
 
 /// Result type for strided array operations.
