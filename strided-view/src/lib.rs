@@ -33,7 +33,9 @@ pub use element_op::{
 // ============================================================================
 // View-based types
 // ============================================================================
-pub use raw::{RawStridedMut, RawStridedRef};
+pub use raw::{
+    ErasedRawStridedMut, ErasedRawStridedRef, KernelDType, RawStridedMut, RawStridedRef,
+};
 pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 
 // ============================================================================
@@ -78,6 +80,42 @@ pub enum StridedError {
     /// Runtime view layout does not match the layout a prepared plan was compiled for.
     #[error("view layout does not match the compiled plan")]
     PlanLayoutMismatch,
+
+    /// Runtime dtype does not match the dtype a prepared plan was compiled for.
+    #[error("dtype mismatch: expected {expected}, got {actual}")]
+    DTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+
+    /// A byte buffer length is not a whole number of dtype elements.
+    #[error(
+        "byte length {byte_len} is not a multiple of element size {element_size} for dtype {dtype}"
+    )]
+    ByteLengthMismatch {
+        dtype: &'static str,
+        byte_len: usize,
+        element_size: usize,
+    },
+
+    /// A byte buffer pointer does not satisfy the dtype alignment.
+    #[error("data pointer for dtype {dtype} is not aligned to {alignment} bytes")]
+    DataAlignmentMismatch {
+        dtype: &'static str,
+        alignment: usize,
+    },
+
+    /// A byte buffer for `bool` contains a value that is not a valid Rust bool.
+    #[error("invalid bool byte value {value}")]
+    InvalidBoolByte { value: u8 },
+
+    /// An execution context requested an invalid worker-thread budget.
+    #[error("invalid thread budget {max_threads}")]
+    InvalidThreadBudget { max_threads: usize },
+
+    /// The dtype is recognized but unsupported by the selected operation.
+    #[error("unsupported dtype {dtype}")]
+    UnsupportedDType { dtype: &'static str },
 }
 
 /// Result type for strided array operations.

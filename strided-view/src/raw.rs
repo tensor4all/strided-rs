@@ -7,7 +7,271 @@
 
 use crate::element_op::Identity;
 use crate::view::validate_bounds;
-use crate::{Result, StridedView, StridedViewMut};
+use num_complex::{Complex32, Complex64};
+
+use crate::{Result, StridedError, StridedView, StridedViewMut};
+
+/// Dtypes supported by dtype-erased kernel entry points.
+///
+/// The enum is intentionally limited to the scalar set currently used by the
+/// tensor runtime callers. Later FFI layers should map their ABI dtype tags to
+/// this enum before dispatching into prepared kernels.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum KernelDType {
+    F32 = 1,
+    F64 = 2,
+    I32 = 3,
+    I64 = 4,
+    Bool = 5,
+    C32 = 6,
+    C64 = 7,
+}
+
+impl KernelDType {
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::Bool => "bool",
+            Self::C32 => "c32",
+            Self::C64 => "c64",
+        }
+    }
+
+    #[inline]
+    pub const fn size_of(self) -> usize {
+        match self {
+            Self::F32 => core::mem::size_of::<f32>(),
+            Self::F64 => core::mem::size_of::<f64>(),
+            Self::I32 => core::mem::size_of::<i32>(),
+            Self::I64 => core::mem::size_of::<i64>(),
+            Self::Bool => core::mem::size_of::<bool>(),
+            Self::C32 => core::mem::size_of::<Complex32>(),
+            Self::C64 => core::mem::size_of::<Complex64>(),
+        }
+    }
+
+    #[inline]
+    pub const fn alignment(self) -> usize {
+        match self {
+            Self::F32 => core::mem::align_of::<f32>(),
+            Self::F64 => core::mem::align_of::<f64>(),
+            Self::I32 => core::mem::align_of::<i32>(),
+            Self::I64 => core::mem::align_of::<i64>(),
+            Self::Bool => core::mem::align_of::<bool>(),
+            Self::C32 => core::mem::align_of::<Complex32>(),
+            Self::C64 => core::mem::align_of::<Complex64>(),
+        }
+    }
+
+    #[inline]
+    pub const fn requires_valid_byte_values(self) -> bool {
+        matches!(self, Self::Bool)
+    }
+}
+
+fn validate_erased_buffer(dtype: KernelDType, data: &[u8]) -> Result<usize> {
+    let element_size = dtype.size_of();
+    if data.len() % element_size != 0 {
+        return Err(StridedError::ByteLengthMismatch {
+            dtype: dtype.label(),
+            byte_len: data.len(),
+            element_size,
+        });
+    }
+
+    let element_count = data.len() / element_size;
+    if element_count == 0 {
+        return Ok(0);
+    }
+
+    let alignment = dtype.alignment();
+    if data.as_ptr() as usize % alignment != 0 {
+        return Err(StridedError::DataAlignmentMismatch {
+            dtype: dtype.label(),
+            alignment,
+        });
+    }
+    if dtype.requires_valid_byte_values() {
+        if let Some(&value) = data.iter().find(|&&value| value > 1) {
+            return Err(StridedError::InvalidBoolByte { value });
+        }
+    }
+    Ok(element_count)
+}
+
+/// Borrowed dtype-erased raw strided input layout.
+///
+/// `dims`, `strides`, and `offset` are expressed in dtype elements, not bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct ErasedRawStridedRef<'a> {
+    dtype: KernelDType,
+    data: &'a [u8],
+    dims: &'a [usize],
+    strides: &'a [isize],
+    offset: isize,
+}
+
+impl<'a> ErasedRawStridedRef<'a> {
+    /// Create a byte-backed erased input descriptor after validating dtype byte
+    /// length, alignment, rank/stride agreement, and reachable element bounds.
+    pub fn new(
+        dtype: KernelDType,
+        data: &'a [u8],
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let element_count = validate_erased_buffer(dtype, data)?;
+        validate_bounds(element_count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data,
+            dims,
+            strides,
+            offset,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    #[inline]
+    pub fn dims(&self) -> &'a [usize] {
+        self.dims
+    }
+
+    #[inline]
+    pub fn strides(&self) -> &'a [isize] {
+        self.strides
+    }
+
+    #[inline]
+    pub fn offset(&self) -> isize {
+        self.offset
+    }
+
+    /// Re-check the current byte buffer against the descriptor dtype.
+    ///
+    /// This is normally redundant after construction, but callers that can
+    /// mutate a sibling output descriptor's bytes may need a cheap way to
+    /// re-establish dtype byte validity before typed replay.
+    pub fn validate_data(&self) -> Result<()> {
+        validate_erased_buffer(self.dtype, self.data).map(|_| ())
+    }
+}
+
+/// Borrowed dtype-erased raw strided output layout.
+///
+/// `dims`, `strides`, and `offset` are expressed in dtype elements, not bytes.
+#[derive(Debug)]
+pub struct ErasedRawStridedMut<'a> {
+    dtype: KernelDType,
+    data: &'a mut [u8],
+    dims: &'a [usize],
+    strides: &'a [isize],
+    offset: isize,
+    needs_data_revalidation: bool,
+}
+
+impl<'a> ErasedRawStridedMut<'a> {
+    /// Create a byte-backed erased output descriptor after validating dtype
+    /// byte length, alignment, rank/stride agreement, and reachable element
+    /// bounds.
+    pub fn new(
+        dtype: KernelDType,
+        data: &'a mut [u8],
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let element_count = validate_erased_buffer(dtype, data)?;
+        validate_bounds(element_count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data,
+            dims,
+            strides,
+            offset,
+            needs_data_revalidation: false,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        self.data
+    }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        if self.dtype.requires_valid_byte_values() {
+            self.needs_data_revalidation = true;
+        }
+        self.data
+    }
+
+    #[inline]
+    pub fn dims(&self) -> &'a [usize] {
+        self.dims
+    }
+
+    #[inline]
+    pub fn strides(&self) -> &'a [isize] {
+        self.strides
+    }
+
+    #[inline]
+    pub fn offset(&self) -> isize {
+        self.offset
+    }
+
+    /// Re-check the current byte buffer against the descriptor dtype.
+    ///
+    /// This guards safe replay when callers mutate bytes through
+    /// [`ErasedRawStridedMut::data_mut`] after construction.
+    pub fn validate_data(&self) -> Result<()> {
+        validate_erased_buffer(self.dtype, self.data).map(|_| ())
+    }
+
+    /// Re-check dtype byte validity only when mutable bytes escaped since the
+    /// last validation.
+    pub fn validate_data_if_needed(&mut self) -> Result<()> {
+        if self.needs_data_revalidation {
+            self.validate_data()?;
+            self.needs_data_revalidation = false;
+        }
+        Ok(())
+    }
+
+    /// Mark the current byte buffer as satisfying this descriptor's dtype
+    /// value invariants.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure every byte sequence in `data` is valid for
+    /// `dtype`. This matters for `bool`, where Rust requires stored values to
+    /// be exactly `0` or `1` before a typed `bool` slice is formed.
+    pub unsafe fn assume_data_valid(&mut self) {
+        self.needs_data_revalidation = false;
+    }
+}
 
 /// Borrowed raw strided input layout.
 ///

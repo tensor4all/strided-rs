@@ -68,6 +68,8 @@ pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 
 // View-based operation modules
 mod copy_plan;
+mod erased;
+mod exec_context;
 mod map_view;
 mod ops_view;
 mod outer_product;
@@ -80,8 +82,8 @@ mod reduce_view;
 pub use strided_view::view;
 pub use strided_view::{
     col_major_strides, row_major_strides, Adjoint, ComposableElementOp, Compose, Conj, ElementOp,
-    ElementOpApply, Identity, RawStridedMut, RawStridedRef, Result, StridedArray, StridedError,
-    StridedView, StridedViewMut, Transpose,
+    ElementOpApply, ErasedRawStridedMut, ErasedRawStridedRef, Identity, KernelDType, RawStridedMut,
+    RawStridedRef, Result, StridedArray, StridedError, StridedView, StridedViewMut, Transpose,
 };
 
 // ============================================================================
@@ -120,6 +122,8 @@ pub use raw_ops::{
 // Prepared (compile-once, execute-many) plans
 // ============================================================================
 pub use copy_plan::CopyPlan;
+pub use erased::ErasedCopyPlan;
+pub use exec_context::ExecContext;
 
 // ============================================================================
 // Reduce operations
