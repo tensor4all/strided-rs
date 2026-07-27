@@ -746,7 +746,8 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         };
 
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send: Vec<SendPtr<T>> = dst_ptrs.iter().map(|&ptr| SendPtr(ptr)).collect();
             let input_send: Vec<SendPtr<T>> = input_ptrs
                 .iter()
@@ -755,8 +756,6 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; ordered_strides.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &kernel_plan.block,
