@@ -364,6 +364,52 @@ fn fused_real_clamp_does_not_panic_on_unordered_or_nan_bounds() {
 }
 
 #[test]
+fn fused_integer_add_uses_wrapping_arithmetic() {
+    let a = StridedArray::<i32>::from_parts(vec![i32::MAX, i32::MIN, -3], &[3], &[1], 0).unwrap();
+    let b = StridedArray::<i32>::from_parts(vec![1, -1, 2], &[3], &[1], 0).unwrap();
+    let mut out = StridedArray::<i32>::col_major(&[3]);
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![2],
+        ops: vec![FusedInst {
+            op: FusedOp::Add,
+            inputs: vec![0, 1],
+        }],
+    };
+
+    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+
+    assert_eq!(out.data(), &[i32::MIN, i32::MAX, -1]);
+}
+
+#[test]
+fn fused_bool_arithmetic_is_rejected_before_writing() {
+    let a = StridedArray::<bool>::from_parts(vec![true, false], &[2], &[1], 0).unwrap();
+    let b = StridedArray::<bool>::from_parts(vec![false, true], &[2], &[1], 0).unwrap();
+    let mut out = StridedArray::<bool>::from_parts(vec![true, true], &[2], &[1], 0).unwrap();
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![2],
+        ops: vec![FusedInst {
+            op: FusedOp::Add,
+            inputs: vec![0, 1],
+        }],
+    };
+
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan)
+        .expect_err("bool add must fail");
+
+    assert!(matches!(
+        err,
+        StridedError::UnsupportedOp {
+            op: "add",
+            dtype: "bool"
+        }
+    ));
+    assert_eq!(out.data(), &[true, true]);
+}
+
+#[test]
 fn fused_complex_divide_matches_native_complex_division() {
     let a = StridedArray::<Complex64>::from_parts(
         vec![Complex64::new(1.0, 2.0), Complex64::new(-3.0, 0.5)],

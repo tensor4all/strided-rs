@@ -202,6 +202,127 @@ fn erased_fused_plan_executes_f64_four_input_dag() {
 }
 
 #[test]
+fn erased_fused_plan_executes_i32_safe_integer_dag() {
+    let dims = [3usize];
+    let strides = [1isize];
+    let x = [-3i32, 2, 5];
+    let y = [4i32, -7, 1];
+    let lo = [0i32, 0, 0];
+    let hi = [10i32, 10, 10];
+    let mut dst = [0i32; 3];
+
+    let plan = ErasedFusedPlan::compile(
+        KernelDType::I32,
+        FusedPlan {
+            input_count: 4,
+            outputs: vec![10],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Add,
+                    inputs: vec![0, 1],
+                },
+                FusedInst {
+                    op: FusedOp::Multiply,
+                    inputs: vec![4, 0],
+                },
+                FusedInst {
+                    op: FusedOp::Negate,
+                    inputs: vec![5],
+                },
+                FusedInst {
+                    op: FusedOp::Abs,
+                    inputs: vec![6],
+                },
+                FusedInst {
+                    op: FusedOp::Maximum,
+                    inputs: vec![7, 2],
+                },
+                FusedInst {
+                    op: FusedOp::Minimum,
+                    inputs: vec![8, 3],
+                },
+                FusedInst {
+                    op: FusedOp::Clamp,
+                    inputs: vec![9, 2, 3],
+                },
+            ],
+        },
+    )
+    .unwrap();
+    let inputs = [
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&x), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&y), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&lo), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&hi), &dims, &strides, 0).unwrap(),
+    ];
+    let mut dest =
+        ErasedRawStridedMut::new(KernelDType::I32, as_bytes_mut(&mut dst), &dims, &strides, 0)
+            .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
+        .unwrap();
+
+    assert_eq!(dst, [3, 10, 10]);
+}
+
+#[test]
+fn erased_fused_plan_executes_i64_binary_add_transposed_layout() {
+    let dims = [2usize, 3];
+    let src_strides = [3isize, 1];
+    let dst_strides = [1isize, 2];
+    let a = [0i64, 1, 2, 10, 11, 12];
+    let b = [100i64, 101, 102, 110, 111, 112];
+    let mut dst = [0i64; 6];
+
+    let plan = ErasedFusedPlan::compile(KernelDType::I64, binary_plan(FusedOp::Add)).unwrap();
+    let inputs = [
+        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&a), &dims, &src_strides, 0).unwrap(),
+        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&b), &dims, &src_strides, 0).unwrap(),
+    ];
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::I64,
+        as_bytes_mut(&mut dst),
+        &dims,
+        &dst_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
+        .unwrap();
+
+    assert_eq!(dst, [100, 120, 102, 122, 104, 124]);
+}
+
+#[test]
+fn erased_fused_plan_executes_bool_identity_conj() {
+    let dims = [3usize];
+    let strides = [1isize];
+    let input = [true, false, true];
+    let mut dst = [false; 3];
+
+    let plan = ErasedFusedPlan::compile(KernelDType::Bool, unary_plan(FusedOp::Conj)).unwrap();
+    let inputs =
+        [
+            ErasedRawStridedRef::new(KernelDType::Bool, as_bytes(&input), &dims, &strides, 0)
+                .unwrap(),
+        ];
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::Bool,
+        as_bytes_mut(&mut dst),
+        &dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
+        .unwrap();
+
+    assert_eq!(dst, input);
+}
+
+#[test]
 fn erased_fused_plan_rejects_dtype_mismatch_before_writing() {
     let dims = [2usize];
     let strides = [1isize];
@@ -274,6 +395,37 @@ fn erased_fused_plan_rejects_input_dtype_mismatch_before_writing() {
 }
 
 #[test]
+fn erased_fused_plan_rejects_runtime_shape_mismatch_before_writing() {
+    let dest_dims = [2usize];
+    let input_dims = [3usize];
+    let strides = [1isize];
+    let a = [1.0f64, 2.0, 3.0];
+    let b = [4.0f64, 5.0, 6.0];
+    let mut dst = [9.0f64, 10.0];
+
+    let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
+    let inputs = [
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &input_dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&b), &input_dims, &strides, 0).unwrap(),
+    ];
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &dest_dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+
+    let err = plan
+        .execute(&ExecContext::serial(), &mut dest, &inputs)
+        .unwrap_err();
+
+    assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
+    assert_eq!(dst, [9.0, 10.0]);
+}
+
+#[test]
 fn erased_fused_plan_exposes_dtype_and_plan() {
     let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
 
@@ -283,14 +435,30 @@ fn erased_fused_plan_exposes_dtype_and_plan() {
 }
 
 #[test]
-fn erased_fused_plan_rejects_unsupported_dtype_and_arity() {
-    let unsupported_dtype =
-        ErasedFusedPlan::compile(KernelDType::I32, binary_plan(FusedOp::Add)).unwrap_err();
+fn erased_fused_plan_rejects_unsupported_ops_by_dtype() {
+    let unsupported_integer_op =
+        ErasedFusedPlan::compile(KernelDType::I32, binary_plan(FusedOp::Divide)).unwrap_err();
     assert!(matches!(
-        unsupported_dtype,
-        StridedError::UnsupportedDType { dtype: "i32" }
+        unsupported_integer_op,
+        StridedError::UnsupportedOp {
+            op: "divide",
+            dtype: "i32"
+        }
     ));
 
+    let unsupported_bool_op =
+        ErasedFusedPlan::compile(KernelDType::Bool, binary_plan(FusedOp::Add)).unwrap_err();
+    assert!(matches!(
+        unsupported_bool_op,
+        StridedError::UnsupportedOp {
+            op: "add",
+            dtype: "bool"
+        }
+    ));
+}
+
+#[test]
+fn erased_fused_plan_rejects_unsupported_arity() {
     let too_many_inputs = FusedPlan {
         input_count: 5,
         outputs: vec![0],
