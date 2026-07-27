@@ -64,6 +64,7 @@ mod gather_plan;
 mod kernel;
 mod order;
 mod simd;
+mod static_indexing_plan;
 mod threading;
 
 mod maybe_sync;
@@ -127,14 +128,16 @@ pub use raw_ops::{
 // ============================================================================
 pub use copy_plan::CopyPlan;
 pub use erased::{
-    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedFusedPlan,
-    ErasedGatherPlan, ErasedReducePlan, ErasedScatterPlan, ReduceOp,
+    ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
+    ErasedFusedPlan, ErasedGatherPlan, ErasedPadPlan, ErasedReducePlan, ErasedReversePlan,
+    ErasedScatterPlan, ErasedSlicePlan, ReduceOp,
 };
 pub use exec_context::ExecContext;
 pub use gather_plan::{
     DynamicSlicePlan, DynamicUpdateSlicePlan, GatherIndex, GatherPlan, GatherSpec, ScatterPlan,
     ScatterSpec,
 };
+pub use static_indexing_plan::{ConcatenatePlan, PadPlan, ReversePlan, SlicePlan};
 
 // ============================================================================
 // Reduce operations

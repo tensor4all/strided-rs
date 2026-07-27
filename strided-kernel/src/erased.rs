@@ -19,10 +19,11 @@ use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
 
 use crate::{
-    fused_elementwise_into, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
+    fused_elementwise_into, ConcatenatePlan, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
     ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, FusedPlan, FusedScalar, GatherIndex,
-    GatherPlan, GatherSpec, KernelDType, RawStridedMut, RawStridedRef, Result, ScatterPlan,
-    ScatterSpec, StridedError, StridedView, StridedViewMut, RAW_FUSED_RANK_LIMIT,
+    GatherPlan, GatherSpec, KernelDType, PadPlan, RawStridedMut, RawStridedRef, Result,
+    ReversePlan, ScatterPlan, ScatterSpec, SlicePlan, StridedError, StridedView, StridedViewMut,
+    RAW_FUSED_RANK_LIMIT,
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
@@ -32,6 +33,34 @@ const ERASED_FUSED_INPUT_LIMIT: usize = 4;
 pub struct ErasedCopyPlan {
     dtype: KernelDType,
     plan: CopyPlan,
+}
+
+/// Dtype-erased static-slice wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedSlicePlan {
+    dtype: KernelDType,
+    plan: SlicePlan,
+}
+
+/// Dtype-erased reverse wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedReversePlan {
+    dtype: KernelDType,
+    plan: ReversePlan,
+}
+
+/// Dtype-erased pad wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedPadPlan {
+    dtype: KernelDType,
+    plan: PadPlan,
+}
+
+/// Dtype-erased concatenate wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedConcatenatePlan {
+    dtype: KernelDType,
+    plan: ConcatenatePlan,
 }
 
 impl ErasedCopyPlan {
@@ -94,6 +123,281 @@ impl ErasedCopyPlan {
             });
         }
         Ok(())
+    }
+}
+
+impl ErasedSlicePlan {
+    /// Validate and store a static slice plan for one dtype and fixed layout set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        starts: &[usize],
+        limits: &[usize],
+        slice_strides: &[usize],
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: SlicePlan::compile(
+                operand_dims,
+                operand_strides,
+                dest_dims,
+                dest_strides,
+                starts,
+                limits,
+                slice_strides,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &SlicePlan {
+        &self.plan
+    }
+
+    /// Execute a static slice into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => execute_slice::<f32>(&self.plan, dest, operand),
+            KernelDType::F64 => execute_slice::<f64>(&self.plan, dest, operand),
+            KernelDType::I32 => execute_slice::<i32>(&self.plan, dest, operand),
+            KernelDType::I64 => execute_slice::<i64>(&self.plan, dest, operand),
+            KernelDType::Bool => execute_slice::<bool>(&self.plan, dest, operand),
+            KernelDType::C32 => execute_slice::<Complex32>(&self.plan, dest, operand),
+            KernelDType::C64 => execute_slice::<Complex64>(&self.plan, dest, operand),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: static slice writes values read from a descriptor with
+            // the same dtype and already-validated byte representation.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
+impl ErasedReversePlan {
+    /// Validate and store a reverse plan for one dtype and fixed layout set.
+    pub fn compile(
+        dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        dest_strides: &[isize],
+        axes: &[usize],
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: ReversePlan::compile(operand_dims, operand_strides, dest_strides, axes)?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &ReversePlan {
+        &self.plan
+    }
+
+    /// Execute a reverse into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => execute_reverse::<f32>(&self.plan, dest, operand),
+            KernelDType::F64 => execute_reverse::<f64>(&self.plan, dest, operand),
+            KernelDType::I32 => execute_reverse::<i32>(&self.plan, dest, operand),
+            KernelDType::I64 => execute_reverse::<i64>(&self.plan, dest, operand),
+            KernelDType::Bool => execute_reverse::<bool>(&self.plan, dest, operand),
+            KernelDType::C32 => execute_reverse::<Complex32>(&self.plan, dest, operand),
+            KernelDType::C64 => execute_reverse::<Complex64>(&self.plan, dest, operand),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: reverse writes values read from a descriptor with the
+            // same dtype and already-validated byte representation.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
+impl ErasedPadPlan {
+    /// Validate and store a pad plan for one dtype and fixed layout set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
+        interior_padding: &[i64],
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: PadPlan::compile(
+                operand_dims,
+                operand_strides,
+                dest_dims,
+                dest_strides,
+                edge_padding_low,
+                edge_padding_high,
+                interior_padding,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &PadPlan {
+        &self.plan
+    }
+
+    /// Execute pad into an erased output descriptor using one dtype scalar as fill.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+        fill: &[u8],
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_scalar_bytes(self.dtype, fill)?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => execute_pad::<f32>(&self.plan, dest, operand, fill),
+            KernelDType::F64 => execute_pad::<f64>(&self.plan, dest, operand, fill),
+            KernelDType::I32 => execute_pad::<i32>(&self.plan, dest, operand, fill),
+            KernelDType::I64 => execute_pad::<i64>(&self.plan, dest, operand, fill),
+            KernelDType::Bool => execute_pad::<bool>(&self.plan, dest, operand, fill),
+            KernelDType::C32 => execute_pad::<Complex32>(&self.plan, dest, operand, fill),
+            KernelDType::C64 => execute_pad::<Complex64>(&self.plan, dest, operand, fill),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: pad writes either the validated fill scalar or values
+            // read from a descriptor with the same validated dtype.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
+impl ErasedConcatenatePlan {
+    /// Validate and store a concatenate plan for one dtype and fixed layout set.
+    pub fn compile(
+        dtype: KernelDType,
+        input_dims: &[&[usize]],
+        input_strides: &[&[isize]],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        axis: usize,
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: ConcatenatePlan::compile(
+                input_dims,
+                input_strides,
+                dest_dims,
+                dest_strides,
+                axis,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &ConcatenatePlan {
+        &self.plan
+    }
+
+    /// Execute concatenate into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        inputs: &[ErasedRawStridedRef<'_>],
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        for input in inputs {
+            check_dtype(self.dtype, input.dtype())?;
+        }
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs),
+            KernelDType::F64 => execute_concatenate::<f64>(&self.plan, dest, inputs),
+            KernelDType::I32 => execute_concatenate::<i32>(&self.plan, dest, inputs),
+            KernelDType::I64 => execute_concatenate::<i64>(&self.plan, dest, inputs),
+            KernelDType::Bool => execute_concatenate::<bool>(&self.plan, dest, inputs),
+            KernelDType::C32 => execute_concatenate::<Complex32>(&self.plan, dest, inputs),
+            KernelDType::C64 => execute_concatenate::<Complex64>(&self.plan, dest, inputs),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: concatenate writes values read from descriptors with
+            // the same dtype and already-validated byte representation.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
     }
 }
 
@@ -1052,6 +1356,38 @@ fn check_scatter_value_dtype(dtype: KernelDType) -> Result<()> {
     }
 }
 
+fn check_static_indexing_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::F32
+        | KernelDType::F64
+        | KernelDType::I32
+        | KernelDType::I64
+        | KernelDType::Bool
+        | KernelDType::C32
+        | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn validate_scalar_bytes(dtype: KernelDType, bytes: &[u8]) -> Result<()> {
+    let element_size = dtype.size_of();
+    if bytes.len() != element_size {
+        return Err(StridedError::ByteLengthMismatch {
+            dtype: dtype.label(),
+            byte_len: bytes.len(),
+            element_size,
+        });
+    }
+    if dtype.requires_valid_byte_values() {
+        if let Some(&value) = bytes.iter().find(|&&value| value > 1) {
+            return Err(StridedError::InvalidBoolByte { value });
+        }
+    }
+    Ok(())
+}
+
 fn checked_total_len(dims: &[usize]) -> Result<usize> {
     if dims.is_empty() {
         return Ok(1);
@@ -1080,6 +1416,116 @@ where
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.execute(&mut dest, &source)
+}
+
+fn execute_slice<T>(
+    plan: &SlicePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref)
+}
+
+fn execute_reverse<T>(
+    plan: &ReversePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref)
+}
+
+fn execute_pad<T>(
+    plan: &PadPlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    fill: &[u8],
+) -> Result<()>
+where
+    T: Copy,
+{
+    let fill = read_unaligned_scalar::<T>(fill);
+    let operand_data = typed_slice::<T>(operand.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, fill)
+}
+
+fn execute_concatenate<T>(
+    plan: &ConcatenatePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    inputs: &[ErasedRawStridedRef<'_>],
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    if inputs.len() != plan.input_count() {
+        return Err(StridedError::RankMismatch(inputs.len(), plan.input_count()));
+    }
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.check_dest_layout(&dest_ref)?;
+
+    for (position, input) in inputs.iter().enumerate() {
+        let input_data = typed_slice::<T>(input.data());
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.check_input_layout(position, &input_ref)?;
+        plan.execute_segment(position, &mut dest_ref, &input_ref)?;
+    }
+    Ok(())
 }
 
 fn execute_reduce<T>(
@@ -1686,4 +2132,11 @@ fn typed_slice_mut<T>(bytes: &mut [u8]) -> &mut [T] {
             bytes.len() / core::mem::size_of::<T>(),
         )
     }
+}
+
+fn read_unaligned_scalar<T>(bytes: &[u8]) -> T
+where
+    T: Copy,
+{
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
