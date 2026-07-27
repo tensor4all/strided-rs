@@ -176,6 +176,230 @@ fn erased_reduce_plan_empty_input_returns_operation_identity() {
 }
 
 #[test]
+fn erased_reduce_plan_executes_single_axis_sum_into_strided_output() {
+    let src_dims = [2usize, 3];
+    let src_strides = [1isize, 2];
+    let input = [0.0f64, 1.0, 10.0, 11.0, 20.0, 21.0];
+    let dest_dims = [3usize];
+    let dest_strides = [1isize];
+    let mut output = [0.0f64; 3];
+
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output, [1.0, 21.0, 41.0]);
+}
+
+#[test]
+fn erased_reduce_plan_executes_multi_axis_sum_with_kept_middle_axis() {
+    let src_dims = [2usize, 3, 4];
+    let src_strides = [1isize, 2, 6];
+    let input: Vec<f64> = (0..src_dims[2])
+        .flat_map(|k| {
+            (0..src_dims[1]).flat_map(move |j| {
+                (0..src_dims[0]).map(move |i| i as f64 + 10.0 * j as f64 + 100.0 * k as f64)
+            })
+        })
+        .collect();
+    let dest_dims = [3usize];
+    let dest_strides = [1isize];
+    let mut output = [0.0f64; 3];
+
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 2],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::max_threads(2).unwrap(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output, [1204.0, 1284.0, 1364.0]);
+}
+
+#[test]
+fn erased_reduce_plan_executes_all_axes_sum_into_rank0_scalar() {
+    let src_dims = [2usize, 3];
+    let src_strides = [1isize, 2];
+    let input = [0.0f64, 1.0, 10.0, 11.0, 20.0, 21.0];
+    let dest_dims: [usize; 0] = [];
+    let dest_strides: [isize; 0] = [];
+    let mut output = [0.0f64];
+
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 1],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output, [63.0]);
+}
+
+#[test]
+fn erased_reduce_plan_axis_reduction_writes_identity_for_empty_reduced_domain() {
+    let src_dims = [2usize, 0];
+    let src_strides = [1isize, 2];
+    let input: [f64; 0] = [];
+    let dest_dims = [2usize];
+    let dest_strides = [1isize];
+    let mut output = [9.0f64, 10.0];
+
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Product,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[1],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output, [1.0, 1.0]);
+}
+
+#[test]
+fn erased_reduce_plan_axis_compile_rejects_invalid_contracts() {
+    let src_dims = [2usize, 3];
+    let src_strides = [1isize, 2];
+    let dest_dims = [3usize];
+    let dest_strides = [1isize];
+
+    let duplicate_axis = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 0],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        duplicate_axis,
+        StridedError::InvalidAxis { axis: 0, rank: 2 }
+    ));
+
+    let shape_mismatch = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &[2],
+        &[1],
+        &[0],
+    )
+    .unwrap_err();
+    assert!(matches!(shape_mismatch, StridedError::ShapeMismatch(_, _)));
+
+    let non_injective_dest = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &[0],
+        &[0],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        non_injective_dest,
+        StridedError::NonInjectiveOutputLayout
+    ));
+}
+
+#[test]
 fn erased_reduce_plan_rejects_dtype_mismatch_before_writing() {
     let dims = [2usize];
     let strides = [1isize];

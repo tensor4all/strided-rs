@@ -1,5 +1,5 @@
-//! Asserts the zero-allocation contract of `CopyPlan::execute*` for ranks at
-//! most `RAW_FUSED_RANK_LIMIT`.
+//! Asserts the zero-allocation contract of prepared erased/raw replay for ranks
+//! at most `RAW_FUSED_RANK_LIMIT`.
 //!
 //! This lives in its own integration-test binary because it installs a
 //! counting global allocator; keeping it isolated avoids counting noise from
@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use num_complex::Complex64;
 use strided_kernel::{
-    CopyPlan, ErasedCopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType,
-    RawStridedMut, RawStridedRef,
+    CopyPlan, ErasedCopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan,
+    ExecContext, KernelDType, RawStridedMut, RawStridedRef, ReduceOp,
 };
 
 struct CountingAllocator;
@@ -135,4 +135,47 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "erased execute must not allocate");
+
+    let src_dims = [2usize; 8];
+    let src_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
+    let dest_dims = [2usize; 4];
+    let dest_strides: Vec<isize> = (0..4).map(|axis| 1isize << axis).collect();
+    let axes = [1usize, 3, 5, 7];
+    let src: Vec<f64> = (0..256).map(|value| value as f64).collect();
+    let mut dst = vec![0.0f64; 16];
+
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &axes,
+    )
+    .unwrap();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&src), &src_dims, &src_strides, 0)
+            .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute(&ExecContext::serial(), &mut dest, &source)
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased reduce-axis execute must not allocate"
+    );
 }
