@@ -19,9 +19,10 @@ use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
 
 use crate::{
-    fused_elementwise_into, CopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext,
-    FusedPlan, FusedScalar, GatherIndex, GatherPlan, GatherSpec, KernelDType, RawStridedMut,
-    RawStridedRef, Result, StridedError, StridedView, StridedViewMut, RAW_FUSED_RANK_LIMIT,
+    fused_elementwise_into, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
+    ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, FusedPlan, FusedScalar, GatherIndex,
+    GatherPlan, GatherSpec, KernelDType, RawStridedMut, RawStridedRef, Result, ScatterPlan,
+    ScatterSpec, StridedError, StridedView, StridedViewMut, RAW_FUSED_RANK_LIMIT,
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
@@ -190,6 +191,30 @@ pub struct ErasedGatherPlan {
     dtype: KernelDType,
     index_dtype: KernelDType,
     plan: GatherPlan,
+}
+
+/// Dtype-erased fixed-window dynamic-slice wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedDynamicSlicePlan {
+    dtype: KernelDType,
+    index_dtype: KernelDType,
+    plan: DynamicSlicePlan,
+}
+
+/// Dtype-erased dynamic-update-slice wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedDynamicUpdateSlicePlan {
+    dtype: KernelDType,
+    index_dtype: KernelDType,
+    plan: DynamicUpdateSlicePlan,
+}
+
+/// Dtype-erased additive scatter wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedScatterPlan {
+    dtype: KernelDType,
+    index_dtype: KernelDType,
+    plan: ScatterPlan,
 }
 
 impl ErasedFusedPlan {
@@ -530,6 +555,394 @@ impl ErasedGatherPlan {
     }
 }
 
+impl ErasedDynamicSlicePlan {
+    /// Validate and store a dynamic-slice plan for one value dtype, index dtype, and layout set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        dtype: KernelDType,
+        index_dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        start_dims: &[usize],
+        start_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        slice_sizes: &[usize],
+    ) -> Result<Self> {
+        check_index_dtype(index_dtype)?;
+        check_gather_value_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            index_dtype,
+            plan: DynamicSlicePlan::compile(
+                operand_dims,
+                operand_strides,
+                start_dims,
+                start_strides,
+                dest_dims,
+                dest_strides,
+                slice_sizes,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn index_dtype(&self) -> KernelDType {
+        self.index_dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &DynamicSlicePlan {
+        &self.plan
+    }
+
+    /// Execute a fixed-window dynamic slice into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+        starts: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.index_dtype, starts.dtype())?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => dispatch_dynamic_slice_index::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            KernelDType::F64 => dispatch_dynamic_slice_index::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            KernelDType::I32 => dispatch_dynamic_slice_index::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            KernelDType::I64 => dispatch_dynamic_slice_index::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            KernelDType::Bool => dispatch_dynamic_slice_index::<bool>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            KernelDType::C32 => dispatch_dynamic_slice_index::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            KernelDType::C64 => dispatch_dynamic_slice_index::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: dynamic slice writes values read from a descriptor with
+            // the same dtype and already-validated byte representation.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
+impl ErasedDynamicUpdateSlicePlan {
+    /// Validate and store a dynamic-update-slice plan for one value dtype, index dtype, and layout set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        dtype: KernelDType,
+        index_dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        start_dims: &[usize],
+        start_strides: &[isize],
+        update_dims: &[usize],
+        update_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+    ) -> Result<Self> {
+        check_index_dtype(index_dtype)?;
+        check_gather_value_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            index_dtype,
+            plan: DynamicUpdateSlicePlan::compile(
+                operand_dims,
+                operand_strides,
+                start_dims,
+                start_strides,
+                update_dims,
+                update_strides,
+                dest_dims,
+                dest_strides,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn index_dtype(&self) -> KernelDType {
+        self.index_dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &DynamicUpdateSlicePlan {
+        &self.plan
+    }
+
+    /// Execute a dynamic update slice into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+        update: &ErasedRawStridedRef<'_>,
+        starts: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.dtype, update.dtype())?;
+        check_dtype(self.index_dtype, starts.dtype())?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => dispatch_dynamic_update_slice_index::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            KernelDType::F64 => dispatch_dynamic_update_slice_index::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            KernelDType::I32 => dispatch_dynamic_update_slice_index::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            KernelDType::I64 => dispatch_dynamic_update_slice_index::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            KernelDType::Bool => dispatch_dynamic_update_slice_index::<bool>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            KernelDType::C32 => dispatch_dynamic_update_slice_index::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            KernelDType::C64 => dispatch_dynamic_update_slice_index::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: dynamic-update-slice writes either values copied from
+            // `operand` or values read from `update`, both with matching dtype.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
+impl ErasedScatterPlan {
+    /// Validate and store an additive scatter plan for one value dtype, index dtype, and layout set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        dtype: KernelDType,
+        index_dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        index_dims: &[usize],
+        index_strides: &[isize],
+        update_dims: &[usize],
+        update_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        spec: ScatterSpec,
+    ) -> Result<Self> {
+        check_index_dtype(index_dtype)?;
+        check_scatter_value_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            index_dtype,
+            plan: ScatterPlan::compile(
+                operand_dims,
+                operand_strides,
+                index_dims,
+                index_strides,
+                update_dims,
+                update_strides,
+                dest_dims,
+                dest_strides,
+                spec,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn index_dtype(&self) -> KernelDType {
+        self.index_dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &ScatterPlan {
+        &self.plan
+    }
+
+    /// Execute additive scatter into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+        scatter_indices: &ErasedRawStridedRef<'_>,
+        updates: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.dtype, updates.dtype())?;
+        check_dtype(self.index_dtype, scatter_indices.dtype())?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => dispatch_scatter_index::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+            ),
+            KernelDType::F64 => dispatch_scatter_index::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+            ),
+            KernelDType::I32 => dispatch_scatter_index::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+            ),
+            KernelDType::I64 => dispatch_scatter_index::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+            ),
+            KernelDType::C32 => dispatch_scatter_index::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+            ),
+            KernelDType::C64 => dispatch_scatter_index::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: additive scatter copies or adds values with matching,
+            // already-validated dtypes.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
 fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
     if actual != expected {
         return Err(StridedError::DTypeMismatch {
@@ -579,6 +992,20 @@ fn check_gather_value_dtype(dtype: KernelDType) -> Result<()> {
         | KernelDType::I32
         | KernelDType::I64
         | KernelDType::Bool
+        | KernelDType::C32
+        | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn check_scatter_value_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::F32
+        | KernelDType::F64
+        | KernelDType::I32
+        | KernelDType::I64
         | KernelDType::C32
         | KernelDType::C64 => Ok(()),
         _ => Err(StridedError::UnsupportedDType {
@@ -943,6 +1370,194 @@ where
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.execute(&mut dest_ref, &operand_ref, &index_ref)
+}
+
+fn dispatch_dynamic_slice_index<T>(
+    plan: &DynamicSlicePlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    match index_dtype {
+        KernelDType::I32 => execute_dynamic_slice::<T, i32>(plan, dest, operand, starts),
+        KernelDType::I64 => execute_dynamic_slice::<T, i64>(plan, dest, operand, starts),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_dynamic_slice<T, I>(
+    plan: &DynamicSlicePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+    I: GatherIndex,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let start_data = typed_slice::<I>(starts.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let start_ref = unsafe {
+        RawStridedRef::new_unchecked(start_data, starts.dims(), starts.strides(), starts.offset())
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, &start_ref)
+}
+
+fn dispatch_dynamic_update_slice_index<T>(
+    plan: &DynamicUpdateSlicePlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    update: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    match index_dtype {
+        KernelDType::I32 => {
+            execute_dynamic_update_slice::<T, i32>(plan, dest, operand, update, starts)
+        }
+        KernelDType::I64 => {
+            execute_dynamic_update_slice::<T, i64>(plan, dest, operand, update, starts)
+        }
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_dynamic_update_slice<T, I>(
+    plan: &DynamicUpdateSlicePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    update: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+    I: GatherIndex,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let update_data = typed_slice::<T>(update.data());
+    let start_data = typed_slice::<I>(starts.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let update_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            update_data,
+            update.dims(),
+            update.strides(),
+            update.offset(),
+        )
+    };
+    let start_ref = unsafe {
+        RawStridedRef::new_unchecked(start_data, starts.dims(), starts.strides(), starts.offset())
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, &update_ref, &start_ref)
+}
+
+fn dispatch_scatter_index<T>(
+    plan: &ScatterPlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    scatter_indices: &ErasedRawStridedRef<'_>,
+    updates: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + Add<Output = T> + crate::MaybeSendSync,
+{
+    match index_dtype {
+        KernelDType::I32 => {
+            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates)
+        }
+        KernelDType::I64 => {
+            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates)
+        }
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_scatter<T, I>(
+    plan: &ScatterPlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    scatter_indices: &ErasedRawStridedRef<'_>,
+    updates: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + Add<Output = T> + crate::MaybeSendSync,
+    I: GatherIndex,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let index_data = typed_slice::<I>(scatter_indices.data());
+    let update_data = typed_slice::<T>(updates.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let index_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            index_data,
+            scatter_indices.dims(),
+            scatter_indices.strides(),
+            scatter_indices.offset(),
+        )
+    };
+    let update_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            update_data,
+            updates.dims(),
+            updates.strides(),
+            updates.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, &update_ref)
 }
 
 fn execute_fused_views<T>(
