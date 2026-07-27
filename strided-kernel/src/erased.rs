@@ -20,8 +20,8 @@ use num_traits::{One, Zero};
 
 use crate::{
     fused_elementwise_into, CopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext,
-    FusedPlan, FusedScalar, KernelDType, RawStridedMut, RawStridedRef, Result, StridedError,
-    StridedView, StridedViewMut,
+    FusedPlan, FusedScalar, GatherIndex, GatherPlan, GatherSpec, KernelDType, RawStridedMut,
+    RawStridedRef, Result, StridedError, StridedView, StridedViewMut,
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
@@ -126,6 +126,17 @@ pub struct ErasedReducePlan {
     op: ReduceOp,
     dims: Vec<usize>,
     src_strides: Vec<isize>,
+}
+
+/// Dtype-erased gather wrapper.
+///
+/// This is the erased replay boundary for indexed reads. Value buffers use the
+/// configured value dtype, while the index descriptor must use `i32` or `i64`.
+#[derive(Clone, Debug)]
+pub struct ErasedGatherPlan {
+    dtype: KernelDType,
+    index_dtype: KernelDType,
+    plan: GatherPlan,
 }
 
 impl ErasedFusedPlan {
@@ -265,6 +276,130 @@ impl ErasedReducePlan {
     }
 }
 
+impl ErasedGatherPlan {
+    /// Validate and store a gather plan for one value dtype, index dtype, and layout set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        dtype: KernelDType,
+        index_dtype: KernelDType,
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        index_dims: &[usize],
+        index_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        spec: GatherSpec,
+    ) -> Result<Self> {
+        check_index_dtype(index_dtype)?;
+        check_gather_value_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            index_dtype,
+            plan: GatherPlan::compile(
+                operand_dims,
+                operand_strides,
+                index_dims,
+                index_strides,
+                dest_dims,
+                dest_strides,
+                spec,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn index_dtype(&self) -> KernelDType {
+        self.index_dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &GatherPlan {
+        &self.plan
+    }
+
+    /// Execute an indexed read into an erased output descriptor.
+    pub fn execute(
+        &self,
+        _ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        operand: &ErasedRawStridedRef<'_>,
+        start_indices: &ErasedRawStridedRef<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.index_dtype, start_indices.dtype())?;
+        dest.validate_data_if_needed()?;
+
+        let result = match self.dtype {
+            KernelDType::F32 => dispatch_gather_index::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            KernelDType::F64 => dispatch_gather_index::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            KernelDType::I32 => dispatch_gather_index::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            KernelDType::I64 => dispatch_gather_index::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            KernelDType::Bool => dispatch_gather_index::<bool>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            KernelDType::C32 => dispatch_gather_index::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            KernelDType::C64 => dispatch_gather_index::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if result.is_ok() {
+            // SAFETY: gather writes values read from a descriptor with the
+            // same dtype and already-validated byte representation.
+            unsafe {
+                dest.assume_data_valid();
+            }
+        }
+        result
+    }
+}
+
 fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
     if actual != expected {
         return Err(StridedError::DTypeMismatch {
@@ -290,6 +425,30 @@ fn check_reduce_dtype(dtype: KernelDType) -> Result<()> {
         | KernelDType::F64
         | KernelDType::I32
         | KernelDType::I64
+        | KernelDType::C32
+        | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn check_index_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::I32 | KernelDType::I64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn check_gather_value_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::F32
+        | KernelDType::F64
+        | KernelDType::I32
+        | KernelDType::I64
+        | KernelDType::Bool
         | KernelDType::C32
         | KernelDType::C64 => Ok(()),
         _ => Err(StridedError::UnsupportedDType {
@@ -435,6 +594,62 @@ where
             max: ERASED_FUSED_INPUT_LIMIT,
         }),
     }
+}
+
+fn dispatch_gather_index<T>(
+    plan: &GatherPlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    start_indices: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    match index_dtype {
+        KernelDType::I32 => execute_gather::<T, i32>(plan, dest, operand, start_indices),
+        KernelDType::I64 => execute_gather::<T, i64>(plan, dest, operand, start_indices),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_gather<T, I>(
+    plan: &GatherPlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    start_indices: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+    I: GatherIndex,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let index_data = typed_slice::<I>(start_indices.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let index_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            index_data,
+            start_indices.dims(),
+            start_indices.strides(),
+            start_indices.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref)
 }
 
 fn execute_fused_views<T>(

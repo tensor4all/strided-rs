@@ -57,6 +57,7 @@
 mod block;
 mod fuse;
 mod fused;
+mod gather_plan;
 mod kernel;
 mod order;
 mod simd;
@@ -122,8 +123,9 @@ pub use raw_ops::{
 // Prepared (compile-once, execute-many) plans
 // ============================================================================
 pub use copy_plan::CopyPlan;
-pub use erased::{ErasedCopyPlan, ErasedFusedPlan, ErasedReducePlan, ReduceOp};
+pub use erased::{ErasedCopyPlan, ErasedFusedPlan, ErasedGatherPlan, ErasedReducePlan, ReduceOp};
 pub use exec_context::ExecContext;
+pub use gather_plan::{GatherIndex, GatherPlan, GatherSpec};
 
 // ============================================================================
 // Reduce operations
