@@ -85,7 +85,7 @@ impl ErasedCopyPlan {
     /// `dest = src` through a non-generic dtype-erased replay boundary.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
     ) -> Result<()> {
@@ -93,7 +93,7 @@ impl ErasedCopyPlan {
         self.check_dtype(src.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_copy::<f32>(&self.plan, dest, src),
             KernelDType::F64 => execute_copy::<f64>(&self.plan, dest, src),
             KernelDType::I32 => execute_copy::<i32>(&self.plan, dest, src),
@@ -104,7 +104,7 @@ impl ErasedCopyPlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: `execute_copy` only writes values produced from the
             // already-validated source descriptor for the same dtype.
@@ -167,7 +167,7 @@ impl ErasedSlicePlan {
     /// Execute a static slice into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
     ) -> Result<()> {
@@ -175,7 +175,7 @@ impl ErasedSlicePlan {
         check_dtype(self.dtype, operand.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_slice::<f32>(&self.plan, dest, operand),
             KernelDType::F64 => execute_slice::<f64>(&self.plan, dest, operand),
             KernelDType::I32 => execute_slice::<i32>(&self.plan, dest, operand),
@@ -186,7 +186,7 @@ impl ErasedSlicePlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: static slice writes values read from a descriptor with
             // the same dtype and already-validated byte representation.
@@ -227,7 +227,7 @@ impl ErasedReversePlan {
     /// Execute a reverse into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
     ) -> Result<()> {
@@ -235,7 +235,7 @@ impl ErasedReversePlan {
         check_dtype(self.dtype, operand.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_reverse::<f32>(&self.plan, dest, operand),
             KernelDType::F64 => execute_reverse::<f64>(&self.plan, dest, operand),
             KernelDType::I32 => execute_reverse::<i32>(&self.plan, dest, operand),
@@ -246,7 +246,7 @@ impl ErasedReversePlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: reverse writes values read from a descriptor with the
             // same dtype and already-validated byte representation.
@@ -299,7 +299,7 @@ impl ErasedPadPlan {
     /// Execute pad into an erased output descriptor using one dtype scalar as fill.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         fill: &[u8],
@@ -309,7 +309,7 @@ impl ErasedPadPlan {
         validate_scalar_bytes(self.dtype, fill)?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_pad::<f32>(&self.plan, dest, operand, fill),
             KernelDType::F64 => execute_pad::<f64>(&self.plan, dest, operand, fill),
             KernelDType::I32 => execute_pad::<i32>(&self.plan, dest, operand, fill),
@@ -320,7 +320,7 @@ impl ErasedPadPlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: pad writes either the validated fill scalar or values
             // read from a descriptor with the same validated dtype.
@@ -368,7 +368,7 @@ impl ErasedConcatenatePlan {
     /// Execute concatenate into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         inputs: &[ErasedRawStridedRef<'_>],
     ) -> Result<()> {
@@ -378,7 +378,7 @@ impl ErasedConcatenatePlan {
         }
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs),
             KernelDType::F64 => execute_concatenate::<f64>(&self.plan, dest, inputs),
             KernelDType::I32 => execute_concatenate::<i32>(&self.plan, dest, inputs),
@@ -389,7 +389,7 @@ impl ErasedConcatenatePlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: concatenate writes values read from descriptors with
             // the same dtype and already-validated byte representation.
@@ -787,7 +787,7 @@ impl ErasedGatherPlan {
     /// Execute an indexed read into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         start_indices: &ErasedRawStridedRef<'_>,
@@ -797,7 +797,7 @@ impl ErasedGatherPlan {
         check_dtype(self.index_dtype, start_indices.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_gather_index::<f32>(
                 &self.plan,
                 self.index_dtype,
@@ -850,7 +850,7 @@ impl ErasedGatherPlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: gather writes values read from a descriptor with the
             // same dtype and already-validated byte representation.
@@ -911,7 +911,7 @@ impl ErasedDynamicSlicePlan {
     /// Execute a fixed-window dynamic slice into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         starts: &ErasedRawStridedRef<'_>,
@@ -921,7 +921,7 @@ impl ErasedDynamicSlicePlan {
         check_dtype(self.index_dtype, starts.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_dynamic_slice_index::<f32>(
                 &self.plan,
                 self.index_dtype,
@@ -974,7 +974,7 @@ impl ErasedDynamicSlicePlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: dynamic slice writes values read from a descriptor with
             // the same dtype and already-validated byte representation.
@@ -1037,7 +1037,7 @@ impl ErasedDynamicUpdateSlicePlan {
     /// Execute a dynamic update slice into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         update: &ErasedRawStridedRef<'_>,
@@ -1049,7 +1049,7 @@ impl ErasedDynamicUpdateSlicePlan {
         check_dtype(self.index_dtype, starts.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_dynamic_update_slice_index::<f32>(
                 &self.plan,
                 self.index_dtype,
@@ -1109,7 +1109,7 @@ impl ErasedDynamicUpdateSlicePlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: dynamic-update-slice writes either values copied from
             // `operand` or values read from `update`, both with matching dtype.
@@ -1174,7 +1174,7 @@ impl ErasedScatterPlan {
     /// Execute additive scatter into an erased output descriptor.
     pub fn execute(
         &self,
-        _ctx: &ExecContext,
+        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         scatter_indices: &ErasedRawStridedRef<'_>,
@@ -1186,7 +1186,7 @@ impl ErasedScatterPlan {
         check_dtype(self.index_dtype, scatter_indices.dtype())?;
         dest.validate_data_if_needed()?;
 
-        let result = match self.dtype {
+        let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_scatter_index::<f32>(
                 &self.plan,
                 self.index_dtype,
@@ -1238,7 +1238,7 @@ impl ErasedScatterPlan {
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        };
+        });
         if result.is_ok() {
             // SAFETY: additive scatter copies or adds values with matching,
             // already-validated dtypes.
@@ -1538,20 +1538,22 @@ where
     T: ErasedReduceScalar,
 {
     let source = erased_view::<T>(src);
-    let value = if ctx.is_ambient() {
-        crate::reduce(
-            &source,
-            |value| value,
-            |a, b| reduce_values(op, a, b),
-            reduce_identity(op),
-        )?
-    } else {
+    let value = if ctx.is_serial() {
         crate::reduce_view::reduce_serial(
             &source,
             |value| value,
             |a, b| reduce_values(op, a, b),
             reduce_identity(op),
         )?
+    } else {
+        ctx.run(|| {
+            crate::reduce(
+                &source,
+                |value| value,
+                |a, b| reduce_values(op, a, b),
+                reduce_identity(op),
+            )
+        })?
     };
 
     let dest_offset = dest.offset();
@@ -1586,6 +1588,7 @@ where
             reduce_total,
         } => execute_reduce_axes::<T>(
             op,
+            ctx,
             dest,
             src,
             AxesLayout {
@@ -1605,6 +1608,7 @@ where
 
 fn execute_reduce_axes<T>(
     op: ReduceOp,
+    ctx: &ExecContext,
     dest: &mut ErasedRawStridedMut<'_>,
     src: &ErasedRawStridedRef<'_>,
     layout: AxesLayout<'_>,
@@ -1612,6 +1616,13 @@ fn execute_reduce_axes<T>(
 where
     T: ErasedReduceScalar,
 {
+    if layout.kept_axes.is_empty()
+        && layout.axes.len() == layout.src_dims.len()
+        && layout.dest_total == 1
+    {
+        return execute_reduce::<T>(op, ctx, dest, src);
+    }
+
     if layout.dest_total == 0 {
         return Ok(());
     }
@@ -2097,10 +2108,10 @@ fn execute_fused_views<T>(
 where
     T: FusedScalar,
 {
-    if ctx.is_ambient() {
-        fused_elementwise_into(dests, inputs, plan)
-    } else {
+    if ctx.is_serial() {
         crate::fused::fused_elementwise_into_serial(dests, inputs, plan)
+    } else {
+        ctx.run(|| fused_elementwise_into(dests, inputs, plan))
     }
 }
 
