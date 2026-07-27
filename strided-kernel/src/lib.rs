@@ -122,7 +122,7 @@ pub use raw_ops::{
 // Prepared (compile-once, execute-many) plans
 // ============================================================================
 pub use copy_plan::CopyPlan;
-pub use erased::ErasedCopyPlan;
+pub use erased::{ErasedCopyPlan, ErasedFusedPlan};
 pub use exec_context::ExecContext;
 
 // ============================================================================
