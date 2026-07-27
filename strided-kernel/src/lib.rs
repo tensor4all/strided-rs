@@ -126,9 +126,15 @@ pub use raw_ops::{
 // Prepared (compile-once, execute-many) plans
 // ============================================================================
 pub use copy_plan::CopyPlan;
-pub use erased::{ErasedCopyPlan, ErasedFusedPlan, ErasedGatherPlan, ErasedReducePlan, ReduceOp};
+pub use erased::{
+    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedFusedPlan,
+    ErasedGatherPlan, ErasedReducePlan, ErasedScatterPlan, ReduceOp,
+};
 pub use exec_context::ExecContext;
-pub use gather_plan::{GatherIndex, GatherPlan, GatherSpec};
+pub use gather_plan::{
+    DynamicSlicePlan, DynamicUpdateSlicePlan, GatherIndex, GatherPlan, GatherSpec, ScatterPlan,
+    ScatterSpec,
+};
 
 // ============================================================================
 // Reduce operations

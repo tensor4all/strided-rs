@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use num_complex::Complex64;
 use strided_kernel::{
-    CopyPlan, ErasedCopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan,
-    ExecContext, KernelDType, RawStridedMut, RawStridedRef, ReduceOp,
+    CopyPlan, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
+    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ErasedScatterPlan, ExecContext,
+    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec,
 };
 
 struct CountingAllocator;
@@ -178,4 +179,201 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         allocations, 0,
         "erased reduce-axis execute must not allocate"
     );
+
+    let src_dims = [2usize; 8];
+    let src_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
+    let start_dims = [8usize];
+    let start_strides = [1isize];
+    let slice_dims = [2usize; 8];
+    let slice_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
+    let starts = [0i64; 8];
+    let src: Vec<f64> = (0..256).map(|value| value as f64).collect();
+    let mut dst = vec![0.0f64; 256];
+    let plan = ErasedDynamicSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &src_dims,
+        &src_strides,
+        &start_dims,
+        &start_strides,
+        &slice_dims,
+        &slice_strides,
+        &slice_dims,
+    )
+    .unwrap();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&src), &src_dims, &src_strides, 0)
+            .unwrap();
+    let starts_ref = ErasedRawStridedRef::new(
+        KernelDType::I64,
+        as_bytes(&starts),
+        &start_dims,
+        &start_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &slice_dims,
+        &slice_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source, &starts_ref)
+        .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute(&ExecContext::serial(), &mut dest, &source, &starts_ref)
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased dynamic-slice execute must not allocate"
+    );
+
+    let update_dims = [1usize; 8];
+    let update_strides: Vec<isize> = (0..8).map(|_| 0isize).collect();
+    let starts = [1i64; 8];
+    let update = [7.0f64];
+    let mut dst = vec![0.0f64; 256];
+    let plan = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &src_dims,
+        &src_strides,
+        &start_dims,
+        &start_strides,
+        &update_dims,
+        &update_strides,
+        &src_dims,
+        &src_strides,
+    )
+    .unwrap();
+    let starts_ref = ErasedRawStridedRef::new(
+        KernelDType::I64,
+        as_bytes(&starts),
+        &start_dims,
+        &start_strides,
+        0,
+    )
+    .unwrap();
+    let update_ref = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&update),
+        &update_dims,
+        &update_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(
+        &ExecContext::serial(),
+        &mut dest,
+        &source,
+        &update_ref,
+        &starts_ref,
+    )
+    .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute(
+                &ExecContext::serial(),
+                &mut dest,
+                &source,
+                &update_ref,
+                &starts_ref,
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased dynamic-update-slice execute must not allocate"
+    );
+
+    let index_dims = [4usize, 8];
+    let index_strides = [1isize, 4];
+    let indices: Vec<i64> = (0..8)
+        .flat_map(|axis| (0..4).map(move |batch| ((axis + batch) & 1) as i64))
+        .collect();
+    let update_dims = [4usize];
+    let update_strides = [1isize];
+    let updates = [1.0f64, 2.0, 3.0, 4.0];
+    let mut dst = vec![0.0f64; 256];
+    let plan = ErasedScatterPlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &src_dims,
+        &src_strides,
+        &index_dims,
+        &index_strides,
+        &update_dims,
+        &update_strides,
+        &src_dims,
+        &src_strides,
+        ScatterSpec {
+            update_window_dims: vec![],
+            inserted_window_dims: (0..8).collect(),
+            scatter_dims_to_operand_dims: (0..8).collect(),
+            index_vector_dim: 1,
+        },
+    )
+    .unwrap();
+    let index_ref = ErasedRawStridedRef::new(
+        KernelDType::I64,
+        as_bytes(&indices),
+        &index_dims,
+        &index_strides,
+        0,
+    )
+    .unwrap();
+    let update_ref = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&updates),
+        &update_dims,
+        &update_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(
+        &ExecContext::serial(),
+        &mut dest,
+        &source,
+        &index_ref,
+        &update_ref,
+    )
+    .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute(
+                &ExecContext::serial(),
+                &mut dest,
+                &source,
+                &index_ref,
+                &update_ref,
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(allocations, 0, "erased scatter execute must not allocate");
 }

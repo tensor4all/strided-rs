@@ -1,12 +1,15 @@
-//! Prepared gather plans over raw strided value and index layouts.
+//! Prepared indexed plans over raw strided value and index layouts.
 //!
-//! This module owns the generic indexed-read traversal used by the erased
-//! replay layer. It models the XLA/tenferro gather shape vocabulary, but keeps
-//! tensor allocation, dtype promotion, and frontend error policy outside
-//! `strided-kernel`.
+//! This module owns the generic gather, dynamic-slice/update, and scatter
+//! traversals used by the erased replay layer. It models the XLA/tenferro
+//! indexed shape vocabulary, but keeps tensor allocation, dtype promotion, and
+//! frontend error policy outside `strided-kernel`.
+
+use core::ops::Add;
 
 use crate::{
-    MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
+    CopyPlan, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError,
+    RAW_FUSED_RANK_LIMIT,
 };
 
 #[cfg(feature = "parallel")]
@@ -65,6 +68,77 @@ pub struct GatherPlan {
     spec: GatherSpec,
     batch_shape: AxisVec<usize>,
     out_axis_to_operand_dim: AxisVec<Option<usize>>,
+}
+
+/// Scatter configuration shared by generic and erased replay.
+///
+/// `ScatterPlan` implements tenferro's current additive scatter semantics:
+/// every update value is added to the selected output slot, so overlapping
+/// windows accumulate in deterministic column-major replay order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScatterSpec {
+    pub update_window_dims: Vec<usize>,
+    pub inserted_window_dims: Vec<usize>,
+    pub scatter_dims_to_operand_dims: Vec<usize>,
+    pub index_vector_dim: usize,
+}
+
+/// A compiled fixed-window dynamic-slice traversal.
+#[derive(Clone, Debug)]
+pub struct DynamicSlicePlan {
+    operand_dims: AxisVec<usize>,
+    operand_strides: AxisVec<isize>,
+    start_dims: AxisVec<usize>,
+    start_strides: AxisVec<isize>,
+    dest_dims: AxisVec<usize>,
+    dest_strides: AxisVec<isize>,
+    slice_sizes: AxisVec<usize>,
+    total: usize,
+}
+
+/// A compiled dynamic-update-slice traversal.
+///
+/// Execution first copies `operand` into `dest`, then overwrites the clamped
+/// update window. The plan performs no allocation for ranks at most
+/// [`RAW_FUSED_RANK_LIMIT`].
+#[derive(Clone, Debug)]
+pub struct DynamicUpdateSlicePlan {
+    operand_dims: AxisVec<usize>,
+    operand_strides: AxisVec<isize>,
+    start_dims: AxisVec<usize>,
+    start_strides: AxisVec<isize>,
+    update_dims: AxisVec<usize>,
+    update_strides: AxisVec<isize>,
+    dest_dims: AxisVec<usize>,
+    dest_strides: AxisVec<isize>,
+    total: usize,
+    copy_plan: CopyPlan,
+}
+
+/// A compiled additive scatter traversal.
+///
+/// Execution first copies `operand` into `dest`, then applies additive updates
+/// in deterministic column-major order. Boolean values are intentionally not
+/// supported because additive scatter has no bool semantics.
+#[derive(Clone, Debug)]
+pub struct ScatterPlan {
+    operand_dims: AxisVec<usize>,
+    operand_strides: AxisVec<isize>,
+    index_dims: AxisVec<usize>,
+    index_strides: AxisVec<isize>,
+    update_dims: AxisVec<usize>,
+    update_strides: AxisVec<isize>,
+    dest_dims: AxisVec<usize>,
+    dest_strides: AxisVec<isize>,
+    spec: ScatterSpec,
+    batch_shape: AxisVec<usize>,
+    window_dims: AxisVec<usize>,
+    window_shape: AxisVec<usize>,
+    window_shape_updates: AxisVec<usize>,
+    is_update_window_dim: AxisVec<bool>,
+    batch_elems: usize,
+    window_elems: usize,
+    copy_plan: CopyPlan,
 }
 
 impl GatherPlan {
@@ -327,6 +401,519 @@ impl GatherPlan {
     }
 }
 
+impl DynamicSlicePlan {
+    /// Compile a fixed-window dynamic-slice traversal.
+    ///
+    /// `start_*` describes a rank-1 index vector whose length equals the
+    /// operand rank. `dest_dims` must equal `slice_sizes`.
+    pub fn compile(
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        start_dims: &[usize],
+        start_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        slice_sizes: &[usize],
+    ) -> Result<Self> {
+        if operand_dims.len() != operand_strides.len()
+            || start_dims.len() != start_strides.len()
+            || dest_dims.len() != dest_strides.len()
+        {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        if slice_sizes.len() != operand_dims.len() {
+            return Err(StridedError::RankMismatch(
+                slice_sizes.len(),
+                operand_dims.len(),
+            ));
+        }
+        validate_start_vector(start_dims, operand_dims.len())?;
+        checked_total_len(operand_dims)?;
+        checked_total_len(start_dims)?;
+        let total = checked_total_len(dest_dims)?;
+        if dest_dims != slice_sizes {
+            return Err(StridedError::ShapeMismatch(
+                dest_dims.to_vec(),
+                slice_sizes.to_vec(),
+            ));
+        }
+        if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
+            return Err(StridedError::NonInjectiveOutputLayout);
+        }
+        validate_window_sizes(operand_dims, slice_sizes)?;
+
+        Ok(Self {
+            operand_dims: operand_dims.into(),
+            operand_strides: operand_strides.into(),
+            start_dims: start_dims.into(),
+            start_strides: start_strides.into(),
+            dest_dims: dest_dims.into(),
+            dest_strides: dest_strides.into(),
+            slice_sizes: slice_sizes.into(),
+            total,
+        })
+    }
+
+    /// Execute the prepared dynamic-slice traversal.
+    pub fn execute<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.check_call(dest, operand, starts)?;
+        if self.total == 0 {
+            return Ok(());
+        }
+
+        // Serial replay keeps this fixed-window primitive deterministic until
+        // the execution-policy layer grows indexed-domain partitioning.
+        let mut starts_storage = CoordScratch::new(self.operand_dims.len());
+        let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
+        let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
+        let clamped_starts = starts_storage.as_mut_slice();
+        let dest_idx = dest_idx_storage.as_mut_slice();
+        let operand_idx = operand_idx_storage.as_mut_slice();
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.slice_sizes,
+            clamped_starts,
+        )?;
+
+        let operand_offset_base = operand.offset();
+        let operand_strides = operand.strides();
+        let dest_offset_base = dest.offset();
+        let dest_strides = dest.strides();
+        let operand_data = operand.data();
+        let dest_data = dest.data_mut();
+
+        for _ in 0..self.total {
+            for axis in 0..operand_idx.len() {
+                operand_idx[axis] = clamped_starts[axis] + dest_idx[axis];
+            }
+            let operand_offset =
+                checked_strided_offset(operand_offset_base, operand_strides, operand_idx)?;
+            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
+            unsafe {
+                *dest_data.as_mut_ptr().offset(dest_offset) =
+                    *operand_data.as_ptr().offset(operand_offset);
+            }
+            advance_col_major_index(dest_idx, &self.dest_dims);
+        }
+        Ok(())
+    }
+
+    fn check_call<T, I>(
+        &self,
+        dest: &RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()> {
+        if dest.dims() != &self.dest_dims[..]
+            || dest.strides() != &self.dest_strides[..]
+            || operand.dims() != &self.operand_dims[..]
+            || operand.strides() != &self.operand_strides[..]
+            || starts.dims() != &self.start_dims[..]
+            || starts.strides() != &self.start_strides[..]
+        {
+            return Err(StridedError::PlanLayoutMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl DynamicUpdateSlicePlan {
+    /// Compile a dynamic-update-slice traversal.
+    ///
+    /// `dest_dims` must match `operand_dims`; execution materializes
+    /// `dest = operand` and then overwrites the clamped update window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        start_dims: &[usize],
+        start_strides: &[isize],
+        update_dims: &[usize],
+        update_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+    ) -> Result<Self> {
+        if operand_dims.len() != operand_strides.len()
+            || start_dims.len() != start_strides.len()
+            || update_dims.len() != update_strides.len()
+            || dest_dims.len() != dest_strides.len()
+        {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        if update_dims.len() != operand_dims.len() {
+            return Err(StridedError::RankMismatch(
+                update_dims.len(),
+                operand_dims.len(),
+            ));
+        }
+        validate_start_vector(start_dims, operand_dims.len())?;
+        checked_total_len(operand_dims)?;
+        checked_total_len(start_dims)?;
+        let total = checked_total_len(update_dims)?;
+        if dest_dims != operand_dims {
+            return Err(StridedError::ShapeMismatch(
+                dest_dims.to_vec(),
+                operand_dims.to_vec(),
+            ));
+        }
+        if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
+            return Err(StridedError::NonInjectiveOutputLayout);
+        }
+        validate_window_sizes(operand_dims, update_dims)?;
+        let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
+
+        Ok(Self {
+            operand_dims: operand_dims.into(),
+            operand_strides: operand_strides.into(),
+            start_dims: start_dims.into(),
+            start_strides: start_strides.into(),
+            update_dims: update_dims.into(),
+            update_strides: update_strides.into(),
+            dest_dims: dest_dims.into(),
+            dest_strides: dest_strides.into(),
+            total,
+            copy_plan,
+        })
+    }
+
+    /// Execute the prepared dynamic-update-slice traversal.
+    pub fn execute<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.check_call(dest, operand, update, starts)?;
+        self.copy_plan.execute(dest, operand)?;
+        if self.total == 0 {
+            return Ok(());
+        }
+
+        // Serial replay keeps the copy-then-overwrite boundary explicit until
+        // indexed-domain partitioning is available in the execution policy.
+        let mut starts_storage = CoordScratch::new(self.operand_dims.len());
+        let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
+        let mut dest_idx_storage = CoordScratch::new(self.operand_dims.len());
+        let clamped_starts = starts_storage.as_mut_slice();
+        let update_idx = update_idx_storage.as_mut_slice();
+        let dest_idx = dest_idx_storage.as_mut_slice();
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.update_dims,
+            clamped_starts,
+        )?;
+
+        let update_offset_base = update.offset();
+        let update_strides = update.strides();
+        let dest_offset_base = dest.offset();
+        let dest_strides = dest.strides();
+        let update_data = update.data();
+        let dest_data = dest.data_mut();
+
+        for _ in 0..self.total {
+            for axis in 0..dest_idx.len() {
+                dest_idx[axis] = clamped_starts[axis] + update_idx[axis];
+            }
+            let update_offset =
+                checked_strided_offset(update_offset_base, update_strides, update_idx)?;
+            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
+            unsafe {
+                *dest_data.as_mut_ptr().offset(dest_offset) =
+                    *update_data.as_ptr().offset(update_offset);
+            }
+            advance_col_major_index(update_idx, &self.update_dims);
+        }
+        Ok(())
+    }
+
+    fn check_call<T, I>(
+        &self,
+        dest: &RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()> {
+        if dest.dims() != &self.dest_dims[..]
+            || dest.strides() != &self.dest_strides[..]
+            || operand.dims() != &self.operand_dims[..]
+            || operand.strides() != &self.operand_strides[..]
+            || update.dims() != &self.update_dims[..]
+            || update.strides() != &self.update_strides[..]
+            || starts.dims() != &self.start_dims[..]
+            || starts.strides() != &self.start_strides[..]
+        {
+            return Err(StridedError::PlanLayoutMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl ScatterPlan {
+    /// Compile an additive scatter traversal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        operand_dims: &[usize],
+        operand_strides: &[isize],
+        index_dims: &[usize],
+        index_strides: &[isize],
+        update_dims: &[usize],
+        update_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        spec: ScatterSpec,
+    ) -> Result<Self> {
+        if operand_dims.len() != operand_strides.len()
+            || index_dims.len() != index_strides.len()
+            || update_dims.len() != update_strides.len()
+            || dest_dims.len() != dest_strides.len()
+        {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        checked_total_len(operand_dims)?;
+        checked_total_len(index_dims)?;
+        checked_total_len(update_dims)?;
+        if dest_dims != operand_dims {
+            return Err(StridedError::ShapeMismatch(
+                dest_dims.to_vec(),
+                operand_dims.to_vec(),
+            ));
+        }
+        if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
+            return Err(StridedError::NonInjectiveOutputLayout);
+        }
+
+        let operand_rank = operand_dims.len();
+        validate_unique_axes(&spec.inserted_window_dims, operand_rank)?;
+        validate_unique_axes(&spec.scatter_dims_to_operand_dims, operand_rank)?;
+        if spec.index_vector_dim > index_dims.len() {
+            return Err(StridedError::InvalidAxis {
+                axis: spec.index_vector_dim,
+                rank: index_dims.len() + 1,
+            });
+        }
+        let index_vector_size = if spec.index_vector_dim == index_dims.len() {
+            1
+        } else {
+            index_dims[spec.index_vector_dim]
+        };
+        if index_vector_size != spec.scatter_dims_to_operand_dims.len() {
+            return Err(StridedError::RankMismatch(
+                index_vector_size,
+                spec.scatter_dims_to_operand_dims.len(),
+            ));
+        }
+
+        let batch_shape = index_batch_shape(index_dims, spec.index_vector_dim);
+        let window_dims = operand_window_dims(operand_rank, &spec.inserted_window_dims);
+        if spec.update_window_dims.len() != window_dims.len() {
+            return Err(StridedError::RankMismatch(
+                spec.update_window_dims.len(),
+                window_dims.len(),
+            ));
+        }
+
+        let update_rank = update_dims.len();
+        let expected_batch_rank = update_rank
+            .checked_sub(spec.update_window_dims.len())
+            .ok_or(StridedError::RankMismatch(
+                spec.update_window_dims.len(),
+                update_rank,
+            ))?;
+        if expected_batch_rank != batch_shape.len() {
+            return Err(StridedError::RankMismatch(
+                expected_batch_rank,
+                batch_shape.len(),
+            ));
+        }
+        validate_unique_axes(&spec.update_window_dims, update_rank)?;
+
+        let mut is_update_window_dim: AxisVec<bool> = (0..update_rank).map(|_| false).collect();
+        for &axis in &spec.update_window_dims {
+            is_update_window_dim[axis] = true;
+        }
+
+        let mut batch_axis = 0usize;
+        for axis in 0..update_rank {
+            if !is_update_window_dim[axis] {
+                if update_dims[axis] != batch_shape[batch_axis] {
+                    return Err(StridedError::ShapeMismatch(
+                        update_dims.to_vec(),
+                        expected_scatter_update_shape(&batch_shape, &spec, update_dims).to_vec(),
+                    ));
+                }
+                batch_axis += 1;
+            }
+        }
+
+        let mut window_shape: AxisVec<usize> = (0..operand_rank).map(|_| 1).collect();
+        let mut window_shape_updates: AxisVec<usize> =
+            AxisVec::with_capacity(spec.update_window_dims.len());
+        for (pos, &update_axis) in spec.update_window_dims.iter().enumerate() {
+            let dim = update_dims[update_axis];
+            window_shape_updates.push(dim);
+            window_shape[window_dims[pos]] = dim;
+        }
+        validate_window_sizes(operand_dims, &window_shape)?;
+
+        let batch_elems = checked_total_len(&batch_shape)?;
+        let window_elems = checked_total_len(&window_shape_updates)?;
+        let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
+
+        Ok(Self {
+            operand_dims: operand_dims.into(),
+            operand_strides: operand_strides.into(),
+            index_dims: index_dims.into(),
+            index_strides: index_strides.into(),
+            update_dims: update_dims.into(),
+            update_strides: update_strides.into(),
+            dest_dims: dest_dims.into(),
+            dest_strides: dest_strides.into(),
+            spec,
+            batch_shape,
+            window_dims,
+            window_shape,
+            window_shape_updates,
+            is_update_window_dim,
+            batch_elems,
+            window_elems,
+            copy_plan,
+        })
+    }
+
+    /// Execute the prepared additive scatter traversal.
+    pub fn execute<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + Add<Output = T> + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.check_call(dest, operand, scatter_indices, updates)?;
+        self.copy_plan.execute(dest, operand)?;
+        if self.batch_elems == 0 || self.window_elems == 0 {
+            return Ok(());
+        }
+
+        // Overlapping additive updates are order-sensitive, so this remains a
+        // deterministic serial replay until a combine-aware parallel plan exists.
+        let mut batch_idx_storage = CoordScratch::new(self.batch_shape.len());
+        let mut window_idx_storage = CoordScratch::new(self.window_shape_updates.len());
+        let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
+        let mut operand_base_storage = CoordScratch::new(self.operand_dims.len());
+        let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
+        let batch_idx = batch_idx_storage.as_mut_slice();
+        let window_idx = window_idx_storage.as_mut_slice();
+        let update_idx = update_idx_storage.as_mut_slice();
+        let operand_base = operand_base_storage.as_mut_slice();
+        let operand_idx = operand_idx_storage.as_mut_slice();
+
+        let index_offset_base = scatter_indices.offset();
+        let index_strides = scatter_indices.strides();
+        let index_data = scatter_indices.data();
+        let update_offset_base = updates.offset();
+        let update_strides = updates.strides();
+        let update_data = updates.data();
+        let dest_offset_base = dest.offset();
+        let dest_strides = dest.strides();
+        let dest_data = dest.data_mut();
+
+        for _ in 0..self.batch_elems {
+            operand_base.fill(0);
+            for (component, &operand_dim) in
+                self.spec.scatter_dims_to_operand_dims.iter().enumerate()
+            {
+                let start = index_component(
+                    scatter_indices.dims(),
+                    index_strides,
+                    index_offset_base,
+                    index_data,
+                    self.spec.index_vector_dim,
+                    batch_idx,
+                    component,
+                )?;
+                operand_base[operand_dim] = clamp_window_start(
+                    start,
+                    self.operand_dims[operand_dim],
+                    self.window_shape[operand_dim],
+                );
+            }
+
+            window_idx.fill(0);
+            for _ in 0..self.window_elems {
+                let mut batch_axis = 0usize;
+                let mut window_axis = 0usize;
+                for axis in 0..self.update_dims.len() {
+                    if self.is_update_window_dim[axis] {
+                        update_idx[axis] = window_idx[window_axis];
+                        window_axis += 1;
+                    } else {
+                        update_idx[axis] = batch_idx[batch_axis];
+                        batch_axis += 1;
+                    }
+                }
+
+                operand_idx.copy_from_slice(operand_base);
+                for (window_axis, &operand_axis) in self.window_dims.iter().enumerate() {
+                    operand_idx[operand_axis] += window_idx[window_axis];
+                }
+
+                let update_offset =
+                    checked_strided_offset(update_offset_base, update_strides, update_idx)?;
+                let dest_offset =
+                    checked_strided_offset(dest_offset_base, dest_strides, operand_idx)?;
+                unsafe {
+                    let slot = dest_data.as_mut_ptr().offset(dest_offset);
+                    *slot = *slot + *update_data.as_ptr().offset(update_offset);
+                }
+                advance_col_major_index(window_idx, &self.window_shape_updates);
+            }
+            advance_col_major_index(batch_idx, &self.batch_shape);
+        }
+        Ok(())
+    }
+
+    fn check_call<T, I>(
+        &self,
+        dest: &RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+    ) -> Result<()> {
+        if dest.dims() != &self.dest_dims[..]
+            || dest.strides() != &self.dest_strides[..]
+            || operand.dims() != &self.operand_dims[..]
+            || operand.strides() != &self.operand_strides[..]
+            || scatter_indices.dims() != &self.index_dims[..]
+            || scatter_indices.strides() != &self.index_strides[..]
+            || updates.dims() != &self.update_dims[..]
+            || updates.strides() != &self.update_strides[..]
+        {
+            return Err(StridedError::PlanLayoutMismatch);
+        }
+        Ok(())
+    }
+}
+
 fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
     let mut seen = vec![false; rank];
     for &axis in axes {
@@ -339,6 +926,104 @@ fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
         seen[axis] = true;
     }
     Ok(())
+}
+
+fn validate_start_vector(start_dims: &[usize], operand_rank: usize) -> Result<()> {
+    if start_dims.len() != 1 {
+        return Err(StridedError::RankMismatch(start_dims.len(), 1));
+    }
+    if start_dims[0] != operand_rank {
+        return Err(StridedError::RankMismatch(start_dims[0], operand_rank));
+    }
+    Ok(())
+}
+
+fn validate_window_sizes(operand_dims: &[usize], window_sizes: &[usize]) -> Result<()> {
+    if operand_dims.len() != window_sizes.len() {
+        return Err(StridedError::RankMismatch(
+            window_sizes.len(),
+            operand_dims.len(),
+        ));
+    }
+    for (axis, (&window, &dim)) in window_sizes.iter().zip(operand_dims.iter()).enumerate() {
+        if window > dim {
+            return Err(StridedError::InvalidAxis {
+                axis,
+                rank: operand_dims.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_clamped_starts<I>(
+    starts: &RawStridedRef<'_, I>,
+    operand_dims: &[usize],
+    window_sizes: &[usize],
+    out: &mut [usize],
+) -> Result<()>
+where
+    I: GatherIndex,
+{
+    debug_assert_eq!(operand_dims.len(), window_sizes.len());
+    debug_assert_eq!(operand_dims.len(), out.len());
+    for axis in 0..operand_dims.len() {
+        let offset = checked_offset_add(starts.offset(), starts.strides()[0], axis)?;
+        let start = unsafe { *starts.data().as_ptr().offset(offset) }.to_i64();
+        out[axis] = clamp_window_start(start, operand_dims[axis], window_sizes[axis]);
+    }
+    Ok(())
+}
+
+fn index_component<I>(
+    index_dims: &[usize],
+    index_strides: &[isize],
+    index_offset_base: isize,
+    index_data: &[I],
+    index_vector_dim: usize,
+    batch_idx: &[usize],
+    component: usize,
+) -> Result<i64>
+where
+    I: GatherIndex,
+{
+    let mut offset = index_offset_base;
+    let mut batch_axis = 0usize;
+    for axis in 0..index_dims.len() {
+        let coord = if axis == index_vector_dim {
+            component
+        } else {
+            let coord = batch_idx[batch_axis];
+            batch_axis += 1;
+            coord
+        };
+        offset = checked_offset_add(offset, index_strides[axis], coord)?;
+    }
+    Ok(unsafe { *index_data.as_ptr().offset(offset) }.to_i64())
+}
+
+#[inline]
+fn clamp_window_start(start: i64, dim_size: usize, window_size: usize) -> usize {
+    let max_start = dim_size.saturating_sub(window_size) as i64;
+    start.clamp(0, max_start) as usize
+}
+
+fn expected_scatter_update_shape(
+    batch_shape: &[usize],
+    spec: &ScatterSpec,
+    update_dims: &[usize],
+) -> AxisVec<usize> {
+    let mut expected: AxisVec<usize> = AxisVec::with_capacity(update_dims.len());
+    let mut batch_axis = 0usize;
+    for axis in 0..update_dims.len() {
+        if spec.update_window_dims.contains(&axis) {
+            expected.push(update_dims[axis]);
+        } else {
+            expected.push(batch_shape[batch_axis]);
+            batch_axis += 1;
+        }
+    }
+    expected
 }
 
 fn operand_window_dims(rank: usize, collapsed_slice_dims: &[usize]) -> AxisVec<usize> {
