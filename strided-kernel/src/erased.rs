@@ -13,7 +13,7 @@
 //! Mutable erased descriptors only re-scan value-constrained dtypes, currently
 //! `bool`, after their raw bytes have escaped through `data_mut`.
 
-use core::ops::{Add, Mul};
+use core::ops::Add;
 
 use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
@@ -1089,7 +1089,7 @@ fn execute_reduce<T>(
     src: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Mul<Output = T> + One + Zero + crate::MaybeSendSync,
+    T: ErasedReduceScalar,
 {
     let source = erased_view::<T>(src);
     let value = if ctx.is_ambient() {
@@ -1124,7 +1124,7 @@ fn dispatch_reduce<T>(
     src: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Mul<Output = T> + One + Zero + crate::MaybeSendSync,
+    T: ErasedReduceScalar,
 {
     match layout {
         ReduceLayout::Full { .. } => execute_reduce::<T>(op, ctx, dest, src),
@@ -1164,7 +1164,7 @@ fn execute_reduce_axes<T>(
     layout: AxesLayout<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Mul<Output = T> + One + Zero + crate::MaybeSendSync,
+    T: ErasedReduceScalar,
 {
     if layout.dest_total == 0 {
         return Ok(());
@@ -1222,13 +1222,57 @@ where
 #[inline]
 fn reduce_values<T>(op: ReduceOp, a: T, b: T) -> T
 where
-    T: Add<Output = T> + Mul<Output = T>,
+    T: ErasedReduceScalar,
 {
     match op {
-        ReduceOp::Sum => a + b,
-        ReduceOp::Product => a * b,
+        ReduceOp::Sum => T::reduce_sum(a, b),
+        ReduceOp::Product => T::reduce_product(a, b),
     }
 }
+
+trait ErasedReduceScalar: Copy + One + Zero + crate::MaybeSendSync {
+    fn reduce_sum(lhs: Self, rhs: Self) -> Self;
+    fn reduce_product(lhs: Self, rhs: Self) -> Self;
+}
+
+macro_rules! impl_default_erased_reduce_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ErasedReduceScalar for $ty {
+                #[inline(always)]
+                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
+                    lhs + rhs
+                }
+
+                #[inline(always)]
+                fn reduce_product(lhs: Self, rhs: Self) -> Self {
+                    lhs * rhs
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! impl_wrapping_erased_reduce_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ErasedReduceScalar for $ty {
+                #[inline(always)]
+                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
+                    lhs.wrapping_add(rhs)
+                }
+
+                #[inline(always)]
+                fn reduce_product(lhs: Self, rhs: Self) -> Self {
+                    lhs.wrapping_mul(rhs)
+                }
+            }
+        )*
+    };
+}
+
+impl_default_erased_reduce_scalar!(f32, f64, Complex32, Complex64);
+impl_wrapping_erased_reduce_scalar!(i32, i64);
 
 fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
     let mut seen = vec![false; rank];
