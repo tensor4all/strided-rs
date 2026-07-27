@@ -583,10 +583,9 @@ fn try_contiguous_range_mul<
 
     #[cfg(feature = "parallel")]
     {
-        let nthreads = rayon::current_num_threads();
+        let nthreads = crate::execution_policy::rayon_threads();
         if nthreads > 1 {
-            use crate::threading::SendPtr;
-            use rayon::prelude::*;
+            use crate::threading::{parallel_for_each, SendPtr};
 
             let dst = SendPtr(dst_ptr);
             let a = SendPtr(a_ptr as *mut A);
@@ -596,39 +595,41 @@ fn try_contiguous_range_mul<
                 let chunk_len = total.div_ceil(nthreads);
                 let nchunks = total.div_ceil(chunk_len);
 
-                (0..nchunks).into_par_iter().for_each(|chunk| {
-                    let start = chunk * chunk_len;
-                    let end = (start + chunk_len).min(total);
-                    let mut index = start;
+                parallel_for_each(0..nchunks, nthreads, &|chunks| {
+                    for chunk in chunks {
+                        let start = chunk * chunk_len;
+                        let end = (start + chunk_len).min(total);
+                        let mut index = start;
 
-                    while index < end {
-                        let in_inner = index % inner_len;
-                        let len = (inner_len - in_inner).min(end - index);
-                        let a_offset = strided_offset_for_contiguous_linear_index(
-                            dims,
-                            a_strides,
-                            &plan.axis_order,
-                            index,
-                        );
-                        let b_offset = strided_offset_for_contiguous_linear_index(
-                            dims,
-                            b_strides,
-                            &plan.axis_order,
-                            index,
-                        );
-
-                        unsafe {
-                            inner_loop_mul2::<D, A, B>(
-                                dst.as_ptr().add(index),
-                                1,
-                                a.as_const().offset(a_offset),
-                                plan.a_fast_stride,
-                                b.as_const().offset(b_offset),
-                                plan.b_fast_stride,
-                                len,
+                        while index < end {
+                            let in_inner = index % inner_len;
+                            let len = (inner_len - in_inner).min(end - index);
+                            let a_offset = strided_offset_for_contiguous_linear_index(
+                                dims,
+                                a_strides,
+                                &plan.axis_order,
+                                index,
                             );
+                            let b_offset = strided_offset_for_contiguous_linear_index(
+                                dims,
+                                b_strides,
+                                &plan.axis_order,
+                                index,
+                            );
+
+                            unsafe {
+                                inner_loop_mul2::<D, A, B>(
+                                    dst.as_ptr().add(index),
+                                    1,
+                                    a.as_const().offset(a_offset),
+                                    plan.a_fast_stride,
+                                    b.as_const().offset(b_offset),
+                                    plan.b_fast_stride,
+                                    len,
+                                );
+                            }
+                            index += len;
                         }
-                        index += len;
                     }
                 });
 
@@ -638,27 +639,34 @@ fn try_contiguous_range_mul<
             let groups_per_chunk = outer_groups.div_ceil(nthreads);
             let nchunks = outer_groups.div_ceil(groups_per_chunk);
 
-            (0..nchunks).into_par_iter().for_each(|chunk| {
-                let group_start = chunk * groups_per_chunk;
-                let group_end = (group_start + groups_per_chunk).min(outer_groups);
-                let mut cursor =
-                    ContiguousMulOuterCursor::new(dims, a_strides, b_strides, &plan, group_start);
+            parallel_for_each(0..nchunks, nthreads, &|chunks| {
+                for chunk in chunks {
+                    let group_start = chunk * groups_per_chunk;
+                    let group_end = (group_start + groups_per_chunk).min(outer_groups);
+                    let mut cursor = ContiguousMulOuterCursor::new(
+                        dims,
+                        a_strides,
+                        b_strides,
+                        &plan,
+                        group_start,
+                    );
 
-                for group in group_start..group_end {
-                    let index = group * block_len;
-                    unsafe {
-                        run_contiguous_mul_row_block::<D, A, B>(
-                            dst.as_ptr(),
-                            a.as_const(),
-                            b.as_const(),
-                            &plan,
-                            index,
-                            total,
-                            cursor.a_offset,
-                            cursor.b_offset,
-                        );
+                    for group in group_start..group_end {
+                        let index = group * block_len;
+                        unsafe {
+                            run_contiguous_mul_row_block::<D, A, B>(
+                                dst.as_ptr(),
+                                a.as_const(),
+                                b.as_const(),
+                                &plan,
+                                index,
+                                total,
+                                cursor.a_offset,
+                                cursor.b_offset,
+                            );
+                        }
+                        cursor.advance();
                     }
-                    cursor.advance();
                 }
             });
 
@@ -890,15 +898,14 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
             let src_send = SendPtr(src_ptr as *mut A);
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1000,7 +1007,8 @@ pub fn zip_map2_into<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
             let a_send = SendPtr(a_ptr as *mut A);
@@ -1008,8 +1016,6 @@ pub fn zip_map2_into<
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1120,7 +1126,8 @@ fn mul_identity_into_raw<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
             let a_send = SendPtr(a_ptr as *mut A);
@@ -1128,8 +1135,6 @@ fn mul_identity_into_raw<
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1365,7 +1370,8 @@ pub fn zip_map3_into<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
             let a_send = SendPtr(a_ptr as *mut A);
@@ -1374,8 +1380,6 @@ pub fn zip_map3_into<
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1519,7 +1523,8 @@ pub fn zip_map4_into<
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
             let dst_send = SendPtr(dst_ptr);
             let a_send = SendPtr(a_ptr as *mut A);
@@ -1529,8 +1534,6 @@ pub fn zip_map4_into<
 
             let costs = compute_costs(&ordered_strides);
             let initial_offsets = vec![0isize; strides_list.len()];
-            let nthreads = rayon::current_num_threads();
-
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,

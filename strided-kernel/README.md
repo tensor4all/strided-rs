@@ -76,6 +76,35 @@ The library automatically optimizes iteration order for cache efficiency:
 strided-kernel = { path = "../strided-kernel", features = ["parallel"] }
 ```
 
+The default `ExecutionPolicy::AmbientRayon` behavior uses the current installed
+Rayon pool (or the global pool). Explicit runtimes can bound strided-owned
+fanout without creating another pool:
+
+```rust
+use std::num::NonZeroUsize;
+use strided_kernel::{
+    map_into, with_execution_policy, ExecutionPolicy, StridedArray,
+};
+
+let source = StridedArray::<f64>::from_fn_col_major(&[4], |index| index[0] as f64);
+let mut destination = StridedArray::<f64>::col_major(&[4]);
+let max_threads = NonZeroUsize::new(2).unwrap();
+
+with_execution_policy(ExecutionPolicy::Rayon { max_threads }, || {
+    map_into(&mut destination.view_mut(), &source.view(), |value| value + 1.0).unwrap();
+});
+assert_eq!(destination.into_data(), vec![1.0, 2.0, 3.0, 4.0]);
+```
+
+`ExecutionPolicy` controls fanout, not CPU placement or pool construction.
+Nested strided operations inside a bounded worker partition run sequentially.
+The opaque parallel permutation-copy path is used under an explicit Rayon
+policy only when the installed pool size fits the requested budget; otherwise
+that copy falls back to its serial implementation because the external copy
+cannot be capped per call.
+The policy is worker-local; callbacks that depend on isolation from unrelated
+work must not invoke their own Rayon scheduling or yielding APIs.
+
 ## Benchmarks
 
 Run all benchmarks (single-threaded + multi-threaded, Rust + Julia):

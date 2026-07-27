@@ -616,7 +616,7 @@ pub(crate) fn total_len(dims: &[usize]) -> usize {
 pub(crate) fn use_sequential_fast_path(total: usize) -> bool {
     #[cfg(feature = "parallel")]
     {
-        total <= crate::threading::MINTHREADLENGTH || rayon::current_num_threads() <= 1
+        total <= crate::threading::MINTHREADLENGTH || crate::execution_policy::rayon_threads() <= 1
     }
     #[cfg(not(feature = "parallel"))]
     {

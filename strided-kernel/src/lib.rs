@@ -10,6 +10,8 @@
 //! - [`StridedArray`]: Owned strided multidimensional array
 //! - [`ElementOp`] trait and implementations ([`Identity`], [`Conj`], [`Transpose`], [`Adjoint`]):
 //!   Type-level element operations applied lazily on access
+//! - [`ExecutionPolicy`] / [`with_execution_policy`]: optional bounds on
+//!   strided-owned CPU fanout without creating a Rayon pool
 //!
 //! # Primary API (view-based, Julia-compatible)
 //!
@@ -55,16 +57,17 @@
 //! - Contiguous arrays use fast paths bypassing the blocking machinery
 
 mod block;
+mod execution_policy;
 mod fuse;
 mod fused;
 mod gather_plan;
 mod kernel;
 mod order;
 mod simd;
-#[cfg(feature = "parallel")]
 mod threading;
 
 mod maybe_sync;
+pub use execution_policy::{with_execution_policy, ExecutionPolicy};
 pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 
 // View-based operation modules

@@ -79,33 +79,36 @@ where
         }));
     }
 
-    // Parallel contiguous fast path: split into rayon chunks with slice-based iteration.
+    // Parallel contiguous fast path: split into scheduler chunks with slice-based iteration.
     // This enables LLVM auto-vectorization on each chunk, unlike the general threaded path
     // which uses scalar pointer-offset loops.
     #[cfg(feature = "parallel")]
     {
         let total = total_len(src_dims);
-        if allow_ambient_parallel
-            && total > MINTHREADLENGTH
-            && rayon::current_num_threads() > 1
+        let nthreads = if allow_ambient_parallel {
+            crate::execution_policy::rayon_threads()
+        } else {
+            1
+        };
+        if total > MINTHREADLENGTH
+            && nthreads > 1
             && same_contiguous_layout(src_dims, &[src_strides]).is_some()
         {
             let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total) };
-            use rayon::prelude::*;
-            let nthreads = rayon::current_num_threads();
-            let chunk_size = (total + nthreads - 1) / nthreads;
-            let result = src_slice
-                .par_chunks(chunk_size)
-                .map(|chunk| {
-                    simd::dispatch_if_large(chunk.len(), || {
+            let result = crate::threading::parallel_map_reduce(
+                0..total,
+                nthreads,
+                &|range| {
+                    simd::dispatch_if_large(range.len(), || {
                         let mut acc = init.clone();
-                        for &val in chunk.iter() {
+                        for &val in &src_slice[range] {
                             acc = reduce_fn(acc, map_fn(Op::apply(val)));
                         }
                         acc
                     })
-                })
-                .reduce(|| init.clone(), |a, b| reduce_fn(a, b));
+                },
+                &|a, b| reduce_fn(a, b),
+            );
             return Ok(result);
         }
     }
@@ -118,8 +121,12 @@ where
     #[cfg(feature = "parallel")]
     {
         let total: usize = fused_dims.iter().product();
-        if allow_ambient_parallel && total > MINTHREADLENGTH && rayon::current_num_threads() > 1 {
-            let nthreads = rayon::current_num_threads();
+        let nthreads = if allow_ambient_parallel {
+            crate::execution_policy::rayon_threads()
+        } else {
+            1
+        };
+        if total > MINTHREADLENGTH && nthreads > 1 {
             // False sharing avoidance: space output slots by cache line size
             let spacing = (64 / std::mem::size_of::<U>()).max(1);
             let mut threadedout = vec![init.clone(); spacing * nthreads];
@@ -283,6 +290,9 @@ where
 
     let out_ptr = out.view_mut().as_mut_ptr();
 
+    // This remains a dedicated sequential traversal: each output owns a mutable
+    // reduction accumulator, which does not fit the current alias-safe strided
+    // fanout primitive without adding a separate reduction-output partitioner.
     let initial_offsets = vec![0isize; ordered_strides.len()];
     for_each_inner_block_preordered(
         &fused_dims,
