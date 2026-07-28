@@ -59,3 +59,8 @@ harness = false
 [[bench]]
 name = "fused_elementwise"
 harness = false
+
+[[bench]]
+name = "erased_policy_thresholds"
+harness = false
+required-features = ["parallel"]
