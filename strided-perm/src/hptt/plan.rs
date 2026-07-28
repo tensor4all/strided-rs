@@ -3,7 +3,7 @@
 //! Mirrors HPTT C++'s plan construction: bilateral fusion → identify stride-1
 //! dims → determine execution mode → compute loop order → build ComputeNode chain.
 
-use crate::fuse::fuse_dims_bilateral;
+use crate::fuse::plan_bilateral_fusion;
 use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
 
 /// A node in the recursive loop structure.
@@ -94,7 +94,11 @@ pub(crate) fn build_permute_plan(
     elem_size: usize,
 ) -> PermutePlan {
     // Phase 1: Bilateral dimension fusion
-    let (fused_dims, fused_src, fused_dst) = fuse_dims_bilateral(dims, src_strides, dst_strides);
+    let fusion = plan_bilateral_fusion(dims, src_strides, dst_strides)
+        .expect("HPTT permutation metadata is prevalidated");
+    let fused_dims = fusion.dims;
+    let fused_src = fusion.src_strides;
+    let fused_dst = fusion.dst_strides;
 
     let rank = fused_dims.len();
     if rank == 0 {

@@ -9,6 +9,7 @@ description = "Cache-efficient tensor permutation / transpose (HPTT-inspired)."
 
 [dependencies]
 strided-view.workspace = true
+thiserror.workspace = true
 rayon = { workspace = true, optional = true }
 
 [features]
