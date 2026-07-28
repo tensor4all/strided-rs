@@ -1477,7 +1477,7 @@ fn execute_pad<T>(
     fill: &[u8],
 ) -> Result<()>
 where
-    T: Copy,
+    T: Copy + crate::MaybeSendSync,
 {
     let fill = read_unaligned_scalar::<T>(fill);
     let operand_data = typed_slice::<T>(operand.data());
@@ -1627,10 +1627,84 @@ where
         return Ok(());
     }
 
+    if ctx.is_serial() {
+        execute_reduce_axes_serial::<T>(op, dest, src, layout)
+    } else {
+        ctx.run(|| execute_reduce_axes_policy::<T>(op, dest, src, layout))
+    }
+}
+
+fn execute_reduce_axes_policy<T>(
+    op: ReduceOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    src: &ErasedRawStridedRef<'_>,
+    layout: AxesLayout<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+{
     let source_data = typed_slice::<T>(src.data());
     let dest_offset_base = dest.offset();
     let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
+        if nthreads > 1 {
+            return execute_reduce_axes_parallel(
+                op,
+                dest_offset_base,
+                dest_data,
+                src.offset(),
+                source_data,
+                layout,
+                nthreads,
+            );
+        }
+    }
 
+    execute_reduce_axes_serial_data(
+        op,
+        dest_offset_base,
+        dest_data,
+        src.offset(),
+        source_data,
+        layout,
+    )
+}
+
+fn execute_reduce_axes_serial<T>(
+    op: ReduceOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    src: &ErasedRawStridedRef<'_>,
+    layout: AxesLayout<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+{
+    let source_data = typed_slice::<T>(src.data());
+    let dest_offset_base = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    execute_reduce_axes_serial_data(
+        op,
+        dest_offset_base,
+        dest_data,
+        src.offset(),
+        source_data,
+        layout,
+    )
+}
+
+fn execute_reduce_axes_serial_data<T>(
+    op: ReduceOp,
+    dest_offset_base: isize,
+    dest_data: &mut [T],
+    source_offset_base: isize,
+    source_data: &[T],
+    layout: AxesLayout<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+{
     let mut out_idx_storage = CoordScratch::new(layout.dest_dims.len());
     let mut reduce_idx_storage = CoordScratch::new(layout.reduce_dims.len());
     let mut src_idx_storage = CoordScratch::new(layout.src_dims.len());
@@ -1650,7 +1724,8 @@ where
             for (reduce_axis, &src_axis) in layout.axes.iter().enumerate() {
                 src_idx[src_axis] = reduce_idx[reduce_axis];
             }
-            let source_offset = checked_strided_offset(src.offset(), layout.src_strides, src_idx)?;
+            let source_offset =
+                checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
             let value = unsafe { *source_data.as_ptr().offset(source_offset) };
             acc = reduce_values(op, acc, value);
             advance_col_major_index(reduce_idx, layout.reduce_dims);
@@ -1663,6 +1738,70 @@ where
         advance_col_major_index(out_idx, layout.dest_dims);
     }
     Ok(())
+}
+
+#[cfg(feature = "parallel")]
+fn execute_reduce_axes_parallel<T>(
+    op: ReduceOp,
+    dest_offset_base: isize,
+    dest_data: &mut [T],
+    source_offset_base: isize,
+    source_data: &[T],
+    layout: AxesLayout<'_>,
+    nthreads: usize,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+{
+    let dest_ptr = crate::threading::SendPtr(dest_data.as_mut_ptr());
+    let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
+    crate::threading::parallel_map_reduce(
+        0..layout.dest_total,
+        nthreads,
+        &|range| {
+            let mut out_idx_storage = CoordScratch::new(layout.dest_dims.len());
+            let mut reduce_idx_storage = CoordScratch::new(layout.reduce_dims.len());
+            let mut src_idx_storage = CoordScratch::new(layout.src_dims.len());
+            let out_idx = out_idx_storage.as_mut_slice();
+            let reduce_idx = reduce_idx_storage.as_mut_slice();
+            let src_idx = src_idx_storage.as_mut_slice();
+            fill_col_major_index(range.start, layout.dest_dims, out_idx);
+            let dest_ptr = dest_ptr.as_ptr();
+            let source_ptr = source_ptr.as_const();
+
+            for _ in range {
+                src_idx.fill(0);
+                for (dest_axis, &src_axis) in layout.kept_axes.iter().enumerate() {
+                    src_idx[src_axis] = out_idx[dest_axis];
+                }
+
+                let mut acc = reduce_identity(op);
+                reduce_idx.fill(0);
+                for _ in 0..layout.reduce_total {
+                    for (reduce_axis, &src_axis) in layout.axes.iter().enumerate() {
+                        src_idx[src_axis] = reduce_idx[reduce_axis];
+                    }
+                    let source_offset =
+                        checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
+                    let value = unsafe { *source_ptr.offset(source_offset) };
+                    acc = reduce_values(op, acc, value);
+                    advance_col_major_index(reduce_idx, layout.reduce_dims);
+                }
+
+                let dest_offset =
+                    checked_strided_offset(dest_offset_base, layout.dest_strides, out_idx)?;
+                unsafe {
+                    // SAFETY: axis reduction writes exactly one scalar per
+                    // logical output position, and compile rejected
+                    // non-injective destination layouts.
+                    *dest_ptr.offset(dest_offset) = acc;
+                }
+                advance_col_major_index(out_idx, layout.dest_dims);
+            }
+            Ok(())
+        },
+        &|left, right| left.and(right),
+    )
 }
 
 #[inline]
@@ -1768,6 +1907,15 @@ fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
             return;
         }
         index[axis] = 0;
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
+    for (axis, coord) in out.iter_mut().enumerate() {
+        let dim = shape[axis];
+        *coord = linear % dim;
+        linear /= dim;
     }
 }
 

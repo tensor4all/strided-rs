@@ -68,6 +68,7 @@ pub struct GatherPlan {
     spec: GatherSpec,
     batch_shape: AxisVec<usize>,
     out_axis_to_operand_dim: AxisVec<Option<usize>>,
+    total: usize,
 }
 
 /// Scatter configuration shared by generic and erased replay.
@@ -160,7 +161,7 @@ impl GatherPlan {
         }
         checked_total_len(operand_dims)?;
         checked_total_len(index_dims)?;
-        checked_total_len(dest_dims)?;
+        let total = checked_total_len(dest_dims)?;
         if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
@@ -257,6 +258,7 @@ impl GatherPlan {
             spec,
             batch_shape,
             out_axis_to_operand_dim,
+            total,
         })
     }
 
@@ -282,9 +284,15 @@ impl GatherPlan {
         I: GatherIndex,
     {
         self.check_call(dest, operand, start_indices)?;
-        let total = checked_total_len(&self.dest_dims)?;
-        if total == 0 {
+        if self.total == 0 {
             return Ok(());
+        }
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.total);
+            if nthreads > 1 {
+                return self.execute_parallel(dest, operand, start_indices, nthreads);
+            }
         }
 
         let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
@@ -306,7 +314,7 @@ impl GatherPlan {
         let index_data = start_indices.data();
         let dest_data = dest.data_mut();
 
-        for _ in 0..total {
+        for _ in 0..self.total {
             window_offsets.fill(0);
             let mut batch_axis = 0usize;
             for (out_axis, &operand_dim) in self.out_axis_to_operand_dim.iter().enumerate() {
@@ -345,6 +353,92 @@ impl GatherPlan {
             advance_col_major_index(out_idx, &self.dest_dims);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn execute_parallel<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        start_indices: &RawStridedRef<'_, I>,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        let dest_offset_base = dest.offset();
+        let operand_offset_base = operand.offset();
+        let index_offset_base = start_indices.offset();
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
+        let index_ptr = crate::threading::SendPtr(start_indices.data().as_ptr() as *mut I);
+
+        crate::threading::parallel_map_reduce(
+            0..self.total,
+            nthreads,
+            &|range| {
+                let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
+                let mut batch_idx_storage = CoordScratch::new(self.batch_shape.len());
+                let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
+                let mut window_offsets_storage = CoordScratch::new(self.operand_dims.len());
+                let out_idx = out_idx_storage.as_mut_slice();
+                let batch_idx = batch_idx_storage.as_mut_slice();
+                let operand_idx = operand_idx_storage.as_mut_slice();
+                let window_offsets = window_offsets_storage.as_mut_slice();
+                fill_col_major_index(range.start, &self.dest_dims, out_idx);
+                let dest_ptr = dest_ptr.as_ptr();
+                let operand_ptr = operand_ptr.as_const();
+                let index_ptr = index_ptr.as_const();
+
+                for _ in range {
+                    window_offsets.fill(0);
+                    let mut batch_axis = 0usize;
+                    for (out_axis, &operand_dim) in self.out_axis_to_operand_dim.iter().enumerate()
+                    {
+                        match operand_dim {
+                            Some(axis) => window_offsets[axis] = out_idx[out_axis],
+                            None => {
+                                batch_idx[batch_axis] = out_idx[out_axis];
+                                batch_axis += 1;
+                            }
+                        }
+                    }
+
+                    operand_idx.fill(0);
+                    for (component, &operand_dim) in self.spec.start_index_map.iter().enumerate() {
+                        let start = self.index_component_ptr(
+                            start_indices.dims(),
+                            index_offset_base,
+                            index_ptr,
+                            batch_idx,
+                            component,
+                        )?;
+                        operand_idx[operand_dim] = self.clamp_window_start(start, operand_dim);
+                    }
+                    for axis in 0..operand_idx.len() {
+                        operand_idx[axis] += window_offsets[axis];
+                    }
+
+                    let dest_offset =
+                        checked_strided_offset(dest_offset_base, &self.dest_strides, out_idx)?;
+                    let operand_offset = checked_strided_offset(
+                        operand_offset_base,
+                        &self.operand_strides,
+                        operand_idx,
+                    )?;
+                    unsafe {
+                        // SAFETY: gather writes one value per logical output,
+                        // and compile rejected non-injective destination
+                        // layouts.
+                        *dest_ptr.offset(dest_offset) = *operand_ptr.offset(operand_offset);
+                    }
+                    advance_col_major_index(out_idx, &self.dest_dims);
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
     }
 
     fn check_call<T, I>(
@@ -390,6 +484,33 @@ impl GatherPlan {
             offset = checked_offset_add(offset, index_strides[axis], coord)?;
         }
         Ok(unsafe { *index_data.as_ptr().offset(offset) }.to_i64())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn index_component_ptr<I>(
+        &self,
+        index_dims: &[usize],
+        index_offset_base: isize,
+        index_ptr: *const I,
+        batch_idx: &[usize],
+        component: usize,
+    ) -> Result<i64>
+    where
+        I: GatherIndex,
+    {
+        let mut offset = index_offset_base;
+        let mut batch_axis = 0usize;
+        for axis in 0..index_dims.len() {
+            let coord = if axis == self.spec.index_vector_dim {
+                component
+            } else {
+                let coord = batch_idx[batch_axis];
+                batch_axis += 1;
+                coord
+            };
+            offset = checked_offset_add(offset, self.index_strides[axis], coord)?;
+        }
+        Ok(unsafe { *index_ptr.offset(offset) }.to_i64())
     }
 
     #[inline]
@@ -469,9 +590,14 @@ impl DynamicSlicePlan {
         if self.total == 0 {
             return Ok(());
         }
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.total);
+            if nthreads > 1 {
+                return self.execute_parallel(dest, operand, starts, nthreads);
+            }
+        }
 
-        // Serial replay keeps this fixed-window primitive deterministic until
-        // the execution-policy layer grows indexed-domain partitioning.
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
         let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
         let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
@@ -506,6 +632,68 @@ impl DynamicSlicePlan {
             advance_col_major_index(dest_idx, &self.dest_dims);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn execute_parallel<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        let mut clamped_starts: AxisVec<usize> = (0..self.operand_dims.len()).map(|_| 0).collect();
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.slice_sizes,
+            &mut clamped_starts,
+        )?;
+
+        let operand_offset_base = operand.offset();
+        let dest_offset_base = dest.offset();
+        let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+
+        crate::threading::parallel_map_reduce(
+            0..self.total,
+            nthreads,
+            &|range| {
+                let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
+                let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
+                let dest_idx = dest_idx_storage.as_mut_slice();
+                let operand_idx = operand_idx_storage.as_mut_slice();
+                fill_col_major_index(range.start, &self.dest_dims, dest_idx);
+                let operand_ptr = operand_ptr.as_const();
+                let dest_ptr = dest_ptr.as_ptr();
+
+                for _ in range {
+                    for axis in 0..operand_idx.len() {
+                        operand_idx[axis] = clamped_starts[axis] + dest_idx[axis];
+                    }
+                    let operand_offset = checked_strided_offset(
+                        operand_offset_base,
+                        &self.operand_strides,
+                        operand_idx,
+                    )?;
+                    let dest_offset =
+                        checked_strided_offset(dest_offset_base, &self.dest_strides, dest_idx)?;
+                    unsafe {
+                        // SAFETY: dynamic slice writes one value per logical
+                        // output, and compile rejected non-injective
+                        // destination layouts.
+                        *dest_ptr.offset(dest_offset) = *operand_ptr.offset(operand_offset);
+                    }
+                    advance_col_major_index(dest_idx, &self.dest_dims);
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
     }
 
     fn check_call<T, I>(
@@ -603,9 +791,14 @@ impl DynamicUpdateSlicePlan {
         if self.total == 0 {
             return Ok(());
         }
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.total);
+            if nthreads > 1 {
+                return self.execute_update_parallel(dest, update, starts, nthreads);
+            }
+        }
 
-        // Serial replay keeps the copy-then-overwrite boundary explicit until
-        // indexed-domain partitioning is available in the execution policy.
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
         let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
         let mut dest_idx_storage = CoordScratch::new(self.operand_dims.len());
@@ -640,6 +833,68 @@ impl DynamicUpdateSlicePlan {
             advance_col_major_index(update_idx, &self.update_dims);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn execute_update_parallel<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        let mut clamped_starts: AxisVec<usize> = (0..self.operand_dims.len()).map(|_| 0).collect();
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.update_dims,
+            &mut clamped_starts,
+        )?;
+
+        let update_offset_base = update.offset();
+        let dest_offset_base = dest.offset();
+        let update_ptr = crate::threading::SendPtr(update.data().as_ptr() as *mut T);
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+
+        crate::threading::parallel_map_reduce(
+            0..self.total,
+            nthreads,
+            &|range| {
+                let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
+                let mut dest_idx_storage = CoordScratch::new(self.operand_dims.len());
+                let update_idx = update_idx_storage.as_mut_slice();
+                let dest_idx = dest_idx_storage.as_mut_slice();
+                fill_col_major_index(range.start, &self.update_dims, update_idx);
+                let update_ptr = update_ptr.as_const();
+                let dest_ptr = dest_ptr.as_ptr();
+
+                for _ in range {
+                    for axis in 0..dest_idx.len() {
+                        dest_idx[axis] = clamped_starts[axis] + update_idx[axis];
+                    }
+                    let update_offset = checked_strided_offset(
+                        update_offset_base,
+                        &self.update_strides,
+                        update_idx,
+                    )?;
+                    let dest_offset =
+                        checked_strided_offset(dest_offset_base, &self.dest_strides, dest_idx)?;
+                    unsafe {
+                        // SAFETY: each update-domain logical index maps to a
+                        // distinct destination position for a fixed window, and
+                        // compile rejected non-injective destination layouts.
+                        *dest_ptr.offset(dest_offset) = *update_ptr.offset(update_offset);
+                    }
+                    advance_col_major_index(update_idx, &self.update_dims);
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
     }
 
     fn check_call<T, I>(
@@ -1075,6 +1330,15 @@ fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
             return;
         }
         index[axis] = 0;
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
+    for (axis, coord) in out.iter_mut().enumerate() {
+        let dim = shape[axis];
+        *coord = linear % dim;
+        linear /= dim;
     }
 }
 
