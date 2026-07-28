@@ -27,6 +27,34 @@ Additive scatter remains order-sensitive when updates overlap. Treat its
 benchmark as evidence for future design, not as permission for a blanket
 parallel implementation.
 
+## Initial Threshold Decision
+
+The initial implementation uses the repository threading threshold,
+`threading::MINTHREADLENGTH` (`1 << 15` elements), as the single source of
+truth. A family enters a parallel replay only when:
+
+- the active execution policy exposes more than one worker;
+- the family-specific independent output/update/copy domain has more than
+  `MINTHREADLENGTH` logical elements.
+
+Small tensors, `ExecContext::serial()`, `ExecContext::max_threads(1)`, nested
+fanout, and single-thread pools remain on the serial replay path.
+
+The policy-aware parallel replay covers:
+
+- axis reductions by partitioning the output domain while preserving the serial
+  reduction order inside each output element;
+- gather;
+- dynamic slice;
+- dynamic-update-slice overwrite phase after the serial copy phase;
+- pad fill and input-copy phases.
+
+Additive scatter still applies overlapping additive updates in deterministic
+serial order. Raw `CopyPlan` replay also remains serial for now: the initial
+range-partitioned prototype was slower than the serial fused loop for large
+contiguous copies in an exploratory 2-thread run. A parallel raw-copy path
+needs a chunked inner-run design, not per-element coordinate replay.
+
 ## Running
 
 The benchmark defaults to a conservative two-thread comparison when

@@ -252,32 +252,122 @@ impl PadPlan {
         fill: T,
     ) -> Result<()>
     where
-        T: Copy,
+        T: Copy + MaybeSendSync,
     {
         self.check_call(dest, operand)?;
-        let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
-        let dest_data = dest.data_mut();
-
-        if self.dest_total != 0 {
-            let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
-            let dest_idx = dest_idx_storage.as_mut_slice();
-            for _ in 0..self.dest_total {
-                let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
-                unsafe {
-                    *dest_data.as_mut_ptr().offset(dest_offset) = fill;
-                }
-                advance_col_major_index(dest_idx, &self.dest_dims);
-            }
-        }
+        self.fill_dest(dest, fill)?;
 
         if self.operand_total == 0 {
             return Ok(());
         }
+        self.copy_operand(dest, operand)
+    }
 
+    fn fill_dest<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        if self.dest_total == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.dest_total);
+            if nthreads > 1 {
+                return self.fill_dest_parallel(dest, fill, nthreads);
+            }
+        }
+        self.fill_dest_serial(dest, fill)
+    }
+
+    fn fill_dest_serial<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T) -> Result<()>
+    where
+        T: Copy,
+    {
+        let dest_offset_base = dest.offset();
+        let dest_strides = dest.strides();
+        let dest_data = dest.data_mut();
+        let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
+        let dest_idx = dest_idx_storage.as_mut_slice();
+        for _ in 0..self.dest_total {
+            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
+            unsafe {
+                *dest_data.as_mut_ptr().offset(dest_offset) = fill;
+            }
+            advance_col_major_index(dest_idx, &self.dest_dims);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn fill_dest_parallel<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        fill: T,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let dest_offset_base = dest.offset();
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        crate::threading::parallel_map_reduce(
+            0..self.dest_total,
+            nthreads,
+            &|range| {
+                let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
+                let dest_idx = dest_idx_storage.as_mut_slice();
+                fill_col_major_index(range.start, &self.dest_dims, dest_idx);
+                let dest_ptr = dest_ptr.as_ptr();
+                for _ in range {
+                    let dest_offset =
+                        checked_strided_offset(dest_offset_base, &self.dest_strides, dest_idx)?;
+                    unsafe {
+                        // SAFETY: `compile` rejected non-injective destination
+                        // layouts, and each logical destination index is visited
+                        // by exactly one range partition.
+                        *dest_ptr.offset(dest_offset) = fill;
+                    }
+                    advance_col_major_index(dest_idx, &self.dest_dims);
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
+    }
+
+    fn copy_operand<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.operand_total);
+            if nthreads > 1 {
+                return self.copy_operand_parallel(dest, operand, nthreads);
+            }
+        }
+        self.copy_operand_serial(dest, operand)
+    }
+
+    fn copy_operand_serial<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy,
+    {
         let operand_offset_base = operand.offset();
         let operand_strides = operand.strides();
         let operand_data = operand.data();
+        let dest_offset_base = dest.offset();
+        let dest_strides = dest.strides();
+        let dest_data = dest.data_mut();
         let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
         let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
         let input_idx = input_idx_storage.as_mut_slice();
@@ -306,6 +396,67 @@ impl PadPlan {
             advance_col_major_index(input_idx, &self.operand_dims);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn copy_operand_parallel<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let operand_offset_base = operand.offset();
+        let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
+        let dest_offset_base = dest.offset();
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        crate::threading::parallel_map_reduce(
+            0..self.operand_total,
+            nthreads,
+            &|range| {
+                let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
+                let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
+                let input_idx = input_idx_storage.as_mut_slice();
+                let out_idx = out_idx_storage.as_mut_slice();
+                fill_col_major_index(range.start, &self.operand_dims, input_idx);
+                let operand_ptr = operand_ptr.as_const();
+                let dest_ptr = dest_ptr.as_ptr();
+
+                for _ in range {
+                    let mut in_bounds = true;
+                    for axis in 0..self.operand_dims.len() {
+                        let out_pos = i128::from(self.edge_padding_low[axis])
+                            + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
+                        if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
+                            in_bounds = false;
+                            break;
+                        }
+                        out_idx[axis] = out_pos as usize;
+                    }
+                    if in_bounds {
+                        let operand_offset = checked_strided_offset(
+                            operand_offset_base,
+                            &self.operand_strides,
+                            input_idx,
+                        )?;
+                        let dest_offset =
+                            checked_strided_offset(dest_offset_base, &self.dest_strides, out_idx)?;
+                        unsafe {
+                            // SAFETY: positive interior steps make the
+                            // input-to-output mapping injective for in-bounds
+                            // positions; the destination layout is also
+                            // injective.
+                            *dest_ptr.offset(dest_offset) = *operand_ptr.offset(operand_offset);
+                        }
+                    }
+                    advance_col_major_index(input_idx, &self.operand_dims);
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
     }
 
     fn check_call<T>(
@@ -643,6 +794,15 @@ fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
             return;
         }
         index[axis] = 0;
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
+    for (axis, coord) in out.iter_mut().enumerate() {
+        let dim = shape[axis];
+        *coord = linear % dim;
+        linear /= dim;
     }
 }
 

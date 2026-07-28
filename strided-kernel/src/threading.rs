@@ -59,6 +59,19 @@ impl<T> SendPtr<T> {
 pub(crate) const MINTHREADLENGTH: usize = 1 << 15;
 
 #[cfg(feature = "parallel")]
+pub(crate) fn parallel_threads_for_len(len: usize) -> usize {
+    if len <= MINTHREADLENGTH {
+        return 1;
+    }
+    let nthreads = crate::execution_policy::rayon_threads();
+    if nthreads > 1 {
+        nthreads
+    } else {
+        1
+    }
+}
+
+#[cfg(feature = "parallel")]
 fn join_with_policy<A, B, RA, RB>(policy: crate::ExecutionPolicy, left: A, right: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,
@@ -477,6 +490,23 @@ mod tests {
 
         // Single dimension
         assert_eq!(streaming_lastargmax(&[100], &[2]), 0);
+    }
+
+    #[test]
+    fn parallel_threads_for_len_honors_policy_and_threshold() {
+        let two = NonZeroUsize::new(2).unwrap();
+        let four = NonZeroUsize::new(4).unwrap();
+
+        with_execution_policy(ExecutionPolicy::Rayon { max_threads: two }, || {
+            assert_eq!(parallel_threads_for_len(MINTHREADLENGTH), 1);
+            assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1), 2);
+        });
+        with_execution_policy(ExecutionPolicy::Rayon { max_threads: four }, || {
+            assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1), 4);
+        });
+        with_execution_policy(ExecutionPolicy::Sequential, || {
+            assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1), 1);
+        });
     }
 
     #[test]

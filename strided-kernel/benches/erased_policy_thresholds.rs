@@ -108,7 +108,7 @@ fn patterned_i32(len: usize) -> Vec<i32> {
 fn bench_axis_reduce(c: &mut Criterion) {
     let mut group = c.benchmark_group("erased_axis_reduce_sum");
     for case in profile_cases() {
-        let rows = 64usize;
+        let rows = 2usize;
         let columns = (case.len / rows).max(1);
         let src_dims = [rows, columns];
         let src_strides = col_major_strides(&src_dims);
