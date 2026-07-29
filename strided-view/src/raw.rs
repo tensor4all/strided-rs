@@ -8,6 +8,7 @@
 use crate::element_op::Identity;
 use crate::view::validate_bounds;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use num_complex::{Complex32, Complex64};
 
@@ -394,6 +395,80 @@ impl<'a> ErasedRawStridedMut<'a> {
     /// be exactly `0` or `1` before a typed `bool` slice is formed.
     pub unsafe fn assume_data_valid(&mut self) {
         self.needs_data_revalidation = false;
+    }
+}
+
+/// Borrowed dtype-erased raw strided output whose reachable elements may be
+/// uninitialized.
+///
+/// This descriptor is only accepted by operations that prove and perform a
+/// full overwrite of every reachable logical destination element. The backing
+/// allocation may contain non-reachable holes, which remain uninitialized.
+#[derive(Debug)]
+pub struct ErasedRawStridedUninitMut<'a> {
+    dtype: KernelDType,
+    data: &'a mut [MaybeUninit<u8>],
+    dims: &'a [usize],
+    strides: &'a [isize],
+    offset: isize,
+}
+
+impl<'a> ErasedRawStridedUninitMut<'a> {
+    /// Create an uninitialized erased output descriptor after validating byte
+    /// length, alignment, rank/stride agreement, and reachable bounds.
+    pub fn new(
+        dtype: KernelDType,
+        data: &'a mut [MaybeUninit<u8>],
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let data_ptr =
+            NonNull::new(data.as_mut_ptr().cast::<u8>()).unwrap_or_else(NonNull::dangling);
+        let element_count = validate_erased_buffer_layout(dtype, data_ptr, data.len())?;
+        validate_bounds(element_count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data,
+            dims,
+            strides,
+            offset,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        self.data.as_ptr().cast::<u8>()
+    }
+
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.data
+    }
+
+    #[inline]
+    pub fn dims(&self) -> &'a [usize] {
+        self.dims
+    }
+
+    #[inline]
+    pub fn strides(&self) -> &'a [isize] {
+        self.strides
+    }
+
+    #[inline]
+    pub fn offset(&self) -> isize {
+        self.offset
     }
 }
 

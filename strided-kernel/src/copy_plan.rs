@@ -9,11 +9,15 @@
 //! replay it with no planning and no heap allocation for ranks at most
 //! [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
 
+use core::mem::MaybeUninit;
 use core::ops::Mul;
 
+use crate::map_view::map_raw_into;
 use crate::ops_view::{copy_conj, copy_into, copy_scale};
 use crate::raw_ops::{apply_fused_pair, fuse_pair_layout, FusedPairLayout};
-use crate::{ElementOpApply, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
+use crate::{
+    ElementOpApply, Identity, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError,
+};
 
 // Same pattern as map_view.rs / outer_product.rs: stack storage when the
 // parallel feature pulls in smallvec, plain Vec otherwise. Only `compile`
@@ -104,7 +108,11 @@ impl CopyPlan {
     /// by [`RawStridedRef::new`]/[`RawStridedMut::new`] (or asserted by the
     /// caller of the `new_unchecked` constructors), so layout equality is the
     /// complete precondition for the unsafe-free fused replay below.
-    fn check_call<T>(&self, dest: &RawStridedMut<'_, T>, src: &RawStridedRef<'_, T>) -> Result<()> {
+    fn check_call<D, S>(
+        &self,
+        dest: &RawStridedMut<'_, D>,
+        src: &RawStridedRef<'_, S>,
+    ) -> Result<()> {
         if dest.dims() != &self.dims[..]
             || src.dims() != &self.dims[..]
             || dest.strides() != &self.dst_strides[..]
@@ -113,6 +121,36 @@ impl CopyPlan {
             return Err(StridedError::PlanLayoutMismatch);
         }
         Ok(())
+    }
+
+    /// `dest = src` into a potentially uninitialized destination.
+    ///
+    /// On success every reachable logical destination element is initialized.
+    /// Non-reachable holes in the backing allocation are not written.
+    pub fn execute_uninit<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        src: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        self.check_call(dest, src)?;
+        match &self.fused {
+            Some(layout) => {
+                apply_fused_pair(
+                    dest,
+                    src,
+                    layout,
+                    |dst, value| {
+                        dst.write(value);
+                    },
+                    |value| value,
+                );
+                Ok(())
+            }
+            None => map_raw_into::<MaybeUninit<T>, T, Identity>(dest, src, MaybeUninit::new),
+        }
     }
 
     /// `dest = src`. Allocation-free for ranks at most [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).

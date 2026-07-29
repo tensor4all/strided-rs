@@ -13,17 +13,17 @@
 //! Mutable erased descriptors only re-scan value-constrained dtypes, currently
 //! `bool`, after their raw bytes have escaped through `data_mut`.
 
-use core::ops::Add;
+use core::{mem::MaybeUninit, ops::Add};
 
 use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
 
 use crate::{
     fused_elementwise_into, ConcatenatePlan, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
-    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ExecContext, FusedPlan,
-    FusedScalar, GatherIndex, GatherPlan, GatherSpec, Identity, KernelDType, PadPlan,
-    RawStridedMut, RawStridedRef, Result, ReversePlan, ScatterPlan, ScatterSpec, SlicePlan,
-    StridedError, StridedView, StridedViewMut, RAW_FUSED_RANK_LIMIT,
+    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
+    ExecContext, FusedPlan, FusedScalar, GatherIndex, GatherPlan, GatherSpec, Identity,
+    KernelDType, PadPlan, RawStridedMut, RawStridedRef, Result, ReversePlan, ScatterPlan,
+    ScatterSpec, SlicePlan, StridedError, StridedView, StridedViewMut, RAW_FUSED_RANK_LIMIT,
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
@@ -345,6 +345,32 @@ impl ErasedSlicePlan {
         }
         result
     }
+
+    /// Execute a static slice as a full overwrite of uninitialized output storage.
+    pub fn execute_uninit(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        let operand = validated_input_ref(operand)?;
+
+        ctx.run(|| match self.dtype {
+            KernelDType::F32 => execute_slice_uninit::<f32>(&self.plan, dest, &operand),
+            KernelDType::F64 => execute_slice_uninit::<f64>(&self.plan, dest, &operand),
+            KernelDType::I32 => execute_slice_uninit::<i32>(&self.plan, dest, &operand),
+            KernelDType::I64 => execute_slice_uninit::<i64>(&self.plan, dest, &operand),
+            KernelDType::Bool => execute_slice_uninit::<bool>(&self.plan, dest, &operand),
+            KernelDType::C32 => execute_slice_uninit::<Complex32>(&self.plan, dest, &operand),
+            KernelDType::C64 => execute_slice_uninit::<Complex64>(&self.plan, dest, &operand),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        })
+    }
 }
 
 impl ErasedReversePlan {
@@ -404,6 +430,32 @@ impl ErasedReversePlan {
             }
         }
         result
+    }
+
+    /// Execute reverse as a full overwrite of uninitialized output storage.
+    pub fn execute_uninit(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        let operand = validated_input_ref(operand)?;
+
+        ctx.run(|| match self.dtype {
+            KernelDType::F32 => execute_reverse_uninit::<f32>(&self.plan, dest, &operand),
+            KernelDType::F64 => execute_reverse_uninit::<f64>(&self.plan, dest, &operand),
+            KernelDType::I32 => execute_reverse_uninit::<i32>(&self.plan, dest, &operand),
+            KernelDType::I64 => execute_reverse_uninit::<i64>(&self.plan, dest, &operand),
+            KernelDType::Bool => execute_reverse_uninit::<bool>(&self.plan, dest, &operand),
+            KernelDType::C32 => execute_reverse_uninit::<Complex32>(&self.plan, dest, &operand),
+            KernelDType::C64 => execute_reverse_uninit::<Complex64>(&self.plan, dest, &operand),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        })
     }
 }
 
@@ -479,6 +531,34 @@ impl ErasedPadPlan {
         }
         result
     }
+
+    /// Execute pad as a full overwrite of uninitialized output storage.
+    pub fn execute_uninit(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        fill: &[u8],
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_scalar_bytes(self.dtype, fill)?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        let operand = validated_input_ref(operand)?;
+
+        ctx.run(|| match self.dtype {
+            KernelDType::F32 => execute_pad_uninit::<f32>(&self.plan, dest, &operand, fill),
+            KernelDType::F64 => execute_pad_uninit::<f64>(&self.plan, dest, &operand, fill),
+            KernelDType::I32 => execute_pad_uninit::<i32>(&self.plan, dest, &operand, fill),
+            KernelDType::I64 => execute_pad_uninit::<i64>(&self.plan, dest, &operand, fill),
+            KernelDType::Bool => execute_pad_uninit::<bool>(&self.plan, dest, &operand, fill),
+            KernelDType::C32 => execute_pad_uninit::<Complex32>(&self.plan, dest, &operand, fill),
+            KernelDType::C64 => execute_pad_uninit::<Complex64>(&self.plan, dest, &operand, fill),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        })
+    }
 }
 
 impl ErasedConcatenatePlan {
@@ -547,6 +627,40 @@ impl ErasedConcatenatePlan {
             }
         }
         result
+    }
+
+    /// Execute concatenate as a full overwrite of uninitialized output storage.
+    pub fn execute_uninit(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        inputs: &[ErasedRawStridedPtr<'_>],
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        if inputs.len() != self.plan.input_count() {
+            return Err(StridedError::RankMismatch(
+                inputs.len(),
+                self.plan.input_count(),
+            ));
+        }
+        for (position, input) in inputs.iter().enumerate() {
+            check_dtype(self.dtype, input.dtype())?;
+            validate_uninit_no_overlap(dest, input, position)?;
+            validated_input_ref(input)?;
+        }
+
+        ctx.run(|| match self.dtype {
+            KernelDType::F32 => execute_concatenate_uninit::<f32>(&self.plan, dest, inputs),
+            KernelDType::F64 => execute_concatenate_uninit::<f64>(&self.plan, dest, inputs),
+            KernelDType::I32 => execute_concatenate_uninit::<i32>(&self.plan, dest, inputs),
+            KernelDType::I64 => execute_concatenate_uninit::<i64>(&self.plan, dest, inputs),
+            KernelDType::Bool => execute_concatenate_uninit::<bool>(&self.plan, dest, inputs),
+            KernelDType::C32 => execute_concatenate_uninit::<Complex32>(&self.plan, dest, inputs),
+            KernelDType::C64 => execute_concatenate_uninit::<Complex64>(&self.plan, dest, inputs),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        })
     }
 }
 
@@ -1520,6 +1634,26 @@ fn validate_no_overlap(
     }
 }
 
+fn validate_uninit_no_overlap(
+    dest: &ErasedRawStridedUninitMut<'_>,
+    input: &ErasedRawStridedPtr<'_>,
+    input_index: usize,
+) -> Result<()> {
+    let dest_start = dest.data_ptr() as usize;
+    let input_start = input.data_ptr() as usize;
+    let Some(dest_end) = dest_start.checked_add(dest.byte_len()) else {
+        return Err(StridedError::OffsetOverflow);
+    };
+    let Some(input_end) = input_start.checked_add(input.byte_len()) else {
+        return Err(StridedError::OffsetOverflow);
+    };
+    if dest_start < input_end && input_start < dest_end {
+        Err(StridedError::OverlappingInputOutput { input: input_index })
+    } else {
+        Ok(())
+    }
+}
+
 trait OneShotScalar: Copy + crate::MaybeSendSync + 'static {
     const INTEGER: bool = false;
     fn is_zero(_value: Self) -> bool {
@@ -1980,6 +2114,32 @@ where
     plan.execute(&mut dest_ref, &operand_ref)
 }
 
+fn execute_slice_uninit<T>(
+    plan: &SlicePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute_uninit(&mut dest_ref, &operand_ref)
+}
+
 fn execute_reverse<T>(
     plan: &ReversePlan,
     dest: &mut ErasedRawStridedMut<'_>,
@@ -2004,6 +2164,32 @@ where
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.execute(&mut dest_ref, &operand_ref)
+}
+
+fn execute_reverse_uninit<T>(
+    plan: &ReversePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    let operand_data = typed_slice::<T>(operand.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute_uninit(&mut dest_ref, &operand_ref)
 }
 
 fn execute_pad<T>(
@@ -2034,6 +2220,34 @@ where
     plan.execute(&mut dest_ref, &operand_ref, fill)
 }
 
+fn execute_pad_uninit<T>(
+    plan: &PadPlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    fill: &[u8],
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    let fill = read_unaligned_scalar::<T>(fill);
+    let operand_data = typed_slice::<T>(operand.data());
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute_uninit(&mut dest_ref, &operand_ref, fill)
+}
+
 fn execute_concatenate<T>(
     plan: &ConcatenatePlan,
     dest: &mut ErasedRawStridedMut<'_>,
@@ -2059,7 +2273,50 @@ where
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
         plan.check_input_layout(position, &input_ref)?;
+        plan.segment_offset(position, dest_offset)?;
+    }
+    for (position, input) in inputs.iter().enumerate() {
+        let input_data = typed_slice::<T>(input.data());
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
         plan.execute_segment(position, &mut dest_ref, &input_ref)?;
+    }
+    Ok(())
+}
+
+fn execute_concatenate_uninit<T>(
+    plan: &ConcatenatePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    inputs: &[ErasedRawStridedPtr<'_>],
+) -> Result<()>
+where
+    T: Copy + crate::MaybeSendSync,
+{
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.check_dest_layout(&dest_ref)?;
+
+    for (position, input) in inputs.iter().enumerate() {
+        let input = validated_input_ref(input)?;
+        let input_data = typed_slice::<T>(input.data());
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.check_input_layout(position, &input_ref)?;
+        plan.segment_offset(position, dest_offset)?;
+    }
+    for (position, input) in inputs.iter().enumerate() {
+        let input = validated_input_ref(input)?;
+        let input_data = typed_slice::<T>(input.data());
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.execute_segment_uninit(position, &mut dest_ref, &input_ref)?;
     }
     Ok(())
 }
@@ -2827,6 +3084,19 @@ fn typed_slice_mut<T>(bytes: &mut [u8]) -> &mut [T] {
             bytes.len() / core::mem::size_of::<T>(),
         )
     }
+}
+
+fn typed_uninit_slice_mut<T>(bytes: &mut [MaybeUninit<u8>]) -> &mut [MaybeUninit<T>] {
+    if bytes.is_empty() {
+        return unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::NonNull::<MaybeUninit<T>>::dangling().as_ptr(),
+                0,
+            )
+        };
+    }
+    let len = bytes.len() / core::mem::size_of::<T>();
+    unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<MaybeUninit<T>>(), len) }
 }
 
 fn read_unaligned_scalar<T>(bytes: &[u8]) -> T

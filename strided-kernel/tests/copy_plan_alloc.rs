@@ -6,15 +6,17 @@
 //! unrelated tests.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use num_complex::Complex64;
 use strided_kernel::{
     erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan, ErasedConcatenatePlan,
     ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedMapOp,
-    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedReducePlan,
-    ErasedReversePlan, ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, ExecContext, Identity,
-    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
+    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
+    ErasedRawStridedUninitMut, ErasedReducePlan, ErasedReversePlan, ErasedScatterPlan,
+    ErasedSlicePlan, ErasedZipOp, ExecContext, Identity, KernelDType, RawStridedMut, RawStridedRef,
+    ReduceOp, ScatterSpec, StridedView, StridedViewMut,
 };
 
 struct CountingAllocator;
@@ -60,6 +62,15 @@ fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
         core::slice::from_raw_parts_mut(
             data.as_mut_ptr().cast::<u8>(),
             data.len() * core::mem::size_of::<T>(),
+        )
+    }
+}
+
+fn as_uninit_bytes_mut<T>(data: &mut [MaybeUninit<T>]) -> &mut [MaybeUninit<u8>] {
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            data.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            core::mem::size_of_val(data),
         )
     }
 }
@@ -485,6 +496,26 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "erased slice execute must not allocate");
+    let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); 256];
+    let mut uninit_dest = ErasedRawStridedUninitMut::new(
+        KernelDType::F64,
+        as_uninit_bytes_mut(&mut uninit_dst),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let source_ptr = ErasedRawStridedPtr::from_ref(&source);
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute_uninit(&ExecContext::serial(), &mut uninit_dest, &source_ptr)
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased uninitialized slice execute must not allocate"
+    );
 
     let axes: Vec<usize> = (0..8).collect();
     let mut dst = vec![0.0f64; 256];
@@ -514,6 +545,25 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "erased reverse execute must not allocate");
+    let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); 256];
+    let mut uninit_dest = ErasedRawStridedUninitMut::new(
+        KernelDType::F64,
+        as_uninit_bytes_mut(&mut uninit_dst),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute_uninit(&ExecContext::serial(), &mut uninit_dest, &source_ptr)
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased uninitialized reverse execute must not allocate"
+    );
 
     let edge = [0i64; 8];
     let interior = [0i64; 8];
@@ -548,6 +598,30 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "erased pad execute must not allocate");
+    let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); 256];
+    let mut uninit_dest = ErasedRawStridedUninitMut::new(
+        KernelDType::F64,
+        as_uninit_bytes_mut(&mut uninit_dst),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute_uninit(
+                &ExecContext::serial(),
+                &mut uninit_dest,
+                &source_ptr,
+                as_bytes(&fill),
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased uninitialized pad execute must not allocate"
+    );
 
     let mut left_dims = [2usize; 8];
     left_dims[0] = 1;
@@ -605,6 +679,29 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     assert_eq!(
         allocations, 0,
         "erased concatenate execute must not allocate"
+    );
+    let input_ptrs = [
+        ErasedRawStridedPtr::from_ref(&inputs[0]),
+        ErasedRawStridedPtr::from_ref(&inputs[1]),
+    ];
+    let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); 256];
+    let mut uninit_dest = ErasedRawStridedUninitMut::new(
+        KernelDType::F64,
+        as_uninit_bytes_mut(&mut uninit_dst),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute_uninit(&ExecContext::serial(), &mut uninit_dest, &input_ptrs)
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased uninitialized concatenate execute must not allocate"
     );
 }
 
