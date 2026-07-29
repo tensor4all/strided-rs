@@ -203,6 +203,37 @@ fn erased_reduce_plan_fixed_bounded_context_is_bitwise_repeatable() {
     }
 }
 
+#[cfg(feature = "parallel")]
+#[test]
+fn erased_sum_squares_fixed_bounded_context_is_bitwise_repeatable() {
+    let dims = [131_073usize];
+    let strides = [1isize];
+    let input = (0..dims[0])
+        .map(|index| match index % 4 {
+            0 => 1.0e6,
+            1 => 1.0,
+            2 => -1.0e6,
+            _ => -0.5,
+        })
+        .collect::<Vec<f64>>();
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &dims, &strides).unwrap();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &strides, 0).unwrap();
+    let ctx = ExecContext::max_threads(4).unwrap();
+    let mut expected = None;
+
+    for _ in 0..8 {
+        let mut output = [0.0f64];
+        let mut dest =
+            ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut output), &[], &[], 0)
+                .unwrap();
+        plan.execute(&ctx, &mut dest, &source).unwrap();
+        let bits = output[0].to_bits();
+        assert_eq!(*expected.get_or_insert(bits), bits);
+    }
+}
+
 #[test]
 fn erased_reduce_plan_preserves_noncompact_and_nonfinite_semantics() {
     let dims = [2usize, 2];
@@ -802,4 +833,341 @@ fn erased_reduce_plan_rejects_invalid_compile_layout() {
         ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &[2, 3], &[1]).unwrap_err();
 
     assert!(matches!(err, StridedError::StrideLengthMismatch));
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_matches_materialized_full_reduction() {
+    let dims = [5usize];
+    let strides = [-1isize];
+    let input = [1.5f64, -2.0, 3.25, -4.5, 0.125, 99.0];
+    let expected = input[..5].iter().map(|&value| value * value).sum::<f64>();
+    let mut serial_output = [0.0f64];
+    let mut max_one_output = [0.0f64];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &dims, &strides).unwrap();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &strides, 4).unwrap();
+
+    let mut serial_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut serial_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    plan.execute(&ExecContext::serial(), &mut serial_dest, &source)
+        .unwrap();
+
+    let mut max_one_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut max_one_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    plan.execute(
+        &ExecContext::max_threads(1).unwrap(),
+        &mut max_one_dest,
+        &source,
+    )
+    .unwrap();
+
+    assert_eq!(serial_output, [expected]);
+    assert_eq!(max_one_output[0].to_bits(), serial_output[0].to_bits());
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_is_bitwise_materialized_sum() {
+    let dims = [257usize];
+    let strides = [1isize];
+    let input = (0..dims[0])
+        .map(|index| match index % 5 {
+            0 => 1.0e100,
+            1 => -1.0e-100,
+            2 => index as f64 * 0.25,
+            3 => -3.5,
+            _ => 0.0,
+        })
+        .collect::<Vec<_>>();
+    let squared = input
+        .iter()
+        .copied()
+        .map(|value| value * value)
+        .collect::<Vec<_>>();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &strides, 0).unwrap();
+    let squared_source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&squared), &dims, &strides, 0).unwrap();
+    let sum_squares_plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &dims, &strides).unwrap();
+    let sum_plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides).unwrap();
+    let mut fused_output = [0.0f64];
+    let mut materialized_output = [0.0f64];
+    let mut fused_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut fused_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    let mut materialized_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut materialized_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+
+    sum_squares_plan
+        .execute(&ExecContext::serial(), &mut fused_dest, &source)
+        .unwrap();
+    sum_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut materialized_dest,
+            &squared_source,
+        )
+        .unwrap();
+
+    assert_eq!(fused_output[0].to_bits(), materialized_output[0].to_bits());
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_matches_materialized_axis_reduction() {
+    let src_dims = [2usize, 3, 2];
+    let src_strides = [1isize, 2, 6];
+    let input = [
+        1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, -10.0, 11.0, -12.0,
+    ];
+    let dest_dims = [3usize];
+    let dest_strides = [2isize];
+    let mut output = [-1.0f32; 5];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F32,
+        ReduceOp::SumSquares,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 2],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::F32,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F32,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::max_threads(2).unwrap(), &mut dest, &source)
+        .unwrap();
+
+    let expected = [
+        1.0f32.powi(2) + (-2.0f32).powi(2) + 7.0f32.powi(2) + (-8.0f32).powi(2),
+        3.0f32.powi(2) + (-4.0f32).powi(2) + 9.0f32.powi(2) + (-10.0f32).powi(2),
+        5.0f32.powi(2) + (-6.0f32).powi(2) + 11.0f32.powi(2) + (-12.0f32).powi(2),
+    ];
+    assert_eq!(output, [expected[0], -1.0, expected[1], -1.0, expected[2]]);
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_axis_handles_negative_stride_offset_and_zero_extent() {
+    let src_dims = [2usize, 3];
+    let src_strides = [-1isize, 2];
+    let input = [1.0f64, -2.0, 3.0, -4.0, 5.0, -6.0];
+    let dest_dims = [3usize];
+    let dest_strides = [2isize];
+    let mut output = [-1.0f64; 6];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::SumSquares,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&input),
+        &src_dims,
+        &src_strides,
+        1,
+    )
+    .unwrap();
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut output),
+        &dest_dims,
+        &dest_strides,
+        1,
+    )
+    .unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert_eq!(output, [-1.0, 5.0, -1.0, 25.0, -1.0, 61.0]);
+
+    let empty_src_dims = [2usize, 0];
+    let empty_src_strides = [-1isize, 2];
+    let empty_dest_dims = [2usize];
+    let empty_dest_strides = [1isize];
+    let empty_plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::SumSquares,
+        &empty_src_dims,
+        &empty_src_strides,
+        &empty_dest_dims,
+        &empty_dest_strides,
+        &[1],
+    )
+    .unwrap();
+    let empty_source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes::<f64>(&[]),
+        &empty_src_dims,
+        &empty_src_strides,
+        isize::MAX,
+    )
+    .unwrap();
+    let mut empty_output = [9.0f64, 10.0];
+    let mut empty_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut empty_output),
+        &empty_dest_dims,
+        &empty_dest_strides,
+        0,
+    )
+    .unwrap();
+
+    empty_plan
+        .execute(&ExecContext::serial(), &mut empty_dest, &empty_source)
+        .unwrap();
+    assert_eq!(empty_output, [0.0, 0.0]);
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_handles_empty_rank_zero_and_nonfinite_values() {
+    let empty_dims = [0usize];
+    let strides = [1isize];
+    let empty_plan = ErasedReducePlan::compile(
+        KernelDType::F64,
+        ReduceOp::SumSquares,
+        &empty_dims,
+        &strides,
+    )
+    .unwrap();
+    let empty_source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes::<f64>(&[]),
+        &empty_dims,
+        &strides,
+        isize::MAX,
+    )
+    .unwrap();
+    let mut empty_output = [9.0f64];
+    let mut empty_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut empty_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    empty_plan
+        .execute(&ExecContext::serial(), &mut empty_dest, &empty_source)
+        .unwrap();
+    assert_eq!(empty_output, [0.0]);
+
+    let scalar = [-0.0f64];
+    let scalar_plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &[], &[]).unwrap();
+    let scalar_source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&scalar), &[], &[], 0).unwrap();
+    let mut scalar_output = [1.0f64];
+    let mut scalar_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut scalar_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    scalar_plan
+        .execute(&ExecContext::serial(), &mut scalar_dest, &scalar_source)
+        .unwrap();
+    assert_eq!(scalar_output[0].to_bits(), 0.0f64.to_bits());
+
+    let nonfinite = [f64::INFINITY, f64::NAN];
+    let nonfinite_plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &[2], &[1]).unwrap();
+    let nonfinite_source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&nonfinite), &[2], &[1], 0).unwrap();
+    let mut nonfinite_output = [0.0f64];
+    let mut nonfinite_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut nonfinite_output),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    nonfinite_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut nonfinite_dest,
+            &nonfinite_source,
+        )
+        .unwrap();
+    assert!(nonfinite_output[0].is_nan());
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_rounds_multiplication_before_accumulation() {
+    let dims = [2usize];
+    let strides = [1isize];
+    let input = [f64::MAX, f64::MIN_POSITIVE / 2.0];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &dims, &strides).unwrap();
+    let source =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest =
+        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut output), &[], &[], 0).unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert!(output[0].is_infinite());
+    assert_eq!((input[1] * input[1]).to_bits(), 0.0f64.to_bits());
+}
+
+#[test]
+fn erased_reduce_plan_sum_squares_rejects_non_float_dtypes() {
+    for dtype in [
+        KernelDType::I32,
+        KernelDType::I64,
+        KernelDType::C32,
+        KernelDType::C64,
+        KernelDType::Bool,
+    ] {
+        let err = ErasedReducePlan::compile(dtype, ReduceOp::SumSquares, &[1], &[1]).unwrap_err();
+        assert!(matches!(err, StridedError::UnsupportedDType { .. }));
+    }
 }
