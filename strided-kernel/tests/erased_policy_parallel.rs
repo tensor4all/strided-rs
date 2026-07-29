@@ -1,9 +1,9 @@
 #![cfg(feature = "parallel")]
 
 use strided_kernel::{
-    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedGatherPlan,
-    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ErasedScatterPlan,
-    ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    erased_zip_into, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
+    ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan,
+    ErasedScatterPlan, ErasedZipOp, ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
 };
 
 const LARGE_LEN: usize = (1 << 15) + 65;
@@ -28,6 +28,44 @@ fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
 
 fn bounded_context() -> ExecContext {
     ExecContext::max_threads(2).unwrap()
+}
+
+#[test]
+fn large_one_shot_zip_matches_serial() {
+    let dims = [LARGE_LEN];
+    let strides = [1isize];
+    let lhs: Vec<f64> = (0..LARGE_LEN).map(|index| index as f64).collect();
+    let rhs: Vec<f64> = (0..LARGE_LEN)
+        .map(|index| (LARGE_LEN - index) as f64)
+        .collect();
+
+    let run = |ctx: ExecContext| {
+        let lhs =
+            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &strides, 0).unwrap();
+        let rhs =
+            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+        let mut output = vec![0.0f64; LARGE_LEN];
+        let mut dest = ErasedRawStridedMut::new(
+            KernelDType::F64,
+            as_bytes_mut(&mut output),
+            &dims,
+            &strides,
+            0,
+        )
+        .unwrap();
+        erased_zip_into(
+            KernelDType::F64,
+            ErasedZipOp::Add,
+            &ctx,
+            &mut dest,
+            &lhs,
+            &rhs,
+        )
+        .unwrap();
+        output
+    };
+
+    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
 }
 
 #[test]

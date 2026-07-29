@@ -21,12 +21,150 @@ use num_traits::{One, Zero};
 use crate::{
     fused_elementwise_into, ConcatenatePlan, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
     ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, FusedPlan, FusedScalar, GatherIndex,
-    GatherPlan, GatherSpec, KernelDType, PadPlan, RawStridedMut, RawStridedRef, Result,
+    GatherPlan, GatherSpec, Identity, KernelDType, PadPlan, RawStridedMut, RawStridedRef, Result,
     ReversePlan, ScatterPlan, ScatterSpec, SlicePlan, StridedError, StridedView, StridedViewMut,
     RAW_FUSED_RANK_LIMIT,
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
+
+/// Runtime unary operation for [`erased_map_into`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErasedMapOp {
+    Negate,
+    Conj,
+    Abs,
+    Sign,
+}
+
+impl ErasedMapOp {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Negate => "negate",
+            Self::Conj => "conj",
+            Self::Abs => "abs",
+            Self::Sign => "sign",
+        }
+    }
+}
+
+/// Runtime binary operation for [`erased_zip_into`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErasedZipOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Maximum,
+    Minimum,
+}
+
+impl ErasedZipOp {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Multiply => "multiply",
+            Self::Divide => "divide",
+            Self::Remainder => "remainder",
+            Self::Maximum => "maximum",
+            Self::Minimum => "minimum",
+        }
+    }
+}
+
+/// Apply one runtime-selected unary operation without compiling a plan.
+///
+/// The destination must not overlap the input. Real and complex dtypes support
+/// every [`ErasedMapOp`], signed integers use wrapping negate/abs semantics,
+/// and `bool` supports only [`ErasedMapOp::Conj`].
+///
+/// # Errors
+///
+/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
+/// or unsupported dtype/op contracts. Validation completes before any write.
+pub fn erased_map_into(
+    dtype: KernelDType,
+    op: ErasedMapOp,
+    ctx: &ExecContext,
+    dest: &mut ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedRef<'_>,
+) -> Result<()> {
+    check_dtype(dtype, dest.dtype())?;
+    check_dtype(dtype, input.dtype())?;
+    validate_no_overlap(dest, input, 0)?;
+    dest.validate_data_if_needed()?;
+
+    let result = ctx.run(|| match dtype {
+        KernelDType::F32 => execute_one_shot_map::<f32>(op, dest, input),
+        KernelDType::F64 => execute_one_shot_map::<f64>(op, dest, input),
+        KernelDType::I32 => execute_one_shot_map::<i32>(op, dest, input),
+        KernelDType::I64 => execute_one_shot_map::<i64>(op, dest, input),
+        KernelDType::Bool => execute_one_shot_map::<bool>(op, dest, input),
+        KernelDType::C32 => execute_one_shot_map::<Complex32>(op, dest, input),
+        KernelDType::C64 => execute_one_shot_map::<Complex64>(op, dest, input),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    });
+    if result.is_ok() {
+        // SAFETY: the scalar map writes valid values of the descriptor dtype.
+        unsafe {
+            dest.assume_data_valid();
+        }
+    }
+    result
+}
+
+/// Apply one runtime-selected binary operation without compiling a plan.
+///
+/// The destination must not overlap either input. Real dtypes support every
+/// [`ErasedZipOp`]. Signed integers support add/subtract/multiply/min/max, and
+/// complex dtypes support add/subtract/multiply/divide. `bool` has no binary
+/// one-shot operations.
+///
+/// # Errors
+///
+/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
+/// or unsupported dtype/op contracts. Validation completes before any write.
+pub fn erased_zip_into(
+    dtype: KernelDType,
+    op: ErasedZipOp,
+    ctx: &ExecContext,
+    dest: &mut ErasedRawStridedMut<'_>,
+    lhs: &ErasedRawStridedRef<'_>,
+    rhs: &ErasedRawStridedRef<'_>,
+) -> Result<()> {
+    check_dtype(dtype, dest.dtype())?;
+    check_dtype(dtype, lhs.dtype())?;
+    check_dtype(dtype, rhs.dtype())?;
+    validate_no_overlap(dest, lhs, 0)?;
+    validate_no_overlap(dest, rhs, 1)?;
+    dest.validate_data_if_needed()?;
+
+    let result = ctx.run(|| match dtype {
+        KernelDType::F32 => execute_one_shot_zip::<f32>(op, dest, lhs, rhs),
+        KernelDType::F64 => execute_one_shot_zip::<f64>(op, dest, lhs, rhs),
+        KernelDType::I32 => execute_one_shot_zip::<i32>(op, dest, lhs, rhs),
+        KernelDType::I64 => execute_one_shot_zip::<i64>(op, dest, lhs, rhs),
+        KernelDType::Bool => execute_one_shot_zip::<bool>(op, dest, lhs, rhs),
+        KernelDType::C32 => execute_one_shot_zip::<Complex32>(op, dest, lhs, rhs),
+        KernelDType::C64 => execute_one_shot_zip::<Complex64>(op, dest, lhs, rhs),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    });
+    if result.is_ok() {
+        // SAFETY: the scalar zip writes valid values of the descriptor dtype.
+        unsafe {
+            dest.assume_data_valid();
+        }
+    }
+    result
+}
 
 /// Dtype-erased wrapper around [`CopyPlan`].
 #[derive(Clone, Debug)]
@@ -1248,6 +1386,286 @@ impl ErasedScatterPlan {
         }
         result
     }
+}
+
+fn execute_one_shot_map<T: OneShotScalar>(
+    op: ErasedMapOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedRef<'_>,
+) -> Result<()> {
+    if !T::supports_map(op) {
+        return Err(StridedError::UnsupportedOp {
+            op: op.label(),
+            dtype: T::one_shot_dtype_label(),
+        });
+    }
+    validate_one_shot_destination(dest)?;
+
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let mut dest =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    let input = erased_raw_ref::<T>(input);
+
+    crate::map_view::map_raw_into::<T, T, Identity>(&mut dest, &input, |value| T::map(op, value))
+}
+
+fn execute_one_shot_zip<T: OneShotScalar>(
+    op: ErasedZipOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    lhs: &ErasedRawStridedRef<'_>,
+    rhs: &ErasedRawStridedRef<'_>,
+) -> Result<()> {
+    if !T::supports_zip(op) {
+        return Err(StridedError::UnsupportedOp {
+            op: op.label(),
+            dtype: T::one_shot_dtype_label(),
+        });
+    }
+    validate_one_shot_destination(dest)?;
+
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let mut dest =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    let lhs = erased_raw_ref::<T>(lhs);
+    let rhs = erased_raw_ref::<T>(rhs);
+
+    crate::map_view::zip_map2_raw_into::<T, T, T, Identity, Identity>(
+        &mut dest,
+        &lhs,
+        &rhs,
+        |lhs, rhs| T::zip(op, lhs, rhs),
+    )
+}
+
+fn validate_one_shot_destination(dest: &ErasedRawStridedMut<'_>) -> Result<()> {
+    if crate::fused::is_provably_injective_layout(dest.dims(), dest.strides()) {
+        Ok(())
+    } else {
+        Err(StridedError::NonInjectiveOutputLayout)
+    }
+}
+
+fn validate_no_overlap(
+    dest: &ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedRef<'_>,
+    input_index: usize,
+) -> Result<()> {
+    let dest_start = dest.data().as_ptr() as usize;
+    let input_start = input.data().as_ptr() as usize;
+    let Some(dest_end) = dest_start.checked_add(dest.data().len()) else {
+        return Err(StridedError::OffsetOverflow);
+    };
+    let Some(input_end) = input_start.checked_add(input.data().len()) else {
+        return Err(StridedError::OffsetOverflow);
+    };
+    if dest_start < input_end && input_start < dest_end {
+        Err(StridedError::OverlappingInputOutput { input: input_index })
+    } else {
+        Ok(())
+    }
+}
+
+trait OneShotScalar: Copy + crate::MaybeSendSync + 'static {
+    fn one_shot_dtype_label() -> &'static str;
+    fn supports_map(op: ErasedMapOp) -> bool;
+    fn supports_zip(op: ErasedZipOp) -> bool;
+    fn map(op: ErasedMapOp, value: Self) -> Self;
+    fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self;
+}
+
+macro_rules! impl_real_one_shot_scalar {
+    ($ty:ty, $label:literal) => {
+        impl OneShotScalar for $ty {
+            fn one_shot_dtype_label() -> &'static str {
+                $label
+            }
+
+            fn supports_map(_op: ErasedMapOp) -> bool {
+                true
+            }
+
+            fn supports_zip(_op: ErasedZipOp) -> bool {
+                true
+            }
+
+            #[inline(always)]
+            fn map(op: ErasedMapOp, value: Self) -> Self {
+                match op {
+                    ErasedMapOp::Negate => -value,
+                    ErasedMapOp::Conj => value,
+                    ErasedMapOp::Abs => value.abs(),
+                    ErasedMapOp::Sign => {
+                        if value == 0.0 {
+                            0.0
+                        } else {
+                            value.signum()
+                        }
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self {
+                match op {
+                    ErasedZipOp::Add => lhs + rhs,
+                    ErasedZipOp::Subtract => lhs - rhs,
+                    ErasedZipOp::Multiply => lhs * rhs,
+                    ErasedZipOp::Divide => lhs / rhs,
+                    ErasedZipOp::Remainder => lhs % rhs,
+                    ErasedZipOp::Maximum => {
+                        if lhs.is_nan() || rhs.is_nan() {
+                            <$ty>::NAN
+                        } else {
+                            lhs.max(rhs)
+                        }
+                    }
+                    ErasedZipOp::Minimum => {
+                        if lhs.is_nan() || rhs.is_nan() {
+                            <$ty>::NAN
+                        } else {
+                            lhs.min(rhs)
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_integer_one_shot_scalar {
+    ($ty:ty, $label:literal) => {
+        impl OneShotScalar for $ty {
+            fn one_shot_dtype_label() -> &'static str {
+                $label
+            }
+
+            fn supports_map(_op: ErasedMapOp) -> bool {
+                true
+            }
+
+            fn supports_zip(op: ErasedZipOp) -> bool {
+                !matches!(op, ErasedZipOp::Divide | ErasedZipOp::Remainder)
+            }
+
+            #[inline(always)]
+            fn map(op: ErasedMapOp, value: Self) -> Self {
+                match op {
+                    ErasedMapOp::Negate => value.wrapping_neg(),
+                    ErasedMapOp::Conj => value,
+                    ErasedMapOp::Abs => value.wrapping_abs(),
+                    ErasedMapOp::Sign => value.signum(),
+                }
+            }
+
+            #[inline(always)]
+            fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self {
+                match op {
+                    ErasedZipOp::Add => lhs.wrapping_add(rhs),
+                    ErasedZipOp::Subtract => lhs.wrapping_sub(rhs),
+                    ErasedZipOp::Multiply => lhs.wrapping_mul(rhs),
+                    ErasedZipOp::Maximum => lhs.max(rhs),
+                    ErasedZipOp::Minimum => lhs.min(rhs),
+                    ErasedZipOp::Divide | ErasedZipOp::Remainder => {
+                        unreachable!("unsupported integer one-shot op")
+                    }
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_complex_one_shot_scalar {
+    ($ty:ty, $label:literal) => {
+        impl OneShotScalar for $ty {
+            fn one_shot_dtype_label() -> &'static str {
+                $label
+            }
+
+            fn supports_map(_op: ErasedMapOp) -> bool {
+                true
+            }
+
+            fn supports_zip(op: ErasedZipOp) -> bool {
+                !matches!(
+                    op,
+                    ErasedZipOp::Remainder | ErasedZipOp::Maximum | ErasedZipOp::Minimum
+                )
+            }
+
+            #[inline(always)]
+            fn map(op: ErasedMapOp, value: Self) -> Self {
+                match op {
+                    ErasedMapOp::Negate => -value,
+                    ErasedMapOp::Conj => value.conj(),
+                    ErasedMapOp::Abs => Self::new(value.norm(), 0.0),
+                    ErasedMapOp::Sign => {
+                        let norm = value.norm();
+                        if norm == 0.0 {
+                            value
+                        } else {
+                            value / norm
+                        }
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self {
+                match op {
+                    ErasedZipOp::Add => lhs + rhs,
+                    ErasedZipOp::Subtract => lhs - rhs,
+                    ErasedZipOp::Multiply => lhs * rhs,
+                    ErasedZipOp::Divide => lhs / rhs,
+                    ErasedZipOp::Remainder | ErasedZipOp::Maximum | ErasedZipOp::Minimum => {
+                        unreachable!("unsupported complex one-shot op")
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_real_one_shot_scalar!(f32, "f32");
+impl_real_one_shot_scalar!(f64, "f64");
+impl_integer_one_shot_scalar!(i32, "i32");
+impl_integer_one_shot_scalar!(i64, "i64");
+impl_complex_one_shot_scalar!(Complex32, "c32");
+impl_complex_one_shot_scalar!(Complex64, "c64");
+
+impl OneShotScalar for bool {
+    fn one_shot_dtype_label() -> &'static str {
+        "bool"
+    }
+
+    fn supports_map(op: ErasedMapOp) -> bool {
+        matches!(op, ErasedMapOp::Conj)
+    }
+
+    fn supports_zip(_op: ErasedZipOp) -> bool {
+        false
+    }
+
+    fn map(op: ErasedMapOp, value: Self) -> Self {
+        match op {
+            ErasedMapOp::Conj => value,
+            _ => unreachable!("unsupported bool one-shot op"),
+        }
+    }
+
+    fn zip(_op: ErasedZipOp, _lhs: Self, _rhs: Self) -> Self {
+        unreachable!("unsupported bool one-shot op")
+    }
+}
+
+fn erased_raw_ref<'a, T>(src: &ErasedRawStridedRef<'a>) -> RawStridedRef<'a, T> {
+    let data = typed_slice::<T>(src.data());
+    unsafe { RawStridedRef::new_unchecked(data, src.dims(), src.strides(), src.offset()) }
 }
 
 fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {

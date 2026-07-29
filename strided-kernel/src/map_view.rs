@@ -864,13 +864,44 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     src: &StridedView<A, Op>,
     f: impl Fn(A) -> D + MaybeSync,
 ) -> Result<()> {
-    ensure_same_shape(dest.dims(), src.dims())?;
+    map_parts_into::<D, A, Op>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.dims(),
+        src.strides(),
+        f,
+    )
+}
 
-    let dst_ptr = dest.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_dims = dest.dims();
-    let dst_strides = dest.strides();
-    let src_strides = src.strides();
+pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+    dest: &mut crate::RawStridedMut<'_, D>,
+    src: &crate::RawStridedRef<'_, A>,
+    f: impl Fn(A) -> D + MaybeSync,
+) -> Result<()> {
+    map_parts_into::<D, A, Op>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.dims(),
+        src.strides(),
+        f,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_parts_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+    dst_ptr: *mut D,
+    dst_dims: &[usize],
+    dst_strides: &[isize],
+    src_ptr: *const A,
+    src_dims: &[usize],
+    src_strides: &[isize],
+    f: impl Fn(A) -> D + MaybeSync,
+) -> Result<()> {
+    ensure_same_shape(dst_dims, src_dims)?;
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
         let len = total_len(dst_dims);
@@ -966,17 +997,67 @@ pub fn zip_map2_into<
     b: &StridedView<B, OpB>,
     f: impl Fn(A, B) -> D + MaybeSync,
 ) -> Result<()> {
-    ensure_same_shape(dest.dims(), a.dims())?;
-    ensure_same_shape(dest.dims(), b.dims())?;
+    zip_map2_parts_into::<D, A, B, OpA, OpB>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        a.ptr(),
+        a.dims(),
+        a.strides(),
+        b.ptr(),
+        b.dims(),
+        b.strides(),
+        f,
+    )
+}
 
-    let dst_ptr = dest.as_mut_ptr();
-    let dst_dims = dest.dims();
-    let dst_strides = dest.strides();
-    let a_ptr = a.ptr();
-    let b_ptr = b.ptr();
+pub(crate) fn zip_map2_raw_into<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dest: &mut crate::RawStridedMut<'_, D>,
+    a: &crate::RawStridedRef<'_, A>,
+    b: &crate::RawStridedRef<'_, B>,
+    f: impl Fn(A, B) -> D + MaybeSync,
+) -> Result<()> {
+    zip_map2_parts_into::<D, A, B, OpA, OpB>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        a.ptr(),
+        a.dims(),
+        a.strides(),
+        b.ptr(),
+        b.dims(),
+        b.strides(),
+        f,
+    )
+}
 
-    let a_strides = a.strides();
-    let b_strides = b.strides();
+#[allow(clippy::too_many_arguments)]
+fn zip_map2_parts_into<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dst_ptr: *mut D,
+    dst_dims: &[usize],
+    dst_strides: &[isize],
+    a_ptr: *const A,
+    a_dims: &[usize],
+    a_strides: &[isize],
+    b_ptr: *const B,
+    b_dims: &[usize],
+    b_strides: &[isize],
+    f: impl Fn(A, B) -> D + MaybeSync,
+) -> Result<()> {
+    ensure_same_shape(dst_dims, a_dims)?;
+    ensure_same_shape(dst_dims, b_dims)?;
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
         let len = total_len(dst_dims);

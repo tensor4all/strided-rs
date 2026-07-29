@@ -689,25 +689,11 @@ fn validate_destination_layout<T>(dest: &StridedViewMut<'_, T>) -> Result<()> {
 }
 
 pub(crate) fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
-    if dims.len() != strides.len() {
-        return false;
-    }
-
-    let Some(total) = dims
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-    else {
+    let Some(total) = validate_injective_layout_inputs(dims, strides) else {
         return false;
     };
     if total <= 1 {
         return true;
-    }
-    if dims
-        .iter()
-        .zip(strides.iter())
-        .any(|(&dim, &stride)| dim > 1 && stride == 0)
-    {
-        return false;
     }
 
     const EXACT_CHECK_LIMIT: usize = 4096;
@@ -716,6 +702,34 @@ pub(crate) fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
     }
 
     has_disjoint_stride_spans(dims, strides)
+}
+
+pub(crate) fn is_provably_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
+    let Some(total) = validate_injective_layout_inputs(dims, strides) else {
+        return false;
+    };
+    total <= 1 || has_disjoint_stride_spans(dims, strides)
+}
+
+fn validate_injective_layout_inputs(dims: &[usize], strides: &[isize]) -> Option<usize> {
+    if dims.len() != strides.len() {
+        return None;
+    }
+
+    let total = dims
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+    if total <= 1 {
+        return Some(total);
+    }
+    if dims
+        .iter()
+        .zip(strides.iter())
+        .any(|(&dim, &stride)| dim > 1 && stride == 0)
+    {
+        return None;
+    }
+    Some(total)
 }
 
 fn has_unique_offsets_exact(dims: &[usize], strides: &[isize], total: usize) -> bool {
@@ -754,21 +768,30 @@ fn has_unique_offsets_exact(dims: &[usize], strides: &[isize], total: usize) -> 
 }
 
 fn has_disjoint_stride_spans(dims: &[usize], strides: &[isize]) -> bool {
-    let mut axes = Vec::with_capacity(dims.len());
-    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
-        if dim <= 1 {
-            continue;
-        }
-        let stride_abs = match stride.checked_abs() {
-            Some(stride_abs) => stride_abs as u128,
-            None => return false,
-        };
-        axes.push((stride_abs, dim as u128 - 1));
-    }
-    axes.sort_unstable_by_key(|&(stride, _)| stride);
-
     let mut covered_span = 0u128;
-    for (stride, extent) in axes {
+    let mut previous_axis = None;
+    let active_axes = dims.iter().filter(|&&dim| dim > 1).count();
+    for _ in 0..active_axes {
+        let mut next = None;
+        for (axis, (&dim, &stride)) in dims.iter().zip(strides.iter()).enumerate() {
+            if dim <= 1 {
+                continue;
+            }
+            let stride = match stride.checked_abs() {
+                Some(stride) => stride as u128,
+                None => return false,
+            };
+            let key = (stride, axis);
+            if previous_axis.is_some_and(|previous| key <= previous) {
+                continue;
+            }
+            if next.is_none_or(|(best, _)| key < best) {
+                next = Some((key, dim as u128 - 1));
+            }
+        }
+        let Some(((stride, axis), extent)) = next else {
+            return false;
+        };
         if stride <= covered_span {
             return false;
         }
@@ -779,6 +802,7 @@ fn has_disjoint_stride_spans(dims: &[usize], strides: &[isize]) -> bool {
             Some(covered_span) => covered_span,
             None => return false,
         };
+        previous_axis = Some((stride, axis));
     }
 
     true

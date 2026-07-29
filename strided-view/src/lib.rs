@@ -124,6 +124,10 @@ pub enum StridedError {
         dtype: &'static str,
     },
 
+    /// A mutable destination overlaps one of the operation inputs.
+    #[error("destination overlaps input {input}")]
+    OverlappingInputOutput { input: usize },
+
     /// The operation arity is unsupported by this entry point.
     #[error("unsupported arity {arity}; maximum supported arity is {max}")]
     UnsupportedArity { arity: usize, max: usize },

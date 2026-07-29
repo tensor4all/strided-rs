@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use num_complex::Complex64;
 use strided_kernel::{
-    CopyPlan, ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan,
-    ErasedDynamicUpdateSlicePlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef,
-    ErasedReducePlan, ErasedReversePlan, ErasedScatterPlan, ErasedSlicePlan, ExecContext,
-    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec,
+    erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan, ErasedConcatenatePlan,
+    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedMapOp,
+    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ErasedReversePlan,
+    ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, ExecContext, Identity, KernelDType,
+    RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
 };
 
 struct CountingAllocator;
@@ -137,6 +138,67 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "erased execute must not allocate");
+
+    let dims = [256usize];
+    let strides = [1isize];
+    let lhs: Vec<f64> = (0..256).map(|value| value as f64).collect();
+    let rhs: Vec<f64> = (0..256).map(|value| (value + 1) as f64).collect();
+    let lhs_ref =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &strides, 0).unwrap();
+    let rhs_ref =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+    let mut dst = vec![0.0f64; 256];
+    let mut dest =
+        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut dst), &dims, &strides, 0)
+            .unwrap();
+
+    erased_zip_into(
+        KernelDType::F64,
+        ErasedZipOp::Add,
+        &ExecContext::serial(),
+        &mut dest,
+        &lhs_ref,
+        &rhs_ref,
+    )
+    .unwrap();
+    let mut typed_dst = vec![0.0f64; 256];
+    let lhs_view: StridedView<'_, f64, Identity> =
+        StridedView::new(&lhs, &dims, &strides, 0).unwrap();
+    let rhs_view: StridedView<'_, f64, Identity> =
+        StridedView::new(&rhs, &dims, &strides, 0).unwrap();
+    let mut typed_dest = StridedViewMut::new(&mut typed_dst, &dims, &strides, 0).unwrap();
+    zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
+    let kernel_allocations = count_allocations(|| {
+        for _ in 0..16 {
+            zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
+            map_into(&mut typed_dest, &lhs_view, |value| -value).unwrap();
+        }
+    });
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            erased_zip_into(
+                KernelDType::F64,
+                ErasedZipOp::Add,
+                &ExecContext::serial(),
+                &mut dest,
+                &lhs_ref,
+                &rhs_ref,
+            )
+            .unwrap();
+            erased_map_into(
+                KernelDType::F64,
+                ErasedMapOp::Negate,
+                &ExecContext::serial(),
+                &mut dest,
+                &lhs_ref,
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, kernel_allocations,
+        "one-shot erased map/zip must not allocate beyond the typed kernels"
+    );
 
     let src_dims = [2usize; 8];
     let src_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
