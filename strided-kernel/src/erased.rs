@@ -27,6 +27,7 @@ use crate::{
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
+const SERIAL_REDUCE_LANES: usize = 8;
 
 /// Runtime unary operation for [`erased_map_into`].
 #[non_exhaustive]
@@ -2331,13 +2332,21 @@ where
     T: ErasedReduceScalar,
 {
     let source = erased_view::<T>(src);
-    let value = if ctx.is_serial() {
-        crate::reduce_view::reduce_serial(
-            &source,
-            |value| value,
-            |a, b| reduce_values(op, a, b),
-            reduce_identity(op),
-        )?
+    let use_serial = ctx.is_serial()
+        || ctx
+            .max_threads_limit()
+            .is_some_and(|max_threads| max_threads.get() == 1);
+    let value = if use_serial {
+        if let Some(value) = reduce_contiguous_serial(op, src) {
+            value
+        } else {
+            crate::reduce_view::reduce_serial(
+                &source,
+                |value| value,
+                |a, b| reduce_values(op, a, b),
+                reduce_identity(op),
+            )?
+        }
     } else {
         ctx.run(|| {
             crate::reduce(
@@ -2355,6 +2364,46 @@ where
         *dest_data.as_mut_ptr().offset(dest_offset) = value;
     }
     Ok(())
+}
+
+fn reduce_contiguous_serial<T>(op: ReduceOp, src: &ErasedRawStridedRef<'_>) -> Option<T>
+where
+    T: ErasedReduceScalar,
+{
+    crate::kernel::same_contiguous_layout(src.dims(), &[src.strides()])?;
+    let len = checked_total_len(src.dims()).ok()?;
+    if len == 0 {
+        return Some(reduce_identity(op));
+    }
+
+    let source_data = typed_slice::<T>(src.data());
+    let start = usize::try_from(src.offset()).ok()?;
+    let end = start.checked_add(len)?;
+    let values = source_data.get(start..end)?;
+    Some(match op {
+        ReduceOp::Sum => T::try_simd_sum(values)
+            .unwrap_or_else(|| reduce_contiguous_lanes(values, T::zero(), T::reduce_sum)),
+        ReduceOp::Product => T::try_simd_product(values)
+            .unwrap_or_else(|| reduce_contiguous_lanes(values, T::one(), T::reduce_product)),
+    })
+}
+
+#[inline]
+fn reduce_contiguous_lanes<T>(values: &[T], identity: T, combine: impl Fn(T, T) -> T) -> T
+where
+    T: Copy,
+{
+    let mut lanes = [identity; SERIAL_REDUCE_LANES];
+    let mut chunks = values.chunks_exact(SERIAL_REDUCE_LANES);
+    for chunk in chunks.by_ref() {
+        for lane in 0..SERIAL_REDUCE_LANES {
+            lanes[lane] = combine(lanes[lane], chunk[lane]);
+        }
+    }
+    for (lane, &value) in chunks.remainder().iter().enumerate() {
+        lanes[lane] = combine(lanes[lane], value);
+    }
+    lanes.into_iter().fold(identity, combine)
 }
 
 fn dispatch_reduce<T>(
@@ -2619,7 +2668,9 @@ where
     }
 }
 
-trait ErasedReduceScalar: Copy + One + Zero + crate::MaybeSendSync {
+trait ErasedReduceScalar:
+    Copy + One + Zero + crate::MaybeSendSync + crate::simd::MaybeSimdOps + crate::simd::MaybeSimdProduct
+{
     fn reduce_sum(lhs: Self, rhs: Self) -> Self;
     fn reduce_product(lhs: Self, rhs: Self) -> Self;
 }
