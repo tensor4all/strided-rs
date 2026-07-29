@@ -34,8 +34,8 @@ pub use element_op::{
 // View-based types
 // ============================================================================
 pub use raw::{
-    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, KernelDType, RawStridedMut,
-    RawStridedRef,
+    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
+    KernelDType, RawStridedMut, RawStridedRef,
 };
 pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 

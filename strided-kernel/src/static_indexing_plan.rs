@@ -5,6 +5,8 @@
 //! of `strided-kernel`; callers provide already-owned output buffers and fixed
 //! raw descriptors.
 
+use core::mem::MaybeUninit;
+
 use crate::{CopyPlan, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
 
 #[cfg(feature = "parallel")]
@@ -167,9 +169,34 @@ impl SlicePlan {
         self.copy_plan.execute(dest, &source)
     }
 
-    fn check_call<T>(
+    /// Execute into storage whose reachable destination elements are uninitialized.
+    pub fn execute_uninit<T>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        self.check_call(dest, operand)?;
+        let source_offset = operand
+            .offset()
+            .checked_add(self.source_offset_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let source = unsafe {
+            RawStridedRef::new_unchecked(
+                operand.data(),
+                &self.dest_dims,
+                &self.source_strides,
+                source_offset,
+            )
+        };
+        self.copy_plan.execute_uninit(dest, &source)
+    }
+
+    fn check_call<D, T>(
+        &self,
+        dest: &RawStridedMut<'_, D>,
         operand: &RawStridedRef<'_, T>,
     ) -> Result<()> {
         if operand.dims() != &self.operand_dims[..]
@@ -286,6 +313,28 @@ impl PadPlan {
         self.copy_operand(dest, operand)
     }
 
+    /// Execute pad into storage whose reachable destination elements are uninitialized.
+    pub fn execute_uninit<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        fill: T,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        self.check_call(dest, operand)?;
+        self.fill_dest(dest, MaybeUninit::new(fill))?;
+
+        if self.operand_total == 0 {
+            return Ok(());
+        }
+        if let Some(run) = self.contiguous_axis0_run {
+            return self.copy_operand_axis0_runs_uninit(dest, operand, run);
+        }
+        self.copy_operand_uninit(dest, operand)
+    }
+
     fn fill_dest<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -363,6 +412,58 @@ impl PadPlan {
                     core::ptr::copy_nonoverlapping(
                         operand_ptr.offset(operand_offset),
                         dest_ptr.offset(dest_offset),
+                        run.len,
+                    );
+                }
+            }
+            advance_col_major_index(outer_idx, outer_dims);
+        }
+        Ok(())
+    }
+
+    fn copy_operand_axis0_runs_uninit<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        run: ContiguousPadAxis0Run,
+    ) -> Result<()>
+    where
+        T: Copy,
+    {
+        if run.len == 0 {
+            return Ok(());
+        }
+        let outer_dims = &self.operand_dims[1..];
+        let outer_total = checked_total_len(outer_dims)?;
+        let mut outer_idx_storage = CoordScratch::new(outer_dims.len());
+        let outer_idx = outer_idx_storage.as_mut_slice();
+        let operand_ptr = operand.data().as_ptr();
+        let dest_ptr = dest.data_mut().as_mut_ptr();
+
+        for _ in 0..outer_total {
+            let mut operand_offset =
+                checked_offset_add(operand.offset(), self.operand_strides[0], run.operand_start)?;
+            let mut dest_offset =
+                checked_offset_add(dest.offset(), self.dest_strides[0], run.dest_start)?;
+            let mut in_bounds = true;
+            for (outer_axis, &coord) in outer_idx.iter().enumerate() {
+                let axis = outer_axis + 1;
+                let out_pos = i128::from(self.edge_padding_low[axis])
+                    + coord as i128 * i128::from(self.interior_step[axis]);
+                if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
+                    in_bounds = false;
+                    break;
+                }
+                operand_offset =
+                    checked_offset_add(operand_offset, self.operand_strides[axis], coord)?;
+                dest_offset =
+                    checked_offset_add(dest_offset, self.dest_strides[axis], out_pos as usize)?;
+            }
+            if in_bounds {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        operand_ptr.offset(operand_offset),
+                        dest_ptr.offset(dest_offset).cast::<T>(),
                         run.len,
                     );
                 }
@@ -455,6 +556,126 @@ impl PadPlan {
             }
         }
         self.copy_operand_serial(dest, operand)
+    }
+
+    fn copy_operand_uninit<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.operand_total);
+            if nthreads > 1 {
+                return self.copy_operand_uninit_parallel(dest, operand, nthreads);
+            }
+        }
+        self.copy_operand_uninit_serial(dest, operand)
+    }
+
+    fn copy_operand_uninit_serial<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy,
+    {
+        let operand_offset_base = operand.offset();
+        let operand_strides = operand.strides();
+        let operand_data = operand.data();
+        let dest_offset_base = dest.offset();
+        let dest_strides = dest.strides();
+        let dest_data = dest.data_mut();
+        let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
+        let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
+        let input_idx = input_idx_storage.as_mut_slice();
+        let out_idx = out_idx_storage.as_mut_slice();
+
+        for _ in 0..self.operand_total {
+            let mut in_bounds = true;
+            for axis in 0..self.operand_dims.len() {
+                let out_pos = i128::from(self.edge_padding_low[axis])
+                    + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
+                if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
+                    in_bounds = false;
+                    break;
+                }
+                out_idx[axis] = out_pos as usize;
+            }
+            if in_bounds {
+                let operand_offset =
+                    checked_strided_offset(operand_offset_base, operand_strides, input_idx)?;
+                let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, out_idx)?;
+                unsafe {
+                    (*dest_data.as_mut_ptr().offset(dest_offset))
+                        .write(*operand_data.as_ptr().offset(operand_offset));
+                }
+            }
+            advance_col_major_index(input_idx, &self.operand_dims);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn copy_operand_uninit_parallel<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let operand_offset_base = operand.offset();
+        let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
+        let dest_offset_base = dest.offset();
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        crate::threading::parallel_map_reduce(
+            0..self.operand_total,
+            nthreads,
+            &|range| {
+                let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
+                let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
+                let input_idx = input_idx_storage.as_mut_slice();
+                let out_idx = out_idx_storage.as_mut_slice();
+                fill_col_major_index(range.start, &self.operand_dims, input_idx);
+                let operand_ptr = operand_ptr.as_const();
+                let dest_ptr = dest_ptr.as_ptr();
+
+                for _ in range {
+                    let mut in_bounds = true;
+                    for axis in 0..self.operand_dims.len() {
+                        let out_pos = i128::from(self.edge_padding_low[axis])
+                            + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
+                        if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
+                            in_bounds = false;
+                            break;
+                        }
+                        out_idx[axis] = out_pos as usize;
+                    }
+                    if in_bounds {
+                        let operand_offset = checked_strided_offset(
+                            operand_offset_base,
+                            &self.operand_strides,
+                            input_idx,
+                        )?;
+                        let dest_offset =
+                            checked_strided_offset(dest_offset_base, &self.dest_strides, out_idx)?;
+                        unsafe {
+                            (*dest_ptr.offset(dest_offset))
+                                .write(*operand_ptr.offset(operand_offset));
+                        }
+                    }
+                    advance_col_major_index(input_idx, &self.operand_dims);
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
     }
 
     fn copy_operand_serial<T>(
@@ -562,9 +783,9 @@ impl PadPlan {
         )
     }
 
-    fn check_call<T>(
+    fn check_call<D, T>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &RawStridedMut<'_, D>,
         operand: &RawStridedRef<'_, T>,
     ) -> Result<()> {
         if operand.dims() != &self.operand_dims[..]
@@ -689,6 +910,31 @@ impl ConcatenatePlan {
         Ok(())
     }
 
+    /// Execute concatenate into storage whose reachable destination elements are uninitialized.
+    pub fn execute_uninit<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        inputs: &[RawStridedRef<'_, T>],
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        self.check_dest_layout(dest)?;
+        if inputs.len() != self.input_dims.len() {
+            return Err(StridedError::RankMismatch(
+                inputs.len(),
+                self.input_dims.len(),
+            ));
+        }
+        for (position, input) in inputs.iter().enumerate() {
+            self.check_input_layout(position, input)?;
+        }
+        for (position, input) in inputs.iter().enumerate() {
+            self.execute_segment_uninit(position, dest, input)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_dest_layout<T>(&self, dest: &RawStridedMut<'_, T>) -> Result<()> {
         if dest.dims() != &self.dest_dims[..] || dest.strides() != &self.dest_strides[..] {
             return Err(StridedError::PlanLayoutMismatch);
@@ -737,6 +983,31 @@ impl ConcatenatePlan {
             )
         };
         self.copy_plans[position].execute(&mut segment, input)
+    }
+
+    pub(crate) fn execute_segment_uninit<T>(
+        &self,
+        position: usize,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        input: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let segment_offset = dest
+            .offset()
+            .checked_add(self.dest_offset_deltas[position])
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest_data = dest.data_mut();
+        let mut segment = unsafe {
+            RawStridedMut::new_unchecked(
+                dest_data,
+                &self.input_dims[position],
+                &self.dest_strides,
+                segment_offset,
+            )
+        };
+        self.copy_plans[position].execute_uninit(&mut segment, input)
     }
 }
 
@@ -819,9 +1090,34 @@ impl ReversePlan {
         self.copy_plan.execute(dest, &source)
     }
 
-    fn check_call<T>(
+    /// Execute reverse into storage whose reachable destination elements are uninitialized.
+    pub fn execute_uninit<T>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        self.check_call(dest, operand)?;
+        let source_offset = operand
+            .offset()
+            .checked_add(self.source_offset_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let source = unsafe {
+            RawStridedRef::new_unchecked(
+                operand.data(),
+                &self.operand_dims,
+                &self.source_strides,
+                source_offset,
+            )
+        };
+        self.copy_plan.execute_uninit(dest, &source)
+    }
+
+    fn check_call<D, T>(
+        &self,
+        dest: &RawStridedMut<'_, D>,
         operand: &RawStridedRef<'_, T>,
     ) -> Result<()> {
         if operand.dims() != &self.operand_dims[..]
