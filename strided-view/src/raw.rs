@@ -468,7 +468,11 @@ impl<'a, T> RawStridedRef<'a, T> {
 
     #[inline]
     pub fn ptr(&self) -> *const T {
-        unsafe { self.data.as_ptr().offset(self.offset) }
+        if self.dims.iter().any(|&dim| dim == 0) {
+            NonNull::<T>::dangling().as_ptr()
+        } else {
+            unsafe { self.data.as_ptr().offset(self.offset) }
+        }
     }
 
     /// Convert to an immutable owning-metadata view.
@@ -556,12 +560,20 @@ impl<'a, T> RawStridedMut<'a, T> {
 
     #[inline]
     pub fn ptr(&self) -> *const T {
-        unsafe { self.data.as_ptr().offset(self.offset) }
+        if self.dims.iter().any(|&dim| dim == 0) {
+            NonNull::<T>::dangling().as_ptr()
+        } else {
+            unsafe { self.data.as_ptr().offset(self.offset) }
+        }
     }
 
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        unsafe { self.data.as_mut_ptr().offset(self.offset) }
+        if self.dims.iter().any(|&dim| dim == 0) {
+            NonNull::<T>::dangling().as_ptr()
+        } else {
+            unsafe { self.data.as_mut_ptr().offset(self.offset) }
+        }
     }
 
     /// Convert to an immutable owning-metadata view.
@@ -586,6 +598,20 @@ impl<'a, T> RawStridedMut<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_raw_views_use_dangling_base_pointers_for_extreme_offsets() {
+        let dims = [0usize];
+        let strides = [1isize];
+        let data: [f64; 0] = [];
+        let raw = RawStridedRef::new(&data, &dims, &strides, isize::MAX).unwrap();
+        assert_eq!(raw.ptr(), NonNull::<f64>::dangling().as_ptr());
+
+        let mut data: [f64; 0] = [];
+        let mut raw = RawStridedMut::new(&mut data, &dims, &strides, isize::MAX).unwrap();
+        assert_eq!(raw.ptr(), NonNull::<f64>::dangling().as_ptr());
+        assert_eq!(raw.as_mut_ptr(), NonNull::<f64>::dangling().as_ptr());
+    }
 
     #[test]
     fn raw_ref_rejects_out_of_bounds_layout() {

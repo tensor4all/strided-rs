@@ -1411,6 +1411,10 @@ fn execute_one_shot_map<T: OneShotScalar>(
         });
     }
     validate_one_shot_destination(dest)?;
+    crate::kernel::ensure_same_shape(dest.dims(), input.dims())?;
+    if dest.dims().contains(&0) {
+        return Ok(());
+    }
 
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
@@ -1433,6 +1437,10 @@ where
     A: Copy + crate::MaybeSendSync,
 {
     validate_one_shot_destination(dest)?;
+    crate::kernel::ensure_same_shape(dest.dims(), input.dims())?;
+    if dest.dims().contains(&0) {
+        return Ok(());
+    }
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
@@ -1456,22 +1464,26 @@ fn execute_one_shot_zip<T: OneShotScalar>(
         });
     }
     validate_one_shot_destination(dest)?;
+    crate::kernel::ensure_same_shape(dest.dims(), lhs.dims())?;
+    crate::kernel::ensure_same_shape(dest.dims(), rhs.dims())?;
+    if dest.dims().contains(&0) {
+        return Ok(());
+    }
 
+    let lhs = erased_raw_ref::<T>(lhs);
+    let rhs = erased_raw_ref::<T>(rhs);
+    if matches!(op, ErasedZipOp::Divide | ErasedZipOp::Remainder)
+        && T::INTEGER
+        && raw_any(&rhs, T::is_zero)?
+    {
+        return Err(StridedError::IntegerDivisionByZero { op: op.label() });
+    }
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = typed_slice_mut::<T>(dest.data_mut());
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    let lhs = erased_raw_ref::<T>(lhs);
-    let rhs = erased_raw_ref::<T>(rhs);
-    if matches!(op, ErasedZipOp::Divide | ErasedZipOp::Remainder)
-        && T::INTEGER
-        && raw_any(&rhs, T::is_zero)
-    {
-        return Err(StridedError::IntegerDivisionByZero { op: op.label() });
-    }
-
     crate::map_view::zip_map2_raw_into::<T, T, T, Identity, Identity>(
         &mut dest,
         &lhs,
@@ -1743,28 +1755,35 @@ fn map_output_dtype(dtype: KernelDType, op: ErasedMapOp) -> Result<KernelDType> 
     }
 }
 
-fn raw_any<T: Copy>(src: &RawStridedRef<'_, T>, predicate: impl Fn(T) -> bool + Copy) -> bool {
-    fn visit<T: Copy>(
-        src: &RawStridedRef<'_, T>,
-        axis: usize,
-        offset: isize,
-        predicate: impl Fn(T) -> bool + Copy,
-    ) -> bool {
-        if axis == src.dims().len() {
-            // SAFETY: RawStridedRef construction validated every reachable offset.
-            return predicate(unsafe { *src.data().as_ptr().offset(offset) });
+fn raw_any<T: Copy>(
+    src: &RawStridedRef<'_, T>,
+    predicate: impl Fn(T) -> bool + Copy,
+) -> Result<bool> {
+    let total = src
+        .dims()
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)?;
+    for linear in 0..total {
+        let mut remainder = linear;
+        let mut offset = src.offset();
+        for (&dim, &stride) in src.dims().iter().zip(src.strides()) {
+            let index = remainder % dim;
+            remainder /= dim;
+            offset = offset
+                .checked_add(
+                    stride
+                        .checked_mul(index as isize)
+                        .ok_or(StridedError::OffsetOverflow)?,
+                )
+                .ok_or(StridedError::OffsetOverflow)?;
         }
-        let mut offset = offset;
-        for _ in 0..src.dims()[axis] {
-            if visit(src, axis + 1, offset, predicate) {
-                return true;
-            }
-            offset += src.strides()[axis];
+        // SAFETY: RawStridedRef construction validated every reachable offset.
+        if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
+            return Ok(true);
         }
-        false
     }
-
-    visit(src, 0, src.offset(), predicate)
+    Ok(false)
 }
 
 fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {

@@ -14,6 +14,21 @@ use std::sync::Arc;
 use crate::element_op::{ComposableElementOp, ElementOp, ElementOpApply, Identity};
 use crate::{Result, StridedError};
 
+#[inline]
+fn empty_layout(dims: &[usize]) -> bool {
+    dims.iter().any(|&dim| dim == 0)
+}
+
+#[inline]
+fn empty_const_ptr<T>() -> *const T {
+    core::ptr::NonNull::<T>::dangling().as_ptr()
+}
+
+#[inline]
+fn empty_mut_ptr<T>() -> *mut T {
+    core::ptr::NonNull::<T>::dangling().as_ptr()
+}
+
 // ============================================================================
 // Validation helpers
 // ============================================================================
@@ -140,7 +155,11 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Create a new immutable strided view from a borrowed slice.
     pub fn new(data: &'a [T], dims: &[usize], strides: &[isize], offset: isize) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
-        let ptr = unsafe { data.as_ptr().offset(offset) };
+        let ptr = if empty_layout(dims) {
+            empty_const_ptr()
+        } else {
+            unsafe { data.as_ptr().offset(offset) }
+        };
         Ok(Self {
             ptr,
             data,
@@ -161,7 +180,11 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         strides: &[isize],
         offset: isize,
     ) -> Self {
-        let ptr = data.as_ptr().offset(offset);
+        let ptr = if empty_layout(dims) {
+            empty_const_ptr()
+        } else {
+            data.as_ptr().offset(offset)
+        };
         Self {
             ptr,
             data,
@@ -454,7 +477,11 @@ impl<'a, T> StridedViewMut<'a, T> {
         offset: isize,
     ) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
-        let ptr = unsafe { data.as_mut_ptr().offset(offset) };
+        let ptr = if empty_layout(dims) {
+            empty_mut_ptr()
+        } else {
+            unsafe { data.as_mut_ptr().offset(offset) }
+        };
         Ok(Self {
             ptr,
             data,
@@ -474,7 +501,11 @@ impl<'a, T> StridedViewMut<'a, T> {
         strides: &[isize],
         offset: isize,
     ) -> Self {
-        let ptr = data.as_mut_ptr().offset(offset);
+        let ptr = if empty_layout(dims) {
+            empty_mut_ptr()
+        } else {
+            data.as_mut_ptr().offset(offset)
+        };
         Self {
             ptr,
             data,
@@ -972,6 +1003,20 @@ impl<T: Copy> IndexMut<&[usize]> for StridedArray<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_views_use_dangling_base_pointers_for_extreme_offsets() {
+        let dims = [0usize];
+        let strides = [1isize];
+        let data: [f64; 0] = [];
+        let view = StridedView::<f64>::new(&data, &dims, &strides, isize::MAX).unwrap();
+        assert_eq!(view.ptr(), empty_const_ptr());
+
+        let mut data: [f64; 0] = [];
+        let view = StridedViewMut::new(&mut data, &dims, &strides, isize::MAX).unwrap();
+        assert_eq!(view.ptr(), empty_const_ptr());
+        assert_eq!(view.as_mut_ptr(), empty_mut_ptr());
+    }
     use num_complex::Complex64;
 
     #[test]

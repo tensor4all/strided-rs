@@ -264,14 +264,20 @@ fn one_shot_empty_output_is_a_noop_for_degenerate_strides() {
     let strides = [1isize, 0];
     let input: [f64; 0] = [];
     let mut output: [f64; 0] = [];
-    let input =
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &strides, 0).unwrap();
+    let input = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&input),
+        &dims,
+        &strides,
+        isize::MAX,
+    )
+    .unwrap();
     let mut output = ErasedRawStridedMut::new(
         KernelDType::F64,
         as_bytes_mut(&mut output),
         &dims,
         &strides,
-        0,
+        isize::MAX,
     )
     .unwrap();
 
@@ -280,6 +286,16 @@ fn one_shot_empty_output_is_a_noop_for_degenerate_strides() {
         ErasedMapOp::Negate,
         &ExecContext::serial(),
         &mut output,
+        &ErasedRawStridedPtr::from_ref(&input),
+    )
+    .unwrap();
+
+    erased_zip_into(
+        KernelDType::F64,
+        ErasedZipOp::Add,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&input),
         &ErasedRawStridedPtr::from_ref(&input),
     )
     .unwrap();
@@ -546,4 +562,36 @@ fn one_shot_accepts_small_injective_layout_without_allocating() {
     )
     .unwrap();
     assert_eq!(actual, [-1.0, 0.0, -2.0, -4.0, -3.0, -5.0, 0.0, -6.0]);
+}
+
+#[test]
+fn integer_division_preflight_handles_high_rank_iteratively() {
+    const RANK: usize = 20_000;
+    let dims = vec![1usize; RANK];
+    let strides = vec![0isize; RANK];
+    let lhs = [i32::MIN];
+    let rhs = [-1i32];
+    let lhs =
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&lhs), &dims, &strides, 0).unwrap();
+    let rhs =
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+    let mut actual = [0i32];
+    let mut output = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut actual),
+        &dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+    erased_zip_into(
+        KernelDType::I32,
+        ErasedZipOp::Divide,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
+    )
+    .unwrap();
+    assert_eq!(actual, [i32::MIN]);
 }
