@@ -512,10 +512,19 @@ pub trait MaybeSimdOps: Copy + Sized {
     }
 }
 
+pub(crate) trait MaybeSimdProduct: Copy + Sized {
+    fn try_simd_product(_src: &[Self]) -> Option<Self> {
+        None
+    }
+}
+
 // Default (no-op) impls for integer types and Complex
 macro_rules! impl_no_simd {
     ($($t:ty),*) => {
-        $(impl MaybeSimdOps for $t {})*
+        $(
+            impl MaybeSimdOps for $t {}
+            impl MaybeSimdProduct for $t {}
+        )*
     };
 }
 
@@ -525,17 +534,25 @@ impl<T: num_traits::Num + Copy + Clone + std::ops::Neg<Output = T>> MaybeSimdOps
     for num_complex::Complex<T>
 {
 }
+impl<T: num_traits::Num + Copy + Clone + std::ops::Neg<Output = T>> MaybeSimdProduct
+    for num_complex::Complex<T>
+{
+}
 
 // f32/f64: SIMD-accelerated when feature enabled, no-op otherwise
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdOps for f32 {}
+#[cfg(not(feature = "simd"))]
+impl MaybeSimdProduct for f32 {}
 
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdOps for f64 {}
+#[cfg(not(feature = "simd"))]
+impl MaybeSimdProduct for f64 {}
 
 #[cfg(feature = "simd")]
 mod simd_impls {
-    use super::MaybeSimdOps;
+    use super::{MaybeSimdOps, MaybeSimdProduct};
     use pulp::{Simd, WithSimd};
 
     impl MaybeSimdOps for f32 {
@@ -578,49 +595,93 @@ mod simd_impls {
         }
 
         fn try_simd_dot(a: &[f32], b: &[f32]) -> Option<f32> {
-            struct Dot<'a> {
-                a: &'a [f32],
-                b: &'a [f32],
-            }
-            impl<'a> WithSimd for Dot<'a> {
+            try_simd_dot_f32(a, b)
+        }
+    }
+
+    impl MaybeSimdProduct for f32 {
+        fn try_simd_product(src: &[f32]) -> Option<f32> {
+            struct Product<'a>(&'a [f32]);
+            impl<'a> WithSimd for Product<'a> {
                 type Output = f32;
 
                 #[inline(always)]
                 fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-                    debug_assert_eq!(self.a.len(), self.b.len());
-                    let (a_head, a_tail) = S::as_simd_f32s(self.a);
-                    let (b_head, b_tail) = S::as_simd_f32s(self.b);
-                    debug_assert_eq!(a_head.len(), b_head.len());
-                    debug_assert_eq!(a_tail.len(), b_tail.len());
+                    let (head, tail) = S::as_simd_f32s(self.0);
 
-                    let mut acc0 = simd.splat_f32s(0.0);
-                    let mut acc1 = simd.splat_f32s(0.0);
-                    let mut acc2 = simd.splat_f32s(0.0);
-                    let mut acc3 = simd.splat_f32s(0.0);
+                    let mut acc0 = simd.splat_f32s(1.0);
+                    let mut acc1 = simd.splat_f32s(1.0);
+                    let mut acc2 = simd.splat_f32s(1.0);
+                    let mut acc3 = simd.splat_f32s(1.0);
 
                     let mut i = 0usize;
-                    while i + 4 <= a_head.len() {
-                        acc0 = simd.mul_add_f32s(a_head[i], b_head[i], acc0);
-                        acc1 = simd.mul_add_f32s(a_head[i + 1], b_head[i + 1], acc1);
-                        acc2 = simd.mul_add_f32s(a_head[i + 2], b_head[i + 2], acc2);
-                        acc3 = simd.mul_add_f32s(a_head[i + 3], b_head[i + 3], acc3);
+                    while i + 4 <= head.len() {
+                        acc0 = simd.mul_f32s(acc0, head[i]);
+                        acc1 = simd.mul_f32s(acc1, head[i + 1]);
+                        acc2 = simd.mul_f32s(acc2, head[i + 2]);
+                        acc3 = simd.mul_f32s(acc3, head[i + 3]);
                         i += 4;
                     }
-                    for j in i..a_head.len() {
-                        acc0 = simd.mul_add_f32s(a_head[j], b_head[j], acc0);
+                    for &value in &head[i..] {
+                        acc0 = simd.mul_f32s(acc0, value);
                     }
 
-                    let acc = simd.add_f32s(simd.add_f32s(acc0, acc1), simd.add_f32s(acc2, acc3));
-                    let mut sum = simd.reduce_sum_f32s(acc);
-                    for (&x, &y) in a_tail.iter().zip(b_tail.iter()) {
-                        sum += x * y;
+                    let acc = simd.mul_f32s(simd.mul_f32s(acc0, acc1), simd.mul_f32s(acc2, acc3));
+                    let mut product = simd.reduce_product_f32s(acc);
+                    for &value in tail {
+                        product *= value;
                     }
-                    sum
+                    product
                 }
             }
 
-            Some(pulp::Arch::new().dispatch(Dot { a, b }))
+            Some(pulp::Arch::new().dispatch(Product(src)))
         }
+    }
+
+    fn try_simd_dot_f32(a: &[f32], b: &[f32]) -> Option<f32> {
+        struct Dot<'a> {
+            a: &'a [f32],
+            b: &'a [f32],
+        }
+        impl<'a> WithSimd for Dot<'a> {
+            type Output = f32;
+
+            #[inline(always)]
+            fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+                debug_assert_eq!(self.a.len(), self.b.len());
+                let (a_head, a_tail) = S::as_simd_f32s(self.a);
+                let (b_head, b_tail) = S::as_simd_f32s(self.b);
+                debug_assert_eq!(a_head.len(), b_head.len());
+                debug_assert_eq!(a_tail.len(), b_tail.len());
+
+                let mut acc0 = simd.splat_f32s(0.0);
+                let mut acc1 = simd.splat_f32s(0.0);
+                let mut acc2 = simd.splat_f32s(0.0);
+                let mut acc3 = simd.splat_f32s(0.0);
+
+                let mut i = 0usize;
+                while i + 4 <= a_head.len() {
+                    acc0 = simd.mul_add_f32s(a_head[i], b_head[i], acc0);
+                    acc1 = simd.mul_add_f32s(a_head[i + 1], b_head[i + 1], acc1);
+                    acc2 = simd.mul_add_f32s(a_head[i + 2], b_head[i + 2], acc2);
+                    acc3 = simd.mul_add_f32s(a_head[i + 3], b_head[i + 3], acc3);
+                    i += 4;
+                }
+                for j in i..a_head.len() {
+                    acc0 = simd.mul_add_f32s(a_head[j], b_head[j], acc0);
+                }
+
+                let acc = simd.add_f32s(simd.add_f32s(acc0, acc1), simd.add_f32s(acc2, acc3));
+                let mut sum = simd.reduce_sum_f32s(acc);
+                for (&x, &y) in a_tail.iter().zip(b_tail.iter()) {
+                    sum += x * y;
+                }
+                sum
+            }
+        }
+
+        Some(pulp::Arch::new().dispatch(Dot { a, b }))
     }
 
     impl MaybeSimdOps for f64 {
@@ -663,49 +724,93 @@ mod simd_impls {
         }
 
         fn try_simd_dot(a: &[f64], b: &[f64]) -> Option<f64> {
-            struct Dot<'a> {
-                a: &'a [f64],
-                b: &'a [f64],
-            }
-            impl<'a> WithSimd for Dot<'a> {
+            try_simd_dot_f64(a, b)
+        }
+    }
+
+    impl MaybeSimdProduct for f64 {
+        fn try_simd_product(src: &[f64]) -> Option<f64> {
+            struct Product<'a>(&'a [f64]);
+            impl<'a> WithSimd for Product<'a> {
                 type Output = f64;
 
                 #[inline(always)]
                 fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-                    debug_assert_eq!(self.a.len(), self.b.len());
-                    let (a_head, a_tail) = S::as_simd_f64s(self.a);
-                    let (b_head, b_tail) = S::as_simd_f64s(self.b);
-                    debug_assert_eq!(a_head.len(), b_head.len());
-                    debug_assert_eq!(a_tail.len(), b_tail.len());
+                    let (head, tail) = S::as_simd_f64s(self.0);
 
-                    let mut acc0 = simd.splat_f64s(0.0);
-                    let mut acc1 = simd.splat_f64s(0.0);
-                    let mut acc2 = simd.splat_f64s(0.0);
-                    let mut acc3 = simd.splat_f64s(0.0);
+                    let mut acc0 = simd.splat_f64s(1.0);
+                    let mut acc1 = simd.splat_f64s(1.0);
+                    let mut acc2 = simd.splat_f64s(1.0);
+                    let mut acc3 = simd.splat_f64s(1.0);
 
                     let mut i = 0usize;
-                    while i + 4 <= a_head.len() {
-                        acc0 = simd.mul_add_f64s(a_head[i], b_head[i], acc0);
-                        acc1 = simd.mul_add_f64s(a_head[i + 1], b_head[i + 1], acc1);
-                        acc2 = simd.mul_add_f64s(a_head[i + 2], b_head[i + 2], acc2);
-                        acc3 = simd.mul_add_f64s(a_head[i + 3], b_head[i + 3], acc3);
+                    while i + 4 <= head.len() {
+                        acc0 = simd.mul_f64s(acc0, head[i]);
+                        acc1 = simd.mul_f64s(acc1, head[i + 1]);
+                        acc2 = simd.mul_f64s(acc2, head[i + 2]);
+                        acc3 = simd.mul_f64s(acc3, head[i + 3]);
                         i += 4;
                     }
-                    for j in i..a_head.len() {
-                        acc0 = simd.mul_add_f64s(a_head[j], b_head[j], acc0);
+                    for &value in &head[i..] {
+                        acc0 = simd.mul_f64s(acc0, value);
                     }
 
-                    let acc = simd.add_f64s(simd.add_f64s(acc0, acc1), simd.add_f64s(acc2, acc3));
-                    let mut sum = simd.reduce_sum_f64s(acc);
-                    for (&x, &y) in a_tail.iter().zip(b_tail.iter()) {
-                        sum += x * y;
+                    let acc = simd.mul_f64s(simd.mul_f64s(acc0, acc1), simd.mul_f64s(acc2, acc3));
+                    let mut product = simd.reduce_product_f64s(acc);
+                    for &value in tail {
+                        product *= value;
                     }
-                    sum
+                    product
                 }
             }
 
-            Some(pulp::Arch::new().dispatch(Dot { a, b }))
+            Some(pulp::Arch::new().dispatch(Product(src)))
         }
+    }
+
+    fn try_simd_dot_f64(a: &[f64], b: &[f64]) -> Option<f64> {
+        struct Dot<'a> {
+            a: &'a [f64],
+            b: &'a [f64],
+        }
+        impl<'a> WithSimd for Dot<'a> {
+            type Output = f64;
+
+            #[inline(always)]
+            fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+                debug_assert_eq!(self.a.len(), self.b.len());
+                let (a_head, a_tail) = S::as_simd_f64s(self.a);
+                let (b_head, b_tail) = S::as_simd_f64s(self.b);
+                debug_assert_eq!(a_head.len(), b_head.len());
+                debug_assert_eq!(a_tail.len(), b_tail.len());
+
+                let mut acc0 = simd.splat_f64s(0.0);
+                let mut acc1 = simd.splat_f64s(0.0);
+                let mut acc2 = simd.splat_f64s(0.0);
+                let mut acc3 = simd.splat_f64s(0.0);
+
+                let mut i = 0usize;
+                while i + 4 <= a_head.len() {
+                    acc0 = simd.mul_add_f64s(a_head[i], b_head[i], acc0);
+                    acc1 = simd.mul_add_f64s(a_head[i + 1], b_head[i + 1], acc1);
+                    acc2 = simd.mul_add_f64s(a_head[i + 2], b_head[i + 2], acc2);
+                    acc3 = simd.mul_add_f64s(a_head[i + 3], b_head[i + 3], acc3);
+                    i += 4;
+                }
+                for j in i..a_head.len() {
+                    acc0 = simd.mul_add_f64s(a_head[j], b_head[j], acc0);
+                }
+
+                let acc = simd.add_f64s(simd.add_f64s(acc0, acc1), simd.add_f64s(acc2, acc3));
+                let mut sum = simd.reduce_sum_f64s(acc);
+                for (&x, &y) in a_tail.iter().zip(b_tail.iter()) {
+                    sum += x * y;
+                }
+                sum
+            }
+        }
+
+        Some(pulp::Arch::new().dispatch(Dot { a, b }))
     }
 }
 

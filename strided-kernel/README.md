@@ -39,6 +39,33 @@ zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
 let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
 ```
 
+### Built-in Erased Reduction Order
+
+The built-in erased `Sum` and `Product` reductions have a narrower, explicit
+determinism contract than the generic closure-based `reduce` API:
+
+- Compact full reductions traverse consecutive physical storage from the
+  logical origin. Other full reductions use the stable fused/block traversal.
+  Axis reductions enumerate reduced coordinates in declared axis order, with
+  the first reduced axis varying fastest.
+- Serial compact `f32`/`f64` full reductions use four SIMD accumulators when
+  the `simd` feature is enabled. Other dtype/feature combinations use a fixed
+  eight-lane scalar accumulator. Accumulator lanes are merged in stable order.
+  Generic closure reductions retain their existing association.
+- `i32` and `i64` use wrapping sum/product. Floating and complex reductions use
+  same-dtype arithmetic without widening, compensation, conjugation, or
+  fast-math. Reassociation can change roundoff, signed zero, NaN details, and
+  the point at which an intermediate overflows or underflows. Consequently,
+  floating product may differ in finite/zero/infinite/NaN classification from
+  a strict left fold.
+- `ExecContext::serial()` and `ExecContext::max_threads(1)` use the same serial
+  algorithm. A fixed nonzero thread budget has deterministic partition and
+  merge order for a fixed executable, target, input, and layout; worker
+  completion order does not affect the result. Different budgets may produce
+  different floating or complex roundoff.
+- Empty sum and product return zero and one respectively. No tolerance or
+  correctness gate is relaxed for the optimized association.
+
 ## High-Level Operations
 
 ```rust
