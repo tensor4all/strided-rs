@@ -155,49 +155,111 @@ pub fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
     costs
 }
 
-/// Bilateral dimension fusion for src + dst stride patterns.
+/// Validated result of fusing adjacent dimensions that are contiguous in
+/// both source and destination layouts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BilateralFusionPlan {
+    /// Fused non-trivial dimensions in iteration order.
+    pub dims: Vec<usize>,
+    /// Source strides corresponding to [`Self::dims`].
+    pub src_strides: Vec<isize>,
+    /// Destination strides corresponding to [`Self::dims`].
+    pub dst_strides: Vec<isize>,
+}
+
+/// Failure while validating or constructing a bilateral fusion plan.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FusionPlanError {
+    /// Shape and stride ranks do not agree.
+    #[error(
+        "metadata lengths differ: dims={dims}, src_strides={src_strides}, \
+         dst_strides={dst_strides}"
+    )]
+    LengthMismatch {
+        /// Number of dimensions.
+        dims: usize,
+        /// Number of source strides.
+        src_strides: usize,
+        /// Number of destination strides.
+        dst_strides: usize,
+    },
+    /// A dimension cannot be represented for stride arithmetic, or a fused
+    /// dimension product exceeds `usize`.
+    #[error("fused dimension product overflows usize")]
+    DimensionOverflow,
+}
+
+/// Plan bilateral dimension fusion for source and destination layouts.
 ///
-/// Two dimensions `i` and `i+1` can be fused if BOTH src and dst strides
-/// are contiguous for those dimensions. Returns the fused (dims, src_strides, dst_strides).
-pub fn fuse_dims_bilateral(
+/// Size-one axes are removed. Two remaining adjacent axes are fused only when
+/// each layout is affine-contiguous across the boundary. Negative strides are
+/// supported; stride multiplication overflow simply prevents fusion.
+///
+/// # Errors
+///
+/// Returns [`FusionPlanError::LengthMismatch`] when the metadata ranks differ,
+/// and [`FusionPlanError::DimensionOverflow`] when a dimension cannot
+/// participate safely in `isize` stride arithmetic or a fused extent
+/// overflows `usize`.
+pub fn plan_bilateral_fusion(
+    dims: &[usize],
+    src_strides: &[isize],
+    dst_strides: &[isize],
+) -> Result<BilateralFusionPlan, FusionPlanError> {
+    if dims.len() != src_strides.len() || dims.len() != dst_strides.len() {
+        return Err(FusionPlanError::LengthMismatch {
+            dims: dims.len(),
+            src_strides: src_strides.len(),
+            dst_strides: dst_strides.len(),
+        });
+    }
+
+    let mut plan = BilateralFusionPlan {
+        dims: Vec::with_capacity(dims.len()),
+        src_strides: Vec::with_capacity(dims.len()),
+        dst_strides: Vec::with_capacity(dims.len()),
+    };
+
+    for ((&dim, &src_stride), &dst_stride) in dims.iter().zip(src_strides).zip(dst_strides) {
+        if dim == 1 {
+            continue;
+        }
+        isize::try_from(dim).map_err(|_| FusionPlanError::DimensionOverflow)?;
+
+        if let Some(last) = plan.dims.len().checked_sub(1) {
+            let current_dim =
+                isize::try_from(plan.dims[last]).map_err(|_| FusionPlanError::DimensionOverflow)?;
+            let src_contiguous = plan.src_strides[last]
+                .checked_mul(current_dim)
+                .is_some_and(|expected| src_stride == expected);
+            let dst_contiguous = plan.dst_strides[last]
+                .checked_mul(current_dim)
+                .is_some_and(|expected| dst_stride == expected);
+
+            if src_contiguous && dst_contiguous {
+                plan.dims[last] = plan.dims[last]
+                    .checked_mul(dim)
+                    .ok_or(FusionPlanError::DimensionOverflow)?;
+                continue;
+            }
+        }
+
+        plan.dims.push(dim);
+        plan.src_strides.push(src_stride);
+        plan.dst_strides.push(dst_stride);
+    }
+
+    Ok(plan)
+}
+
+#[cfg(test)]
+fn fuse_dims_bilateral(
     dims: &[usize],
     src_strides: &[isize],
     dst_strides: &[isize],
 ) -> (Vec<usize>, Vec<isize>, Vec<isize>) {
-    let n = dims.len();
-    if n <= 1 {
-        return (dims.to_vec(), src_strides.to_vec(), dst_strides.to_vec());
-    }
-
-    let mut fused_dims = Vec::with_capacity(n);
-    let mut fused_src = Vec::with_capacity(n);
-    let mut fused_dst = Vec::with_capacity(n);
-
-    fused_dims.push(dims[0]);
-    fused_src.push(src_strides[0]);
-    fused_dst.push(dst_strides[0]);
-
-    for i in 1..n {
-        let last = fused_dims.len() - 1;
-        let d_prev = fused_dims[last];
-        let ss_prev = fused_src[last];
-        let ds_prev = fused_dst[last];
-
-        // Check if dim i is contiguous with the previous fused dim in BOTH src and dst
-        let src_contiguous = src_strides[i] == ss_prev * d_prev as isize;
-        let dst_contiguous = dst_strides[i] == ds_prev * d_prev as isize;
-
-        if src_contiguous && dst_contiguous {
-            // Fuse: multiply the last fused dim
-            fused_dims[last] *= dims[i];
-        } else {
-            fused_dims.push(dims[i]);
-            fused_src.push(src_strides[i]);
-            fused_dst.push(dst_strides[i]);
-        }
-    }
-
-    (fused_dims, fused_src, fused_dst)
+    let plan = plan_bilateral_fusion(dims, src_strides, dst_strides).unwrap();
+    (plan.dims, plan.src_strides, plan.dst_strides)
 }
 
 #[cfg(test)]
