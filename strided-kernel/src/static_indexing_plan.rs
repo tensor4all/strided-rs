@@ -905,6 +905,9 @@ impl ConcatenatePlan {
         }
         for (position, input) in inputs.iter().enumerate() {
             self.check_input_layout(position, input)?;
+            self.segment_offset(position, dest.offset())?;
+        }
+        for (position, input) in inputs.iter().enumerate() {
             self.execute_segment(position, dest, input)?;
         }
         Ok(())
@@ -928,6 +931,7 @@ impl ConcatenatePlan {
         }
         for (position, input) in inputs.iter().enumerate() {
             self.check_input_layout(position, input)?;
+            self.segment_offset(position, dest.offset())?;
         }
         for (position, input) in inputs.iter().enumerate() {
             self.execute_segment_uninit(position, dest, input)?;
@@ -960,6 +964,12 @@ impl ConcatenatePlan {
         self.input_dims.len()
     }
 
+    pub(crate) fn segment_offset(&self, position: usize, dest_offset: isize) -> Result<isize> {
+        dest_offset
+            .checked_add(self.dest_offset_deltas[position])
+            .ok_or(StridedError::OffsetOverflow)
+    }
+
     pub(crate) fn execute_segment<T>(
         &self,
         position: usize,
@@ -969,10 +979,7 @@ impl ConcatenatePlan {
     where
         T: Copy + MaybeSendSync,
     {
-        let segment_offset = dest
-            .offset()
-            .checked_add(self.dest_offset_deltas[position])
-            .ok_or(StridedError::OffsetOverflow)?;
+        let segment_offset = self.segment_offset(position, dest.offset())?;
         let dest_data = dest.data_mut();
         let mut segment = unsafe {
             RawStridedMut::new_unchecked(
@@ -994,10 +1001,7 @@ impl ConcatenatePlan {
     where
         T: Copy + MaybeSendSync,
     {
-        let segment_offset = dest
-            .offset()
-            .checked_add(self.dest_offset_deltas[position])
-            .ok_or(StridedError::OffsetOverflow)?;
+        let segment_offset = self.segment_offset(position, dest.offset())?;
         let dest_data = dest.data_mut();
         let mut segment = unsafe {
             RawStridedMut::new_unchecked(

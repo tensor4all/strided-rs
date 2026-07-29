@@ -79,6 +79,38 @@ where
     assert_eq!(assume_init_vec(dest), expected);
 }
 
+fn assert_empty_uninit_slice<T>(dtype: KernelDType)
+where
+    T: Copy,
+{
+    let dims = [0usize];
+    let strides = [1isize];
+    let starts = [0usize];
+    let limits = [0usize];
+    let slice_strides = [1usize];
+    let plan = ErasedSlicePlan::compile(
+        dtype,
+        &dims,
+        &strides,
+        &dims,
+        &strides,
+        &starts,
+        &limits,
+        &slice_strides,
+    )
+    .unwrap();
+    let operand: [T; 0] = [];
+    let operand_ref =
+        ErasedRawStridedRef::new(dtype, as_bytes(&operand), &dims, &strides, 0).unwrap();
+    let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
+    let mut empty_bytes: [MaybeUninit<u8>; 0] = [];
+    let mut dest_ref =
+        ErasedRawStridedUninitMut::new(dtype, &mut empty_bytes, &dims, &strides, 0).unwrap();
+
+    plan.execute_uninit(&ExecContext::serial(), &mut dest_ref, &operand_ptr)
+        .unwrap();
+}
+
 #[test]
 fn erased_slice_uninit_executes_every_kernel_dtype() {
     assert_uninit_slice(KernelDType::F32, vec![1.0f32, -2.0], vec![1.0, -2.0]);
@@ -96,6 +128,17 @@ fn erased_slice_uninit_executes_every_kernel_dtype() {
         vec![Complex64::new(1.0, 2.0), Complex64::new(-2.0, 3.0)],
         vec![Complex64::new(1.0, 2.0), Complex64::new(-2.0, 3.0)],
     );
+}
+
+#[test]
+fn erased_slice_uninit_accepts_unaligned_empty_storage_for_every_kernel_dtype() {
+    assert_empty_uninit_slice::<f32>(KernelDType::F32);
+    assert_empty_uninit_slice::<f64>(KernelDType::F64);
+    assert_empty_uninit_slice::<i32>(KernelDType::I32);
+    assert_empty_uninit_slice::<i64>(KernelDType::I64);
+    assert_empty_uninit_slice::<bool>(KernelDType::Bool);
+    assert_empty_uninit_slice::<Complex32>(KernelDType::C32);
+    assert_empty_uninit_slice::<Complex64>(KernelDType::C64);
 }
 
 #[test]
@@ -282,6 +325,68 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
             .map(|value| unsafe { value.assume_init() })
             .collect::<Vec<_>>(),
         [7, 9]
+    );
+}
+
+#[test]
+fn erased_concatenate_validates_all_segment_offsets_before_writing() {
+    let first_dims = [1usize];
+    let empty_dims = [0usize];
+    let input_strides = [1isize];
+    let dest_dims = [1usize];
+    let dest_strides = [isize::MAX];
+    let input_dims: [&[usize]; 2] = [&first_dims, &empty_dims];
+    let input_stride_sets: [&[isize]; 2] = [&input_strides, &input_strides];
+    let plan = ErasedConcatenatePlan::compile(
+        KernelDType::I32,
+        &input_dims,
+        &input_stride_sets,
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+    let first = [11i32];
+    let empty: [i32; 0] = [];
+    let first_ref = ErasedRawStridedRef::new(
+        KernelDType::I32,
+        as_bytes(&first),
+        &first_dims,
+        &input_strides,
+        0,
+    )
+    .unwrap();
+    let empty_ref = ErasedRawStridedRef::new(
+        KernelDType::I32,
+        as_bytes(&empty),
+        &empty_dims,
+        &input_strides,
+        0,
+    )
+    .unwrap();
+    let inputs = [
+        ErasedRawStridedPtr::from_ref(&first_ref),
+        ErasedRawStridedPtr::from_ref(&empty_ref),
+    ];
+    let mut dest = [MaybeUninit::new(3i32), MaybeUninit::new(7i32)];
+    let mut dest_ref = ErasedRawStridedUninitMut::new(
+        KernelDType::I32,
+        as_uninit_bytes_mut(&mut dest),
+        &dest_dims,
+        &dest_strides,
+        1,
+    )
+    .unwrap();
+
+    let error = plan
+        .execute_uninit(&ExecContext::serial(), &mut dest_ref, &inputs)
+        .unwrap_err();
+
+    assert!(matches!(error, StridedError::OffsetOverflow));
+    assert_eq!(
+        dest.map(|value| unsafe { value.assume_init() }),
+        [3, 7],
+        "validation failure must precede every segment write"
     );
 }
 

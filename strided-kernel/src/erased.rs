@@ -2273,6 +2273,13 @@ where
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
         plan.check_input_layout(position, &input_ref)?;
+        plan.segment_offset(position, dest_offset)?;
+    }
+    for (position, input) in inputs.iter().enumerate() {
+        let input_data = typed_slice::<T>(input.data());
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
         plan.execute_segment(position, &mut dest_ref, &input_ref)?;
     }
     Ok(())
@@ -2301,6 +2308,7 @@ where
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
         plan.check_input_layout(position, &input_ref)?;
+        plan.segment_offset(position, dest_offset)?;
     }
     for (position, input) in inputs.iter().enumerate() {
         let input = validated_input_ref(input)?;
@@ -3079,6 +3087,14 @@ fn typed_slice_mut<T>(bytes: &mut [u8]) -> &mut [T] {
 }
 
 fn typed_uninit_slice_mut<T>(bytes: &mut [MaybeUninit<u8>]) -> &mut [MaybeUninit<T>] {
+    if bytes.is_empty() {
+        return unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::NonNull::<MaybeUninit<T>>::dangling().as_ptr(),
+                0,
+            )
+        };
+    }
     let len = bytes.len() / core::mem::size_of::<T>();
     unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<MaybeUninit<T>>(), len) }
 }
