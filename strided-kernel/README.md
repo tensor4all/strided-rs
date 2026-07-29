@@ -41,8 +41,9 @@ let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
 
 ### Built-in Erased Reduction Order
 
-The built-in erased `Sum` and `Product` reductions have a narrower, explicit
-determinism contract than the generic closure-based `reduce` API:
+The built-in erased `Sum`, `Product`, and `SumSquares` reductions have a
+narrower, explicit determinism contract than the generic closure-based
+`reduce` API:
 
 - Compact full reductions traverse consecutive physical storage from the
   logical origin. Other full reductions use the stable fused/block traversal.
@@ -52,6 +53,11 @@ determinism contract than the generic closure-based `reduce` API:
   the `simd` feature is enabled. Other dtype/feature combinations use a fixed
   eight-lane scalar accumulator. Accumulator lanes are merged in stable order.
   Generic closure reductions retain their existing association.
+- `SumSquares` accepts `f32` and `f64`. Each value is multiplied by itself and
+  rounded in that dtype before the result enters the `Sum` accumulator. The
+  multiply and add are not contracted into FMA, so overflow and underflow are
+  classified before accumulation. The kernel does not materialize a squared
+  tensor.
 - `i32` and `i64` use wrapping sum/product. Floating and complex reductions use
   same-dtype arithmetic without widening, compensation, conjugation, or
   fast-math. Reassociation can change roundoff, signed zero, NaN details, and
@@ -63,8 +69,9 @@ determinism contract than the generic closure-based `reduce` API:
   merge order for a fixed executable, target, input, and layout; worker
   completion order does not affect the result. Different budgets may produce
   different floating or complex roundoff.
-- Empty sum and product return zero and one respectively. No tolerance or
-  correctness gate is relaxed for the optimized association.
+- Empty sum, product, and sum-of-squares return zero, one, and zero
+  respectively. No tolerance or correctness gate is relaxed for the optimized
+  association.
 
 ## High-Level Operations
 

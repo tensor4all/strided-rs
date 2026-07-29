@@ -518,12 +518,19 @@ pub(crate) trait MaybeSimdProduct: Copy + Sized {
     }
 }
 
+pub(crate) trait MaybeSimdSumSquares: Copy + Sized {
+    fn try_simd_sum_squares(_src: &[Self]) -> Option<Self> {
+        None
+    }
+}
+
 // Default (no-op) impls for integer types and Complex
 macro_rules! impl_no_simd {
     ($($t:ty),*) => {
         $(
             impl MaybeSimdOps for $t {}
             impl MaybeSimdProduct for $t {}
+            impl MaybeSimdSumSquares for $t {}
         )*
     };
 }
@@ -538,21 +545,29 @@ impl<T: num_traits::Num + Copy + Clone + std::ops::Neg<Output = T>> MaybeSimdPro
     for num_complex::Complex<T>
 {
 }
+impl<T: num_traits::Num + Copy + Clone + std::ops::Neg<Output = T>> MaybeSimdSumSquares
+    for num_complex::Complex<T>
+{
+}
 
 // f32/f64: SIMD-accelerated when feature enabled, no-op otherwise
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdOps for f32 {}
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdProduct for f32 {}
+#[cfg(not(feature = "simd"))]
+impl MaybeSimdSumSquares for f32 {}
 
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdOps for f64 {}
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdProduct for f64 {}
+#[cfg(not(feature = "simd"))]
+impl MaybeSimdSumSquares for f64 {}
 
 #[cfg(feature = "simd")]
 mod simd_impls {
-    use super::{MaybeSimdOps, MaybeSimdProduct};
+    use super::{MaybeSimdOps, MaybeSimdProduct, MaybeSimdSumSquares};
     use pulp::{Simd, WithSimd};
 
     impl MaybeSimdOps for f32 {
@@ -636,6 +651,51 @@ mod simd_impls {
             }
 
             Some(pulp::Arch::new().dispatch(Product(src)))
+        }
+    }
+
+    impl MaybeSimdSumSquares for f32 {
+        fn try_simd_sum_squares(src: &[f32]) -> Option<f32> {
+            struct SumSquares<'a>(&'a [f32]);
+            impl<'a> WithSimd for SumSquares<'a> {
+                type Output = f32;
+
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+                    let (head, tail) = S::as_simd_f32s(self.0);
+                    let mut acc0 = simd.splat_f32s(0.0);
+                    let mut acc1 = simd.splat_f32s(0.0);
+                    let mut acc2 = simd.splat_f32s(0.0);
+                    let mut acc3 = simd.splat_f32s(0.0);
+
+                    let mut i = 0usize;
+                    while i + 4 <= head.len() {
+                        let square0 = simd.mul_f32s(head[i], head[i]);
+                        let square1 = simd.mul_f32s(head[i + 1], head[i + 1]);
+                        let square2 = simd.mul_f32s(head[i + 2], head[i + 2]);
+                        let square3 = simd.mul_f32s(head[i + 3], head[i + 3]);
+                        acc0 = simd.add_f32s(acc0, square0);
+                        acc1 = simd.add_f32s(acc1, square1);
+                        acc2 = simd.add_f32s(acc2, square2);
+                        acc3 = simd.add_f32s(acc3, square3);
+                        i += 4;
+                    }
+                    for &value in &head[i..] {
+                        let square = simd.mul_f32s(value, value);
+                        acc0 = simd.add_f32s(acc0, square);
+                    }
+
+                    let acc = simd.add_f32s(simd.add_f32s(acc0, acc1), simd.add_f32s(acc2, acc3));
+                    let mut sum = simd.reduce_sum_f32s(acc);
+                    for &value in tail {
+                        let square = value * value;
+                        sum += square;
+                    }
+                    sum
+                }
+            }
+
+            Some(pulp::Arch::new().dispatch(SumSquares(src)))
         }
     }
 
@@ -765,6 +825,51 @@ mod simd_impls {
             }
 
             Some(pulp::Arch::new().dispatch(Product(src)))
+        }
+    }
+
+    impl MaybeSimdSumSquares for f64 {
+        fn try_simd_sum_squares(src: &[f64]) -> Option<f64> {
+            struct SumSquares<'a>(&'a [f64]);
+            impl<'a> WithSimd for SumSquares<'a> {
+                type Output = f64;
+
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+                    let (head, tail) = S::as_simd_f64s(self.0);
+                    let mut acc0 = simd.splat_f64s(0.0);
+                    let mut acc1 = simd.splat_f64s(0.0);
+                    let mut acc2 = simd.splat_f64s(0.0);
+                    let mut acc3 = simd.splat_f64s(0.0);
+
+                    let mut i = 0usize;
+                    while i + 4 <= head.len() {
+                        let square0 = simd.mul_f64s(head[i], head[i]);
+                        let square1 = simd.mul_f64s(head[i + 1], head[i + 1]);
+                        let square2 = simd.mul_f64s(head[i + 2], head[i + 2]);
+                        let square3 = simd.mul_f64s(head[i + 3], head[i + 3]);
+                        acc0 = simd.add_f64s(acc0, square0);
+                        acc1 = simd.add_f64s(acc1, square1);
+                        acc2 = simd.add_f64s(acc2, square2);
+                        acc3 = simd.add_f64s(acc3, square3);
+                        i += 4;
+                    }
+                    for &value in &head[i..] {
+                        let square = simd.mul_f64s(value, value);
+                        acc0 = simd.add_f64s(acc0, square);
+                    }
+
+                    let acc = simd.add_f64s(simd.add_f64s(acc0, acc1), simd.add_f64s(acc2, acc3));
+                    let mut sum = simd.reduce_sum_f64s(acc);
+                    for &value in tail {
+                        let square = value * value;
+                        sum += square;
+                    }
+                    sum
+                }
+            }
+
+            Some(pulp::Arch::new().dispatch(SumSquares(src)))
         }
     }
 

@@ -682,6 +682,11 @@ pub struct ErasedFusedPlan {
 pub enum ReduceOp {
     Sum,
     Product,
+    /// Sum of same-dtype rounded squares.
+    ///
+    /// Each input is first multiplied by itself without FMA contraction, then
+    /// accumulated under the same association policy as [`Self::Sum`].
+    SumSquares,
 }
 
 /// Dtype-erased reduction wrapper.
@@ -862,7 +867,7 @@ impl ErasedReducePlan {
         dims: &[usize],
         src_strides: &[isize],
     ) -> Result<Self> {
-        check_reduce_dtype(dtype)?;
+        check_reduce_op_dtype(dtype, op)?;
         if dims.len() != src_strides.len() {
             return Err(StridedError::StrideLengthMismatch);
         }
@@ -892,7 +897,7 @@ impl ErasedReducePlan {
         dest_strides: &[isize],
         axes: &[usize],
     ) -> Result<Self> {
-        check_reduce_dtype(dtype)?;
+        check_reduce_op_dtype(dtype, op)?;
         if src_dims.len() != src_strides.len() || dest_dims.len() != dest_strides.len() {
             return Err(StridedError::StrideLengthMismatch);
         }
@@ -1989,6 +1994,15 @@ fn check_reduce_dtype(dtype: KernelDType) -> Result<()> {
     }
 }
 
+fn check_reduce_op_dtype(dtype: KernelDType, op: ReduceOp) -> Result<()> {
+    if op == ReduceOp::SumSquares && !matches!(dtype, KernelDType::F32 | KernelDType::F64) {
+        return Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        });
+    }
+    check_reduce_dtype(dtype)
+}
+
 fn check_index_dtype(dtype: KernelDType) -> Result<()> {
     match dtype {
         KernelDType::I32 | KernelDType::I64 => Ok(()),
@@ -2331,7 +2345,6 @@ fn execute_reduce<T>(
 where
     T: ErasedReduceScalar,
 {
-    let source = erased_view::<T>(src);
     let use_serial = ctx.is_serial()
         || ctx
             .max_threads_limit()
@@ -2340,18 +2353,20 @@ where
         if let Some(value) = reduce_contiguous_serial(op, src) {
             value
         } else {
+            let source = erased_view::<T>(src);
             crate::reduce_view::reduce_serial(
                 &source,
-                |value| value,
+                |value| reduce_map_value(op, value),
                 |a, b| reduce_values(op, a, b),
                 reduce_identity(op),
             )?
         }
     } else {
+        let source = erased_view::<T>(src);
         ctx.run(|| {
             crate::reduce(
                 &source,
-                |value| value,
+                |value| reduce_map_value(op, value),
                 |a, b| reduce_values(op, a, b),
                 reduce_identity(op),
             )
@@ -2385,6 +2400,14 @@ where
             .unwrap_or_else(|| reduce_contiguous_lanes(values, T::zero(), T::reduce_sum)),
         ReduceOp::Product => T::try_simd_product(values)
             .unwrap_or_else(|| reduce_contiguous_lanes(values, T::one(), T::reduce_product)),
+        ReduceOp::SumSquares => T::try_simd_sum_squares(values).unwrap_or_else(|| {
+            reduce_contiguous_mapped_lanes(
+                values,
+                T::zero(),
+                |value| T::reduce_product(value, value),
+                T::reduce_sum,
+            )
+        }),
     })
 }
 
@@ -2393,15 +2416,28 @@ fn reduce_contiguous_lanes<T>(values: &[T], identity: T, combine: impl Fn(T, T) 
 where
     T: Copy,
 {
+    reduce_contiguous_mapped_lanes(values, identity, |value| value, combine)
+}
+
+#[inline]
+fn reduce_contiguous_mapped_lanes<T>(
+    values: &[T],
+    identity: T,
+    map: impl Fn(T) -> T,
+    combine: impl Fn(T, T) -> T,
+) -> T
+where
+    T: Copy,
+{
     let mut lanes = [identity; SERIAL_REDUCE_LANES];
     let mut chunks = values.chunks_exact(SERIAL_REDUCE_LANES);
     for chunk in chunks.by_ref() {
         for lane in 0..SERIAL_REDUCE_LANES {
-            lanes[lane] = combine(lanes[lane], chunk[lane]);
+            lanes[lane] = combine(lanes[lane], map(chunk[lane]));
         }
     }
     for (lane, &value) in chunks.remainder().iter().enumerate() {
-        lanes[lane] = combine(lanes[lane], value);
+        lanes[lane] = combine(lanes[lane], map(value));
     }
     lanes.into_iter().fold(identity, combine)
 }
@@ -2569,7 +2605,7 @@ where
             let source_offset =
                 checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
             let value = unsafe { *source_data.as_ptr().offset(source_offset) };
-            acc = reduce_values(op, acc, value);
+            acc = reduce_values(op, acc, reduce_map_value(op, value));
             advance_col_major_index(reduce_idx, layout.reduce_dims);
         }
 
@@ -2626,7 +2662,7 @@ where
                     let source_offset =
                         checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
                     let value = unsafe { *source_ptr.offset(source_offset) };
-                    acc = reduce_values(op, acc, value);
+                    acc = reduce_values(op, acc, reduce_map_value(op, value));
                     advance_col_major_index(reduce_idx, layout.reduce_dims);
                 }
 
@@ -2654,6 +2690,7 @@ where
     match op {
         ReduceOp::Sum => T::zero(),
         ReduceOp::Product => T::one(),
+        ReduceOp::SumSquares => T::zero(),
     }
 }
 
@@ -2665,11 +2702,29 @@ where
     match op {
         ReduceOp::Sum => T::reduce_sum(a, b),
         ReduceOp::Product => T::reduce_product(a, b),
+        ReduceOp::SumSquares => T::reduce_sum(a, b),
+    }
+}
+
+#[inline]
+fn reduce_map_value<T>(op: ReduceOp, value: T) -> T
+where
+    T: ErasedReduceScalar,
+{
+    match op {
+        ReduceOp::Sum | ReduceOp::Product => value,
+        ReduceOp::SumSquares => T::reduce_product(value, value),
     }
 }
 
 trait ErasedReduceScalar:
-    Copy + One + Zero + crate::MaybeSendSync + crate::simd::MaybeSimdOps + crate::simd::MaybeSimdProduct
+    Copy
+    + One
+    + Zero
+    + crate::MaybeSendSync
+    + crate::simd::MaybeSimdOps
+    + crate::simd::MaybeSimdProduct
+    + crate::simd::MaybeSimdSumSquares
 {
     fn reduce_sum(lhs: Self, rhs: Self) -> Self;
     fn reduce_product(lhs: Self, rhs: Self) -> Self;

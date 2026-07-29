@@ -266,6 +266,78 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         "erased reduce-axis execute must not allocate"
     );
 
+    let sum_squares_axis_plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::SumSquares,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &axes,
+    )
+    .unwrap();
+    sum_squares_axis_plan
+        .execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    let allocations = count_allocations(|| {
+        sum_squares_axis_plan
+            .execute(&ExecContext::serial(), &mut dest, &source)
+            .unwrap();
+    });
+    assert_eq!(
+        allocations, 0,
+        "erased sum-squares axis execute must not allocate"
+    );
+
+    let sum_squares_dims = [4096usize];
+    let sum_squares_strides = [1isize];
+    let sum_squares_src = vec![1.25f64; sum_squares_dims[0]];
+    let mut sum_squares_dst = [0.0f64];
+    let sum_squares_plan = ErasedReducePlan::compile(
+        KernelDType::F64,
+        ReduceOp::SumSquares,
+        &sum_squares_dims,
+        &sum_squares_strides,
+    )
+    .unwrap();
+    let sum_squares_source = ErasedRawStridedRef::new(
+        KernelDType::F64,
+        as_bytes(&sum_squares_src),
+        &sum_squares_dims,
+        &sum_squares_strides,
+        0,
+    )
+    .unwrap();
+    let mut sum_squares_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut sum_squares_dst),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+
+    sum_squares_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut sum_squares_dest,
+            &sum_squares_source,
+        )
+        .unwrap();
+    let allocations = count_allocations(|| {
+        sum_squares_plan
+            .execute(
+                &ExecContext::serial(),
+                &mut sum_squares_dest,
+                &sum_squares_source,
+            )
+            .unwrap();
+    });
+    assert_eq!(
+        allocations, 0,
+        "compact sum-squares replay must not allocate"
+    );
+
     let src_dims = [2usize; 8];
     let src_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
     let start_dims = [8usize];
