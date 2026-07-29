@@ -378,6 +378,25 @@ mod tests {
     }
 
     #[test]
+    fn compile_rejects_unrepresentable_positive_and_negative_offset_spans() {
+        for strides in [
+            [isize::MAX / 2 + 1, isize::MAX],
+            [isize::MIN / 2 - 1, isize::MIN],
+        ] {
+            let err = CopyPlan::compile(&[2, 2], &strides, &strides).unwrap_err();
+            assert!(matches!(err, StridedError::NonInjectiveOutputLayout));
+        }
+    }
+
+    #[test]
+    fn compile_accepts_representable_mixed_sign_span_without_fusion_overflow() {
+        let positive = isize::MAX / 4;
+        let negative = -(isize::MAX - positive);
+        let strides = [positive, negative];
+        CopyPlan::compile(&[2, 2], &strides, &strides).unwrap();
+    }
+
+    #[test]
     fn compile_rejects_non_injective_destination() {
         // Two logical columns land on the same offsets: forbidden overlap in
         // the mutable destination.

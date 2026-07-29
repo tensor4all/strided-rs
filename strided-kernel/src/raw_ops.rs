@@ -73,8 +73,8 @@ pub(crate) fn fuse_pair_layout(
     let mut fused = 0usize;
     for axis in 1..layout.rank {
         let extent = layout.dims[fused] as isize;
-        if layout.dst_strides[fused] * extent == layout.dst_strides[axis]
-            && layout.src_strides[fused] * extent == layout.src_strides[axis]
+        if layout.dst_strides[fused].checked_mul(extent) == Some(layout.dst_strides[axis])
+            && layout.src_strides[fused].checked_mul(extent) == Some(layout.src_strides[axis])
         {
             layout.dims[fused] *= layout.dims[axis];
         } else {

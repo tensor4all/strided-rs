@@ -68,6 +68,18 @@ fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
 // sibling tests would leak their setup allocations into the counted window.
 #[test]
 fn execute_is_allocation_free_up_to_rank_limit() {
+    #[cfg(feature = "parallel")]
+    {
+        let compile_allocations = count_allocations(|| {
+            let plan = CopyPlan::compile(&[2, 2], &[1, 2], &[1, 2]).unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            compile_allocations, 0,
+            "provably disjoint small CopyPlan compile must not allocate"
+        );
+    }
+
     // Rank 8 (the RAW_FUSED_RANK_LIMIT boundary), permuted strides so fusion
     // cannot collapse everything into one contiguous run.
     let dims = [2usize; 8];

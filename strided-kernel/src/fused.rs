@@ -692,7 +692,7 @@ pub(crate) fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
     let Some(total) = validate_injective_layout_inputs(dims, strides) else {
         return false;
     };
-    if total <= 1 {
+    if total <= 1 || has_disjoint_stride_spans(dims, strides) {
         return true;
     }
 
@@ -701,7 +701,7 @@ pub(crate) fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
         return has_unique_offsets_exact(dims, strides, total);
     }
 
-    has_disjoint_stride_spans(dims, strides)
+    false
 }
 
 pub(crate) fn is_injective_layout_without_alloc(dims: &[usize], strides: &[isize]) -> bool {
@@ -757,6 +757,21 @@ fn validate_injective_layout_inputs(dims: &[usize], strides: &[isize]) -> Option
         .any(|(&dim, &stride)| dim > 1 && stride == 0)
     {
         return None;
+    }
+
+    let mut min_offset = 0isize;
+    let mut max_offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        if dim <= 1 {
+            continue;
+        }
+        let extent = isize::try_from(dim - 1).ok()?;
+        let span = stride.checked_mul(extent)?;
+        if span >= 0 {
+            max_offset = max_offset.checked_add(span)?;
+        } else {
+            min_offset = min_offset.checked_add(span)?;
+        }
     }
     Some(total)
 }
@@ -1519,5 +1534,13 @@ mod tests {
         assert!(!is_injective_layout(&[2, 3], &[1]));
         assert!(!is_injective_layout(&[2, 2], &[0, 1]));
         assert!(is_injective_layout(&[1], &[0]));
+    }
+
+    #[test]
+    fn is_injective_layout_rejects_unrepresentable_offset_spans() {
+        let positive = isize::MAX / 2 + 1;
+        let negative = isize::MIN / 2 - 1;
+        assert!(!is_injective_layout(&[2, 2], &[positive, isize::MAX]));
+        assert!(!is_injective_layout(&[2, 2], &[negative, isize::MIN]));
     }
 }
