@@ -1,8 +1,9 @@
 use num_complex::{Complex32, Complex64};
+use std::ptr::NonNull;
 use strided_kernel::{
     erased_map_into, erased_zip_into, ErasedFusedPlan, ErasedMapOp, ErasedRawStridedMut,
-    ErasedRawStridedRef, ErasedZipOp, ExecContext, FusedInst, FusedOp, FusedPlan, KernelDType,
-    StridedError,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedZipOp, ExecContext, FusedInst, FusedOp,
+    FusedPlan, KernelDType, StridedError,
 };
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
@@ -52,7 +53,7 @@ fn assert_unary_matches_plan<T>(
             one_shot_op,
             &ExecContext::serial(),
             &mut output,
-            &input,
+            &ErasedRawStridedPtr::from_ref(&input),
         )
         .unwrap();
     }
@@ -96,8 +97,8 @@ fn assert_binary_matches_plan<T>(
             one_shot_op,
             &ExecContext::serial(),
             &mut output,
-            &lhs,
-            &rhs,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs),
         )
         .unwrap();
     }
@@ -188,7 +189,7 @@ fn one_shot_covers_required_unary_and_binary_ops() {
         ErasedMapOp::Sign,
         &ExecContext::serial(),
         &mut output,
-        &input_ref,
+        &ErasedRawStridedPtr::from_ref(&input_ref),
     )
     .unwrap();
     assert_eq!(signed, [-1.0, 0.0, 1.0]);
@@ -215,8 +216,8 @@ fn one_shot_covers_required_unary_and_binary_ops() {
             op,
             &ExecContext::serial(),
             &mut output,
-            &lhs_ref,
-            &rhs_ref,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            &ErasedRawStridedPtr::from_ref(&rhs_ref),
         )
         .unwrap();
         assert_eq!(actual, expected);
@@ -249,8 +250,8 @@ fn one_shot_handles_borrowed_noncontiguous_metadata() {
         ErasedZipOp::Add,
         &ExecContext::serial(),
         &mut dest,
-        &lhs,
-        &rhs,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
     )
     .unwrap();
 
@@ -279,7 +280,7 @@ fn one_shot_empty_output_is_a_noop_for_degenerate_strides() {
         ErasedMapOp::Negate,
         &ExecContext::serial(),
         &mut output,
-        &input,
+        &ErasedRawStridedPtr::from_ref(&input),
     )
     .unwrap();
 }
@@ -309,8 +310,8 @@ fn one_shot_rejects_unsupported_ops_before_writing() {
         ErasedZipOp::Add,
         &ExecContext::serial(),
         &mut dest,
-        &lhs,
-        &rhs,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
     )
     .unwrap_err();
 
@@ -322,4 +323,227 @@ fn one_shot_rejects_unsupported_ops_before_writing() {
         }
     ));
     assert_eq!(dst, [true, true]);
+}
+
+#[test]
+fn one_shot_complex_abs_uses_real_output_dtype() {
+    macro_rules! check {
+        ($input_ty:ty, $output_ty:ty, $input_dtype:expr, $output_dtype:expr) => {{
+            let dims = [2usize];
+            let strides = [1isize];
+            let input = [<$input_ty>::new(3.0, 4.0), <$input_ty>::new(5.0, 12.0)];
+            let input =
+                ErasedRawStridedRef::new($input_dtype, as_bytes(&input), &dims, &strides, 0)
+                    .unwrap();
+            let mut actual = [0.0 as $output_ty; 2];
+            let mut output = ErasedRawStridedMut::new(
+                $output_dtype,
+                as_bytes_mut(&mut actual),
+                &dims,
+                &strides,
+                0,
+            )
+            .unwrap();
+            erased_map_into(
+                $input_dtype,
+                ErasedMapOp::Abs,
+                &ExecContext::serial(),
+                &mut output,
+                &ErasedRawStridedPtr::from_ref(&input),
+            )
+            .unwrap();
+            assert_eq!(actual, [5.0, 13.0]);
+        }};
+    }
+
+    check!(Complex32, f32, KernelDType::C32, KernelDType::F32);
+    check!(Complex64, f64, KernelDType::C64, KernelDType::F64);
+}
+
+#[test]
+fn one_shot_integer_division_is_wrapping_and_zero_is_preflighted() {
+    macro_rules! check {
+        ($ty:ty, $dtype:expr) => {{
+            let dims = [2usize];
+            let strides = [1isize];
+            let lhs = [<$ty>::MIN, 7];
+            let rhs = [-1 as $ty, 3];
+            for (op, expected) in [
+                (ErasedZipOp::Divide, [<$ty>::MIN, 2]),
+                (ErasedZipOp::Remainder, [0, 1]),
+            ] {
+                let lhs =
+                    ErasedRawStridedRef::new($dtype, as_bytes(&lhs), &dims, &strides, 0).unwrap();
+                let rhs =
+                    ErasedRawStridedRef::new($dtype, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+                let mut actual = [99 as $ty; 2];
+                let mut output =
+                    ErasedRawStridedMut::new($dtype, as_bytes_mut(&mut actual), &dims, &strides, 0)
+                        .unwrap();
+                erased_zip_into(
+                    $dtype,
+                    op,
+                    &ExecContext::serial(),
+                    &mut output,
+                    &ErasedRawStridedPtr::from_ref(&lhs),
+                    &ErasedRawStridedPtr::from_ref(&rhs),
+                )
+                .unwrap();
+                assert_eq!(actual, expected);
+            }
+
+            let rhs = [1 as $ty, 0];
+            let lhs = ErasedRawStridedRef::new($dtype, as_bytes(&lhs), &dims, &strides, 0).unwrap();
+            let rhs = ErasedRawStridedRef::new($dtype, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+            let mut actual = [99 as $ty; 2];
+            let mut output =
+                ErasedRawStridedMut::new($dtype, as_bytes_mut(&mut actual), &dims, &strides, 0)
+                    .unwrap();
+            let error = erased_zip_into(
+                $dtype,
+                ErasedZipOp::Divide,
+                &ExecContext::serial(),
+                &mut output,
+                &ErasedRawStridedPtr::from_ref(&lhs),
+                &ErasedRawStridedPtr::from_ref(&rhs),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                StridedError::IntegerDivisionByZero { op: "divide" }
+            ));
+            assert_eq!(actual, [99, 99]);
+        }};
+    }
+
+    check!(i32, KernelDType::I32);
+    check!(i64, KernelDType::I64);
+}
+
+#[test]
+fn one_shot_preserves_tenferro_numeric_edge_semantics() {
+    let dims = [2usize];
+    let strides = [1isize];
+
+    for op in [ErasedZipOp::Maximum, ErasedZipOp::Minimum] {
+        let lhs = [0.0f64, -0.0];
+        let rhs = [-0.0f64, 0.0];
+        let lhs_ref =
+            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &strides, 0).unwrap();
+        let rhs_ref =
+            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+        let mut actual = [1.0f64; 2];
+        let mut output = ErasedRawStridedMut::new(
+            KernelDType::F64,
+            as_bytes_mut(&mut actual),
+            &dims,
+            &strides,
+            0,
+        )
+        .unwrap();
+        erased_zip_into(
+            KernelDType::F64,
+            op,
+            &ExecContext::serial(),
+            &mut output,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        )
+        .unwrap();
+        assert_eq!(actual[0].to_bits(), lhs[0].to_bits());
+        assert_eq!(actual[1].to_bits(), lhs[1].to_bits());
+    }
+
+    let input = [Complex64::new(-0.0, 0.0), Complex64::new(3.0, 4.0)];
+    let input =
+        ErasedRawStridedRef::new(KernelDType::C64, as_bytes(&input), &dims, &strides, 0).unwrap();
+    let mut actual = [Complex64::new(1.0, 1.0); 2];
+    let mut output = ErasedRawStridedMut::new(
+        KernelDType::C64,
+        as_bytes_mut(&mut actual),
+        &dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+    erased_map_into(
+        KernelDType::C64,
+        ErasedMapOp::Sign,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&input),
+    )
+    .unwrap();
+    assert_eq!(actual[0].re.to_bits(), 0.0f64.to_bits());
+    assert_eq!(actual[0].im.to_bits(), 0.0f64.to_bits());
+    assert_eq!(actual[1], Complex64::new(0.6, 0.8));
+}
+
+#[test]
+fn one_shot_rejects_overlap_before_forming_input_reference() {
+    let dims = [2usize];
+    let strides = [1isize];
+    let mut storage = [1.0f64, 2.0];
+    let ptr = NonNull::new(storage.as_mut_ptr().cast::<u8>()).unwrap();
+    let input = unsafe {
+        ErasedRawStridedPtr::new(
+            KernelDType::F64,
+            ptr,
+            core::mem::size_of_val(&storage),
+            &dims,
+            &strides,
+            0,
+        )
+        .unwrap()
+    };
+    let mut output = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut storage),
+        &dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+    let error = erased_map_into(
+        KernelDType::F64,
+        ErasedMapOp::Negate,
+        &ExecContext::serial(),
+        &mut output,
+        &input,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StridedError::OverlappingInputOutput { input: 0 }
+    ));
+    assert_eq!(storage, [1.0, 2.0]);
+}
+
+#[test]
+fn one_shot_accepts_small_injective_layout_without_allocating() {
+    let dims = [3usize, 2];
+    let input_strides = [1isize, 3];
+    let output_strides = [2isize, 3];
+    let input = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let input =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &input_strides, 0)
+            .unwrap();
+    let mut actual = [0.0f64; 8];
+    let mut output = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut actual),
+        &dims,
+        &output_strides,
+        0,
+    )
+    .unwrap();
+    erased_map_into(
+        KernelDType::F64,
+        ErasedMapOp::Negate,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&input),
+    )
+    .unwrap();
+    assert_eq!(actual, [-1.0, 0.0, -2.0, -4.0, -3.0, -5.0, 0.0, -6.0]);
 }

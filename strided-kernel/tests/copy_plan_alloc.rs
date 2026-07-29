@@ -12,9 +12,9 @@ use num_complex::Complex64;
 use strided_kernel::{
     erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan, ErasedConcatenatePlan,
     ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedMapOp,
-    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ErasedReversePlan,
-    ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, ExecContext, Identity, KernelDType,
-    RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
+    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedReducePlan,
+    ErasedReversePlan, ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, ExecContext, Identity,
+    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
 };
 
 struct CountingAllocator;
@@ -157,8 +157,8 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         ErasedZipOp::Add,
         &ExecContext::serial(),
         &mut dest,
-        &lhs_ref,
-        &rhs_ref,
+        &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        &ErasedRawStridedPtr::from_ref(&rhs_ref),
     )
     .unwrap();
     let mut typed_dst = vec![0.0f64; 256];
@@ -181,8 +181,8 @@ fn execute_is_allocation_free_up_to_rank_limit() {
                 ErasedZipOp::Add,
                 &ExecContext::serial(),
                 &mut dest,
-                &lhs_ref,
-                &rhs_ref,
+                &ErasedRawStridedPtr::from_ref(&lhs_ref),
+                &ErasedRawStridedPtr::from_ref(&rhs_ref),
             )
             .unwrap();
             erased_map_into(
@@ -190,7 +190,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
                 ErasedMapOp::Negate,
                 &ExecContext::serial(),
                 &mut dest,
-                &lhs_ref,
+                &ErasedRawStridedPtr::from_ref(&lhs_ref),
             )
             .unwrap();
         }

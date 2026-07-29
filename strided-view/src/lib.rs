@@ -34,7 +34,8 @@ pub use element_op::{
 // View-based types
 // ============================================================================
 pub use raw::{
-    ErasedRawStridedMut, ErasedRawStridedRef, KernelDType, RawStridedMut, RawStridedRef,
+    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, KernelDType, RawStridedMut,
+    RawStridedRef,
 };
 pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 
@@ -127,6 +128,10 @@ pub enum StridedError {
     /// A mutable destination overlaps one of the operation inputs.
     #[error("destination overlaps input {input}")]
     OverlappingInputOutput { input: usize },
+
+    /// Integer division or remainder encountered a zero divisor.
+    #[error("integer {op} encountered a zero divisor")]
+    IntegerDivisionByZero { op: &'static str },
 
     /// The operation arity is unsupported by this entry point.
     #[error("unsupported arity {arity}; maximum supported arity is {max}")]

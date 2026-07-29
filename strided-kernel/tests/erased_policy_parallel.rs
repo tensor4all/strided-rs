@@ -2,8 +2,9 @@
 
 use strided_kernel::{
     erased_zip_into, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
-    ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan,
-    ErasedScatterPlan, ErasedZipOp, ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
+    ErasedReducePlan, ErasedScatterPlan, ErasedZipOp, ExecContext, GatherSpec, KernelDType,
+    ReduceOp, ScatterSpec,
 };
 
 const LARGE_LEN: usize = (1 << 15) + 65;
@@ -58,8 +59,8 @@ fn large_one_shot_zip_matches_serial() {
             ErasedZipOp::Add,
             &ctx,
             &mut dest,
-            &lhs,
-            &rhs,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs),
         )
         .unwrap();
         output

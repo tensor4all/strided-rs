@@ -7,6 +7,8 @@
 
 use crate::element_op::Identity;
 use crate::view::validate_bounds;
+use core::marker::PhantomData;
+use core::ptr::NonNull;
 use num_complex::{Complex32, Complex64};
 
 use crate::{Result, StridedError, StridedView, StridedViewMut};
@@ -103,6 +105,128 @@ fn validate_erased_buffer(dtype: KernelDType, data: &[u8]) -> Result<usize> {
         }
     }
     Ok(element_count)
+}
+
+fn validate_erased_buffer_layout(
+    dtype: KernelDType,
+    data: NonNull<u8>,
+    byte_len: usize,
+) -> Result<usize> {
+    let element_size = dtype.size_of();
+    if byte_len % element_size != 0 {
+        return Err(StridedError::ByteLengthMismatch {
+            dtype: dtype.label(),
+            byte_len,
+            element_size,
+        });
+    }
+    if byte_len != 0 && data.as_ptr() as usize % dtype.alignment() != 0 {
+        return Err(StridedError::DataAlignmentMismatch {
+            dtype: dtype.label(),
+            alignment: dtype.alignment(),
+        });
+    }
+    Ok(byte_len / element_size)
+}
+
+/// Pointer-backed dtype-erased input used by one-shot write entry points.
+///
+/// Unlike [`ErasedRawStridedRef`], this descriptor does not create a shared
+/// Rust reference at construction time. That lets the entry point reject an
+/// input/output overlap before forming references to either side.
+#[derive(Clone, Copy, Debug)]
+pub struct ErasedRawStridedPtr<'a> {
+    dtype: KernelDType,
+    data: NonNull<u8>,
+    byte_len: usize,
+    dims: &'a [usize],
+    strides: &'a [isize],
+    offset: isize,
+    marker: PhantomData<&'a [u8]>,
+}
+
+impl<'a> ErasedRawStridedPtr<'a> {
+    /// Create a pointer-backed descriptor.
+    ///
+    /// # Safety
+    ///
+    /// `data..data + byte_len` must remain readable and allocated for `'a`.
+    /// Its bytes must contain valid values for `dtype`. The allocation may
+    /// overlap a destination passed to a one-shot entry point; overlap is
+    /// checked before the pointer is dereferenced.
+    pub unsafe fn new(
+        dtype: KernelDType,
+        data: NonNull<u8>,
+        byte_len: usize,
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let element_count = validate_erased_buffer_layout(dtype, data, byte_len)?;
+        validate_bounds(element_count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data,
+            byte_len,
+            dims,
+            strides,
+            offset,
+            marker: PhantomData,
+        })
+    }
+
+    /// Borrow a safe erased input as a pointer descriptor.
+    pub fn from_ref(input: &ErasedRawStridedRef<'a>) -> Self {
+        Self {
+            dtype: input.dtype,
+            data: NonNull::new(input.data.as_ptr().cast_mut()).unwrap_or_else(NonNull::dangling),
+            byte_len: input.data.len(),
+            dims: input.dims,
+            strides: input.strides,
+            offset: input.offset,
+            marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    #[inline]
+    pub fn dims(&self) -> &'a [usize] {
+        self.dims
+    }
+
+    #[inline]
+    pub fn strides(&self) -> &'a [isize] {
+        self.strides
+    }
+
+    #[inline]
+    pub fn offset(&self) -> isize {
+        self.offset
+    }
+
+    /// Materialize the shared byte slice after the caller has ruled out a
+    /// concurrent mutable alias.
+    ///
+    /// # Safety
+    ///
+    /// No live mutable reference may overlap the returned slice.
+    pub unsafe fn data_unchecked(&self) -> &'a [u8] {
+        core::slice::from_raw_parts(self.data.as_ptr(), self.byte_len)
+    }
 }
 
 /// Borrowed dtype-erased raw strided input layout.

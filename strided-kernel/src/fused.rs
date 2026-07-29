@@ -704,11 +704,40 @@ pub(crate) fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
     has_disjoint_stride_spans(dims, strides)
 }
 
-pub(crate) fn is_provably_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
+pub(crate) fn is_injective_layout_without_alloc(dims: &[usize], strides: &[isize]) -> bool {
     let Some(total) = validate_injective_layout_inputs(dims, strides) else {
         return false;
     };
-    total <= 1 || has_disjoint_stride_spans(dims, strides)
+    if total <= 1 || has_disjoint_stride_spans(dims, strides) {
+        return true;
+    }
+
+    const EXACT_CHECK_LIMIT: usize = 4096;
+    total <= EXACT_CHECK_LIMIT && has_unique_offsets_pairwise(dims, strides, total)
+}
+
+fn offset_for_linear_index(dims: &[usize], strides: &[isize], mut linear: usize) -> Option<isize> {
+    let mut offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        let index = linear % dim;
+        linear /= dim;
+        offset = offset.checked_add(stride.checked_mul(index as isize)?)?;
+    }
+    Some(offset)
+}
+
+fn has_unique_offsets_pairwise(dims: &[usize], strides: &[isize], total: usize) -> bool {
+    for lhs in 0..total {
+        let Some(lhs_offset) = offset_for_linear_index(dims, strides, lhs) else {
+            return false;
+        };
+        for rhs in (lhs + 1)..total {
+            if offset_for_linear_index(dims, strides, rhs) == Some(lhs_offset) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn validate_injective_layout_inputs(dims: &[usize], strides: &[isize]) -> Option<usize> {
