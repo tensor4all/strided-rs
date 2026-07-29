@@ -822,7 +822,11 @@ impl<T> StridedArray<T> {
 
     /// Create an immutable view over this tensor.
     pub fn view(&self) -> StridedView<'_, T> {
-        let ptr = unsafe { self.data.as_ptr().offset(self.offset) };
+        let ptr = if self.is_empty() {
+            empty_const_ptr()
+        } else {
+            unsafe { self.data.as_ptr().offset(self.offset) }
+        };
         StridedView {
             ptr,
             data: &self.data,
@@ -835,7 +839,11 @@ impl<T> StridedArray<T> {
 
     /// Create a mutable view over this tensor.
     pub fn view_mut(&mut self) -> StridedViewMut<'_, T> {
-        let ptr = unsafe { self.data.as_mut_ptr().offset(self.offset) };
+        let ptr = if self.is_empty() {
+            empty_mut_ptr()
+        } else {
+            unsafe { self.data.as_mut_ptr().offset(self.offset) }
+        };
         StridedViewMut {
             ptr,
             data: &mut self.data,
@@ -1014,6 +1022,16 @@ mod tests {
 
         let mut data: [f64; 0] = [];
         let view = StridedViewMut::new(&mut data, &dims, &strides, isize::MAX).unwrap();
+        assert_eq!(view.ptr(), empty_const_ptr());
+        assert_eq!(view.as_mut_ptr(), empty_mut_ptr());
+
+        let array =
+            StridedArray::<f64>::from_parts(Vec::new(), &dims, &strides, isize::MAX).unwrap();
+        assert_eq!(array.view().ptr(), empty_const_ptr());
+
+        let mut array =
+            StridedArray::<f64>::from_parts(Vec::new(), &dims, &strides, isize::MAX).unwrap();
+        let view = array.view_mut();
         assert_eq!(view.ptr(), empty_const_ptr());
         assert_eq!(view.as_mut_ptr(), empty_mut_ptr());
     }
