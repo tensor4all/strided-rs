@@ -923,6 +923,23 @@ mod simd_impls {
 mod tests {
     #[cfg(feature = "simd")]
     #[test]
+    fn sum_squares_simd_covers_unrolled_body_and_tail() {
+        const LEN: usize = 285;
+        let f32_values = vec![1.0_f32; LEN];
+        let f64_values = vec![1.0_f64; LEN];
+
+        assert_eq!(
+            <f32 as super::MaybeSimdSumSquares>::try_simd_sum_squares(&f32_values),
+            Some(LEN as f32)
+        );
+        assert_eq!(
+            <f64 as super::MaybeSimdSumSquares>::try_simd_sum_squares(&f64_values),
+            Some(LEN as f64)
+        );
+    }
+
+    #[cfg(feature = "simd")]
+    #[test]
     fn test_try_mul_contiguous_complex64() {
         let a = vec![
             num_complex::Complex64::new(1.0, 2.0),
