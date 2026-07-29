@@ -87,8 +87,9 @@ mod reduce_view;
 pub use strided_view::view;
 pub use strided_view::{
     col_major_strides, row_major_strides, Adjoint, ComposableElementOp, Compose, Conj, ElementOp,
-    ElementOpApply, ErasedRawStridedMut, ErasedRawStridedRef, Identity, KernelDType, RawStridedMut,
-    RawStridedRef, Result, StridedArray, StridedError, StridedView, StridedViewMut, Transpose,
+    ElementOpApply, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, Identity,
+    KernelDType, RawStridedMut, RawStridedRef, Result, StridedArray, StridedError, StridedView,
+    StridedViewMut, Transpose,
 };
 
 // ============================================================================
@@ -128,9 +129,10 @@ pub use raw_ops::{
 // ============================================================================
 pub use copy_plan::CopyPlan;
 pub use erased::{
-    ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
-    ErasedFusedPlan, ErasedGatherPlan, ErasedPadPlan, ErasedReducePlan, ErasedReversePlan,
-    ErasedScatterPlan, ErasedSlicePlan, ReduceOp,
+    erased_map_into, erased_zip_into, ErasedConcatenatePlan, ErasedCopyPlan,
+    ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedFusedPlan, ErasedGatherPlan,
+    ErasedMapOp, ErasedPadPlan, ErasedReducePlan, ErasedReversePlan, ErasedScatterPlan,
+    ErasedSlicePlan, ErasedZipOp, ReduceOp,
 };
 pub use exec_context::ExecContext;
 pub use gather_plan::{
