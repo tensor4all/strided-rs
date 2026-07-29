@@ -1011,6 +1011,50 @@ pub fn zip_map2_into<
     )
 }
 
+/// Runtime comparison selected once before entering the element loop.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareOp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Compare two ordered views elementwise into a Boolean destination.
+///
+/// Unlike embedding a runtime operation match inside a [`zip_map2_into`]
+/// closure, this entry point selects a fixed comparison before traversal.
+///
+/// # Errors
+///
+/// Returns [`StridedError::DimensionMismatch`] when the source and destination
+/// shapes differ, or [`StridedError::NonInjectiveOutputLayout`] when distinct
+/// logical destination elements may overlap.
+pub fn compare_into<T, OpA, OpB>(
+    dest: &mut StridedViewMut<bool>,
+    a: &StridedView<T, OpA>,
+    b: &StridedView<T, OpB>,
+    op: CompareOp,
+) -> Result<()>
+where
+    T: Copy + MaybeSendSync + PartialOrd,
+    OpA: ElementOp<T>,
+    OpB: ElementOp<T>,
+{
+    if !crate::fused::is_injective_layout_without_alloc(dest.dims(), dest.strides()) {
+        return Err(StridedError::NonInjectiveOutputLayout);
+    }
+    match op {
+        CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| lhs == rhs),
+        CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| lhs < rhs),
+        CompareOp::Le => zip_map2_into(dest, a, b, |lhs, rhs| lhs <= rhs),
+        CompareOp::Gt => zip_map2_into(dest, a, b, |lhs, rhs| lhs > rhs),
+        CompareOp::Ge => zip_map2_into(dest, a, b, |lhs, rhs| lhs >= rhs),
+    }
+}
+
 pub(crate) fn zip_map2_raw_into<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
