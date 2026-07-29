@@ -1,3 +1,4 @@
+use num_complex::{Complex32, Complex64};
 use strided_kernel::{
     ErasedConcatenatePlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef,
     ErasedReversePlan, ErasedSlicePlan, ExecContext, KernelDType, StridedError,
@@ -151,6 +152,298 @@ fn erased_pad_plan_fills_output_and_copies_cropped_interior_padded_input() {
     .unwrap();
 
     assert_eq!(dest, [-1, 11, -1, 12, -1, -1]);
+}
+
+fn assert_dense_edge_pad<T>(dtype: KernelDType, operand: &[T], fill: T, expected: &[T])
+where
+    T: Copy + core::fmt::Debug + PartialEq,
+{
+    let operand_dims = [operand.len()];
+    let operand_strides = [1isize];
+    let dest_dims = [expected.len()];
+    let dest_strides = [1isize];
+    let edge_low = [2i64];
+    let edge_high = [1i64];
+    let interior = [0i64];
+    let mut dest = vec![fill; expected.len()];
+    let fill = [fill];
+
+    let plan = ErasedPadPlan::compile(
+        dtype,
+        &operand_dims,
+        &operand_strides,
+        &dest_dims,
+        &dest_strides,
+        &edge_low,
+        &edge_high,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::new(dtype, as_bytes(operand), &operand_dims, &operand_strides, 0)
+            .unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::new(dtype, as_bytes_mut(&mut dest), &dest_dims, &dest_strides, 0)
+            .unwrap();
+
+    plan.execute(
+        &ExecContext::max_threads(4).unwrap(),
+        &mut dest_ref,
+        &operand_ref,
+        as_bytes(&fill),
+    )
+    .unwrap();
+    assert_eq!(dest, expected);
+}
+
+#[test]
+fn erased_pad_contiguous_run_matches_expected_for_every_kernel_dtype() {
+    assert_dense_edge_pad(
+        KernelDType::F32,
+        &[1.0f32, 2.0],
+        -1.0,
+        &[-1.0, -1.0, 1.0, 2.0, -1.0],
+    );
+    assert_dense_edge_pad(
+        KernelDType::F64,
+        &[1.0f64, 2.0],
+        -1.0,
+        &[-1.0, -1.0, 1.0, 2.0, -1.0],
+    );
+    assert_dense_edge_pad(KernelDType::I32, &[1i32, 2], -1, &[-1, -1, 1, 2, -1]);
+    assert_dense_edge_pad(KernelDType::I64, &[1i64, 2], -1, &[-1, -1, 1, 2, -1]);
+    assert_dense_edge_pad(
+        KernelDType::Bool,
+        &[true, false],
+        false,
+        &[false, false, true, false, false],
+    );
+    assert_dense_edge_pad(
+        KernelDType::C32,
+        &[Complex32::new(1.0, 2.0), Complex32::new(3.0, 4.0)],
+        Complex32::new(-1.0, 0.0),
+        &[
+            Complex32::new(-1.0, 0.0),
+            Complex32::new(-1.0, 0.0),
+            Complex32::new(1.0, 2.0),
+            Complex32::new(3.0, 4.0),
+            Complex32::new(-1.0, 0.0),
+        ],
+    );
+    assert_dense_edge_pad(
+        KernelDType::C64,
+        &[Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)],
+        Complex64::new(-1.0, 0.0),
+        &[
+            Complex64::new(-1.0, 0.0),
+            Complex64::new(-1.0, 0.0),
+            Complex64::new(1.0, 2.0),
+            Complex64::new(3.0, 4.0),
+            Complex64::new(-1.0, 0.0),
+        ],
+    );
+}
+
+#[test]
+fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
+    let empty_dims = [0usize];
+    let empty_strides = [1isize];
+    let padded_dims = [3usize];
+    let padded_strides = [1isize];
+    let edge_low = [1i64];
+    let edge_high = [2i64];
+    let interior = [0i64];
+    let empty: [i32; 0] = [];
+    let fill = [-7i32];
+    let mut padded = [0i32; 3];
+    let plan = ErasedPadPlan::compile(
+        KernelDType::I32,
+        &empty_dims,
+        &empty_strides,
+        &padded_dims,
+        &padded_strides,
+        &edge_low,
+        &edge_high,
+        &interior,
+    )
+    .unwrap();
+    let empty_ref = ErasedRawStridedRef::new(
+        KernelDType::I32,
+        as_bytes(&empty),
+        &empty_dims,
+        &empty_strides,
+        0,
+    )
+    .unwrap();
+    let mut padded_ref = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut padded),
+        &padded_dims,
+        &padded_strides,
+        0,
+    )
+    .unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut padded_ref,
+        &empty_ref,
+        as_bytes(&fill),
+    )
+    .unwrap();
+    assert_eq!(padded, [-7; 3]);
+
+    let scalar = [42i32];
+    let mut scalar_dest = [0i32];
+    let scalar_plan =
+        ErasedPadPlan::compile(KernelDType::I32, &[], &[], &[], &[], &[], &[], &[]).unwrap();
+    let scalar_ref =
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&scalar), &[], &[], 0).unwrap();
+    let mut scalar_dest_ref = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut scalar_dest),
+        &[],
+        &[],
+        0,
+    )
+    .unwrap();
+    scalar_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut scalar_dest_ref,
+            &scalar_ref,
+            as_bytes(&fill),
+        )
+        .unwrap();
+    assert_eq!(scalar_dest, [42]);
+
+    let operand = [10i32, 20];
+    let mut strided_dest = [-9i32; 4];
+    let dims = [2usize];
+    let operand_strides = [1isize];
+    let dest_strides = [2isize];
+    let edge = [0i64];
+    let fallback = ErasedPadPlan::compile(
+        KernelDType::I32,
+        &dims,
+        &operand_strides,
+        &dims,
+        &dest_strides,
+        &edge,
+        &edge,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref = ErasedRawStridedRef::new(
+        KernelDType::I32,
+        as_bytes(&operand),
+        &dims,
+        &operand_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest_ref = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut strided_dest),
+        &dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+    fallback
+        .execute(
+            &ExecContext::serial(),
+            &mut dest_ref,
+            &operand_ref,
+            as_bytes(&fill),
+        )
+        .unwrap();
+    assert_eq!(strided_dest, [10, -9, 20, -9]);
+}
+
+#[test]
+fn erased_pad_contiguous_runs_honor_offsets_and_outer_axis_cropping() {
+    let dims = [3usize];
+    let strides = [1isize];
+    let padded_dims = [5usize];
+    let edge = [1i64];
+    let interior = [0i64];
+    let operand = [99i32, 10, 20, 30, 99];
+    let mut dest = [99i32, 0, 0, 0, 0, 0, 99];
+    let fill = [-7i32];
+    let plan = ErasedPadPlan::compile(
+        KernelDType::I32,
+        &dims,
+        &strides,
+        &padded_dims,
+        &strides,
+        &edge,
+        &edge,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&operand), &dims, &strides, 1).unwrap();
+    let mut dest_ref = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut dest),
+        &padded_dims,
+        &strides,
+        1,
+    )
+    .unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut dest_ref,
+        &operand_ref,
+        as_bytes(&fill),
+    )
+    .unwrap();
+    assert_eq!(dest, [99, -7, 10, 20, 30, -7, 99]);
+
+    let operand_dims = [2usize, 3];
+    let operand_strides = [1isize, 2];
+    let dest_dims = [4usize, 2];
+    let dest_strides = [1isize, 4];
+    let edge_low = [1i64, -1];
+    let edge_high = [1i64, 0];
+    let interior = [0i64, 0];
+    let operand = [1i32, 2, 3, 4, 5, 6];
+    let mut dest = [0i32; 8];
+    let plan = ErasedPadPlan::compile(
+        KernelDType::I32,
+        &operand_dims,
+        &operand_strides,
+        &dest_dims,
+        &dest_strides,
+        &edge_low,
+        &edge_high,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref = ErasedRawStridedRef::new(
+        KernelDType::I32,
+        as_bytes(&operand),
+        &operand_dims,
+        &operand_strides,
+        0,
+    )
+    .unwrap();
+    let mut dest_ref = ErasedRawStridedMut::new(
+        KernelDType::I32,
+        as_bytes_mut(&mut dest),
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut dest_ref,
+        &operand_ref,
+        as_bytes(&fill),
+    )
+    .unwrap();
+    assert_eq!(dest, [-7, 3, 4, -7, -7, 5, 6, -7]);
 }
 
 #[test]

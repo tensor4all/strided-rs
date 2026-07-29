@@ -54,6 +54,15 @@ pub struct PadPlan {
     interior_step: AxisVec<i64>,
     operand_total: usize,
     dest_total: usize,
+    contiguous_dest_fill: bool,
+    contiguous_axis0_run: Option<ContiguousPadAxis0Run>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContiguousPadAxis0Run {
+    operand_start: usize,
+    dest_start: usize,
+    len: usize,
 }
 
 /// A compiled multi-input concatenate traversal.
@@ -231,6 +240,15 @@ impl PadPlan {
                 expected_dest_dims.to_vec(),
             ));
         }
+        let contiguous_dest_fill = is_dense_col_major(dest_dims, dest_strides);
+        let contiguous_axis0_run = compile_contiguous_pad_axis0_run(
+            operand_dims,
+            operand_strides,
+            dest_dims,
+            dest_strides,
+            edge_padding_low,
+            &interior_step,
+        );
 
         Ok(Self {
             operand_dims: operand_dims.into(),
@@ -241,6 +259,8 @@ impl PadPlan {
             interior_step,
             operand_total,
             dest_total,
+            contiguous_dest_fill,
+            contiguous_axis0_run,
         })
     }
 
@@ -260,6 +280,9 @@ impl PadPlan {
         if self.operand_total == 0 {
             return Ok(());
         }
+        if let Some(run) = self.contiguous_axis0_run {
+            return self.copy_operand_axis0_runs(dest, operand, run);
+        }
         self.copy_operand(dest, operand)
     }
 
@@ -270,6 +293,19 @@ impl PadPlan {
         if self.dest_total == 0 {
             return Ok(());
         }
+        if self.contiguous_dest_fill {
+            let dest_offset =
+                usize::try_from(dest.offset()).map_err(|_| StridedError::OffsetOverflow)?;
+            let dest_end = dest_offset
+                .checked_add(self.dest_total)
+                .ok_or(StridedError::OffsetOverflow)?;
+            let dest_data = dest.data_mut();
+            let dest_slice = dest_data
+                .get_mut(dest_offset..dest_end)
+                .ok_or(StridedError::OffsetOverflow)?;
+            dest_slice.fill(fill);
+            return Ok(());
+        }
         #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.dest_total);
@@ -278,6 +314,73 @@ impl PadPlan {
             }
         }
         self.fill_dest_serial(dest, fill)
+    }
+
+    fn copy_operand_axis0_runs<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        run: ContiguousPadAxis0Run,
+    ) -> Result<()>
+    where
+        T: Copy,
+    {
+        if run.len == 0 {
+            return Ok(());
+        }
+        let outer_dims = &self.operand_dims[1..];
+        let outer_total = checked_total_len(outer_dims)?;
+        let mut outer_idx_storage = CoordScratch::new(outer_dims.len());
+        let outer_idx = outer_idx_storage.as_mut_slice();
+        let operand_ptr = operand.data().as_ptr();
+        let dest_ptr = dest.data_mut().as_mut_ptr();
+
+        for _ in 0..outer_total {
+            let mut operand_offset =
+                checked_offset_add(operand.offset(), self.operand_strides[0], run.operand_start)?;
+            let mut dest_offset =
+                checked_offset_add(dest.offset(), self.dest_strides[0], run.dest_start)?;
+            let mut in_bounds = true;
+            for (outer_axis, &coord) in outer_idx.iter().enumerate() {
+                let axis = outer_axis + 1;
+                let out_pos = i128::from(self.edge_padding_low[axis])
+                    + coord as i128 * i128::from(self.interior_step[axis]);
+                if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
+                    in_bounds = false;
+                    break;
+                }
+                operand_offset =
+                    checked_offset_add(operand_offset, self.operand_strides[axis], coord)?;
+                dest_offset =
+                    checked_offset_add(dest_offset, self.dest_strides[axis], out_pos as usize)?;
+            }
+            if in_bounds {
+                unsafe {
+                    // SAFETY: compile requires unit axis-0 strides, the clipped
+                    // run is in bounds, and the destination layout is injective.
+                    // RawStridedMut's exclusive borrow cannot overlap the
+                    // RawStridedRef's shared borrow in safe Rust.
+                    core::ptr::copy_nonoverlapping(
+                        operand_ptr.offset(operand_offset),
+                        dest_ptr.offset(dest_offset),
+                        run.len,
+                    );
+                }
+            }
+            advance_col_major_index(outer_idx, outer_dims);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn contiguous_axis0_run(&self) -> Option<(usize, usize, usize)> {
+        self.contiguous_axis0_run
+            .map(|run| (run.operand_start, run.dest_start, run.len))
+    }
+
+    #[cfg(test)]
+    fn has_contiguous_dest_fill(&self) -> bool {
+        self.contiguous_dest_fill
     }
 
     fn fill_dest_serial<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T) -> Result<()>
@@ -771,6 +874,52 @@ fn checked_pad_output_dim(
     usize::try_from(dim).map_err(|_| StridedError::InvalidAxis { axis, rank })
 }
 
+fn is_dense_col_major(dims: &[usize], strides: &[isize]) -> bool {
+    let mut expected = 1isize;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        if stride != expected {
+            return false;
+        }
+        let Ok(dim) = isize::try_from(dim) else {
+            return false;
+        };
+        let Some(next) = expected.checked_mul(dim) else {
+            return false;
+        };
+        expected = next;
+    }
+    true
+}
+
+fn compile_contiguous_pad_axis0_run(
+    operand_dims: &[usize],
+    operand_strides: &[isize],
+    dest_dims: &[usize],
+    dest_strides: &[isize],
+    edge_padding_low: &[i64],
+    interior_step: &[i64],
+) -> Option<ContiguousPadAxis0Run> {
+    if operand_dims.is_empty()
+        || operand_strides[0] != 1
+        || dest_strides[0] != 1
+        || interior_step[0] != 1
+    {
+        return None;
+    }
+
+    let operand_extent = operand_dims[0] as i128;
+    let dest_extent = dest_dims[0] as i128;
+    let edge_low = i128::from(edge_padding_low[0]);
+    let operand_start = (-edge_low).clamp(0, operand_extent);
+    let dest_start = edge_low.clamp(0, dest_extent);
+    let len = (operand_extent - operand_start).min(dest_extent - dest_start);
+    Some(ContiguousPadAxis0Run {
+        operand_start: usize::try_from(operand_start).ok()?,
+        dest_start: usize::try_from(dest_start).ok()?,
+        len: usize::try_from(len).ok()?,
+    })
+}
+
 fn checked_strided_offset(base: isize, strides: &[isize], index: &[usize]) -> Result<isize> {
     let mut offset = base;
     for (&stride, &coord) in strides.iter().zip(index.iter()) {
@@ -834,5 +983,105 @@ impl CoordScratch {
             Some(heap) => heap,
             None => &mut self.inline[..self.len],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::fmt::Debug;
+
+    use num_complex::{Complex32, Complex64};
+
+    use super::{PadPlan, RawStridedMut, RawStridedRef};
+
+    fn assert_contiguous_pad_matches_scalar<T>(operand_data: &[T], fill: T)
+    where
+        T: Copy + Debug + PartialEq + super::MaybeSendSync,
+    {
+        let operand_dims = [3usize, 2];
+        let operand_strides = [1isize, -3];
+        let operand_offset = 3isize;
+        let dest_dims = [4usize, 4];
+        let dest_strides = [1isize, 4];
+        let dest_offset = 2isize;
+        let edge_low = [-1i64, 1];
+        let edge_high = [2i64, 0];
+        let interior = [0i64, 1];
+        let plan = PadPlan::compile(
+            &operand_dims,
+            &operand_strides,
+            &dest_dims,
+            &dest_strides,
+            &edge_low,
+            &edge_high,
+            &interior,
+        )
+        .unwrap();
+        assert!(plan.contiguous_axis0_run.is_some());
+
+        let mut scalar_plan = plan.clone();
+        scalar_plan.contiguous_dest_fill = false;
+        scalar_plan.contiguous_axis0_run = None;
+        let mut fast_dest = vec![fill; 20];
+        let mut scalar_dest = fast_dest.clone();
+        let operand = RawStridedRef::new(
+            operand_data,
+            &operand_dims,
+            &operand_strides,
+            operand_offset,
+        )
+        .unwrap();
+        {
+            let mut dest =
+                RawStridedMut::new(&mut fast_dest, &dest_dims, &dest_strides, dest_offset).unwrap();
+            plan.execute(&mut dest, &operand, fill).unwrap();
+        }
+        {
+            let mut dest =
+                RawStridedMut::new(&mut scalar_dest, &dest_dims, &dest_strides, dest_offset)
+                    .unwrap();
+            scalar_plan.execute(&mut dest, &operand, fill).unwrap();
+        }
+        assert_eq!(fast_dest, scalar_dest);
+    }
+
+    #[test]
+    fn pad_plan_selects_contiguous_axis0_run_for_dense_edge_padding() {
+        let plan =
+            PadPlan::compile(&[2_097_152], &[1], &[2_097_408], &[1], &[128], &[128], &[0]).unwrap();
+
+        assert_eq!(plan.contiguous_axis0_run(), Some((0, 128, 2_097_152)));
+        assert!(plan.has_contiguous_dest_fill());
+    }
+
+    #[test]
+    fn contiguous_pad_matches_scalar_for_every_erased_scalar_type() {
+        assert_contiguous_pad_matches_scalar(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], -1.0);
+        assert_contiguous_pad_matches_scalar(&[1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0], -1.0);
+        assert_contiguous_pad_matches_scalar(&[1i32, 2, 3, 4, 5, 6], -1);
+        assert_contiguous_pad_matches_scalar(&[1i64, 2, 3, 4, 5, 6], -1);
+        assert_contiguous_pad_matches_scalar(&[true, false, true, false, true, false], false);
+        assert_contiguous_pad_matches_scalar(
+            &[
+                Complex32::new(1.0, -1.0),
+                Complex32::new(2.0, -2.0),
+                Complex32::new(3.0, -3.0),
+                Complex32::new(4.0, -4.0),
+                Complex32::new(5.0, -5.0),
+                Complex32::new(6.0, -6.0),
+            ],
+            Complex32::new(-1.0, 0.0),
+        );
+        assert_contiguous_pad_matches_scalar(
+            &[
+                Complex64::new(1.0, -1.0),
+                Complex64::new(2.0, -2.0),
+                Complex64::new(3.0, -3.0),
+                Complex64::new(4.0, -4.0),
+                Complex64::new(5.0, -5.0),
+                Complex64::new(6.0, -6.0),
+            ],
+            Complex64::new(-1.0, 0.0),
+        );
     }
 }
