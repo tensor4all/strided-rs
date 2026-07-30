@@ -1,11 +1,15 @@
 use approx::assert_relative_eq;
 use num_complex::Complex64;
+#[cfg(feature = "parallel")]
+use std::num::NonZeroUsize;
 use strided_kernel::{
     add, axpy, batched_outer_product_into, broadcast_mul_into, copy_conj, copy_into, copy_scale,
     copy_transpose_scale_into, dot, fma, map_into, mul, mul_into, reduce, reduce_axis, sum,
     symmetrize_conj_into, symmetrize_into, zip_map2_into, zip_map3_into, zip_map4_into,
     StridedArray, StridedError,
 };
+#[cfg(feature = "parallel")]
+use strided_kernel::{with_execution_policy, ExecutionPolicy};
 
 fn make_tensor(rows: usize, cols: usize) -> StridedArray<f64> {
     StridedArray::from_fn_row_major(&[rows, cols], |idx| (idx[0] * cols + idx[1]) as f64)
@@ -26,6 +30,118 @@ fn test_map_into_transposed() {
             assert_relative_eq!(out.get(&[i, j]), expected, epsilon = 1e-10);
         }
     }
+}
+
+fn assert_map_arity_rejects_noninjective_destination(len: usize) {
+    let source = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64);
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+
+    let error = map_into(&mut dest, &source.view(), |x| x + 1.0);
+
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+}
+
+#[test]
+fn test_map_into_rejects_noninjective_destination_before_serial_write() {
+    assert_map_arity_rejects_noninjective_destination(4);
+}
+
+fn assert_zip_map2_arity_rejects_noninjective_destination(len: usize) {
+    let a = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64);
+    let b = StridedArray::<f64>::from_fn_col_major(&[len], |idx| (2 * idx[0]) as f64);
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+
+    let error = zip_map2_into(&mut dest, &a.view(), &b.view(), |x, y| x + y);
+
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+}
+
+#[test]
+fn test_zip_map2_into_rejects_noninjective_destination_before_serial_write() {
+    assert_zip_map2_arity_rejects_noninjective_destination(4);
+}
+
+#[test]
+fn test_zip_map3_into_rejects_noninjective_destination_before_serial_write() {
+    let sources = (0..3)
+        .map(|offset| StridedArray::<f64>::from_fn_col_major(&[4], |idx| (idx[0] + offset) as f64))
+        .collect::<Vec<_>>();
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[4], &[0], 0).unwrap();
+
+    let error = zip_map3_into(
+        &mut dest,
+        &sources[0].view(),
+        &sources[1].view(),
+        &sources[2].view(),
+        |x, y, z| x + y + z,
+    );
+
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+}
+
+#[test]
+fn test_zip_map4_into_rejects_noninjective_destination_before_serial_write() {
+    let sources = (0..4)
+        .map(|offset| StridedArray::<f64>::from_fn_col_major(&[4], |idx| (idx[0] + offset) as f64))
+        .collect::<Vec<_>>();
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[4], &[0], 0).unwrap();
+
+    let error = zip_map4_into(
+        &mut dest,
+        &sources[0].view(),
+        &sources[1].view(),
+        &sources[2].view(),
+        &sources[3].view(),
+        |w, x, y, z| w + x + y + z,
+    );
+
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_map_and_zip_reject_large_noninjective_destinations_before_parallel_write() {
+    const LEN: usize = 100_000;
+    assert_map_arity_rejects_noninjective_destination(LEN);
+    assert_zip_map2_arity_rejects_noninjective_destination(LEN);
+
+    let sources = (0..4)
+        .map(|offset| {
+            StridedArray::<f64>::from_fn_col_major(&[LEN], |idx| (idx[0] + offset) as f64)
+        })
+        .collect::<Vec<_>>();
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[LEN], &[0], 0).unwrap();
+    let error = zip_map3_into(
+        &mut dest,
+        &sources[0].view(),
+        &sources[1].view(),
+        &sources[2].view(),
+        |x, y, z| x + y + z,
+    );
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[LEN], &[0], 0).unwrap();
+    let error = zip_map4_into(
+        &mut dest,
+        &sources[0].view(),
+        &sources[1].view(),
+        &sources[2].view(),
+        &sources[3].view(),
+        |w, x, y, z| w + x + y + z,
+    );
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
 }
 
 #[test]
@@ -65,6 +181,45 @@ fn test_mul_into_contiguous() {
             );
         }
     }
+}
+
+fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
+    let lhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 1.0);
+    let rhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 2.0);
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+
+    let error = mul_into(&mut dest, &lhs.view(), &rhs.view());
+
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+
+    let lhs = StridedArray::<f64>::from_fn_col_major(&[1], |_| 2.0);
+    let rhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 2.0);
+    let mut output = [7.0_f64];
+    let mut dest = strided_kernel::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+
+    let error = broadcast_mul_into(&mut dest, &lhs.view(), &[0], &rhs.view(), &[0]);
+
+    assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
+    assert_eq!(output, [7.0]);
+}
+
+#[test]
+fn test_mul_identity_paths_reject_noninjective_destination_before_serial_write() {
+    assert_mul_identity_paths_reject_noninjective_destination(4);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_mul_identity_paths_reject_noninjective_destination_before_bounded_parallel_write() {
+    const LEN: usize = 100_000;
+    with_execution_policy(
+        ExecutionPolicy::Rayon {
+            max_threads: NonZeroUsize::new(2).unwrap(),
+        },
+        || assert_mul_identity_paths_reject_noninjective_destination(LEN),
+    );
 }
 
 #[test]

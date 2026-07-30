@@ -565,6 +565,38 @@ fn one_shot_accepts_small_injective_layout_without_allocating() {
 }
 
 #[test]
+fn one_shot_rejects_noninjective_destination_before_raw_replay() {
+    let dims = [4usize];
+    let input_strides = [1isize];
+    let output_strides = [0isize];
+    let input = [1.0f64, 2.0, 3.0, 4.0];
+    let input =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&input), &dims, &input_strides, 0)
+            .unwrap();
+    let mut actual = [7.0f64];
+    let mut output = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut actual),
+        &dims,
+        &output_strides,
+        0,
+    )
+    .unwrap();
+
+    let error = erased_map_into(
+        KernelDType::F64,
+        ErasedMapOp::Negate,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&input),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, StridedError::NonInjectiveOutputLayout));
+    assert_eq!(actual, [7.0]);
+}
+
+#[test]
 fn integer_division_preflight_handles_high_rank_iteratively() {
     const RANK: usize = 20_000;
     let dims = vec![1usize; RANK];

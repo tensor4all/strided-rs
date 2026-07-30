@@ -223,6 +223,113 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         "one-shot erased map/zip must not allocate beyond the typed kernels"
     );
 
+    let dims = [3usize, 2];
+    let input_strides = [1isize, 3];
+    let output_strides = [2isize, 3];
+    let lhs = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let rhs = [6.0f64, 5.0, 4.0, 3.0, 2.0, 1.0];
+    let lhs_ref =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &input_strides, 0)
+            .unwrap();
+    let rhs_ref =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &input_strides, 0)
+            .unwrap();
+    let mut dst = [0.0f64; 8];
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut dst),
+        &dims,
+        &output_strides,
+        0,
+    )
+    .unwrap();
+    let reference_strides = [2isize, 7];
+    let mut reference_dst = [0.0f64; 12];
+    let mut reference_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut reference_dst),
+        &dims,
+        &reference_strides,
+        0,
+    )
+    .unwrap();
+    erased_map_into(
+        KernelDType::F64,
+        ErasedMapOp::Negate,
+        &ExecContext::serial(),
+        &mut reference_dest,
+        &ErasedRawStridedPtr::from_ref(&lhs_ref),
+    )
+    .unwrap();
+    erased_zip_into(
+        KernelDType::F64,
+        ErasedZipOp::Add,
+        &ExecContext::serial(),
+        &mut reference_dest,
+        &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        &ErasedRawStridedPtr::from_ref(&rhs_ref),
+    )
+    .unwrap();
+    erased_map_into(
+        KernelDType::F64,
+        ErasedMapOp::Negate,
+        &ExecContext::serial(),
+        &mut dest,
+        &ErasedRawStridedPtr::from_ref(&lhs_ref),
+    )
+    .unwrap();
+    erased_zip_into(
+        KernelDType::F64,
+        ErasedZipOp::Add,
+        &ExecContext::serial(),
+        &mut dest,
+        &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        &ErasedRawStridedPtr::from_ref(&rhs_ref),
+    )
+    .unwrap();
+    let kernel_allocations = count_allocations(|| {
+        erased_map_into(
+            KernelDType::F64,
+            ErasedMapOp::Negate,
+            &ExecContext::serial(),
+            &mut reference_dest,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        )
+        .unwrap();
+        erased_zip_into(
+            KernelDType::F64,
+            ErasedZipOp::Add,
+            &ExecContext::serial(),
+            &mut reference_dest,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        )
+        .unwrap();
+    });
+    let allocations = count_allocations(|| {
+        erased_map_into(
+            KernelDType::F64,
+            ErasedMapOp::Negate,
+            &ExecContext::serial(),
+            &mut dest,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        )
+        .unwrap();
+        erased_zip_into(
+            KernelDType::F64,
+            ErasedZipOp::Add,
+            &ExecContext::serial(),
+            &mut dest,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        allocations, kernel_allocations,
+        "validated one-shot raw replay must not repeat allocating injectivity checks"
+    );
+
     let src_dims = [2usize; 8];
     let src_strides: Vec<isize> = (0..8).map(|axis| 1isize << axis).collect();
     let dest_dims = [2usize; 4];

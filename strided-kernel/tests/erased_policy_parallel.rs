@@ -4,7 +4,7 @@ use strided_kernel::{
     erased_zip_into, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
     ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
     ErasedReducePlan, ErasedScatterPlan, ErasedZipOp, ExecContext, GatherSpec, KernelDType,
-    ReduceOp, ScatterSpec,
+    ReduceOp, ScatterSpec, StridedError,
 };
 
 const LARGE_LEN: usize = (1 << 15) + 65;
@@ -67,6 +67,41 @@ fn large_one_shot_zip_matches_serial() {
     };
 
     assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+}
+
+#[test]
+fn bounded_one_shot_rejects_noninjective_destination_before_raw_replay() {
+    let dims = [LARGE_LEN];
+    let source_strides = [1isize];
+    let dest_strides = [0isize];
+    let lhs = vec![1.0f64; LARGE_LEN];
+    let rhs = vec![2.0f64; LARGE_LEN];
+    let lhs = ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &source_strides, 0)
+        .unwrap();
+    let rhs = ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &source_strides, 0)
+        .unwrap();
+    let mut actual = [7.0f64];
+    let mut dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut actual),
+        &dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+
+    let error = erased_zip_into(
+        KernelDType::F64,
+        ErasedZipOp::Add,
+        &bounded_context(),
+        &mut dest,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, StridedError::NonInjectiveOutputLayout));
+    assert_eq!(actual, [7.0]);
 }
 
 #[test]

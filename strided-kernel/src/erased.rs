@@ -1530,7 +1530,8 @@ fn execute_one_shot_map<T: OneShotScalar>(
             dtype: T::one_shot_dtype_label(),
         });
     }
-    validate_one_shot_destination(dest)?;
+    let validated =
+        crate::map_view::validate_destination_layout_without_alloc(dest.dims(), dest.strides())?;
     crate::kernel::ensure_same_shape(dest.dims(), input.dims())?;
     if dest.dims().contains(&0) {
         return Ok(());
@@ -1544,7 +1545,12 @@ fn execute_one_shot_map<T: OneShotScalar>(
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     let input = erased_raw_ref::<T>(input);
 
-    crate::map_view::map_raw_into::<T, T, Identity>(&mut dest, &input, |value| T::map(op, value))
+    crate::map_view::map_raw_into_validated::<T, T, Identity>(
+        &mut dest,
+        &input,
+        |value| T::map(op, value),
+        validated,
+    )
 }
 
 fn execute_one_shot_map_with<D, A>(
@@ -1556,7 +1562,8 @@ where
     D: Copy + crate::MaybeSendSync,
     A: Copy + crate::MaybeSendSync,
 {
-    validate_one_shot_destination(dest)?;
+    let validated =
+        crate::map_view::validate_destination_layout_without_alloc(dest.dims(), dest.strides())?;
     crate::kernel::ensure_same_shape(dest.dims(), input.dims())?;
     if dest.dims().contains(&0) {
         return Ok(());
@@ -1568,7 +1575,7 @@ where
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     let input = erased_raw_ref::<A>(input);
-    crate::map_view::map_raw_into::<D, A, Identity>(&mut dest, &input, map)
+    crate::map_view::map_raw_into_validated::<D, A, Identity>(&mut dest, &input, map, validated)
 }
 
 fn execute_one_shot_zip<T: OneShotScalar>(
@@ -1583,7 +1590,8 @@ fn execute_one_shot_zip<T: OneShotScalar>(
             dtype: T::one_shot_dtype_label(),
         });
     }
-    validate_one_shot_destination(dest)?;
+    let validated =
+        crate::map_view::validate_destination_layout_without_alloc(dest.dims(), dest.strides())?;
     crate::kernel::ensure_same_shape(dest.dims(), lhs.dims())?;
     crate::kernel::ensure_same_shape(dest.dims(), rhs.dims())?;
     if dest.dims().contains(&0) {
@@ -1604,20 +1612,13 @@ fn execute_one_shot_zip<T: OneShotScalar>(
     let dest_data = typed_slice_mut::<T>(dest.data_mut());
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    crate::map_view::zip_map2_raw_into::<T, T, T, Identity, Identity>(
+    crate::map_view::zip_map2_raw_into_validated::<T, T, T, Identity, Identity>(
         &mut dest,
         &lhs,
         &rhs,
         |lhs, rhs| T::zip(op, lhs, rhs),
+        validated,
     )
-}
-
-fn validate_one_shot_destination(dest: &ErasedRawStridedMut<'_>) -> Result<()> {
-    if crate::fused::is_injective_layout_without_alloc(dest.dims(), dest.strides()) {
-        Ok(())
-    } else {
-        Err(StridedError::NonInjectiveOutputLayout)
-    }
 }
 
 fn validate_no_overlap(

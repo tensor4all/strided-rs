@@ -1,6 +1,10 @@
 //! Map operations on dynamic-rank strided views.
 //!
 //! These are the canonical view-based map functions, equivalent to Julia's `Base.map!`.
+//! Mutable destinations must have an injective layout. Validation is
+//! conservative and bounded: layouts that are injective but cannot be proven
+//! by the bounded checker are rejected with
+//! [`StridedError::NonInjectiveOutputLayout`].
 
 use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
@@ -26,6 +30,32 @@ type AxisVec<T> = SmallVec<[T; 8]>;
 type AxisVec<T> = Vec<T>;
 
 const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
+
+pub(crate) struct ValidatedDestinationLayout(());
+
+#[inline]
+fn validate_destination_layout(
+    dims: &[usize],
+    strides: &[isize],
+) -> Result<ValidatedDestinationLayout> {
+    if crate::fused::is_injective_layout(dims, strides) {
+        Ok(ValidatedDestinationLayout(()))
+    } else {
+        Err(StridedError::NonInjectiveOutputLayout)
+    }
+}
+
+#[inline]
+pub(crate) fn validate_destination_layout_without_alloc(
+    dims: &[usize],
+    strides: &[isize],
+) -> Result<ValidatedDestinationLayout> {
+    if crate::fused::is_injective_layout_without_alloc(dims, strides) {
+        Ok(ValidatedDestinationLayout(()))
+    } else {
+        Err(StridedError::NonInjectiveOutputLayout)
+    }
+}
 
 // ============================================================================
 // Stride-specialized inner loop helpers
@@ -891,6 +921,28 @@ pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op:
     )
 }
 
+pub(crate) fn map_raw_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    Op: ElementOp<A>,
+>(
+    dest: &mut crate::RawStridedMut<'_, D>,
+    src: &crate::RawStridedRef<'_, A>,
+    f: impl Fn(A) -> D + MaybeSync,
+    validated: ValidatedDestinationLayout,
+) -> Result<()> {
+    ensure_same_shape(dest.dims(), src.dims())?;
+    map_parts_into_validated::<D, A, Op>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.strides(),
+        f,
+        validated,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
     dst_ptr: *mut D,
@@ -902,7 +954,28 @@ fn map_parts_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementO
     f: impl Fn(A) -> D + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, src_dims)?;
+    let validated = validate_destination_layout(dst_dims, dst_strides)?;
+    map_parts_into_validated::<D, A, Op>(
+        dst_ptr,
+        dst_dims,
+        dst_strides,
+        src_ptr,
+        src_strides,
+        f,
+        validated,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+    dst_ptr: *mut D,
+    dst_dims: &[usize],
+    dst_strides: &[isize],
+    src_ptr: *const A,
+    src_strides: &[isize],
+    f: impl Fn(A) -> D + MaybeSync,
+    _validated: ValidatedDestinationLayout,
+) -> Result<()> {
     if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
         let len = total_len(dst_dims);
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
@@ -1011,6 +1084,32 @@ pub fn zip_map2_into<
     )
 }
 
+fn zip_map2_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    f: impl Fn(A, B) -> D + MaybeSync,
+    validated: ValidatedDestinationLayout,
+) -> Result<()> {
+    zip_map2_parts_into_validated::<D, A, B, OpA, OpB>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        a.ptr(),
+        a.strides(),
+        b.ptr(),
+        b.strides(),
+        f,
+        validated,
+    )
+}
+
 /// Runtime comparison selected once before entering the element loop.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1043,9 +1142,6 @@ where
     OpA: ElementOp<T>,
     OpB: ElementOp<T>,
 {
-    if !crate::fused::is_injective_layout_without_alloc(dest.dims(), dest.strides()) {
-        return Err(StridedError::NonInjectiveOutputLayout);
-    }
     match op {
         CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| lhs == rhs),
         CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| lhs < rhs),
@@ -1055,7 +1151,7 @@ where
     }
 }
 
-pub(crate) fn zip_map2_raw_into<
+pub(crate) fn zip_map2_raw_into_validated<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
     B: Copy + MaybeSendSync,
@@ -1066,18 +1162,20 @@ pub(crate) fn zip_map2_raw_into<
     a: &crate::RawStridedRef<'_, A>,
     b: &crate::RawStridedRef<'_, B>,
     f: impl Fn(A, B) -> D + MaybeSync,
+    validated: ValidatedDestinationLayout,
 ) -> Result<()> {
-    zip_map2_parts_into::<D, A, B, OpA, OpB>(
+    ensure_same_shape(dest.dims(), a.dims())?;
+    ensure_same_shape(dest.dims(), b.dims())?;
+    zip_map2_parts_into_validated::<D, A, B, OpA, OpB>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
         a.ptr(),
-        a.dims(),
         a.strides(),
         b.ptr(),
-        b.dims(),
         b.strides(),
         f,
+        validated,
     )
 }
 
@@ -1102,7 +1200,38 @@ fn zip_map2_parts_into<
 ) -> Result<()> {
     ensure_same_shape(dst_dims, a_dims)?;
     ensure_same_shape(dst_dims, b_dims)?;
+    let validated = validate_destination_layout(dst_dims, dst_strides)?;
+    zip_map2_parts_into_validated::<D, A, B, OpA, OpB>(
+        dst_ptr,
+        dst_dims,
+        dst_strides,
+        a_ptr,
+        a_strides,
+        b_ptr,
+        b_strides,
+        f,
+        validated,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn zip_map2_parts_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dst_ptr: *mut D,
+    dst_dims: &[usize],
+    dst_strides: &[isize],
+    a_ptr: *const A,
+    a_strides: &[isize],
+    b_ptr: *const B,
+    b_strides: &[isize],
+    f: impl Fn(A, B) -> D + MaybeSync,
+    _validated: ValidatedDestinationLayout,
+) -> Result<()> {
     if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
         let len = total_len(dst_dims);
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
@@ -1310,22 +1439,6 @@ fn mul_identity_into_raw<
     )
 }
 
-fn mul_identity_into<
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
-    B: Copy + MaybeSendSync + 'static,
-    OpA: ElementOp<A>,
-    OpB: ElementOp<B>,
->(
-    dest: &mut StridedViewMut<D>,
-    a: &StridedView<A, OpA>,
-    b: &StridedView<B, OpB>,
-) -> Result<()> {
-    ensure_same_shape(dest.dims(), a.dims())?;
-    ensure_same_shape(dest.dims(), b.dims())?;
-    mul_identity_into_raw(dest, a.ptr(), a.strides(), b.ptr(), b.strides())
-}
-
 /// Element-wise multiplication: `dest[i] = a[i] * b[i]`.
 ///
 /// All views must have the same shape. Broadcast operands should be represented
@@ -1341,11 +1454,15 @@ pub fn mul_into<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
 ) -> Result<()> {
+    ensure_same_shape(dest.dims(), a.dims())?;
+    ensure_same_shape(dest.dims(), b.dims())?;
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
+
     if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
-        return mul_identity_into(dest, a, b);
+        return mul_identity_into_raw(dest, a.ptr(), a.strides(), b.ptr(), b.strides());
     }
 
-    zip_map2_into(dest, a, b, |x, y| x * y)
+    zip_map2_into_validated(dest, a, b, |x, y| x * y, validated)
 }
 
 fn broadcast_strides_for_axes(
@@ -1419,6 +1536,7 @@ pub fn broadcast_mul_into<
     b: &StridedView<B, OpB>,
     b_axes: &[usize],
 ) -> Result<()> {
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
     let a_strides = broadcast_strides_for_axes(a.dims(), a.strides(), dest.dims(), a_axes)?;
     let b_strides = broadcast_strides_for_axes(b.dims(), b.strides(), dest.dims(), b_axes)?;
 
@@ -1428,7 +1546,7 @@ pub fn broadcast_mul_into<
 
     let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
     let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
-    mul_into(dest, &a, &b)
+    zip_map2_into_validated(dest, &a, &b, |x, y| x * y, validated)
 }
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
@@ -1450,6 +1568,7 @@ pub fn zip_map3_into<
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
@@ -1583,6 +1702,7 @@ pub fn zip_map4_into<
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
     ensure_same_shape(dest.dims(), e.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
@@ -1720,8 +1840,24 @@ pub fn zip_map4_into<
 #[cfg(test)]
 mod scalar_branch_tests {
     use super::*;
-    use crate::StridedArray;
+    use crate::{RawStridedMut, RawStridedRef, StridedArray};
     use strided_view::Identity;
+
+    #[test]
+    fn raw_map_rejects_noninjective_destination_before_write() {
+        let dims = [4usize];
+        let source_strides = [1isize];
+        let dest_strides = [0isize];
+        let lhs = [1.0f64, 2.0, 3.0, 4.0];
+        let lhs = RawStridedRef::new(&lhs, &dims, &source_strides, 0).unwrap();
+
+        let mut output = [7.0f64];
+        let mut dest = RawStridedMut::new(&mut output, &dims, &dest_strides, 0).unwrap();
+        let error =
+            map_raw_into::<f64, f64, Identity>(&mut dest, &lhs, |value| -value).unwrap_err();
+        assert!(matches!(error, StridedError::NonInjectiveOutputLayout));
+        assert_eq!(output, [7.0]);
+    }
 
     #[test]
     fn test_inner_loop_map2_stride_specializations() {
