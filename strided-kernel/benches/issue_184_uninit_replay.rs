@@ -43,22 +43,6 @@ impl PairOrder {
     }
 }
 
-fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(data.as_ptr().cast(), core::mem::size_of_val(data)) }
-}
-
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), core::mem::size_of_val(data))
-    }
-}
-
-fn as_uninit_bytes<T>(data: &mut [MaybeUninit<T>]) -> &mut [MaybeUninit<u8>] {
-    unsafe {
-        core::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), core::mem::size_of_val(data))
-    }
-}
-
 fn elapsed(operation: &mut impl FnMut()) -> Duration {
     let start = Instant::now();
     operation();
@@ -255,10 +239,8 @@ fn bench_fused(context: ExecContext) {
     let strides = [1];
     let lhs = vector_values(VECTOR_LEN, 1.0);
     let rhs = vector_values(VECTOR_LEN, 2.0);
-    let lhs_ref =
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &strides, 0).unwrap();
-    let rhs_ref =
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &strides, 0).unwrap();
+    let lhs_ref = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
+    let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
     let refs = [lhs_ref, rhs_ref];
     let ptrs = refs.map(|input| ErasedRawStridedPtr::from_ref(&input));
     let plan = ErasedFusedPlan::compile(
@@ -281,22 +263,11 @@ fn bench_fused(context: ExecContext) {
     .unwrap();
     let mut initialized = vec![0.0; VECTOR_LEN];
     let mut uninitialized = vec![MaybeUninit::<f64>::uninit(); VECTOR_LEN];
-    let mut initialized = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        as_bytes_mut(&mut initialized),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
-    let mut uninitialized = ErasedRawStridedUninitMut::new(
-        KernelDType::F64,
-        as_uninit_bytes(&mut uninitialized),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut initialized =
+        ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
+    let mut uninitialized =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
+            .unwrap();
 
     measure_pair(
         "fused_add_mul",

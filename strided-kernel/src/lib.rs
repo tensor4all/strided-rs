@@ -88,8 +88,8 @@ pub use strided_view::view;
 pub use strided_view::{
     col_major_strides, row_major_strides, Adjoint, ComposableElementOp, Compose, Conj, ElementOp,
     ElementOpApply, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, Identity, KernelDType, RawStridedMut, RawStridedRef, Result,
-    StridedArray, StridedError, StridedView, StridedViewMut, Transpose,
+    ErasedRawStridedUninitMut, Identity, KernelDType, KernelStorageElement, RawStridedMut,
+    RawStridedRef, Result, StridedArray, StridedError, StridedView, StridedViewMut, Transpose,
 };
 
 // ============================================================================

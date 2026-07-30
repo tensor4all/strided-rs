@@ -4,24 +4,6 @@ use strided_kernel::{
     KernelDType, StridedError,
 };
 
-fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
-}
-
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            data.as_mut_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
-}
-
 #[test]
 fn erased_gather_plan_executes_f64_column_gather_with_i64_indices() {
     let operand_dims = [3usize, 4];
@@ -55,30 +37,12 @@ fn erased_gather_plan_executes_f64_column_gather_with_i64_indices() {
         spec,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::F64,
-        as_bytes(&operand),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let index_ref = ErasedRawStridedRef::new(
-        KernelDType::I64,
-        as_bytes(&indices),
-        &index_dims,
-        &index_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        as_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
         &ExecContext::serial(),
@@ -122,30 +86,12 @@ fn erased_gather_plan_executes_f32_windows_with_i32_indices_and_clamping() {
         spec,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::F32,
-        as_bytes(&operand),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let index_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&indices),
-        &index_dims,
-        &index_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::F32,
-        as_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
         &ExecContext::max_threads(1).unwrap(),
@@ -160,7 +106,7 @@ fn erased_gather_plan_executes_f32_windows_with_i32_indices_and_clamping() {
 
 fn assert_supported_take<T>(dtype: KernelDType, input: &[T])
 where
-    T: Copy + core::fmt::Debug + Default + PartialEq,
+    T: Copy + core::fmt::Debug + Default + PartialEq + strided_kernel::KernelStorageElement,
 {
     let operand_dims = [input.len()];
     let operand_strides = [1isize];
@@ -191,24 +137,11 @@ where
     )
     .unwrap();
     let operand_ref =
-        ErasedRawStridedRef::new(dtype, as_bytes(input), &operand_dims, &operand_strides, 0)
-            .unwrap();
-    let index_ref = ErasedRawStridedRef::new(
-        KernelDType::I64,
-        as_bytes(&indices),
-        &index_dims,
-        &index_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        dtype,
-        as_bytes_mut(&mut output),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+        ErasedRawStridedRef::from_slice(input, &operand_dims, &operand_strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
         &ExecContext::ambient(),
@@ -266,30 +199,11 @@ fn erased_gather_plan_rejects_dtype_and_layout_mismatch_before_writing() {
         spec,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::F64,
-        as_bytes(&operand),
-        &operand_dims,
-        &strides,
-        0,
-    )
-    .unwrap();
-    let index_ref = ErasedRawStridedRef::new(
-        KernelDType::I64,
-        as_bytes(&indices),
-        &index_dims,
-        &strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::F32,
-        as_bytes_mut(&mut output),
-        &dest_dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &strides, 0).unwrap();
+    let index_ref = ErasedRawStridedRef::from_slice(&indices, &index_dims, &strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &strides, 0).unwrap();
 
     let err = plan
         .execute(
@@ -303,17 +217,10 @@ fn erased_gather_plan_rejects_dtype_and_layout_mismatch_before_writing() {
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
     assert_eq!(output, [9.0]);
 
-    let bad_index_ref =
-        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&indices), &[1], &[0], 0).unwrap();
+    let bad_index_ref = ErasedRawStridedRef::from_slice(&indices, &[1], &[0], 0).unwrap();
     let mut output = [9.0f64];
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        as_bytes_mut(&mut output),
-        &dest_dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &strides, 0).unwrap();
     let err = plan
         .execute(
             &ExecContext::serial(),

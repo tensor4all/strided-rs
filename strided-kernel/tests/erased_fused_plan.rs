@@ -4,24 +4,6 @@ use strided_kernel::{
     FusedPlan, KernelDType, StridedError,
 };
 
-fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
-}
-
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            data.as_mut_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
-}
-
 fn binary_plan(op: FusedOp) -> FusedPlan {
     FusedPlan {
         input_count: 2,
@@ -55,17 +37,10 @@ fn erased_fused_plan_executes_f64_binary_add_transposed_layout() {
 
     let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &dims, &src_strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&b), &dims, &src_strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &dims, &src_strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &src_strides, 0).unwrap(),
     ];
-    let mut dest = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        as_bytes_mut(&mut dst),
-        &dims,
-        &dst_strides,
-        0,
-    )
-    .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &inputs)
         .unwrap();
@@ -95,13 +70,11 @@ fn erased_fused_plan_executes_f32_ternary_clamp_with_ambient_context() {
     )
     .unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::F32, as_bytes(&x), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F32, as_bytes(&min), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F32, as_bytes(&max), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&x, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&min, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&max, &dims, &strides, 0).unwrap(),
     ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::F32, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     plan.execute(&ExecContext::ambient(), &mut dest, &inputs)
         .unwrap();
@@ -117,12 +90,8 @@ fn erased_fused_plan_executes_c32_unary_conjugate() {
     let mut dst = [Complex32::new(0.0, 0.0); 2];
 
     let plan = ErasedFusedPlan::compile(KernelDType::C32, unary_plan(FusedOp::Conj)).unwrap();
-    let inputs = [
-        ErasedRawStridedRef::new(KernelDType::C32, as_bytes(&input), &dims, &strides, 0).unwrap(),
-    ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::C32, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let inputs = [ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap()];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &inputs)
         .unwrap();
@@ -140,12 +109,10 @@ fn erased_fused_plan_executes_c64_binary_multiply() {
 
     let plan = ErasedFusedPlan::compile(KernelDType::C64, binary_plan(FusedOp::Multiply)).unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::C64, as_bytes(&a), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::C64, as_bytes(&b), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &strides, 0).unwrap(),
     ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::C64, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     plan.execute(&ExecContext::max_threads(1).unwrap(), &mut dest, &inputs)
         .unwrap();
@@ -186,14 +153,12 @@ fn erased_fused_plan_executes_f64_four_input_dag() {
     )
     .unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&b), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&c), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&d), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&c, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&d, &dims, &strides, 0).unwrap(),
     ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &inputs)
         .unwrap();
@@ -250,14 +215,12 @@ fn erased_fused_plan_executes_i32_safe_integer_dag() {
     )
     .unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&x), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&y), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&lo), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&hi), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&x, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&y, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&lo, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&hi, &dims, &strides, 0).unwrap(),
     ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::I32, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &inputs)
         .unwrap();
@@ -276,17 +239,10 @@ fn erased_fused_plan_executes_i64_binary_add_transposed_layout() {
 
     let plan = ErasedFusedPlan::compile(KernelDType::I64, binary_plan(FusedOp::Add)).unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&a), &dims, &src_strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&b), &dims, &src_strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &dims, &src_strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &src_strides, 0).unwrap(),
     ];
-    let mut dest = ErasedRawStridedMut::new(
-        KernelDType::I64,
-        as_bytes_mut(&mut dst),
-        &dims,
-        &dst_strides,
-        0,
-    )
-    .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &inputs)
         .unwrap();
@@ -302,19 +258,8 @@ fn erased_fused_plan_executes_bool_identity_conj() {
     let mut dst = [false; 3];
 
     let plan = ErasedFusedPlan::compile(KernelDType::Bool, unary_plan(FusedOp::Conj)).unwrap();
-    let inputs =
-        [
-            ErasedRawStridedRef::new(KernelDType::Bool, as_bytes(&input), &dims, &strides, 0)
-                .unwrap(),
-        ];
-    let mut dest = ErasedRawStridedMut::new(
-        KernelDType::Bool,
-        as_bytes_mut(&mut dst),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let inputs = [ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap()];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &inputs)
         .unwrap();
@@ -332,12 +277,10 @@ fn erased_fused_plan_rejects_dtype_mismatch_before_writing() {
 
     let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&b), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &strides, 0).unwrap(),
     ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::F32, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
         .execute(&ExecContext::serial(), &mut dest, &inputs)
@@ -355,11 +298,8 @@ fn erased_fused_plan_rejects_input_count_mismatch_before_writing() {
     let mut dst = [9.0f64, 10.0];
 
     let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
-    let inputs =
-        [ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &dims, &strides, 0).unwrap()];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let inputs = [ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap()];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
         .execute(&ExecContext::serial(), &mut dest, &inputs)
@@ -379,12 +319,10 @@ fn erased_fused_plan_rejects_input_dtype_mismatch_before_writing() {
 
     let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F32, as_bytes(&b), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &strides, 0).unwrap(),
     ];
-    let mut dest =
-        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut dst), &dims, &strides, 0)
-            .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
         .execute(&ExecContext::serial(), &mut dest, &inputs)
@@ -405,17 +343,10 @@ fn erased_fused_plan_rejects_runtime_shape_mismatch_before_writing() {
 
     let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Add)).unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&a), &input_dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&b), &input_dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&a, &input_dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &input_dims, &strides, 0).unwrap(),
     ];
-    let mut dest = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        as_bytes_mut(&mut dst),
-        &dest_dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dest_dims, &strides, 0).unwrap();
 
     let err = plan
         .execute(&ExecContext::serial(), &mut dest, &inputs)

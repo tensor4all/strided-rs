@@ -9,11 +9,7 @@
 //! descriptors used by one replay call, and validate ABI dtype tags before
 //! constructing these Rust descriptors.
 //!
-//! The safe Rust descriptor constructors validate dtype byte layout up front.
-//! Mutable erased descriptors only re-scan value-constrained dtypes, currently
-//! `bool`, after their raw bytes have escaped through `data_mut`.
-
-use core::{mem::MaybeUninit, ops::Add};
+use core::ops::Add;
 
 use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
@@ -22,8 +18,9 @@ use crate::{
     fused_elementwise_into, ConcatenatePlan, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
     ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
     ExecContext, FusedPlan, FusedScalar, GatherIndex, GatherPlan, GatherSpec, Identity,
-    KernelDType, PadPlan, RawStridedMut, RawStridedRef, Result, ReversePlan, ScatterPlan,
-    ScatterSpec, SlicePlan, StridedError, StridedView, StridedViewMut, RAW_FUSED_RANK_LIMIT,
+    KernelDType, KernelStorageElement, PadPlan, RawStridedMut, RawStridedRef, Result, ReversePlan,
+    ScatterPlan, ScatterSpec, SlicePlan, StridedError, StridedView, StridedViewMut,
+    RAW_FUSED_RANK_LIMIT,
 };
 
 const ERASED_FUSED_INPUT_LIMIT: usize = 4;
@@ -99,7 +96,6 @@ pub fn erased_map_into(
     check_dtype(input_dtype, input.dtype())?;
     check_dtype(map_output_dtype(input_dtype, op)?, dest.dtype())?;
     validate_no_overlap(dest, input, 0)?;
-    dest.validate_data_if_needed()?;
     let input = validated_input_ref(input)?;
 
     let result = ctx.run(|| match (input_dtype, op) {
@@ -120,12 +116,6 @@ pub fn erased_map_into(
             dtype: input_dtype.label(),
         }),
     });
-    if result.is_ok() {
-        // SAFETY: the scalar map writes valid values of the descriptor dtype.
-        unsafe {
-            dest.assume_data_valid();
-        }
-    }
     result
 }
 
@@ -153,7 +143,6 @@ pub fn erased_zip_into(
     check_dtype(dtype, rhs.dtype())?;
     validate_no_overlap(dest, lhs, 0)?;
     validate_no_overlap(dest, rhs, 1)?;
-    dest.validate_data_if_needed()?;
     let lhs = validated_input_ref(lhs)?;
     let rhs = validated_input_ref(rhs)?;
 
@@ -169,12 +158,6 @@ pub fn erased_zip_into(
             dtype: dtype.label(),
         }),
     });
-    if result.is_ok() {
-        // SAFETY: the scalar zip writes valid values of the descriptor dtype.
-        unsafe {
-            dest.assume_data_valid();
-        }
-    }
     result
 }
 
@@ -241,7 +224,6 @@ impl ErasedCopyPlan {
     ) -> Result<()> {
         self.check_dtype(dest.dtype())?;
         self.check_dtype(src.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_copy::<f32>(&self.plan, dest, src),
@@ -255,13 +237,6 @@ impl ErasedCopyPlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: `execute_copy` only writes values produced from the
-            // already-validated source descriptor for the same dtype.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 
@@ -323,7 +298,6 @@ impl ErasedSlicePlan {
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_slice::<f32>(&self.plan, dest, operand),
@@ -337,13 +311,6 @@ impl ErasedSlicePlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: static slice writes values read from a descriptor with
-            // the same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 
@@ -409,7 +376,6 @@ impl ErasedReversePlan {
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_reverse::<f32>(&self.plan, dest, operand),
@@ -423,13 +389,6 @@ impl ErasedReversePlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: reverse writes values read from a descriptor with the
-            // same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 
@@ -509,7 +468,6 @@ impl ErasedPadPlan {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         validate_scalar_bytes(self.dtype, fill)?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_pad::<f32>(&self.plan, dest, operand, fill),
@@ -523,13 +481,6 @@ impl ErasedPadPlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: pad writes either the validated fill scalar or values
-            // read from a descriptor with the same validated dtype.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 
@@ -606,7 +557,6 @@ impl ErasedConcatenatePlan {
         for input in inputs {
             check_dtype(self.dtype, input.dtype())?;
         }
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs),
@@ -620,13 +570,6 @@ impl ErasedConcatenatePlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: concatenate writes values read from descriptors with
-            // the same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 
@@ -644,9 +587,13 @@ impl ErasedConcatenatePlan {
                 self.plan.input_count(),
             ));
         }
-        for (position, input) in inputs.iter().enumerate() {
+        for input in inputs {
             check_dtype(self.dtype, input.dtype())?;
+        }
+        for (position, input) in inputs.iter().enumerate() {
             validate_uninit_no_overlap(dest, input, position)?;
+        }
+        for input in inputs {
             validated_input_ref(input)?;
         }
 
@@ -834,7 +781,6 @@ impl ErasedFusedPlan {
         for input in inputs {
             check_dtype(self.dtype, input.dtype())?;
         }
-        dest.validate_data_if_needed()?;
 
         let result = match self.dtype {
             KernelDType::F32 => execute_fused::<f32>(&self.plan, ctx, dest, inputs),
@@ -848,13 +794,6 @@ impl ErasedFusedPlan {
                 dtype: self.dtype.label(),
             }),
         };
-        if result.is_ok() {
-            // SAFETY: supported fused elementwise dtypes have no extra byte
-            // validity invariant beyond the typed values written by the kernel.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 
@@ -1088,7 +1027,6 @@ impl ErasedReducePlan {
                 }
             }
         }
-        dest.validate_data_if_needed()?;
 
         let result = match self.dtype {
             KernelDType::F32 => dispatch_reduce::<f32>(self.op, &self.layout, ctx, dest, src),
@@ -1101,13 +1039,6 @@ impl ErasedReducePlan {
                 dtype: self.dtype.label(),
             }),
         };
-        if result.is_ok() {
-            // SAFETY: supported reduction dtypes have no extra byte validity
-            // invariant beyond the typed scalar written by the kernel.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 }
@@ -1169,7 +1100,6 @@ impl ErasedGatherPlan {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.index_dtype, start_indices.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_gather_index::<f32>(
@@ -1225,13 +1155,6 @@ impl ErasedGatherPlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: gather writes values read from a descriptor with the
-            // same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 }
@@ -1293,7 +1216,6 @@ impl ErasedDynamicSlicePlan {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.index_dtype, starts.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_dynamic_slice_index::<f32>(
@@ -1349,13 +1271,6 @@ impl ErasedDynamicSlicePlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: dynamic slice writes values read from a descriptor with
-            // the same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 }
@@ -1421,7 +1336,6 @@ impl ErasedDynamicUpdateSlicePlan {
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.dtype, update.dtype())?;
         check_dtype(self.index_dtype, starts.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_dynamic_update_slice_index::<f32>(
@@ -1484,13 +1398,6 @@ impl ErasedDynamicUpdateSlicePlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: dynamic-update-slice writes either values copied from
-            // `operand` or values read from `update`, both with matching dtype.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 }
@@ -1558,7 +1465,6 @@ impl ErasedScatterPlan {
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.dtype, updates.dtype())?;
         check_dtype(self.index_dtype, scatter_indices.dtype())?;
-        dest.validate_data_if_needed()?;
 
         let result = ctx.run(|| match self.dtype {
             KernelDType::F32 => dispatch_scatter_index::<f32>(
@@ -1613,13 +1519,6 @@ impl ErasedScatterPlan {
                 dtype: self.dtype.label(),
             }),
         });
-        if result.is_ok() {
-            // SAFETY: additive scatter copies or adds values with matching,
-            // already-validated dtypes.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
         result
     }
 }
@@ -1645,10 +1544,10 @@ fn execute_one_shot_map<T: OneShotScalar>(
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    let input = erased_raw_ref::<T>(input);
+    let input = erased_raw_ref::<T>(input)?;
 
     crate::map_view::map_raw_into_validated::<T, T, Identity>(
         &mut dest,
@@ -1664,8 +1563,8 @@ fn execute_one_shot_map_with<D, A>(
     map: impl Fn(A) -> D + crate::MaybeSync,
 ) -> Result<()>
 where
-    D: Copy + crate::MaybeSendSync,
-    A: Copy + crate::MaybeSendSync,
+    D: Copy + crate::MaybeSendSync + KernelStorageElement,
+    A: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     let validated =
         crate::map_view::validate_destination_layout_without_alloc(dest.dims(), dest.strides())?;
@@ -1676,10 +1575,10 @@ where
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<D>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<D>()?;
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    let input = erased_raw_ref::<A>(input);
+    let input = erased_raw_ref::<A>(input)?;
     crate::map_view::map_raw_into_validated::<D, A, Identity>(&mut dest, &input, map, validated)
 }
 
@@ -1703,8 +1602,8 @@ fn execute_one_shot_zip<T: OneShotScalar>(
         return Ok(());
     }
 
-    let lhs = erased_raw_ref::<T>(lhs);
-    let rhs = erased_raw_ref::<T>(rhs);
+    let lhs = erased_raw_ref::<T>(lhs)?;
+    let rhs = erased_raw_ref::<T>(rhs)?;
     if matches!(op, ErasedZipOp::Divide | ErasedZipOp::Remainder)
         && T::INTEGER
         && raw_any(&rhs, T::is_zero)?
@@ -1714,7 +1613,7 @@ fn execute_one_shot_zip<T: OneShotScalar>(
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     crate::map_view::zip_map2_raw_into_validated::<T, T, T, Identity, Identity>(
@@ -1731,15 +1630,7 @@ fn validate_no_overlap(
     input: &ErasedRawStridedPtr<'_>,
     input_index: usize,
 ) -> Result<()> {
-    let dest_start = dest.data().as_ptr() as usize;
-    let input_start = input.data_ptr() as usize;
-    let Some(dest_end) = dest_start.checked_add(dest.data().len()) else {
-        return Err(StridedError::OffsetOverflow);
-    };
-    let Some(input_end) = input_start.checked_add(input.byte_len()) else {
-        return Err(StridedError::OffsetOverflow);
-    };
-    if dest_start < input_end && input_start < dest_end {
+    if input.overlaps_mut(dest)? {
         Err(StridedError::OverlappingInputOutput { input: input_index })
     } else {
         Ok(())
@@ -1751,22 +1642,14 @@ fn validate_uninit_no_overlap(
     input: &ErasedRawStridedPtr<'_>,
     input_index: usize,
 ) -> Result<()> {
-    let dest_start = dest.data_ptr() as usize;
-    let input_start = input.data_ptr() as usize;
-    let Some(dest_end) = dest_start.checked_add(dest.byte_len()) else {
-        return Err(StridedError::OffsetOverflow);
-    };
-    let Some(input_end) = input_start.checked_add(input.byte_len()) else {
-        return Err(StridedError::OffsetOverflow);
-    };
-    if dest_start < input_end && input_start < dest_end {
+    if input.overlaps_uninit_mut(dest)? {
         Err(StridedError::OverlappingInputOutput { input: input_index })
     } else {
         Ok(())
     }
 }
 
-trait OneShotScalar: Copy + crate::MaybeSendSync + 'static {
+trait OneShotScalar: Copy + crate::MaybeSendSync + KernelStorageElement + 'static {
     const INTEGER: bool = false;
     fn is_zero(_value: Self) -> bool {
         false
@@ -1970,22 +1853,16 @@ impl OneShotScalar for bool {
     }
 }
 
-fn erased_raw_ref<'a, T>(src: &ErasedRawStridedRef<'a>) -> RawStridedRef<'a, T> {
-    let data = typed_slice::<T>(src.data());
-    unsafe { RawStridedRef::new_unchecked(data, src.dims(), src.strides(), src.offset()) }
+fn erased_raw_ref<'a, T: KernelStorageElement>(
+    src: &'a ErasedRawStridedRef<'a>,
+) -> Result<RawStridedRef<'a, T>> {
+    let data = src.data_as::<T>()?;
+    Ok(unsafe { RawStridedRef::new_unchecked(data, src.dims(), src.strides(), src.offset()) })
 }
 
-fn validated_input_ref<'a>(input: &ErasedRawStridedPtr<'a>) -> Result<ErasedRawStridedRef<'a>> {
-    // SAFETY: the pointer descriptor promises readable, dtype-valid storage,
-    // and the caller has already ruled out overlap with the mutable output.
-    let data = unsafe { input.data_unchecked() };
-    ErasedRawStridedRef::new(
-        input.dtype(),
-        data,
-        input.dims(),
-        input.strides(),
-        input.offset(),
-    )
+fn validated_input_ref<'a>(input: &'a ErasedRawStridedPtr<'a>) -> Result<ErasedRawStridedRef<'a>> {
+    // SAFETY: callers reject overlap before this conversion.
+    unsafe { input.try_as_ref_after_no_overlap() }
 }
 
 fn map_output_dtype(dtype: KernelDType, op: ErasedMapOp) -> Result<KernelDType> {
@@ -2194,13 +2071,13 @@ fn execute_copy<T>(
     src: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
-    let source_data = typed_slice::<T>(src.data());
+    let source_data = src.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let source = unsafe {
         RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
     };
@@ -2215,13 +2092,13 @@ fn execute_slice<T>(
     operand: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2241,13 +2118,13 @@ fn execute_slice_uninit<T>(
     operand: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2267,13 +2144,13 @@ fn execute_reverse<T>(
     operand: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2293,13 +2170,13 @@ fn execute_reverse_uninit<T>(
     operand: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2320,14 +2197,14 @@ fn execute_pad<T>(
     fill: &[u8],
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     let fill = read_unaligned_scalar::<T>(fill);
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2348,14 +2225,14 @@ fn execute_pad_uninit<T>(
     fill: &[u8],
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     let fill = read_unaligned_scalar::<T>(fill);
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2375,7 +2252,7 @@ fn execute_concatenate<T>(
     inputs: &[ErasedRawStridedRef<'_>],
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     if inputs.len() != plan.input_count() {
         return Err(StridedError::RankMismatch(inputs.len(), plan.input_count()));
@@ -2383,13 +2260,13 @@ where
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.check_dest_layout(&dest_ref)?;
 
     for (position, input) in inputs.iter().enumerate() {
-        let input_data = typed_slice::<T>(input.data());
+        let input_data = input.data_as::<T>()?;
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
@@ -2397,7 +2274,7 @@ where
         plan.segment_offset(position, dest_offset)?;
     }
     for (position, input) in inputs.iter().enumerate() {
-        let input_data = typed_slice::<T>(input.data());
+        let input_data = input.data_as::<T>()?;
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
@@ -2412,19 +2289,19 @@ fn execute_concatenate_uninit<T>(
     inputs: &[ErasedRawStridedPtr<'_>],
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     plan.check_dest_layout(&dest_ref)?;
 
     for (position, input) in inputs.iter().enumerate() {
         let input = validated_input_ref(input)?;
-        let input_data = typed_slice::<T>(input.data());
+        let input_data = input.data_as::<T>()?;
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
@@ -2433,7 +2310,7 @@ where
     }
     for (position, input) in inputs.iter().enumerate() {
         let input = validated_input_ref(input)?;
-        let input_data = typed_slice::<T>(input.data());
+        let input_data = input.data_as::<T>()?;
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
@@ -2459,7 +2336,7 @@ where
         if let Some(value) = reduce_contiguous_serial(op, src) {
             value
         } else {
-            let source = erased_view::<T>(src);
+            let source = erased_view::<T>(src)?;
             crate::reduce_view::reduce_serial(
                 &source,
                 |value| reduce_map_value(op, value),
@@ -2468,7 +2345,7 @@ where
             )?
         }
     } else {
-        let source = erased_view::<T>(src);
+        let source = erased_view::<T>(src)?;
         ctx.run(|| {
             crate::reduce(
                 &source,
@@ -2480,7 +2357,7 @@ where
     };
 
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     unsafe {
         *dest_data.as_mut_ptr().offset(dest_offset) = value;
     }
@@ -2497,7 +2374,7 @@ where
         return Some(reduce_identity(op));
     }
 
-    let source_data = typed_slice::<T>(src.data());
+    let source_data = src.data_as::<T>().ok()?;
     let start = usize::try_from(src.offset()).ok()?;
     let end = start.checked_add(len)?;
     let values = source_data.get(start..end)?;
@@ -2627,9 +2504,9 @@ fn execute_reduce_axes_policy<T>(
 where
     T: ErasedReduceScalar,
 {
-    let source_data = typed_slice::<T>(src.data());
+    let source_data = src.data_as::<T>()?;
     let dest_offset_base = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     #[cfg(feature = "parallel")]
     {
         let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
@@ -2665,9 +2542,9 @@ fn execute_reduce_axes_serial<T>(
 where
     T: ErasedReduceScalar,
 {
-    let source_data = typed_slice::<T>(src.data());
+    let source_data = src.data_as::<T>()?;
     let dest_offset_base = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     execute_reduce_axes_serial_data(
         op,
         dest_offset_base,
@@ -2824,7 +2701,8 @@ where
 }
 
 trait ErasedReduceScalar:
-    Copy
+    KernelStorageElement
+    + Copy
     + One
     + Zero
     + crate::MaybeSendSync
@@ -2962,41 +2840,41 @@ fn execute_fused<T>(
     inputs: &[ErasedRawStridedRef<'_>],
 ) -> Result<()>
 where
-    T: FusedScalar,
+    T: FusedScalar + KernelStorageElement,
 {
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let dest_view =
         unsafe { StridedViewMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
 
     match inputs {
         [a] => {
-            let input_views = [erased_view::<T>(a)];
+            let input_views = [erased_view::<T>(a)?];
             let mut dests = [dest_view];
             execute_fused_views(ctx, &mut dests, &input_views, plan)
         }
         [a, b] => {
-            let input_views = [erased_view::<T>(a), erased_view::<T>(b)];
+            let input_views = [erased_view::<T>(a)?, erased_view::<T>(b)?];
             let mut dests = [dest_view];
             execute_fused_views(ctx, &mut dests, &input_views, plan)
         }
         [a, b, c] => {
             let input_views = [
-                erased_view::<T>(a),
-                erased_view::<T>(b),
-                erased_view::<T>(c),
+                erased_view::<T>(a)?,
+                erased_view::<T>(b)?,
+                erased_view::<T>(c)?,
             ];
             let mut dests = [dest_view];
             execute_fused_views(ctx, &mut dests, &input_views, plan)
         }
         [a, b, c, d] => {
             let input_views = [
-                erased_view::<T>(a),
-                erased_view::<T>(b),
-                erased_view::<T>(c),
-                erased_view::<T>(d),
+                erased_view::<T>(a)?,
+                erased_view::<T>(b)?,
+                erased_view::<T>(c)?,
+                erased_view::<T>(d)?,
             ];
             let mut dests = [dest_view];
             execute_fused_views(ctx, &mut dests, &input_views, plan)
@@ -3016,16 +2894,16 @@ fn execute_fused_uninit<T>(
     validated: crate::map_view::ValidatedDestinationLayout,
 ) -> Result<()>
 where
-    T: FusedScalar,
+    T: FusedScalar + KernelStorageElement,
 {
     let dims = dest.dims();
     let strides = dest.strides();
     let offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let mut dest_view = unsafe { StridedViewMut::new_unchecked(dest_data, dims, strides, offset) };
     match inputs {
         [a] => {
-            let input_views = [erased_view::<T>(a)];
+            let input_views = [erased_view::<T>(a)?];
             crate::fused::fused_elementwise_into_uninit(
                 &mut dest_view,
                 &input_views,
@@ -3035,7 +2913,7 @@ where
             )
         }
         [a, b] => {
-            let input_views = [erased_view::<T>(a), erased_view::<T>(b)];
+            let input_views = [erased_view::<T>(a)?, erased_view::<T>(b)?];
             crate::fused::fused_elementwise_into_uninit(
                 &mut dest_view,
                 &input_views,
@@ -3046,9 +2924,9 @@ where
         }
         [a, b, c] => {
             let input_views = [
-                erased_view::<T>(a),
-                erased_view::<T>(b),
-                erased_view::<T>(c),
+                erased_view::<T>(a)?,
+                erased_view::<T>(b)?,
+                erased_view::<T>(c)?,
             ];
             crate::fused::fused_elementwise_into_uninit(
                 &mut dest_view,
@@ -3060,10 +2938,10 @@ where
         }
         [a, b, c, d] => {
             let input_views = [
-                erased_view::<T>(a),
-                erased_view::<T>(b),
-                erased_view::<T>(c),
-                erased_view::<T>(d),
+                erased_view::<T>(a)?,
+                erased_view::<T>(b)?,
+                erased_view::<T>(c)?,
+                erased_view::<T>(d)?,
             ];
             crate::fused::fused_elementwise_into_uninit(
                 &mut dest_view,
@@ -3088,7 +2966,7 @@ fn execute_fused_uninit_ptrs<T>(
     validated: crate::map_view::ValidatedDestinationLayout,
 ) -> Result<()>
 where
-    T: FusedScalar,
+    T: FusedScalar + KernelStorageElement,
 {
     match inputs {
         [a] => {
@@ -3131,7 +3009,7 @@ fn dispatch_gather_index<T>(
     start_indices: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => execute_gather::<T, i32>(plan, dest, operand, start_indices),
@@ -3149,15 +3027,15 @@ fn execute_gather<T, I>(
     start_indices: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let index_data = typed_slice::<I>(start_indices.data());
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = start_indices.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -3187,7 +3065,7 @@ fn dispatch_dynamic_slice_index<T>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => execute_dynamic_slice::<T, i32>(plan, dest, operand, starts),
@@ -3205,15 +3083,15 @@ fn execute_dynamic_slice<T, I>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let start_data = typed_slice::<I>(starts.data());
+    let operand_data = operand.data_as::<T>()?;
+    let start_data = starts.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -3239,7 +3117,7 @@ fn dispatch_dynamic_update_slice_index<T>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
@@ -3262,16 +3140,16 @@ fn execute_dynamic_update_slice<T, I>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let update_data = typed_slice::<T>(update.data());
-    let start_data = typed_slice::<I>(starts.data());
+    let operand_data = operand.data_as::<T>()?;
+    let update_data = update.data_as::<T>()?;
+    let start_data = starts.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -3305,7 +3183,7 @@ fn dispatch_scatter_index<T>(
     updates: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + crate::MaybeSendSync,
+    T: Copy + Add<Output = T> + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
@@ -3328,16 +3206,16 @@ fn execute_scatter<T, I>(
     updates: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + Add<Output = T> + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let index_data = typed_slice::<I>(scatter_indices.data());
-    let update_data = typed_slice::<T>(updates.data());
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = scatter_indices.data_as::<I>()?;
+    let update_data = updates.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -3374,7 +3252,7 @@ fn execute_fused_views<T>(
     plan: &FusedPlan,
 ) -> Result<()>
 where
-    T: FusedScalar,
+    T: FusedScalar + KernelStorageElement,
 {
     if ctx.is_serial() {
         crate::fused::fused_elementwise_into_serial(dests, inputs, plan)
@@ -3383,47 +3261,11 @@ where
     }
 }
 
-fn erased_view<'a, T>(src: &ErasedRawStridedRef<'a>) -> StridedView<'a, T> {
-    let data = typed_slice::<T>(src.data());
-    unsafe { StridedView::new_unchecked(data, src.dims(), src.strides(), src.offset()) }
-}
-
-fn typed_slice<T>(bytes: &[u8]) -> &[T] {
-    if bytes.is_empty() {
-        return &[];
-    }
-    unsafe {
-        core::slice::from_raw_parts(
-            bytes.as_ptr().cast::<T>(),
-            bytes.len() / core::mem::size_of::<T>(),
-        )
-    }
-}
-
-fn typed_slice_mut<T>(bytes: &mut [u8]) -> &mut [T] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            if bytes.is_empty() {
-                core::ptr::NonNull::<T>::dangling().as_ptr()
-            } else {
-                bytes.as_mut_ptr().cast::<T>()
-            },
-            bytes.len() / core::mem::size_of::<T>(),
-        )
-    }
-}
-
-fn typed_uninit_slice_mut<T>(bytes: &mut [MaybeUninit<u8>]) -> &mut [MaybeUninit<T>] {
-    if bytes.is_empty() {
-        return unsafe {
-            core::slice::from_raw_parts_mut(
-                core::ptr::NonNull::<MaybeUninit<T>>::dangling().as_ptr(),
-                0,
-            )
-        };
-    }
-    let len = bytes.len() / core::mem::size_of::<T>();
-    unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<MaybeUninit<T>>(), len) }
+fn erased_view<'a, T: KernelStorageElement>(
+    src: &'a ErasedRawStridedRef<'a>,
+) -> Result<StridedView<'a, T>> {
+    let data = src.data_as::<T>()?;
+    Ok(unsafe { StridedView::new_unchecked(data, src.dims(), src.strides(), src.offset()) })
 }
 
 fn read_unaligned_scalar<T>(bytes: &[u8]) -> T
