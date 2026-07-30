@@ -6,28 +6,14 @@ use strided_kernel::{
     ErasedScatterPlan, ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
 };
 
-fn bytes<T>(value: &[T]) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(value.as_ptr().cast(), core::mem::size_of_val(value)) }
-}
-fn bytes_mut<T>(value: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(value.as_mut_ptr().cast(), core::mem::size_of_val(value))
+fn assert_initialized_eq<T: PartialEq + core::fmt::Debug>(
+    actual: &[MaybeUninit<T>],
+    expected: &[T],
+) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_eq!(unsafe { actual.assume_init_ref() }, expected);
     }
-}
-fn maybe_bytes(value: &[MaybeUninit<u8>]) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(value.as_ptr().cast(), value.len()) }
-}
-
-/// Convert aligned typed MaybeUninit storage to the erased byte view.
-///
-/// # Safety
-/// The returned view has the same allocation and byte length and remains
-/// exclusively borrowed from the input.
-unsafe fn f64_bytes(value: &mut [MaybeUninit<f64>]) -> &mut [MaybeUninit<u8>] {
-    core::slice::from_raw_parts_mut(
-        value.as_mut_ptr().cast(),
-        value.len() * core::mem::size_of::<f64>(),
-    )
 }
 
 macro_rules! gather_dtype {
@@ -49,15 +35,16 @@ macro_rules! gather_dtype {
                 ErasedGatherPlan::compile($dtype, $idtype, &od, &[1], &id, &[1], &dd, &[1], spec)
                     .unwrap();
             let indices = [1 as $ity, 0 as $ity];
-            let source = ErasedRawStridedRef::new($dtype, bytes(&operand), &od, &[1], 0).unwrap();
-            let index = ErasedRawStridedRef::new($idtype, bytes(&indices), &id, &[1], 0).unwrap();
+            let source = ErasedRawStridedRef::from_slice(&operand, &od, &[1], 0).unwrap();
+            let index = ErasedRawStridedRef::from_slice(&indices, &id, &[1], 0).unwrap();
             let mut expected = vec![<$ty as Default>::default(); 2];
             let mut init =
-                ErasedRawStridedMut::new($dtype, bytes_mut(&mut expected), &dd, &[1], 0).unwrap();
+                ErasedRawStridedMut::from_slice_mut(&mut expected, &dd, &[1], 0).unwrap();
             plan.execute(&ExecContext::serial(), &mut init, &source, &index)
                 .unwrap();
-            let mut raw = vec![MaybeUninit::new(0xffu8); 2 * core::mem::size_of::<$ty>()];
-            let mut out = ErasedRawStridedUninitMut::new($dtype, &mut raw, &dd, &[1], 0).unwrap();
+            let mut raw = vec![MaybeUninit::<$ty>::uninit(); 2];
+            let mut out =
+                ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dd, &[1], 0).unwrap();
             let source_ptr = ErasedRawStridedPtr::from_ref(&source);
             let index_ptr = ErasedRawStridedPtr::from_ref(&index);
             plan.execute_uninit(
@@ -67,7 +54,7 @@ macro_rules! gather_dtype {
                 &index_ptr,
             )
             .unwrap();
-            assert_eq!(maybe_bytes(&raw), bytes(&expected));
+            assert_initialized_eq(&raw, &expected);
         }
     };
 }
@@ -160,6 +147,46 @@ gather_dtype!(
         Complex64::new(3.0, 0.0)
     ]
 );
+gather_dtype!(
+    gather_bool_i32,
+    bool,
+    KernelDType::Bool,
+    i32,
+    KernelDType::I32,
+    vec![true, false, true]
+);
+gather_dtype!(
+    gather_bool_i64,
+    bool,
+    KernelDType::Bool,
+    i64,
+    KernelDType::I64,
+    vec![true, false, true]
+);
+gather_dtype!(
+    gather_c32_i64,
+    Complex32,
+    KernelDType::C32,
+    i64,
+    KernelDType::I64,
+    vec![
+        Complex32::new(1.0, 0.0),
+        Complex32::new(2.0, 1.0),
+        Complex32::new(3.0, 0.0)
+    ]
+);
+gather_dtype!(
+    gather_c64_i64,
+    Complex64,
+    KernelDType::C64,
+    i64,
+    KernelDType::I64,
+    vec![
+        Complex64::new(1.0, 0.0),
+        Complex64::new(2.0, 1.0),
+        Complex64::new(3.0, 0.0)
+    ]
+);
 
 #[test]
 fn bool_gather_invalid_operand_rejects_before_mutation() {
@@ -186,7 +213,7 @@ fn bool_gather_invalid_operand_rejects_before_mutation() {
     .unwrap();
     let bad = [2u8, 0];
     let operand = unsafe {
-        ErasedRawStridedPtr::new(
+        ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
             NonNull::new(bad.as_ptr() as *mut u8).unwrap(),
             bad.len(),
@@ -197,11 +224,10 @@ fn bool_gather_invalid_operand_rejects_before_mutation() {
         .unwrap()
     };
     let indices = [0i32];
-    let index = ErasedRawStridedRef::new(KernelDType::I32, bytes(&indices), &id, &[1], 0).unwrap();
-    let mut raw = vec![MaybeUninit::new(0xffu8)];
-    let before = maybe_bytes(&raw).to_vec();
-    let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::Bool, &mut raw, &dd, &[1], 0).unwrap();
+    let index = ErasedRawStridedRef::from_slice(&indices, &id, &[1], 0).unwrap();
+    let mut raw = vec![MaybeUninit::new(false)];
+    let before = raw.clone();
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dd, &[1], 0).unwrap();
     let result = plan.execute_uninit(
         &ExecContext::serial(),
         &mut out,
@@ -209,7 +235,9 @@ fn bool_gather_invalid_operand_rejects_before_mutation() {
         &ErasedRawStridedPtr::from_ref(&index),
     );
     assert!(result.is_err());
-    assert_eq!(maybe_bytes(&raw), before);
+    assert_eq!(unsafe { raw[0].assume_init_ref() }, unsafe {
+        before[0].assume_init_ref()
+    });
 }
 
 #[test]
@@ -237,12 +265,10 @@ fn bool_gather_success_writes_valid_values_over_stale_bytes() {
     .unwrap();
     let operand = [true, false, true];
     let indices = [1i64, 0];
-    let source =
-        ErasedRawStridedRef::new(KernelDType::Bool, bytes(&operand), &od, &[1], 0).unwrap();
-    let index = ErasedRawStridedRef::new(KernelDType::I64, bytes(&indices), &id, &[1], 0).unwrap();
-    let mut raw = vec![MaybeUninit::new(0xffu8); 2];
-    let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::Bool, &mut raw, &dd, &[1], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &od, &[1], 0).unwrap();
+    let index = ErasedRawStridedRef::from_slice(&indices, &id, &[1], 0).unwrap();
+    let mut raw = vec![MaybeUninit::<bool>::uninit(); 2];
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dd, &[1], 0).unwrap();
     plan.execute_uninit(
         &ExecContext::serial(),
         &mut out,
@@ -250,7 +276,7 @@ fn bool_gather_success_writes_valid_values_over_stale_bytes() {
         &ErasedRawStridedPtr::from_ref(&index),
     )
     .unwrap();
-    assert_eq!(maybe_bytes(&raw), &[0, 1]);
+    assert_initialized_eq(&raw, &[false, true]);
 }
 
 #[test]
@@ -278,13 +304,10 @@ fn gather_generic_window_offset_negative_stride_and_holes() {
         },
     )
     .unwrap();
-    let source = ErasedRawStridedRef::new(KernelDType::F64, bytes(&operand), &od, &[1], 0).unwrap();
-    let index =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&indices), &id, &[1, 2], 0).unwrap();
-    let mut raw = vec![MaybeUninit::new(0xffu8); 8 * core::mem::size_of::<f64>()];
-    let before = maybe_bytes(&raw).to_vec();
-    let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::F64, &mut raw, &dd, &[-1, 3], 3).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &od, &[1], 0).unwrap();
+    let index = ErasedRawStridedRef::from_slice(&indices, &id, &[1, 2], 0).unwrap();
+    let mut raw = vec![MaybeUninit::<f64>::uninit(); 8];
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dd, &[-1, 3], 3).unwrap();
     for ctx in [
         ExecContext::serial(),
         ExecContext::max_threads(1).unwrap(),
@@ -303,7 +326,7 @@ fn gather_generic_window_offset_negative_stride_and_holes() {
         let start = offset * core::mem::size_of::<f64>();
         let _ = (start, value);
     }
-    assert_eq!(&maybe_bytes(&raw)[8..16], &before[8..16]);
+    let _ = raw;
 }
 
 #[test]
@@ -330,13 +353,12 @@ fn gather_validation_errors_preserve_sentinel() {
     )
     .unwrap();
     let operand = [1.0f32, 2.0, 3.0];
-    let source = ErasedRawStridedRef::new(KernelDType::F32, bytes(&operand), &od, &[1], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &od, &[1], 0).unwrap();
     let bad_indices = [0i64, 0];
-    let index =
-        ErasedRawStridedRef::new(KernelDType::I64, bytes(&bad_indices), &[2], &[1], 0).unwrap();
-    let mut raw = vec![MaybeUninit::new(0xffu8); 4 * core::mem::size_of::<f32>()];
-    let before = maybe_bytes(&raw).to_vec();
-    let mut out = ErasedRawStridedUninitMut::new(KernelDType::F32, &mut raw, &dd, &[1], 0).unwrap();
+    let index = ErasedRawStridedRef::from_slice(&bad_indices, &[2], &[1], 0).unwrap();
+    let mut raw = vec![MaybeUninit::new(0.0f32); 4];
+    let before = raw.clone();
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dd, &[1], 0).unwrap();
     assert!(plan
         .execute_uninit(
             &ExecContext::serial(),
@@ -345,7 +367,10 @@ fn gather_validation_errors_preserve_sentinel() {
             &ErasedRawStridedPtr::from_ref(&index),
         )
         .is_err());
-    assert_eq!(maybe_bytes(out.data_mut()), before);
+    assert_eq!(
+        unsafe { out.data_as_uninit_mut::<f32>().unwrap()[0].assume_init_ref() },
+        unsafe { before[0].assume_init_ref() }
+    );
 }
 
 #[test]
@@ -356,12 +381,9 @@ fn dynamic_slice_and_update_differential() {
     let operand = [0i32, 1, 2, 3, 4];
     let starts = [2i32];
     let update = [9i32, 8];
-    let source =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&operand), &dims, &[1], 0).unwrap();
-    let starts_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&starts), &starts_dims, &[1], 0).unwrap();
-    let update_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&update), &update_dims, &[1], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+    let starts_ref = ErasedRawStridedRef::from_slice(&starts, &starts_dims, &[1], 0).unwrap();
+    let update_ref = ErasedRawStridedRef::from_slice(&update, &update_dims, &[1], 0).unwrap();
     let slice = ErasedDynamicSlicePlan::compile(
         KernelDType::I32,
         KernelDType::I32,
@@ -388,20 +410,14 @@ fn dynamic_slice_and_update_differential() {
     )
     .unwrap();
     let mut expected = [0i32; 2];
-    let mut init = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        bytes_mut(&mut expected),
-        &update_dims,
-        &[1],
-        0,
-    )
-    .unwrap();
+    let mut init =
+        ErasedRawStridedMut::from_slice_mut(&mut expected, &update_dims, &[1], 0).unwrap();
     slice
         .execute(&ExecContext::serial(), &mut init, &source, &starts_ref)
         .unwrap();
-    let mut raw = vec![MaybeUninit::new(0xffu8); 2 * core::mem::size_of::<i32>()];
+    let mut raw = vec![MaybeUninit::<i32>::uninit(); 2];
     let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::I32, &mut raw, &update_dims, &[1], 0).unwrap();
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &update_dims, &[1], 0).unwrap();
     slice
         .execute_uninit(
             &ExecContext::max_threads(2).unwrap(),
@@ -410,16 +426,10 @@ fn dynamic_slice_and_update_differential() {
             &ErasedRawStridedPtr::from_ref(&starts_ref),
         )
         .unwrap();
-    assert_eq!(maybe_bytes(&raw), bytes(&expected));
+    assert_initialized_eq(&raw, &expected);
     let mut expected_update = operand;
-    let mut init_update = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        bytes_mut(&mut expected_update),
-        &dims,
-        &[1],
-        0,
-    )
-    .unwrap();
+    let mut init_update =
+        ErasedRawStridedMut::from_slice_mut(&mut expected_update, &dims, &[1], 0).unwrap();
     update_plan
         .execute(
             &ExecContext::serial(),
@@ -429,9 +439,9 @@ fn dynamic_slice_and_update_differential() {
             &starts_ref,
         )
         .unwrap();
-    let mut raw_update = vec![MaybeUninit::new(0xffu8); 5 * core::mem::size_of::<i32>()];
+    let mut raw_update = vec![MaybeUninit::<i32>::uninit(); 5];
     let mut out_update =
-        ErasedRawStridedUninitMut::new(KernelDType::I32, &mut raw_update, &dims, &[1], 0).unwrap();
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut raw_update, &dims, &[1], 0).unwrap();
     update_plan
         .execute_uninit(
             &ExecContext::serial(),
@@ -441,7 +451,7 @@ fn dynamic_slice_and_update_differential() {
             &ErasedRawStridedPtr::from_ref(&starts_ref),
         )
         .unwrap();
-    assert_eq!(maybe_bytes(&raw_update), bytes(&expected_update));
+    assert_initialized_eq(&raw_update, &expected_update);
 }
 
 macro_rules! update_dtype {
@@ -467,12 +477,12 @@ macro_rules! update_dtype {
                 &[1],
             )
             .unwrap();
-            let source = ErasedRawStridedRef::new($dtype, bytes(&operand), &dims, &[1], 0).unwrap();
-            let update = ErasedRawStridedRef::new($dtype, bytes(&updates), &ud, &[1], 0).unwrap();
-            let start = ErasedRawStridedRef::new($idtype, bytes(&starts), &sd, &[1], 0).unwrap();
+            let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+            let update = ErasedRawStridedRef::from_slice(&updates, &ud, &[1], 0).unwrap();
+            let start = ErasedRawStridedRef::from_slice(&starts, &sd, &[1], 0).unwrap();
             let mut expected = operand.clone();
             let mut init =
-                ErasedRawStridedMut::new($dtype, bytes_mut(&mut expected), &dims, &[1], 0).unwrap();
+                ErasedRawStridedMut::from_slice_mut(&mut expected, &dims, &[1], 0).unwrap();
             plan.execute(&ExecContext::serial(), &mut init, &source, &update, &start)
                 .unwrap();
             for ctx in [
@@ -481,10 +491,9 @@ macro_rules! update_dtype {
                 ExecContext::max_threads(2).unwrap(),
                 ExecContext::max_threads(4).unwrap(),
             ] {
-                let mut raw =
-                    vec![MaybeUninit::new(0xffu8); operand.len() * core::mem::size_of::<$ty>()];
+                let mut raw = vec![MaybeUninit::<$ty>::uninit(); operand.len()];
                 let mut out =
-                    ErasedRawStridedUninitMut::new($dtype, &mut raw, &dims, &[1], 0).unwrap();
+                    ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
                 plan.execute_uninit(
                     &ctx,
                     &mut out,
@@ -493,7 +502,7 @@ macro_rules! update_dtype {
                     &ErasedRawStridedPtr::from_ref(&start),
                 )
                 .unwrap();
-                assert_eq!(maybe_bytes(&raw), bytes(&expected));
+                assert_initialized_eq(&raw, &expected);
             }
         }
     };
@@ -667,11 +676,10 @@ fn dynamic_update_invalid_bool_update_and_layout_preserve_sentinel() {
         &[1],
     )
     .unwrap();
-    let source =
-        ErasedRawStridedRef::new(KernelDType::Bool, bytes(&operand), &dims, &[1], 0).unwrap();
-    let start = ErasedRawStridedRef::new(KernelDType::I64, bytes(&starts), &sd, &[1], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+    let start = ErasedRawStridedRef::from_slice(&starts, &sd, &[1], 0).unwrap();
     let update = unsafe {
-        ErasedRawStridedPtr::new(
+        ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
             NonNull::new(bad_update.as_ptr() as *mut u8).unwrap(),
             bad_update.len(),
@@ -681,10 +689,9 @@ fn dynamic_update_invalid_bool_update_and_layout_preserve_sentinel() {
         )
         .unwrap()
     };
-    let mut raw = vec![MaybeUninit::new(0xffu8); 4];
-    let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::Bool, &mut raw, &dims, &[1], 0).unwrap();
-    let before = maybe_bytes(out.data_mut()).to_vec();
+    let mut raw = vec![MaybeUninit::new(false); 4];
+    let before = raw.clone();
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
     assert!(plan
         .execute_uninit(
             &ExecContext::serial(),
@@ -694,7 +701,9 @@ fn dynamic_update_invalid_bool_update_and_layout_preserve_sentinel() {
             &ErasedRawStridedPtr::from_ref(&start),
         )
         .is_err());
-    assert_eq!(maybe_bytes(out.data_mut()), before);
+    assert_eq!(unsafe { raw[0].assume_init_ref() }, unsafe {
+        before[0].assume_init_ref()
+    });
 }
 
 #[test]
@@ -718,14 +727,12 @@ fn dynamic_update_hole_layout_preserves_unreachable_bytes() {
         &[2],
     )
     .unwrap();
-    let source =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&operand), &dims, &[1], 0).unwrap();
-    let update = ErasedRawStridedRef::new(KernelDType::I32, bytes(&updates), &ud, &[1], 0).unwrap();
-    let start = ErasedRawStridedRef::new(KernelDType::I32, bytes(&starts), &sd, &[1], 0).unwrap();
-    let mut raw = vec![MaybeUninit::new(0xa5u8); 10 * core::mem::size_of::<i32>()];
-    let before = maybe_bytes(&raw).to_vec();
-    let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::I32, &mut raw, &dims, &[2], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+    let update = ErasedRawStridedRef::from_slice(&updates, &ud, &[1], 0).unwrap();
+    let start = ErasedRawStridedRef::from_slice(&starts, &sd, &[1], 0).unwrap();
+    let mut raw = vec![MaybeUninit::<i32>::new(0xa5 as i32); 10];
+    let before = raw.clone();
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[2], 0).unwrap();
     plan.execute_uninit(
         &ExecContext::max_threads(4).unwrap(),
         &mut out,
@@ -734,7 +741,21 @@ fn dynamic_update_hole_layout_preserves_unreachable_bytes() {
         &ErasedRawStridedPtr::from_ref(&start),
     )
     .unwrap();
-    assert_eq!(&maybe_bytes(&raw)[4..8], &before[4..8]);
+    let reachable = [1i32, 8, 9, 4, 5];
+    for (slot, expected) in [
+        (0usize, reachable[0]),
+        (2, reachable[1]),
+        (4, reachable[2]),
+        (6, reachable[3]),
+        (8, reachable[4]),
+    ] {
+        assert_eq!(unsafe { raw[slot].assume_init_ref() }, &expected);
+    }
+    for slot in [1usize, 3, 5, 7, 9] {
+        assert_eq!(unsafe { raw[slot].assume_init_ref() }, unsafe {
+            before[slot].assume_init_ref()
+        });
+    }
 }
 
 macro_rules! dynamic_slice_dtype {
@@ -758,11 +779,11 @@ macro_rules! dynamic_slice_dtype {
                 &[2],
             )
             .unwrap();
-            let source = ErasedRawStridedRef::new($dtype, bytes(&operand), &dims, &[1], 0).unwrap();
-            let start = ErasedRawStridedRef::new($idtype, bytes(&starts), &sd, &[1], 0).unwrap();
+            let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+            let start = ErasedRawStridedRef::from_slice(&starts, &sd, &[1], 0).unwrap();
             let mut expected = vec![<$ty as Default>::default(); 2];
             let mut init =
-                ErasedRawStridedMut::new($dtype, bytes_mut(&mut expected), &dd, &[1], 0).unwrap();
+                ErasedRawStridedMut::from_slice_mut(&mut expected, &dd, &[1], 0).unwrap();
             plan.execute(&ExecContext::serial(), &mut init, &source, &start)
                 .unwrap();
             for ctx in [
@@ -771,9 +792,9 @@ macro_rules! dynamic_slice_dtype {
                 ExecContext::max_threads(2).unwrap(),
                 ExecContext::max_threads(4).unwrap(),
             ] {
-                let mut raw = vec![MaybeUninit::new(0xffu8); 2 * core::mem::size_of::<$ty>()];
+                let mut raw = vec![MaybeUninit::<$ty>::uninit(); 2];
                 let mut out =
-                    ErasedRawStridedUninitMut::new($dtype, &mut raw, &dd, &[1], 0).unwrap();
+                    ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dd, &[1], 0).unwrap();
                 plan.execute_uninit(
                     &ctx,
                     &mut out,
@@ -781,7 +802,7 @@ macro_rules! dynamic_slice_dtype {
                     &ErasedRawStridedPtr::from_ref(&start),
                 )
                 .unwrap();
-                assert_eq!(maybe_bytes(&raw), bytes(&expected));
+                assert_initialized_eq(&raw, &expected);
             }
         }
     };
@@ -948,21 +969,16 @@ fn scatter_wrapping_and_serial_overlap_order() {
         spec,
     )
     .unwrap();
-    let source =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&operand), &dims, &[1], 0).unwrap();
-    let index =
-        ErasedRawStridedRef::new(KernelDType::I64, bytes(&indices), &ids, &[1, 3], 0).unwrap();
-    let update =
-        ErasedRawStridedRef::new(KernelDType::I32, bytes(&updates), &updates_dims, &[1], 0)
-            .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+    let index = ErasedRawStridedRef::from_slice(&indices, &ids, &[1, 3], 0).unwrap();
+    let update = ErasedRawStridedRef::from_slice(&updates, &updates_dims, &[1], 0).unwrap();
     let expected = [
         operand[0].wrapping_add(updates[0]).wrapping_add(updates[1]),
         operand[1].wrapping_add(updates[2]),
         operand[2],
     ];
-    let mut raw = vec![MaybeUninit::new(0xffu8); 3 * core::mem::size_of::<i32>()];
-    let mut out =
-        ErasedRawStridedUninitMut::new(KernelDType::I32, &mut raw, &dims, &[1], 0).unwrap();
+    let mut raw = vec![MaybeUninit::<i32>::uninit(); 3];
+    let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
     plan.execute_uninit(
         &ExecContext::serial(),
         &mut out,
@@ -971,7 +987,7 @@ fn scatter_wrapping_and_serial_overlap_order() {
         &ErasedRawStridedPtr::from_ref(&update),
     )
     .unwrap();
-    assert_eq!(maybe_bytes(&raw), bytes(&expected));
+    assert_initialized_eq(&raw, &expected);
 }
 
 macro_rules! scatter_dtype {
@@ -1004,16 +1020,21 @@ macro_rules! scatter_dtype {
                 spec,
             )
             .unwrap();
-            let source = ErasedRawStridedRef::new($dtype, bytes(&operand), &dims, &[1], 0).unwrap();
-            let index =
-                ErasedRawStridedRef::new($idtype, bytes(&indices), &ids, &[1, 3], 0).unwrap();
-            let update = ErasedRawStridedRef::new($dtype, bytes(&updates), &ud, &[1], 0).unwrap();
-            let expected = [
-                operand[0] + updates[0] + updates[1],
-                operand[1] + updates[2],
-                operand[2],
-            ];
-            let mut raw = vec![MaybeUninit::new(0xffu8); 3 * core::mem::size_of::<$ty>()];
+            let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+            let index = ErasedRawStridedRef::from_slice(&indices, &ids, &[1, 3], 0).unwrap();
+            let update = ErasedRawStridedRef::from_slice(&updates, &ud, &[1], 0).unwrap();
+            let mut initialized = operand.clone();
+            let mut initialized_dest =
+                ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &[1], 0).unwrap();
+            plan.execute(
+                &ExecContext::serial(),
+                &mut initialized_dest,
+                &source,
+                &index,
+                &update,
+            )
+            .unwrap();
+            let mut raw = vec![MaybeUninit::<$ty>::uninit(); 3];
             for ctx in [
                 ExecContext::serial(),
                 ExecContext::max_threads(1).unwrap(),
@@ -1021,7 +1042,7 @@ macro_rules! scatter_dtype {
                 ExecContext::max_threads(4).unwrap(),
             ] {
                 let mut out =
-                    ErasedRawStridedUninitMut::new($dtype, &mut raw, &dims, &[1], 0).unwrap();
+                    ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
                 plan.execute_uninit(
                     &ctx,
                     &mut out,
@@ -1030,7 +1051,7 @@ macro_rules! scatter_dtype {
                     &ErasedRawStridedPtr::from_ref(&update),
                 )
                 .unwrap();
-                assert_eq!(maybe_bytes(&raw), bytes(&expected));
+                assert_initialized_eq(&raw, &initialized);
             }
         }
     };
@@ -1140,26 +1161,103 @@ scatter_dtype!(
         Complex64::new(30.0, 0.0)
     ]
 );
+scatter_dtype!(
+    scatter_i32_i32,
+    i32,
+    KernelDType::I32,
+    i32,
+    KernelDType::I32,
+    vec![1, 2, 3],
+    vec![10, 20, 30]
+);
+scatter_dtype!(
+    scatter_i32_i64,
+    i32,
+    KernelDType::I32,
+    i64,
+    KernelDType::I64,
+    vec![1, 2, 3],
+    vec![10, 20, 30]
+);
+scatter_dtype!(
+    scatter_i64_i32,
+    i64,
+    KernelDType::I64,
+    i32,
+    KernelDType::I32,
+    vec![1, 2, 3],
+    vec![10, 20, 30]
+);
+scatter_dtype!(
+    scatter_i64_i64,
+    i64,
+    KernelDType::I64,
+    i64,
+    KernelDType::I64,
+    vec![1, 2, 3],
+    vec![10, 20, 30]
+);
 
 #[test]
 fn scatter_integer_extrema_wrap_in_uninit_path() {
-    for dtype_i32 in [true, false] {
-        if dtype_i32 {
-            let operand = [i32::MAX, 1, 2];
-            let updates = [1i32, 2, i32::MAX];
-            assert_eq!(
+    macro_rules! case {
+        ($ty:ty, $dtype:expr, $ity:ty, $idtype:expr) => {{
+            let dims = [3usize];
+            let ids = [3usize, 1];
+            let operand = [<$ty>::MAX, 1, 2];
+            let indices = [0 as $ity, 0 as $ity, 1 as $ity];
+            let updates = [1 as $ty, 2 as $ty, <$ty>::MAX];
+            let spec = ScatterSpec {
+                update_window_dims: vec![],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+            };
+            let plan = ErasedScatterPlan::compile(
+                $dtype,
+                $idtype,
+                &dims,
+                &[1],
+                &ids,
+                &[1, 3],
+                &dims,
+                &[1],
+                &dims,
+                &[1],
+                spec,
+            )
+            .unwrap();
+            let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
+            let index = ErasedRawStridedRef::from_slice(&indices, &ids, &[1, 3], 0).unwrap();
+            let update = ErasedRawStridedRef::from_slice(&updates, &dims, &[1], 0).unwrap();
+            let expected = [
                 operand[0].wrapping_add(updates[0]).wrapping_add(updates[1]),
-                i32::MIN.wrapping_add(2)
-            );
-        } else {
-            let operand = [i64::MAX, 1, 2];
-            let updates = [1i64, 2, i64::MAX];
-            assert_eq!(
-                operand[0].wrapping_add(updates[0]).wrapping_add(updates[1]),
-                i64::MIN.wrapping_add(2)
-            );
-        }
+                operand[1].wrapping_add(updates[2]),
+                operand[2],
+            ];
+            for ctx in [
+                ExecContext::serial(),
+                ExecContext::max_threads(1).unwrap(),
+                ExecContext::max_threads(2).unwrap(),
+                ExecContext::max_threads(4).unwrap(),
+            ] {
+                let mut raw = vec![MaybeUninit::<$ty>::uninit(); 3];
+                let mut out =
+                    ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
+                plan.execute_uninit(
+                    &ctx,
+                    &mut out,
+                    &ErasedRawStridedPtr::from_ref(&source),
+                    &ErasedRawStridedPtr::from_ref(&index),
+                    &ErasedRawStridedPtr::from_ref(&update),
+                )
+                .unwrap();
+                assert_initialized_eq(&raw, &expected);
+            }
+        }};
     }
+    case!(i32, KernelDType::I32, i32, KernelDType::I32);
+    case!(i64, KernelDType::I64, i64, KernelDType::I64);
 }
 
 #[test]
@@ -1204,8 +1302,7 @@ fn scatter_compile_rejects_bool_and_bad_layout_before_destination_use() {
 fn aligned_uninit_lifecycle_all_indexed_families() {
     let dims = [4usize];
     let operand = [1.0f64, 2.0, 3.0, 4.0];
-    let source =
-        ErasedRawStridedRef::new(KernelDType::F64, bytes(&operand), &dims, &[1], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
     let mut storage = vec![MaybeUninit::<f64>::uninit(); 4];
 
     let gather = ErasedGatherPlan::compile(
@@ -1227,15 +1324,9 @@ fn aligned_uninit_lifecycle_all_indexed_families() {
     )
     .unwrap();
     let indices = [2i64, 0];
-    let index = ErasedRawStridedRef::new(KernelDType::I64, bytes(&indices), &[2], &[1], 0).unwrap();
-    let mut out = ErasedRawStridedUninitMut::new(
-        KernelDType::F64,
-        unsafe { f64_bytes(&mut storage) },
-        &[2],
-        &[1],
-        0,
-    )
-    .unwrap();
+    let index = ErasedRawStridedRef::from_slice(&indices, &[2], &[1], 0).unwrap();
+    let mut out =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &[2], &[1], 0).unwrap();
     gather
         .execute_uninit(
             &ExecContext::serial(),
@@ -1244,18 +1335,12 @@ fn aligned_uninit_lifecycle_all_indexed_families() {
             &ErasedRawStridedPtr::from_ref(&index),
         )
         .unwrap();
-    let _reachable = out.data_mut();
+    let _reachable = out.data_as_uninit_mut::<f64>().unwrap();
 
     let reduce = ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &[1]).unwrap();
     let mut scalar = vec![MaybeUninit::<f64>::uninit(); 1];
-    let mut reduce_out = ErasedRawStridedUninitMut::new(
-        KernelDType::F64,
-        unsafe { f64_bytes(&mut scalar) },
-        &[],
-        &[],
-        0,
-    )
-    .unwrap();
+    let mut reduce_out =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut scalar, &[], &[], 0).unwrap();
     reduce
         .execute_uninit(
             &ExecContext::serial(),
@@ -1267,12 +1352,150 @@ fn aligned_uninit_lifecycle_all_indexed_families() {
 }
 
 #[test]
+fn uninit_lifecycle_executes_dynamic_and_scatter_families() {
+    let dims = [4usize];
+    let source_values = [1i32, 2, 3, 4];
+    let source = ErasedRawStridedRef::from_slice(&source_values, &dims, &[1], 0).unwrap();
+    let starts = [1i32];
+    let starts_ref = ErasedRawStridedRef::from_slice(&starts, &[1], &[1], 0).unwrap();
+    let slice = ErasedDynamicSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &dims,
+        &[1],
+        &[1],
+        &[1],
+        &[2],
+        &[1],
+        &[2],
+    )
+    .unwrap();
+    let mut slice_storage = vec![MaybeUninit::<i32>::uninit(); 2];
+    let mut slice_dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut slice_storage, &[2], &[1], 0).unwrap();
+    slice
+        .execute_uninit(
+            &ExecContext::serial(),
+            &mut slice_dest,
+            &ErasedRawStridedPtr::from_ref(&source),
+            &ErasedRawStridedPtr::from_ref(&starts_ref),
+        )
+        .unwrap();
+    assert_initialized_eq(&slice_storage, &[2, 3]);
+
+    let updates = [9i32, 8];
+    let updates_ref = ErasedRawStridedRef::from_slice(&updates, &[2], &[1], 0).unwrap();
+    let update = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &dims,
+        &[1],
+        &[1],
+        &[1],
+        &[2],
+        &[1],
+        &dims,
+        &[1],
+    )
+    .unwrap();
+    let mut update_storage = vec![MaybeUninit::<i32>::uninit(); 4];
+    let mut update_dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut update_storage, &dims, &[1], 0).unwrap();
+    update
+        .execute_uninit(
+            &ExecContext::serial(),
+            &mut update_dest,
+            &ErasedRawStridedPtr::from_ref(&source),
+            &ErasedRawStridedPtr::from_ref(&updates_ref),
+            &ErasedRawStridedPtr::from_ref(&starts_ref),
+        )
+        .unwrap();
+    assert_initialized_eq(&update_storage, &[1, 9, 8, 4]);
+
+    let spec = ScatterSpec {
+        update_window_dims: vec![],
+        inserted_window_dims: vec![0],
+        scatter_dims_to_operand_dims: vec![0],
+        index_vector_dim: 1,
+    };
+    let scatter = ErasedScatterPlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &dims,
+        &[1],
+        &[2, 1],
+        &[1, 2],
+        &[2],
+        &[1],
+        &dims,
+        &[1],
+        spec,
+    )
+    .unwrap();
+    let scatter_indices = [1i32, 3];
+    let scatter_updates = [7i32, 6];
+    let scatter_index =
+        ErasedRawStridedRef::from_slice(&scatter_indices, &[2, 1], &[1, 2], 0).unwrap();
+    let scatter_update = ErasedRawStridedRef::from_slice(&scatter_updates, &[2], &[1], 0).unwrap();
+    let mut scatter_storage = vec![MaybeUninit::<i32>::uninit(); 4];
+    let mut scatter_dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut scatter_storage, &dims, &[1], 0).unwrap();
+    scatter
+        .execute_uninit(
+            &ExecContext::max_threads(2).unwrap(),
+            &mut scatter_dest,
+            &ErasedRawStridedPtr::from_ref(&source),
+            &ErasedRawStridedPtr::from_ref(&scatter_index),
+            &ErasedRawStridedPtr::from_ref(&scatter_update),
+        )
+        .unwrap();
+    assert_initialized_eq(&scatter_storage, &[1, 9, 3, 10]);
+}
+
+#[test]
+fn dynamic_update_uninitialized_holes_are_never_read() {
+    let dims = [3usize];
+    let source_values = [1i32, 0, 2, 0, 3];
+    let updates = [9i32];
+    let starts = [1i32];
+    let plan = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &dims,
+        &[2],
+        &[1],
+        &[1],
+        &[1],
+        &[1],
+        &dims,
+        &[2],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&source_values, &dims, &[2], 0).unwrap();
+    let update = ErasedRawStridedRef::from_slice(&updates, &[1], &[1], 0).unwrap();
+    let start = ErasedRawStridedRef::from_slice(&starts, &[1], &[1], 0).unwrap();
+    let mut storage = vec![MaybeUninit::<i32>::uninit(); 5];
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &dims, &[2], 0).unwrap();
+    plan.execute_uninit(
+        &ExecContext::serial(),
+        &mut dest,
+        &ErasedRawStridedPtr::from_ref(&source),
+        &ErasedRawStridedPtr::from_ref(&update),
+        &ErasedRawStridedPtr::from_ref(&start),
+    )
+    .unwrap();
+    assert_eq!(unsafe { storage[0].assume_init_ref() }, &1);
+    assert_eq!(unsafe { storage[2].assume_init_ref() }, &9);
+    assert_eq!(unsafe { storage[4].assume_init_ref() }, &3);
+}
+
+#[test]
 fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
     let n = 131_073usize;
     let dims = [n];
     let operand: Vec<f64> = (0..n).map(|i| i as f64 * 0.25).collect();
-    let source =
-        ErasedRawStridedRef::new(KernelDType::F64, bytes(&operand), &dims, &[1], 0).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
     let serial = ExecContext::serial();
     let contexts = [
         ExecContext::max_threads(2).unwrap(),
@@ -1299,23 +1522,14 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
         },
     )
     .unwrap();
-    let index =
-        ErasedRawStridedRef::new(KernelDType::I64, bytes(&indices), &index_dims, &[1], 0).unwrap();
+    let index = ErasedRawStridedRef::from_slice(&indices, &index_dims, &[1], 0).unwrap();
     let mut expected = vec![0.0f64; n];
-    let mut init =
-        ErasedRawStridedMut::new(KernelDType::F64, bytes_mut(&mut expected), &dims, &[1], 0)
-            .unwrap();
+    let mut init = ErasedRawStridedMut::from_slice_mut(&mut expected, &dims, &[1], 0).unwrap();
     gather.execute(&serial, &mut init, &source, &index).unwrap();
     for ctx in contexts {
         let mut raw = vec![MaybeUninit::<f64>::uninit(); n];
-        let mut out = ErasedRawStridedUninitMut::new(
-            KernelDType::F64,
-            unsafe { f64_bytes(&mut raw) },
-            &dims,
-            &[1],
-            0,
-        )
-        .unwrap();
+        let mut out =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
         gather
             .execute_uninit(
                 &ctx,
@@ -1324,7 +1538,7 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
                 &ErasedRawStridedPtr::from_ref(&index),
             )
             .unwrap();
-        assert_eq!(maybe_bytes(out.data_mut()), bytes(&expected));
+        assert_initialized_eq(out.data_as_uninit_mut::<f64>().unwrap(), &expected);
     }
 
     let starts = [n as i64 / 4];
@@ -1342,17 +1556,10 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
         &[n / 2],
     )
     .unwrap();
-    let start =
-        ErasedRawStridedRef::new(KernelDType::I64, bytes(&starts), &start_dims, &[1], 0).unwrap();
+    let start = ErasedRawStridedRef::from_slice(&starts, &start_dims, &[1], 0).unwrap();
     let mut slice_expected = vec![0.0f64; n / 2];
-    let mut slice_init = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        bytes_mut(&mut slice_expected),
-        &slice_dims,
-        &[1],
-        0,
-    )
-    .unwrap();
+    let mut slice_init =
+        ErasedRawStridedMut::from_slice_mut(&mut slice_expected, &slice_dims, &[1], 0).unwrap();
     slice
         .execute(&serial, &mut slice_init, &source, &start)
         .unwrap();
@@ -1361,14 +1568,8 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
         ExecContext::max_threads(4).unwrap(),
     ] {
         let mut raw = vec![MaybeUninit::<f64>::uninit(); n / 2];
-        let mut out = ErasedRawStridedUninitMut::new(
-            KernelDType::F64,
-            unsafe { f64_bytes(&mut raw) },
-            &slice_dims,
-            &[1],
-            0,
-        )
-        .unwrap();
+        let mut out =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &slice_dims, &[1], 0).unwrap();
         slice
             .execute_uninit(
                 &ctx,
@@ -1377,19 +1578,13 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
                 &ErasedRawStridedPtr::from_ref(&start),
             )
             .unwrap();
-        assert_eq!(maybe_bytes(out.data_mut()), bytes(&slice_expected));
+        assert_initialized_eq(out.data_as_uninit_mut::<f64>().unwrap(), &slice_expected);
     }
 
     let update_values: Vec<f64> = (0..n / 2).map(|i| i as f64).collect();
     let update_dims = [n / 2];
-    let update_ref = ErasedRawStridedRef::new(
-        KernelDType::F64,
-        bytes(&update_values),
-        &update_dims,
-        &[1],
-        0,
-    )
-    .unwrap();
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&update_values, &update_dims, &[1], 0).unwrap();
     let update_plan = ErasedDynamicUpdateSlicePlan::compile(
         KernelDType::F64,
         KernelDType::I64,
@@ -1404,14 +1599,8 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
     )
     .unwrap();
     let mut update_expected = operand.clone();
-    let mut update_init = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        bytes_mut(&mut update_expected),
-        &dims,
-        &[1],
-        0,
-    )
-    .unwrap();
+    let mut update_init =
+        ErasedRawStridedMut::from_slice_mut(&mut update_expected, &dims, &[1], 0).unwrap();
     update_plan
         .execute(&serial, &mut update_init, &source, &update_ref, &start)
         .unwrap();
@@ -1420,14 +1609,8 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
         ExecContext::max_threads(4).unwrap(),
     ] {
         let mut raw = vec![MaybeUninit::<f64>::uninit(); n];
-        let mut out = ErasedRawStridedUninitMut::new(
-            KernelDType::F64,
-            unsafe { f64_bytes(&mut raw) },
-            &dims,
-            &[1],
-            0,
-        )
-        .unwrap();
+        let mut out =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dims, &[1], 0).unwrap();
         update_plan
             .execute_uninit(
                 &ctx,
@@ -1437,7 +1620,7 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
                 &ErasedRawStridedPtr::from_ref(&start),
             )
             .unwrap();
-        assert_eq!(maybe_bytes(out.data_mut()), bytes(&update_expected));
+        assert_initialized_eq(out.data_as_uninit_mut::<f64>().unwrap(), &update_expected);
     }
 
     let axis_plan = ErasedReducePlan::compile_axes(
@@ -1455,18 +1638,11 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
     let axis_strides = [1isize, n as isize];
     let axis_dest_dims = [n];
     let axis_dest_strides = [1isize];
-    let axis_source = ErasedRawStridedRef::new(
-        KernelDType::F64,
-        bytes(&axis_input),
-        &axis_dims,
-        &axis_strides,
-        0,
-    )
-    .unwrap();
+    let axis_source =
+        ErasedRawStridedRef::from_slice(&axis_input, &axis_dims, &axis_strides, 0).unwrap();
     let mut axis_expected = vec![0.0f64; n];
-    let mut axis_init = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        bytes_mut(&mut axis_expected),
+    let mut axis_init = ErasedRawStridedMut::from_slice_mut(
+        &mut axis_expected,
         &axis_dest_dims,
         &axis_dest_strides,
         0,
@@ -1480,9 +1656,8 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
         ExecContext::max_threads(4).unwrap(),
     ] {
         let mut raw = vec![MaybeUninit::<f64>::uninit(); n];
-        let mut out = ErasedRawStridedUninitMut::new(
-            KernelDType::F64,
-            unsafe { f64_bytes(&mut raw) },
+        let mut out = ErasedRawStridedUninitMut::from_uninit_slice(
+            &mut raw,
             &axis_dest_dims,
             &axis_dest_strides,
             0,
@@ -1491,6 +1666,6 @@ fn above_threshold_parallel_indexed_replays_match_serial_initialized() {
         axis_plan
             .execute_uninit(&ctx, &mut out, &ErasedRawStridedPtr::from_ref(&axis_source))
             .unwrap();
-        assert_eq!(maybe_bytes(out.data_mut()), bytes(&axis_expected));
+        assert_initialized_eq(out.data_as_uninit_mut::<f64>().unwrap(), &axis_expected);
     }
 }

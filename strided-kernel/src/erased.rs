@@ -9,7 +9,7 @@
 //! descriptors used by one replay call, and validate ABI dtype tags before
 //! constructing these Rust descriptors.
 //!
-use core::ops::Add;
+use core::{mem::MaybeUninit, ops::Add};
 
 use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
@@ -349,6 +349,12 @@ impl ErasedSlicePlan {
     }
 
     /// Execute a static slice as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -427,6 +433,12 @@ impl ErasedReversePlan {
     }
 
     /// Execute reverse as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -519,6 +531,12 @@ impl ErasedPadPlan {
     }
 
     /// Execute pad as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -608,6 +626,12 @@ impl ErasedConcatenatePlan {
     }
 
     /// Execute concatenate as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -845,6 +869,12 @@ impl ErasedFusedPlan {
     /// Returns a typed dtype, input-count, shape, bounds, destination
     /// injectivity, unsupported-operation, or input/output-overlap error. All
     /// error-producing validation completes before execution starts.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -1064,31 +1094,29 @@ impl ErasedReducePlan {
 
         let result = match self.dtype {
             KernelDType::F32 => {
-                dispatch_reduce::<f32, _>(self.op, &self.layout, ctx, &mut reduce_writer(dest), src)
+                let mut writer = reduce_writer::<f32>(dest)?;
+                dispatch_reduce::<f32, _>(self.op, &self.layout, ctx, &mut writer, src)
             }
             KernelDType::F64 => {
-                dispatch_reduce::<f64, _>(self.op, &self.layout, ctx, &mut reduce_writer(dest), src)
+                let mut writer = reduce_writer::<f64>(dest)?;
+                dispatch_reduce::<f64, _>(self.op, &self.layout, ctx, &mut writer, src)
             }
             KernelDType::I32 => {
-                dispatch_reduce::<i32, _>(self.op, &self.layout, ctx, &mut reduce_writer(dest), src)
+                let mut writer = reduce_writer::<i32>(dest)?;
+                dispatch_reduce::<i32, _>(self.op, &self.layout, ctx, &mut writer, src)
             }
             KernelDType::I64 => {
-                dispatch_reduce::<i64, _>(self.op, &self.layout, ctx, &mut reduce_writer(dest), src)
+                let mut writer = reduce_writer::<i64>(dest)?;
+                dispatch_reduce::<i64, _>(self.op, &self.layout, ctx, &mut writer, src)
             }
-            KernelDType::C32 => dispatch_reduce::<Complex32, _>(
-                self.op,
-                &self.layout,
-                ctx,
-                &mut reduce_writer(dest),
-                src,
-            ),
-            KernelDType::C64 => dispatch_reduce::<Complex64, _>(
-                self.op,
-                &self.layout,
-                ctx,
-                &mut reduce_writer(dest),
-                src,
-            ),
+            KernelDType::C32 => {
+                let mut writer = reduce_writer::<Complex32>(dest)?;
+                dispatch_reduce::<Complex32, _>(self.op, &self.layout, ctx, &mut writer, src)
+            }
+            KernelDType::C64 => {
+                let mut writer = reduce_writer::<Complex64>(dest)?;
+                dispatch_reduce::<Complex64, _>(self.op, &self.layout, ctx, &mut writer, src)
+            }
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
@@ -1096,6 +1124,12 @@ impl ErasedReducePlan {
         result
     }
 
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -1107,13 +1141,6 @@ impl ErasedReducePlan {
         validate_uninit_no_overlap(dest, src, 0)?;
         let src = validated_input_ref(src)?;
         self.layout.check_src_layout(&src)?;
-        let src = ErasedRawStridedRef::new(
-            self.dtype,
-            src.data(),
-            src.dims(),
-            src.strides(),
-            src.offset(),
-        )?;
         match &self.layout {
             ReduceLayout::Full { .. } => {
                 let total = checked_total_len(dest.dims())?;
@@ -1134,7 +1161,7 @@ impl ErasedReducePlan {
         }
         macro_rules! run {
             ($ty:ty) => {{
-                let mut writer = reduce_uninit_writer::<$ty>(dest);
+                let mut writer = reduce_uninit_writer::<$ty>(dest)?;
                 dispatch_reduce::<$ty, _>(self.op, &self.layout, ctx, &mut writer, &src)
             }};
         }
@@ -1269,6 +1296,12 @@ impl ErasedGatherPlan {
 
     /// Execute gather into a destination whose reachable slots may be
     /// uninitialized. All validation precedes the first destination write.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -1462,6 +1495,11 @@ impl ErasedDynamicSlicePlan {
 
     /// Execute dynamic slice into a destination whose reachable slots may be
     /// uninitialized.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution may
+    /// leave reachable slots partially initialized, but the `MaybeUninit`
+    /// destination remains safely droppable.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -1664,6 +1702,12 @@ impl ErasedDynamicUpdateSlicePlan {
         result
     }
 
+    /// On success, the copy phase initializes every reachable destination
+    /// slot before the read-modify-write phase. Unreachable holes are neither
+    /// read nor initialized. Validation errors before the copy leave the
+    /// destination untouched; an error or panic after the copy may leave a
+    /// mixture of old and new reachable values, all initialized and safely
+    /// droppable.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -1871,6 +1915,12 @@ impl ErasedScatterPlan {
         result
     }
 
+    /// On success, the copy phase initializes every reachable destination
+    /// slot before the read-modify-write phase. Unreachable holes are neither
+    /// read nor initialized. Validation errors before the copy leave the
+    /// destination untouched; an error or panic after the copy may leave a
+    /// mixture of old and new reachable values, all initialized and safely
+    /// droppable.
     pub fn execute_uninit(
         &self,
         ctx: &ExecContext,
@@ -2356,32 +2406,38 @@ fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
     Ok(())
 }
 
-fn reduce_writer<'a, T>(dest: &'a mut ErasedRawStridedMut<'_>) -> RawReduceWriter<'a, T> {
+fn reduce_writer<'a, T>(dest: &'a mut ErasedRawStridedMut<'_>) -> Result<RawReduceWriter<'a, T>>
+where
+    T: KernelStorageElement,
+{
     let offset = dest.offset();
-    let data = dest.data_mut();
-    let ptr = data.as_mut_ptr().cast::<T>();
-    let extent = data.len() / core::mem::size_of::<T>();
-    RawReduceWriter {
+    let data = dest.data_as_mut::<T>()?;
+    let ptr = data.as_mut_ptr();
+    let extent = data.len();
+    Ok(RawReduceWriter {
         ptr,
         extent,
         offset,
         _marker: core::marker::PhantomData,
-    }
+    })
 }
 
 fn reduce_uninit_writer<'a, T>(
     dest: &'a mut ErasedRawStridedUninitMut<'_>,
-) -> RawReduceWriter<'a, T> {
+) -> Result<RawReduceWriter<'a, T>>
+where
+    T: KernelStorageElement,
+{
     let offset = dest.offset();
-    let data = dest.data_mut();
+    let data = dest.data_as_uninit_mut::<T>()?;
     let ptr = data.as_mut_ptr().cast::<T>();
-    let extent = data.len() / core::mem::size_of::<T>();
-    RawReduceWriter {
+    let extent = data.len();
+    Ok(RawReduceWriter {
         ptr,
         extent,
         offset,
         _marker: core::marker::PhantomData,
-    }
+    })
 }
 
 fn check_fused_dtype(dtype: KernelDType) -> Result<()> {
@@ -2585,7 +2641,7 @@ fn execute_gather_uninit_dispatch<T>(
     start_indices: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
@@ -2608,15 +2664,15 @@ fn execute_gather_uninit<T, I>(
     start_indices: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let index_data = typed_slice::<I>(start_indices.data());
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = start_indices.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2646,7 +2702,7 @@ fn execute_dynamic_slice_uninit_dispatch<T>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => execute_dynamic_slice_uninit::<T, i32>(plan, dest, operand, starts),
@@ -2664,15 +2720,15 @@ fn execute_dynamic_slice_uninit<T, I>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let starts_data = typed_slice::<I>(starts.data());
+    let operand_data = operand.data_as::<T>()?;
+    let starts_data = starts.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2703,7 +2759,7 @@ fn execute_dynamic_update_uninit_dispatch<T>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
@@ -2726,16 +2782,16 @@ fn execute_dynamic_update_uninit<T, I>(
     starts: &ErasedRawStridedRef<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let update_data = typed_slice::<T>(update.data());
-    let starts_data = typed_slice::<I>(starts.data());
+    let operand_data = operand.data_as::<T>()?;
+    let update_data = update.data_as::<T>()?;
+    let starts_data = starts.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2775,7 +2831,7 @@ fn execute_scatter_uninit_dispatch<T>(
     combine: fn(T, T) -> T,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + crate::MaybeSendSync,
+    T: Copy + Add<Output = T> + crate::MaybeSendSync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
@@ -2799,17 +2855,17 @@ fn execute_scatter_uninit<T, I>(
     combine: fn(T, T) -> T,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + Add<Output = T> + crate::MaybeSendSync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
     let indices = scatter_indices;
-    let operand_data = typed_slice::<T>(operand.data());
-    let index_data = typed_slice::<I>(indices.data());
-    let update_data = typed_slice::<T>(updates.data());
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = indices.data_as::<I>()?;
+    let update_data = updates.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,

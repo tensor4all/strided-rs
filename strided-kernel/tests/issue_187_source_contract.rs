@@ -8,6 +8,20 @@ fn reduction_uninit_has_no_initialized_backing_conversion() {
         .0;
     assert!(!reduce.contains("from_raw_parts_mut"));
     assert!(!reduce.contains("ErasedRawStridedMut::new"));
+    assert!(reduce.contains("reduce_uninit_writer"));
+    for forbidden in [
+        "ErasedRawStridedMut::from_slice_mut",
+        "RawStridedMut::new",
+        "typed_slice_mut",
+        "data_as_mut",
+        "data_as::<",
+        "from_slice_mut",
+    ] {
+        assert!(
+            !reduce.contains(forbidden),
+            "initialized conversion remains: {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -81,11 +95,82 @@ fn receipt_and_typed_uninit_boundaries_remain_private() {
     assert!(!copy.contains("pub fn execute_uninit_then"));
     let erased = include_str!("../src/erased.rs");
     assert!(erased.contains("fn reduce_uninit_writer"));
-    assert!(erased.contains("typed_uninit_slice_mut"));
+    assert!(erased.contains("data_as_uninit_mut"));
     let reduce_uninit = erased
         .split_once("pub fn execute_uninit")
         .and_then(|(_, rest)| rest.split_once("impl ErasedGatherPlan"))
         .map(|(body, _)| body)
         .expect("reduce uninitialized entry point remains");
     assert!(!reduce_uninit.contains("typed_slice_mut"));
+    assert!(reduce_uninit.contains("reduce_uninit_writer"));
+    assert!(!reduce_uninit.contains("from_slice_mut"));
+    let writer = erased
+        .split_once("fn reduce_uninit_writer")
+        .and_then(|(_, rest)| rest.split_once("\nfn "))
+        .map(|(body, _)| body)
+        .expect("reduction uninitialized writer remains");
+    assert!(writer.contains("data_as_uninit_mut"));
+    for forbidden in [
+        "ErasedRawStridedMut<",
+        "from_slice_mut",
+        "typed_slice_mut",
+        "data_as_mut",
+        "RawStridedMut<",
+        "assume_init",
+    ] {
+        assert!(
+            !writer.contains(forbidden),
+            "initialized conversion remains: {forbidden}"
+        );
+    }
+    for helper in [
+        "execute_gather_uninit_dispatch",
+        "execute_dynamic_slice_uninit_dispatch",
+        "execute_dynamic_update_uninit_dispatch",
+        "execute_scatter_uninit_dispatch",
+    ] {
+        let body = erased
+            .split_once(&format!("fn {helper}"))
+            .and_then(|(_, rest)| rest.split_once("\nfn "))
+            .map(|(body, _)| body)
+            .expect("uninitialized dispatch helper remains");
+        for forbidden in ["data_as_mut", "RawStridedMut<", "assume_init", "*dest"] {
+            assert!(
+                !body.contains(forbidden),
+                "destination read remains in {helper}: {forbidden}"
+            );
+        }
+    }
+    for helper in [
+        "execute_gather_uninit<T, I>",
+        "execute_dynamic_slice_uninit<T, I>",
+        "execute_dynamic_update_uninit<T, I>",
+        "execute_scatter_uninit<T, I>",
+    ] {
+        let body = erased
+            .split_once(&format!("fn {helper}"))
+            .and_then(|(_, rest)| rest.split_once("\nfn "))
+            .map(|(body, _)| body)
+            .expect("generic uninitialized helper remains");
+        assert!(
+            body.contains("data_as_uninit_mut"),
+            "missing typed uninit accessor in {helper}"
+        );
+        for forbidden in [
+            "data_as_mut",
+            "RawStridedMut::<T>",
+            "RawStridedMut<T>",
+            "StridedViewMut",
+            "from_slice_mut",
+            "assume_init",
+            "dest_data.as_ptr",
+            "dest_data[",
+            "*dest_ptr",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "destination read/conversion in {helper}: {forbidden}"
+            );
+        }
+    }
 }
