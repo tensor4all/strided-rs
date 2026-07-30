@@ -64,3 +64,8 @@ harness = false
 name = "erased_policy_thresholds"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "issue_184_uninit_replay"
+harness = false
+required-features = ["parallel"]

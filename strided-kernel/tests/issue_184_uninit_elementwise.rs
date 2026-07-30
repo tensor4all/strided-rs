@@ -176,25 +176,27 @@ where
     let ptrs: Vec<_> = refs.iter().map(ErasedRawStridedPtr::from_ref).collect();
     let plan = ErasedFusedPlan::compile(dtype, plan).unwrap();
 
-    let mut initialized = vec![inputs[0][0]; dims[0]];
-    let mut initialized_dest =
-        ErasedRawStridedMut::new(dtype, as_bytes_mut(&mut initialized), &dims, &strides, 0)
+    for context in [ExecContext::serial(), ExecContext::max_threads(2).unwrap()] {
+        let mut initialized = vec![inputs[0][0]; dims[0]];
+        let mut initialized_dest =
+            ErasedRawStridedMut::new(dtype, as_bytes_mut(&mut initialized), &dims, &strides, 0)
+                .unwrap();
+        plan.execute(&context, &mut initialized_dest, &refs)
             .unwrap();
-    plan.execute(&ExecContext::serial(), &mut initialized_dest, &refs)
-        .unwrap();
 
-    let mut uninitialized = vec![MaybeUninit::<T>::uninit(); dims[0]];
-    let mut uninitialized_dest = ErasedRawStridedUninitMut::new(
-        dtype,
-        as_uninit_bytes(&mut uninitialized),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
-    plan.execute_uninit(&ExecContext::serial(), &mut uninitialized_dest, &ptrs)
+        let mut uninitialized = vec![MaybeUninit::<T>::uninit(); dims[0]];
+        let mut uninitialized_dest = ErasedRawStridedUninitMut::new(
+            dtype,
+            as_uninit_bytes(&mut uninitialized),
+            &dims,
+            &strides,
+            0,
+        )
         .unwrap();
-    assert_eq!(assume_init(uninitialized), initialized);
+        plan.execute_uninit(&context, &mut uninitialized_dest, &ptrs)
+            .unwrap();
+        assert_eq!(assume_init(uninitialized), initialized);
+    }
 }
 
 #[test]
@@ -360,6 +362,24 @@ fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specializa
                 FusedInst {
                     op: FusedOp::Multiply,
                     inputs: vec![2, 0],
+                },
+            ],
+        },
+    );
+    assert_fused_differential(
+        KernelDType::F64,
+        &[vec![1.0, 2.0], vec![3.0, 4.0]],
+        FusedPlan {
+            input_count: 2,
+            outputs: vec![3],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Add,
+                    inputs: vec![0, 1],
+                },
+                FusedInst {
+                    op: FusedOp::Multiply,
+                    inputs: vec![0, 2],
                 },
             ],
         },

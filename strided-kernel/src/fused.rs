@@ -933,6 +933,46 @@ enum StaticFusedKind {
     DivClampSqrtRsqrt,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static UNINITIALIZED_STATIC_FAMILY_HITS: core::cell::Cell<[usize; 7]> =
+        const { core::cell::Cell::new([0; 7]) };
+}
+
+#[cfg(test)]
+impl StaticFusedKind {
+    fn test_index(self) -> usize {
+        match self {
+            Self::Unary(..) => 0,
+            Self::Binary(..) => 1,
+            Self::Ternary(..) => 2,
+            Self::AddMulLeft => 3,
+            Self::AddMulRight => 4,
+            Self::MulAddExp => 5,
+            Self::DivClampSqrtRsqrt => 6,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn reset_uninitialized_static_family_hits() {
+    UNINITIALIZED_STATIC_FAMILY_HITS.set([0; 7]);
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn uninitialized_static_family_hits() -> [usize; 7] {
+    UNINITIALIZED_STATIC_FAMILY_HITS.get()
+}
+
+#[cfg(test)]
+fn record_uninitialized_static_family_hit(kind: StaticFusedKind) {
+    UNINITIALIZED_STATIC_FAMILY_HITS.set({
+        let mut hits = UNINITIALIZED_STATIC_FAMILY_HITS.get();
+        hits[kind.test_index()] += 1;
+        hits
+    });
+}
+
 fn classify_static_specialization(plan: &FusedPlan) -> Option<StaticFusedKind> {
     if plan.outputs.len() != 1 {
         return None;
@@ -995,6 +1035,9 @@ fn classify_static_specialization(plan: &FusedPlan) -> Option<StaticFusedKind> {
 trait StaticOutput<T: FusedScalar> {
     type Value: Copy + MaybeSendSync;
 
+    #[cfg(test)]
+    const IS_UNINITIALIZED: bool;
+
     fn write(value: T) -> Self::Value;
 }
 
@@ -1002,6 +1045,9 @@ struct InitializedStaticOutput;
 
 impl<T: FusedScalar> StaticOutput<T> for InitializedStaticOutput {
     type Value = T;
+
+    #[cfg(test)]
+    const IS_UNINITIALIZED: bool = false;
 
     #[inline(always)]
     fn write(value: T) -> T {
@@ -1013,6 +1059,9 @@ struct UninitializedStaticOutput;
 
 impl<T: FusedScalar> StaticOutput<T> for UninitializedStaticOutput {
     type Value = MaybeUninit<T>;
+
+    #[cfg(test)]
+    const IS_UNINITIALIZED: bool = true;
 
     #[inline(always)]
     fn write(value: T) -> MaybeUninit<T> {
@@ -1030,18 +1079,26 @@ where
     T: FusedScalar,
     O: StaticOutput<T>,
 {
-    match classify_static_specialization(plan) {
-        Some(StaticFusedKind::Unary(op, a)) => {
+    let Some(kind) = classify_static_specialization(plan) else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    if O::IS_UNINITIALIZED {
+        record_uninitialized_static_family_hit(kind);
+    }
+
+    match kind {
+        StaticFusedKind::Unary(op, a) => {
             map_into_validated(dest, &inputs[a], |x| O::write(eval_unary(op, x)), validated)?
         }
-        Some(StaticFusedKind::Binary(op, a, b)) => zip_map2_into_validated(
+        StaticFusedKind::Binary(op, a, b) => zip_map2_into_validated(
             dest,
             &inputs[a],
             &inputs[b],
             |x, y| O::write(eval_binary(op, x, y)),
             validated,
         )?,
-        Some(StaticFusedKind::Ternary(op, a, b, c)) => zip_map3_into_validated(
+        StaticFusedKind::Ternary(op, a, b, c) => zip_map3_into_validated(
             dest,
             &inputs[a],
             &inputs[b],
@@ -1049,21 +1106,21 @@ where
             |x, y, z| O::write(eval_ternary(op, x, y, z)),
             validated,
         )?,
-        Some(StaticFusedKind::AddMulLeft) => zip_map2_into_validated(
+        StaticFusedKind::AddMulLeft => zip_map2_into_validated(
             dest,
             &inputs[0],
             &inputs[1],
             |a, b| O::write(a.fused_add(b).fused_multiply(a)),
             validated,
         )?,
-        Some(StaticFusedKind::AddMulRight) => zip_map2_into_validated(
+        StaticFusedKind::AddMulRight => zip_map2_into_validated(
             dest,
             &inputs[0],
             &inputs[1],
             |a, b| O::write(a.fused_multiply(a.fused_add(b))),
             validated,
         )?,
-        Some(StaticFusedKind::MulAddExp) => zip_map3_into_validated(
+        StaticFusedKind::MulAddExp => zip_map3_into_validated(
             dest,
             &inputs[0],
             &inputs[1],
@@ -1071,7 +1128,7 @@ where
             |a, b, c| O::write(a.fused_multiply(b).fused_add(c).fused_exp()),
             validated,
         )?,
-        Some(StaticFusedKind::DivClampSqrtRsqrt) => zip_map4_into_validated(
+        StaticFusedKind::DivClampSqrtRsqrt => zip_map4_into_validated(
             dest,
             &inputs[0],
             &inputs[1],
@@ -1088,7 +1145,6 @@ where
             },
             validated,
         )?,
-        None => return Ok(false),
     }
     Ok(true)
 }
@@ -1581,6 +1637,128 @@ mod tests {
         for (actual, expected) in static_values.iter().zip(interpreter_values.iter()) {
             assert!((actual - expected).abs() < 1e-12);
         }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn uninitialized_nonserial_replay_selects_every_static_family() {
+        use crate::ExecContext;
+
+        fn run(plan: FusedPlan, arrays: &[StridedArray<f64>]) {
+            let inputs: Vec<_> = arrays.iter().map(|array| array.view()).collect();
+            let mut output = vec![MaybeUninit::uninit(); arrays[0].len()];
+            let mut dest = StridedViewMut::new(&mut output, arrays[0].dims(), &[1], 0).unwrap();
+            let validated =
+                validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
+            ExecContext::max_threads(2).unwrap().run(|| {
+                fused_elementwise_into_uninit(&mut dest, &inputs, &plan, false, validated).unwrap();
+            });
+        }
+
+        reset_uninitialized_static_family_hits();
+        let a = input(&[4.0, 9.0, 16.0]);
+        let b = input(&[2.0, 3.0, 4.0]);
+        let c = input(&[1.0, 1.5, 2.0]);
+        let d = input(&[4.0, 4.0, 4.0]);
+
+        run(
+            single_op(1, FusedOp::Sqrt, vec![0]),
+            std::slice::from_ref(&a),
+        );
+        run(
+            single_op(2, FusedOp::Add, vec![0, 1]),
+            &[a.clone(), b.clone()],
+        );
+        run(
+            single_op(3, FusedOp::Clamp, vec![0, 1, 2]),
+            &[a.clone(), c.clone(), d.clone()],
+        );
+        run(
+            FusedPlan {
+                input_count: 2,
+                outputs: vec![3],
+                ops: vec![
+                    FusedInst {
+                        op: FusedOp::Add,
+                        inputs: vec![0, 1],
+                    },
+                    FusedInst {
+                        op: FusedOp::Multiply,
+                        inputs: vec![2, 0],
+                    },
+                ],
+            },
+            &[a.clone(), b.clone()],
+        );
+        run(
+            FusedPlan {
+                input_count: 2,
+                outputs: vec![3],
+                ops: vec![
+                    FusedInst {
+                        op: FusedOp::Add,
+                        inputs: vec![0, 1],
+                    },
+                    FusedInst {
+                        op: FusedOp::Multiply,
+                        inputs: vec![0, 2],
+                    },
+                ],
+            },
+            &[a.clone(), b.clone()],
+        );
+        run(
+            FusedPlan {
+                input_count: 3,
+                outputs: vec![5],
+                ops: vec![
+                    FusedInst {
+                        op: FusedOp::Multiply,
+                        inputs: vec![0, 1],
+                    },
+                    FusedInst {
+                        op: FusedOp::Add,
+                        inputs: vec![3, 2],
+                    },
+                    FusedInst {
+                        op: FusedOp::Exp,
+                        inputs: vec![4],
+                    },
+                ],
+            },
+            &[a.clone(), b.clone(), c.clone()],
+        );
+        run(
+            FusedPlan {
+                input_count: 4,
+                outputs: vec![8],
+                ops: vec![
+                    FusedInst {
+                        op: FusedOp::Divide,
+                        inputs: vec![0, 1],
+                    },
+                    FusedInst {
+                        op: FusedOp::Maximum,
+                        inputs: vec![4, 2],
+                    },
+                    FusedInst {
+                        op: FusedOp::Minimum,
+                        inputs: vec![5, 3],
+                    },
+                    FusedInst {
+                        op: FusedOp::Sqrt,
+                        inputs: vec![6],
+                    },
+                    FusedInst {
+                        op: FusedOp::Rsqrt,
+                        inputs: vec![7],
+                    },
+                ],
+            },
+            &[a, b, c, d],
+        );
+
+        assert_eq!(uninitialized_static_family_hits(), [1; 7]);
     }
 
     #[cfg(feature = "parallel")]
