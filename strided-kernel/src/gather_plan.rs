@@ -590,6 +590,9 @@ impl DynamicSlicePlan {
         if self.total == 0 {
             return Ok(());
         }
+        if self.uses_rank_one_contiguous_path() {
+            return self.execute_rank_one_contiguous(dest, operand, starts);
+        }
         #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.total);
@@ -631,6 +634,51 @@ impl DynamicSlicePlan {
             }
             advance_col_major_index(dest_idx, &self.dest_dims);
         }
+        Ok(())
+    }
+
+    #[inline]
+    fn uses_rank_one_contiguous_path(&self) -> bool {
+        self.operand_dims.len() == 1 && self.operand_strides[0] == 1 && self.dest_strides[0] == 1
+    }
+
+    fn execute_rank_one_contiguous<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy,
+        I: GatherIndex,
+    {
+        let mut clamped_starts = [0usize; 1];
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.slice_sizes,
+            &mut clamped_starts,
+        )?;
+        let source_start = checked_offset_add(operand.offset(), 1, clamped_starts[0])?;
+        let source_start =
+            usize::try_from(source_start).map_err(|_| StridedError::OffsetOverflow)?;
+        let dest_start =
+            usize::try_from(dest.offset()).map_err(|_| StridedError::OffsetOverflow)?;
+        let source_end = source_start
+            .checked_add(self.total)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest_end = dest_start
+            .checked_add(self.total)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let source = operand
+            .data()
+            .get(source_start..source_end)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest = dest
+            .data_mut()
+            .get_mut(dest_start..dest_end)
+            .ok_or(StridedError::OffsetOverflow)?;
+        dest.copy_from_slice(source);
         Ok(())
     }
 
@@ -791,6 +839,9 @@ impl DynamicUpdateSlicePlan {
         if self.total == 0 {
             return Ok(());
         }
+        if self.uses_rank_one_contiguous_path() {
+            return self.execute_rank_one_contiguous(dest, update, starts);
+        }
         #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.total);
@@ -832,6 +883,53 @@ impl DynamicUpdateSlicePlan {
             }
             advance_col_major_index(update_idx, &self.update_dims);
         }
+        Ok(())
+    }
+
+    #[inline]
+    fn uses_rank_one_contiguous_path(&self) -> bool {
+        self.operand_dims.len() == 1
+            && self.operand_strides[0] == 1
+            && self.update_strides[0] == 1
+            && self.dest_strides[0] == 1
+    }
+
+    fn execute_rank_one_contiguous<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy,
+        I: GatherIndex,
+    {
+        let mut clamped_starts = [0usize; 1];
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.update_dims,
+            &mut clamped_starts,
+        )?;
+        let update_start =
+            usize::try_from(update.offset()).map_err(|_| StridedError::OffsetOverflow)?;
+        let dest_start = checked_offset_add(dest.offset(), 1, clamped_starts[0])?;
+        let dest_start = usize::try_from(dest_start).map_err(|_| StridedError::OffsetOverflow)?;
+        let update_end = update_start
+            .checked_add(self.total)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest_end = dest_start
+            .checked_add(self.total)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let update = update
+            .data()
+            .get(update_start..update_end)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest = dest
+            .data_mut()
+            .get_mut(dest_start..dest_end)
+            .ok_or(StridedError::OffsetOverflow)?;
+        dest.copy_from_slice(update);
         Ok(())
     }
 
@@ -1370,5 +1468,51 @@ impl CoordScratch {
             Some(heap) => heap,
             None => &mut self.inline[..self.len],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan};
+
+    #[test]
+    fn dynamic_slice_fast_path_is_limited_to_rank_one_contiguous_layouts() {
+        let contiguous =
+            DynamicSlicePlan::compile(&[16], &[1], &[1], &[1], &[8], &[1], &[8]).unwrap();
+        assert!(contiguous.uses_rank_one_contiguous_path());
+
+        let higher_rank =
+            DynamicSlicePlan::compile(&[4, 4], &[1, 4], &[2], &[1], &[2, 2], &[1, 2], &[2, 2])
+                .unwrap();
+        assert!(!higher_rank.uses_rank_one_contiguous_path());
+
+        let strided = DynamicSlicePlan::compile(&[16], &[2], &[1], &[1], &[8], &[2], &[8]).unwrap();
+        assert!(!strided.uses_rank_one_contiguous_path());
+    }
+
+    #[test]
+    fn dynamic_update_fast_path_is_limited_to_rank_one_contiguous_layouts() {
+        let contiguous =
+            DynamicUpdateSlicePlan::compile(&[16], &[1], &[1], &[1], &[8], &[1], &[16], &[1])
+                .unwrap();
+        assert!(contiguous.uses_rank_one_contiguous_path());
+
+        let higher_rank = DynamicUpdateSlicePlan::compile(
+            &[4, 4],
+            &[1, 4],
+            &[2],
+            &[1],
+            &[2, 2],
+            &[1, 2],
+            &[4, 4],
+            &[1, 4],
+        )
+        .unwrap();
+        assert!(!higher_rank.uses_rank_one_contiguous_path());
+
+        let strided =
+            DynamicUpdateSlicePlan::compile(&[16], &[2], &[1], &[1], &[8], &[2], &[16], &[2])
+                .unwrap();
+        assert!(!strided.uses_rank_one_contiguous_path());
     }
 }

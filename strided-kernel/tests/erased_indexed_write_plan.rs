@@ -1,3 +1,4 @@
+use num_complex::{Complex32, Complex64};
 use strided_kernel::{
     ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedRawStridedMut, ErasedRawStridedRef,
     ErasedScatterPlan, ExecContext, KernelDType, ScatterSpec, StridedError,
@@ -297,4 +298,323 @@ fn erased_indexed_write_plans_reject_invalid_contracts() {
         scatter_bool_err,
         StridedError::UnsupportedDType { dtype: "bool" }
     ));
+}
+
+fn strided_storage<T: Copy + Default>(values: &[T]) -> Vec<T> {
+    let mut storage = vec![T::default(); values.len().saturating_mul(2).saturating_sub(1)];
+    for (slot, &value) in storage.iter_mut().step_by(2).zip(values) {
+        *slot = value;
+    }
+    storage
+}
+
+fn assert_dynamic_fast_paths_match_generic<T>(dtype: KernelDType, values: &[T], updates: &[T])
+where
+    T: Copy + core::fmt::Debug + Default + PartialEq,
+{
+    let starts_dims = [1usize];
+    let starts_strides = [1isize];
+    let starts = [99i64];
+    let starts_ref = ErasedRawStridedRef::new(
+        KernelDType::I64,
+        as_bytes(&starts),
+        &starts_dims,
+        &starts_strides,
+        0,
+    )
+    .unwrap();
+
+    let slice_dims = [4usize];
+    let contiguous_strides = [1isize];
+    let strided_strides = [2isize];
+    let operand_dims = [values.len()];
+    let contiguous_operand = values.to_vec();
+    let strided_operand = strided_storage(values);
+    let mut contiguous_slice = vec![T::default(); slice_dims[0]];
+    let mut strided_slice = strided_storage(&contiguous_slice);
+    let contiguous_slice_plan = ErasedDynamicSlicePlan::compile(
+        dtype,
+        KernelDType::I64,
+        &operand_dims,
+        &contiguous_strides,
+        &starts_dims,
+        &starts_strides,
+        &slice_dims,
+        &contiguous_strides,
+        &slice_dims,
+    )
+    .unwrap();
+    let strided_slice_plan = ErasedDynamicSlicePlan::compile(
+        dtype,
+        KernelDType::I64,
+        &operand_dims,
+        &strided_strides,
+        &starts_dims,
+        &starts_strides,
+        &slice_dims,
+        &strided_strides,
+        &slice_dims,
+    )
+    .unwrap();
+    let contiguous_operand_ref = ErasedRawStridedRef::new(
+        dtype,
+        as_bytes(&contiguous_operand),
+        &operand_dims,
+        &contiguous_strides,
+        0,
+    )
+    .unwrap();
+    let strided_operand_ref = ErasedRawStridedRef::new(
+        dtype,
+        as_bytes(&strided_operand),
+        &operand_dims,
+        &strided_strides,
+        0,
+    )
+    .unwrap();
+    let mut contiguous_slice_ref = ErasedRawStridedMut::new(
+        dtype,
+        as_bytes_mut(&mut contiguous_slice),
+        &slice_dims,
+        &contiguous_strides,
+        0,
+    )
+    .unwrap();
+    let mut strided_slice_ref = ErasedRawStridedMut::new(
+        dtype,
+        as_bytes_mut(&mut strided_slice),
+        &slice_dims,
+        &strided_strides,
+        0,
+    )
+    .unwrap();
+    contiguous_slice_plan
+        .execute(
+            &ExecContext::max_threads(4).unwrap(),
+            &mut contiguous_slice_ref,
+            &contiguous_operand_ref,
+            &starts_ref,
+        )
+        .unwrap();
+    strided_slice_plan
+        .execute(
+            &ExecContext::max_threads(4).unwrap(),
+            &mut strided_slice_ref,
+            &strided_operand_ref,
+            &starts_ref,
+        )
+        .unwrap();
+    let strided_slice_values = strided_slice.iter().step_by(2).copied().collect::<Vec<_>>();
+    assert_eq!(contiguous_slice, strided_slice_values);
+
+    let update_dims = [updates.len()];
+    let contiguous_update = updates.to_vec();
+    let strided_update = strided_storage(updates);
+    let mut contiguous_dest = vec![T::default(); values.len()];
+    let mut strided_dest = strided_storage(&contiguous_dest);
+    let contiguous_update_plan = ErasedDynamicUpdateSlicePlan::compile(
+        dtype,
+        KernelDType::I64,
+        &operand_dims,
+        &contiguous_strides,
+        &starts_dims,
+        &starts_strides,
+        &update_dims,
+        &contiguous_strides,
+        &operand_dims,
+        &contiguous_strides,
+    )
+    .unwrap();
+    let strided_update_plan = ErasedDynamicUpdateSlicePlan::compile(
+        dtype,
+        KernelDType::I64,
+        &operand_dims,
+        &strided_strides,
+        &starts_dims,
+        &starts_strides,
+        &update_dims,
+        &strided_strides,
+        &operand_dims,
+        &strided_strides,
+    )
+    .unwrap();
+    let contiguous_update_ref = ErasedRawStridedRef::new(
+        dtype,
+        as_bytes(&contiguous_update),
+        &update_dims,
+        &contiguous_strides,
+        0,
+    )
+    .unwrap();
+    let strided_update_ref = ErasedRawStridedRef::new(
+        dtype,
+        as_bytes(&strided_update),
+        &update_dims,
+        &strided_strides,
+        0,
+    )
+    .unwrap();
+    let mut contiguous_dest_ref = ErasedRawStridedMut::new(
+        dtype,
+        as_bytes_mut(&mut contiguous_dest),
+        &operand_dims,
+        &contiguous_strides,
+        0,
+    )
+    .unwrap();
+    let mut strided_dest_ref = ErasedRawStridedMut::new(
+        dtype,
+        as_bytes_mut(&mut strided_dest),
+        &operand_dims,
+        &strided_strides,
+        0,
+    )
+    .unwrap();
+    contiguous_update_plan
+        .execute(
+            &ExecContext::max_threads(4).unwrap(),
+            &mut contiguous_dest_ref,
+            &contiguous_operand_ref,
+            &contiguous_update_ref,
+            &starts_ref,
+        )
+        .unwrap();
+    strided_update_plan
+        .execute(
+            &ExecContext::max_threads(4).unwrap(),
+            &mut strided_dest_ref,
+            &strided_operand_ref,
+            &strided_update_ref,
+            &starts_ref,
+        )
+        .unwrap();
+    let strided_dest_values = strided_dest.iter().step_by(2).copied().collect::<Vec<_>>();
+    assert_eq!(contiguous_dest, strided_dest_values);
+}
+
+#[test]
+fn erased_dynamic_fast_paths_match_generic_replay_for_every_value_dtype() {
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::F32,
+        &[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        &[10.0f32, 11.0, 12.0],
+    );
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::F64,
+        &[0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        &[10.0f64, 11.0, 12.0],
+    );
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::I32,
+        &[0i32, 1, 2, 3, 4, 5, 6, 7],
+        &[10i32, 11, 12],
+    );
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::I64,
+        &[0i64, 1, 2, 3, 4, 5, 6, 7],
+        &[10i64, 11, 12],
+    );
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::Bool,
+        &[false, true, false, true, true, false, true, false],
+        &[true, true, false],
+    );
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::C32,
+        &[
+            Complex32::new(0.0, 0.0),
+            Complex32::new(1.0, -1.0),
+            Complex32::new(2.0, -2.0),
+            Complex32::new(3.0, -3.0),
+            Complex32::new(4.0, -4.0),
+            Complex32::new(5.0, -5.0),
+            Complex32::new(6.0, -6.0),
+            Complex32::new(7.0, -7.0),
+        ],
+        &[
+            Complex32::new(10.0, 1.0),
+            Complex32::new(11.0, 2.0),
+            Complex32::new(12.0, 3.0),
+        ],
+    );
+    assert_dynamic_fast_paths_match_generic(
+        KernelDType::C64,
+        &[
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, -1.0),
+            Complex64::new(2.0, -2.0),
+            Complex64::new(3.0, -3.0),
+            Complex64::new(4.0, -4.0),
+            Complex64::new(5.0, -5.0),
+            Complex64::new(6.0, -6.0),
+            Complex64::new(7.0, -7.0),
+        ],
+        &[
+            Complex64::new(10.0, 1.0),
+            Complex64::new(11.0, 2.0),
+            Complex64::new(12.0, 3.0),
+        ],
+    );
+}
+
+#[test]
+fn erased_dynamic_slice_preserves_empty_and_negative_stride_generic_cases() {
+    let empty_plan = ErasedDynamicSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &[4],
+        &[1],
+        &[1],
+        &[1],
+        &[0],
+        &[1],
+        &[0],
+    )
+    .unwrap();
+    let operand = [0.0f64, 1.0, 2.0, 3.0];
+    let starts = [0i64];
+    let mut empty = Vec::<f64>::new();
+    let operand_ref =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&operand), &[4], &[1], 0).unwrap();
+    let starts_ref =
+        ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&starts), &[1], &[1], 0).unwrap();
+    let mut empty_ref =
+        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut empty), &[0], &[1], 0)
+            .unwrap();
+    empty_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut empty_ref,
+            &operand_ref,
+            &starts_ref,
+        )
+        .unwrap();
+
+    let reverse_plan = ErasedDynamicSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &[4],
+        &[-1],
+        &[1],
+        &[1],
+        &[4],
+        &[1],
+        &[4],
+    )
+    .unwrap();
+    let reverse_operand =
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&operand), &[4], &[-1], 3).unwrap();
+    let mut reversed = [0.0f64; 4];
+    let mut reversed_ref =
+        ErasedRawStridedMut::new(KernelDType::F64, as_bytes_mut(&mut reversed), &[4], &[1], 0)
+            .unwrap();
+    reverse_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut reversed_ref,
+            &reverse_operand,
+            &starts_ref,
+        )
+        .unwrap();
+    assert_eq!(reversed, [3.0, 2.0, 1.0, 0.0]);
 }
