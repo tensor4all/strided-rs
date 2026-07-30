@@ -273,12 +273,14 @@ fn bench_fused(context: ExecContext) {
         "fused_add_mul",
         || {
             plan.execute(&context, &mut initialized, &refs).unwrap();
-            black_box(initialized.data()[0]);
+            black_box(initialized.data_as::<f64>().unwrap()[0]);
         },
         || {
             plan.execute_uninit(&context, &mut uninitialized, &ptrs)
                 .unwrap();
-            black_box(unsafe { uninitialized.data_mut()[0].assume_init() });
+            black_box(unsafe {
+                uninitialized.data_as_uninit_mut::<f64>().unwrap()[0].assume_init()
+            });
         },
     );
 }
