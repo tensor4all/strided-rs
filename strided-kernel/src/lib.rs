@@ -96,8 +96,8 @@ pub use strided_view::{
 // Map operations
 // ============================================================================
 pub use map_view::{
-    broadcast_mul_into, compare_into, map_into, mul_into, zip_map2_into, zip_map3_into,
-    zip_map4_into, CompareOp,
+    broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
+    mul_into, mul_into_uninit, zip_map2_into, zip_map3_into, zip_map4_into, CompareOp,
 };
 
 // ============================================================================
@@ -108,7 +108,7 @@ pub use fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, FusedScal
 // ============================================================================
 // Outer-product operations
 // ============================================================================
-pub use outer_product::batched_outer_product_into;
+pub use outer_product::{batched_outer_product_into, batched_outer_product_into_uninit};
 
 // ============================================================================
 // High-level operations

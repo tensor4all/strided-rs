@@ -857,6 +857,60 @@ impl ErasedFusedPlan {
         }
         result
     }
+
+    /// Execute a single-output fused plan into fully overwritten uninitialized storage.
+    pub fn execute_uninit(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        inputs: &[ErasedRawStridedRef<'_>],
+    ) -> Result<()> {
+        if inputs.len() != self.plan.input_count {
+            return Err(StridedError::RankMismatch(
+                inputs.len(),
+                self.plan.input_count,
+            ));
+        }
+        check_dtype(self.dtype, dest.dtype())?;
+        for input in inputs {
+            check_dtype(self.dtype, input.dtype())?;
+        }
+        for (index, input) in inputs.iter().enumerate() {
+            validate_uninit_no_overlap(dest, &ErasedRawStridedPtr::from_ref(input), index)?;
+        }
+
+        let run = |dest: &mut ErasedRawStridedUninitMut<'_>| match self.dtype {
+            KernelDType::F32 => {
+                execute_fused_uninit::<f32>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            KernelDType::F64 => {
+                execute_fused_uninit::<f64>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            KernelDType::I32 => {
+                execute_fused_uninit::<i32>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            KernelDType::I64 => {
+                execute_fused_uninit::<i64>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            KernelDType::Bool => {
+                execute_fused_uninit::<bool>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            KernelDType::C32 => {
+                execute_fused_uninit::<Complex32>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            KernelDType::C64 => {
+                execute_fused_uninit::<Complex64>(&self.plan, dest, inputs, ctx.is_serial())
+            }
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if ctx.is_serial() {
+            run(dest)
+        } else {
+            ctx.run(|| run(dest))
+        }
+    }
 }
 
 impl ErasedReducePlan {
@@ -2895,6 +2949,53 @@ where
             ];
             let mut dests = [dest_view];
             execute_fused_views(ctx, &mut dests, &input_views, plan)
+        }
+        _ => Err(StridedError::UnsupportedArity {
+            arity: inputs.len(),
+            max: ERASED_FUSED_INPUT_LIMIT,
+        }),
+    }
+}
+
+fn execute_fused_uninit<T>(
+    plan: &FusedPlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    inputs: &[ErasedRawStridedRef<'_>],
+    serial: bool,
+) -> Result<()>
+where
+    T: FusedScalar,
+{
+    let dims = dest.dims();
+    let strides = dest.strides();
+    let offset = dest.offset();
+    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let mut dest_view = unsafe { StridedViewMut::new_unchecked(dest_data, dims, strides, offset) };
+    match inputs {
+        [a] => {
+            let input_views = [erased_view::<T>(a)];
+            crate::fused::fused_elementwise_into_uninit(&mut dest_view, &input_views, plan, serial)
+        }
+        [a, b] => {
+            let input_views = [erased_view::<T>(a), erased_view::<T>(b)];
+            crate::fused::fused_elementwise_into_uninit(&mut dest_view, &input_views, plan, serial)
+        }
+        [a, b, c] => {
+            let input_views = [
+                erased_view::<T>(a),
+                erased_view::<T>(b),
+                erased_view::<T>(c),
+            ];
+            crate::fused::fused_elementwise_into_uninit(&mut dest_view, &input_views, plan, serial)
+        }
+        [a, b, c, d] => {
+            let input_views = [
+                erased_view::<T>(a),
+                erased_view::<T>(b),
+                erased_view::<T>(c),
+                erased_view::<T>(d),
+            ];
+            crate::fused::fused_elementwise_into_uninit(&mut dest_view, &input_views, plan, serial)
         }
         _ => Err(StridedError::UnsupportedArity {
             arity: inputs.len(),

@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use num_complex::Complex64;
 use strided_kernel::{
     erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan, ErasedConcatenatePlan,
-    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedMapOp,
-    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
+    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedFusedPlan,
+    ErasedMapOp, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
     ErasedRawStridedUninitMut, ErasedReducePlan, ErasedReversePlan, ErasedScatterPlan,
-    ErasedSlicePlan, ErasedZipOp, ExecContext, Identity, KernelDType, RawStridedMut, RawStridedRef,
-    ReduceOp, ScatterSpec, StridedView, StridedViewMut,
+    ErasedSlicePlan, ErasedZipOp, ExecContext, FusedInst, FusedOp, FusedPlan, Identity,
+    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
 };
 
 struct CountingAllocator;
@@ -881,6 +881,67 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     assert_eq!(
         allocations, 0,
         "erased uninitialized concatenate execute must not allocate"
+    );
+
+    let dims = [32usize];
+    let strides = [1isize];
+    let lhs = [1.0f64; 32];
+    let rhs = [2.0f64; 32];
+    let inputs = [
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&lhs), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&rhs), &dims, &strides, 0).unwrap(),
+    ];
+    let plan = ErasedFusedPlan::compile(
+        KernelDType::F64,
+        FusedPlan {
+            input_count: 2,
+            outputs: vec![2],
+            ops: vec![FusedInst {
+                op: FusedOp::Add,
+                inputs: vec![0, 1],
+            }],
+        },
+    )
+    .unwrap();
+    let ctx = ExecContext::serial();
+
+    let mut initialized = vec![0.0f64; 32];
+    let mut initialized_dest = ErasedRawStridedMut::new(
+        KernelDType::F64,
+        as_bytes_mut(&mut initialized),
+        &dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+    plan.execute(&ctx, &mut initialized_dest, &inputs).unwrap();
+    let initialized_allocations = count_allocations(|| {
+        for _ in 0..8 {
+            plan.execute(&ctx, &mut initialized_dest, &inputs).unwrap();
+        }
+    });
+
+    let mut uninitialized = vec![MaybeUninit::<f64>::uninit(); 32];
+    let mut uninitialized_dest = ErasedRawStridedUninitMut::new(
+        KernelDType::F64,
+        as_uninit_bytes_mut(&mut uninitialized),
+        &dims,
+        &strides,
+        0,
+    )
+    .unwrap();
+    plan.execute_uninit(&ctx, &mut uninitialized_dest, &inputs)
+        .unwrap();
+    let uninitialized_allocations = count_allocations(|| {
+        for _ in 0..8 {
+            plan.execute_uninit(&ctx, &mut uninitialized_dest, &inputs)
+                .unwrap();
+        }
+    });
+
+    assert!(
+        uninitialized_allocations <= initialized_allocations,
+        "uninitialized replay allocated beyond initialized path: initialized={initialized_allocations}, uninitialized={uninitialized_allocations}"
     );
 }
 

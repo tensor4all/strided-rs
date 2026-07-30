@@ -1,10 +1,14 @@
 //! Runtime-DAG fused elementwise kernels.
 
+use core::mem::MaybeUninit;
+
 use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
+use crate::map_view::{
+    map_into, map_into_uninit, zip_map2_into, zip_map2_into_uninit, zip_map3_into, zip_map4_into,
+};
 use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
 
 #[cfg(feature = "parallel")]
@@ -1205,6 +1209,146 @@ pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
     validate_plan_for_scalar::<T>(plan, inputs.len(), dests.len())?;
     validate_shapes(dests, inputs)?;
     interpret_fused_elementwise_into_serial(dests, inputs, plan)
+}
+
+unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
+    dst_ptr: *mut MaybeUninit<T>,
+    input_ptrs: &[*const T],
+    plan: &FusedPlan,
+    offsets: &[isize],
+    len: usize,
+    strides: &[isize],
+) {
+    let mut regs = Vec::with_capacity(plan.input_count + plan.ops.len());
+    for i in 0..len {
+        let i = i as isize;
+        regs.clear();
+        for (input_index, &input_ptr) in input_ptrs.iter().enumerate() {
+            let stride_index = 1 + input_index;
+            regs.push(*input_ptr.offset(offsets[stride_index] + i * strides[stride_index]));
+        }
+        for inst in &plan.ops {
+            regs.push(eval_op(inst.op, &regs, &inst.inputs));
+        }
+        *dst_ptr.offset(offsets[0] + i * strides[0]) = MaybeUninit::new(regs[plan.outputs[0]]);
+    }
+}
+
+pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
+    dest: &mut StridedViewMut<'_, MaybeUninit<T>>,
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+    serial: bool,
+) -> Result<()> {
+    #[cfg(not(feature = "parallel"))]
+    let _ = serial;
+    validate_plan_for_scalar::<T>(plan, inputs.len(), 1)?;
+    if !is_injective_layout(dest.dims(), dest.strides()) {
+        return Err(StridedError::NonInjectiveOutputLayout);
+    }
+    for input in inputs {
+        ensure_same_shape(dest.dims(), input.dims())?;
+    }
+
+    if plan.ops.len() == 1 && plan.outputs.as_slice() == [plan.input_count] {
+        let inst = &plan.ops[0];
+        match op_arity(inst.op) {
+            1 => {
+                map_into_uninit(dest, &inputs[inst.inputs[0]], |x| eval_unary(inst.op, x))?;
+                return Ok(());
+            }
+            2 => {
+                zip_map2_into_uninit(
+                    dest,
+                    &inputs[inst.inputs[0]],
+                    &inputs[inst.inputs[1]],
+                    |a, b| eval_binary(inst.op, a, b),
+                )?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    let dims = dest.dims();
+    if total_len(dims) == 0 {
+        return Ok(());
+    }
+    let dst_ptr = dest.as_mut_ptr();
+    let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
+    let mut strides_list: Vec<&[isize]> = Vec::with_capacity(1 + inputs.len());
+    strides_list.push(dest.strides());
+    for input in inputs {
+        strides_list.push(input.strides());
+    }
+    let total = total_len(dims);
+    let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dims, &strides_list)
+    } else {
+        build_plan_fused(dims, &strides_list, Some(0), core::mem::size_of::<T>())
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        let total: usize = fused_dims.iter().product();
+        let nthreads = crate::execution_policy::rayon_threads();
+        if !serial && total > MINTHREADLENGTH && nthreads > 1 {
+            let dst_send = SendPtr(dst_ptr);
+            let input_send: Vec<SendPtr<T>> = input_ptrs
+                .iter()
+                .map(|&ptr| SendPtr(ptr as *mut T))
+                .collect();
+            let costs = compute_costs(&ordered_strides);
+            let initial_offsets = vec![0isize; ordered_strides.len()];
+            return mapreduce_threaded(
+                &fused_dims,
+                &kernel_plan.block,
+                &ordered_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                0,
+                1,
+                &|dims, blocks, strides_list, offsets| {
+                    let input_ptrs: Vec<*const T> =
+                        input_send.iter().map(|ptr| ptr.as_const()).collect();
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        strides_list,
+                        offsets,
+                        |offsets, len, strides| {
+                            unsafe {
+                                interpret_inner_loop_uninit(
+                                    dst_send.as_ptr(),
+                                    &input_ptrs,
+                                    plan,
+                                    offsets,
+                                    len,
+                                    strides,
+                                );
+                            }
+                            Ok(())
+                        },
+                    )
+                },
+            );
+        }
+    }
+
+    let initial_offsets = vec![0isize; ordered_strides.len()];
+    for_each_inner_block_preordered(
+        &fused_dims,
+        &kernel_plan.block,
+        &ordered_strides,
+        &initial_offsets,
+        |offsets, len, strides| {
+            unsafe {
+                interpret_inner_loop_uninit(dst_ptr, &input_ptrs, plan, offsets, len, strides);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Evaluate a runtime-DAG elementwise plan into one or more destinations.

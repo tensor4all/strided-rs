@@ -14,6 +14,7 @@ use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
+use core::mem::MaybeUninit;
 use std::ops::Mul;
 use strided_view::ElementOp;
 
@@ -905,6 +906,26 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     )
 }
 
+pub(crate) fn map_into_uninit<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    Op: ElementOp<A>,
+>(
+    dest: &mut StridedViewMut<MaybeUninit<D>>,
+    src: &StridedView<A, Op>,
+    f: impl Fn(A) -> D + MaybeSync,
+) -> Result<()> {
+    map_parts_into::<MaybeUninit<D>, A, Op>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.dims(),
+        src.strides(),
+        |value| MaybeUninit::new(f(value)),
+    )
+}
+
 pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
@@ -1151,6 +1172,27 @@ where
     }
 }
 
+/// Compare two views into a fully overwritten uninitialized Boolean output.
+pub fn compare_into_uninit<T, OpA, OpB>(
+    dest: &mut StridedViewMut<MaybeUninit<bool>>,
+    a: &StridedView<T, OpA>,
+    b: &StridedView<T, OpB>,
+    op: CompareOp,
+) -> Result<()>
+where
+    T: Copy + MaybeSendSync + PartialOrd,
+    OpA: ElementOp<T>,
+    OpB: ElementOp<T>,
+{
+    match op {
+        CompareOp::Eq => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs == rhs),
+        CompareOp::Lt => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs < rhs),
+        CompareOp::Le => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs <= rhs),
+        CompareOp::Gt => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs > rhs),
+        CompareOp::Ge => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs >= rhs),
+    }
+}
+
 pub(crate) fn zip_map2_raw_into_validated<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
@@ -1176,6 +1218,32 @@ pub(crate) fn zip_map2_raw_into_validated<
         b.strides(),
         f,
         validated,
+    )
+}
+
+pub(crate) fn zip_map2_into_uninit<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dest: &mut StridedViewMut<MaybeUninit<D>>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    f: impl Fn(A, B) -> D + MaybeSync,
+) -> Result<()> {
+    zip_map2_parts_into::<MaybeUninit<D>, A, B, OpA, OpB>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        a.ptr(),
+        a.dims(),
+        a.strides(),
+        b.ptr(),
+        b.dims(),
+        b.strides(),
+        |lhs, rhs| MaybeUninit::new(f(lhs, rhs)),
     )
 }
 
@@ -1465,6 +1533,21 @@ pub fn mul_into<
     zip_map2_into_validated(dest, a, b, |x, y| x * y, validated)
 }
 
+/// Multiply two views into a fully overwritten uninitialized output.
+pub fn mul_into_uninit<
+    D: Copy + MaybeSendSync + 'static,
+    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
+    B: Copy + MaybeSendSync + 'static,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dest: &mut StridedViewMut<MaybeUninit<D>>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+) -> Result<()> {
+    zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs * rhs)
+}
+
 fn broadcast_strides_for_axes(
     source_dims: &[usize],
     source_strides: &[isize],
@@ -1547,6 +1630,27 @@ pub fn broadcast_mul_into<
     let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
     let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
     zip_map2_into_validated(dest, &a, &b, |x, y| x * y, validated)
+}
+
+/// Broadcast and multiply into a fully overwritten uninitialized output.
+pub fn broadcast_mul_into_uninit<
+    D: Copy + MaybeSendSync + 'static,
+    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
+    B: Copy + MaybeSendSync + 'static,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+>(
+    dest: &mut StridedViewMut<MaybeUninit<D>>,
+    a: &StridedView<A, OpA>,
+    a_axes: &[usize],
+    b: &StridedView<B, OpB>,
+    b_axes: &[usize],
+) -> Result<()> {
+    let a_strides = broadcast_strides_for_axes(a.dims(), a.strides(), dest.dims(), a_axes)?;
+    let b_strides = broadcast_strides_for_axes(b.dims(), b.strides(), dest.dims(), b_axes)?;
+    let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
+    let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
+    zip_map2_into_uninit(dest, &a, &b, |lhs, rhs| lhs * rhs)
 }
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
