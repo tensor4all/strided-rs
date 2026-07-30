@@ -906,26 +906,6 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     )
 }
 
-pub(crate) fn map_into_uninit<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    Op: ElementOp<A>,
->(
-    dest: &mut StridedViewMut<MaybeUninit<D>>,
-    src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + MaybeSync,
-) -> Result<()> {
-    map_parts_into::<MaybeUninit<D>, A, Op>(
-        dest.as_mut_ptr(),
-        dest.dims(),
-        dest.strides(),
-        src.ptr(),
-        src.dims(),
-        src.strides(),
-        |value| MaybeUninit::new(f(value)),
-    )
-}
-
 pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
@@ -1185,11 +1165,11 @@ where
     OpB: ElementOp<T>,
 {
     match op {
-        CompareOp::Eq => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs == rhs),
-        CompareOp::Lt => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs < rhs),
-        CompareOp::Le => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs <= rhs),
-        CompareOp::Gt => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs > rhs),
-        CompareOp::Ge => zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs >= rhs),
+        CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs == rhs)),
+        CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs < rhs)),
+        CompareOp::Le => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs <= rhs)),
+        CompareOp::Gt => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs > rhs)),
+        CompareOp::Ge => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs >= rhs)),
     }
 }
 
@@ -1218,32 +1198,6 @@ pub(crate) fn zip_map2_raw_into_validated<
         b.strides(),
         f,
         validated,
-    )
-}
-
-pub(crate) fn zip_map2_into_uninit<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    OpA: ElementOp<A>,
-    OpB: ElementOp<B>,
->(
-    dest: &mut StridedViewMut<MaybeUninit<D>>,
-    a: &StridedView<A, OpA>,
-    b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
-) -> Result<()> {
-    zip_map2_parts_into::<MaybeUninit<D>, A, B, OpA, OpB>(
-        dest.as_mut_ptr(),
-        dest.dims(),
-        dest.strides(),
-        a.ptr(),
-        a.dims(),
-        a.strides(),
-        b.ptr(),
-        b.dims(),
-        b.strides(),
-        |lhs, rhs| MaybeUninit::new(f(lhs, rhs)),
     )
 }
 
@@ -1545,7 +1499,7 @@ pub fn mul_into_uninit<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
 ) -> Result<()> {
-    zip_map2_into_uninit(dest, a, b, |lhs, rhs| lhs * rhs)
+    zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs * rhs))
 }
 
 fn broadcast_strides_for_axes(
@@ -1650,7 +1604,7 @@ pub fn broadcast_mul_into_uninit<
     let b_strides = broadcast_strides_for_axes(b.dims(), b.strides(), dest.dims(), b_axes)?;
     let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
     let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
-    zip_map2_into_uninit(dest, &a, &b, |lhs, rhs| lhs * rhs)
+    zip_map2_into(dest, &a, &b, |lhs, rhs| MaybeUninit::new(lhs * rhs))
 }
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.

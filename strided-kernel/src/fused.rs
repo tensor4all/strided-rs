@@ -6,9 +6,7 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::map_view::{
-    map_into, map_into_uninit, zip_map2_into, zip_map2_into_uninit, zip_map3_into, zip_map4_into,
-};
+use crate::map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
 use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
 
 #[cfg(feature = "parallel")]
@@ -1254,15 +1252,17 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
         let inst = &plan.ops[0];
         match op_arity(inst.op) {
             1 => {
-                map_into_uninit(dest, &inputs[inst.inputs[0]], |x| eval_unary(inst.op, x))?;
+                map_into(dest, &inputs[inst.inputs[0]], |x| {
+                    MaybeUninit::new(eval_unary(inst.op, x))
+                })?;
                 return Ok(());
             }
             2 => {
-                zip_map2_into_uninit(
+                zip_map2_into(
                     dest,
                     &inputs[inst.inputs[0]],
                     &inputs[inst.inputs[1]],
-                    |a, b| eval_binary(inst.op, a, b),
+                    |a, b| MaybeUninit::new(eval_binary(inst.op, a, b)),
                 )?;
                 return Ok(());
             }
