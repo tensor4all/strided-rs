@@ -27,6 +27,15 @@ type AxisVec<T> = Vec<T>;
 
 const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
 
+#[inline]
+fn validate_destination_layout(dims: &[usize], strides: &[isize]) -> Result<()> {
+    if crate::fused::is_injective_layout(dims, strides) {
+        Ok(())
+    } else {
+        Err(StridedError::NonInjectiveOutputLayout)
+    }
+}
+
 // ============================================================================
 // Stride-specialized inner loop helpers
 //
@@ -902,6 +911,7 @@ fn map_parts_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementO
     f: impl Fn(A) -> D + MaybeSync,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, src_dims)?;
+    validate_destination_layout(dst_dims, dst_strides)?;
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
         let len = total_len(dst_dims);
@@ -1043,9 +1053,6 @@ where
     OpA: ElementOp<T>,
     OpB: ElementOp<T>,
 {
-    if !crate::fused::is_injective_layout_without_alloc(dest.dims(), dest.strides()) {
-        return Err(StridedError::NonInjectiveOutputLayout);
-    }
     match op {
         CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| lhs == rhs),
         CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| lhs < rhs),
@@ -1102,6 +1109,7 @@ fn zip_map2_parts_into<
 ) -> Result<()> {
     ensure_same_shape(dst_dims, a_dims)?;
     ensure_same_shape(dst_dims, b_dims)?;
+    validate_destination_layout(dst_dims, dst_strides)?;
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
         let len = total_len(dst_dims);
@@ -1450,6 +1458,7 @@ pub fn zip_map3_into<
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
@@ -1583,6 +1592,7 @@ pub fn zip_map4_into<
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
     ensure_same_shape(dest.dims(), e.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
