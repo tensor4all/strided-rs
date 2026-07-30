@@ -185,6 +185,16 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dst = vec![0.0f64; 256];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
+    let mut typed_dst = vec![0.0f64; 256];
+    let lhs_view: StridedView<'_, f64, Identity> =
+        StridedView::new(&lhs, &dims, &strides, 0).unwrap();
+    let rhs_view: StridedView<'_, f64, Identity> =
+        StridedView::new(&rhs, &dims, &strides, 0).unwrap();
+    let mut typed_dest = StridedViewMut::new(&mut typed_dst, &dims, &strides, 0).unwrap();
+    // Warm each exact counted sequence symmetrically so TLS/coverage runtime
+    // initialization is outside both allocation windows.
+    zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
+    map_into(&mut typed_dest, &lhs_view, |value| -value).unwrap();
     erased_zip_into(
         KernelDType::F64,
         ErasedZipOp::Add,
@@ -194,13 +204,14 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         &ErasedRawStridedPtr::from_ref(&rhs_ref),
     )
     .unwrap();
-    let mut typed_dst = vec![0.0f64; 256];
-    let lhs_view: StridedView<'_, f64, Identity> =
-        StridedView::new(&lhs, &dims, &strides, 0).unwrap();
-    let rhs_view: StridedView<'_, f64, Identity> =
-        StridedView::new(&rhs, &dims, &strides, 0).unwrap();
-    let mut typed_dest = StridedViewMut::new(&mut typed_dst, &dims, &strides, 0).unwrap();
-    zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
+    erased_map_into(
+        KernelDType::F64,
+        ErasedMapOp::Negate,
+        &ExecContext::serial(),
+        &mut dest,
+        &ErasedRawStridedPtr::from_ref(&lhs_ref),
+    )
+    .unwrap();
     let kernel_allocations = count_allocations(|| {
         for _ in 0..16 {
             zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
