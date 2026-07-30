@@ -6,7 +6,10 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::map_view::{map_into, zip_map2_into, zip_map3_into, zip_map4_into};
+use crate::map_view::{
+    map_into_validated, validate_destination_layout_without_alloc, zip_map2_into_validated,
+    zip_map3_into_validated, zip_map4_into_validated, ValidatedDestinationLayout,
+};
 use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
 
 #[cfg(feature = "parallel")]
@@ -919,51 +922,32 @@ fn eval_ternary<T: FusedScalar>(op: FusedOp, a: T, b: T, c: T) -> T {
     }
 }
 
-fn try_static_specialization<T: FusedScalar>(
-    dests: &mut [StridedViewMut<'_, T>],
-    inputs: &[StridedView<'_, T>],
-    plan: &FusedPlan,
-) -> Result<bool> {
-    if dests.len() != 1 || plan.outputs.len() != 1 {
-        return Ok(false);
-    }
+#[derive(Clone, Copy)]
+enum StaticFusedKind {
+    Unary(FusedOp, usize),
+    Binary(FusedOp, usize, usize),
+    Ternary(FusedOp, usize, usize, usize),
+    AddMulLeft,
+    AddMulRight,
+    MulAddExp,
+    DivClampSqrtRsqrt,
+}
 
+fn classify_static_specialization(plan: &FusedPlan) -> Option<StaticFusedKind> {
+    if plan.outputs.len() != 1 {
+        return None;
+    }
     if let [inst] = plan.ops.as_slice() {
-        let output_id = plan.input_count;
-        if plan.outputs[0] != output_id {
-            return Ok(false);
+        if plan.outputs[0] != plan.input_count {
+            return None;
         }
-
-        match op_arity(inst.op) {
-            1 => {
-                map_into(&mut dests[0], &inputs[inst.inputs[0]], |x| {
-                    eval_unary(inst.op, x)
-                })?;
-                return Ok(true);
-            }
-            2 => {
-                zip_map2_into(
-                    &mut dests[0],
-                    &inputs[inst.inputs[0]],
-                    &inputs[inst.inputs[1]],
-                    |a, b| eval_binary(inst.op, a, b),
-                )?;
-                return Ok(true);
-            }
-            3 => {
-                zip_map3_into(
-                    &mut dests[0],
-                    &inputs[inst.inputs[0]],
-                    &inputs[inst.inputs[1]],
-                    &inputs[inst.inputs[2]],
-                    |a, b, c| eval_ternary(inst.op, a, b, c),
-                )?;
-                return Ok(true);
-            }
-            _ => unreachable!("unsupported fused op arity"),
-        }
+        return match (op_arity(inst.op), inst.inputs.as_slice()) {
+            (1, [a]) => Some(StaticFusedKind::Unary(inst.op, *a)),
+            (2, [a, b]) => Some(StaticFusedKind::Binary(inst.op, *a, *b)),
+            (3, [a, b, c]) => Some(StaticFusedKind::Ternary(inst.op, *a, *b, *c)),
+            _ => None,
+        };
     }
-
     if plan.input_count == 2
         && plan.outputs.as_slice() == [3]
         && plan.ops.len() == 2
@@ -971,23 +955,12 @@ fn try_static_specialization<T: FusedScalar>(
         && plan.ops[0].inputs.as_slice() == [0, 1]
         && plan.ops[1].op == FusedOp::Multiply
     {
-        match plan.ops[1].inputs.as_slice() {
-            [2, 0] => {
-                zip_map2_into(&mut dests[0], &inputs[0], &inputs[1], |a, b| {
-                    a.fused_add(b).fused_multiply(a)
-                })?;
-                return Ok(true);
-            }
-            [0, 2] => {
-                zip_map2_into(&mut dests[0], &inputs[0], &inputs[1], |a, b| {
-                    a.fused_multiply(a.fused_add(b))
-                })?;
-                return Ok(true);
-            }
-            _ => {}
-        }
+        return match plan.ops[1].inputs.as_slice() {
+            [2, 0] => Some(StaticFusedKind::AddMulLeft),
+            [0, 2] => Some(StaticFusedKind::AddMulRight),
+            _ => None,
+        };
     }
-
     if plan.input_count == 3
         && plan.outputs.as_slice() == [5]
         && plan.ops.len() == 3
@@ -998,16 +971,8 @@ fn try_static_specialization<T: FusedScalar>(
         && plan.ops[2].op == FusedOp::Exp
         && plan.ops[2].inputs.as_slice() == [4]
     {
-        zip_map3_into(
-            &mut dests[0],
-            &inputs[0],
-            &inputs[1],
-            &inputs[2],
-            |a, b, c| a.fused_multiply(b).fused_add(c).fused_exp(),
-        )?;
-        return Ok(true);
+        return Some(StaticFusedKind::MulAddExp);
     }
-
     if plan.input_count == 4
         && plan.outputs.as_slice() == [8]
         && plan.ops.len() == 5
@@ -1022,24 +987,127 @@ fn try_static_specialization<T: FusedScalar>(
         && plan.ops[4].op == FusedOp::Rsqrt
         && plan.ops[4].inputs.as_slice() == [7]
     {
-        zip_map4_into(
-            &mut dests[0],
+        return Some(StaticFusedKind::DivClampSqrtRsqrt);
+    }
+    None
+}
+
+trait StaticOutput<T: FusedScalar> {
+    type Value: Copy + MaybeSendSync;
+
+    fn write(value: T) -> Self::Value;
+}
+
+struct InitializedStaticOutput;
+
+impl<T: FusedScalar> StaticOutput<T> for InitializedStaticOutput {
+    type Value = T;
+
+    #[inline(always)]
+    fn write(value: T) -> T {
+        value
+    }
+}
+
+struct UninitializedStaticOutput;
+
+impl<T: FusedScalar> StaticOutput<T> for UninitializedStaticOutput {
+    type Value = MaybeUninit<T>;
+
+    #[inline(always)]
+    fn write(value: T) -> MaybeUninit<T> {
+        MaybeUninit::new(value)
+    }
+}
+
+fn try_static_specialization_validated<T, O>(
+    dest: &mut StridedViewMut<'_, O::Value>,
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+    validated: ValidatedDestinationLayout,
+) -> Result<bool>
+where
+    T: FusedScalar,
+    O: StaticOutput<T>,
+{
+    match classify_static_specialization(plan) {
+        Some(StaticFusedKind::Unary(op, a)) => {
+            map_into_validated(dest, &inputs[a], |x| O::write(eval_unary(op, x)), validated)?
+        }
+        Some(StaticFusedKind::Binary(op, a, b)) => zip_map2_into_validated(
+            dest,
+            &inputs[a],
+            &inputs[b],
+            |x, y| O::write(eval_binary(op, x, y)),
+            validated,
+        )?,
+        Some(StaticFusedKind::Ternary(op, a, b, c)) => zip_map3_into_validated(
+            dest,
+            &inputs[a],
+            &inputs[b],
+            &inputs[c],
+            |x, y, z| O::write(eval_ternary(op, x, y, z)),
+            validated,
+        )?,
+        Some(StaticFusedKind::AddMulLeft) => zip_map2_into_validated(
+            dest,
+            &inputs[0],
+            &inputs[1],
+            |a, b| O::write(a.fused_add(b).fused_multiply(a)),
+            validated,
+        )?,
+        Some(StaticFusedKind::AddMulRight) => zip_map2_into_validated(
+            dest,
+            &inputs[0],
+            &inputs[1],
+            |a, b| O::write(a.fused_multiply(a.fused_add(b))),
+            validated,
+        )?,
+        Some(StaticFusedKind::MulAddExp) => zip_map3_into_validated(
+            dest,
+            &inputs[0],
+            &inputs[1],
+            &inputs[2],
+            |a, b, c| O::write(a.fused_multiply(b).fused_add(c).fused_exp()),
+            validated,
+        )?,
+        Some(StaticFusedKind::DivClampSqrtRsqrt) => zip_map4_into_validated(
+            dest,
             &inputs[0],
             &inputs[1],
             &inputs[2],
             &inputs[3],
             |a, b, lo, hi| {
-                a.fused_divide(b)
-                    .fused_maximum(lo)
-                    .fused_minimum(hi)
-                    .fused_sqrt()
-                    .fused_rsqrt()
+                O::write(
+                    a.fused_divide(b)
+                        .fused_maximum(lo)
+                        .fused_minimum(hi)
+                        .fused_sqrt()
+                        .fused_rsqrt(),
+                )
             },
-        )?;
-        return Ok(true);
+            validated,
+        )?,
+        None => return Ok(false),
     }
+    Ok(true)
+}
 
-    Ok(false)
+fn try_static_specialization<T: FusedScalar>(
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+) -> Result<bool> {
+    if dests.len() != 1 {
+        return Ok(false);
+    }
+    let validated = validate_destination_layout_without_alloc(dests[0].dims(), dests[0].strides())?;
+    try_static_specialization_validated::<T, InitializedStaticOutput>(
+        &mut dests[0],
+        inputs,
+        plan,
+        validated,
+    )
 }
 
 unsafe fn interpret_inner_loop<T: FusedScalar>(
@@ -1237,37 +1305,21 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
     serial: bool,
+    validated: ValidatedDestinationLayout,
 ) -> Result<()> {
     #[cfg(not(feature = "parallel"))]
     let _ = serial;
     validate_plan_for_scalar::<T>(plan, inputs.len(), 1)?;
-    if !is_injective_layout(dest.dims(), dest.strides()) {
-        return Err(StridedError::NonInjectiveOutputLayout);
-    }
     for input in inputs {
         ensure_same_shape(dest.dims(), input.dims())?;
     }
 
-    if plan.ops.len() == 1 && plan.outputs.as_slice() == [plan.input_count] {
-        let inst = &plan.ops[0];
-        match op_arity(inst.op) {
-            1 => {
-                map_into(dest, &inputs[inst.inputs[0]], |x| {
-                    MaybeUninit::new(eval_unary(inst.op, x))
-                })?;
-                return Ok(());
-            }
-            2 => {
-                zip_map2_into(
-                    dest,
-                    &inputs[inst.inputs[0]],
-                    &inputs[inst.inputs[1]],
-                    |a, b| MaybeUninit::new(eval_binary(inst.op, a, b)),
-                )?;
-                return Ok(());
-            }
-            _ => {}
-        }
+    if !serial
+        && try_static_specialization_validated::<T, UninitializedStaticOutput>(
+            dest, inputs, plan, validated,
+        )?
+    {
+        return Ok(());
     }
 
     let dims = dest.dims();
@@ -1391,6 +1443,110 @@ pub fn fused_elementwise_into<T: FusedScalar>(
 mod tests {
     use super::*;
     use crate::StridedArray;
+    #[cfg(feature = "parallel")]
+    use std::sync::Mutex;
+
+    #[cfg(feature = "parallel")]
+    static UNINIT_WORKER_IDS: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+
+    #[cfg(feature = "parallel")]
+    #[derive(Clone, Copy)]
+    struct ThreadTracked(u64);
+
+    #[cfg(feature = "parallel")]
+    impl ThreadTracked {
+        fn observed(value: u64) -> Self {
+            let id = std::thread::current().id();
+            let mut ids = UNINIT_WORKER_IDS.lock().unwrap();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+            drop(ids);
+            for _ in 0..32 {
+                std::hint::spin_loop();
+            }
+            Self(value)
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    impl FusedScalar for ThreadTracked {
+        fn fused_add(self, rhs: Self) -> Self {
+            Self::observed(self.0 + rhs.0)
+        }
+
+        fn fused_multiply(self, rhs: Self) -> Self {
+            Self(self.0 * rhs.0)
+        }
+
+        fn fused_negate(self) -> Self {
+            self
+        }
+
+        fn fused_conj(self) -> Self {
+            self
+        }
+
+        fn fused_divide(self, _rhs: Self) -> Self {
+            self
+        }
+
+        fn fused_abs(self) -> Self {
+            self
+        }
+
+        fn fused_maximum(self, _rhs: Self) -> Self {
+            self
+        }
+
+        fn fused_minimum(self, _rhs: Self) -> Self {
+            self
+        }
+
+        fn fused_clamp(self, _min: Self, _max: Self) -> Self {
+            self
+        }
+
+        fn fused_exp(self) -> Self {
+            self
+        }
+
+        fn fused_log(self) -> Self {
+            self
+        }
+
+        fn fused_sin(self) -> Self {
+            self
+        }
+
+        fn fused_cos(self) -> Self {
+            self
+        }
+
+        fn fused_tanh(self) -> Self {
+            self
+        }
+
+        fn fused_sqrt(self) -> Self {
+            self
+        }
+
+        fn fused_rsqrt(self) -> Self {
+            self
+        }
+
+        fn fused_pow(self, _rhs: Self) -> Self {
+            self
+        }
+
+        fn fused_expm1(self) -> Self {
+            self
+        }
+
+        fn fused_log1p(self) -> Self {
+            self
+        }
+    }
 
     fn input(values: &[f64]) -> StridedArray<f64> {
         StridedArray::from_parts(values.to_vec(), &[values.len()], &[1], 0).unwrap()
@@ -1425,6 +1581,56 @@ mod tests {
         for (actual, expected) in static_values.iter().zip(interpreter_values.iter()) {
             assert!((actual - expected).abs() < 1e-12);
         }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_threshold() {
+        use crate::{with_execution_policy, ExecContext, ExecutionPolicy};
+        use std::num::NonZeroUsize;
+
+        let len = MINTHREADLENGTH + 65;
+        let lhs = vec![ThreadTracked(1); len];
+        let rhs = vec![ThreadTracked(2); len];
+        let lhs = StridedView::new(&lhs, &[len], &[1], 0).unwrap();
+        let rhs = StridedView::new(&rhs, &[len], &[1], 0).unwrap();
+        let inputs = [lhs, rhs];
+        let plan = FusedPlan {
+            input_count: 2,
+            outputs: vec![2],
+            ops: vec![FusedInst {
+                op: FusedOp::Add,
+                inputs: vec![0, 1],
+            }],
+        };
+        let four = NonZeroUsize::new(4).unwrap();
+
+        let caller = std::thread::current().id();
+        let mut output = vec![MaybeUninit::uninit(); len];
+        let mut dest = StridedViewMut::new(&mut output, &[len], &[1], 0).unwrap();
+        let validated =
+            validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
+        UNINIT_WORKER_IDS.lock().unwrap().clear();
+        with_execution_policy(ExecutionPolicy::Rayon { max_threads: four }, || {
+            fused_elementwise_into_uninit(&mut dest, &inputs, &plan, true, validated).unwrap();
+        });
+        assert_eq!(*UNINIT_WORKER_IDS.lock().unwrap(), vec![caller]);
+
+        let mut output = vec![MaybeUninit::uninit(); len];
+        let mut dest = StridedViewMut::new(&mut output, &[len], &[1], 0).unwrap();
+        let validated =
+            validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
+        UNINIT_WORKER_IDS.lock().unwrap().clear();
+        let ctx = ExecContext::max_threads(2).unwrap();
+        ctx.run(|| {
+            fused_elementwise_into_uninit(&mut dest, &inputs, &plan, false, validated).unwrap();
+        });
+        let workers = UNINIT_WORKER_IDS.lock().unwrap();
+        assert!(
+            workers.len() > 1,
+            "bounded replay must cross the parallel threshold"
+        );
+        assert!(workers.len() <= 2, "bounded replay exceeded max_threads(2)");
     }
 
     // Single-instruction plan whose sole output is the instruction result. Such

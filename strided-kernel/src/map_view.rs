@@ -32,6 +32,7 @@ type AxisVec<T> = Vec<T>;
 
 const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
 
+#[derive(Clone, Copy)]
 pub(crate) struct ValidatedDestinationLayout(());
 
 #[inline]
@@ -56,6 +57,87 @@ pub(crate) fn validate_destination_layout_without_alloc(
     } else {
         Err(StridedError::NonInjectiveOutputLayout)
     }
+}
+
+fn reachable_byte_range(
+    ptr: usize,
+    elem_size: usize,
+    dims: &[usize],
+    strides: &[isize],
+) -> Result<Option<(usize, usize)>> {
+    if elem_size == 0 || dims.contains(&0) {
+        return Ok(None);
+    }
+
+    let mut min_offset = 0isize;
+    let mut max_offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides) {
+        if dim <= 1 {
+            continue;
+        }
+        let extent = isize::try_from(dim - 1).map_err(|_| StridedError::OffsetOverflow)?;
+        let span = stride
+            .checked_mul(extent)
+            .ok_or(StridedError::OffsetOverflow)?;
+        if span < 0 {
+            min_offset = min_offset
+                .checked_add(span)
+                .ok_or(StridedError::OffsetOverflow)?;
+        } else {
+            max_offset = max_offset
+                .checked_add(span)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+
+    let ptr = ptr as i128;
+    let elem_size = elem_size as i128;
+    let start = ptr
+        .checked_add(
+            (min_offset as i128)
+                .checked_mul(elem_size)
+                .ok_or(StridedError::OffsetOverflow)?,
+        )
+        .ok_or(StridedError::OffsetOverflow)?;
+    let end = ptr
+        .checked_add(
+            (max_offset as i128)
+                .checked_mul(elem_size)
+                .and_then(|offset| offset.checked_add(elem_size))
+                .ok_or(StridedError::OffsetOverflow)?,
+        )
+        .ok_or(StridedError::OffsetOverflow)?;
+    if start < 0 || end < 0 || start > usize::MAX as i128 || end > usize::MAX as i128 {
+        return Err(StridedError::OffsetOverflow);
+    }
+    Ok(Some((start as usize, end as usize)))
+}
+
+fn validate_typed_no_overlap<D, A, Op: ElementOp<A>>(
+    dest: &StridedViewMut<MaybeUninit<D>>,
+    input: &StridedView<A, Op>,
+    input_index: usize,
+) -> Result<()> {
+    let dest_range = reachable_byte_range(
+        dest.ptr() as usize,
+        core::mem::size_of::<D>(),
+        dest.dims(),
+        dest.strides(),
+    )?;
+    let input_range = reachable_byte_range(
+        input.ptr() as usize,
+        core::mem::size_of::<A>(),
+        input.dims(),
+        input.strides(),
+    )?;
+    if let (Some((dest_start, dest_end)), Some((input_start, input_end))) =
+        (dest_range, input_range)
+    {
+        if dest_start < input_end && input_start < dest_end {
+            return Err(StridedError::OverlappingInputOutput { input: input_index });
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -177,13 +259,105 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
 }
 
 /// Binary multiplication inner loop for identity element ops.
+trait MulOutput<D: Copy + 'static>: Copy + MaybeSendSync + 'static {
+    type Slot: Copy + MaybeSendSync + 'static;
+
+    unsafe fn write(dst: *mut Self::Slot, value: D);
+
+    unsafe fn try_contiguous<A: 'static, B: 'static>(
+        dst: *mut Self::Slot,
+        len: usize,
+        a: &[A],
+        b: &[B],
+    ) -> bool;
+}
+
+#[derive(Clone, Copy)]
+struct InitializedOutput;
+
+impl<D: Copy + MaybeSendSync + 'static> MulOutput<D> for InitializedOutput {
+    type Slot = D;
+
+    #[inline(always)]
+    unsafe fn write(dst: *mut D, value: D) {
+        unsafe { dst.write(value) };
+    }
+
+    #[inline(always)]
+    unsafe fn try_contiguous<A: 'static, B: 'static>(
+        dst: *mut D,
+        len: usize,
+        a: &[A],
+        b: &[B],
+    ) -> bool {
+        unsafe { simd::try_mul_contiguous_ptr(dst, len, a, b) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UninitializedOutput;
+
+impl<D: Copy + MaybeSendSync + 'static> MulOutput<D> for UninitializedOutput {
+    type Slot = MaybeUninit<D>;
+
+    #[inline(always)]
+    unsafe fn write(dst: *mut MaybeUninit<D>, value: D) {
+        unsafe { dst.write(MaybeUninit::new(value)) };
+    }
+
+    #[inline(always)]
+    unsafe fn try_contiguous<A: 'static, B: 'static>(
+        dst: *mut MaybeUninit<D>,
+        len: usize,
+        a: &[A],
+        b: &[B],
+    ) -> bool {
+        // SIMD stores write complete values directly through raw pointers; no
+        // initialized reference is formed over the uninitialized destination.
+        unsafe { simd::try_mul_contiguous_ptr(dst.cast::<D>(), len, a, b) }
+    }
+}
+
+#[inline(always)]
+fn multiply_value<A, B, D>(lhs: A, rhs: B) -> D
+where
+    A: Copy + Mul<B, Output = D> + 'static,
+    B: Copy + 'static,
+    D: Copy + 'static,
+{
+    use core::any::TypeId;
+
+    if TypeId::of::<A>() == TypeId::of::<i32>()
+        && TypeId::of::<B>() == TypeId::of::<i32>()
+        && TypeId::of::<D>() == TypeId::of::<i32>()
+    {
+        // The exact TypeId checks prove identical layout and validity.
+        let lhs = unsafe { *(&lhs as *const A).cast::<i32>() };
+        let rhs = unsafe { *(&rhs as *const B).cast::<i32>() };
+        let value = lhs.wrapping_mul(rhs);
+        return unsafe { core::mem::transmute_copy(&value) };
+    }
+    if TypeId::of::<A>() == TypeId::of::<i64>()
+        && TypeId::of::<B>() == TypeId::of::<i64>()
+        && TypeId::of::<D>() == TypeId::of::<i64>()
+    {
+        // The exact TypeId checks prove identical layout and validity.
+        let lhs = unsafe { *(&lhs as *const A).cast::<i64>() };
+        let rhs = unsafe { *(&rhs as *const B).cast::<i64>() };
+        let value = lhs.wrapping_mul(rhs);
+        return unsafe { core::mem::transmute_copy(&value) };
+    }
+    lhs * rhs
+}
+
 #[inline(always)]
 unsafe fn inner_loop_mul2<
+    O: MulOutput<D>,
     D: Copy + 'static,
     A: Copy + Mul<B, Output = D> + 'static,
     B: Copy + 'static,
 >(
-    dp: *mut D,
+    dp: *mut O::Slot,
     ds: isize,
     ap: *const A,
     a_s: isize,
@@ -194,48 +368,42 @@ unsafe fn inner_loop_mul2<
     if ds == 1 && a_s == 1 && b_s == 1 {
         let src_a = std::slice::from_raw_parts(ap, len);
         let src_b = std::slice::from_raw_parts(bp, len);
-        let dst = std::slice::from_raw_parts_mut(dp, len);
-        if len >= 64 && simd::try_mul_contiguous(dst, src_a, src_b) {
+        if len >= 64 && O::try_contiguous(dp, len, src_a, src_b) {
             return;
         }
         for i in 0..len {
-            dst[i] = src_a[i] * src_b[i];
+            O::write(dp.add(i), multiply_value(src_a[i], src_b[i]));
         }
     } else if ds == 1 && a_s == 1 && b_s == 0 {
         let src_a = std::slice::from_raw_parts(ap, len);
         let b = *bp;
-        let dst = std::slice::from_raw_parts_mut(dp, len);
         for i in 0..len {
-            dst[i] = src_a[i] * b;
+            O::write(dp.add(i), multiply_value(src_a[i], b));
         }
     } else if ds == 1 && a_s == 0 && b_s == 1 {
         let a = *ap;
         let src_b = std::slice::from_raw_parts(bp, len);
-        let dst = std::slice::from_raw_parts_mut(dp, len);
         for i in 0..len {
-            dst[i] = a * src_b[i];
+            O::write(dp.add(i), multiply_value(a, src_b[i]));
         }
     } else if ds == 1 && a_s == 0 && b_s == 0 {
         let a = *ap;
         let b = *bp;
-        let dst = std::slice::from_raw_parts_mut(dp, len);
-        for d in dst.iter_mut() {
-            *d = a * b;
+        for i in 0..len {
+            O::write(dp.add(i), multiply_value(a, b));
         }
     } else if ds == 1 && b_s == 0 {
         let b = *bp;
-        let dst = std::slice::from_raw_parts_mut(dp, len);
         let mut ap = ap;
-        for d in dst.iter_mut() {
-            *d = *ap * b;
+        for i in 0..len {
+            O::write(dp.add(i), multiply_value(*ap, b));
             ap = ap.offset(a_s);
         }
     } else if ds == 1 && a_s == 0 {
         let a = *ap;
-        let dst = std::slice::from_raw_parts_mut(dp, len);
         let mut bp = bp;
-        for d in dst.iter_mut() {
-            *d = a * *bp;
+        for i in 0..len {
+            O::write(dp.add(i), multiply_value(a, *bp));
             bp = bp.offset(b_s);
         }
     } else {
@@ -243,7 +411,7 @@ unsafe fn inner_loop_mul2<
         let mut ap = ap;
         let mut bp = bp;
         for _ in 0..len {
-            *dp = *ap * *bp;
+            O::write(dp, multiply_value(*ap, *bp));
             dp = dp.offset(ds);
             ap = ap.offset(a_s);
             bp = bp.offset(b_s);
@@ -487,11 +655,12 @@ impl<'a> ContiguousMulOuterCursor<'a> {
 
 #[inline(always)]
 unsafe fn run_contiguous_mul_row_block<
+    O: MulOutput<D>,
     D: Copy + 'static,
     A: Copy + Mul<B, Output = D> + 'static,
     B: Copy + 'static,
 >(
-    dst_ptr: *mut D,
+    dst_ptr: *mut O::Slot,
     a_ptr: *const A,
     b_ptr: *const B,
     plan: &ContiguousMulRangePlan,
@@ -510,7 +679,7 @@ unsafe fn run_contiguous_mul_row_block<
         match transposed_scalar_tile_kind(plan) {
             Some(TransposedScalarTileKind::RhsScalar) => {
                 if simd::try_mul_transposed_scalar_rhs_2d::<D, A, B>(
-                    dst_ptr.add(base_index),
+                    dst_ptr.add(base_index).cast::<D>(),
                     a_ptr.offset(base_a_offset),
                     b_ptr.offset(base_b_offset),
                     inner_len,
@@ -523,7 +692,7 @@ unsafe fn run_contiguous_mul_row_block<
             }
             Some(TransposedScalarTileKind::LhsScalar) => {
                 if simd::try_mul_transposed_scalar_lhs_2d::<D, A, B>(
-                    dst_ptr.add(base_index),
+                    dst_ptr.add(base_index).cast::<D>(),
                     a_ptr.offset(base_a_offset),
                     b_ptr.offset(base_b_offset),
                     inner_len,
@@ -547,7 +716,7 @@ unsafe fn run_contiguous_mul_row_block<
             break;
         }
         let len = inner_len.min(total - index);
-        inner_loop_mul2::<D, A, B>(
+        inner_loop_mul2::<O, D, A, B>(
             dst_ptr.add(index),
             1,
             a_ptr.offset(a_offset),
@@ -583,11 +752,12 @@ fn strided_offset_for_contiguous_linear_index(
 }
 
 fn try_contiguous_range_mul<
+    O: MulOutput<D>,
     D: Copy + MaybeSendSync + 'static,
     A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
     B: Copy + MaybeSendSync + 'static,
 >(
-    dst_ptr: *mut D,
+    dst_ptr: *mut O::Slot,
     dims: &[usize],
     dst_strides: &[isize],
     a_ptr: *const A,
@@ -649,7 +819,7 @@ fn try_contiguous_range_mul<
                             );
 
                             unsafe {
-                                inner_loop_mul2::<D, A, B>(
+                                inner_loop_mul2::<O, D, A, B>(
                                     dst.as_ptr().add(index),
                                     1,
                                     a.as_const().offset(a_offset),
@@ -685,7 +855,7 @@ fn try_contiguous_range_mul<
                     for group in group_start..group_end {
                         let index = group * block_len;
                         unsafe {
-                            run_contiguous_mul_row_block::<D, A, B>(
+                            run_contiguous_mul_row_block::<O, D, A, B>(
                                 dst.as_ptr(),
                                 a.as_const(),
                                 b.as_const(),
@@ -703,7 +873,7 @@ fn try_contiguous_range_mul<
 
             true
         } else {
-            run_contiguous_range_mul_single_thread(
+            run_contiguous_range_mul_single_thread::<O, D, A, B>(
                 dst_ptr,
                 dims,
                 a_ptr,
@@ -720,7 +890,7 @@ fn try_contiguous_range_mul<
 
     #[cfg(not(feature = "parallel"))]
     {
-        run_contiguous_range_mul_single_thread(
+        run_contiguous_range_mul_single_thread::<O, D, A, B>(
             dst_ptr,
             dims,
             a_ptr,
@@ -736,11 +906,12 @@ fn try_contiguous_range_mul<
 }
 
 fn run_contiguous_range_mul_single_thread<
+    O: MulOutput<D>,
     D: Copy + MaybeSendSync + 'static,
     A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
     B: Copy + MaybeSendSync + 'static,
 >(
-    dst_ptr: *mut D,
+    dst_ptr: *mut O::Slot,
     dims: &[usize],
     a_ptr: *const A,
     a_strides: &[isize],
@@ -755,7 +926,7 @@ fn run_contiguous_range_mul_single_thread<
     for group in 0..outer_groups {
         let index = group * block_len;
         unsafe {
-            run_contiguous_mul_row_block::<D, A, B>(
+            run_contiguous_mul_row_block::<O, D, A, B>(
                 dst_ptr,
                 a_ptr,
                 b_ptr,
@@ -903,6 +1074,28 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
         src.dims(),
         src.strides(),
         f,
+    )
+}
+
+pub(crate) fn map_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    Op: ElementOp<A>,
+>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<A, Op>,
+    f: impl Fn(A) -> D + MaybeSync,
+    validated: ValidatedDestinationLayout,
+) -> Result<()> {
+    ensure_same_shape(dest.dims(), src.dims())?;
+    map_parts_into_validated::<D, A, Op>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.strides(),
+        f,
+        validated,
     )
 }
 
@@ -1085,7 +1278,7 @@ pub fn zip_map2_into<
     )
 }
 
-fn zip_map2_into_validated<
+pub(crate) fn zip_map2_into_validated<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
     B: Copy + MaybeSendSync,
@@ -1129,7 +1322,7 @@ pub enum CompareOp {
 ///
 /// # Errors
 ///
-/// Returns [`StridedError::DimensionMismatch`] when the source and destination
+/// Returns [`StridedError::ShapeMismatch`] when the source and destination
 /// shapes differ, or [`StridedError::NonInjectiveOutputLayout`] when distinct
 /// logical destination elements may overlap.
 pub fn compare_into<T, OpA, OpB>(
@@ -1153,6 +1346,23 @@ where
 }
 
 /// Compare two views into a fully overwritten uninitialized Boolean output.
+///
+/// Dtype-independent shape, destination-injectivity, and reachable-byte
+/// overlap validation completes before the first write. Safe Rust borrows
+/// already prevent input/output aliasing; the explicit overlap check preserves
+/// the contract for views produced through unsafe constructors.
+///
+/// `Ok(())` means every logical destination element is initialized. An error
+/// occurs before writes. A panic during replay may leave a partially initialized
+/// destination, which remains safe to drop as `MaybeUninit<bool>`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::ShapeMismatch`] for unequal shapes,
+/// [`StridedError::NonInjectiveOutputLayout`] for an overlapping output layout,
+/// [`StridedError::OverlappingInputOutput`] for aliased storage, or
+/// [`StridedError::OffsetOverflow`] when a reachable byte range is not
+/// representable.
 pub fn compare_into_uninit<T, OpA, OpB>(
     dest: &mut StridedViewMut<MaybeUninit<bool>>,
     a: &StridedView<T, OpA>,
@@ -1164,12 +1374,47 @@ where
     OpA: ElementOp<T>,
     OpB: ElementOp<T>,
 {
+    ensure_same_shape(dest.dims(), a.dims())?;
+    ensure_same_shape(dest.dims(), b.dims())?;
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
+    validate_typed_no_overlap(dest, a, 0)?;
+    validate_typed_no_overlap(dest, b, 1)?;
     match op {
-        CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs == rhs)),
-        CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs < rhs)),
-        CompareOp::Le => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs <= rhs)),
-        CompareOp::Gt => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs > rhs)),
-        CompareOp::Ge => zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs >= rhs)),
+        CompareOp::Eq => zip_map2_into_validated(
+            dest,
+            a,
+            b,
+            |lhs, rhs| MaybeUninit::new(lhs == rhs),
+            validated,
+        ),
+        CompareOp::Lt => zip_map2_into_validated(
+            dest,
+            a,
+            b,
+            |lhs, rhs| MaybeUninit::new(lhs < rhs),
+            validated,
+        ),
+        CompareOp::Le => zip_map2_into_validated(
+            dest,
+            a,
+            b,
+            |lhs, rhs| MaybeUninit::new(lhs <= rhs),
+            validated,
+        ),
+        CompareOp::Gt => zip_map2_into_validated(
+            dest,
+            a,
+            b,
+            |lhs, rhs| MaybeUninit::new(lhs > rhs),
+            validated,
+        ),
+        CompareOp::Ge => zip_map2_into_validated(
+            dest,
+            a,
+            b,
+            |lhs, rhs| MaybeUninit::new(lhs >= rhs),
+            validated,
+        ),
     }
 }
 
@@ -1345,32 +1590,32 @@ fn zip_map2_parts_into_validated<
 }
 
 fn mul_identity_into_raw<
+    O: MulOutput<D>,
     D: Copy + MaybeSendSync + 'static,
     A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
     B: Copy + MaybeSendSync + 'static,
 >(
-    dest: &mut StridedViewMut<D>,
+    dst_ptr: *mut O::Slot,
+    dst_dims: &[usize],
+    dst_strides: &[isize],
     a_ptr: *const A,
     a_strides: &[isize],
     b_ptr: *const B,
     b_strides: &[isize],
+    _validated: ValidatedDestinationLayout,
 ) -> Result<()> {
-    let dst_ptr = dest.as_mut_ptr();
-    let dst_dims = dest.dims();
-    let dst_strides = dest.strides();
     debug_assert_eq!(dst_dims.len(), a_strides.len());
     debug_assert_eq!(dst_dims.len(), b_strides.len());
 
     if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
         let len = total_len(dst_dims);
-        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
-        if simd::try_mul_contiguous(dst, sa, sb) {
+        if unsafe { O::try_contiguous(dst_ptr, len, sa, sb) } {
             return Ok(());
         }
         for i in 0..len {
-            dst[i] = sa[i] * sb[i];
+            unsafe { O::write(dst_ptr.add(i), multiply_value(sa[i], sb[i])) };
         }
         return Ok(());
     }
@@ -1381,7 +1626,7 @@ fn mul_identity_into_raw<
         .max(std::mem::size_of::<B>());
     let total = total_len(dst_dims);
 
-    if try_contiguous_range_mul(
+    if try_contiguous_range_mul::<O, D, A, B>(
         dst_ptr,
         dst_dims,
         dst_strides,
@@ -1431,7 +1676,7 @@ fn mul_identity_into_raw<
                             let ap = unsafe { a_send.as_const().offset(offsets[1]) };
                             let bp = unsafe { b_send.as_const().offset(offsets[2]) };
                             unsafe {
-                                inner_loop_mul2::<D, A, B>(
+                                inner_loop_mul2::<O, D, A, B>(
                                     dp, strides[0], ap, strides[1], bp, strides[2], len,
                                 )
                             };
@@ -1454,7 +1699,7 @@ fn mul_identity_into_raw<
             let ap = unsafe { a_ptr.offset(offsets[1]) };
             let bp = unsafe { b_ptr.offset(offsets[2]) };
             unsafe {
-                inner_loop_mul2::<D, A, B>(dp, strides[0], ap, strides[1], bp, strides[2], len)
+                inner_loop_mul2::<O, D, A, B>(dp, strides[0], ap, strides[1], bp, strides[2], len)
             };
             Ok(())
         },
@@ -1481,13 +1726,39 @@ pub fn mul_into<
     let validated = validate_destination_layout(dest.dims(), dest.strides())?;
 
     if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
-        return mul_identity_into_raw(dest, a.ptr(), a.strides(), b.ptr(), b.strides());
+        return mul_identity_into_raw::<InitializedOutput, D, A, B>(
+            dest.as_mut_ptr(),
+            dest.dims(),
+            dest.strides(),
+            a.ptr(),
+            a.strides(),
+            b.ptr(),
+            b.strides(),
+            validated,
+        );
     }
 
-    zip_map2_into_validated(dest, a, b, |x, y| x * y, validated)
+    zip_map2_into_validated(dest, a, b, multiply_value, validated)
 }
 
 /// Multiply two views into a fully overwritten uninitialized output.
+///
+/// Shape, destination-injectivity, and reachable-byte overlap validation
+/// completes before the first write. Safe Rust borrows already prevent
+/// input/output aliasing; the explicit overlap check preserves the contract for
+/// views produced through unsafe constructors.
+///
+/// `Ok(())` means every logical destination element is initialized. An error
+/// occurs before writes. A panic during replay may leave a partially initialized
+/// destination, which remains safe to drop as `MaybeUninit<D>`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::ShapeMismatch`] for unequal shapes,
+/// [`StridedError::NonInjectiveOutputLayout`] for an overlapping output layout,
+/// [`StridedError::OverlappingInputOutput`] for aliased storage, or
+/// [`StridedError::OffsetOverflow`] when a reachable byte range is not
+/// representable.
 pub fn mul_into_uninit<
     D: Copy + MaybeSendSync + 'static,
     A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
@@ -1499,7 +1770,32 @@ pub fn mul_into_uninit<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
 ) -> Result<()> {
-    zip_map2_into(dest, a, b, |lhs, rhs| MaybeUninit::new(lhs * rhs))
+    ensure_same_shape(dest.dims(), a.dims())?;
+    ensure_same_shape(dest.dims(), b.dims())?;
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
+    validate_typed_no_overlap(dest, a, 0)?;
+    validate_typed_no_overlap(dest, b, 1)?;
+
+    if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
+        return mul_identity_into_raw::<UninitializedOutput, D, A, B>(
+            dest.as_mut_ptr(),
+            dest.dims(),
+            dest.strides(),
+            a.ptr(),
+            a.strides(),
+            b.ptr(),
+            b.strides(),
+            validated,
+        );
+    }
+
+    zip_map2_into_validated(
+        dest,
+        a,
+        b,
+        |lhs, rhs| MaybeUninit::new(multiply_value(lhs, rhs)),
+        validated,
+    )
 }
 
 fn broadcast_strides_for_axes(
@@ -1578,15 +1874,41 @@ pub fn broadcast_mul_into<
     let b_strides = broadcast_strides_for_axes(b.dims(), b.strides(), dest.dims(), b_axes)?;
 
     if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
-        return mul_identity_into_raw(dest, a.ptr(), &a_strides, b.ptr(), &b_strides);
+        return mul_identity_into_raw::<InitializedOutput, D, A, B>(
+            dest.as_mut_ptr(),
+            dest.dims(),
+            dest.strides(),
+            a.ptr(),
+            &a_strides,
+            b.ptr(),
+            &b_strides,
+            validated,
+        );
     }
 
     let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
     let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
-    zip_map2_into_validated(dest, &a, &b, |x, y| x * y, validated)
+    zip_map2_into_validated(dest, &a, &b, multiply_value, validated)
 }
 
 /// Broadcast and multiply into a fully overwritten uninitialized output.
+///
+/// Axis mappings, shapes, destination injectivity, and reachable-byte overlap
+/// are validated before the first write. Safe Rust borrows already prevent
+/// input/output aliasing; the explicit overlap check preserves the contract for
+/// views produced through unsafe constructors.
+///
+/// `Ok(())` means every logical destination element is initialized. An error
+/// occurs before writes. A panic during replay may leave a partially initialized
+/// destination, which remains safe to drop as `MaybeUninit<D>`.
+///
+/// # Errors
+///
+/// Returns a typed rank, axis, or shape error for an invalid broadcast mapping,
+/// [`StridedError::NonInjectiveOutputLayout`] for an overlapping output layout,
+/// [`StridedError::OverlappingInputOutput`] for aliased storage, or
+/// [`StridedError::OffsetOverflow`] when a reachable byte range is not
+/// representable.
 pub fn broadcast_mul_into_uninit<
     D: Copy + MaybeSendSync + 'static,
     A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
@@ -1600,11 +1922,34 @@ pub fn broadcast_mul_into_uninit<
     b: &StridedView<B, OpB>,
     b_axes: &[usize],
 ) -> Result<()> {
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
     let a_strides = broadcast_strides_for_axes(a.dims(), a.strides(), dest.dims(), a_axes)?;
     let b_strides = broadcast_strides_for_axes(b.dims(), b.strides(), dest.dims(), b_axes)?;
+    validate_typed_no_overlap(dest, a, 0)?;
+    validate_typed_no_overlap(dest, b, 1)?;
+
+    if OpA::IS_IDENTITY && OpB::IS_IDENTITY {
+        return mul_identity_into_raw::<UninitializedOutput, D, A, B>(
+            dest.as_mut_ptr(),
+            dest.dims(),
+            dest.strides(),
+            a.ptr(),
+            &a_strides,
+            b.ptr(),
+            &b_strides,
+            validated,
+        );
+    }
+
     let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
     let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
-    zip_map2_into(dest, &a, &b, |lhs, rhs| MaybeUninit::new(lhs * rhs))
+    zip_map2_into_validated(
+        dest,
+        &a,
+        &b,
+        |lhs, rhs| MaybeUninit::new(multiply_value(lhs, rhs)),
+        validated,
+    )
 }
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
@@ -1626,8 +1971,29 @@ pub fn zip_map3_into<
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
-    validate_destination_layout(dest.dims(), dest.strides())?;
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
+    zip_map3_into_validated(dest, a, b, c, f, validated)
+}
 
+pub(crate) fn zip_map3_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    C: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    OpC: ElementOp<C>,
+>(
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    c: &StridedView<C, OpC>,
+    f: impl Fn(A, B, C) -> D + MaybeSync,
+    _validated: ValidatedDestinationLayout,
+) -> Result<()> {
+    ensure_same_shape(dest.dims(), a.dims())?;
+    ensure_same_shape(dest.dims(), b.dims())?;
+    ensure_same_shape(dest.dims(), c.dims())?;
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
@@ -1760,8 +2126,33 @@ pub fn zip_map4_into<
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
     ensure_same_shape(dest.dims(), e.dims())?;
-    validate_destination_layout(dest.dims(), dest.strides())?;
+    let validated = validate_destination_layout(dest.dims(), dest.strides())?;
+    zip_map4_into_validated(dest, a, b, c, e, f, validated)
+}
 
+pub(crate) fn zip_map4_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    C: Copy + MaybeSendSync,
+    E: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    OpC: ElementOp<C>,
+    OpE: ElementOp<E>,
+>(
+    dest: &mut StridedViewMut<D>,
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    c: &StridedView<C, OpC>,
+    e: &StridedView<E, OpE>,
+    f: impl Fn(A, B, C, E) -> D + MaybeSync,
+    _validated: ValidatedDestinationLayout,
+) -> Result<()> {
+    ensure_same_shape(dest.dims(), a.dims())?;
+    ensure_same_shape(dest.dims(), b.dims())?;
+    ensure_same_shape(dest.dims(), c.dims())?;
+    ensure_same_shape(dest.dims(), e.dims())?;
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
     let b_ptr = b.ptr();
@@ -2020,25 +2411,57 @@ mod scalar_branch_tests {
 
         let mut out = [0.0; 3];
         unsafe {
-            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 1, b.as_ptr(), 1, 3);
+            inner_loop_mul2::<InitializedOutput, f64, f64, f64>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                1,
+                3,
+            );
         }
         assert_eq!(out, [34.0, 57.0, 115.0]);
 
         let mut out = [0.0; 3];
         unsafe {
-            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 0, b.as_ptr(), 1, 3);
+            inner_loop_mul2::<InitializedOutput, f64, f64, f64>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                1,
+                3,
+            );
         }
         assert_eq!(out, [34.0, 38.0, 46.0]);
 
         let mut out = [0.0; 3];
         unsafe {
-            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 0, b.as_ptr(), 0, 3);
+            inner_loop_mul2::<InitializedOutput, f64, f64, f64>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                0,
+                3,
+            );
         }
         assert_eq!(out, [34.0, 34.0, 34.0]);
 
         let mut out = [0.0; 3];
         unsafe {
-            inner_loop_mul2::<f64, f64, f64>(out.as_mut_ptr(), 1, a.as_ptr(), 0, b.as_ptr(), 2, 3);
+            inner_loop_mul2::<InitializedOutput, f64, f64, f64>(
+                out.as_mut_ptr(),
+                1,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                2,
+                3,
+            );
         }
         assert_eq!(out, [34.0, 46.0, 62.0]);
     }
@@ -2133,7 +2556,12 @@ mod scalar_branch_tests {
         let b = vec![3.0; 243];
         let mut out = vec![0.0; total];
 
-        assert!(run_contiguous_range_mul_single_thread::<f64, f64, f64>(
+        assert!(run_contiguous_range_mul_single_thread::<
+            InitializedOutput,
+            f64,
+            f64,
+            f64,
+        >(
             out.as_mut_ptr(),
             &dims,
             a.as_ptr(),
