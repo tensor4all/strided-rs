@@ -33,3 +33,6 @@ plan
 
 # Git worktrees
 .worktrees/
+
+# CodeGraph index
+/.codegraph/
