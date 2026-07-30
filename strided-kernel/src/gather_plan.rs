@@ -5,11 +5,11 @@
 //! indexed shape vocabulary, but keeps tensor allocation, dtype promotion, and
 //! frontend error policy outside `strided-kernel`.
 
-use core::ops::Add;
+use core::{mem::MaybeUninit, ops::Add};
 
+use crate::copy_plan::{CopyPlan, OverwriteWriter, ReadModifyWrite};
 use crate::{
-    CopyPlan, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError,
-    RAW_FUSED_RANK_LIMIT,
+    MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
 };
 
 #[cfg(feature = "parallel")]
@@ -283,6 +283,35 @@ impl GatherPlan {
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
+        self.execute_with_writer(dest, operand, start_indices)
+    }
+
+    /// Execute the prepared gather into a destination whose reachable slots
+    /// may be uninitialized. Every logical destination slot is written.
+    pub(crate) fn execute_uninit<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        start_indices: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.execute_with_writer(dest, operand, start_indices)
+    }
+
+    fn execute_with_writer<T, I, W>(
+        &self,
+        dest: &mut W,
+        operand: &RawStridedRef<'_, T>,
+        start_indices: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
         self.check_call(dest, operand, start_indices)?;
         if self.total == 0 {
             return Ok(());
@@ -305,14 +334,12 @@ impl GatherPlan {
         let window_offsets = window_offsets_storage.as_mut_slice();
 
         let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
         let operand_offset_base = operand.offset();
         let operand_strides = operand.strides();
         let index_offset_base = start_indices.offset();
         let index_strides = start_indices.strides();
         let operand_data = operand.data();
         let index_data = start_indices.data();
-        let dest_data = dest.data_mut();
 
         for _ in 0..self.total {
             window_offsets.fill(0);
@@ -343,22 +370,22 @@ impl GatherPlan {
                 operand_idx[axis] += window_offsets[axis];
             }
 
-            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, &out_idx)?;
+            let dest_offset = checked_strided_offset(dest_offset_base, dest.strides(), &out_idx)?;
             let operand_offset =
                 checked_strided_offset(operand_offset_base, operand_strides, &operand_idx)?;
-            unsafe {
-                *dest_data.as_mut_ptr().offset(dest_offset) =
-                    *operand_data.as_ptr().offset(operand_offset);
-            }
+            // SAFETY: the validated operand layout proves this source offset.
+            let value = unsafe { *operand_data.as_ptr().offset(operand_offset) };
+            // SAFETY: the validated plan proves this logical offset is in-bounds.
+            unsafe { dest.write_at(dest_offset, value) };
             advance_col_major_index(out_idx, &self.dest_dims);
         }
         Ok(())
     }
 
     #[cfg(feature = "parallel")]
-    fn execute_parallel<T, I>(
+    fn execute_parallel<T, I, W>(
         &self,
-        dest: &mut RawStridedMut<'_, T>,
+        dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
         nthreads: usize,
@@ -366,11 +393,13 @@ impl GatherPlan {
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
+        W: OverwriteWriter<T>,
     {
         let dest_offset_base = dest.offset();
         let operand_offset_base = operand.offset();
         let index_offset_base = start_indices.offset();
-        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
         let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
         let index_ptr = crate::threading::SendPtr(start_indices.data().as_ptr() as *mut I);
 
@@ -431,7 +460,9 @@ impl GatherPlan {
                         // SAFETY: gather writes one value per logical output,
                         // and compile rejected non-injective destination
                         // layouts.
-                        *dest_ptr.offset(dest_offset) = *operand_ptr.offset(operand_offset);
+                        dest_ptr
+                            .offset(dest_offset)
+                            .write(operand_ptr.offset(operand_offset).read());
                     }
                     advance_col_major_index(out_idx, &self.dest_dims);
                 }
@@ -441,12 +472,15 @@ impl GatherPlan {
         )
     }
 
-    fn check_call<T, I>(
+    fn check_call<T, I, W>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &W,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: OverwriteWriter<T>,
+    {
         if dest.dims() != &self.dest_dims[..]
             || dest.strides() != &self.dest_strides[..]
             || operand.dims() != &self.operand_dims[..]
@@ -586,6 +620,33 @@ impl DynamicSlicePlan {
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
+        self.execute_with_writer(dest, operand, starts)
+    }
+
+    pub(crate) fn execute_uninit<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.execute_with_writer(dest, operand, starts)
+    }
+
+    fn execute_with_writer<T, I, W>(
+        &self,
+        dest: &mut W,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
         self.check_call(dest, operand, starts)?;
         if self.total == 0 {
             return Ok(());
@@ -617,9 +678,7 @@ impl DynamicSlicePlan {
         let operand_offset_base = operand.offset();
         let operand_strides = operand.strides();
         let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
         let operand_data = operand.data();
-        let dest_data = dest.data_mut();
 
         for _ in 0..self.total {
             for axis in 0..operand_idx.len() {
@@ -627,11 +686,11 @@ impl DynamicSlicePlan {
             }
             let operand_offset =
                 checked_strided_offset(operand_offset_base, operand_strides, operand_idx)?;
-            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
-            unsafe {
-                *dest_data.as_mut_ptr().offset(dest_offset) =
-                    *operand_data.as_ptr().offset(operand_offset);
-            }
+            let dest_offset = checked_strided_offset(dest_offset_base, dest.strides(), dest_idx)?;
+            // SAFETY: the validated plan proves both offsets.
+            let value = unsafe { *operand_data.as_ptr().offset(operand_offset) };
+            // SAFETY: the validated plan proves this logical offset is in-bounds.
+            unsafe { dest.write_at(dest_offset, value) };
             advance_col_major_index(dest_idx, &self.dest_dims);
         }
         Ok(())
@@ -642,15 +701,16 @@ impl DynamicSlicePlan {
         self.operand_dims.len() == 1 && self.operand_strides[0] == 1 && self.dest_strides[0] == 1
     }
 
-    fn execute_rank_one_contiguous<T, I>(
+    fn execute_rank_one_contiguous<T, I, W>(
         &self,
-        dest: &mut RawStridedMut<'_, T>,
+        dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
     ) -> Result<()>
     where
         T: Copy,
         I: GatherIndex,
+        W: OverwriteWriter<T>,
     {
         let mut clamped_starts = [0usize; 1];
         read_clamped_starts(
@@ -667,25 +727,24 @@ impl DynamicSlicePlan {
         let source_end = source_start
             .checked_add(self.total)
             .ok_or(StridedError::OffsetOverflow)?;
-        let dest_end = dest_start
-            .checked_add(self.total)
-            .ok_or(StridedError::OffsetOverflow)?;
         let source = operand
             .data()
             .get(source_start..source_end)
             .ok_or(StridedError::OffsetOverflow)?;
-        let dest = dest
-            .data_mut()
-            .get_mut(dest_start..dest_end)
-            .ok_or(StridedError::OffsetOverflow)?;
-        dest.copy_from_slice(source);
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = unsafe { dest.data_ptr() };
+        // SAFETY: bounds were checked above and the writer owns the logical
+        // destination storage.
+        unsafe {
+            core::ptr::copy_nonoverlapping(source.as_ptr(), dest_ptr.add(dest_start), self.total);
+        }
         Ok(())
     }
 
     #[cfg(feature = "parallel")]
-    fn execute_parallel<T, I>(
+    fn execute_parallel<T, I, W>(
         &self,
-        dest: &mut RawStridedMut<'_, T>,
+        dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
         nthreads: usize,
@@ -693,6 +752,7 @@ impl DynamicSlicePlan {
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
+        W: OverwriteWriter<T>,
     {
         let mut clamped_starts: AxisVec<usize> = (0..self.operand_dims.len()).map(|_| 0).collect();
         read_clamped_starts(
@@ -705,7 +765,8 @@ impl DynamicSlicePlan {
         let operand_offset_base = operand.offset();
         let dest_offset_base = dest.offset();
         let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
-        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
 
         crate::threading::parallel_map_reduce(
             0..self.total,
@@ -734,7 +795,9 @@ impl DynamicSlicePlan {
                         // SAFETY: dynamic slice writes one value per logical
                         // output, and compile rejected non-injective
                         // destination layouts.
-                        *dest_ptr.offset(dest_offset) = *operand_ptr.offset(operand_offset);
+                        dest_ptr
+                            .offset(dest_offset)
+                            .write(operand_ptr.offset(operand_offset).read());
                     }
                     advance_col_major_index(dest_idx, &self.dest_dims);
                 }
@@ -744,12 +807,15 @@ impl DynamicSlicePlan {
         )
     }
 
-    fn check_call<T, I>(
+    fn check_call<T, I, W>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &W,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: OverwriteWriter<T>,
+    {
         if dest.dims() != &self.dest_dims[..]
             || dest.strides() != &self.dest_strides[..]
             || operand.dims() != &self.operand_dims[..]
@@ -836,6 +902,40 @@ impl DynamicUpdateSlicePlan {
     {
         self.check_call(dest, operand, update, starts)?;
         self.copy_plan.execute(dest, operand)?;
+        self.execute_update_with_writer(dest, update, starts)
+    }
+
+    /// Execute dynamic update into a destination whose reachable slots may be
+    /// uninitialized. The copy completes before any read-modify-write access.
+    pub(crate) fn execute_uninit<'a, T, I>(
+        &self,
+        dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.check_call(dest, operand, update, starts)?;
+        self.copy_plan
+            .execute_uninit_then(dest, operand, |mut receipt| {
+                self.execute_update_with_writer(&mut receipt, update, starts)
+            })?
+    }
+
+    fn execute_update_with_writer<T, I, W>(
+        &self,
+        dest: &mut W,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
         if self.total == 0 {
             return Ok(());
         }
@@ -866,9 +966,7 @@ impl DynamicUpdateSlicePlan {
         let update_offset_base = update.offset();
         let update_strides = update.strides();
         let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
         let update_data = update.data();
-        let dest_data = dest.data_mut();
 
         for _ in 0..self.total {
             for axis in 0..dest_idx.len() {
@@ -876,11 +974,10 @@ impl DynamicUpdateSlicePlan {
             }
             let update_offset =
                 checked_strided_offset(update_offset_base, update_strides, update_idx)?;
-            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
-            unsafe {
-                *dest_data.as_mut_ptr().offset(dest_offset) =
-                    *update_data.as_ptr().offset(update_offset);
-            }
+            let dest_offset = checked_strided_offset(dest_offset_base, dest.strides(), dest_idx)?;
+            let value = unsafe { *update_data.as_ptr().offset(update_offset) };
+            // SAFETY: the validated plan proves this logical offset is in-bounds.
+            unsafe { dest.write_at(dest_offset, value) };
             advance_col_major_index(update_idx, &self.update_dims);
         }
         Ok(())
@@ -894,15 +991,16 @@ impl DynamicUpdateSlicePlan {
             && self.dest_strides[0] == 1
     }
 
-    fn execute_rank_one_contiguous<T, I>(
+    fn execute_rank_one_contiguous<T, I, W>(
         &self,
-        dest: &mut RawStridedMut<'_, T>,
+        dest: &mut W,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
     ) -> Result<()>
     where
         T: Copy,
         I: GatherIndex,
+        W: OverwriteWriter<T>,
     {
         let mut clamped_starts = [0usize; 1];
         read_clamped_starts(
@@ -918,25 +1016,23 @@ impl DynamicUpdateSlicePlan {
         let update_end = update_start
             .checked_add(self.total)
             .ok_or(StridedError::OffsetOverflow)?;
-        let dest_end = dest_start
-            .checked_add(self.total)
-            .ok_or(StridedError::OffsetOverflow)?;
         let update = update
             .data()
             .get(update_start..update_end)
             .ok_or(StridedError::OffsetOverflow)?;
-        let dest = dest
-            .data_mut()
-            .get_mut(dest_start..dest_end)
-            .ok_or(StridedError::OffsetOverflow)?;
-        dest.copy_from_slice(update);
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = unsafe { dest.data_ptr() };
+        // SAFETY: the checked ranges are inside the destination allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(update.as_ptr(), dest_ptr.add(dest_start), self.total);
+        }
         Ok(())
     }
 
     #[cfg(feature = "parallel")]
-    fn execute_update_parallel<T, I>(
+    fn execute_update_parallel<T, I, W>(
         &self,
-        dest: &mut RawStridedMut<'_, T>,
+        dest: &mut W,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
         nthreads: usize,
@@ -944,6 +1040,7 @@ impl DynamicUpdateSlicePlan {
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
+        W: OverwriteWriter<T>,
     {
         let mut clamped_starts: AxisVec<usize> = (0..self.operand_dims.len()).map(|_| 0).collect();
         read_clamped_starts(
@@ -956,7 +1053,8 @@ impl DynamicUpdateSlicePlan {
         let update_offset_base = update.offset();
         let dest_offset_base = dest.offset();
         let update_ptr = crate::threading::SendPtr(update.data().as_ptr() as *mut T);
-        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
 
         crate::threading::parallel_map_reduce(
             0..self.total,
@@ -985,7 +1083,9 @@ impl DynamicUpdateSlicePlan {
                         // SAFETY: each update-domain logical index maps to a
                         // distinct destination position for a fixed window, and
                         // compile rejected non-injective destination layouts.
-                        *dest_ptr.offset(dest_offset) = *update_ptr.offset(update_offset);
+                        dest_ptr
+                            .offset(dest_offset)
+                            .write(update_ptr.offset(update_offset).read());
                     }
                     advance_col_major_index(update_idx, &self.update_dims);
                 }
@@ -995,13 +1095,16 @@ impl DynamicUpdateSlicePlan {
         )
     }
 
-    fn check_call<T, I>(
+    fn check_call<T, I, W>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &W,
         operand: &RawStridedRef<'_, T>,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: OverwriteWriter<T>,
+    {
         if dest.dims() != &self.dest_dims[..]
             || dest.strides() != &self.dest_strides[..]
             || operand.dims() != &self.operand_dims[..]
@@ -1163,6 +1266,42 @@ impl ScatterPlan {
     {
         self.check_call(dest, operand, scatter_indices, updates)?;
         self.copy_plan.execute(dest, operand)?;
+        self.execute_updates(dest, scatter_indices, updates, |a, b| a + b)
+    }
+
+    /// Execute additive scatter into a destination whose reachable slots may
+    /// be uninitialized. The operand copy completes before any RMW access.
+    pub(crate) fn execute_uninit<'a, T, I>(
+        &self,
+        dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+        combine: fn(T, T) -> T,
+    ) -> Result<()>
+    where
+        T: Copy + Add<Output = T> + MaybeSendSync,
+        I: GatherIndex,
+    {
+        self.check_call(dest, operand, scatter_indices, updates)?;
+        self.copy_plan
+            .execute_uninit_then(dest, operand, |mut receipt| {
+                self.execute_updates(&mut receipt, scatter_indices, updates, combine)
+            })?
+    }
+
+    fn execute_updates<T, I, W>(
+        &self,
+        dest: &mut W,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+        combine: fn(T, T) -> T,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: ReadModifyWrite<T>,
+    {
         if self.batch_elems == 0 || self.window_elems == 0 {
             return Ok(());
         }
@@ -1187,8 +1326,6 @@ impl ScatterPlan {
         let update_strides = updates.strides();
         let update_data = updates.data();
         let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
-        let dest_data = dest.data_mut();
 
         for _ in 0..self.batch_elems {
             operand_base.fill(0);
@@ -1233,11 +1370,11 @@ impl ScatterPlan {
                 let update_offset =
                     checked_strided_offset(update_offset_base, update_strides, update_idx)?;
                 let dest_offset =
-                    checked_strided_offset(dest_offset_base, dest_strides, operand_idx)?;
-                unsafe {
-                    let slot = dest_data.as_mut_ptr().offset(dest_offset);
-                    *slot = *slot + *update_data.as_ptr().offset(update_offset);
-                }
+                    checked_strided_offset(dest_offset_base, dest.strides(), operand_idx)?;
+                let value = unsafe { *update_data.as_ptr().offset(update_offset) };
+                // SAFETY: copy completion and serial scatter traversal prove
+                // this initialized logical slot is in-bounds.
+                unsafe { dest.add_at(dest_offset, value, combine) };
                 advance_col_major_index(window_idx, &self.window_shape_updates);
             }
             advance_col_major_index(batch_idx, &self.batch_shape);
@@ -1245,13 +1382,16 @@ impl ScatterPlan {
         Ok(())
     }
 
-    fn check_call<T, I>(
+    fn check_call<T, I, W>(
         &self,
-        dest: &RawStridedMut<'_, T>,
+        dest: &W,
         operand: &RawStridedRef<'_, T>,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: OverwriteWriter<T>,
+    {
         if dest.dims() != &self.dest_dims[..]
             || dest.strides() != &self.dest_strides[..]
             || operand.dims() != &self.operand_dims[..]

@@ -69,3 +69,8 @@ required-features = ["parallel"]
 name = "issue_184_uninit_replay"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "issue_187_uninit_indexed"
+harness = false
+required-features = ["parallel"]

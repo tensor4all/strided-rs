@@ -9,8 +9,11 @@
 //! replay it with no planning and no heap allocation for ranks at most
 //! [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
 
-use core::mem::MaybeUninit;
-use core::ops::Mul;
+use core::{
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ops::{Add, Mul},
+};
 
 use crate::map_view::map_raw_into;
 use crate::ops_view::{copy_conj, copy_into, copy_scale};
@@ -26,6 +29,125 @@ use crate::{
 type AxisVec<T> = smallvec::SmallVec<[T; crate::RAW_FUSED_RANK_LIMIT]>;
 #[cfg(not(feature = "parallel"))]
 type AxisVec<T> = Vec<T>;
+
+pub(crate) trait OverwriteWriter<T> {
+    fn dims(&self) -> &[usize];
+    fn strides(&self) -> &[isize];
+    fn offset(&self) -> isize;
+    /// # Safety
+    /// The caller must use the pointer only for the validated allocation and
+    /// logical layout represented by this writer.
+    unsafe fn data_ptr(&mut self) -> *mut T;
+    /// # Safety
+    /// The offset must be an in-bounds logical destination proven by layout.
+    unsafe fn write_at(&mut self, offset: isize, value: T);
+}
+
+pub(crate) trait ReadModifyWrite<T>: OverwriteWriter<T> {
+    /// # Safety
+    /// The offset must be an in-bounds initialized slot covered by the
+    /// traversal's copy and disjointness proof.
+    unsafe fn add_at(&mut self, offset: isize, value: T, combine: fn(T, T) -> T);
+}
+
+impl<'a, T> OverwriteWriter<T> for RawStridedMut<'a, T> {
+    fn dims(&self) -> &[usize] {
+        self.dims()
+    }
+    fn strides(&self) -> &[isize] {
+        self.strides()
+    }
+    fn offset(&self) -> isize {
+        self.offset()
+    }
+    unsafe fn data_ptr(&mut self) -> *mut T {
+        self.data_mut().as_mut_ptr()
+    }
+    unsafe fn write_at(&mut self, offset: isize, value: T) {
+        // SAFETY: the prepared layout validates every logical destination.
+        unsafe { self.data_mut().as_mut_ptr().offset(offset).write(value) }
+    }
+}
+
+impl<'a, T> ReadModifyWrite<T> for RawStridedMut<'a, T>
+where
+    T: Add<Output = T>,
+{
+    unsafe fn add_at(&mut self, offset: isize, value: T, combine: fn(T, T) -> T) {
+        // SAFETY: the copy or initialized caller proves this logical slot.
+        unsafe {
+            let ptr = self.data_mut().as_mut_ptr().offset(offset);
+            ptr.write(combine(ptr.read(), value));
+        }
+    }
+}
+
+impl<'a, T> OverwriteWriter<T> for RawStridedMut<'a, MaybeUninit<T>> {
+    fn dims(&self) -> &[usize] {
+        self.dims()
+    }
+    fn strides(&self) -> &[isize] {
+        self.strides()
+    }
+    fn offset(&self) -> isize {
+        self.offset()
+    }
+    unsafe fn data_ptr(&mut self) -> *mut T {
+        self.data_mut().as_mut_ptr().cast()
+    }
+    unsafe fn write_at(&mut self, offset: isize, value: T) {
+        // SAFETY: the prepared layout validates every logical destination.
+        unsafe {
+            self.data_mut()
+                .as_mut_ptr()
+                .offset(offset)
+                .write(MaybeUninit::new(value))
+        }
+    }
+}
+
+pub(crate) struct InitializedRawDest<'a, T> {
+    ptr: *mut T,
+    extent: usize,
+    dims: &'a [usize],
+    strides: &'a [isize],
+    offset: isize,
+    _marker: PhantomData<&'a mut [MaybeUninit<T>]>,
+}
+
+impl<'a, T> OverwriteWriter<T> for InitializedRawDest<'a, T> {
+    fn dims(&self) -> &[usize] {
+        self.dims
+    }
+    fn strides(&self) -> &[isize] {
+        self.strides
+    }
+    fn offset(&self) -> isize {
+        self.offset
+    }
+    unsafe fn data_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+    unsafe fn write_at(&mut self, offset: isize, value: T) {
+        debug_assert!(offset >= 0 && (offset as usize) < self.extent);
+        // SAFETY: the copy proof and extent check cover this logical slot.
+        unsafe { self.ptr.offset(offset).write(value) }
+    }
+}
+
+impl<'a, T> ReadModifyWrite<T> for InitializedRawDest<'a, T>
+where
+    T: Add<Output = T>,
+{
+    unsafe fn add_at(&mut self, offset: isize, value: T, combine: fn(T, T) -> T) {
+        debug_assert!(offset >= 0 && (offset as usize) < self.extent);
+        // SAFETY: the copy proof and extent check cover this logical slot.
+        unsafe {
+            let ptr = self.ptr.offset(offset);
+            ptr.write(combine(ptr.read(), value));
+        }
+    }
+}
 
 /// A compiled copy traversal for one `(dims, dst_strides, src_strides)`
 /// layout pair.
@@ -69,6 +191,28 @@ pub struct CopyPlan {
 }
 
 impl CopyPlan {
+    pub(crate) fn execute_uninit_then<'a, T, R>(
+        &self,
+        dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
+        src: &RawStridedRef<'_, T>,
+        f: impl for<'b> FnOnce(InitializedRawDest<'b, T>) -> R,
+    ) -> Result<R>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        self.execute_uninit(dest, src)?;
+        let data = dest.data_mut();
+        let receipt = InitializedRawDest {
+            ptr: data.as_mut_ptr().cast(),
+            extent: data.len(),
+            dims: dest.dims(),
+            strides: dest.strides(),
+            offset: dest.offset(),
+            _marker: PhantomData,
+        };
+        Ok(f(receipt))
+    }
+
     /// Compile a copy plan for the given layout pair.
     ///
     /// Performs the layout validation and traversal construction
@@ -236,6 +380,24 @@ impl CopyPlan {
 mod tests {
     use super::*;
     use num_complex::{Complex32, Complex64};
+
+    #[test]
+    fn uninit_then_receipt_drops_after_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let plan = CopyPlan::compile(&[2], &[1], &[1]).unwrap();
+        let source_data = [3i32, 5];
+        let source = RawStridedRef::new(&source_data, &[2], &[1], 0).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut storage = vec![MaybeUninit::<i32>::uninit(); 3];
+            let mut dest = RawStridedMut::new(&mut storage, &[2], &[1], 0).unwrap();
+            let _: () = plan
+                .execute_uninit_then(&mut dest, &source, |_receipt| {
+                    panic!("post-copy update failure");
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+    }
 
     /// Reference: the per-call raw kernel (which itself is differential-tested
     /// against the view kernels in raw_ops.rs).
