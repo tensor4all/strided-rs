@@ -1,8 +1,12 @@
 //! Reproducible paired benchmark for issue #184 initialized/uninitialized replay.
 //!
-//! Run on pinned CPUs:
-//! `taskset -c 60 cargo bench -p strided-kernel --features parallel --bench issue_184_uninit_replay -- 1`
-//! `taskset -c 60-63 cargo bench -p strided-kernel --features parallel --bench issue_184_uninit_replay -- 4`
+//! Build without CPU affinity, extract this target's exact executable from
+//! Cargo's current JSON artifact stream, then pin only benchmark execution:
+//! `cargo bench -p strided-kernel --features parallel --bench issue_184_uninit_replay --no-run --message-format=json > /tmp/issue-184-artifacts.json`
+//! `bench_exe="$(jq -er 'select(.reason == "compiler-artifact" and .target.name == "issue_184_uninit_replay" and (.target.kind | index("bench")) and .executable != null) | .executable' /tmp/issue-184-artifacts.json | tail -n1)"`
+//! `test -x "$bench_exe"`
+//! `taskset -c 60 "$bench_exe" 1`
+//! `taskset -c 60-63 "$bench_exe" 4`
 
 use core::mem::MaybeUninit;
 use std::hint::black_box;

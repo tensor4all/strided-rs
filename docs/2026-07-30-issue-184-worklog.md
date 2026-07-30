@@ -78,12 +78,33 @@ product.
 The rerun was pinned to CPU 60 for t1 and CPUs 60-63 for t4. Before t1,
 `mpstat -P 60,61,62,63 1 2` reported 100 percent idle on all four CPUs; the
 same was true immediately before t4. The raw 31-pair samples are included in
-the PR implementation response and are reproduced by:
+the PR implementation response. Reproduce them by compiling without affinity,
+extracting the exact executable from Cargo's current JSON artifact output, and
+pinning only execution:
 
-```text
-taskset -c 60 cargo bench -p strided-kernel --features parallel --bench issue_184_uninit_replay -- 1
-taskset -c 60-63 cargo bench -p strided-kernel --features parallel --bench issue_184_uninit_replay -- 4
+```bash
+cargo bench -p strided-kernel --features parallel \
+  --bench issue_184_uninit_replay --no-run --message-format=json \
+  > /tmp/issue-184-artifacts.json
+bench_exe="$(
+  jq -er '
+    select(
+      .reason == "compiler-artifact"
+      and .target.name == "issue_184_uninit_replay"
+      and (.target.kind | index("bench"))
+      and .executable != null
+    )
+    | .executable
+  ' /tmp/issue-184-artifacts.json | tail -n1
+)"
+test -x "$bench_exe"
+taskset -c 60 "$bench_exe" 1
+taskset -c 60-63 "$bench_exe" 4
 ```
+
+Overwriting the JSON file and filtering the exact target avoids selecting a
+stale hashed executable. Main's independent rerun found maximum upper95 values
+of 1.170936 at t1 and 1.018668 at t4, also below the +20 percent gate.
 
 | family | t1 initialized / uninit ms | t1 ratio / upper95 | t4 initialized / uninit ms | t4 ratio / upper95 |
 |---|---:|---:|---:|---:|
