@@ -12,6 +12,34 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use num_complex::{Complex32, Complex64};
 
+mod private {
+    pub trait Sealed {}
+}
+
+/// A scalar type that can safely witness storage for an erased kernel view.
+pub trait KernelStorageElement: private::Sealed + Copy + 'static {
+    const DTYPE: KernelDType;
+}
+
+macro_rules! kernel_storage_element {
+    ($($ty:ty => $dtype:ident),* $(,)?) => {$ (
+        impl private::Sealed for $ty {}
+        impl KernelStorageElement for $ty {
+            const DTYPE: KernelDType = KernelDType::$dtype;
+        }
+    )* };
+}
+
+kernel_storage_element! {
+    f32 => F32,
+    f64 => F64,
+    i32 => I32,
+    i64 => I64,
+    bool => Bool,
+    Complex32 => C32,
+    Complex64 => C64,
+}
+
 use crate::{Result, StridedError, StridedView, StridedViewMut};
 
 /// Dtypes supported by dtype-erased kernel entry points.
@@ -143,19 +171,27 @@ pub struct ErasedRawStridedPtr<'a> {
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
-    marker: PhantomData<&'a [u8]>,
+    marker: PhantomData<&'a [MaybeUninit<u8>]>,
 }
 
 impl<'a> ErasedRawStridedPtr<'a> {
-    /// Create a pointer-backed descriptor.
+    /// Create a pointer-backed descriptor from erased storage.
     ///
     /// # Safety
     ///
-    /// `data..data + byte_len` must remain readable and allocated for `'a`.
-    /// Its bytes must contain valid values for `dtype`. The allocation may
-    /// overlap a destination passed to a one-shot entry point; overlap is
-    /// checked before the pointer is dereferenced.
-    pub unsafe fn new(
+    /// `data` must point into an allocation whose alignment is suitable for
+    /// `dtype`, independently of the observed address. The allocation must
+    /// provide `byte_len` initialized, readable bytes with valid provenance
+    /// for `'a`, and remain alive for `'a`. For `bool`, the bytes may contain
+    /// invalid values temporarily. They must not be read or used to form a
+    /// typed reference until a caller has rejected overlap and
+    /// [`Self::try_as_ref_after_no_overlap`] has validated the complete extent.
+    /// The allocation may overlap a destination.
+    /// The original owner may perform synchronized sequential mutation through
+    /// the same-provenance raw pointer before conversion. No concurrent
+    /// mutation or conflicting access is permitted during overlap checking,
+    /// conversion, or consumer access.
+    pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
         byte_len: usize,
@@ -189,19 +225,52 @@ impl<'a> ErasedRawStridedPtr<'a> {
         }
     }
 
+    /// Convert this pointer to an initialized descriptor after overlap checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have proved that no mutable allocation overlaps this
+    /// pointer's complete byte extent.
+    /// The allocation contract from [`Self::from_raw_parts`] must still hold.
+    /// No mutation or other conflicting access may occur during this conversion
+    /// or for the duration of the returned descriptor's consumer access.
+    /// Bool bytes are validated here, immediately before typed access.
+    pub unsafe fn try_as_ref_after_no_overlap(&self) -> Result<ErasedRawStridedRef<'_>> {
+        let bytes = core::slice::from_raw_parts(self.data.as_ptr(), self.byte_len);
+        validate_erased_buffer(self.dtype, bytes)?;
+        ErasedRawStridedRef::from_raw_parts(
+            self.dtype,
+            self.data,
+            self.byte_len,
+            self.dims,
+            self.strides,
+            self.offset,
+        )
+    }
+
     #[inline]
     pub fn dtype(&self) -> KernelDType {
         self.dtype
     }
 
-    #[inline]
-    pub fn data_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
+    /// Check overlap with initialized mutable storage without reading it.
+    pub fn overlaps_mut(&self, dest: &ErasedRawStridedMut<'_>) -> Result<bool> {
+        ranges_overlap(
+            self.data.as_ptr() as usize,
+            self.byte_len,
+            dest.data.as_ptr() as usize,
+            dest.data.len(),
+        )
     }
 
-    #[inline]
-    pub fn byte_len(&self) -> usize {
-        self.byte_len
+    /// Check overlap with uninitialized mutable storage without reading it.
+    pub fn overlaps_uninit_mut(&self, dest: &ErasedRawStridedUninitMut<'_>) -> Result<bool> {
+        ranges_overlap(
+            self.data.as_ptr() as usize,
+            self.byte_len,
+            dest.data.as_ptr() as usize,
+            dest.data.len(),
+        )
     }
 
     #[inline]
@@ -217,16 +286,6 @@ impl<'a> ErasedRawStridedPtr<'a> {
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
-    }
-
-    /// Materialize the shared byte slice after the caller has ruled out a
-    /// concurrent mutable alias.
-    ///
-    /// # Safety
-    ///
-    /// No live mutable reference may overlap the returned slice.
-    pub unsafe fn data_unchecked(&self) -> &'a [u8] {
-        core::slice::from_raw_parts(self.data.as_ptr(), self.byte_len)
     }
 }
 
@@ -243,34 +302,78 @@ pub struct ErasedRawStridedRef<'a> {
 }
 
 impl<'a> ErasedRawStridedRef<'a> {
-    /// Create a byte-backed erased input descriptor after validating dtype byte
-    /// length, alignment, rank/stride agreement, and reachable element bounds.
-    pub fn new(
-        dtype: KernelDType,
-        data: &'a [u8],
+    /// Create an erased input descriptor from typed, initialized storage.
+    pub fn from_slice<T: KernelStorageElement>(
+        data: &'a [T],
         dims: &'a [usize],
         strides: &'a [isize],
         offset: isize,
     ) -> Result<Self> {
-        let element_count = validate_erased_buffer(dtype, data)?;
+        let dtype = T::DTYPE;
+        let byte_len = data
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(StridedError::OffsetOverflow)?;
+        let bytes = unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_len) };
+        let element_count = validate_erased_buffer(dtype, bytes)?;
         validate_bounds(element_count, dims, strides, offset)?;
         Ok(Self {
             dtype,
-            data,
+            data: bytes,
             dims,
             strides,
             offset,
         })
     }
 
-    #[inline]
-    pub fn dtype(&self) -> KernelDType {
-        self.dtype
+    /// Construct from erased storage.
+    ///
+    /// # Safety
+    /// `data` must be the start of an allocation aligned for `dtype`; the
+    /// allocation must contain `byte_len` initialized, readable bytes for
+    /// `'a`, and every byte extent must represent valid values for `dtype`.
+    /// The allocation and metadata must outlive `'a`; no mutable alias may
+    /// exist while this descriptor is used. Alignment is an allocation
+    /// property and must not be inferred from the observed address alone.
+    pub unsafe fn from_raw_parts(
+        dtype: KernelDType,
+        data: NonNull<u8>,
+        byte_len: usize,
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let count = validate_erased_buffer_layout(dtype, data, byte_len)?;
+        let bytes = core::slice::from_raw_parts(data.as_ptr(), byte_len);
+        validate_bounds(count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data: bytes,
+            dims,
+            strides,
+            offset,
+        })
+    }
+
+    /// Borrow the initialized storage as its concrete scalar type.
+    pub fn data_as<T: KernelStorageElement>(&self) -> Result<&[T]> {
+        if self.dtype != T::DTYPE {
+            return Err(StridedError::DTypeMismatch {
+                expected: T::DTYPE.label(),
+                actual: self.dtype.label(),
+            });
+        }
+        Ok(unsafe {
+            core::slice::from_raw_parts(
+                self.data.as_ptr().cast::<T>(),
+                self.data.len() / core::mem::size_of::<T>(),
+            )
+        })
     }
 
     #[inline]
-    pub fn data(&self) -> &'a [u8] {
-        self.data
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
     }
 
     #[inline]
@@ -286,15 +389,6 @@ impl<'a> ErasedRawStridedRef<'a> {
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
-    }
-
-    /// Re-check the current byte buffer against the descriptor dtype.
-    ///
-    /// This is normally redundant after construction, but callers that can
-    /// mutate a sibling output descriptor's bytes may need a cheap way to
-    /// re-establish dtype byte validity before typed replay.
-    pub fn validate_data(&self) -> Result<()> {
-        validate_erased_buffer(self.dtype, self.data).map(|_| ())
     }
 }
 
@@ -308,20 +402,23 @@ pub struct ErasedRawStridedMut<'a> {
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
-    needs_data_revalidation: bool,
 }
 
 impl<'a> ErasedRawStridedMut<'a> {
-    /// Create a byte-backed erased output descriptor after validating dtype
-    /// byte length, alignment, rank/stride agreement, and reachable element
-    /// bounds.
-    pub fn new(
-        dtype: KernelDType,
-        data: &'a mut [u8],
+    /// Create an erased output descriptor from typed, initialized storage.
+    pub fn from_slice_mut<T: KernelStorageElement>(
+        data: &'a mut [T],
         dims: &'a [usize],
         strides: &'a [isize],
         offset: isize,
     ) -> Result<Self> {
+        let dtype = T::DTYPE;
+        let byte_len = data
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(StridedError::OffsetOverflow)?;
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), byte_len) };
         let element_count = validate_erased_buffer(dtype, data)?;
         validate_bounds(element_count, dims, strides, offset)?;
         Ok(Self {
@@ -330,26 +427,75 @@ impl<'a> ErasedRawStridedMut<'a> {
             dims,
             strides,
             offset,
-            needs_data_revalidation: false,
+        })
+    }
+
+    /// Construct from erased storage.
+    ///
+    /// # Safety
+    /// `data..data + byte_len` must be an aligned, writable allocation valid
+    /// for `'a`, with valid initialized values for `dtype` throughout the
+    /// complete byte extent; its provenance, extent, lifetime, and exclusive
+    /// aliasing must be upheld by the caller.
+    /// The alignment requirement is on the allocation, not merely the observed
+    /// address. The caller must retain exclusive access: no mutable alias or
+    /// concurrent mutation may exist while this descriptor is used.
+    pub unsafe fn from_raw_parts(
+        dtype: KernelDType,
+        data: NonNull<u8>,
+        byte_len: usize,
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let count = validate_erased_buffer_layout(dtype, data, byte_len)?;
+        let data = core::slice::from_raw_parts_mut(data.as_ptr(), byte_len);
+        validate_erased_buffer(dtype, data)?;
+        validate_bounds(count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data,
+            dims,
+            strides,
+            offset,
+        })
+    }
+
+    /// Borrow initialized storage as its concrete scalar type.
+    pub fn data_as<T: KernelStorageElement>(&self) -> Result<&[T]> {
+        if self.dtype != T::DTYPE {
+            return Err(StridedError::DTypeMismatch {
+                expected: T::DTYPE.label(),
+                actual: self.dtype.label(),
+            });
+        }
+        Ok(unsafe {
+            core::slice::from_raw_parts(
+                self.data.as_ptr().cast::<T>(),
+                self.data.len() / core::mem::size_of::<T>(),
+            )
+        })
+    }
+
+    /// Borrow initialized storage mutably as its concrete scalar type.
+    pub fn data_as_mut<T: KernelStorageElement>(&mut self) -> Result<&mut [T]> {
+        if self.dtype != T::DTYPE {
+            return Err(StridedError::DTypeMismatch {
+                expected: T::DTYPE.label(),
+                actual: self.dtype.label(),
+            });
+        }
+        Ok(unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.as_mut_ptr().cast::<T>(),
+                self.data.len() / core::mem::size_of::<T>(),
+            )
         })
     }
 
     #[inline]
     pub fn dtype(&self) -> KernelDType {
         self.dtype
-    }
-
-    #[inline]
-    pub fn data(&self) -> &[u8] {
-        self.data
-    }
-
-    #[inline]
-    pub fn data_mut(&mut self) -> &mut [u8] {
-        if self.dtype.requires_valid_byte_values() {
-            self.needs_data_revalidation = true;
-        }
-        self.data
     }
 
     #[inline]
@@ -365,36 +511,6 @@ impl<'a> ErasedRawStridedMut<'a> {
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
-    }
-
-    /// Re-check the current byte buffer against the descriptor dtype.
-    ///
-    /// This guards safe replay when callers mutate bytes through
-    /// [`ErasedRawStridedMut::data_mut`] after construction.
-    pub fn validate_data(&self) -> Result<()> {
-        validate_erased_buffer(self.dtype, self.data).map(|_| ())
-    }
-
-    /// Re-check dtype byte validity only when mutable bytes escaped since the
-    /// last validation.
-    pub fn validate_data_if_needed(&mut self) -> Result<()> {
-        if self.needs_data_revalidation {
-            self.validate_data()?;
-            self.needs_data_revalidation = false;
-        }
-        Ok(())
-    }
-
-    /// Mark the current byte buffer as satisfying this descriptor's dtype
-    /// value invariants.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure every byte sequence in `data` is valid for
-    /// `dtype`. This matters for `bool`, where Rust requires stored values to
-    /// be exactly `0` or `1` before a typed `bool` slice is formed.
-    pub unsafe fn assume_data_valid(&mut self) {
-        self.needs_data_revalidation = false;
     }
 }
 
@@ -414,18 +530,24 @@ pub struct ErasedRawStridedUninitMut<'a> {
 }
 
 impl<'a> ErasedRawStridedUninitMut<'a> {
-    /// Create an uninitialized erased output descriptor after validating byte
-    /// length, alignment, rank/stride agreement, and reachable bounds.
-    pub fn new(
-        dtype: KernelDType,
-        data: &'a mut [MaybeUninit<u8>],
+    /// Create an uninitialized erased output descriptor from typed storage.
+    pub fn from_uninit_slice<T: KernelStorageElement>(
+        data: &'a mut [MaybeUninit<T>],
         dims: &'a [usize],
         strides: &'a [isize],
         offset: isize,
     ) -> Result<Self> {
+        let dtype = T::DTYPE;
+        let byte_len = data
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(StridedError::OffsetOverflow)?;
+        let data = unsafe {
+            core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<MaybeUninit<u8>>(), byte_len)
+        };
         let data_ptr =
             NonNull::new(data.as_mut_ptr().cast::<u8>()).unwrap_or_else(NonNull::dangling);
-        let element_count = validate_erased_buffer_layout(dtype, data_ptr, data.len())?;
+        let element_count = validate_erased_buffer_layout(dtype, data_ptr, byte_len)?;
         validate_bounds(element_count, dims, strides, offset)?;
         Ok(Self {
             dtype,
@@ -436,24 +558,56 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
         })
     }
 
+    /// Construct from erased uninitialized storage.
+    ///
+    /// # Safety
+    /// `data..data + byte_len` must be an aligned, writable allocation valid
+    /// for `'a`, with provenance and extent sufficient for all reachable
+    /// elements. The caller must ensure every reachable element is completely
+    /// overwritten before it is read or exposed as initialized storage. The
+    /// allocation's alignment is an allocation property independent of the
+    /// observed address, and the descriptor must have exclusive access with no
+    /// mutable alias or concurrent mutation during use.
+    pub unsafe fn from_raw_parts(
+        dtype: KernelDType,
+        data: NonNull<u8>,
+        byte_len: usize,
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        let count = validate_erased_buffer_layout(dtype, data, byte_len)?;
+        let data =
+            core::slice::from_raw_parts_mut(data.as_ptr().cast::<MaybeUninit<u8>>(), byte_len);
+        validate_bounds(count, dims, strides, offset)?;
+        Ok(Self {
+            dtype,
+            data,
+            dims,
+            strides,
+            offset,
+        })
+    }
+
+    /// Borrow the uninitialized storage as its concrete scalar type.
+    pub fn data_as_uninit_mut<T: KernelStorageElement>(&mut self) -> Result<&mut [MaybeUninit<T>]> {
+        if self.dtype != T::DTYPE {
+            return Err(StridedError::DTypeMismatch {
+                expected: T::DTYPE.label(),
+                actual: self.dtype.label(),
+            });
+        }
+        Ok(unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.as_mut_ptr().cast::<MaybeUninit<T>>(),
+                self.data.len() / core::mem::size_of::<T>(),
+            )
+        })
+    }
+
     #[inline]
     pub fn dtype(&self) -> KernelDType {
         self.dtype
-    }
-
-    #[inline]
-    pub fn data_ptr(&self) -> *const u8 {
-        self.data.as_ptr().cast::<u8>()
-    }
-
-    #[inline]
-    pub fn byte_len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    pub fn data_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        self.data
     }
 
     #[inline]
@@ -470,6 +624,16 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     pub fn offset(&self) -> isize {
         self.offset
     }
+}
+
+fn ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) -> Result<bool> {
+    let a_end = a_start
+        .checked_add(a_len)
+        .ok_or(StridedError::OffsetOverflow)?;
+    let b_end = b_start
+        .checked_add(b_len)
+        .ok_or(StridedError::OffsetOverflow)?;
+    Ok(a_start < b_end && b_start < a_end)
 }
 
 /// Borrowed raw strided input layout.
@@ -675,38 +839,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn typed_erased_storage_covers_all_kernel_dtypes() {
+        macro_rules! check {
+            ($ty:ty, $value:expr) => {{
+                let mut initialized = [$value, $value];
+                let dims = [2usize];
+                let strides = [1isize];
+                let reference =
+                    ErasedRawStridedRef::from_slice(&initialized, &dims, &strides, 0).unwrap();
+                assert_eq!(reference.data_as::<$ty>().unwrap().len(), 2);
+                let mut mutable =
+                    ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0)
+                        .unwrap();
+                assert_eq!(mutable.data_as::<$ty>().unwrap().len(), 2);
+                assert_eq!(mutable.data_as_mut::<$ty>().unwrap().len(), 2);
+                let mut uninitialized = [MaybeUninit::<$ty>::uninit(); 2];
+                let mut destination = ErasedRawStridedUninitMut::from_uninit_slice(
+                    &mut uninitialized,
+                    &dims,
+                    &strides,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(destination.data_as_uninit_mut::<$ty>().unwrap().len(), 2);
+            }};
+        }
+
+        check!(f32, 1.0f32);
+        check!(f64, 1.0f64);
+        check!(i32, 1i32);
+        check!(i64, 1i64);
+        check!(bool, true);
+        check!(Complex32, Complex32::new(1.0, 0.0));
+        check!(Complex64, Complex64::new(1.0, 0.0));
+    }
+
+    #[test]
     fn rejects_usize_max_dimension_before_isize_truncation() {
-        let data = [0u8; 1];
+        let data = [false; 1];
         let dims = [usize::MAX];
         let strides = [-1isize];
         assert!(matches!(
             RawStridedRef::new(&data, &dims, &strides, 0),
             Err(crate::StridedError::OffsetOverflow)
         ));
-        let mut data = [0u8; 1];
+        let mut data = [false; 1];
         assert!(matches!(
             RawStridedMut::new(&mut data, &dims, &strides, 0),
             Err(crate::StridedError::OffsetOverflow)
         ));
         assert!(matches!(
-            ErasedRawStridedRef::new(KernelDType::Bool, &data, &dims, &strides, 0),
+            ErasedRawStridedRef::from_slice(&data, &dims, &strides, 0),
             Err(crate::StridedError::OffsetOverflow)
         ));
-        let mut data = [0u8; 1];
+        let mut data = [false; 1];
         assert!(matches!(
-            ErasedRawStridedMut::new(KernelDType::Bool, &mut data, &dims, &strides, 0),
+            ErasedRawStridedMut::from_slice_mut(&mut data, &dims, &strides, 0),
             Err(crate::StridedError::OffsetOverflow)
         ));
         let ptr = NonNull::new(data.as_mut_ptr()).unwrap();
         assert!(matches!(
             unsafe {
-                ErasedRawStridedPtr::new(KernelDType::Bool, ptr, data.len(), &dims, &strides, 0)
+                ErasedRawStridedPtr::from_raw_parts(
+                    KernelDType::Bool,
+                    ptr.cast(),
+                    data.len(),
+                    &dims,
+                    &strides,
+                    0,
+                )
             },
             Err(crate::StridedError::OffsetOverflow)
         ));
-        let mut data = vec![MaybeUninit::<u8>::uninit(); 1];
+        let mut data = vec![MaybeUninit::<bool>::uninit(); 1];
         assert!(matches!(
-            ErasedRawStridedUninitMut::new(KernelDType::Bool, &mut data, &dims, &strides, 0),
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut data, &dims, &strides, 0),
             Err(crate::StridedError::OffsetOverflow)
         ));
     }

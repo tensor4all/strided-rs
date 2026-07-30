@@ -86,15 +86,6 @@ fn as_bytes<T>(data: &[T]) -> &[u8] {
     }
 }
 
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            data.as_mut_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
-}
-
 fn patterned_f64(len: usize) -> Vec<f64> {
     (0..len)
         .map(|index| (index % 251) as f64 * 0.25 + 1.0)
@@ -125,26 +116,14 @@ fn bench_axis_reduce(c: &mut Criterion) {
             &[0],
         )
         .unwrap();
-        let source = ErasedRawStridedRef::new(
-            KernelDType::F64,
-            as_bytes(&input),
-            &src_dims,
-            &src_strides,
-            0,
-        )
-        .unwrap();
+        let source = ErasedRawStridedRef::from_slice(&input, &src_dims, &src_strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; columns];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::F64,
-                as_bytes_mut(&mut output),
-                &dest_dims,
-                &dest_strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &source).unwrap();
                 black_box(&mut dest);
@@ -186,34 +165,17 @@ fn bench_gather_take(c: &mut Criterion) {
             spec,
         )
         .unwrap();
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::F64,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
-        let index_ref = ErasedRawStridedRef::new(
-            KernelDType::I64,
-            as_bytes(&indices),
-            &index_dims,
-            &index_strides,
-            0,
-        )
-        .unwrap();
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let index_ref =
+            ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::F64,
-                as_bytes_mut(&mut output),
-                &dest_dims,
-                &dest_strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &operand_ref, &index_ref)
                     .unwrap();
@@ -248,34 +210,17 @@ fn bench_dynamic_slice(c: &mut Criterion) {
             &slice_sizes,
         )
         .unwrap();
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::F64,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
-        let starts_ref = ErasedRawStridedRef::new(
-            KernelDType::I64,
-            as_bytes(&starts),
-            &starts_dims,
-            &starts_strides,
-            0,
-        )
-        .unwrap();
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let starts_ref =
+            ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::F64,
-                as_bytes_mut(&mut output),
-                &dest_dims,
-                &dest_strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &operand_ref, &starts_ref)
                     .unwrap();
@@ -313,42 +258,19 @@ fn bench_dynamic_update_slice(c: &mut Criterion) {
             &dest_strides,
         )
         .unwrap();
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
-        let update_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&update),
-            &update_dims,
-            &update_strides,
-            0,
-        )
-        .unwrap();
-        let starts_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&starts),
-            &starts_dims,
-            &starts_strides,
-            0,
-        )
-        .unwrap();
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let update_ref =
+            ErasedRawStridedRef::from_slice(&update, &update_dims, &update_strides, 0).unwrap();
+        let starts_ref =
+            ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0i32; case.len + 128];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::I32,
-                as_bytes_mut(&mut output),
-                &dest_dims,
-                &dest_strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
                     .unwrap();
@@ -384,26 +306,15 @@ fn bench_pad_fill_and_copy(c: &mut Criterion) {
             &interior,
         )
         .unwrap();
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0i32; dest_dims[0]];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::I32,
-                as_bytes_mut(&mut output),
-                &dest_dims,
-                &dest_strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
                     .unwrap();
@@ -421,21 +332,13 @@ fn bench_copy_raw_path(c: &mut Criterion) {
         let strides = [1isize];
         let source_data = patterned_f64(case.len);
         let plan = ErasedCopyPlan::compile(KernelDType::F64, &dims, &strides, &strides).unwrap();
-        let source =
-            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&source_data), &dims, &strides, 0)
-                .unwrap();
+        let source = ErasedRawStridedRef::from_slice(&source_data, &dims, &strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::F64,
-                as_bytes_mut(&mut output),
-                &dims,
-                &strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &source).unwrap();
                 black_box(&mut dest);
@@ -481,42 +384,19 @@ fn bench_scatter_additive(c: &mut Criterion) {
             spec,
         )
         .unwrap();
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::F64,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
-        let index_ref = ErasedRawStridedRef::new(
-            KernelDType::I64,
-            as_bytes(&indices),
-            &index_dims,
-            &index_strides,
-            0,
-        )
-        .unwrap();
-        let update_ref = ErasedRawStridedRef::new(
-            KernelDType::F64,
-            as_bytes(&updates),
-            &update_dims,
-            &update_strides,
-            0,
-        )
-        .unwrap();
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let index_ref =
+            ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+        let update_ref =
+            ErasedRawStridedRef::from_slice(&updates, &update_dims, &update_strides, 0).unwrap();
         let ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
-            let mut dest = ErasedRawStridedMut::new(
-                KernelDType::F64,
-                as_bytes_mut(&mut output),
-                &dest_dims,
-                &dest_strides,
-                0,
-            )
-            .unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
                     .unwrap();

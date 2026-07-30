@@ -15,24 +15,6 @@ fn as_bytes<T>(data: &[T]) -> &[u8] {
     }
 }
 
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            data.as_mut_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
-}
-
-fn as_uninit_bytes_mut<T>(data: &mut [MaybeUninit<T>]) -> &mut [MaybeUninit<u8>] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            data.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-            core::mem::size_of_val(data),
-        )
-    }
-}
-
 fn assume_init_vec<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
     let mut data = core::mem::ManuallyDrop::new(data);
     unsafe { Vec::from_raw_parts(data.as_mut_ptr().cast::<T>(), data.len(), data.capacity()) }
@@ -40,7 +22,7 @@ fn assume_init_vec<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
 
 fn assert_uninit_slice<T>(dtype: KernelDType, operand: Vec<T>, expected: Vec<T>)
 where
-    T: Copy + core::fmt::Debug + PartialEq,
+    T: Copy + core::fmt::Debug + PartialEq + strided_kernel::KernelStorageElement,
 {
     let dims = [operand.len()];
     let strides = [1isize];
@@ -58,16 +40,14 @@ where
         &slice_strides,
     )
     .unwrap();
-    let operand_ref =
-        ErasedRawStridedRef::new(dtype, as_bytes(&operand), &dims, &strides, 0).unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
     let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
     let mut dest = Vec::<MaybeUninit<T>>::with_capacity(operand.len());
     unsafe {
         dest.set_len(operand.len());
     }
     let mut dest_ref =
-        ErasedRawStridedUninitMut::new(dtype, as_uninit_bytes_mut(&mut dest), &dims, &strides, 0)
-            .unwrap();
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut dest, &dims, &strides, 0).unwrap();
 
     plan.execute_uninit(
         &ExecContext::max_threads(2).unwrap(),
@@ -81,7 +61,7 @@ where
 
 fn assert_empty_uninit_slice<T>(dtype: KernelDType)
 where
-    T: Copy,
+    T: Copy + strided_kernel::KernelStorageElement,
 {
     let dims = [0usize];
     let strides = [1isize];
@@ -100,12 +80,11 @@ where
     )
     .unwrap();
     let operand: [T; 0] = [];
-    let operand_ref =
-        ErasedRawStridedRef::new(dtype, as_bytes(&operand), &dims, &strides, 0).unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
     let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
-    let mut empty_bytes: [MaybeUninit<u8>; 0] = [];
+    let mut empty_bytes: [MaybeUninit<T>; 0] = [];
     let mut dest_ref =
-        ErasedRawStridedUninitMut::new(dtype, &mut empty_bytes, &dims, &strides, 0).unwrap();
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut empty_bytes, &dims, &strides, 0).unwrap();
 
     plan.execute_uninit(&ExecContext::serial(), &mut dest_ref, &operand_ptr)
         .unwrap();
@@ -149,18 +128,11 @@ fn erased_reverse_uninit_handles_rank_above_inline_limit() {
     let operand: Vec<i32> = (0..512).collect();
     let plan =
         ErasedReversePlan::compile(KernelDType::I32, &dims, &strides, &strides, &axes).unwrap();
-    let operand_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&operand), &dims, &strides, 0).unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
     let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
     let mut dest = vec![MaybeUninit::<i32>::uninit(); operand.len()];
-    let mut dest_ref = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes_mut(&mut dest),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest_ref =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut dest, &dims, &strides, 0).unwrap();
 
     plan.execute_uninit(&ExecContext::serial(), &mut dest_ref, &operand_ptr)
         .unwrap();
@@ -192,24 +164,13 @@ fn erased_pad_and_concatenate_uninit_cover_noncontiguous_and_multi_input_outputs
         &interior,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&operand),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
     let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
     let mut padded = vec![MaybeUninit::<i32>::uninit(); 7];
-    let mut padded_ref = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes_mut(&mut padded),
-        &padded_dims,
-        &padded_strides,
-        0,
-    )
-    .unwrap();
+    let mut padded_ref =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut padded, &padded_dims, &padded_strides, 0)
+            .unwrap();
     pad.execute_uninit(
         &ExecContext::serial(),
         &mut padded_ref,
@@ -237,35 +198,18 @@ fn erased_pad_and_concatenate_uninit_cover_noncontiguous_and_multi_input_outputs
         0,
     )
     .unwrap();
-    let lhs_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&lhs),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let rhs_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&rhs),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
+    let lhs_ref =
+        ErasedRawStridedRef::from_slice(&lhs, &operand_dims, &operand_strides, 0).unwrap();
+    let rhs_ref =
+        ErasedRawStridedRef::from_slice(&rhs, &operand_dims, &operand_strides, 0).unwrap();
     let inputs = [
         ErasedRawStridedPtr::from_ref(&lhs_ref),
         ErasedRawStridedPtr::from_ref(&rhs_ref),
     ];
     let mut joined = vec![MaybeUninit::<i32>::uninit(); 4];
-    let mut joined_ref = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes_mut(&mut joined),
-        &concat_dims,
-        &concat_strides,
-        0,
-    )
-    .unwrap();
+    let mut joined_ref =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut joined, &concat_dims, &concat_strides, 0)
+            .unwrap();
     concat
         .execute_uninit(&ExecContext::serial(), &mut joined_ref, &inputs)
         .unwrap();
@@ -292,7 +236,7 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
     .unwrap();
     let mut storage = vec![MaybeUninit::new(7i32), MaybeUninit::new(9i32)];
     let input_ptr = unsafe {
-        ErasedRawStridedPtr::new(
+        ErasedRawStridedPtr::from_raw_parts(
             KernelDType::I32,
             core::ptr::NonNull::new(storage.as_mut_ptr().cast::<u8>()).unwrap(),
             core::mem::size_of_val(storage.as_slice()),
@@ -302,14 +246,8 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
         )
         .unwrap()
     };
-    let mut dest = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes_mut(&mut storage),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &dims, &strides, 0).unwrap();
 
     let error = plan
         .execute_uninit(&ExecContext::serial(), &mut dest, &input_ptr)
@@ -348,35 +286,18 @@ fn erased_concatenate_validates_all_segment_offsets_before_writing() {
     .unwrap();
     let first = [11i32];
     let empty: [i32; 0] = [];
-    let first_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&first),
-        &first_dims,
-        &input_strides,
-        0,
-    )
-    .unwrap();
-    let empty_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&empty),
-        &empty_dims,
-        &input_strides,
-        0,
-    )
-    .unwrap();
+    let first_ref =
+        ErasedRawStridedRef::from_slice(&first, &first_dims, &input_strides, 0).unwrap();
+    let empty_ref =
+        ErasedRawStridedRef::from_slice(&empty, &empty_dims, &input_strides, 0).unwrap();
     let inputs = [
         ErasedRawStridedPtr::from_ref(&first_ref),
         ErasedRawStridedPtr::from_ref(&empty_ref),
     ];
     let mut dest = [MaybeUninit::new(3i32), MaybeUninit::new(7i32)];
-    let mut dest_ref = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        1,
-    )
-    .unwrap();
+    let mut dest_ref =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut dest, &dest_dims, &dest_strides, 1)
+            .unwrap();
 
     let error = plan
         .execute_uninit(&ExecContext::serial(), &mut dest_ref, &inputs)
@@ -416,22 +337,10 @@ fn erased_slice_plan_executes_strided_static_slice() {
         &slice_strides,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::F64,
-        as_bytes(&operand),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::F64,
-        as_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest_ref, &operand_ref)
         .unwrap();
@@ -449,16 +358,8 @@ fn erased_reverse_plan_executes_multi_axis_reverse() {
 
     let plan =
         ErasedReversePlan::compile(KernelDType::I32, &dims, &strides, &strides, &axes).unwrap();
-    let operand_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&operand), &dims, &strides, 0).unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut dest),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+    let mut dest_ref = ErasedRawStridedMut::from_slice_mut(&mut dest, &dims, &strides, 0).unwrap();
 
     plan.execute(
         &ExecContext::max_threads(1).unwrap(),
@@ -494,22 +395,10 @@ fn erased_pad_plan_fills_output_and_copies_cropped_interior_padded_input() {
         &interior,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&operand),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
         &ExecContext::serial(),
@@ -524,7 +413,7 @@ fn erased_pad_plan_fills_output_and_copies_cropped_interior_padded_input() {
 
 fn assert_dense_edge_pad<T>(dtype: KernelDType, operand: &[T], fill: T, expected: &[T])
 where
-    T: Copy + core::fmt::Debug + PartialEq,
+    T: Copy + core::fmt::Debug + PartialEq + strided_kernel::KernelStorageElement,
 {
     let operand_dims = [operand.len()];
     let operand_strides = [1isize];
@@ -548,11 +437,9 @@ where
     )
     .unwrap();
     let operand_ref =
-        ErasedRawStridedRef::new(dtype, as_bytes(operand), &operand_dims, &operand_strides, 0)
-            .unwrap();
+        ErasedRawStridedRef::from_slice(operand, &operand_dims, &operand_strides, 0).unwrap();
     let mut dest_ref =
-        ErasedRawStridedMut::new(dtype, as_bytes_mut(&mut dest), &dest_dims, &dest_strides, 0)
-            .unwrap();
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
         &ExecContext::max_threads(4).unwrap(),
@@ -635,22 +522,10 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
         &interior,
     )
     .unwrap();
-    let empty_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&empty),
-        &empty_dims,
-        &empty_strides,
-        0,
-    )
-    .unwrap();
-    let mut padded_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut padded),
-        &padded_dims,
-        &padded_strides,
-        0,
-    )
-    .unwrap();
+    let empty_ref =
+        ErasedRawStridedRef::from_slice(&empty, &empty_dims, &empty_strides, 0).unwrap();
+    let mut padded_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut padded, &padded_dims, &padded_strides, 0).unwrap();
     plan.execute(
         &ExecContext::serial(),
         &mut padded_ref,
@@ -664,16 +539,9 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
     let mut scalar_dest = [0i32];
     let scalar_plan =
         ErasedPadPlan::compile(KernelDType::I32, &[], &[], &[], &[], &[], &[], &[]).unwrap();
-    let scalar_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&scalar), &[], &[], 0).unwrap();
-    let mut scalar_dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut scalar_dest),
-        &[],
-        &[],
-        0,
-    )
-    .unwrap();
+    let scalar_ref = ErasedRawStridedRef::from_slice(&scalar, &[], &[], 0).unwrap();
+    let mut scalar_dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut scalar_dest, &[], &[], 0).unwrap();
     scalar_plan
         .execute(
             &ExecContext::serial(),
@@ -701,22 +569,10 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
         &interior,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&operand),
-        &dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut strided_dest),
-        &dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &dims, &operand_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut strided_dest, &dims, &dest_strides, 0).unwrap();
     fallback
         .execute(
             &ExecContext::serial(),
@@ -749,16 +605,9 @@ fn erased_pad_contiguous_runs_honor_offsets_and_outer_axis_cropping() {
         &interior,
     )
     .unwrap();
-    let operand_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&operand), &dims, &strides, 1).unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut dest),
-        &padded_dims,
-        &strides,
-        1,
-    )
-    .unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 1).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &padded_dims, &strides, 1).unwrap();
     plan.execute(
         &ExecContext::serial(),
         &mut dest_ref,
@@ -788,22 +637,10 @@ fn erased_pad_contiguous_runs_honor_offsets_and_outer_axis_cropping() {
         &interior,
     )
     .unwrap();
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&operand),
-        &operand_dims,
-        &operand_strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I32,
-        as_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
     plan.execute(
         &ExecContext::serial(),
         &mut dest_ref,
@@ -839,39 +676,15 @@ fn erased_concatenate_plan_executes_three_input_axis_concatenate() {
         axis,
     )
     .unwrap();
-    let input0_ref = ErasedRawStridedRef::new(
-        KernelDType::I64,
-        as_bytes(&input0),
-        &input0_dims,
-        &input_strides,
-        0,
-    )
-    .unwrap();
-    let input1_ref = ErasedRawStridedRef::new(
-        KernelDType::I64,
-        as_bytes(&input1),
-        &input1_dims,
-        &input_strides,
-        0,
-    )
-    .unwrap();
-    let input2_ref = ErasedRawStridedRef::new(
-        KernelDType::I64,
-        as_bytes(&input2),
-        &input2_dims,
-        &input_strides,
-        0,
-    )
-    .unwrap();
+    let input0_ref =
+        ErasedRawStridedRef::from_slice(&input0, &input0_dims, &input_strides, 0).unwrap();
+    let input1_ref =
+        ErasedRawStridedRef::from_slice(&input1, &input1_dims, &input_strides, 0).unwrap();
+    let input2_ref =
+        ErasedRawStridedRef::from_slice(&input2, &input2_dims, &input_strides, 0).unwrap();
     let inputs = [input0_ref, input1_ref, input2_ref];
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::I64,
-        as_bytes_mut(&mut dest),
-        &dest_dims,
-        &dest_strides,
-        0,
-    )
-    .unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest_ref, &inputs)
         .unwrap();
@@ -957,16 +770,9 @@ fn erased_static_indexing_plans_reject_mismatches_before_writing() {
         &slice_strides,
     )
     .unwrap();
-    let operand_ref =
-        ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&operand), &dims, &strides, 0).unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::F32,
-        as_bytes_mut(&mut f32_dest),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut f32_dest, &dims, &strides, 0).unwrap();
 
     let err = slice
         .execute(&ExecContext::serial(), &mut dest_ref, &operand_ref)
@@ -989,22 +795,9 @@ fn erased_static_indexing_plans_reject_mismatches_before_writing() {
     .unwrap();
     let bool_operand = [true, false];
     let mut bool_dest = [false, false];
-    let operand_ref = ErasedRawStridedRef::new(
-        KernelDType::Bool,
-        as_bytes(&bool_operand),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
-    let mut dest_ref = ErasedRawStridedMut::new(
-        KernelDType::Bool,
-        as_bytes_mut(&mut bool_dest),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&bool_operand, &dims, &strides, 0).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut bool_dest, &dims, &strides, 0).unwrap();
 
     let err = pad
         .execute(&ExecContext::serial(), &mut dest_ref, &operand_ref, &[2u8])

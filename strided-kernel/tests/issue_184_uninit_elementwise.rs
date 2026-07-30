@@ -26,6 +26,7 @@ fn assume_init<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
 fn assert_mul_dtype<T>(lhs: &[T], rhs: &[T], expected: &[T])
 where
     T: Copy
+        + strided_kernel::KernelStorageElement
         + core::fmt::Debug
         + PartialEq
         + core::ops::Mul<Output = T>
@@ -40,25 +41,10 @@ where
     assert_eq!(assume_init(output), expected);
 }
 
-fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(data.as_ptr().cast(), core::mem::size_of_val(data)) }
-}
-
-fn as_uninit_bytes<T>(data: &mut [MaybeUninit<T>]) -> &mut [MaybeUninit<u8>] {
-    unsafe {
-        core::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), core::mem::size_of_val(data))
-    }
-}
-
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), core::mem::size_of_val(data))
-    }
-}
-
 fn assert_mul_broadcast_outer_differential<T>(lhs: &[T], rhs: &[T])
 where
     T: Copy
+        + strided_kernel::KernelStorageElement
         + core::fmt::Debug
         + PartialEq
         + core::ops::Mul<Output = T>
@@ -131,7 +117,11 @@ where
 
 fn assert_compare_differential<T>(lhs: &[T], rhs: &[T])
 where
-    T: Copy + core::fmt::Debug + PartialOrd + strided_kernel::MaybeSendSync,
+    T: Copy
+        + core::fmt::Debug
+        + PartialOrd
+        + strided_kernel::MaybeSendSync
+        + strided_kernel::KernelStorageElement,
 {
     let dims = [lhs.len()];
     let lhs_view = StridedView::<_, Identity>::new(lhs, &dims, &[1], 0).unwrap();
@@ -165,13 +155,13 @@ where
 
 fn assert_fused_differential<T>(dtype: KernelDType, inputs: &[Vec<T>], plan: FusedPlan)
 where
-    T: Copy + core::fmt::Debug + PartialEq,
+    T: Copy + core::fmt::Debug + PartialEq + strided_kernel::KernelStorageElement,
 {
     let dims = [inputs[0].len()];
     let strides = [1isize];
     let refs: Vec<_> = inputs
         .iter()
-        .map(|input| ErasedRawStridedRef::new(dtype, as_bytes(input), &dims, &strides, 0).unwrap())
+        .map(|input| ErasedRawStridedRef::from_slice(input, &dims, &strides, 0).unwrap())
         .collect();
     let ptrs: Vec<_> = refs.iter().map(ErasedRawStridedPtr::from_ref).collect();
     let plan = ErasedFusedPlan::compile(dtype, plan).unwrap();
@@ -179,20 +169,14 @@ where
     for context in [ExecContext::serial(), ExecContext::max_threads(2).unwrap()] {
         let mut initialized = vec![inputs[0][0]; dims[0]];
         let mut initialized_dest =
-            ErasedRawStridedMut::new(dtype, as_bytes_mut(&mut initialized), &dims, &strides, 0)
-                .unwrap();
+            ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
         plan.execute(&context, &mut initialized_dest, &refs)
             .unwrap();
 
         let mut uninitialized = vec![MaybeUninit::<T>::uninit(); dims[0]];
-        let mut uninitialized_dest = ErasedRawStridedUninitMut::new(
-            dtype,
-            as_uninit_bytes(&mut uninitialized),
-            &dims,
-            &strides,
-            0,
-        )
-        .unwrap();
+        let mut uninitialized_dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
+                .unwrap();
         plan.execute_uninit(&context, &mut uninitialized_dest, &ptrs)
             .unwrap();
         assert_eq!(assume_init(uninitialized), initialized);
@@ -460,18 +444,10 @@ fn erased_fused_uninitialized_replay_writes_valid_bool_output() {
         },
     )
     .unwrap();
-    let inputs = [
-        ErasedRawStridedRef::new(KernelDType::Bool, as_bytes(&lhs), &dims, &strides, 0).unwrap(),
-    ];
+    let inputs = [ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap()];
     let mut output = vec![MaybeUninit::<bool>::uninit(); 4];
-    let mut dest = ErasedRawStridedUninitMut::new(
-        KernelDType::Bool,
-        as_uninit_bytes(&mut output),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     let inputs = inputs.map(|input| ErasedRawStridedPtr::from_ref(&input));
     plan.execute_uninit(&ExecContext::max_threads(1).unwrap(), &mut dest, &inputs)
         .unwrap();
@@ -521,7 +497,7 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
     let mut output = vec![MaybeUninit::new(99i32); 4];
     let ptr = NonNull::new(output.as_mut_ptr().cast::<u8>()).unwrap();
     let overlapping = unsafe {
-        ErasedRawStridedPtr::new(
+        ErasedRawStridedPtr::from_raw_parts(
             KernelDType::I32,
             ptr,
             core::mem::size_of_val(output.as_slice()),
@@ -531,14 +507,8 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         )
         .unwrap()
     };
-    let mut dest = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes(&mut output),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(&ExecContext::serial(), &mut dest, &[overlapping]),
         Err(StridedError::OverlappingInputOutput { input: 0 })
@@ -549,17 +519,10 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
 
     let wrong_dtype = [1.0f32; 4];
     let wrong_dtype_ref =
-        ErasedRawStridedRef::new(KernelDType::F32, as_bytes(&wrong_dtype), &dims, &strides, 0)
-            .unwrap();
+        ErasedRawStridedRef::from_slice(&wrong_dtype, &dims, &strides, 0).unwrap();
     let mut output = vec![MaybeUninit::new(99i32); 4];
-    let mut dest = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes(&mut output),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(
             &ExecContext::serial(),
@@ -574,23 +537,11 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
 
     let short_dims = [2usize];
     let short_input = [1i32; 2];
-    let short_ref = ErasedRawStridedRef::new(
-        KernelDType::I32,
-        as_bytes(&short_input),
-        &short_dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let short_ref =
+        ErasedRawStridedRef::from_slice(&short_input, &short_dims, &strides, 0).unwrap();
     let mut output = vec![MaybeUninit::new(99i32); 4];
-    let mut dest = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes(&mut output),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(
             &ExecContext::serial(),
@@ -604,18 +555,11 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         .all(|value| unsafe { value.assume_init() == 99 }));
 
     let input = [1i32; 4];
-    let input_ref =
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&input), &dims, &strides, 0).unwrap();
+    let input_ref = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
     let input_ptr = ErasedRawStridedPtr::from_ref(&input_ref);
     let mut output = vec![MaybeUninit::new(99i32); 4];
-    let mut noninjective = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes(&mut output),
-        &dims,
-        &[0],
-        0,
-    )
-    .unwrap();
+    let mut noninjective =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &[0], 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(&ExecContext::serial(), &mut noninjective, &[input_ptr]),
         Err(StridedError::NonInjectiveOutputLayout)
@@ -680,18 +624,12 @@ fn erased_fused_uninitialized_parallel_replay_preserves_wrapping_integer_semanti
     )
     .unwrap();
     let inputs = [
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&lhs), &dims, &strides, 0).unwrap(),
-        ErasedRawStridedRef::new(KernelDType::I32, as_bytes(&rhs), &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap(),
     ];
     let mut output = vec![MaybeUninit::<i32>::uninit(); len];
-    let mut dest = ErasedRawStridedUninitMut::new(
-        KernelDType::I32,
-        as_uninit_bytes(&mut output),
-        &dims,
-        &strides,
-        0,
-    )
-    .unwrap();
+    let mut dest =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     let inputs = inputs.map(|input| ErasedRawStridedPtr::from_ref(&input));
     plan.execute_uninit(&ExecContext::max_threads(2).unwrap(), &mut dest, &inputs)
         .unwrap();

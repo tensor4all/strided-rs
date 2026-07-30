@@ -35,7 +35,7 @@ pub use element_op::{
 // ============================================================================
 pub use raw::{
     ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    KernelDType, RawStridedMut, RawStridedRef,
+    KernelDType, KernelStorageElement, RawStridedMut, RawStridedRef,
 };
 pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 
