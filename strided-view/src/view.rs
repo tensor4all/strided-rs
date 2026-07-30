@@ -52,8 +52,12 @@ pub(crate) fn validate_bounds(
     let mut max_offset = offset;
     for (&dim, &stride) in dims.iter().zip(strides.iter()) {
         if dim > 1 {
+            let last = dim
+                .checked_sub(1)
+                .and_then(|value| isize::try_from(value).ok())
+                .ok_or(StridedError::OffsetOverflow)?;
             let end = stride
-                .checked_mul(dim as isize - 1)
+                .checked_mul(last)
                 .ok_or(StridedError::OffsetOverflow)?;
             if end >= 0 {
                 max_offset = max_offset

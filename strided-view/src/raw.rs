@@ -675,6 +675,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_usize_max_dimension_before_isize_truncation() {
+        let data = [0u8; 1];
+        let dims = [usize::MAX];
+        let strides = [-1isize];
+        assert!(matches!(
+            RawStridedRef::new(&data, &dims, &strides, 0),
+            Err(crate::StridedError::OffsetOverflow)
+        ));
+        let mut data = [0u8; 1];
+        assert!(matches!(
+            RawStridedMut::new(&mut data, &dims, &strides, 0),
+            Err(crate::StridedError::OffsetOverflow)
+        ));
+        assert!(matches!(
+            ErasedRawStridedRef::new(KernelDType::Bool, &data, &dims, &strides, 0),
+            Err(crate::StridedError::OffsetOverflow)
+        ));
+        let mut data = [0u8; 1];
+        assert!(matches!(
+            ErasedRawStridedMut::new(KernelDType::Bool, &mut data, &dims, &strides, 0),
+            Err(crate::StridedError::OffsetOverflow)
+        ));
+        let ptr = NonNull::new(data.as_mut_ptr()).unwrap();
+        assert!(matches!(
+            unsafe {
+                ErasedRawStridedPtr::new(KernelDType::Bool, ptr, data.len(), &dims, &strides, 0)
+            },
+            Err(crate::StridedError::OffsetOverflow)
+        ));
+        let mut data = vec![MaybeUninit::<u8>::uninit(); 1];
+        assert!(matches!(
+            ErasedRawStridedUninitMut::new(KernelDType::Bool, &mut data, &dims, &strides, 0),
+            Err(crate::StridedError::OffsetOverflow)
+        ));
+    }
+
+    #[test]
     fn empty_raw_views_use_dangling_base_pointers_for_extreme_offsets() {
         let dims = [0usize];
         let strides = [1isize];
