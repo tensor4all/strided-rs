@@ -29,25 +29,21 @@ unsafe fn cast_slice<T, U>(src: &[T]) -> &[U] {
 }
 
 #[cfg(feature = "simd")]
-#[inline(always)]
-unsafe fn cast_slice_mut<T, U>(src: &mut [T]) -> &mut [U] {
-    debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<U>());
-    unsafe { std::slice::from_raw_parts_mut(src.as_mut_ptr().cast::<U>(), src.len()) }
-}
-
-#[cfg(feature = "simd")]
-macro_rules! impl_simd_mul_partial {
+macro_rules! impl_simd_mul_ptr {
     (
         $mul_into:ident,
         $ty:ty,
         $lanes:ident,
         $load:ident,
-        $store:ident,
-        $mul:ident
+        $mask:ident,
+        $store_ptr:ident,
+        $mul:ident,
+        $mask_scale:expr
     ) => {
-        fn $mul_into(dst: &mut [$ty], a: &[$ty], b: &[$ty]) {
+        unsafe fn $mul_into(dst: *mut $ty, len: usize, a: &[$ty], b: &[$ty]) {
             struct Mul<'a> {
-                dst: &'a mut [$ty],
+                dst: *mut $ty,
+                len: usize,
                 a: &'a [$ty],
                 b: &'a [$ty],
             }
@@ -57,126 +53,106 @@ macro_rules! impl_simd_mul_partial {
 
                 #[inline(always)]
                 fn with_simd<S: pulp::Simd>(self, simd: S) -> Self::Output {
-                    debug_assert_eq!(self.dst.len(), self.a.len());
-                    debug_assert_eq!(self.dst.len(), self.b.len());
+                    debug_assert_eq!(self.len, self.a.len());
+                    debug_assert_eq!(self.len, self.b.len());
 
                     let lanes = S::$lanes;
                     let mut i = 0usize;
-                    while i + lanes <= self.dst.len() {
+                    while i + lanes <= self.len {
                         let va = simd.$load(&self.a[i..i + lanes]);
                         let vb = simd.$load(&self.b[i..i + lanes]);
-                        simd.$store(&mut self.dst[i..i + lanes], simd.$mul(va, vb));
+                        unsafe {
+                            simd.$store_ptr(
+                                simd.$mask(0, (lanes * $mask_scale) as _),
+                                self.dst.add(i),
+                                simd.$mul(va, vb),
+                            );
+                        }
                         i += lanes;
                     }
-                    if i < self.dst.len() {
+                    if i < self.len {
                         let va = simd.$load(&self.a[i..]);
                         let vb = simd.$load(&self.b[i..]);
-                        simd.$store(&mut self.dst[i..], simd.$mul(va, vb));
+                        unsafe {
+                            simd.$store_ptr(
+                                simd.$mask(0, ((self.len - i) * $mask_scale) as _),
+                                self.dst.add(i),
+                                simd.$mul(va, vb),
+                            );
+                        }
                     }
                 }
             }
 
-            pulp::Arch::new().dispatch(Mul { dst, a, b });
+            pulp::Arch::new().dispatch(Mul { dst, len, a, b });
         }
     };
 }
 
 #[cfg(feature = "simd")]
-macro_rules! impl_simd_mul_body_tail {
-    (
-        $mul_into:ident,
-        $ty:ty,
-        $as_simd:ident,
-        $as_mut_simd:ident,
-        $load:ident,
-        $store:ident,
-        $mul:ident
-    ) => {
-        fn $mul_into(dst: &mut [$ty], a: &[$ty], b: &[$ty]) {
-            struct Mul<'a> {
-                dst: &'a mut [$ty],
-                a: &'a [$ty],
-                b: &'a [$ty],
-            }
-
-            impl<'a> pulp::WithSimd for Mul<'a> {
-                type Output = ();
-
-                #[inline(always)]
-                fn with_simd<S: pulp::Simd>(self, simd: S) -> Self::Output {
-                    debug_assert_eq!(self.dst.len(), self.a.len());
-                    debug_assert_eq!(self.dst.len(), self.b.len());
-
-                    let (dst_head, dst_tail) = S::$as_mut_simd(self.dst);
-                    let (a_head, a_tail) = S::$as_simd(self.a);
-                    let (b_head, b_tail) = S::$as_simd(self.b);
-                    debug_assert_eq!(dst_head.len(), a_head.len());
-                    debug_assert_eq!(dst_head.len(), b_head.len());
-                    debug_assert_eq!(dst_tail.len(), a_tail.len());
-                    debug_assert_eq!(dst_tail.len(), b_tail.len());
-
-                    for i in 0..dst_head.len() {
-                        dst_head[i] = simd.$mul(a_head[i], b_head[i]);
-                    }
-                    if !dst_tail.is_empty() {
-                        let va = simd.$load(a_tail);
-                        let vb = simd.$load(b_tail);
-                        simd.$store(dst_tail, simd.$mul(va, vb));
-                    }
-                }
-            }
-
-            pulp::Arch::new().dispatch(Mul { dst, a, b });
-        }
-    };
-}
-
-#[cfg(feature = "simd")]
-impl_simd_mul_partial!(
+impl_simd_mul_ptr!(
     simd_mul_f32_into,
     f32,
     F32_LANES,
     partial_load_f32s,
-    partial_store_f32s,
-    mul_f32s
+    mask_between_m32s,
+    mask_store_ptr_f32s,
+    mul_f32s,
+    1
 );
 
 #[cfg(feature = "simd")]
-impl_simd_mul_partial!(
+impl_simd_mul_ptr!(
     simd_mul_f64_into,
     f64,
     F64_LANES,
     partial_load_f64s,
-    partial_store_f64s,
-    mul_f64s
+    mask_between_m64s,
+    mask_store_ptr_f64s,
+    mul_f64s,
+    1
 );
 
 #[cfg(feature = "simd")]
-impl_simd_mul_body_tail!(
+impl_simd_mul_ptr!(
     simd_mul_c32_into,
     num_complex::Complex32,
-    as_simd_c32s,
-    as_mut_simd_c32s,
+    C32_LANES,
     partial_load_c32s,
-    partial_store_c32s,
-    mul_e_c32s
+    mask_between_m32s,
+    mask_store_ptr_c32s,
+    mul_e_c32s,
+    2
 );
 
 #[cfg(feature = "simd")]
-impl_simd_mul_body_tail!(
+impl_simd_mul_ptr!(
     simd_mul_c64_into,
     num_complex::Complex64,
-    as_simd_c64s,
-    as_mut_simd_c64s,
+    C64_LANES,
     partial_load_c64s,
-    partial_store_c64s,
-    mul_e_c64s
+    mask_between_m64s,
+    mask_store_ptr_c64s,
+    mul_e_c64s,
+    2
 );
 
 #[cfg(feature = "simd")]
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_mul_contiguous<D: 'static, A: 'static, B: 'static>(
     dst: &mut [D],
+    a: &[A],
+    b: &[B],
+) -> bool {
+    unsafe { try_mul_contiguous_ptr(dst.as_mut_ptr(), dst.len(), a, b) }
+}
+
+#[cfg(feature = "simd")]
+#[inline]
+pub(crate) unsafe fn try_mul_contiguous_ptr<D: 'static, A: 'static, B: 'static>(
+    dst: *mut D,
+    len: usize,
     a: &[A],
     b: &[B],
 ) -> bool {
@@ -188,7 +164,7 @@ pub(crate) fn try_mul_contiguous<D: 'static, A: 'static, B: 'static>(
                 && TypeId::of::<A>() == TypeId::of::<$ty>()
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
-                unsafe { $mul_into(cast_slice_mut(dst), cast_slice(a), cast_slice(b)) };
+                unsafe { $mul_into(dst.cast::<$ty>(), len, cast_slice(a), cast_slice(b)) };
                 return true;
             }
         };
@@ -204,8 +180,20 @@ pub(crate) fn try_mul_contiguous<D: 'static, A: 'static, B: 'static>(
 
 #[cfg(not(feature = "simd"))]
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_mul_contiguous<D: 'static, A: 'static, B: 'static>(
     _dst: &mut [D],
+    _a: &[A],
+    _b: &[B],
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "simd"))]
+#[inline]
+pub(crate) unsafe fn try_mul_contiguous_ptr<D: 'static, A: 'static, B: 'static>(
+    _dst: *mut D,
+    _len: usize,
     _a: &[A],
     _b: &[B],
 ) -> bool {

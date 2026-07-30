@@ -857,6 +857,111 @@ impl ErasedFusedPlan {
         }
         result
     }
+
+    /// Execute a single-output fused plan into fully overwritten uninitialized storage.
+    ///
+    /// Dtype, shape, destination injectivity, bounds, and input/output overlap
+    /// are validated before any shared typed input descriptor is formed or any
+    /// destination byte is written. On `Ok(())`, every logical destination
+    /// element is initialized. An error leaves the destination untouched; a
+    /// panic during execution may leave partial initialization, but the backing
+    /// `MaybeUninit` storage remains safe to drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed dtype, input-count, shape, bounds, destination
+    /// injectivity, unsupported-operation, or input/output-overlap error. All
+    /// error-producing validation completes before execution starts.
+    pub fn execute_uninit(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        inputs: &[ErasedRawStridedPtr<'_>],
+    ) -> Result<()> {
+        if inputs.len() != self.plan.input_count {
+            return Err(StridedError::RankMismatch(
+                inputs.len(),
+                self.plan.input_count,
+            ));
+        }
+        check_dtype(self.dtype, dest.dtype())?;
+        for input in inputs {
+            check_dtype(self.dtype, input.dtype())?;
+        }
+        for (index, input) in inputs.iter().enumerate() {
+            validate_uninit_no_overlap(dest, input, index)?;
+            if input.dims() != dest.dims() {
+                return Err(StridedError::ShapeMismatch(
+                    input.dims().to_vec(),
+                    dest.dims().to_vec(),
+                ));
+            }
+        }
+        let validated = crate::map_view::validate_destination_layout_without_alloc(
+            dest.dims(),
+            dest.strides(),
+        )?;
+
+        let run = |dest: &mut ErasedRawStridedUninitMut<'_>| match self.dtype {
+            KernelDType::F32 => execute_fused_uninit_ptrs::<f32>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            KernelDType::F64 => execute_fused_uninit_ptrs::<f64>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            KernelDType::I32 => execute_fused_uninit_ptrs::<i32>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            KernelDType::I64 => execute_fused_uninit_ptrs::<i64>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            KernelDType::Bool => execute_fused_uninit_ptrs::<bool>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            KernelDType::C32 => execute_fused_uninit_ptrs::<Complex32>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            KernelDType::C64 => execute_fused_uninit_ptrs::<Complex64>(
+                &self.plan,
+                dest,
+                inputs,
+                ctx.is_serial(),
+                validated,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        if ctx.is_serial() {
+            run(dest)
+        } else {
+            ctx.run(|| run(dest))
+        }
+    }
 }
 
 impl ErasedReducePlan {
@@ -2895,6 +3000,121 @@ where
             ];
             let mut dests = [dest_view];
             execute_fused_views(ctx, &mut dests, &input_views, plan)
+        }
+        _ => Err(StridedError::UnsupportedArity {
+            arity: inputs.len(),
+            max: ERASED_FUSED_INPUT_LIMIT,
+        }),
+    }
+}
+
+fn execute_fused_uninit<T>(
+    plan: &FusedPlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    inputs: &[ErasedRawStridedRef<'_>],
+    serial: bool,
+    validated: crate::map_view::ValidatedDestinationLayout,
+) -> Result<()>
+where
+    T: FusedScalar,
+{
+    let dims = dest.dims();
+    let strides = dest.strides();
+    let offset = dest.offset();
+    let dest_data = typed_uninit_slice_mut::<T>(dest.data_mut());
+    let mut dest_view = unsafe { StridedViewMut::new_unchecked(dest_data, dims, strides, offset) };
+    match inputs {
+        [a] => {
+            let input_views = [erased_view::<T>(a)];
+            crate::fused::fused_elementwise_into_uninit(
+                &mut dest_view,
+                &input_views,
+                plan,
+                serial,
+                validated,
+            )
+        }
+        [a, b] => {
+            let input_views = [erased_view::<T>(a), erased_view::<T>(b)];
+            crate::fused::fused_elementwise_into_uninit(
+                &mut dest_view,
+                &input_views,
+                plan,
+                serial,
+                validated,
+            )
+        }
+        [a, b, c] => {
+            let input_views = [
+                erased_view::<T>(a),
+                erased_view::<T>(b),
+                erased_view::<T>(c),
+            ];
+            crate::fused::fused_elementwise_into_uninit(
+                &mut dest_view,
+                &input_views,
+                plan,
+                serial,
+                validated,
+            )
+        }
+        [a, b, c, d] => {
+            let input_views = [
+                erased_view::<T>(a),
+                erased_view::<T>(b),
+                erased_view::<T>(c),
+                erased_view::<T>(d),
+            ];
+            crate::fused::fused_elementwise_into_uninit(
+                &mut dest_view,
+                &input_views,
+                plan,
+                serial,
+                validated,
+            )
+        }
+        _ => Err(StridedError::UnsupportedArity {
+            arity: inputs.len(),
+            max: ERASED_FUSED_INPUT_LIMIT,
+        }),
+    }
+}
+
+fn execute_fused_uninit_ptrs<T>(
+    plan: &FusedPlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    inputs: &[ErasedRawStridedPtr<'_>],
+    serial: bool,
+    validated: crate::map_view::ValidatedDestinationLayout,
+) -> Result<()>
+where
+    T: FusedScalar,
+{
+    match inputs {
+        [a] => {
+            let refs = [validated_input_ref(a)?];
+            execute_fused_uninit::<T>(plan, dest, &refs, serial, validated)
+        }
+        [a, b] => {
+            let refs = [validated_input_ref(a)?, validated_input_ref(b)?];
+            execute_fused_uninit::<T>(plan, dest, &refs, serial, validated)
+        }
+        [a, b, c] => {
+            let refs = [
+                validated_input_ref(a)?,
+                validated_input_ref(b)?,
+                validated_input_ref(c)?,
+            ];
+            execute_fused_uninit::<T>(plan, dest, &refs, serial, validated)
+        }
+        [a, b, c, d] => {
+            let refs = [
+                validated_input_ref(a)?,
+                validated_input_ref(b)?,
+                validated_input_ref(c)?,
+                validated_input_ref(d)?,
+            ];
+            execute_fused_uninit::<T>(plan, dest, &refs, serial, validated)
         }
         _ => Err(StridedError::UnsupportedArity {
             arity: inputs.len(),
