@@ -1,4 +1,5 @@
 use core::mem::MaybeUninit;
+use num_complex::{Complex32, Complex64};
 
 use strided_kernel::{
     batched_outer_product_into_uninit, broadcast_mul_into_uninit, compare_into_uninit,
@@ -16,6 +17,23 @@ fn uninit_view<'a, T>(
 fn assume_init<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
     let mut data = core::mem::ManuallyDrop::new(data);
     unsafe { Vec::from_raw_parts(data.as_mut_ptr().cast(), data.len(), data.capacity()) }
+}
+
+fn assert_mul_dtype<T>(lhs: &[T], rhs: &[T], expected: &[T])
+where
+    T: Copy
+        + core::fmt::Debug
+        + PartialEq
+        + core::ops::Mul<Output = T>
+        + strided_kernel::MaybeSendSync
+        + 'static,
+{
+    let dims = [lhs.len()];
+    let lhs_view = StridedView::<_, Identity>::new(lhs, &dims, &[1], 0).unwrap();
+    let rhs_view = StridedView::<_, Identity>::new(rhs, &dims, &[1], 0).unwrap();
+    let mut output = vec![MaybeUninit::uninit(); lhs.len()];
+    mul_into_uninit(&mut uninit_view(&mut output, &dims), &lhs_view, &rhs_view).unwrap();
+    assert_eq!(assume_init(output), expected);
 }
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
@@ -69,6 +87,20 @@ fn typed_uninitialized_full_overwrite_siblings_match_initialized_paths() {
     batched_outer_product_into_uninit(&mut outer_view, &lhs_outer_view, &rhs_outer_view, 1, 1)
         .unwrap();
     assert_eq!(assume_init(outer_out), [20, 30, 40, 60, 60, 90]);
+
+    assert_mul_dtype(&[1.0f32, -2.0], &[3.0, 4.0], &[3.0, -8.0]);
+    assert_mul_dtype(&[1.0f64, -2.0], &[3.0, 4.0], &[3.0, -8.0]);
+    assert_mul_dtype(&[3i64, -4], &[5, 6], &[15, -24]);
+    assert_mul_dtype(
+        &[Complex32::new(1.0, 2.0), Complex32::new(3.0, -1.0)],
+        &[Complex32::new(2.0, -1.0), Complex32::new(0.5, 2.0)],
+        &[Complex32::new(4.0, 3.0), Complex32::new(3.5, 5.5)],
+    );
+    assert_mul_dtype(
+        &[Complex64::new(1.0, 2.0), Complex64::new(3.0, -1.0)],
+        &[Complex64::new(2.0, -1.0), Complex64::new(0.5, 2.0)],
+        &[Complex64::new(4.0, 3.0), Complex64::new(3.5, 5.5)],
+    );
 }
 
 #[test]
