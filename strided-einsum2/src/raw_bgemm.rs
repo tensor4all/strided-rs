@@ -9,6 +9,55 @@ use crate::backend::Backend;
 use crate::{contiguous, Scalar, ScalarBase};
 use strided_view::{Conj, ElementOp, ElementOpApply, RawStridedMut, RawStridedRef};
 
+#[derive(Clone, Copy)]
+pub(crate) struct BgemmGroupLayout {
+    pub(crate) a_sum_end: usize,
+    pub(crate) a_rank: usize,
+    pub(crate) b_ro_end: usize,
+    pub(crate) b_rank: usize,
+    pub(crate) c_ro_end: usize,
+    pub(crate) c_rank: usize,
+    pub(crate) label_len: usize,
+}
+
+pub(crate) fn checked_bgemm_group_layout(
+    n_batch: usize,
+    n_lo: usize,
+    n_ro: usize,
+    n_sum: usize,
+) -> crate::Result<BgemmGroupLayout> {
+    let a_sum_end = n_lo
+        .checked_add(n_sum)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    let a_rank = a_sum_end
+        .checked_add(n_batch)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    let b_ro_end = n_sum
+        .checked_add(n_ro)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    let b_rank = b_ro_end
+        .checked_add(n_batch)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    let c_ro_end = n_lo
+        .checked_add(n_ro)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    let c_rank = c_ro_end
+        .checked_add(n_batch)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    let label_len = c_rank
+        .checked_add(n_sum)
+        .ok_or(strided_view::StridedError::OffsetOverflow)?;
+    Ok(BgemmGroupLayout {
+        a_sum_end,
+        a_rank,
+        b_ro_end,
+        b_rank,
+        c_ro_end,
+        c_rank,
+        label_len,
+    })
+}
+
 /// Batched strided GEMM on raw borrowed layout metadata using the active backend.
 ///
 /// This is the raw-layout counterpart to backend-specific `bgemm_strided_into`
@@ -186,8 +235,8 @@ where
     Ok(())
 }
 
-pub(crate) fn validate_bgemm_shapes<T>(
-    c: &RawStridedMut<'_, T>,
+pub(crate) fn validate_bgemm_shapes<T, U>(
+    c: &RawStridedMut<'_, U>,
     a: &RawStridedRef<'_, T>,
     b: &RawStridedRef<'_, T>,
     n_batch: usize,
@@ -195,23 +244,21 @@ pub(crate) fn validate_bgemm_shapes<T>(
     n_ro: usize,
     n_sum: usize,
 ) -> crate::Result<()> {
-    let a_rank = n_lo + n_sum + n_batch;
-    let b_rank = n_sum + n_ro + n_batch;
-    let c_rank = n_lo + n_ro + n_batch;
-    if a.dims().len() != a_rank {
-        return Err(strided_view::StridedError::RankMismatch(a_rank, a.dims().len()).into());
+    let groups = checked_bgemm_group_layout(n_batch, n_lo, n_ro, n_sum)?;
+    if a.dims().len() != groups.a_rank {
+        return Err(strided_view::StridedError::RankMismatch(groups.a_rank, a.dims().len()).into());
     }
-    if b.dims().len() != b_rank {
-        return Err(strided_view::StridedError::RankMismatch(b_rank, b.dims().len()).into());
+    if b.dims().len() != groups.b_rank {
+        return Err(strided_view::StridedError::RankMismatch(groups.b_rank, b.dims().len()).into());
     }
-    if c.dims().len() != c_rank {
-        return Err(strided_view::StridedError::RankMismatch(c_rank, c.dims().len()).into());
+    if c.dims().len() != groups.c_rank {
+        return Err(strided_view::StridedError::RankMismatch(groups.c_rank, c.dims().len()).into());
     }
 
     let lo_dims = &a.dims()[..n_lo];
-    let sum_dims = &a.dims()[n_lo..n_lo + n_sum];
-    let batch_dims = &a.dims()[n_lo + n_sum..];
-    let ro_dims = &b.dims()[n_sum..n_sum + n_ro];
+    let sum_dims = &a.dims()[n_lo..groups.a_sum_end];
+    let batch_dims = &a.dims()[groups.a_sum_end..];
+    let ro_dims = &b.dims()[n_sum..groups.b_ro_end];
 
     if &b.dims()[..n_sum] != sum_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
@@ -220,10 +267,10 @@ pub(crate) fn validate_bgemm_shapes<T>(
         )
         .into());
     }
-    if &b.dims()[n_sum + n_ro..] != batch_dims {
+    if &b.dims()[groups.b_ro_end..] != batch_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             batch_dims.to_vec(),
-            b.dims()[n_sum + n_ro..].to_vec(),
+            b.dims()[groups.b_ro_end..].to_vec(),
         )
         .into());
     }
@@ -234,17 +281,17 @@ pub(crate) fn validate_bgemm_shapes<T>(
         )
         .into());
     }
-    if &c.dims()[n_lo..n_lo + n_ro] != ro_dims {
+    if &c.dims()[n_lo..groups.c_ro_end] != ro_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             ro_dims.to_vec(),
-            c.dims()[n_lo..n_lo + n_ro].to_vec(),
+            c.dims()[n_lo..groups.c_ro_end].to_vec(),
         )
         .into());
     }
-    if &c.dims()[n_lo + n_ro..] != batch_dims {
+    if &c.dims()[groups.c_ro_end..] != batch_dims {
         return Err(strided_view::StridedError::ShapeMismatch(
             batch_dims.to_vec(),
-            c.dims()[n_lo + n_ro..].to_vec(),
+            c.dims()[groups.c_ro_end..].to_vec(),
         )
         .into());
     }

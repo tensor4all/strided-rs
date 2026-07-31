@@ -57,6 +57,8 @@ pub mod plan;
 pub mod raw_bgemm;
 /// Trace-axis reduction (summing axes that appear only in one operand).
 pub mod trace;
+/// Overwrite-only APIs for genuinely uninitialized destinations.
+pub mod uninit;
 /// Shared helpers (permutation inversion, multi-index iteration, dimension fusion).
 pub mod util;
 
@@ -78,12 +80,15 @@ pub use strided_view::{
 };
 
 pub use backend::Backend;
-pub use dot_general::{dot_general_into, dot_general_with_backend_into, DotGeneralConfig};
+pub use dot_general::{
+    dot_general_into, dot_general_into_uninit, dot_general_with_backend_into, DotGeneralConfig,
+};
 pub use plan::Einsum2Plan;
 pub use raw_bgemm::{
     bgemm_raw_strided_into, bgemm_raw_strided_into_unchecked, bgemm_raw_with_backend_into,
     bgemm_raw_with_backend_into_unchecked,
 };
+pub use uninit::{bgemm_raw_strided_into_uninit, einsum2_into_owned_uninit, einsum2_into_uninit};
 
 /// Trait alias for axis label types.
 pub trait AxisId: Clone + Eq + Hash + Debug {}
@@ -156,6 +161,8 @@ pub enum EinsumError {
         expected: Vec<usize>,
         got: Vec<usize>,
     },
+    #[error("unsupported einsum operation: {0}")]
+    Unsupported(String),
     #[error(transparent)]
     Strided(#[from] strided_view::StridedError),
 }

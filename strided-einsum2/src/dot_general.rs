@@ -25,7 +25,9 @@
 //! ```
 
 use smallvec::SmallVec;
-use strided_view::{StridedView, StridedViewMut};
+use std::mem::MaybeUninit;
+use strided_kernel::ExecContext;
+use strided_view::{RawStridedMut, StridedView, StridedViewMut};
 
 use crate::backend::Backend;
 use crate::{einsum2_dispatch, Einsum2Plan, EinsumError, Result, ScalarBase};
@@ -278,6 +280,66 @@ where
     crate::backend::ActiveBackend: Backend<T>,
 {
     dot_general_with_backend_into::<T, crate::backend::ActiveBackend>(c, a, b, config, alpha, beta)
+}
+
+/// Compute dot-general into a genuinely uninitialized destination.
+///
+/// The destination is only exposed as initialized after this function returns
+/// `Ok(())`; holes in a strided backing allocation are never touched.
+pub fn dot_general_into_uninit<T: crate::Scalar>(
+    c: &mut RawStridedMut<'_, MaybeUninit<T>>,
+    a: &StridedView<'_, T>,
+    b: &StridedView<'_, T>,
+    config: &DotGeneralConfig<'_>,
+    alpha: T,
+    ctx: &ExecContext,
+) -> Result<()> {
+    let labels = config.labels_for_shapes(a.dims(), b.dims(), c.dims())?;
+    crate::einsum2_into_uninit(
+        c,
+        a,
+        b,
+        labels.out_labels.as_slice(),
+        labels.lhs_labels.as_slice(),
+        labels.rhs_labels.as_slice(),
+        alpha,
+        ctx,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::MaybeUninit;
+
+    #[test]
+    fn uninit_entry_point_routes_through_einsum_validation() {
+        let a = strided_view::StridedArray::from_fn_col_major(&[2, 3], |idx| {
+            (idx[0] + 2 * idx[1] + 1) as f64
+        });
+        let b = strided_view::StridedArray::from_fn_col_major(&[3, 2], |idx| {
+            (idx[0] + 3 * idx[1] + 1) as f64
+        });
+        let mut storage = vec![MaybeUninit::<f64>::uninit(); 4];
+        let mut c = RawStridedMut::new(&mut storage, &[2, 2], &[2, 1], 0).unwrap();
+        let config = DotGeneralConfig {
+            lhs_contracting_dims: &[1],
+            rhs_contracting_dims: &[0],
+            lhs_batch_dims: &[],
+            rhs_batch_dims: &[],
+        };
+
+        let err = dot_general_into_uninit(
+            &mut c,
+            &a.view(),
+            &b.view(),
+            &config,
+            1.0,
+            &ExecContext::serial(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::EinsumError::Unsupported(_)));
+    }
 }
 
 /// Compute `C = alpha * dot_general(A, B) + beta * C` with the naive fallback.

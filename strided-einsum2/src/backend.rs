@@ -4,6 +4,7 @@
 //! and the `ActiveBackend` type alias that serves as the single point of
 //! backend selection based on Cargo features.
 
+use strided_kernel::ExecContext;
 use strided_view::ElementOp;
 
 /// Trait for backends that can execute batched GEMM on contiguous operands.
@@ -44,6 +45,23 @@ pub trait Backend<T: crate::ScalarBase> {
         k: usize,
         alpha: T,
         beta: T,
+    ) -> strided_view::Result<()>;
+}
+
+/// Private overwrite-only backend contract. The initialized `Backend` trait
+/// remains unchanged for beta-bearing callers.
+#[allow(dead_code)]
+pub(crate) trait OverwriteBackend<T: crate::ScalarBase> {
+    fn bgemm_contiguous_overwrite(
+        c: &mut crate::contiguous::UninitContiguousOperand<'_, '_, T>,
+        a: &crate::contiguous::ContiguousOperand<T>,
+        b: &crate::contiguous::ContiguousOperand<T>,
+        batch_dims: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: T,
+        ctx: &ExecContext,
     ) -> strided_view::Result<()>;
 }
 
@@ -136,6 +154,26 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(not(any(feature = "blas", feature = "blas-inject")))]
+impl<T> OverwriteBackend<T> for NaiveBackend
+where
+    T: crate::ScalarBase + strided_view::ElementOpApply,
+{
+    fn bgemm_contiguous_overwrite(
+        c: &mut crate::contiguous::UninitContiguousOperand<'_, '_, T>,
+        a: &crate::contiguous::ContiguousOperand<T>,
+        b: &crate::contiguous::ContiguousOperand<T>,
+        batch_dims: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: T,
+        ctx: &ExecContext,
+    ) -> strided_view::Result<()> {
+        crate::uninit::bgemm_contiguous_naive(c, a, b, batch_dims, m, n, k, alpha, ctx)
     }
 }
 

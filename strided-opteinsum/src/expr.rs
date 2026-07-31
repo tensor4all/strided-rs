@@ -1,10 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+use std::mem::MaybeUninit;
 
 use num_complex::Complex64;
 #[cfg(test)]
 use num_traits::Zero;
-use strided_einsum2::{einsum2_into, einsum2_into_owned};
+use strided_einsum2::einsum2_into;
+#[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
+use strided_einsum2::einsum2_into_owned;
+#[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+use strided_einsum2::einsum2_into_uninit;
 use strided_kernel::copy_scale;
+#[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+use strided_kernel::ExecContext;
 use strided_view::{StridedArray, StridedViewMut};
 
 use crate::operand::{EinsumOperand, EinsumScalar, StridedData};
@@ -64,7 +72,28 @@ trait PoolOps: EinsumScalar {
     /// # Safety contract
     /// The returned array may contain uninitialized data. Callers must write
     /// every element before reading (e.g. via `einsum2_into` with `beta=0`).
-    fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<Self>;
+    #[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+    fn pool_acquire(
+        pool: &mut BufferPool,
+        dims: &[usize],
+    ) -> crate::Result<StridedArray<MaybeUninit<Self>>>;
+
+    /// Acquire initialized storage for the Faer compatibility path. Faer
+    /// cannot currently accept `MaybeUninit<T>` output; reused buffers are
+    /// already initialized, while fresh buffers are initialized once.
+    #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+    fn pool_acquire_initialized(
+        pool: &mut BufferPool,
+        dims: &[usize],
+    ) -> crate::Result<StridedArray<Self>>;
+
+    /// Convert a completely overwritten array into initialized storage.
+    ///
+    /// # Safety
+    /// The caller must have received `Ok(())` from the overwrite-only kernel
+    /// for every logical element before calling this method.
+    #[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+    unsafe fn assume_initialized(array: StridedArray<MaybeUninit<Self>>) -> StridedArray<Self>;
 
     /// Release an owned buffer back to the pool for reuse.
     /// Views are silently dropped (nothing to recycle).
@@ -83,14 +112,76 @@ fn take_best_fit<T>(pool: &mut BTreeMap<usize, Vec<Vec<T>>>, total: usize) -> Op
     buf
 }
 
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+fn acquire_initialized<T: EinsumScalar>(
+    pool: &mut BTreeMap<usize, Vec<Vec<T>>>,
+    dims: &[usize],
+) -> crate::Result<StridedArray<T>> {
+    let total = dims
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(strided_view::StridedError::OffsetOverflow)?
+        .max(1);
+    let mut data = take_best_fit(pool, total).unwrap_or_default();
+    if data.len() < total {
+        data.resize_with(total, T::default);
+    } else {
+        data.truncate(total);
+    }
+    Ok(StridedArray::from_parts(
+        data,
+        dims,
+        &strided_view::col_major_strides(dims),
+        0,
+    )?)
+}
+
 impl PoolOps for f64 {
-    fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<f64> {
-        let total: usize = dims.iter().product();
+    #[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+    fn pool_acquire(
+        pool: &mut BufferPool,
+        dims: &[usize],
+    ) -> crate::Result<StridedArray<MaybeUninit<f64>>> {
+        let total = dims
+            .iter()
+            .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+            .ok_or(strided_view::StridedError::OffsetOverflow)?
+            .max(1);
         // SAFETY: einsum2_into with beta=0 writes every output element before reading.
         match take_best_fit(&mut pool.f64_pool, total) {
-            Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
-            None => unsafe { StridedArray::col_major_uninit(dims) },
+            Some(buf) => unsafe {
+                let mut buf = std::mem::ManuallyDrop::new(buf);
+                let data = Vec::from_raw_parts(
+                    buf.as_mut_ptr().cast::<MaybeUninit<f64>>(),
+                    buf.len(),
+                    buf.capacity(),
+                );
+                Ok(StridedArray::col_major_from_buffer_uninit(data, dims))
+            },
+            None => Ok(unsafe { StridedArray::col_major_uninit(dims) }),
         }
+    }
+
+    #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+    fn pool_acquire_initialized(
+        pool: &mut BufferPool,
+        dims: &[usize],
+    ) -> crate::Result<StridedArray<Self>> {
+        acquire_initialized(&mut pool.f64_pool, dims)
+    }
+
+    #[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+    unsafe fn assume_initialized(array: StridedArray<MaybeUninit<f64>>) -> StridedArray<f64> {
+        let dims = array.dims().to_vec();
+        let strides = array.strides().to_vec();
+        let offset = 0;
+        let data = array.into_data();
+        let len = data.len();
+        let cap = data.capacity();
+        let ptr = data.as_ptr().cast_mut().cast::<f64>();
+        std::mem::forget(data);
+        StridedArray::from_parts(Vec::from_raw_parts(ptr, len, cap), &dims, &strides, offset)
+            .expect("validated pool layout")
     }
 
     fn pool_release(pool: &mut BufferPool, data: StridedData<'_, f64>) {
@@ -102,13 +193,52 @@ impl PoolOps for f64 {
 }
 
 impl PoolOps for Complex64 {
-    fn pool_acquire(pool: &mut BufferPool, dims: &[usize]) -> StridedArray<Complex64> {
-        let total: usize = dims.iter().product();
+    #[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+    fn pool_acquire(
+        pool: &mut BufferPool,
+        dims: &[usize],
+    ) -> crate::Result<StridedArray<MaybeUninit<Complex64>>> {
+        let total = dims
+            .iter()
+            .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+            .ok_or(strided_view::StridedError::OffsetOverflow)?
+            .max(1);
         // SAFETY: einsum2_into with beta=0 writes every output element before reading.
         match take_best_fit(&mut pool.c64_pool, total) {
-            Some(buf) => unsafe { StridedArray::col_major_from_buffer_uninit(buf, dims) },
-            None => unsafe { StridedArray::col_major_uninit(dims) },
+            Some(buf) => unsafe {
+                let mut buf = std::mem::ManuallyDrop::new(buf);
+                let data = Vec::from_raw_parts(
+                    buf.as_mut_ptr().cast::<MaybeUninit<Complex64>>(),
+                    buf.len(),
+                    buf.capacity(),
+                );
+                Ok(StridedArray::col_major_from_buffer_uninit(data, dims))
+            },
+            None => Ok(unsafe { StridedArray::col_major_uninit(dims) }),
         }
+    }
+
+    #[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
+    fn pool_acquire_initialized(
+        pool: &mut BufferPool,
+        dims: &[usize],
+    ) -> crate::Result<StridedArray<Self>> {
+        acquire_initialized(&mut pool.c64_pool, dims)
+    }
+
+    #[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+    unsafe fn assume_initialized(
+        array: StridedArray<MaybeUninit<Complex64>>,
+    ) -> StridedArray<Complex64> {
+        let dims = array.dims().to_vec();
+        let strides = array.strides().to_vec();
+        let data = array.into_data();
+        let len = data.len();
+        let cap = data.capacity();
+        let ptr = data.as_ptr().cast_mut().cast::<Complex64>();
+        std::mem::forget(data);
+        StridedArray::from_parts(Vec::from_raw_parts(ptr, len, cap), &dims, &strides, 0)
+            .expect("validated pool layout")
     }
 
     fn pool_release(pool: &mut BufferPool, data: StridedData<'_, Complex64>) {
@@ -288,10 +418,8 @@ fn compute_binary_output_ids(
     out
 }
 
-/// Generic inner function for pairwise contraction with buffer pool.
-///
-/// Acquires an output buffer, runs `einsum2_into`, and releases input buffers
-/// back to the pool.
+/// Faer compatibility path until the upstream overwrite API exists.
+#[cfg(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject"))))]
 fn eval_pair_alloc<T: PoolOps>(
     ld: StridedData<'_, T>,
     left_ids: &[char],
@@ -309,10 +437,9 @@ fn eval_pair_alloc<T: PoolOps>(
         output_ids,
         size_dict,
     )?;
-    let mut c_arr = T::pool_acquire(pool, &out_dims);
-    match (ld, rd) {
-        // Preserve ownership so strided-einsum2 can use prepare_input_owned
-        // and avoid extra materialization in prepare_input_view.
+    let mut c_arr = T::pool_acquire_initialized(pool, &out_dims)?;
+    let (left, right) = (ld, rd);
+    match (left, right) {
         (StridedData::Owned(a), StridedData::Owned(b)) => {
             einsum2_into_owned(
                 c_arr.view_mut(),
@@ -327,9 +454,9 @@ fn eval_pair_alloc<T: PoolOps>(
                 false,
             )?;
         }
-        (ld, rd) => {
-            let a_view = ld.as_view();
-            let b_view = rd.as_view();
+        (left, right) => {
+            let a_view = left.as_view();
+            let b_view = right.as_view();
             einsum2_into(
                 c_arr.view_mut(),
                 &a_view,
@@ -340,10 +467,75 @@ fn eval_pair_alloc<T: PoolOps>(
                 T::one(),
                 T::zero(),
             )?;
+            T::pool_release(pool, left);
+            T::pool_release(pool, right);
+        }
+    }
+    Ok(T::wrap_array(c_arr))
+}
+
+/// Generic inner function for pairwise contraction with buffer pool.
+///
+/// Acquires an output buffer, runs `einsum2_into`, and releases input buffers
+/// back to the pool.
+#[cfg(not(all(feature = "faer", not(any(feature = "blas", feature = "blas-inject")))))]
+fn eval_pair_alloc<T: PoolOps>(
+    ld: StridedData<'_, T>,
+    left_ids: &[char],
+    rd: StridedData<'_, T>,
+    right_ids: &[char],
+    output_ids: &[char],
+    pool: &mut BufferPool,
+    size_dict: &HashMap<char, usize>,
+) -> crate::Result<EinsumOperand<'static>> {
+    let out_dims = out_dims_from_ids(
+        left_ids,
+        ld.dims(),
+        right_ids,
+        rd.dims(),
+        output_ids,
+        size_dict,
+    )?;
+    let mut c_arr = T::pool_acquire(pool, &out_dims)?;
+    match (ld, rd) {
+        // Preserve ownership so strided-einsum2 can use prepare_input_owned
+        // and avoid extra materialization in prepare_input_view.
+        (StridedData::Owned(a), StridedData::Owned(b)) => {
+            let dims = c_arr.dims().to_vec();
+            let strides = c_arr.strides().to_vec();
+            let mut out = strided_view::RawStridedMut::new(c_arr.data_mut(), &dims, &strides, 0)?;
+            strided_einsum2::einsum2_into_owned_uninit(
+                &mut out,
+                a,
+                b,
+                output_ids,
+                left_ids,
+                right_ids,
+                T::one(),
+                &ExecContext::serial(),
+            )?;
+        }
+        (ld, rd) => {
+            let a_view = ld.as_view();
+            let b_view = rd.as_view();
+            let dims = c_arr.dims().to_vec();
+            let strides = c_arr.strides().to_vec();
+            let mut out = strided_view::RawStridedMut::new(c_arr.data_mut(), &dims, &strides, 0)?;
+            einsum2_into_uninit(
+                &mut out,
+                &a_view,
+                &b_view,
+                output_ids,
+                left_ids,
+                right_ids,
+                T::one(),
+                &ExecContext::serial(),
+            )?;
             T::pool_release(pool, ld);
             T::pool_release(pool, rd);
         }
     }
+    let c_arr = unsafe { T::assume_initialized(c_arr) };
     Ok(T::wrap_array(c_arr))
 }
 
@@ -402,8 +594,20 @@ fn eval_pair_into<T: EinsumScalar>(
 
     match (left_data, right_data) {
         (StridedData::Owned(a), StridedData::Owned(b)) => {
+            #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
             einsum2_into_owned(
                 output, a, b, output_ids, left_ids, right_ids, alpha, beta, false, false,
+            )?;
+            #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
+            einsum2_into(
+                output,
+                &a.view(),
+                &b.view(),
+                output_ids,
+                left_ids,
+                right_ids,
+                alpha,
+                beta,
             )?;
         }
         (StridedData::Owned(a), StridedData::View(b)) => {

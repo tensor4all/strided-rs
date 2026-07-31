@@ -177,7 +177,7 @@ where
     let a_contig_buf: Option<StridedArray<T>>;
     let (a_ptr, a_row_stride, a_col_stride);
     if a_needs_copy {
-        let mut buf = alloc_col_major_uninit(a.dims());
+        let mut buf = alloc_col_major_uninit(a.dims())?;
         strided_kernel::copy_into(&mut buf.view_mut(), &a.as_view())?;
         a_ptr = buf.view().ptr();
         // Col-major inner A [lo..., sum...]: lo stride = 1, sum stride = m
@@ -201,7 +201,7 @@ where
     let b_contig_buf: Option<StridedArray<T>>;
     let (b_ptr, b_row_stride, b_col_stride);
     if b_needs_copy {
-        let mut buf = alloc_col_major_uninit(b.dims());
+        let mut buf = alloc_col_major_uninit(b.dims())?;
         strided_kernel::copy_into(&mut buf.view_mut(), &b.as_view())?;
         b_ptr = buf.view().ptr();
         // Col-major inner B [sum..., ro...]: sum stride = 1, ro stride = k
@@ -225,7 +225,7 @@ where
     let c_contig_buf: Option<StridedArray<T>>;
     let (c_ptr, c_row_stride, c_col_stride);
     if c_needs_copy {
-        let mut buf = alloc_col_major_uninit(c.dims());
+        let mut buf = alloc_col_major_uninit(c.dims())?;
         if beta != T::zero() {
             let c_view: StridedView<'_, T> = c.as_view();
             strided_kernel::copy_into(&mut buf.view_mut(), &c_view)?;
