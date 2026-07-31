@@ -307,6 +307,41 @@ pub fn dot_general_into_uninit<T: crate::Scalar>(
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::MaybeUninit;
+
+    #[test]
+    fn uninit_entry_point_routes_through_einsum_validation() {
+        let a = strided_view::StridedArray::from_fn_col_major(&[2, 3], |idx| {
+            (idx[0] + 2 * idx[1] + 1) as f64
+        });
+        let b = strided_view::StridedArray::from_fn_col_major(&[3, 2], |idx| {
+            (idx[0] + 3 * idx[1] + 1) as f64
+        });
+        let mut storage = vec![MaybeUninit::<f64>::uninit(); 4];
+        let mut c = RawStridedMut::new(&mut storage, &[2, 2], &[2, 1], 0).unwrap();
+        let config = DotGeneralConfig {
+            lhs_contracting_dims: &[1],
+            rhs_contracting_dims: &[0],
+            lhs_batch_dims: &[],
+            rhs_batch_dims: &[],
+        };
+
+        let err = dot_general_into_uninit(
+            &mut c,
+            &a.view(),
+            &b.view(),
+            &config,
+            1.0,
+            &ExecContext::serial(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::EinsumError::Unsupported(_)));
+    }
+}
+
 /// Compute `C = alpha * dot_general(A, B) + beta * C` with the naive fallback.
 #[cfg(not(any(feature = "faer", feature = "blas", feature = "blas-inject")))]
 pub fn dot_general_into<T: crate::Scalar>(

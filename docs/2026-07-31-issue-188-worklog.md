@@ -29,6 +29,12 @@ Add overwrite-only contraction entry points whose destination is borrowed as
 ## Verification
 
 - `cargo fmt --all`
+- Added coverage tests for the Faer-gated validation/naive fallback, the
+  `dot_general_into_uninit` forwarding boundary, and both direct and
+  temporary raw-output finalize paths.
+- `CARGO_BUILD_JOBS=4 RUSTFLAGS='-C link-arg=-Wl,--threads=1' cargo llvm-cov --workspace --json --output-path /tmp/coverage-188.json`
+- `python3 scripts/check-coverage.py /tmp/coverage-188.json` (54/54 files;
+  `contiguous.rs` 86.98%, `dot_general.rs` 86.53%, `uninit.rs` 82.17%)
 - `cargo test -p strided-einsum2 --lib`
 - `cargo test -p strided-opteinsum --lib`
 - `cargo test -p strided-einsum2 --no-default-features`

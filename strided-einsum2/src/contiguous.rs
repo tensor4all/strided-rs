@@ -1166,4 +1166,67 @@ mod tests {
         let after = pooled_count_for_type::<f64>();
         assert!(after >= before.saturating_add(1));
     }
+
+    #[test]
+    fn test_output_raw_uninit_direct_finalize() {
+        let mut storage = vec![MaybeUninit::<f64>::uninit(); 6];
+        let mut raw = RawStridedMut::new(&mut storage, &[2, 3], &[1, 2], 0).unwrap();
+        let op = prepare_output_raw_uninit(&mut raw, 1, 1, false).unwrap();
+
+        assert!(op.temp.is_none());
+        assert!(op.writeback.is_none());
+        for j in 0..3 {
+            for i in 0..2 {
+                let offset = i as isize * op.row_stride() + j as isize * op.col_stride();
+                // SAFETY: the direct layout is injective and every logical
+                // destination element is written exactly once before finalize.
+                unsafe {
+                    op.ptr()
+                        .offset(offset)
+                        .write(MaybeUninit::new((10 + i + 2 * j) as f64));
+                }
+            }
+        }
+        op.finalize().unwrap();
+        drop(raw);
+
+        let values: Vec<f64> = storage
+            .into_iter()
+            .map(|x| unsafe { x.assume_init() })
+            .collect();
+        assert_eq!(values, vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+    }
+
+    #[test]
+    fn test_output_raw_uninit_temp_finalize_writes_back() {
+        let mut storage = vec![MaybeUninit::<f64>::uninit(); 30];
+        let mut raw = RawStridedMut::new(&mut storage, &[2, 3, 1], &[10, 1, 1], 0).unwrap();
+        let op = prepare_output_raw_uninit(&mut raw, 2, 1, true).unwrap();
+
+        assert!(op.temp.is_some());
+        assert!(op.writeback.is_some());
+        for i in 0..6 {
+            let offset = i as isize * op.row_stride();
+            // SAFETY: the dense temporary has one initialized value for every
+            // logical output element before writeback.
+            unsafe {
+                op.ptr()
+                    .offset(offset)
+                    .write(MaybeUninit::new((20 + i) as f64));
+            }
+        }
+        op.finalize().unwrap();
+        drop(raw);
+
+        // SAFETY: finalize wrote every asserted destination element before
+        // these reads.
+        unsafe {
+            assert_eq!(storage[0].assume_init_ref(), &20.0);
+            assert_eq!(storage[1].assume_init_ref(), &22.0);
+            assert_eq!(storage[2].assume_init_ref(), &24.0);
+            assert_eq!(storage[10].assume_init_ref(), &21.0);
+            assert_eq!(storage[11].assume_init_ref(), &23.0);
+            assert_eq!(storage[12].assume_init_ref(), &25.0);
+        }
+    }
 }

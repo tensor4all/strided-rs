@@ -810,6 +810,108 @@ mod tests {
         assert!(matches!(err, crate::EinsumError::Unsupported(_)));
     }
 
+    #[cfg(feature = "faer")]
+    #[test]
+    fn faer_uninit_gemm_validates_labels_before_backend_selection() {
+        let a = StridedArray::from_fn_col_major(&[2], |_| 1.0f64);
+        let b = StridedArray::from_fn_col_major(&[2], |_| 1.0f64);
+
+        let mut rank_storage = vec![MaybeUninit::<f64>::uninit(); 2];
+        let mut rank_dest = RawStridedMut::new(&mut rank_storage, &[2], &[1], 0).unwrap();
+        let rank_err = einsum2_into_uninit(
+            &mut rank_dest,
+            &a.view(),
+            &b.view(),
+            &['i'],
+            &['i', 'j'],
+            &['i'],
+            1.0,
+            &ExecContext::serial(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            rank_err,
+            crate::EinsumError::OutputShapeMismatch { .. }
+        ));
+
+        let mut shape_storage = vec![MaybeUninit::<f64>::uninit(); 3];
+        let mut shape_dest = RawStridedMut::new(&mut shape_storage, &[3], &[1], 0).unwrap();
+        let shape_err = einsum2_into_uninit(
+            &mut shape_dest,
+            &a.view(),
+            &b.view(),
+            &['i'],
+            &['i'],
+            &['i'],
+            1.0,
+            &ExecContext::serial(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            shape_err,
+            crate::EinsumError::OutputShapeMismatch { .. }
+        ));
+
+        let b_mismatched = StridedArray::from_fn_col_major(&[3], |_| 1.0f64);
+        let mut scalar_storage = vec![MaybeUninit::<f64>::uninit()];
+        let mut scalar_dest = RawStridedMut::new(&mut scalar_storage, &[], &[], 0).unwrap();
+        let dimension_err = einsum2_into_uninit(
+            &mut scalar_dest,
+            &a.view(),
+            &b_mismatched.view(),
+            &[],
+            &['i'],
+            &['i'],
+            1.0,
+            &ExecContext::serial(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            dimension_err,
+            crate::EinsumError::DimensionMismatch { .. }
+        ));
+    }
+
+    #[cfg(feature = "faer")]
+    #[test]
+    fn naive_overwrite_backend_covers_batches_and_conjugation() {
+        let a = StridedArray::from_fn_col_major(&[2, 2, 2], |idx| {
+            (1 + idx[0] + 2 * idx[1] + 4 * idx[2]) as f64
+        });
+        let b = StridedArray::from_fn_col_major(&[2, 2, 2], |idx| {
+            (1 + idx[0] + 2 * idx[1] + 4 * idx[2]) as f64
+        });
+        let a_raw = RawStridedRef::new(a.data(), a.dims(), a.strides(), a.view().offset()).unwrap();
+        let b_raw = RawStridedRef::new(b.data(), b.dims(), b.strides(), b.view().offset()).unwrap();
+        let a_op =
+            crate::contiguous::prepare_input_raw(&a_raw, 1, 1, true, false, false, None).unwrap();
+        let b_op =
+            crate::contiguous::prepare_input_raw(&b_raw, 1, 1, true, false, false, None).unwrap();
+
+        let mut storage = vec![MaybeUninit::<f64>::uninit(); 8];
+        let mut c = RawStridedMut::new(&mut storage, &[2, 2, 2], &[1, 2, 4], 0).unwrap();
+        let mut c_op = crate::contiguous::prepare_output_raw_uninit(&mut c, 1, 1, false).unwrap();
+        bgemm_contiguous_naive(
+            &mut c_op,
+            &a_op,
+            &b_op,
+            &[2],
+            2,
+            2,
+            2,
+            2.0,
+            &ExecContext::serial(),
+        )
+        .unwrap();
+        c_op.finalize().unwrap();
+
+        let values: Vec<f64> = storage
+            .into_iter()
+            .map(|x| unsafe { x.assume_init() })
+            .collect();
+        assert!(values.iter().all(|value| *value > 0.0));
+    }
+
     #[cfg(not(feature = "faer"))]
     #[test]
     fn noncontiguous_output_is_written_back_after_overwrite() {
