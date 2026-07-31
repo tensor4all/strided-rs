@@ -8,6 +8,7 @@ use crate::ScalarBase;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use strided_view::{RawStridedMut, RawStridedRef, StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.
@@ -34,6 +35,20 @@ pub struct ContiguousOperandMut<T: Copy + 'static> {
     /// Owns the buffer if a copy was made.
     pub(crate) _buf: Option<StridedArray<T>>,
     buf_is_pooled: bool,
+}
+
+/// Overwrite-only C operand. The destination borrow is retained until the
+/// provider has returned successfully; no initialized C view is constructed
+/// while the provider is running.
+#[allow(dead_code)]
+pub(crate) struct UninitContiguousOperand<'a, 'b, T: Copy + 'static> {
+    destination: &'a mut RawStridedMut<'b, MaybeUninit<T>>,
+    ptr: *mut MaybeUninit<T>,
+    row_stride: isize,
+    col_stride: isize,
+    batch_strides: Vec<isize>,
+    temp: Option<StridedArray<MaybeUninit<T>>>,
+    writeback: Option<strided_kernel::CopyPlan>,
 }
 
 thread_local! {
@@ -106,26 +121,32 @@ fn return_pooled_vec<T: Copy + 'static>(mut data: Vec<T>) {
     });
 }
 
-fn alloc_col_major_uninit_with_pool<T: Copy + 'static>(dims: &[usize]) -> (StridedArray<T>, bool) {
-    let total: usize = dims.iter().product::<usize>().max(1);
+fn alloc_col_major_uninit_with_pool<T: Copy + 'static>(
+    dims: &[usize],
+) -> strided_view::Result<(StridedArray<T>, bool)> {
+    let total = dims
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(strided_view::StridedError::OffsetOverflow)?
+        .max(1);
     let bytes = total.saturating_mul(std::mem::size_of::<T>());
     if bytes == 0 || bytes > MAX_POOLED_BYTES {
-        return (alloc_col_major_uninit(dims), false);
+        return Ok((alloc_col_major_uninit(dims)?, false));
     }
     let data = take_pooled_vec_uninit::<T>(total);
     let arr = unsafe { StridedArray::col_major_from_buffer_uninit(data, dims) };
-    (arr, true)
+    Ok((arr, true))
 }
 
 /// Allocate a col-major buffer, optionally reusing from the thread-local pool.
 fn alloc_maybe_pooled<T: Copy + 'static>(
     dims: &[usize],
     use_pool: bool,
-) -> (StridedArray<T>, bool) {
+) -> strided_view::Result<(StridedArray<T>, bool)> {
     if use_pool {
         alloc_col_major_uninit_with_pool(dims)
     } else {
-        (alloc_col_major_uninit(dims), false)
+        Ok((alloc_col_major_uninit(dims)?, false))
     }
 }
 
@@ -374,12 +395,18 @@ fn col_major_layout(
 /// With batch-last canonical order `[inner..., batch...]`, pure column-major
 /// naturally gives batch dims the largest strides — each batch slice is a
 /// contiguous column-major matrix.
-pub(crate) fn alloc_col_major_uninit<T: Copy>(dims: &[usize]) -> StridedArray<T> {
-    let total: usize = dims.iter().product::<usize>().max(1);
+pub(crate) fn alloc_col_major_uninit<T: Copy>(
+    dims: &[usize],
+) -> strided_view::Result<StridedArray<T>> {
+    let total = dims
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(strided_view::StridedError::OffsetOverflow)?
+        .max(1);
     // SAFETY: `T: Copy` guarantees no drop glue, so leaving elements
-    // uninitialised is safe. Every call-site writes all elements before
-    // reading: A and B via `copy_into`, C via `copy_into` (beta != 0)
-    // or GEMM with replace semantics (beta == 0).
+    // uninitialised is safe. Each caller must establish initialization before
+    // exposing the array as initialized; uninitialized-output callers use
+    // `T = MaybeUninit<U>` and finalize only after complete overwrite.
     let mut data = Vec::with_capacity(total);
     unsafe { data.set_len(total) };
 
@@ -393,8 +420,7 @@ pub(crate) fn alloc_col_major_uninit<T: Copy>(dims: &[usize]) -> StridedArray<T>
         }
     }
 
-    let arr = StridedArray::from_parts(data, dims, &strides, 0).expect("col-major allocation");
-    arr
+    Ok(StridedArray::from_parts(data, dims, &strides, 0)?)
 }
 
 /// Prepare a borrowed input view for GEMM.
@@ -424,7 +450,7 @@ pub fn prepare_input_view<T: ScalarBase + 'static>(
     // materialize conj into the data before the GEMM call.
     if let Some(conj_fn) = materialize_conj_fn {
         if conj {
-            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool)?;
             strided_kernel::map_into(&mut buf.view_mut(), view, conj_fn)?;
             let ptr = buf.view().ptr();
             let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
@@ -449,7 +475,7 @@ pub fn prepare_input_view<T: ScalarBase + 'static>(
     );
 
     if check.needs_copy {
-        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool)?;
         strided_kernel::copy_into_col_major(&mut buf.view_mut(), view)?;
         let ptr = buf.view().ptr();
         let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
@@ -497,7 +523,7 @@ pub fn prepare_input_raw<T: ScalarBase + 'static>(
 
     if let Some(conj_fn) = materialize_conj_fn {
         if conj {
-            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool)?;
             strided_kernel::map_into(&mut buf.view_mut(), &view.as_view(), conj_fn)?;
             let ptr = buf.view().ptr();
             let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
@@ -522,7 +548,7 @@ pub fn prepare_input_raw<T: ScalarBase + 'static>(
     );
 
     if check.needs_copy {
-        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool);
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(dims, use_pool)?;
         strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
         let ptr = buf.view().ptr();
         let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
@@ -574,7 +600,7 @@ pub fn prepare_input_owned<T: ScalarBase + 'static>(
     // materialize conj into the data before the GEMM call.
     if let Some(conj_fn) = materialize_conj_fn {
         if conj {
-            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
+            let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool)?;
             strided_kernel::map_into(&mut buf.view_mut(), &arr.view(), conj_fn)?;
             let ptr = buf.view().ptr();
             let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
@@ -599,7 +625,7 @@ pub fn prepare_input_owned<T: ScalarBase + 'static>(
     );
 
     if check.needs_copy {
-        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool)?;
         strided_kernel::copy_into_col_major(&mut buf.view_mut(), &arr.view())?;
         let ptr = buf.view().ptr();
         let (row_stride, col_stride, batch_strides) = col_major_layout(&buf, n_group1, n_inner);
@@ -664,7 +690,7 @@ pub fn prepare_output_view<T: ScalarBase + 'static>(
     );
 
     if check.needs_copy {
-        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool)?;
         if beta != T::zero() {
             strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
         }
@@ -720,7 +746,7 @@ pub fn prepare_output_raw<T: ScalarBase + 'static>(
     );
 
     if check.needs_copy {
-        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool);
+        let (mut buf, buf_is_pooled) = alloc_maybe_pooled(&dims, use_pool)?;
         if beta != T::zero() {
             strided_kernel::copy_into_col_major(&mut buf.view_mut(), &view.as_view())?;
         }
@@ -748,6 +774,116 @@ pub fn prepare_output_raw<T: ScalarBase + 'static>(
             buf_is_pooled: false,
         })
     }
+}
+
+#[allow(dead_code)]
+impl<'a, 'b, T: Copy + 'static> UninitContiguousOperand<'a, 'b, T> {
+    #[inline]
+    pub(crate) fn ptr(&self) -> *mut MaybeUninit<T> {
+        self.ptr
+    }
+
+    #[inline]
+    pub(crate) fn row_stride(&self) -> isize {
+        self.row_stride
+    }
+
+    #[inline]
+    pub(crate) fn col_stride(&self) -> isize {
+        self.col_stride
+    }
+
+    #[inline]
+    pub(crate) fn batch_strides(&self) -> &[isize] {
+        &self.batch_strides
+    }
+
+    /// Finalize the destination only after a successful overwrite provider.
+    pub(crate) fn finalize(self) -> crate::Result<()> {
+        let Self {
+            destination,
+            temp,
+            writeback,
+            ..
+        } = self;
+        let (Some(temp), Some(writeback)) = (temp, writeback) else {
+            return Ok(());
+        };
+        // The temporary is dense and the provider has returned success, so
+        // every element is initialized. This conversion is intentionally
+        // after provider success and is never used for direct C storage.
+        let dims = temp.dims().to_vec();
+        let strides = temp.strides().to_vec();
+        let data = temp.into_data();
+        let len = data.len();
+        let cap = data.capacity();
+        let ptr = data.as_ptr().cast_mut().cast::<T>();
+        std::mem::forget(data);
+        let initialized = unsafe {
+            StridedArray::from_parts(Vec::from_raw_parts(ptr, len, cap), &dims, &strides, 0)
+        }?;
+        let source = RawStridedRef::new(
+            initialized.data(),
+            initialized.dims(),
+            initialized.strides(),
+            initialized.view().offset(),
+        )?;
+        writeback.execute_uninit(destination, &source)?;
+        Ok(())
+    }
+}
+
+/// Prepare an overwrite-only C operand. A non-fusable destination receives a
+/// dense `MaybeUninit` temporary and a compiled uninitialized writeback plan.
+#[allow(dead_code)]
+pub(crate) fn prepare_output_raw_uninit<'a, 'b, T: ScalarBase + 'static>(
+    destination: &'a mut RawStridedMut<'b, MaybeUninit<T>>,
+    n_group1: usize,
+    n_group2: usize,
+    requires_unit_stride: bool,
+) -> crate::Result<UninitContiguousOperand<'a, 'b, T>> {
+    let dims = destination.dims().to_vec();
+    let strides = destination.strides().to_vec();
+    let n_inner = n_group1 + n_group2;
+    let check = check_contiguity(
+        &dims[..n_group1],
+        &strides[..n_group1],
+        &dims[n_group1..n_inner],
+        &strides[n_group1..n_inner],
+        requires_unit_stride,
+    );
+    if !check.needs_copy {
+        let Some((_, row_stride)) = check.fused_g1 else {
+            return Err(strided_view::StridedError::PlanLayoutMismatch.into());
+        };
+        let Some((_, col_stride)) = check.fused_g2 else {
+            return Err(strided_view::StridedError::PlanLayoutMismatch.into());
+        };
+        let ptr = destination.as_mut_ptr();
+        return Ok(UninitContiguousOperand {
+            destination,
+            ptr: ptr.cast(),
+            row_stride,
+            col_stride,
+            batch_strides: strides[n_inner..].to_vec(),
+            temp: None,
+            writeback: None,
+        });
+    }
+
+    let temp = alloc_col_major_uninit::<MaybeUninit<T>>(&dims)?;
+    let ptr = temp.view().ptr().cast_mut();
+    let (row_stride, col_stride, batch_strides) = col_major_layout(&temp, n_group1, n_inner);
+    let writeback = strided_kernel::CopyPlan::compile(&dims, &strides, temp.strides())?;
+    Ok(UninitContiguousOperand {
+        destination,
+        ptr,
+        row_stride,
+        col_stride,
+        batch_strides,
+        temp: Some(temp),
+        writeback: Some(writeback),
+    })
 }
 
 #[cfg(test)]

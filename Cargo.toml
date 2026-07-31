@@ -31,7 +31,7 @@ mdarray-opteinsum = { version = "0.3.0", path = "mdarray-opteinsum", default-fea
 ndarray-opteinsum = { version = "0.3.0", path = "ndarray-opteinsum", default-features = false }
 
 approx = "0.5"
-cblas-inject = "0.1"
+cblas-inject = "0.1.2"
 cblas-sys = "0.2"
 criterion = "0.5"
 faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }

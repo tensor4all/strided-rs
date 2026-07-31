@@ -25,7 +25,9 @@
 //! ```
 
 use smallvec::SmallVec;
-use strided_view::{StridedView, StridedViewMut};
+use std::mem::MaybeUninit;
+use strided_kernel::ExecContext;
+use strided_view::{RawStridedMut, StridedView, StridedViewMut};
 
 use crate::backend::Backend;
 use crate::{einsum2_dispatch, Einsum2Plan, EinsumError, Result, ScalarBase};
@@ -278,6 +280,31 @@ where
     crate::backend::ActiveBackend: Backend<T>,
 {
     dot_general_with_backend_into::<T, crate::backend::ActiveBackend>(c, a, b, config, alpha, beta)
+}
+
+/// Compute dot-general into a genuinely uninitialized destination.
+///
+/// The destination is only exposed as initialized after this function returns
+/// `Ok(())`; holes in a strided backing allocation are never touched.
+pub fn dot_general_into_uninit<T: crate::Scalar>(
+    c: &mut RawStridedMut<'_, MaybeUninit<T>>,
+    a: &StridedView<'_, T>,
+    b: &StridedView<'_, T>,
+    config: &DotGeneralConfig<'_>,
+    alpha: T,
+    ctx: &ExecContext,
+) -> Result<()> {
+    let labels = config.labels_for_shapes(a.dims(), b.dims(), c.dims())?;
+    crate::einsum2_into_uninit(
+        c,
+        a,
+        b,
+        labels.out_labels.as_slice(),
+        labels.lhs_labels.as_slice(),
+        labels.rhs_labels.as_slice(),
+        alpha,
+        ctx,
+    )
 }
 
 /// Compute `C = alpha * dot_general(A, B) + beta * C` with the naive fallback.
