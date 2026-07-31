@@ -9,6 +9,7 @@ use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
+use strided_kernel::MaybeSendSync;
 use strided_view::{RawStridedMut, RawStridedRef, StridedArray, StridedView, StridedViewMut};
 
 /// GEMM-ready input operand with contiguous data.
@@ -777,7 +778,7 @@ pub fn prepare_output_raw<T: ScalarBase + 'static>(
 }
 
 #[allow(dead_code)]
-impl<'a, 'b, T: Copy + 'static> UninitContiguousOperand<'a, 'b, T> {
+impl<'a, 'b, T: Copy + MaybeSendSync + 'static> UninitContiguousOperand<'a, 'b, T> {
     #[inline]
     pub(crate) fn ptr(&self) -> *mut MaybeUninit<T> {
         self.ptr
@@ -836,7 +837,7 @@ impl<'a, 'b, T: Copy + 'static> UninitContiguousOperand<'a, 'b, T> {
 /// Prepare an overwrite-only C operand. A non-fusable destination receives a
 /// dense `MaybeUninit` temporary and a compiled uninitialized writeback plan.
 #[allow(dead_code)]
-pub(crate) fn prepare_output_raw_uninit<'a, 'b, T: ScalarBase + 'static>(
+pub(crate) fn prepare_output_raw_uninit<'a, 'b, T: ScalarBase + MaybeSendSync + 'static>(
     destination: &'a mut RawStridedMut<'b, MaybeUninit<T>>,
     n_group1: usize,
     n_group2: usize,
