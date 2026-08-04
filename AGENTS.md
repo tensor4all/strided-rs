@@ -59,6 +59,43 @@ cargo fmt --all -- --check   # run `cargo fmt --all` to fix
 cargo test --workspace       # all tests
 ```
 
+## Repository Rules Review Bot
+
+`.github/workflows/review_bot.yml` reviews every PR diff against
+`REPOSITORY_RULES.md`. It runs from the trusted base revision and treats PR
+contents as data: the PR head is fetched for `git diff` only, never checked out
+or executed. Findings are posted as a single updating PR comment; only
+`block`-severity findings fail CI.
+
+Preview the review locally before pushing:
+
+```bash
+python3 scripts/repository-rules-review.py --base main --worktree --dry-run
+python3 scripts/test-repository-rules-review.py   # the script's own tests
+```
+
+Drop the `--dry-run` to include the LLM pass; it needs `DEEPSEEK_API_KEY` in the
+environment or in a repo-root `.env` (`pip install -r scripts/requirements-dev.txt`).
+
+The system prompt lives in `ai/prompts/repository-rules-review.md`. Two
+deterministic checks run before the LLM and independently of it: secret-shaped
+text in added lines blocks the upload entirely, and the **Retired Crate Freeze**
+rejects source changes in the crates retired by
+[#199](https://github.com/tensor4all/strided-rs/issues/199).
+
+Maintainer escape hatches, both requiring the `maintain`/`admin` role and
+reapplication after the latest push:
+
+| Label | Effect |
+|-------|--------|
+| `rules-review:no-llm` | Skips the LLM pass; deterministic checks still run |
+| `rules-review:waive` | Waives the review entirely |
+
+When adding a `## ` section to `REPOSITORY_RULES.md`, also route it in
+`SECTION_TRIGGERS` (or `ALWAYS_SECTIONS` / `HUMAN_ONLY_SECTIONS`); an unrouted
+section is never shown to the reviewer, and
+`test_every_rule_section_is_reachable` fails.
+
 ## Build And Test Commands
 
 ```bash
@@ -72,9 +109,11 @@ RUSTFLAGS="-C target-cpu=native" cargo bench   # enable AVX2/NEON auto-vectoriza
 
 ## Benchmarking Notes
 
-- Keep benchmark programs and published results in
-  [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite);
-  crate READMEs document usage and API contracts, not performance tables.
+- This workspace's own regression benchmarks live in `<crate>/benches/`.
+  Cross-repository comparisons and published results go to
+  [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite).
+- Crate READMEs and rustdoc document usage and API contracts, not performance
+  tables. Dated worklogs under `docs/` may quote measurements as evidence.
 - Naive baselines must be credible: pointer-based loops with precomputed
   strides, not per-element high-level indexing.
 - Keep setup out of timed regions; use `black_box`.
