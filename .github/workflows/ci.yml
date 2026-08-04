@@ -43,6 +43,14 @@ jobs:
       - name: Run facade README doctests
         run: cargo test -p strided-rs --doc
 
+  scripts:
+    name: maintenance scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the repository-rules review script
+        run: python3 scripts/test-repository-rules-review.py
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

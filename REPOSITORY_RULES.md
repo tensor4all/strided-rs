@@ -3,6 +3,20 @@
 These rules are adapted from `tenferro-rs/REPOSITORY_RULES.md` for the current
 strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 
+## Retired Crate Freeze
+
+- `strided-einsum2`, `strided-opteinsum`, `mdarray-opteinsum`,
+  `ndarray-opteinsum`, and everything under `deprecated/` are retired per
+  [#199](https://github.com/tensor4all/strided-rs/issues/199). Contraction is
+  owned by tenferro (`tenferro-einsum` plans, `tenferro-cpu` executes).
+- Do not land new features, refactors, or performance work in the retired
+  crates. Only fixes that protect the current tenferro pin belong here, and
+  only when the tenferro-side absorption cannot deliver them first.
+- Deprecation notices are exempt: README banners, crate-level and item-level
+  doc comments, `#[deprecated]` attributes, and `Cargo.toml` metadata may
+  change freely.
+- A maintainer waiver label is the escape hatch for a pin-protecting fix.
+
 ## Public Surface Discipline
 
 - Keep public APIs intentionally small. Implementation modules, planning
@@ -84,9 +98,16 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 
 ## Performance And Benchmark Discipline
 
-- Keep benchmark programs and published benchmark results in
-  `tensor4all/strided-rs-benchmark-suite`. Crate READMEs should document usage,
-  features, and API contracts rather than carrying stale performance tables.
+- This workspace's own regression benchmarks live in `<crate>/benches/`. Keep
+  them there. The rule is about location, not about which harness they use.
+- Cross-repository comparisons, competitor and cross-language baselines, and
+  any *published* benchmark results belong in
+  `tensor4all/strided-rs-benchmark-suite`, not in this repository.
+- Crate READMEs and rustdoc must not carry performance tables. Numbers go stale
+  as soon as the hardware or the kernel changes; document usage, features, and
+  API contracts, and link to the benchmark suite for results. Dated worklogs and
+  design records under `docs/` may quote measurements as evidence for a
+  decision, provided they state the date and the machine.
 - Use release-mode benchmarks for performance claims. Pin thread counts and
   backend configuration, and do not run benchmark jobs concurrently.
 - Benchmark scaling across representative tensor sizes, shapes, layouts, dtypes,
