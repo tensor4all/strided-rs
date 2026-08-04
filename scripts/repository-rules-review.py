@@ -80,13 +80,43 @@ SECRET_NAME = (
 # Matching only `name <sep> value` redacts the type and leaves the literal, so
 # allow a short annotation before the separator that precedes the value.
 SECRET_ANNOTATION = r"(?:\s*:[^=\n]{0,40})?"
+# The value alternatives are ordered quoted-first so a quoted secret is
+# consumed whole. Putting the bare-token alternative first would stop at the
+# first space inside a quoted passphrase and upload the remainder. (Spelling
+# out an example assignment here would make this file trip its own guard.)
+SECRET_VALUE = r"""(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s#]+)"""
 SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(" + SECRET_NAME + SECRET_ANNOTATION + r"\s*[:=]\s*)([^\s#]+)"
+    r"(?i)\b(?P<name>" + SECRET_NAME + r")(?P<sep>" + SECRET_ANNOTATION
+    + r"\s*[:=]\s*)(?P<value>" + SECRET_VALUE + r")"
 )
+# Quoted credentials may legitimately contain spaces (a diceware passphrase is
+# prose by construction), so the value shape cannot be the discriminator.
 QUOTED_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b" + SECRET_NAME + SECRET_ANNOTATION + r"\s*[:=]\s*"
-    r'''(?:"[^\s"\r\n]{12,}"|\'[^\s\'\r\n]{12,}\')'''
+    r"(?i)\b(?P<name>" + SECRET_NAME + r")" + SECRET_ANNOTATION + r"\s*[:=]\s*"
+    r"""(?:"[^"\r\n]{8,}"|'[^'\r\n]{8,}')"""
 )
+# A quote opened on this line and closed on a later one hides the value from
+# any single-line pattern, so treat the opening alone as disqualifying.
+UNTERMINATED_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(?P<name>" + SECRET_NAME + r")" + SECRET_ANNOTATION
+    + r"""\s*[:=]\s*["'][^"'\r\n]*$"""
+)
+# Since the value may be prose, the name has to carry the discrimination.
+# `token_type`, `secret_name`, and `key_path` describe a credential rather than
+# holding one, and their values are ordinary text.
+SECRET_NAME_METADATA = re.compile(
+    r"(?i)[_-]?(?:type|kind|name|names|id|ids|len|length|size|count|path|paths"
+    r"|file|files|dir|env|var|vars|header|prefix|suffix|field|fields|url|uri"
+    r"|list|set|map|schema|format|scheme|class|enum|error|regex|pattern|label"
+    r"|source|store|provider|policy|status|state|mode|version)$"
+)
+
+
+def is_credential_name(name: str) -> bool:
+    """Whether a matched identifier holds a credential rather than describes one."""
+    return not SECRET_NAME_METADATA.search(name)
+
+
 SEVERITY_ALIASES = {
     "block": "block",
     "blocker": "block",
@@ -186,6 +216,32 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
 )
 
 
+# Signals in the changed lines themselves. Path routing cannot see that a file
+# under a generic path just gained an `unsafe` block or a rayon call.
+CONTENT_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
+    (
+        re.compile(r"\bunsafe\b|get_unchecked|from_raw_parts|\bas_ptr\b|\bas_mut_ptr\b"),
+        frozenset({"Unsafe And Fast-Path Boundaries"}),
+    ),
+    (
+        re.compile(r"rayon|par_iter|ExecutionPolicy|num_threads|join\("),
+        frozenset({"CPU Threading Contract"}),
+    ),
+    (
+        re.compile(r"\bvec!\[|to_vec\(\)|collect::<Vec|materiali[sz]e"),
+        frozenset({"Materialization And Copies"}),
+    ),
+    (
+        re.compile(r"col_major|row_major|\bstrides?\b|linear_index"),
+        frozenset({"Layout And Copy Semantics"}),
+    ),
+    (
+        re.compile(r"criterion|black_box|Instant::now"),
+        frozenset({"Performance And Benchmark Discipline"}),
+    ),
+)
+
+
 @dataclass(frozen=True)
 class Finding:
     id: str
@@ -209,8 +265,11 @@ class Finding:
 
 
 def run_git(args: list[str], cwd: Path = ROOT, *, check: bool = True) -> str:
+    # Without this git C-quotes non-ASCII pathnames ("\346\227\245..."), and
+    # the quoted form matches no real path: per_file_diffs yields nothing and
+    # the extension-based deterministic checks never recognise the file.
     completed = subprocess.run(
-        ["git", *args],
+        ["git", "-c", "core.quotePath=false", *args],
         cwd=cwd,
         check=check,
         capture_output=True,
@@ -325,12 +384,30 @@ def parse_repository_rules_sections(path: Path = RULES_PATH) -> dict[str, str]:
     return sections
 
 
-def select_rule_sections(files: list[str]) -> list[str]:
+def select_rule_sections(
+    files: list[str],
+    added: dict[str, list[tuple[int, str]]] | None = None,
+) -> list[str]:
+    """Pick the rule sections to show the reviewer.
+
+    Path routing alone misses rule-relevant code added under a generic path:
+    an `unsafe` block in a file whose name matches no trigger meant the unsafe
+    rules were never supplied -- and the prompt forbids inventing requirements
+    that were not supplied, making the rule unenforceable there. Content
+    triggers close that gap without making every safety section unconditional.
+    """
     selected = set(ALWAYS_SECTIONS)
     for path in files:
         for pattern, section_names in SECTION_TRIGGERS:
             if pattern.search(path):
                 selected.update(section_names)
+
+    if added:
+        for entries in added.values():
+            for _line_no, text in entries:
+                for pattern, section_names in CONTENT_TRIGGERS:
+                    if pattern.search(text):
+                        selected.update(section_names)
     return sorted(selected - HUMAN_ONLY_SECTIONS)
 
 
@@ -614,7 +691,12 @@ def redact_sensitive_text(text: str) -> str:
     redacted = text
     for pattern in SECRET_VALUE_PATTERNS:
         redacted = pattern.sub("[REDACTED_SECRET]", redacted)
-    return SECRET_ASSIGNMENT.sub(r"\1[REDACTED_SECRET]", redacted)
+    def mask(match: re.Match[str]) -> str:
+        if not is_credential_name(match.group("name")):
+            return match.group(0)
+        return f"{match.group('name')}{match.group('sep')}[REDACTED_SECRET]"
+
+    return SECRET_ASSIGNMENT.sub(mask, redacted)
 
 
 def redact_file_diffs(file_diffs: dict[str, str]) -> dict[str, str]:
@@ -622,9 +704,13 @@ def redact_file_diffs(file_diffs: dict[str, str]) -> dict[str, str]:
 
 
 def contains_sensitive_text(text: str) -> bool:
-    return any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS) or bool(
-        QUOTED_SECRET_ASSIGNMENT.search(text)
-    )
+    if any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS):
+        return True
+    for pattern in (QUOTED_SECRET_ASSIGNMENT, UNTERMINATED_SECRET_ASSIGNMENT):
+        for match in pattern.finditer(text):
+            if is_credential_name(match.group("name")):
+                return True
+    return False
 
 
 def sensitive_diff_location(diff_text: str) -> tuple[str, int] | None:
@@ -815,6 +901,12 @@ TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
 )
 NETWORK_RETRIES = 2
 RETRY_BACKOFF_SECONDS = 5.0
+# Wall-clock ceiling for all LLM traffic in one run. The workflow allows 20
+# minutes; a run that blows past it is killed mid-request, so neither the
+# exception handler nor the report ever executes and the gate fails with no
+# diagnostic at all -- the exact failure this retry logic exists to prevent.
+# Finishing under our own budget guarantees a report is always posted.
+DEFAULT_BUDGET_SECONDS = 900.0
 
 
 def call_deepseek(
@@ -825,6 +917,7 @@ def call_deepseek(
     system_prompt: str,
     user_content: str,
     timeout: float,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -846,8 +939,11 @@ def call_deepseek(
     )
     last_error: BaseException | None = None
     for attempt in range(1, NETWORK_RETRIES + 1):
+        attempt_timeout = timeout
+        if deadline is not None:
+            attempt_timeout = min(timeout, max(1.0, deadline - time.monotonic()))
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=attempt_timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
             break
         except TRANSPORT_ERRORS as exc:
@@ -855,6 +951,10 @@ def call_deepseek(
             # that one blocked PR per blip is not an acceptable failure mode.
             last_error = exc
             if attempt == NETWORK_RETRIES:
+                raise
+            if deadline is not None and time.monotonic() + RETRY_BACKOFF_SECONDS >= deadline:
+                # Retrying would run past the budget and get the job killed,
+                # which loses the report entirely. Fail now, with a diagnostic.
                 raise
             print(
                 f"LLM request attempt {attempt}/{NETWORK_RETRIES} failed "
@@ -879,6 +979,7 @@ def review_chunk(
     changed: list[str],
     diff_chunk: str,
     timeout: float,
+    deadline: float | None = None,
 ) -> tuple[str, list[Finding]]:
     user_content = "\n\n".join(
         [
@@ -902,6 +1003,7 @@ def review_chunk(
         system_prompt=system_prompt,
         user_content=user_content,
         timeout=timeout,
+        deadline=deadline,
     )
     return parse_findings(parsed)
 
@@ -916,6 +1018,23 @@ def merge_findings(all_findings: list[Finding]) -> list[Finding]:
         ):
             merged[key] = finding
     return list(merged.values())
+
+
+def budget_exhausted_finding(reviewed: int, total: int) -> Finding:
+    return Finding(
+        id="llm-budget-exhausted",
+        severity="warn",
+        rule_section="External LLM Review",
+        file="",
+        line=None,
+        summary="External LLM review stopped at its time budget",
+        detail=(
+            f"Reviewed {reviewed} of {total} diff chunk(s) before the "
+            f"{DEFAULT_BUDGET_SECONDS:.0f}s budget ran out, so part of this "
+            "diff was not reviewed. Deterministic checks still covered all of "
+            "it. Split the PR or raise --budget-seconds to review the rest."
+        ),
+    )
 
 
 def llm_skipped_finding(reason: str) -> Finding:
@@ -1086,6 +1205,13 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("DEEPSEEK_API_URL", DEFAULT_API_URL),
     )
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--budget-seconds",
+        type=float,
+        default=DEFAULT_BUDGET_SECONDS,
+        help="Wall-clock ceiling for all LLM requests, so the job is never "
+        "killed before the report is written",
+    )
     args = parser.parse_args(argv)
 
     if args.llm_skipped_reason and not args.dry_run:
@@ -1115,7 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
     diff_text = unified_diff(args.base, args.head, worktree=args.worktree)
     added_text = added_lines_with_text(diff_text)
     added_lines = added_line_numbers(added_text)
-    section_names = select_rule_sections(files)
+    section_names = select_rule_sections(files, added_text)
     rules_text = build_rules_payload(section_names)
     system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -1175,8 +1301,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         llm_findings: list[Finding] = []
         llm_started = time.monotonic()
+        llm_deadline = llm_started + args.budget_seconds
+        reviewed = 0
         for index, chunk in enumerate(chunks, start=1):
             chunk_started = time.monotonic()
+            if chunk_started >= llm_deadline:
+                print(
+                    f"LLM review: budget exhausted after {reviewed}/{len(chunks)} "
+                    "chunk(s)",
+                    file=sys.stderr,
+                )
+                findings.append(budget_exhausted_finding(reviewed, len(chunks)))
+                break
             try:
                 _, chunk_findings = review_chunk(
                     api_key=api_key,
@@ -1187,6 +1323,7 @@ def main(argv: list[str] | None = None) -> int:
                     changed=files,
                     diff_chunk=chunk,
                     timeout=args.timeout,
+                    deadline=llm_deadline,
                 )
             except (KeyError, ValueError, *TRANSPORT_ERRORS) as exc:
                 print(
@@ -1204,6 +1341,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             llm_findings.extend(chunk_findings)
+            reviewed += 1
         merged_llm_findings = merge_findings(llm_findings)
         kept_llm_findings = filter_findings(
             merged_llm_findings,
