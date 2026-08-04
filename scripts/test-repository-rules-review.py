@@ -484,6 +484,82 @@ def test_split_large_file_diff_splits_single_overlong_line() -> None:
         assert len(chunk) <= mod.MAX_FILE_DIFF_CHARS
 
 
+def test_call_deepseek_retries_transient_network_errors() -> None:
+    """socket.timeout is only a TimeoutError alias from Python 3.10 on."""
+    import socket
+    import urllib.request
+
+    mod = load_module()
+    calls = {"n": 0}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{\\"verdict\\":\\"pass\\"}"}}]}'
+
+    def fake_urlopen(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise socket.timeout("The read operation timed out")
+        return FakeResponse()
+
+    original_urlopen = urllib.request.urlopen
+    original_sleep = mod.time.sleep
+    urllib.request.urlopen = fake_urlopen
+    mod.time.sleep = lambda _seconds: None
+    try:
+        payload = mod.call_deepseek(
+            api_key="k",
+            model="m",
+            api_url="https://example.invalid",
+            system_prompt="s",
+            user_content="u",
+            timeout=1.0,
+        )
+    finally:
+        urllib.request.urlopen = original_urlopen
+        mod.time.sleep = original_sleep
+
+    assert calls["n"] == 2
+    assert payload == {"verdict": "pass"}
+
+
+def test_call_deepseek_reraises_after_retries_exhausted() -> None:
+    import socket
+    import urllib.request
+
+    mod = load_module()
+
+    def always_timeout(request, timeout=None):
+        raise socket.timeout("nope")
+
+    original_urlopen = urllib.request.urlopen
+    original_sleep = mod.time.sleep
+    urllib.request.urlopen = always_timeout
+    mod.time.sleep = lambda _seconds: None
+    try:
+        mod.call_deepseek(
+            api_key="k",
+            model="m",
+            api_url="https://example.invalid",
+            system_prompt="s",
+            user_content="u",
+            timeout=1.0,
+        )
+    except OSError:
+        pass
+    else:
+        raise AssertionError("expected the timeout to propagate")
+    finally:
+        urllib.request.urlopen = original_urlopen
+        mod.time.sleep = original_sleep
+
+
 # --- secret handling ---------------------------------------------------------
 
 
