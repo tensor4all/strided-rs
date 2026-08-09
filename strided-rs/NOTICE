@@ -1,0 +1,7 @@
+strided-rs
+
+This user-facing facade crate and its re-export structure are original to
+strided-rs. Component crates carry their own package-specific provenance and
+applicable third-party license notices.
+
+This crate is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.

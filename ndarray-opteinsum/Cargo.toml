@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "N-ary einsum frontend for ndarray arrays, powered by strided-opteinsum."
+keywords = ["tensor", "einsum", "ndarray", "contraction"]
+categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
 ndarray.workspace = true

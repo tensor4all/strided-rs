@@ -1,0 +1,9 @@
+strided-opteinsum
+
+This crate is inspired by design ideas and reference test-case patterns from
+OMEinsum.jl:
+https://github.com/under-Peter/OMEinsum.jl
+
+The implementation is original to strided-rs; no OMEinsum.jl code is ported.
+
+This crate is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.

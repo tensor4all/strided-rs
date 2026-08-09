@@ -7,6 +7,8 @@ authors.workspace = true
 repository.workspace = true
 description = "User-facing facade crate for the strided-rs workspace."
 readme = "README.md"
+keywords = ["tensor", "strided", "array", "einsum", "numerical"]
+categories = ["science", "mathematics", "data-structures"]
 
 [dependencies]
 strided-traits.workspace = true

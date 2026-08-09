@@ -1,0 +1,9 @@
+mdarray-opteinsum
+
+This crate provides an einsum adapter compatible with the `mdarray` array
+library:
+https://crates.io/crates/mdarray
+
+No mdarray code is ported into this adapter.
+
+This crate is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.

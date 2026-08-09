@@ -53,6 +53,12 @@ AWS = "AKIA" + "ABCDEFGHIJKLMNOP"
 SK = "sk-" + "0123456789abcdef0123456789abcdef"
 VALUE = "abcdefghij" + "klmnopqrst"
 BEARER = "Authorization: Bearer " + VALUE
+MAINTAINED_EINSUM_CRATES = (
+    "strided-einsum2",
+    "strided-opteinsum",
+    "mdarray-opteinsum",
+    "ndarray-opteinsum",
+)
 
 
 # --- diff parsing ------------------------------------------------------------
@@ -247,12 +253,12 @@ def test_select_rule_sections_routes_bench_paths() -> None:
     assert "Performance And Benchmark Discipline" in sections
 
 
-def test_select_rule_sections_routes_retired_crates_to_freeze() -> None:
+def test_select_rule_sections_does_not_freeze_maintained_einsum_crates() -> None:
     mod = load_module()
-    for crate in mod.RETIRED_CRATES:
+    for crate in MAINTAINED_EINSUM_CRATES:
         sections = mod.select_rule_sections([f"{crate}/src/lib.rs"])
-        assert "Retired Crate Freeze" in sections, crate
-    assert "Retired Crate Freeze" in mod.select_rule_sections(
+        assert "Deprecated Tree Freeze" not in sections, crate
+    assert "Deprecated Tree Freeze" in mod.select_rule_sections(
         ["deprecated/benches/strided_bench.rs"]
     )
 
@@ -284,42 +290,52 @@ def test_build_rules_payload_returns_requested_section_bodies() -> None:
     assert "Public Surface Discipline" not in payload
 
 
-# --- retired-crate freeze ----------------------------------------------------
+# --- maintained einsum crates -----------------------------------------------
 
 
-def test_retired_freeze_blocks_source_change() -> None:
+def test_maintained_einsum_crates_are_not_deterministically_frozen() -> None:
     mod = load_module()
-    diff = make_diff("strided-einsum2/src/util.rs", ["fn faster() -> usize { 1 }"])
-    findings = mod.deterministic_checks(
-        ["strided-einsum2/src/util.rs"], added=mod.added_lines_with_text(diff)
-    )
+    for crate in MAINTAINED_EINSUM_CRATES:
+        path = f"{crate}/src/lib.rs"
+        diff = make_diff(path, ["fn maintained() -> usize { 1 }"])
+        assert mod.deterministic_checks(
+            [path], added=mod.added_lines_with_text(diff)
+        ) == [], crate
+
+
+def test_deprecated_tree_freeze_blocks_source_change() -> None:
+    mod = load_module()
+    path = "deprecated/strided/src/lib.rs"
+    diff = make_diff(path, ["fn new_feature() -> usize { 1 }"])
+    findings = mod.deterministic_checks([path], added=mod.added_lines_with_text(diff))
     assert len(findings) == 1
     assert findings[0].severity == "block"
-    assert findings[0].id == "retired-crate-freeze"
-    assert "strided-einsum2/src/util.rs:2" in findings[0].detail
+    assert findings[0].id == "deprecated-tree-freeze"
+    assert f"{path}:2" in findings[0].detail
 
 
-def test_retired_freeze_allows_deprecation_notices() -> None:
+def test_deprecated_tree_freeze_allows_deprecation_notices() -> None:
     mod = load_module()
+    path = "deprecated/strided/src/lib.rs"
     diff = make_diff(
-        "strided-opteinsum/src/lib.rs",
+        path,
         [
-            "//! Deprecated: use tenferro-einsum instead.",
+            "//! Deprecated: use strided-view instead.",
             "/// Migration pointer.",
-            '#[deprecated(note = "see strided-rs#199")]',
+            '#[deprecated(note = "use strided-view")]',
             "",
         ],
     )
-    findings = mod.deterministic_checks(
-        ["strided-opteinsum/src/lib.rs"], added=mod.added_lines_with_text(diff)
-    )
-    assert findings == []
+    assert mod.deterministic_checks(
+        [path], added=mod.added_lines_with_text(diff)
+    ) == []
 
 
-def test_retired_freeze_exempts_block_comments_but_not_dereference() -> None:
+def test_deprecated_tree_freeze_exempts_block_comments_but_not_dereference() -> None:
     mod = load_module()
+    path = "deprecated/strided/src/uninit.rs"
     diff = make_diff(
-        "strided-einsum2/src/uninit.rs",
+        path,
         [
             "/** Deprecated. */",
             " * continuation",
@@ -327,47 +343,24 @@ def test_retired_freeze_exempts_block_comments_but_not_dereference() -> None:
             "*dst = value;",
         ],
     )
-    findings = mod.deterministic_checks(
-        ["strided-einsum2/src/uninit.rs"], added=mod.added_lines_with_text(diff)
-    )
+    findings = mod.deterministic_checks([path], added=mod.added_lines_with_text(diff))
     assert len(findings) == 1
-    detail = findings[0].detail
-    assert "*dst = value;" in detail
-    assert "continuation" not in detail
+    assert "*dst = value;" in findings[0].detail
+    assert "continuation" not in findings[0].detail
 
 
-def test_retired_freeze_allows_readme_and_manifest() -> None:
+def test_deprecated_tree_freeze_allows_readme_and_manifest() -> None:
     mod = load_module()
     diff = "\n".join(
         [
-            make_diff("mdarray-opteinsum/README.md", ["> **Deprecated.**"]),
-            make_diff("mdarray-opteinsum/Cargo.toml", ['description = "deprecated"']),
+            make_diff("deprecated/strided/README.md", ["> **Deprecated.**"]),
+            make_diff("deprecated/strided/Cargo.toml", ['description = "deprecated"']),
         ]
     )
-    findings = mod.deterministic_checks(
-        ["mdarray-opteinsum/README.md", "mdarray-opteinsum/Cargo.toml"],
+    assert mod.deterministic_checks(
+        ["deprecated/strided/README.md", "deprecated/strided/Cargo.toml"],
         added=mod.added_lines_with_text(diff),
-    )
-    assert findings == []
-
-
-def test_retired_freeze_ignores_retained_crates() -> None:
-    mod = load_module()
-    diff = make_diff("strided-kernel/src/threading.rs", ["fn faster() -> usize { 1 }"])
-    findings = mod.deterministic_checks(
-        ["strided-kernel/src/threading.rs"], added=mod.added_lines_with_text(diff)
-    )
-    assert findings == []
-
-
-def test_retired_path_prefixes_cover_all_retired_crates() -> None:
-    mod = load_module()
-    for crate in mod.RETIRED_CRATES:
-        assert mod.is_retired_path(f"{crate}/src/lib.rs"), crate
-    assert mod.is_retired_path("deprecated/benches/strided_bench.rs")
-    assert not mod.is_retired_path("strided-view/src/view.rs")
-    # Prefix matching must not catch a retained crate whose name shares a stem.
-    assert not mod.is_retired_path("strided-einsum2-notes.md")
+    ) == []
 
 
 # --- model response handling -------------------------------------------------
@@ -1081,12 +1074,15 @@ def test_prompt_file_exists_and_requires_json_only() -> None:
     assert "untrusted data" in text
 
 
-def test_rules_file_documents_the_retirement() -> None:
+def test_rules_file_documents_einsum_maintenance_ownership() -> None:
     mod = load_module()
-    freeze = mod.parse_repository_rules_sections()["Retired Crate Freeze"]
-    for crate in mod.RETIRED_CRATES:
-        assert crate in freeze, crate
-    assert "199" in freeze
+    ownership = mod.parse_repository_rules_sections()["Einsum Maintenance Ownership"]
+    for crate in MAINTAINED_EINSUM_CRATES:
+        assert crate in ownership, crate
+    assert "minimum binary CPU einsum implementation" in ownership
+    assert "maintained N-ary frontend" in ownership
+    deprecated = mod.parse_repository_rules_sections()["Deprecated Tree Freeze"]
+    assert "deprecated/" in deprecated
 
 
 def main() -> int:

@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Shared traits for strided-rs: element operations, scalar bounds, and type-level composition."
+keywords = ["tensor", "strided", "numerical", "traits"]
+categories = ["science", "mathematics"]
 
 [dependencies]
 num-traits.workspace = true

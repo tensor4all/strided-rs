@@ -1,0 +1,5 @@
+strided-einsum2
+
+This binary einsum implementation is original to strided-rs.
+
+This crate is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.

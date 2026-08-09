@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Device-agnostic strided view types and metadata operations (ported from Julia StridedViews.jl)."
+keywords = ["tensor", "strided", "array", "multidimensional"]
+categories = ["science", "mathematics", "data-structures"]
 
 [dependencies]
 strided-traits.workspace = true

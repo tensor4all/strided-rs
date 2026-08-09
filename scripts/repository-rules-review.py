@@ -3,9 +3,8 @@
 
 Ported from ``tenferro-rs/scripts/repository-rules-review.py`` and adapted to
 the strided-rs workspace: crates live at the repository root, the rule sections
-differ, and the deterministic boundary check enforces the retired-crate freeze
-from https://github.com/tensor4all/strided-rs/issues/199 instead of tenferro's
-AD boundary.
+differ, and the deterministic boundary check protects the retired
+`deprecated/` tree instead of tenferro's AD boundary.
 
 Local API key loading uses the ``python-dotenv`` library. Install dev helpers with:
 
@@ -44,19 +43,8 @@ HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
 )
 
-# Crates retired by #199. Contraction moves to tenferro; strided-rs narrows to
-# the affine strided primitive layer.
-RETIRED_CRATES: tuple[str, ...] = (
-    "strided-einsum2",
-    "strided-opteinsum",
-    "mdarray-opteinsum",
-    "ndarray-opteinsum",
-)
-RETIRED_PATH_PREFIXES: tuple[str, ...] = (
-    *(f"{crate}/" for crate in RETIRED_CRATES),
-    "deprecated/",
-)
-# Deprecation notices may still land in the frozen crates: doc comments,
+DEPRECATED_PATH_PREFIX = "deprecated/"
+# Deprecation notices may still land in the frozen tree: doc comments,
 # attributes such as `#[deprecated]`, and blank lines. The block-comment
 # continuation alternatives require a trailing space, slash, or end of line so
 # that a dereference such as `*dst = value;` is not mistaken for a comment.
@@ -150,19 +138,14 @@ ALWAYS_SECTIONS = frozenset(
     }
 )
 
-# Sections a human reviewer owns; never routed to the LLM. Empty today because
-# every strided-rs rule section is delta-reviewable. Kept so that adding a
-# human-only section stays a one-line change, and so the rule-coverage test can
-# tell "human-owned" apart from "accidentally unrouted".
-HUMAN_ONLY_SECTIONS: frozenset[str] = frozenset()
+# Sections a human reviewer owns; never routed to the LLM. Maintenance
+# ownership is repository context rather than a delta-reviewable restriction.
+HUMAN_ONLY_SECTIONS: frozenset[str] = frozenset({"Einsum Maintenance Ownership"})
 
 SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     (
-        re.compile(
-            r"^(?:strided-einsum2|strided-opteinsum|mdarray-opteinsum"
-            r"|ndarray-opteinsum|deprecated)/"
-        ),
-        frozenset({"Retired Crate Freeze"}),
+        re.compile(r"^deprecated/"),
+        frozenset({"Deprecated Tree Freeze"}),
     ),
     (
         re.compile(r"^strided-view/|/view|/erased|/copy_plan|/metadata"),
@@ -1187,21 +1170,17 @@ def format_report(
     return "\n".join(lines)
 
 
-def is_retired_path(path: str) -> bool:
-    return path.startswith(RETIRED_PATH_PREFIXES)
-
-
-def retired_freeze_violations(
+def deprecated_tree_freeze_violations(
     added: dict[str, list[tuple[int, str]]],
 ) -> list[str]:
-    """Report added source lines inside the crates frozen by #199.
+    """Report added source lines inside the tree retired by #199.
 
     Non-Rust files (README banners, `Cargo.toml` metadata) are exempt, as are
-    doc comments and attributes, so the Phase 0 deprecation notices can land.
+    doc comments and attributes, so deprecation notices can land.
     """
     violations: list[str] = []
     for path in sorted(added):
-        if not is_retired_path(path) or not path.endswith(".rs"):
+        if not path.startswith(DEPRECATED_PATH_PREFIX) or not path.endswith(".rs"):
             continue
         for line_no, text in added[path]:
             if FREEZE_EXEMPT_LINE.match(text):
@@ -1219,24 +1198,20 @@ def deterministic_checks(
     if added is None:
         return findings
 
-    violations = retired_freeze_violations(added)
+    violations = deprecated_tree_freeze_violations(added)
     if violations:
-        touched = sorted(
-            {path.split("/", 1)[0] for path in added if is_retired_path(path)}
-        )
         findings.append(
             Finding(
-                id="retired-crate-freeze",
+                id="deprecated-tree-freeze",
                 severity="block",
-                rule_section="Retired Crate Freeze",
-                file=touched[0] if touched else "",
+                rule_section="Deprecated Tree Freeze",
+                file="deprecated",
                 line=None,
-                summary="Source change in a crate retired by #199",
+                summary="Source change under deprecated/",
                 detail=(
-                    "These crates are frozen; contraction moves to tenferro. "
-                    "Deprecation notices (docs, attributes, Cargo metadata) are "
-                    "exempt. Use the maintainer waiver label for a fix that "
-                    "protects the current tenferro pin.\n"
+                    "This tree is frozen. Deprecation notices (docs, attributes, "
+                    "Cargo metadata) are exempt. Use the maintainer waiver label "
+                    "for a fix that protects the current tenferro pin.\n"
                     + "\n".join(violations)
                 ),
             )

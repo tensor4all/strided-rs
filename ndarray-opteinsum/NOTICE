@@ -1,0 +1,9 @@
+ndarray-opteinsum
+
+This crate provides an einsum adapter compatible with the `ndarray` array
+library:
+https://crates.io/crates/ndarray
+
+No ndarray code is ported into this adapter.
+
+This crate is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.

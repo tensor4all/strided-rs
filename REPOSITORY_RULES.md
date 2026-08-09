@@ -3,15 +3,19 @@
 These rules are adapted from `tenferro-rs/REPOSITORY_RULES.md` for the current
 strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 
-## Retired Crate Freeze
+## Einsum Maintenance Ownership
 
-- `strided-einsum2`, `strided-opteinsum`, `mdarray-opteinsum`,
-  `ndarray-opteinsum`, and everything under `deprecated/` are retired per
-  [#199](https://github.com/tensor4all/strided-rs/issues/199). Contraction is
-  owned by tenferro (`tenferro-einsum` plans, `tenferro-cpu` executes).
-- Do not land new features, refactors, or performance work in the retired
-  crates. Only fixes that protect the current tenferro pin belong here, and
-  only when the tenferro-side absorption cannot deliver them first.
+- `strided-einsum2` is the minimum binary CPU einsum implementation.
+- `strided-opteinsum` is its maintained N-ary frontend.
+- `mdarray-opteinsum` and `ndarray-opteinsum` remain maintained adapters.
+
+## Deprecated Tree Freeze
+
+- Everything under `deprecated/` remains retired per
+  [#199](https://github.com/tensor4all/strided-rs/issues/199).
+- Do not land new features, refactors, or performance work there. Only fixes
+  that protect the current tenferro pin belong there, and only when the
+  tenferro-side absorption cannot deliver them first.
 - Deprecation notices are exempt: README banners, crate-level and item-level
   doc comments, `#[deprecated]` attributes, and `Cargo.toml` metadata may
   change freely.
