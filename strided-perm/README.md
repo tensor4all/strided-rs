@@ -30,7 +30,7 @@ Enable the `parallel` feature to use Rayon-backed copy entry points:
 
 ```toml
 [dependencies]
-strided-perm = { version = "0.1", features = ["parallel"] }
+strided-perm = { version = "0.4", features = ["parallel"] }
 ```
 
 ```rust
@@ -51,7 +51,7 @@ The transpose engine in `src/hptt/` reimplements the algorithm of
 Paolo Bientinesi, following the structure of the original C++ implementation
 (P. Springer, T. Su, P. Bientinesi, "HPTT: A High-Performance Tensor
 Transposition C++ Library", ARRAY 2017). HPTT is licensed under BSD-3-Clause
-(Copyright 2018 Paul Springer); see `THIRD-PARTY-LICENSES` at the workspace
-root for the full text.
+(Copyright 2018 Paul Springer); see the packaged `THIRD-PARTY-LICENSES` file
+for the full text.
 
 This crate is therefore licensed as `(MIT OR Apache-2.0) AND BSD-3-Clause`.

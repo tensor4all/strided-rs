@@ -8,7 +8,7 @@ users can depend on one package.
 
 ```toml
 [dependencies]
-strided-rs = "0.1"
+strided-rs = "0.4"
 ```
 
 Use individual crates such as `strided-perm`, `strided-view`, or
@@ -51,14 +51,14 @@ features are disabled, enable one backend feature when using einsum APIs or the
 
 ```toml
 [dependencies]
-strided-rs = { version = "0.1", default-features = false, features = ["blas"] }
+strided-rs = { version = "0.4", default-features = false, features = ["blas"] }
 ```
 
 Use a provider feature when the BLAS provider should be fixed explicitly:
 
 ```toml
 [dependencies]
-strided-rs = { version = "0.1", default-features = false, features = ["blas-openblas"] }
+strided-rs = { version = "0.4", default-features = false, features = ["blas-openblas"] }
 ```
 
 ## Namespaced APIs

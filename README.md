@@ -8,7 +8,7 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 The recommended user-facing crate is [`strided-rs`](strided-rs/README.md).
 Use individual crates such as `strided-perm`, `strided-view`, or
 `strided-kernel` directly when you need a smaller dependency surface or a
-lower-level API.
+lower-level API. All nine workspace crates listed below are maintained.
 
 ## Workspace Layout
 
@@ -33,20 +33,11 @@ lower-level API.
 
 ## Installation
 
-These crates are being prepared for crates.io publication, but this repository
-does not publish them automatically. Until a release is published, use workspace
-path dependencies:
+Add the facade crate from crates.io:
 
 ```toml
 [dependencies]
-strided-rs = { path = "../strided-rs/strided-rs" }
-```
-
-After publication, use:
-
-```toml
-[dependencies]
-strided-rs = "0.1"
+strided-rs = "0.4"
 ```
 
 ## Documentation
