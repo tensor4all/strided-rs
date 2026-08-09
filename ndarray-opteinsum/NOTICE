@@ -1,15 +1,9 @@
-strided-rs
+ndarray-opteinsum
 
-This repository is a Rust port of Julia's Strided.jl and StridedViews.jl.
+This crate provides an einsum adapter compatible with the `ndarray` array
+library:
+https://crates.io/crates/ndarray
 
-Upstream projects:
-- Strided.jl: https://github.com/Jutho/Strided.jl (MIT License)
-- StridedViews.jl: https://github.com/Jutho/StridedViews.jl (MIT License)
+No ndarray code is ported into this adapter.
 
-Upstream copyright notices:
-- Strided.jl: Copyright (c) 2017 Jutho Haegeman.
-- StridedViews.jl: Copyright (c) 2023 Jutho Haegeman and contributors.
-
-This repository is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.
-When redistributing this work, you must also comply with the upstream MIT license
-notice requirements for the portions derived from the upstream projects.
+This crate is licensed under the terms in `LICENSE-APACHE` and `LICENSE-MIT`.

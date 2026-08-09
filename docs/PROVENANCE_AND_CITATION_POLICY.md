@@ -66,6 +66,10 @@ list is best-effort; corrections and additions are welcome.
 | Blocked tensor transposition (dimension fusion, macro/micro kernels, recursive loop nest) | `strided-perm` | P. Springer, T. Su, P. Bientinesi, "HPTT: A High-Performance Tensor Transposition C++ Library", [ARRAY 2017](https://doi.org/10.1145/3091966.3091968), [arXiv:1704.04374](https://arxiv.org/abs/1704.04374) |
 | Cache-blocked strided map/reduce (dimension fusion, stride-ordered loops, L1 blocking) | `strided-kernel` | Strided.jl has no accompanying paper; cite the [Strided.jl repository](https://github.com/Jutho/Strided.jl) |
 
-License-bearing attributions are declared in `NOTICE` (Strided.jl /
-StridedViews.jl, MIT) and `THIRD-PARTY-LICENSES` (HPTT, BSD-3-Clause); the
-`strided-perm` crate is licensed as `(MIT OR Apache-2.0) AND BSD-3-Clause`.
+Every published crate declares its component-specific lineage in its packaged
+`NOTICE`. Crates containing ported or license-derived code also package the
+applicable complete upstream license text in `THIRD-PARTY-LICENSES`:
+`strided-traits` and `strided-kernel` carry Strided.jl's MIT notice,
+`strided-view` carries StridedViews.jl's MIT notice, and `strided-perm` carries
+HPTT's BSD-3-Clause notice. The `strided-perm` crate is licensed as
+`(MIT OR Apache-2.0) AND BSD-3-Clause`.

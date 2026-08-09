@@ -11,6 +11,8 @@ release. Do not edit manifests while publishing: crates.io must receive the
 same manifests recorded by the tag.
 
 ```bash
+set -euo pipefail
+
 git switch main
 git pull --ff-only origin main
 cargo fmt --all -- --check
@@ -20,17 +22,36 @@ cargo test --workspace
 Confirm all nine package archives contain their license and provenance files:
 
 ```bash
+set -euo pipefail
+
 for crate in \
   strided-traits strided-view strided-perm strided-kernel \
   strided-einsum2 strided-opteinsum mdarray-opteinsum \
   ndarray-opteinsum strided-rs
 do
-  cargo package -p "$crate" --list
+  package_files=$(cargo package -p "$crate" --list)
+  printf '%s\n' "$package_files"
+  for required in LICENSE-APACHE LICENSE-MIT NOTICE; do
+    grep -Fxq "$required" <<<"$package_files"
+  done
+  case "$crate" in
+    strided-traits|strided-view|strided-perm|strided-kernel)
+      grep -Fxq THIRD-PARTY-LICENSES <<<"$package_files"
+      ;;
+    *)
+      if grep -Fxq THIRD-PARTY-LICENSES <<<"$package_files"; then
+        echo "unexpected THIRD-PARTY-LICENSES in $crate" >&2
+        exit 1
+      fi
+      ;;
+  esac
 done
 ```
 
-Every list must contain `LICENSE-APACHE`, `LICENSE-MIT`, and `NOTICE`.
-`strided-perm` must also contain `THIRD-PARTY-LICENSES`.
+Every package must contain `LICENSE-APACHE`, `LICENSE-MIT`, and its
+package-specific `NOTICE`. Only `strided-traits`, `strided-view`,
+`strided-kernel`, and `strided-perm` contain ported or license-derived code, so
+only those archives contain `THIRD-PARTY-LICENSES`.
 
 ## 2. Tag before publishing
 
@@ -67,6 +88,8 @@ Create each package archive from the tag and verify Cargo recorded the tagged
 commit in `.cargo_vcs_info.json`:
 
 ```bash
+set -euo pipefail
+
 version=0.4.0
 expected=$(git rev-parse HEAD)
 for crate in \
@@ -76,11 +99,28 @@ for crate in \
 do
   cargo package -p "$crate" --no-verify
   archive="target/package/${crate}-${version}.crate"
-  vcs_info=$(tar -xOf "$archive" "${crate}-${version}/.cargo_vcs_info.json")
+  prefix="${crate}-${version}"
+  vcs_info=$(tar -xOf "$archive" "$prefix/.cargo_vcs_info.json")
   actual=$(printf '%s' "$vcs_info" | python3 -c 'import json, sys; print(json.load(sys.stdin)["git"]["sha1"])')
   dirty=$(printf '%s' "$vcs_info" | python3 -c 'import json, sys; print(str(json.load(sys.stdin)["git"].get("dirty", False)).lower())')
   test "$actual" = "$expected"
   test "$dirty" = false
+  for required in LICENSE-APACHE LICENSE-MIT NOTICE; do
+    tar -xOf "$archive" "$prefix/$required" | cmp - "$crate/$required"
+  done
+  case "$crate" in
+    strided-traits|strided-view|strided-perm|strided-kernel)
+      tar -xOf "$archive" "$prefix/THIRD-PARTY-LICENSES" |
+        cmp - "$crate/THIRD-PARTY-LICENSES"
+      ;;
+    *)
+      archive_files=$(tar -tf "$archive")
+      if grep -q '/THIRD-PARTY-LICENSES$' <<<"$archive_files"; then
+        echo "unexpected THIRD-PARTY-LICENSES in $crate" >&2
+        exit 1
+      fi
+      ;;
+  esac
 done
 ```
 
@@ -102,14 +142,20 @@ Publish one layer at a time in this order:
 For each crate, publish from the unchanged tag checkout:
 
 ```bash
-cargo publish -p <crate>
+set -euo pipefail
+
+crate=strided-traits # Replace for each package in the order above.
+cargo publish -p "$crate"
 ```
 
 After each publish, wait until crates.io serves that exact version before
 publishing a dependent crate:
 
 ```bash
-cargo info <crate>@0.4.0
+set -euo pipefail
+
+crate=strided-traits # Replace with the package just published.
+cargo info "$crate@0.4.0"
 ```
 
 Registry indexing is asynchronous; retry `cargo info` rather than changing a

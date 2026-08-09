@@ -257,7 +257,7 @@ def test_select_rule_sections_does_not_freeze_maintained_einsum_crates() -> None
     mod = load_module()
     for crate in MAINTAINED_EINSUM_CRATES:
         sections = mod.select_rule_sections([f"{crate}/src/lib.rs"])
-        assert "Retired Crate Freeze" not in sections, crate
+        assert "Deprecated Tree Freeze" not in sections, crate
     assert "Deprecated Tree Freeze" in mod.select_rule_sections(
         ["deprecated/benches/strided_bench.rs"]
     )
