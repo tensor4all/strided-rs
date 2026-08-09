@@ -39,7 +39,23 @@ Replace `0.4.0` below for later releases.
 
 ```bash
 git push origin main
-git tag -a v0.4.0 -m "strided-rs v0.4.0"
+release_sha=$(git rev-parse HEAD)
+test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
+
+# Wait for the required CI workflow triggered by this exact pushed commit.
+run_id=
+for attempt in {1..30}; do
+  run_id=$(gh run list --workflow ci.yml --branch main --event push \
+    --commit "$release_sha" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+  test -z "$run_id" || break
+  sleep 10
+done
+test -n "$run_id"
+gh run watch "$run_id" --exit-status
+test "$(gh run view "$run_id" --json headSha --jq .headSha)" = "$release_sha"
+test "$(gh run view "$run_id" --json conclusion --jq .conclusion)" = success
+
+git tag -a v0.4.0 "$release_sha" -m "strided-rs v0.4.0"
 git push origin v0.4.0
 git switch --detach v0.4.0
 test -z "$(git status --porcelain)"
