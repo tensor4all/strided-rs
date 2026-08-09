@@ -155,23 +155,28 @@ for crate in \
 do
   test -z "$(git status --porcelain)"
 
-  registry_archive="$download_dir/${crate}-${version}.crate"
-  if ! http_status=$(curl --location --silent --show-error \
+  metadata_response="$download_dir/${crate}-${version}.json"
+  if ! http_status=$(curl --silent --show-error \
     --user-agent "strided-rs-release/$version" \
-    --output "$registry_archive" --write-out '%{http_code}' \
-    "https://crates.io/api/v1/crates/$crate/$version/download"); then
+    --output "$metadata_response" --write-out '%{http_code}' \
+    "https://crates.io/api/v1/crates/$crate/$version"); then
     echo "failed to query crates.io for $crate@$version" >&2
     exit 1
   fi
 
   case "$http_status" in
     200)
+      registry_archive="$download_dir/${crate}-${version}.crate"
+      curl --fail --location --silent --show-error \
+        --user-agent "strided-rs-release/$version" \
+        --output "$registry_archive" \
+        "https://crates.io/api/v1/crates/$crate/$version/download"
       verify_archive "$crate" "$registry_archive"
       echo "$crate@$version already exists and matches tag; skipping"
       continue
       ;;
     404)
-      rm -f "$registry_archive"
+      rm -f "$metadata_response"
       ;;
     *)
       echo "unexpected HTTP status $http_status for $crate@$version" >&2
