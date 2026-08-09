@@ -8,10 +8,12 @@ strided-rs provides dynamic-rank strided views and cache-optimized CPU kernels:
 kernel layers are ports of Julia's Strided.jl / StridedViews.jl; the
 permutation engine follows HPTT.
 
-`strided-einsum2`, `strided-opteinsum`, `mdarray-opteinsum`,
-`ndarray-opteinsum`, and `deprecated/` are retired. Contraction is owned by
-tenferro. A deterministic check already reports source changes there, so do not
-duplicate that finding; review those diffs only for the rules that still apply.
+`strided-einsum2` is the minimum binary CPU einsum implementation, and
+`strided-opteinsum` is its maintained N-ary frontend. `mdarray-opteinsum` and
+`ndarray-opteinsum` remain maintained adapters. Everything under `deprecated/`
+remains retired. A deterministic check already reports source changes under
+`deprecated/`, so do not duplicate that finding; review those diffs only for
+the rules that still apply.
 
 ## Authority
 

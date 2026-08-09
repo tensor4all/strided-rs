@@ -79,9 +79,8 @@ environment or in a repo-root `.env` (`pip install -r scripts/requirements-dev.t
 
 The system prompt lives in `ai/prompts/repository-rules-review.md`. Two
 deterministic checks run before the LLM and independently of it: secret-shaped
-text in added lines blocks the upload entirely, and the **Retired Crate Freeze**
-rejects source changes in the crates retired by
-[#199](https://github.com/tensor4all/strided-rs/issues/199).
+text in added lines blocks the upload entirely, and the **Deprecated Tree
+Freeze** rejects source changes under `deprecated/`.
 
 Maintainer escape hatches, both requiring the `maintain`/`admin` role and
 reapplication after the latest push:
