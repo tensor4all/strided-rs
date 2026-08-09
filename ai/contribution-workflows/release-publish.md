@@ -38,6 +38,8 @@ Push the validated `main` commit before creating and pushing the release tag.
 Replace `0.4.0` below for later releases.
 
 ```bash
+set -euo pipefail
+
 git push origin main
 release_sha=$(git rev-parse HEAD)
 test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
