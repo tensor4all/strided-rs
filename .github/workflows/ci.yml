@@ -38,10 +38,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --profile ci
 
       - name: Run facade README doctests
-        run: cargo test -p strided-rs --doc
+        run: cargo test --profile ci -p strided-rs --doc
+
+      - name: Report Cargo artifact usage
+        if: always()
+        run: |
+          du -sh target
+          df -h target
 
   scripts:
     name: maintenance scripts
