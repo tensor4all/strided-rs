@@ -47,3 +47,18 @@ rand_distr = "0.4"
 rayon = "1.10"
 smallvec = "1"
 thiserror = "1.0"
+
+# Workspace tests instantiate large generic kernels in many executables.
+# Omitting debuginfo keeps those artifacts small while preserving debug
+# assertions and overflow checks from Cargo's default development profiles.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+# Hosted CI starts from cold caches, where incremental state has no value.
+[profile.ci]
+inherits = "test"
+incremental = false
+strip = "symbols"
