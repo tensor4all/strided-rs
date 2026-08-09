@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Confirm all nine package archives contain their license and provenance files:
+Confirm all nine package file lists contain their license and provenance files:
 
 ```bash
 set -euo pipefail
@@ -84,20 +84,46 @@ git switch --detach v0.4.0
 test -z "$(git status --porcelain)"
 ```
 
-Create each package archive from the tag and verify Cargo recorded the tagged
-commit in `.cargo_vcs_info.json`:
+The detached tag checkout is the publication source. Do not create all nine
+archives at once: Cargo cannot package a crate whose v0.4 workspace
+prerequisites are not yet available from crates.io.
+
+## 3. Package, inspect, and publish in dependency order
+
+Process one crate completely before starting the next, in this exact order:
+
+1. `strided-traits`
+2. `strided-view`
+3. `strided-perm`
+4. `strided-kernel`
+5. `strided-einsum2`
+6. `strided-opteinsum`
+7. `mdarray-opteinsum`
+8. `ndarray-opteinsum`
+9. `strided-rs`
+
+The adapters occupy the same dependency layer and may be processed in either
+order. For every crate, create and inspect its archive, run the publish dry
+run, publish it, and wait for crates.io to serve the exact version before
+proceeding. Thus every prerequisite is registry-visible before Cargo packages
+a dependent crate, and the first archive is fully inspected before the first
+irreversible publish.
 
 ```bash
 set -euo pipefail
 
 version=0.4.0
 expected=$(git rev-parse HEAD)
+test "$(git describe --exact-match --tags HEAD)" = "v$version"
+
 for crate in \
   strided-traits strided-view strided-perm strided-kernel \
   strided-einsum2 strided-opteinsum mdarray-opteinsum \
   ndarray-opteinsum strided-rs
 do
+  test -z "$(git status --porcelain)"
   cargo package -p "$crate" --no-verify
+
   archive="target/package/${crate}-${version}.crate"
   prefix="${crate}-${version}"
   vcs_info=$(tar -xOf "$archive" "$prefix/.cargo_vcs_info.json")
@@ -105,6 +131,7 @@ do
   dirty=$(printf '%s' "$vcs_info" | python3 -c 'import json, sys; print(str(json.load(sys.stdin)["git"].get("dirty", False)).lower())')
   test "$actual" = "$expected"
   test "$dirty" = false
+
   for required in LICENSE-APACHE LICENSE-MIT NOTICE; do
     tar -xOf "$archive" "$prefix/$required" | cmp - "$crate/$required"
   done
@@ -121,44 +148,26 @@ do
       fi
       ;;
   esac
+
+  cargo publish -p "$crate" --dry-run
+  cargo publish -p "$crate"
+
+  visible=false
+  for attempt in {1..30}; do
+    if cargo info "$crate@$version"; then
+      visible=true
+      break
+    fi
+    sleep 10
+  done
+  test "$visible" = true
 done
+
+test -z "$(git status --porcelain)"
 ```
 
-Do not publish if an archive names another commit or reports a dirty worktree.
-
-## 3. Publish in dependency order
-
-Publish one layer at a time in this order:
-
-1. `strided-traits`
-2. `strided-view`
-3. `strided-perm`
-4. `strided-kernel`
-5. `strided-einsum2`
-6. `strided-opteinsum`
-7. `mdarray-opteinsum` and `ndarray-opteinsum` (either order)
-8. `strided-rs`
-
-For each crate, publish from the unchanged tag checkout:
-
-```bash
-set -euo pipefail
-
-crate=strided-traits # Replace for each package in the order above.
-cargo publish -p "$crate"
-```
-
-After each publish, wait until crates.io serves that exact version before
-publishing a dependent crate:
-
-```bash
-set -euo pipefail
-
-crate=strided-traits # Replace with the package just published.
-cargo info "$crate@0.4.0"
-```
-
-Registry indexing is asynchronous; retry `cargo info` rather than changing a
-manifest, repackaging with different metadata, or publishing dependents early.
-After the facade is visible, leave the detached checkout unchanged and verify
-`git status --porcelain` is empty.
+The visibility wait is bounded to 30 attempts and retries because registry
+indexing is asynchronous. If it expires, stop and resume only after confirming
+the just-published version is visible; do not edit a manifest, repackage with
+different metadata, or publish a dependent early. After the facade is visible,
+leave the detached checkout unchanged.
