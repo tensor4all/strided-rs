@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Cache-optimized kernels for strided multidimensional array operations in Rust (ported from Julia Strided.jl/StridedViews.jl)."
+keywords = ["tensor", "strided", "kernels", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
 strided-view.workspace = true

@@ -7,6 +7,8 @@ authors.workspace = true
 repository.workspace = true
 description = "N-ary einsum frontend with contraction-order optimization for strided tensors."
 readme = "README.md"
+keywords = ["tensor", "einsum", "contraction", "optimization"]
+categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
 strided-view.workspace = true

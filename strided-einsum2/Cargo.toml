@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Binary einsum (pairwise tensor contraction) on strided views."
+keywords = ["tensor", "einsum", "contraction", "linear-algebra"]
+categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
 strided-traits.workspace = true
