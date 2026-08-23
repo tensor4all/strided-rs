@@ -51,8 +51,7 @@ Rejected or deferred:
 ## Predeclared performance experiment
 
 Baseline source commit: `dc0a8e03286c61a84d56446b5cc2c53295f75d76` plus
-documentation-only changes. Candidate commit: to be recorded after
-implementation.
+documentation-only changes. Candidate production commit: `f8997fd`.
 
 Benchmark source:
 `strided-kernel/benches/erased_policy_thresholds.rs`, release Criterion profile
@@ -159,6 +158,32 @@ serial replay for every context.
 
 ### Verification and residual risk
 
-Focused initialized/uninitialized and default/parallel-feature tests passed
-before the candidate measurement. Full repository verification and independent
-review are recorded below when complete.
+Verification on evidence commit `d993e72`:
+
+- `cargo fmt --all -- --check`
+- focused default-feature tests: 80 passed
+- focused `parallel`-feature tests: 88 passed
+- `cargo test --workspace`: 899 passed, 9 ignored
+- `cargo test -p strided-kernel --features parallel`: 517 passed
+- deterministic repository-rules review: pass, no findings
+- repository-rules review script tests: 79 passed
+
+An independent read-only DeepSeek review of `origin/main...d993e72` returned
+**Correct-to-merge**. It found no blocking issue and three minor observations:
+
+- The fast paths use unchecked incremental `isize` offsets after layout
+  validation. This is intentional: the nearby `INVARIANT` and `SAFETY`
+  comments name the proof, and restoring checked arithmetic per element would
+  recreate the measured defect. Existing raw-layout validation and offset tests
+  cover the boundary.
+- The worklog still had a candidate placeholder; this section fixes it.
+- A synthetic fast-versus-generic differential test could be added. It is
+  deferred because existing ground-truth tests separately cover rank-one clamp
+  and offsets, all supported dtypes, initialized and uninitialized writers,
+  above-threshold parallel gather, repeated-index order, and integer wrapping;
+  generic windowed and strided fallbacks retain their existing tests.
+
+Residual scope: arbitrary-rank indexed replay still rebuilds coordinates and
+checked offsets per element. Issue #213 remains the owner for that broader
+incremental-offset work. This change intentionally adds no uniqueness contract
+or parallel additive scatter.
