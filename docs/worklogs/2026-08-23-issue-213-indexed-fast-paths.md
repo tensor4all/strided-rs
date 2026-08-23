@@ -94,5 +94,35 @@ Non-regression gates:
 
 ## Evidence
 
-Baseline results, candidate results, verification, and residual risks will be
-appended after the complete runs.
+### Baseline
+
+Documentation commit measured: `f8672f5`. Production source is unchanged from
+`dc0a8e0`. The first proposed CPU set failed the predeclared noise gate and was
+discarded before timing. CPUs 44-47 then passed: each selected core was
+0.0-0.3% busy over four seconds, and the complete L3 domain (CPUs 40-47) was
+0.0-0.5% busy.
+
+Criterion point estimates and reported confidence intervals:
+
+| family | context | size | estimate |
+|---|---|---:|---:|
+| gather | serial | 4,096 | 96.218 us `[94.446, 98.299]` |
+| gather | max_threads(4) | 4,096 | 96.436 us `[95.008, 97.760]` |
+| gather | serial | 32,768 | 793.56 us `[776.95, 804.97]` |
+| gather | max_threads(4) | 32,768 | 807.07 us `[803.78, 810.27]` |
+| gather | serial | 262,144 | 6.2187 ms `[6.0127, 6.3665]` |
+| gather | max_threads(4) | 262,144 | 1.0574 ms `[1.0571, 1.0578]` |
+| gather | serial | 1,048,576 | 24.817 ms `[24.343, 25.237]` |
+| gather | max_threads(4) | 1,048,576 | 4.2780 ms `[4.2626, 4.2838]` |
+| additive scatter | serial | 4,096 | 96.472 us `[94.890, 99.012]` |
+| additive scatter | max_threads(4) | 4,096 | 95.149 us `[92.726, 98.493]` |
+| additive scatter | serial | 32,768 | 767.72 us `[746.08, 794.00]` |
+| additive scatter | max_threads(4) | 32,768 | 762.24 us `[747.42, 777.36]` |
+| additive scatter | serial | 262,144 | 6.2632 ms `[6.1146, 6.3923]` |
+| additive scatter | max_threads(4) | 262,144 | 6.3004 ms `[6.0890, 6.4622]` |
+| additive scatter | serial | 1,048,576 | 25.524 ms `[25.124, 25.787]` |
+| additive scatter | max_threads(4) | 1,048,576 | 25.259 ms `[24.831, 25.746]` |
+
+Commands used the predeclared environment and ran the gather and scatter groups
+sequentially with `taskset -c 44-47`. Candidate results, verification, and
+residual risks will be appended after implementation.
