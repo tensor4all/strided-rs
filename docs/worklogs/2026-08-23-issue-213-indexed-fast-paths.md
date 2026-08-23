@@ -124,5 +124,41 @@ Criterion point estimates and reported confidence intervals:
 | additive scatter | max_threads(4) | 1,048,576 | 25.259 ms `[24.831, 25.746]` |
 
 Commands used the predeclared environment and ran the gather and scatter groups
-sequentially with `taskset -c 44-47`. Candidate results, verification, and
-residual risks will be appended after implementation.
+sequentially with `taskset -c 44-47`.
+
+### Candidate
+
+Candidate production commit: `f8997fd`. A first post-build load check failed
+before timing and was discarded. The accepted check found CPUs 44-47 at
+0.0-0.2% busy; the same L3 domain peaked at 18.0%, below the predeclared 20%
+limit.
+
+| family | context | size | estimate | baseline ratio |
+|---|---|---:|---:|---:|
+| gather | serial | 4,096 | 3.950 us `[3.913, 3.991]` | 24.4x faster |
+| gather | max_threads(4) | 4,096 | 3.943 us `[3.872, 4.040]` | 24.5x faster |
+| gather | serial | 32,768 | 30.957 us `[30.489, 31.542]` | 25.6x faster |
+| gather | max_threads(4) | 32,768 | 31.092 us `[30.190, 32.040]` | 26.0x faster |
+| gather | serial | 262,144 | 250.73 us `[247.05, 253.52]` | 24.8x faster |
+| gather | max_threads(4) | 262,144 | 120.72 us `[120.61, 120.81]` | 8.8x faster |
+| gather | serial | 1,048,576 | 1.0384 ms `[1.0220, 1.0508]` | 23.9x faster |
+| gather | max_threads(4) | 1,048,576 | 452.87 us `[451.96, 453.60]` | 9.4x faster |
+| additive scatter | serial | 4,096 | 3.851 us `[3.769, 3.911]` | 25.0x faster |
+| additive scatter | max_threads(4) | 4,096 | 3.214 us `[3.007, 3.378]` | 29.6x faster |
+| additive scatter | serial | 32,768 | 29.906 us `[29.760, 30.071]` | 25.7x faster |
+| additive scatter | max_threads(4) | 32,768 | 29.961 us `[29.753, 30.084]` | 25.4x faster |
+| additive scatter | serial | 262,144 | 1.0890 ms `[1.0751, 1.0980]` | 5.8x faster |
+| additive scatter | max_threads(4) | 262,144 | 1.0576 ms `[1.0296, 1.0865]` | 6.0x faster |
+| additive scatter | serial | 1,048,576 | 4.4556 ms `[4.4347, 4.4712]` | 5.7x faster |
+| additive scatter | max_threads(4) | 1,048,576 | 4.3946 ms `[4.3451, 4.4482]` | 5.7x faster |
+
+Criterion classified every case as an improvement with `p < 0.05`. All primary
+and non-regression performance gates pass. The gather threshold still keeps
+4,096 and exactly 32,768 elements serial; additive scatter remains ordered
+serial replay for every context.
+
+### Verification and residual risk
+
+Focused initialized/uninitialized and default/parallel-feature tests passed
+before the candidate measurement. Full repository verification and independent
+review are recorded below when complete.
