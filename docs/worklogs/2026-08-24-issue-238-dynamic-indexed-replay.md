@@ -661,7 +661,7 @@ Exact final performance candidate `75d4921` ran the complete 96-case suite on CP
 | update control | serial | large_n1048576 | 252.76 µs `[249.13 µs, 257.04 µs]` |
 | update control | max_threads_4 | large_n1048576 | 199.36 µs `[194.25 µs, 205.99 µs]` |
 
-Every final performance and validity gate is **PASS**. At medium size, slice rank 4/8 serial speedups are 17.26x/29.07x and four-thread speedups are 4.56x/7.63x; non-unit/negative serial speedups are 8.97x/7.18x. Update rank 4/8 serial speedups are 16.24x/31.13x and four-thread speedups are 4.20x/6.57x; non-unit/negative serial speedups are 8.63x/7.38x. Candidate rank-8/rank-2 ratios are 1.147 (slice) and 1.048 (update), below 1.5. Every generic case improved with `p < 0.05`; the maximum rank-one control point-estimate regression was 1.62%, below 10%.
+Every final performance and validity gate is **PASS**. At medium size, slice rank 4/8 serial speedups are 17.26x/29.07x and four-thread speedups are 4.56x/7.63x; non-unit/negative serial speedups are 8.97x/7.18x. Update rank 4/8 serial speedups are 16.23x/30.97x and four-thread speedups are 3.81x/6.69x; non-unit/negative serial speedups are 8.01x/7.38x. Candidate rank-8/rank-2 ratios are 1.147 (slice) and 1.048 (update), below 1.5. Every generic case improved with `p < 0.05`; the maximum rank-one control point-estimate regression was 1.62%, below 10%.
 
 Attempt 1, attempt 2, and attempt 3 remain recorded as failed evidence; no
 case, threshold, or exclusion changed.
@@ -694,11 +694,13 @@ Review gates completed so far:
 
 - initial design `9fa1480`: `reviewer-flash` Correct-to-merge;
 - fusion delta `a85deb3`: Correct-to-merge;
-- feature-aware plan-layout delta `490a7a3`: Correct-to-merge.
+- feature-aware plan-layout delta `490a7a3`: Correct-to-merge;
+- exact final safety/semantic review of `a8789cd`: PASS with no Critical or
+  Important findings; its only new Minor was the summary-ratio transcription
+  corrected in the final paired section above.
 
 The last review noted a pre-existing pathological-offset error-atomicity corner
 in dynamic update (the full copy can precede a later start/base overflow). This
 change does not alter that ordering or error contract; it is tracked separately
 as [#243](https://github.com/tensor4all/strided-rs/issues/243) rather than hidden
-in this performance PR. Exact
-final-diff `reviewer-flash` review and hosted CI remain pending.
+in this performance PR. Hosted CI remains the final merge gate.
