@@ -83,6 +83,16 @@ Tighten existing rule sections rather than adding a new policy section:
 
 ## Gate status
 
-Implementation must not start until `reviewer-flash` records a
-Correct-to-merge verdict for this document. Final verification and review
-results will be appended after implementation.
+`reviewer-flash` reviewed design commit `b0accd0` with high thinking and a
+read-only tool boundary. Verdict: **Correct-to-merge**; implementation may
+begin. The implementation will also fold in its three non-blocking refinements:
+
+- anchor `multi_index` and related identifiers with word boundaries and drop
+  generic `decode` from the content trigger;
+- route the performance section for `strided-view` as well as kernel and
+  permutation paths so fast-path work outside the current audit files is not a
+  blind spot;
+- test the compiled trigger behavior, not merely the prose list.
+
+Final verification and exact-diff review results will be appended after
+implementation.
