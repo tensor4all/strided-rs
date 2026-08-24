@@ -66,9 +66,32 @@ pub struct GatherPlan {
     dest_dims: AxisVec<usize>,
     dest_strides: AxisVec<isize>,
     spec: GatherSpec,
-    batch_shape: AxisVec<usize>,
-    out_axis_to_operand_dim: AxisVec<Option<usize>>,
+    replay: GatherReplay,
     total: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GatherReplayAxis {
+    dest_step: isize,
+    dest_reset: isize,
+    window_step: isize,
+    window_reset: isize,
+    index_batch_step: isize,
+    index_batch_reset: isize,
+}
+
+#[derive(Clone, Debug)]
+struct GatherReplay {
+    axes: AxisVec<GatherReplayAxis>,
+    index_component_offsets: AxisVec<isize>,
+    index_operand_strides: AxisVec<isize>,
+}
+
+struct GatherReplayState {
+    coords: AxisVec<usize>,
+    dest_offset: isize,
+    window_offset: isize,
+    index_batch_offset: isize,
 }
 
 /// Scatter configuration shared by generic and erased replay.
@@ -162,6 +185,9 @@ impl GatherPlan {
         checked_total_len(operand_dims)?;
         checked_total_len(index_dims)?;
         let total = checked_total_len(dest_dims)?;
+        validate_layout_span(operand_dims, operand_strides)?;
+        validate_layout_span(index_dims, index_strides)?;
+        validate_layout_span(dest_dims, dest_strides)?;
         if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
@@ -248,6 +274,43 @@ impl GatherPlan {
             ));
         }
 
+        let batch_index_strides: AxisVec<isize> = index_dims
+            .iter()
+            .zip(index_strides.iter())
+            .enumerate()
+            .filter_map(|(axis, (_, &stride))| (axis != spec.index_vector_dim).then_some(stride))
+            .collect();
+        let mut batch_axis = 0usize;
+        let mut replay_axes = AxisVec::with_capacity(out_rank);
+        for (out_axis, &operand_dim) in out_axis_to_operand_dim.iter().enumerate() {
+            let (window_step, index_batch_step) = match operand_dim {
+                Some(axis) => (operand_strides[axis], 0),
+                None => {
+                    let step = batch_index_strides[batch_axis];
+                    batch_axis += 1;
+                    (0, step)
+                }
+            };
+            replay_axes.push(GatherReplayAxis {
+                dest_step: dest_strides[out_axis],
+                dest_reset: checked_replay_reset(dest_dims[out_axis], dest_strides[out_axis])?,
+                window_step,
+                window_reset: checked_replay_reset(dest_dims[out_axis], window_step)?,
+                index_batch_step,
+                index_batch_reset: checked_replay_reset(dest_dims[out_axis], index_batch_step)?,
+            });
+        }
+
+        let vector_stride = if spec.index_vector_dim < index_dims.len() {
+            index_strides[spec.index_vector_dim]
+        } else {
+            0
+        };
+        let mut index_component_offsets = AxisVec::with_capacity(spec.start_index_map.len());
+        for component in 0..spec.start_index_map.len() {
+            index_component_offsets.push(checked_offset_add(0, vector_stride, component)?);
+        }
+
         Ok(Self {
             operand_dims: operand_dims.into(),
             operand_strides: operand_strides.into(),
@@ -255,9 +318,16 @@ impl GatherPlan {
             index_strides: index_strides.into(),
             dest_dims: dest_dims.into(),
             dest_strides: dest_strides.into(),
-            spec,
-            batch_shape,
-            out_axis_to_operand_dim,
+            spec: spec.clone(),
+            replay: GatherReplay {
+                axes: replay_axes,
+                index_component_offsets,
+                index_operand_strides: spec
+                    .start_index_map
+                    .iter()
+                    .map(|&axis| operand_strides[axis])
+                    .collect(),
+            },
             total,
         })
     }
@@ -339,60 +409,40 @@ impl GatherPlan {
             }
         }
 
-        let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
-        let mut batch_idx_storage = CoordScratch::new(self.batch_shape.len());
-        let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
-        let mut window_offsets_storage = CoordScratch::new(self.operand_dims.len());
-        let out_idx = out_idx_storage.as_mut_slice();
-        let batch_idx = batch_idx_storage.as_mut_slice();
-        let operand_idx = operand_idx_storage.as_mut_slice();
-        let window_offsets = window_offsets_storage.as_mut_slice();
-
-        let dest_offset_base = dest.offset();
-        let operand_offset_base = operand.offset();
-        let operand_strides = operand.strides();
-        let index_offset_base = start_indices.offset();
-        let index_strides = start_indices.strides();
+        let mut state =
+            self.decode_replay_state(0, dest.offset(), operand.offset(), start_indices.offset())?;
         let operand_data = operand.data();
         let index_data = start_indices.data();
 
+        // INVARIANT: the checked decode starts at a valid logical output. Each
+        // replay axis has checked step/reset deltas, so this state remains the
+        // corresponding destination, window, and batch-index offsets.
         for _ in 0..self.total {
-            window_offsets.fill(0);
-            let mut batch_axis = 0usize;
-            for (out_axis, &operand_dim) in self.out_axis_to_operand_dim.iter().enumerate() {
-                match operand_dim {
-                    Some(axis) => window_offsets[axis] = out_idx[out_axis],
-                    None => {
-                        batch_idx[batch_axis] = out_idx[out_axis];
-                        batch_axis += 1;
-                    }
-                }
+            // INVARIANT: window_offset plus every clamped mapped contribution
+            // is an operand offset for coordinates inside operand_dims; the
+            // validated operand span and RawStridedRef reachability therefore
+            // keep the fresh source offset inside the allocation.
+            let mut source_offset = state.window_offset;
+            for ((&index_component_offset, &operand_stride), &operand_dim) in self
+                .replay
+                .index_component_offsets
+                .iter()
+                .zip(self.replay.index_operand_strides.iter())
+                .zip(self.spec.start_index_map.iter())
+            {
+                let index_offset = state.index_batch_offset + index_component_offset;
+                // SAFETY: checked index layout replay and RawStridedRef
+                // reachability prove this component read is in bounds.
+                let start = unsafe { *index_data.as_ptr().offset(index_offset) }.to_i64();
+                let clamped = self.clamp_window_start(start, operand_dim);
+                source_offset += operand_stride * clamped as isize;
             }
 
-            operand_idx.fill(0);
-            for (component, &operand_dim) in self.spec.start_index_map.iter().enumerate() {
-                let start = self.index_component(
-                    start_indices.dims(),
-                    index_strides,
-                    index_offset_base,
-                    index_data,
-                    &batch_idx,
-                    component,
-                )?;
-                operand_idx[operand_dim] = self.clamp_window_start(start, operand_dim);
-            }
-            for axis in 0..operand_idx.len() {
-                operand_idx[axis] += window_offsets[axis];
-            }
-
-            let dest_offset = checked_strided_offset(dest_offset_base, dest.strides(), &out_idx)?;
-            let operand_offset =
-                checked_strided_offset(operand_offset_base, operand_strides, &operand_idx)?;
-            // SAFETY: the validated operand layout proves this source offset.
-            let value = unsafe { *operand_data.as_ptr().offset(operand_offset) };
-            // SAFETY: the validated plan proves this logical offset is in-bounds.
-            unsafe { dest.write_at(dest_offset, value) };
-            advance_col_major_index(out_idx, &self.dest_dims);
+            // SAFETY: checked replay metadata and the validated writer prove
+            // both the source and the distinct destination offset are valid.
+            let value = unsafe { *operand_data.as_ptr().offset(source_offset) };
+            unsafe { dest.write_at(state.dest_offset, value) };
+            self.advance_replay_state(&mut state);
         }
         Ok(())
     }
@@ -518,64 +568,48 @@ impl GatherPlan {
             0..self.total,
             nthreads,
             &|range| {
-                let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
-                let mut batch_idx_storage = CoordScratch::new(self.batch_shape.len());
-                let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
-                let mut window_offsets_storage = CoordScratch::new(self.operand_dims.len());
-                let out_idx = out_idx_storage.as_mut_slice();
-                let batch_idx = batch_idx_storage.as_mut_slice();
-                let operand_idx = operand_idx_storage.as_mut_slice();
-                let window_offsets = window_offsets_storage.as_mut_slice();
-                fill_col_major_index(range.start, &self.dest_dims, out_idx);
+                let mut state = self.decode_replay_state(
+                    range.start,
+                    dest_offset_base,
+                    operand_offset_base,
+                    index_offset_base,
+                )?;
                 let dest_ptr = dest_ptr.as_ptr();
                 let operand_ptr = operand_ptr.as_const();
                 let index_ptr = index_ptr.as_const();
 
+                // INVARIANT: this worker owns a disjoint logical range. Checked
+                // range-start decode plus checked replay deltas keeps every
+                // state at its corresponding output, and injectivity makes all
+                // writes across workers distinct.
                 for _ in range {
-                    window_offsets.fill(0);
-                    let mut batch_axis = 0usize;
-                    for (out_axis, &operand_dim) in self.out_axis_to_operand_dim.iter().enumerate()
+                    // INVARIANT: source_offset is freshly based on the current
+                    // window offset; clamped mapped coordinates remain inside
+                    // the validated operand span and are never accumulated.
+                    let mut source_offset = state.window_offset;
+                    for ((&index_component_offset, &operand_stride), &operand_dim) in self
+                        .replay
+                        .index_component_offsets
+                        .iter()
+                        .zip(self.replay.index_operand_strides.iter())
+                        .zip(self.spec.start_index_map.iter())
                     {
-                        match operand_dim {
-                            Some(axis) => window_offsets[axis] = out_idx[out_axis],
-                            None => {
-                                batch_idx[batch_axis] = out_idx[out_axis];
-                                batch_axis += 1;
-                            }
-                        }
+                        let index_offset = state.index_batch_offset + index_component_offset;
+                        // SAFETY: the checked index span and this worker's
+                        // validated range-start state prove this read is valid.
+                        let start = unsafe { (*index_ptr.offset(index_offset)).to_i64() };
+                        let clamped = self.clamp_window_start(start, operand_dim);
+                        source_offset += operand_stride * clamped as isize;
                     }
 
-                    operand_idx.fill(0);
-                    for (component, &operand_dim) in self.spec.start_index_map.iter().enumerate() {
-                        let start = self.index_component_ptr(
-                            start_indices.dims(),
-                            index_offset_base,
-                            index_ptr,
-                            batch_idx,
-                            component,
-                        )?;
-                        operand_idx[operand_dim] = self.clamp_window_start(start, operand_dim);
-                    }
-                    for axis in 0..operand_idx.len() {
-                        operand_idx[axis] += window_offsets[axis];
-                    }
-
-                    let dest_offset =
-                        checked_strided_offset(dest_offset_base, &self.dest_strides, out_idx)?;
-                    let operand_offset = checked_strided_offset(
-                        operand_offset_base,
-                        &self.operand_strides,
-                        operand_idx,
-                    )?;
+                    // SAFETY: the source proof above and distinct destination
+                    // invariant justify these raw accesses.
                     unsafe {
-                        // SAFETY: gather writes one value per logical output,
-                        // and compile rejected non-injective destination
-                        // layouts.
                         dest_ptr
-                            .offset(dest_offset)
-                            .write(operand_ptr.offset(operand_offset).read());
+                            .offset(state.dest_offset)
+                            .write(operand_ptr.offset(source_offset).read());
                     }
-                    advance_col_major_index(out_idx, &self.dest_dims);
+                    self.advance_replay_state(&mut state);
                 }
                 Ok(())
             },
@@ -604,58 +638,51 @@ impl GatherPlan {
         Ok(())
     }
 
-    fn index_component<I>(
+    fn decode_replay_state(
         &self,
-        index_dims: &[usize],
-        index_strides: &[isize],
+        mut linear: usize,
+        dest_offset_base: isize,
+        operand_offset_base: isize,
         index_offset_base: isize,
-        index_data: &[I],
-        batch_idx: &[usize],
-        component: usize,
-    ) -> Result<i64>
-    where
-        I: GatherIndex,
-    {
-        let mut offset = index_offset_base;
-        let mut batch_axis = 0usize;
-        for axis in 0..index_dims.len() {
-            let coord = if axis == self.spec.index_vector_dim {
-                component
-            } else {
-                let coord = batch_idx[batch_axis];
-                batch_axis += 1;
-                coord
-            };
-            offset = checked_offset_add(offset, index_strides[axis], coord)?;
+    ) -> Result<GatherReplayState> {
+        let mut coords = AxisVec::with_capacity(self.dest_dims.len());
+        let mut dest_offset = dest_offset_base;
+        let mut window_offset = operand_offset_base;
+        let mut index_batch_offset = index_offset_base;
+        for (axis, &dim) in self.dest_dims.iter().enumerate() {
+            let coord = linear % dim;
+            linear /= dim;
+            let replay_axis = self.replay.axes[axis];
+            coords.push(coord);
+            dest_offset = checked_offset_add(dest_offset, replay_axis.dest_step, coord)?;
+            window_offset = checked_offset_add(window_offset, replay_axis.window_step, coord)?;
+            index_batch_offset =
+                checked_offset_add(index_batch_offset, replay_axis.index_batch_step, coord)?;
         }
-        Ok(unsafe { *index_data.as_ptr().offset(offset) }.to_i64())
+        Ok(GatherReplayState {
+            coords,
+            dest_offset,
+            window_offset,
+            index_batch_offset,
+        })
     }
 
-    #[cfg(feature = "parallel")]
-    fn index_component_ptr<I>(
-        &self,
-        index_dims: &[usize],
-        index_offset_base: isize,
-        index_ptr: *const I,
-        batch_idx: &[usize],
-        component: usize,
-    ) -> Result<i64>
-    where
-        I: GatherIndex,
-    {
-        let mut offset = index_offset_base;
-        let mut batch_axis = 0usize;
-        for axis in 0..index_dims.len() {
-            let coord = if axis == self.spec.index_vector_dim {
-                component
-            } else {
-                let coord = batch_idx[batch_axis];
-                batch_axis += 1;
-                coord
-            };
-            offset = checked_offset_add(offset, self.index_strides[axis], coord)?;
+    #[inline]
+    fn advance_replay_state(&self, state: &mut GatherReplayState) {
+        for (axis, replay_axis) in self.replay.axes.iter().enumerate() {
+            let coord = state.coords[axis];
+            if coord + 1 < self.dest_dims[axis] {
+                state.coords[axis] = coord + 1;
+                state.dest_offset += replay_axis.dest_step;
+                state.window_offset += replay_axis.window_step;
+                state.index_batch_offset += replay_axis.index_batch_step;
+                return;
+            }
+            state.coords[axis] = 0;
+            state.dest_offset += replay_axis.dest_reset;
+            state.window_offset += replay_axis.window_reset;
+            state.index_batch_offset += replay_axis.index_batch_reset;
         }
-        Ok(unsafe { *index_ptr.offset(offset) }.to_i64())
     }
 
     #[inline]
@@ -1704,6 +1731,41 @@ fn index_batch_shape(index_dims: &[usize], index_vector_dim: usize) -> AxisVec<u
         .enumerate()
         .filter_map(|(axis, &dim)| (axis != index_vector_dim).then_some(dim))
         .collect()
+}
+
+fn validate_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
+    if dims.len() != strides.len() {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+    let mut min_offset = 0isize;
+    let mut max_offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        let last =
+            isize::try_from(dim.saturating_sub(1)).map_err(|_| StridedError::OffsetOverflow)?;
+        let extent = stride
+            .checked_mul(last)
+            .ok_or(StridedError::OffsetOverflow)?;
+        if extent < 0 {
+            min_offset = min_offset
+                .checked_add(extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+        } else {
+            max_offset = max_offset
+                .checked_add(extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+    Ok(())
+}
+
+fn checked_replay_reset(dim: usize, step: isize) -> Result<isize> {
+    if dim == 0 {
+        return Ok(0);
+    }
+    let last = isize::try_from(dim - 1).map_err(|_| StridedError::OffsetOverflow)?;
+    step.checked_mul(last)
+        .and_then(isize::checked_neg)
+        .ok_or(StridedError::OffsetOverflow)
 }
 
 fn checked_total_len(dims: &[usize]) -> Result<usize> {

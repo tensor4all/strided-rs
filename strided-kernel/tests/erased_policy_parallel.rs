@@ -1,10 +1,11 @@
 #![cfg(feature = "parallel")]
 
+use core::mem::MaybeUninit;
 use strided_kernel::{
     erased_zip_into, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
     ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedReducePlan, ErasedScatterPlan, ErasedZipOp, ExecContext, GatherSpec, KernelDType,
-    ReduceOp, ScatterSpec, StridedError,
+    ErasedRawStridedUninitMut, ErasedReducePlan, ErasedScatterPlan, ErasedZipOp, ExecContext,
+    GatherSpec, KernelDType, ReduceOp, ScatterSpec, StridedError,
 };
 
 const LARGE_LEN: usize = (1 << 15) + 65;
@@ -176,6 +177,74 @@ fn large_erased_gather_matches_serial() {
     };
 
     assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+}
+
+#[test]
+fn generic_gather_matches_across_threshold_for_initialized_and_uninit_outputs() {
+    for &len in &[4_096usize, 1 << 15, (1 << 15) + 2, 131_074] {
+        let batch = len / 2;
+        let operand_dims = [2usize, batch];
+        let operand_strides = [1isize, 2];
+        let operand: Vec<f64> = (0..len).map(|index| index as f64 * 0.25).collect();
+        let index_dims = [batch, 1];
+        let index_strides = [1isize, batch as isize];
+        let indices: Vec<i64> = (0..batch)
+            .map(|index| ((index * 5 + 1) % batch) as i64)
+            .collect();
+        let dest_dims = operand_dims;
+        let dest_strides = operand_strides;
+        let plan = ErasedGatherPlan::compile(
+            KernelDType::F64,
+            KernelDType::I64,
+            &operand_dims,
+            &operand_strides,
+            &index_dims,
+            &index_strides,
+            &dest_dims,
+            &dest_strides,
+            GatherSpec {
+                offset_dims: vec![0],
+                collapsed_slice_dims: vec![1],
+                start_index_map: vec![1],
+                index_vector_dim: 1,
+                slice_sizes: vec![2, 1],
+            },
+        )
+        .unwrap();
+        let source =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let index =
+            ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+        let mut expected = vec![0.0f64; len];
+        let mut serial_dest =
+            ErasedRawStridedMut::from_slice_mut(&mut expected, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute(&ExecContext::serial(), &mut serial_dest, &source, &index)
+            .unwrap();
+
+        let mut initialized = vec![0.0f64; len];
+        let mut initialized_dest =
+            ErasedRawStridedMut::from_slice_mut(&mut initialized, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute(&bounded_context(), &mut initialized_dest, &source, &index)
+            .unwrap();
+        assert_eq!(initialized, expected);
+
+        let mut raw = vec![MaybeUninit::<f64>::uninit(); len];
+        let mut uninit_dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute_uninit(
+            &bounded_context(),
+            &mut uninit_dest,
+            &ErasedRawStridedPtr::from_ref(&source),
+            &ErasedRawStridedPtr::from_ref(&index),
+        )
+        .unwrap();
+        for (actual, expected) in raw.iter().zip(&expected) {
+            assert_eq!(unsafe { actual.assume_init_ref() }, expected);
+        }
+    }
 }
 
 #[test]
