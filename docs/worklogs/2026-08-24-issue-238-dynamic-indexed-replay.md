@@ -288,8 +288,11 @@ next_source_stride == current_source_step * fused_extent
 next_dest_stride   == current_dest_step   * fused_extent
 ```
 
-All products are checked. A fused axis retains the first source/destination
-step, checked combined extent, and recomputed checked resets. Negative or
+All products are checked. Fusion scans axes left-to-right in the same
+fastest-axis-first order used by `decode`, accumulating the checked fused extent
+for each subsequent boundary test. A fused axis retains the first
+source/destination step, checked combined extent, and recomputed checked resets.
+Negative or
 otherwise noncontiguous boundaries remain separate (the negative rank-2 case
 therefore exercises the unfused path). This changes only private replay
 metadata/state dimensionality; starts, clamping, logical order, offsets,
@@ -297,8 +300,11 @@ copy-before-update, uninitialized lifecycle, and public APIs are unchanged. It
 is not a new fast path: every generic case still executes the same replay loop,
 with compile-time-equivalent adjacent axes represented once.
 
-Implementation of this design delta is blocked until `reviewer-flash` records a
-Correct-to-merge verdict. After implementation, the entire named-baseline
-baseline/candidate suite will be rerun under the unchanged host protocol; no
-selective candidate row will be promoted. Full attempt-1 and final paired tables
-will be retained in this worklog before PR creation.
+`reviewer-flash` reviewed exact design-delta commit `a85deb3` and returned
+**Correct-to-merge** before implementation. The carry-propagation explanation
+remains a hypothesis until the unchanged paired rerun drives the ratio to 1.5
+or below; if it does not, the candidate fails again and no fallback gate is
+substituted. After implementation, the entire named-baseline baseline/candidate
+suite will be rerun under the unchanged host protocol; no selective candidate
+row will be promoted. Full attempt-1 and final paired tables will be retained
+in this worklog before PR creation.
