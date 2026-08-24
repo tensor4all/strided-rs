@@ -312,7 +312,7 @@ All predeclared performance gates are **PASS**:
 - every generic case improved with `p < 0.05`; no generic or rank-one control
   regressed.
 
-The rank-one controls improved by up to roughly 15% on the candidate CCD,
+The rank-one controls improved by up to roughly 17% on the candidate CCD,
 showing a host/CCD frequency difference, but the generic improvements are
 57-92% and every primary ratio remains well beyond its gate after that control
 shift.
@@ -361,5 +361,11 @@ found no Critical or Important issue and seven Minor observations. Disposition:
 A current-toolchain exploratory `cargo clippy -D warnings` was also run. It is
 not a repository PR gate and reported existing workspace lints across
 `strided-view`/`strided-kernel`; the one new `manual_contains` lint in
-`validate_layout_span` was fixed. Final exact-candidate review and hosted CI
-remain pending.
+`validate_layout_span` was fixed.
+
+`reviewer-flash` reviewed exact candidate `d01a82a` and returned
+**Correct-to-merge**, with no Critical or Important findings. Its suggested
+error-variant assertion was already present for both overflow cases in the
+submitted source, so no change was required. The only follow-up here corrects
+its valid wording note from roughly 15% to roughly 17%; production, tests, and
+benchmark evidence are unchanged. Hosted CI remains the final merge gate.
