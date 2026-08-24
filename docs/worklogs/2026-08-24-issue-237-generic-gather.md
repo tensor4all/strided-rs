@@ -39,11 +39,14 @@ output count and deliberately miss `uses_rank_one_scalar_take_path`:
 - the existing compact rank-one scalar take group remains the fast-path control.
 
 For compact rank `r`, the first `r - 1` operand axes are extent 2 window axes;
-the final axis is selected by one scalar index per batch. Output order is batch
-axis first followed by the window axes, matching the existing rank-2 ground
-truth. The physical operand and requested output stay O(N). Non-unit and
-negative layouts use validated storage extents and offsets; setup, allocation,
-plan compile, and reference construction remain outside Criterion timing.
+the final axis is selected by one scalar index per batch. Output order is the
+window axes followed by the batch axis, so every rank writes one compact
+column-major stream; this avoids confounding rank scaling with the scattered
+multi-stream destination used by the existing batch-first rank-2 correctness
+test. Correctness coverage retains both output-axis orders. The physical
+operand and requested output stay O(N). Non-unit and negative layouts use
+validated storage extents and offsets; setup, allocation, plan compile, and
+reference construction remain outside Criterion timing.
 
 Threshold profile sizes are `2^12`, `2^15`, `2^18`, and `2^20`; contexts are
 serial and `max_threads(4)`. Criterion uses the existing 300 ms warmup, 10
@@ -74,7 +77,9 @@ Predeclared candidate primary gates using Criterion point estimates:
 - serial non-unit and negative rank-2 cases at `medium_n262144`: at least 2x
   faster;
 - candidate rank-8 per-output cost at medium size no more than 1.5x candidate
-  rank-2 compact cost.
+  rank-2 compact cost; all compact rank cases use the same contiguous write
+  pattern, and the ratio plus raw estimates will also be reported rather than
+  interpreted without the memory-layout context.
 
 Non-regression and validity gates:
 
@@ -99,14 +104,23 @@ host gate invalidates the complete run rather than permitting selective retry.
 - each output window axis's operand-stride contribution;
 - each output batch axis's start-index-stride contribution;
 - each index-vector component's fixed offset and mapped operand stride;
-- checked reset/carry deltas needed when a column-major coordinate wraps.
+- checked reset/carry deltas needed when a column-major coordinate wraps;
+- checked operand/index layout spans sufficient to prove all prepared deltas
+  and range-start decodes fit `isize`, including negative strides.
+
+Actual allocation reachability remains proven by validated `RawStridedRef` /
+writer construction plus `check_call`'s exact layout match. Serial traversal and
+each parallel range perform one checked initial decode; direct hot-loop
+arithmetic is permitted only because those proofs cover the whole reachable
+range.
 
 Generic serial execution decodes its initial state once. Generic parallel
 execution decodes once at each worker range start. Each output then:
 
 1. reads only the data-dependent index-vector components;
-2. clamps them and adds their mapped operand-stride contributions to the
-   incrementally maintained window offset;
+2. starts a fresh source offset from the incrementally maintained window
+   offset, then clamps and adds each mapped index contribution for this element
+   only; index contributions are never accumulated into the next element;
 3. writes the value at the incrementally maintained destination offset; and
 4. advances output coordinates plus destination/window/index-batch offsets via
    prevalidated carry deltas.
@@ -139,5 +153,20 @@ requests an exact-final-diff `reviewer-flash` verdict before PR creation.
 
 ## Gate status
 
-Design review, benchmark implementation, baseline results, candidate results,
+The first broad review attempt timed out before reaching a verdict and did not
+clear the gate. A bounded `reviewer-flash` re-review completed with a
+conditional **Correct-to-merge** verdict. Its binding findings are incorporated
+above:
+
+- index contributions are explicitly fresh/non-accumulating per element;
+- operand/index span validation, checked carries, and checked serial/range-start
+  decode are required before unchecked incremental arithmetic;
+- compact rank cases now use the same contiguous destination pattern, removing
+  the prior rank-8/rank-2 scattered-write confound.
+
+The f64/i64 benchmark dtype is retained as the representative performance case;
+existing dtype-matrix correctness tests remain required. Because the benchmark
+layout and safety proof changed materially while recording these conditions,
+implementation remains blocked until `reviewer-flash` re-reviews this exact
+design revision. Benchmark implementation, baseline results, candidate results,
 and final verification are pending.
