@@ -256,4 +256,49 @@ Benchmark-only commit: `de42f23`. The complete baseline ran sequentially on CPUs
 | update control | serial | large_n1048576 | 264.35 µs `[255.33 µs, 274.31 µs]` |
 | update control | max_threads_4 | large_n1048576 | 268.19 µs `[265.20 µs, 273.61 µs]` |
 
-The need-before-implementation gate is **PASS for both families**. At medium size, serial slice rank 4/8 measured 9.2671/18.602 ms versus the rank-one 0.052501 ms control, and serial update rank 4/8 measured 9.4503/19.210 ms versus the rank-one 0.051635 ms control. Rank-8/rank-2 cost ratios were 4.01 (slice) and 3.69 (update), both above the 25% scaling signal. Production implementation may proceed for both families without changing any case or gate. Candidate and final verification remain pending.
+The need-before-implementation gate is **PASS for both families**. At medium size, serial slice rank 4/8 measured 9.2671/18.602 ms versus the rank-one 0.052501 ms control, and serial update rank 4/8 measured 9.4503/19.210 ms versus the rank-one 0.051635 ms control. Rank-8/rank-2 cost ratios were 4.01 (slice) and 3.69 (update), both above the 25% scaling signal. Production implementation proceeded for both families without changing any case or gate.
+
+## Candidate attempt 1 and design delta
+
+The first production implementation used incremental `WindowReplay` state. A
+complete named-baseline paired rerun was performed because an exploratory
+tuning run had advanced Criterion's default history. Exact baseline commit
+`de42f23` was saved as `issue238-final-base`; candidate commit `56b2ad0` ran all
+96 declared cases against that baseline. Both four-second load gates passed.
+
+All primary speedup gates passed except one hard gate. At medium size:
+
+- slice compact rank 2/4/8 serial: 4.6250/9.1742/18.650 ms baseline and
+  0.58643/0.68698/0.89878 ms candidate;
+- update compact rank 2/4/8 serial: 4.8585/9.8359/19.677 ms baseline and
+  0.63894/0.72891/0.88775 ms candidate.
+
+The candidate slice rank-8/rank-2 ratio was 1.5327, above the predeclared 1.5
+limit. Candidate attempt 1 is therefore **FAIL** and cannot be promoted, despite
+all other generic cases improving significantly. The update ratio was 1.389.
+No threshold, case, or exclusion is changed.
+
+The failure isolates amortized carry propagation across the eight logical axes.
+A private `WindowReplay::compile` refinement will compress adjacent logical
+axes only when both source and destination layouts prove the same contiguous
+fusion boundary:
+
+```text
+next_source_stride == current_source_step * fused_extent
+next_dest_stride   == current_dest_step   * fused_extent
+```
+
+All products are checked. A fused axis retains the first source/destination
+step, checked combined extent, and recomputed checked resets. Negative or
+otherwise noncontiguous boundaries remain separate (the negative rank-2 case
+therefore exercises the unfused path). This changes only private replay
+metadata/state dimensionality; starts, clamping, logical order, offsets,
+copy-before-update, uninitialized lifecycle, and public APIs are unchanged. It
+is not a new fast path: every generic case still executes the same replay loop,
+with compile-time-equivalent adjacent axes represented once.
+
+Implementation of this design delta is blocked until `reviewer-flash` records a
+Correct-to-merge verdict. After implementation, the entire named-baseline
+baseline/candidate suite will be rerun under the unchanged host protocol; no
+selective candidate row will be promoted. Full attempt-1 and final paired tables
+will be retained in this worklog before PR creation.
