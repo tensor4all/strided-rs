@@ -3401,11 +3401,22 @@ where
 {
     let mut outer =
         ReduceOuterCursor::decode(0, source_offset_base, dest_offset_base, layout.outer_axes)?;
-    let mut inner = ReduceInnerCursor::new(source_offset_base, layout.inner_axes);
+    let mut reusable_inner = (layout.inner_axes.len() > RAW_FUSED_RANK_LIMIT)
+        .then(|| ReduceInnerCursor::new(source_offset_base, layout.inner_axes));
 
     for output in 0..layout.dest_total {
         let mut acc = reduce_identity(op);
-        inner.reset(outer.source_offset);
+        let mut inline_inner;
+        let inner = match &mut reusable_inner {
+            Some(inner) => {
+                inner.reset(outer.source_offset);
+                inner
+            }
+            None => {
+                inline_inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+                &mut inline_inner
+            }
+        };
         // INVARIANT: (1) compile_axes checked signed source/destination spans and
         // every cursor step/reset, including -(extent-1)*stride; (2) raw input
         // and output descriptors validated every reachable offset; (3) execute
@@ -3550,11 +3561,23 @@ where
             )?;
             let dest_ptr = dest_ptr.as_ptr();
             let source_ptr = source_ptr.as_const();
-            let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+            let mut reusable_inner = (layout.inner_axes.len() > RAW_FUSED_RANK_LIMIT)
+                .then(|| ReduceInnerCursor::new(outer.source_offset, layout.inner_axes));
 
             for output in range {
                 let mut acc = reduce_identity(op);
-                inner.reset(outer.source_offset);
+                let mut inline_inner;
+                let inner = match &mut reusable_inner {
+                    Some(inner) => {
+                        inner.reset(outer.source_offset);
+                        inner
+                    }
+                    None => {
+                        inline_inner =
+                            ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+                        &mut inline_inner
+                    }
+                };
                 // INVARIANT: (1) compile_axes checked signed source/destination
                 // spans and every cursor step/reset, including
                 // -(extent-1)*stride; (2) raw descriptors validated every
