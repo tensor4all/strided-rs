@@ -65,4 +65,16 @@ Benchmark commit `ed3ee36` ran on EPYC CPUs 25-28 (one L3 domain) because the pr
 
 ### Decision
 
-The need-before-implementation gate is **PASS**: compact rank 2/4/8 current scans cost 0.879/1.792/3.682 ms; current scan is 51.2%/78.9% of matching rank-1/rank-8 serial divide; incremental headroom is 2.56x at rank 2, 4.29x at rank 4, and 7.55x at rank 8 with non-overlapping intervals; negative/non-unit controls improve 2.61x/2.64x. Create a focused child issue and a separately reviewed implementation design before touching production.
+The need-before-implementation gate is **PASS**: compact rank 2/4/8 current scans cost 0.879/1.792/3.682 ms; current scan is 51.2%/79.4% of matching rank-1/rank-8 serial divide; incremental headroom is 2.56x at rank 2, 4.29x at rank 4, and 7.55x at rank 8 with non-overlapping intervals; negative/non-unit controls improve 2.61x/2.64x. Create a focused child issue and a separately reviewed implementation design before touching production.
+
+Exact scan command (the public-control command differed only in the final filter):
+
+```bash
+STRIDED_KERNEL_ERASED_POLICY_BENCH_PROFILE=threshold \
+STRIDED_KERNEL_ERASED_POLICY_BENCH_THREADS=4 \
+CARGO_TARGET_DIR=/tmp/strided213-target RAYON_NUM_THREADS=4 \
+  taskset -c 25-28 cargo bench -p strided-kernel \
+  --bench erased_policy_thresholds --features parallel -- erased_raw_any_scan
+```
+
+Exact review of measurement commit `72e9fdec` by read-only `reviewer-flash` (high) returned **Correct-to-merge**; its only findings were nonblocking evidence-presentation details.
