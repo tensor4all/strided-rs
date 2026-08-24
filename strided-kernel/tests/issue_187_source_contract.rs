@@ -1,4 +1,19 @@
 #[test]
+fn erased_axis_reduction_uses_prepared_incremental_cursors() {
+    let source = include_str!("../src/erased.rs");
+    assert!(source.contains("ReduceOuterAxis"));
+    assert!(source.contains("ReduceInnerAxis"));
+    assert!(source.contains("checked_reduce_layout_span"));
+    assert!(source.contains("checked_reduce_reset"));
+    let axes = source
+        .split_once("fn execute_reduce_axes_serial_data")
+        .and_then(|(_, rest)| rest.split_once("#[cfg(feature = \"parallel\")]"))
+        .map(|(body, _)| body)
+        .expect("axis serial replay remains ordered");
+    assert!(!axes.contains("checked_strided_offset"));
+}
+
+#[test]
 fn reduction_uninit_has_no_initialized_backing_conversion() {
     let source = include_str!("../src/erased.rs");
     let reduce = source

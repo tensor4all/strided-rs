@@ -719,10 +719,27 @@ enum ReduceLayout {
         dest_strides: Vec<isize>,
         axes: Vec<usize>,
         kept_axes: Vec<usize>,
-        reduce_dims: Vec<usize>,
+        outer_axes: Vec<ReduceOuterAxis>,
+        inner_axes: Vec<ReduceInnerAxis>,
         dest_total: usize,
         reduce_total: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReduceOuterAxis {
+    extent: usize,
+    source_step: isize,
+    source_reset: isize,
+    dest_step: isize,
+    dest_reset: isize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReduceInnerAxis {
+    extent: usize,
+    source_step: isize,
+    source_reset: isize,
 }
 
 impl ReduceLayout {
@@ -750,12 +767,10 @@ impl ReduceLayout {
 #[derive(Clone, Copy, Debug)]
 struct AxesLayout<'a> {
     src_dims: &'a [usize],
-    src_strides: &'a [isize],
-    dest_dims: &'a [usize],
-    dest_strides: &'a [isize],
     axes: &'a [usize],
     kept_axes: &'a [usize],
-    reduce_dims: &'a [usize],
+    outer_axes: &'a [ReduceOuterAxis],
+    inner_axes: &'a [ReduceInnerAxis],
     dest_total: usize,
     reduce_total: usize,
 }
@@ -1010,7 +1025,9 @@ impl ErasedReducePlan {
             return Err(StridedError::StrideLengthMismatch);
         }
         checked_total_len(src_dims)?;
+        checked_reduce_layout_span(src_dims, src_strides)?;
         let dest_total = checked_total_len(dest_dims)?;
+        checked_reduce_layout_span(dest_dims, dest_strides)?;
         if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
@@ -1034,8 +1051,35 @@ impl ErasedReducePlan {
             ));
         }
 
-        let reduce_dims = axes.iter().map(|&axis| src_dims[axis]).collect::<Vec<_>>();
-        let reduce_total = checked_total_len(&reduce_dims)?;
+        let reduce_total = axes
+            .iter()
+            .try_fold(1usize, |total, &axis| total.checked_mul(src_dims[axis]))
+            .ok_or(StridedError::OffsetOverflow)?;
+        let outer_axes = kept_axes
+            .iter()
+            .enumerate()
+            .map(|(dest_axis, &src_axis)| {
+                let extent = src_dims[src_axis];
+                Ok(ReduceOuterAxis {
+                    extent,
+                    source_step: src_strides[src_axis],
+                    source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                    dest_step: dest_strides[dest_axis],
+                    dest_reset: checked_reduce_reset(extent, dest_strides[dest_axis])?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inner_axes = axes
+            .iter()
+            .map(|&src_axis| {
+                let extent = src_dims[src_axis];
+                Ok(ReduceInnerAxis {
+                    extent,
+                    source_step: src_strides[src_axis],
+                    source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             dtype,
             op,
@@ -1046,7 +1090,8 @@ impl ErasedReducePlan {
                 dest_strides: dest_strides.to_vec(),
                 axes: axes.to_vec(),
                 kept_axes,
-                reduce_dims,
+                outer_axes,
+                inner_axes,
                 dest_total,
                 reduce_total,
             },
@@ -3227,14 +3272,13 @@ where
         ReduceLayout::Full { .. } => execute_reduce::<T, W>(op, ctx, dest, src),
         ReduceLayout::Axes {
             src_dims,
-            src_strides,
-            dest_dims,
-            dest_strides,
             axes,
             kept_axes,
-            reduce_dims,
+            outer_axes,
+            inner_axes,
             dest_total,
             reduce_total,
+            ..
         } => execute_reduce_axes::<T, W>(
             op,
             ctx,
@@ -3242,12 +3286,10 @@ where
             src,
             AxesLayout {
                 src_dims,
-                src_strides,
-                dest_dims,
-                dest_strides,
                 axes,
                 kept_axes,
-                reduce_dims,
+                outer_axes,
+                inner_axes,
                 dest_total: *dest_total,
                 reduce_total: *reduce_total,
             },
@@ -3277,7 +3319,13 @@ where
         return Ok(());
     }
 
-    if ctx.is_serial() {
+    if layout.reduce_total == 0 {
+        if ctx.is_serial() {
+            execute_reduce_axes_identity_serial(op, dest, layout)
+        } else {
+            ctx.run(|| execute_reduce_axes_identity_policy(op, dest, layout))
+        }
+    } else if ctx.is_serial() {
         execute_reduce_axes_serial::<T, W>(op, dest, src, layout)
     } else {
         ctx.run(|| execute_reduce_axes_policy::<T, W>(op, dest, src, layout))
@@ -3333,15 +3381,7 @@ where
     W: ReduceWriter<T>,
 {
     let source_data = src.data_as::<T>()?;
-    let dest_offset_base = dest.offset();
-    execute_reduce_axes_serial_data(
-        op,
-        dest_offset_base,
-        dest,
-        src.offset(),
-        source_data,
-        layout,
-    )
+    execute_reduce_axes_serial_data(op, dest.offset(), dest, src.offset(), source_data, layout)
 }
 
 fn execute_reduce_axes_serial_data<T, W>(
@@ -3356,38 +3396,124 @@ where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
 {
-    let mut out_idx_storage = CoordScratch::new(layout.dest_dims.len());
-    let mut reduce_idx_storage = CoordScratch::new(layout.reduce_dims.len());
-    let mut src_idx_storage = CoordScratch::new(layout.src_dims.len());
-    let out_idx = out_idx_storage.as_mut_slice();
-    let reduce_idx = reduce_idx_storage.as_mut_slice();
-    let src_idx = src_idx_storage.as_mut_slice();
+    let mut outer =
+        ReduceOuterCursor::decode(0, source_offset_base, dest_offset_base, layout.outer_axes)?;
 
-    for _ in 0..layout.dest_total {
-        src_idx.fill(0);
-        for (dest_axis, &src_axis) in layout.kept_axes.iter().enumerate() {
-            src_idx[src_axis] = out_idx[dest_axis];
-        }
-
+    for output in 0..layout.dest_total {
         let mut acc = reduce_identity(op);
-        reduce_idx.fill(0);
-        for _ in 0..layout.reduce_total {
-            for (reduce_axis, &src_axis) in layout.axes.iter().enumerate() {
-                src_idx[src_axis] = reduce_idx[reduce_axis];
-            }
-            let source_offset =
-                checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
-            let value = unsafe { *source_data.as_ptr().offset(source_offset) };
+        let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+        // INVARIANT: (1) compile_axes checked signed source/destination spans and
+        // every cursor step/reset, including -(extent-1)*stride; (2) raw input
+        // and output descriptors validated every reachable offset; (3) execute
+        // checked exact plan-layout equality before dispatch.
+        // SAFETY: the three-link layout invariant above proves each source
+        // cursor offset is within `source_data`.
+        for value_index in 0..layout.reduce_total {
+            let value = unsafe { *source_data.as_ptr().offset(inner.source_offset) };
             acc = reduce_values(op, acc, reduce_map_value(op, value));
-            advance_col_major_index(reduce_idx, layout.reduce_dims);
+            if value_index + 1 < layout.reduce_total {
+                inner.advance();
+            }
         }
 
-        let dest_offset = checked_strided_offset(dest_offset_base, layout.dest_strides, out_idx)?;
-        // SAFETY: reduction layout and extent validation prove the offset.
-        unsafe { dest.write_at(dest_offset, acc) };
-        advance_col_major_index(out_idx, layout.dest_dims);
+        // SAFETY: the three-link layout invariant above proves the destination
+        // cursor offset is an in-bounds logical output offset.
+        unsafe { dest.write_at(outer.dest_offset, acc) };
+        if output + 1 < layout.dest_total {
+            outer.advance();
+        }
     }
     Ok(())
+}
+
+fn execute_reduce_axes_identity_serial<T, W>(
+    op: ReduceOp,
+    dest: &mut W,
+    layout: AxesLayout<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+{
+    let mut outer = ReduceOuterCursor::decode(0, 0, dest.offset(), layout.outer_axes)?;
+    for output in 0..layout.dest_total {
+        // INVARIANT: (1) compile_axes checked the destination span and every
+        // destination step/reset, including -(extent-1)*stride; (2) the raw
+        // destination descriptor validated every reachable offset; (3) execute
+        // checked exact plan-layout equality before dispatch.
+        // SAFETY: the three-link layout invariant proves this destination
+        // cursor offset is in bounds; the source pointer is intentionally never
+        // formed for an empty reduction domain.
+        unsafe { dest.write_at(outer.dest_offset, reduce_identity(op)) };
+        if output + 1 < layout.dest_total {
+            outer.advance();
+        }
+    }
+    Ok(())
+}
+
+fn execute_reduce_axes_identity_policy<T, W>(
+    op: ReduceOp,
+    dest: &mut W,
+    layout: AxesLayout<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+{
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
+        if nthreads > 1 {
+            return execute_reduce_axes_identity_parallel(op, dest, layout, nthreads);
+        }
+    }
+    execute_reduce_axes_identity_serial(op, dest, layout)
+}
+
+#[cfg(feature = "parallel")]
+fn execute_reduce_axes_identity_parallel<T, W>(
+    op: ReduceOp,
+    dest: &mut W,
+    layout: AxesLayout<'_>,
+    nthreads: usize,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+{
+    // SAFETY: the validated reduction writer owns the destination allocation.
+    let dest_ptr = crate::threading::SendPtr(unsafe { dest.ptr() });
+    let dest_offset_base = dest.offset();
+    crate::threading::parallel_map_reduce(
+        0..layout.dest_total,
+        nthreads,
+        &|range| {
+            let range_end = range.end;
+            let mut outer =
+                ReduceOuterCursor::decode(range.start, 0, dest_offset_base, layout.outer_axes)?;
+            let dest_ptr = dest_ptr.as_ptr();
+            for output in range {
+                // INVARIANT: (1) compile_axes checked the destination span and
+                // every destination step/reset, including
+                // -(extent-1)*stride; (2) the raw destination descriptor
+                // validated every reachable pointer offset; (3) execute checked
+                // exact plan-layout equality before dispatch.
+                // SAFETY: the three-link layout invariant proves this
+                // destination offset is in bounds; no source pointer is formed.
+                unsafe {
+                    dest_ptr
+                        .offset(outer.dest_offset)
+                        .write(reduce_identity(op))
+                };
+                if output + 1 < range_end {
+                    outer.advance();
+                }
+            }
+            Ok(())
+        },
+        &|left, right| left.and(right),
+    )
 }
 
 #[cfg(feature = "parallel")]
@@ -3411,44 +3537,40 @@ where
         0..layout.dest_total,
         nthreads,
         &|range| {
-            let mut out_idx_storage = CoordScratch::new(layout.dest_dims.len());
-            let mut reduce_idx_storage = CoordScratch::new(layout.reduce_dims.len());
-            let mut src_idx_storage = CoordScratch::new(layout.src_dims.len());
-            let out_idx = out_idx_storage.as_mut_slice();
-            let reduce_idx = reduce_idx_storage.as_mut_slice();
-            let src_idx = src_idx_storage.as_mut_slice();
-            fill_col_major_index(range.start, layout.dest_dims, out_idx);
+            let range_end = range.end;
+            let mut outer = ReduceOuterCursor::decode(
+                range.start,
+                source_offset_base,
+                dest_offset_base,
+                layout.outer_axes,
+            )?;
             let dest_ptr = dest_ptr.as_ptr();
             let source_ptr = source_ptr.as_const();
 
-            for _ in range {
-                src_idx.fill(0);
-                for (dest_axis, &src_axis) in layout.kept_axes.iter().enumerate() {
-                    src_idx[src_axis] = out_idx[dest_axis];
-                }
-
+            for output in range {
                 let mut acc = reduce_identity(op);
-                reduce_idx.fill(0);
-                for _ in 0..layout.reduce_total {
-                    for (reduce_axis, &src_axis) in layout.axes.iter().enumerate() {
-                        src_idx[src_axis] = reduce_idx[reduce_axis];
-                    }
-                    let source_offset =
-                        checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
-                    let value = unsafe { *source_ptr.offset(source_offset) };
+                let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+                // INVARIANT: (1) compile_axes checked signed source/destination
+                // spans and every cursor step/reset, including
+                // -(extent-1)*stride; (2) raw descriptors validated every
+                // reachable pointer offset; (3) execute checked exact
+                // plan-layout equality before dispatch.
+                // SAFETY: the three-link layout invariant above proves each
+                // source cursor offset is within the source allocation.
+                for value_index in 0..layout.reduce_total {
+                    let value = unsafe { *source_ptr.offset(inner.source_offset) };
                     acc = reduce_values(op, acc, reduce_map_value(op, value));
-                    advance_col_major_index(reduce_idx, layout.reduce_dims);
+                    if value_index + 1 < layout.reduce_total {
+                        inner.advance();
+                    }
                 }
 
-                let dest_offset =
-                    checked_strided_offset(dest_offset_base, layout.dest_strides, out_idx)?;
-                unsafe {
-                    // SAFETY: axis reduction writes exactly one scalar per
-                    // logical output position, and compile rejected
-                    // non-injective destination layouts.
-                    dest_ptr.offset(dest_offset).write(acc);
+                // SAFETY: the three-link layout invariant above proves this
+                // destination cursor offset is in bounds.
+                unsafe { dest_ptr.offset(outer.dest_offset).write(acc) };
+                if output + 1 < range_end {
+                    outer.advance();
                 }
-                advance_col_major_index(out_idx, layout.dest_dims);
             }
             Ok(())
         },
@@ -3558,12 +3680,129 @@ fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
     Ok(())
 }
 
-fn checked_strided_offset(base: isize, strides: &[isize], index: &[usize]) -> Result<isize> {
-    let mut offset = base;
-    for (&stride, &coord) in strides.iter().zip(index.iter()) {
-        offset = checked_offset_add(offset, stride, coord)?;
+struct ReduceOuterCursor<'a> {
+    axes: &'a [ReduceOuterAxis],
+    coords: CoordScratch,
+    source_offset: isize,
+    dest_offset: isize,
+}
+
+impl<'a> ReduceOuterCursor<'a> {
+    fn decode(
+        mut linear: usize,
+        source_base: isize,
+        dest_base: isize,
+        axes: &'a [ReduceOuterAxis],
+    ) -> Result<Self> {
+        let mut coords = CoordScratch::new(axes.len());
+        let mut source_offset = source_base;
+        let mut dest_offset = dest_base;
+        for (coord, axis) in coords.as_mut_slice().iter_mut().zip(axes) {
+            // INVARIANT: a non-empty destination domain implies every outer
+            // extent is nonzero before decode; compile-time span checks make
+            // these one-time checked additions represent valid layout offsets.
+            debug_assert!(axis.extent != 0);
+            *coord = linear % axis.extent;
+            linear /= axis.extent;
+            source_offset = checked_offset_add(source_offset, axis.source_step, *coord)?;
+            dest_offset = checked_offset_add(dest_offset, axis.dest_step, *coord)?;
+        }
+        Ok(Self {
+            axes,
+            coords,
+            source_offset,
+            dest_offset,
+        })
     }
-    Ok(offset)
+
+    #[inline]
+    fn advance(&mut self) {
+        // INVARIANT: compile_axes checked every signed step and reset delta;
+        // descriptor validation plus exact layout equality proves each cursor
+        // state is a reachable source/destination offset.
+        for (coord, axis) in self.coords.as_mut_slice().iter_mut().zip(self.axes) {
+            let next = *coord + 1;
+            if next < axis.extent {
+                *coord = next;
+                self.source_offset += axis.source_step;
+                self.dest_offset += axis.dest_step;
+                return;
+            }
+            *coord = 0;
+            self.source_offset += axis.source_reset;
+            self.dest_offset += axis.dest_reset;
+        }
+    }
+}
+
+struct ReduceInnerCursor<'a> {
+    axes: &'a [ReduceInnerAxis],
+    coords: CoordScratch,
+    source_offset: isize,
+}
+
+impl<'a> ReduceInnerCursor<'a> {
+    fn new(source_base: isize, axes: &'a [ReduceInnerAxis]) -> Self {
+        Self {
+            axes,
+            coords: CoordScratch::new(axes.len()),
+            source_offset: source_base,
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        // INVARIANT: compile_axes checked every signed source step and reset
+        // delta, and the validated descriptor/layout chain proves each value
+        // offset is reachable from the current outer source base.
+        for (coord, axis) in self.coords.as_mut_slice().iter_mut().zip(self.axes) {
+            let next = *coord + 1;
+            if next < axis.extent {
+                *coord = next;
+                self.source_offset += axis.source_step;
+                return;
+            }
+            *coord = 0;
+            self.source_offset += axis.source_reset;
+        }
+    }
+}
+
+fn checked_reduce_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
+    if dims.len() != strides.len() {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+    let mut min_offset = 0isize;
+    let mut max_offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides) {
+        let last =
+            isize::try_from(dim.saturating_sub(1)).map_err(|_| StridedError::OffsetOverflow)?;
+        let extent = stride
+            .checked_mul(last)
+            .ok_or(StridedError::OffsetOverflow)?;
+        if extent < 0 {
+            min_offset = min_offset
+                .checked_add(extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+        } else {
+            max_offset = max_offset
+                .checked_add(extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+    let _ = (min_offset, max_offset);
+    Ok(())
+}
+
+fn checked_reduce_reset(extent: usize, stride: isize) -> Result<isize> {
+    if extent == 0 {
+        return Ok(0);
+    }
+    let last = isize::try_from(extent - 1).map_err(|_| StridedError::OffsetOverflow)?;
+    stride
+        .checked_mul(last)
+        .and_then(isize::checked_neg)
+        .ok_or(StridedError::OffsetOverflow)
 }
 
 fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
@@ -3572,25 +3811,6 @@ fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize>
         .checked_mul(coord)
         .ok_or(StridedError::OffsetOverflow)?;
     base.checked_add(scaled).ok_or(StridedError::OffsetOverflow)
-}
-
-fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
-    for axis in 0..index.len() {
-        index[axis] += 1;
-        if index[axis] < shape[axis] {
-            return;
-        }
-        index[axis] = 0;
-    }
-}
-
-#[cfg(feature = "parallel")]
-fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
-    for (axis, coord) in out.iter_mut().enumerate() {
-        let dim = shape[axis];
-        *coord = linear % dim;
-        linear /= dim;
-    }
 }
 
 struct CoordScratch {

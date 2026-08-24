@@ -135,6 +135,35 @@ fn large_erased_axis_reduce_matches_serial() {
     };
 
     assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+
+    let rank8_dims = [2, 2, 2, 2, 2, 2, 2, LARGE_LEN];
+    let rank8_strides = [1, 2, 4, 8, 16, 32, 64, 128];
+    let rank8_source: Vec<i32> = (0..128 * LARGE_LEN)
+        .map(|index| (index % 251) as i32 - 113)
+        .collect();
+    let rank8_plan = ErasedReducePlan::compile_axes(
+        KernelDType::I32,
+        ReduceOp::Sum,
+        &rank8_dims,
+        &rank8_strides,
+        &dest_dims,
+        &dest_strides,
+        &[6, 0, 3, 1, 5, 2, 4],
+    )
+    .unwrap();
+    let run_rank8 = |ctx: ExecContext| {
+        let source_ref =
+            ErasedRawStridedRef::from_slice(&rank8_source, &rank8_dims, &rank8_strides, 0).unwrap();
+        let mut output = vec![0i32; LARGE_LEN];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        rank8_plan.execute(&ctx, &mut dest, &source_ref).unwrap();
+        output
+    };
+    assert_eq!(
+        run_rank8(bounded_context()),
+        run_rank8(ExecContext::serial())
+    );
 }
 
 #[test]

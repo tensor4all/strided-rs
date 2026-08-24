@@ -459,6 +459,71 @@ fn erased_reduce_plan_executes_multi_axis_sum_with_kept_middle_axis() {
 }
 
 #[test]
+fn erased_reduce_plan_rank8_reordered_axes_preserve_fold_order() {
+    let src_dims = [2usize; 8];
+    let src_strides = [1isize, 2, 4, 8, 16, 32, 64, 128];
+    let input: Vec<f64> = (0..256)
+        .map(|index| match index % 4 {
+            0 => 1.0e16,
+            1 => index as f64,
+            2 => -1.0e16,
+            _ => -(index as f64),
+        })
+        .collect();
+    let axes = [6usize, 0, 3];
+    let kept_axes = [1usize, 2, 4, 5, 7];
+    let dest_dims = [2usize; 5];
+    let dest_strides = [1isize, 2, 4, 8, 16];
+    let mut output = [0.0f64; 32];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &axes,
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&input, &src_dims, &src_strides, 0).unwrap();
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    let mut expected = [0.0f64; 32];
+    for (output_linear, expected_value) in expected.iter_mut().enumerate() {
+        let mut source_index = [0usize; 8];
+        let mut linear = output_linear;
+        for &axis in &kept_axes {
+            source_index[axis] = linear % 2;
+            linear /= 2;
+        }
+        let mut acc = 0.0f64;
+        for reduced_linear in 0..8 {
+            let mut linear = reduced_linear;
+            for &axis in &axes {
+                source_index[axis] = linear % 2;
+                linear /= 2;
+            }
+            let offset = source_index
+                .iter()
+                .zip(src_strides)
+                .map(|(&coord, stride)| coord as isize * stride)
+                .sum::<isize>() as usize;
+            acc += input[offset];
+        }
+        *expected_value = acc;
+    }
+    assert_eq!(
+        output.map(f64::to_bits),
+        expected.map(f64::to_bits),
+        "caller-supplied reduced-axis order defines the fold order"
+    );
+}
+
+#[test]
 fn erased_reduce_plan_executes_all_axes_sum_into_rank0_scalar() {
     let src_dims = [2usize, 3];
     let src_strides = [1isize, 2];
