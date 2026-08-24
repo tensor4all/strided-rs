@@ -697,22 +697,26 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     );
 
     let edge = [0i64; 8];
-    let interior = [0i64; 8];
+    let mut interior = [0i64; 8];
+    interior[0] = 1;
+    let mut pad_dims = src_dims;
+    pad_dims[0] = 3;
+    let pad_strides = col_major_strides(&pad_dims);
     let fill = [0.0f64];
-    let mut dst = vec![0.0f64; 256];
+    let mut dst = vec![0.0f64; 384];
     let plan = ErasedPadPlan::compile(
         KernelDType::F64,
         &src_dims,
         &src_strides,
-        &src_dims,
-        &src_strides,
+        &pad_dims,
+        &pad_strides,
         &edge,
         &edge,
         &interior,
     )
     .unwrap();
     let mut dest =
-        ErasedRawStridedMut::from_slice_mut(&mut dst, &src_dims, &src_strides, 0).unwrap();
+        ErasedRawStridedMut::from_slice_mut(&mut dst, &pad_dims, &pad_strides, 0).unwrap();
 
     plan.execute(&ExecContext::serial(), &mut dest, &source, as_bytes(&fill))
         .unwrap();
@@ -723,9 +727,9 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "erased pad execute must not allocate");
-    let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); 256];
+    let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); 384];
     let mut uninit_dest =
-        ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit_dst, &src_dims, &src_strides, 0)
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit_dst, &pad_dims, &pad_strides, 0)
             .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
@@ -740,7 +744,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     });
     assert_eq!(
         allocations, 0,
-        "erased uninitialized pad execute must not allocate"
+        "erased uninitialized generic pad execute must not allocate"
     );
 
     let mut left_dims = [2usize; 8];

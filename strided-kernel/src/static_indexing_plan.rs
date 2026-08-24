@@ -58,6 +58,26 @@ pub struct PadPlan {
     dest_total: usize,
     contiguous_dest_fill: bool,
     contiguous_axis0_run: Option<ContiguousPadAxis0Run>,
+    generic_fill: PadFillCursor,
+    generic_copy: PadCopyCursor,
+}
+
+#[derive(Clone, Debug)]
+struct PadFillCursor {
+    steps: AxisVec<isize>,
+    resets: AxisVec<isize>,
+}
+
+#[derive(Clone, Debug)]
+struct PadCopyCursor {
+    shape: AxisVec<usize>,
+    source_base_delta: isize,
+    dest_base_delta: isize,
+    source_steps: AxisVec<isize>,
+    source_resets: AxisVec<isize>,
+    dest_steps: AxisVec<isize>,
+    dest_resets: AxisVec<isize>,
+    total: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +296,15 @@ impl PadPlan {
             edge_padding_low,
             &interior_step,
         );
+        let generic_fill = compile_pad_fill_cursor(dest_dims, dest_strides)?;
+        let generic_copy = compile_pad_copy_cursor(
+            operand_dims,
+            operand_strides,
+            dest_dims,
+            dest_strides,
+            edge_padding_low,
+            &interior_step,
+        )?;
 
         Ok(Self {
             operand_dims: operand_dims.into(),
@@ -288,6 +317,8 @@ impl PadPlan {
             dest_total,
             contiguous_dest_fill,
             contiguous_axis0_run,
+            generic_fill,
+            generic_copy,
         })
     }
 
@@ -488,17 +519,16 @@ impl PadPlan {
     where
         T: Copy,
     {
-        let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
-        let dest_data = dest.data_mut();
-        let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
-        let dest_idx = dest_idx_storage.as_mut_slice();
+        let dest_ptr = dest.data_mut().as_mut_ptr();
+        let mut cursor = PadFillState::new(dest.offset(), &self.dest_dims, &self.generic_fill);
         for _ in 0..self.dest_total {
-            let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, dest_idx)?;
             unsafe {
-                *dest_data.as_mut_ptr().offset(dest_offset) = fill;
+                // INVARIANT: compile-time checked fill spans, validated raw
+                // descriptors, and exact plan-layout equality prove this is a
+                // reachable destination offset.
+                *dest_ptr.offset(cursor.offset) = fill;
             }
-            advance_col_major_index(dest_idx, &self.dest_dims);
+            cursor.advance(&self.dest_dims, &self.generic_fill);
         }
         Ok(())
     }
@@ -519,20 +549,22 @@ impl PadPlan {
             0..self.dest_total,
             nthreads,
             &|range| {
-                let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
-                let dest_idx = dest_idx_storage.as_mut_slice();
-                fill_col_major_index(range.start, &self.dest_dims, dest_idx);
+                let mut cursor = PadFillState::decode(
+                    range.start,
+                    dest_offset_base,
+                    &self.dest_dims,
+                    &self.generic_fill,
+                )?;
                 let dest_ptr = dest_ptr.as_ptr();
                 for _ in range {
-                    let dest_offset =
-                        checked_strided_offset(dest_offset_base, &self.dest_strides, dest_idx)?;
                     unsafe {
-                        // SAFETY: `compile` rejected non-injective destination
-                        // layouts, and each logical destination index is visited
-                        // by exactly one range partition.
-                        *dest_ptr.offset(dest_offset) = fill;
+                        // INVARIANT: compile-time checked fill spans, validated
+                        // raw descriptors, exact layout equality, and disjoint
+                        // positive logical partition mapping prove this offset
+                        // is reachable and uniquely owned by this range.
+                        *dest_ptr.offset(cursor.offset) = fill;
                     }
-                    advance_col_major_index(dest_idx, &self.dest_dims);
+                    cursor.advance(&self.dest_dims, &self.generic_fill);
                 }
                 Ok(())
             },
@@ -550,7 +582,7 @@ impl PadPlan {
     {
         #[cfg(feature = "parallel")]
         {
-            let nthreads = crate::threading::parallel_threads_for_len(self.operand_total);
+            let nthreads = crate::threading::parallel_threads_for_len(self.generic_copy.total);
             if nthreads > 1 {
                 return self.copy_operand_parallel(dest, operand, nthreads);
             }
@@ -568,7 +600,7 @@ impl PadPlan {
     {
         #[cfg(feature = "parallel")]
         {
-            let nthreads = crate::threading::parallel_threads_for_len(self.operand_total);
+            let nthreads = crate::threading::parallel_threads_for_len(self.generic_copy.total);
             if nthreads > 1 {
                 return self.copy_operand_uninit_parallel(dest, operand, nthreads);
             }
@@ -584,38 +616,30 @@ impl PadPlan {
     where
         T: Copy,
     {
-        let operand_offset_base = operand.offset();
-        let operand_strides = operand.strides();
-        let operand_data = operand.data();
-        let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
-        let dest_data = dest.data_mut();
-        let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
-        let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
-        let input_idx = input_idx_storage.as_mut_slice();
-        let out_idx = out_idx_storage.as_mut_slice();
-
-        for _ in 0..self.operand_total {
-            let mut in_bounds = true;
-            for axis in 0..self.operand_dims.len() {
-                let out_pos = i128::from(self.edge_padding_low[axis])
-                    + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
-                if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
-                    in_bounds = false;
-                    break;
-                }
-                out_idx[axis] = out_pos as usize;
+        if self.generic_copy.total == 0 {
+            return Ok(());
+        }
+        let operand_ptr = operand.data().as_ptr();
+        let dest_ptr = dest.data_mut().as_mut_ptr();
+        let source_base = operand
+            .offset()
+            .checked_add(self.generic_copy.source_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest_base = dest
+            .offset()
+            .checked_add(self.generic_copy.dest_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut cursor = PadCopyState::new(source_base, dest_base, &self.generic_copy);
+        for _ in 0..self.generic_copy.total {
+            unsafe {
+                // INVARIANT: compile-time checked copy spans/base deltas,
+                // validated raw descriptors, and exact plan-layout equality
+                // prove both offsets reachable; positive steps make destinations
+                // injective, so no copy aliases another cursor position.
+                (*dest_ptr.offset(cursor.dest_offset))
+                    .write(*operand_ptr.offset(cursor.source_offset));
             }
-            if in_bounds {
-                let operand_offset =
-                    checked_strided_offset(operand_offset_base, operand_strides, input_idx)?;
-                let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, out_idx)?;
-                unsafe {
-                    (*dest_data.as_mut_ptr().offset(dest_offset))
-                        .write(*operand_data.as_ptr().offset(operand_offset));
-                }
-            }
-            advance_col_major_index(input_idx, &self.operand_dims);
+            cursor.advance(&self.generic_copy);
         }
         Ok(())
     }
@@ -630,47 +654,35 @@ impl PadPlan {
     where
         T: Copy + MaybeSendSync,
     {
-        let operand_offset_base = operand.offset();
+        let operand_base = operand
+            .offset()
+            .checked_add(self.generic_copy.source_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
         let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
-        let dest_offset_base = dest.offset();
+        let dest_base = dest
+            .offset()
+            .checked_add(self.generic_copy.dest_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         crate::threading::parallel_map_reduce(
-            0..self.operand_total,
+            0..self.generic_copy.total,
             nthreads,
             &|range| {
-                let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
-                let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
-                let input_idx = input_idx_storage.as_mut_slice();
-                let out_idx = out_idx_storage.as_mut_slice();
-                fill_col_major_index(range.start, &self.operand_dims, input_idx);
+                let mut cursor =
+                    PadCopyState::decode(range.start, operand_base, dest_base, &self.generic_copy)?;
                 let operand_ptr = operand_ptr.as_const();
                 let dest_ptr = dest_ptr.as_ptr();
 
                 for _ in range {
-                    let mut in_bounds = true;
-                    for axis in 0..self.operand_dims.len() {
-                        let out_pos = i128::from(self.edge_padding_low[axis])
-                            + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
-                        if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
-                            in_bounds = false;
-                            break;
-                        }
-                        out_idx[axis] = out_pos as usize;
+                    unsafe {
+                        // INVARIANT: compile-time checked copy spans/base
+                        // deltas, validated descriptors, exact layout equality,
+                        // and positive injective mapping prove disjoint,
+                        // reachable source/destination offsets per range.
+                        (*dest_ptr.offset(cursor.dest_offset))
+                            .write(*operand_ptr.offset(cursor.source_offset));
                     }
-                    if in_bounds {
-                        let operand_offset = checked_strided_offset(
-                            operand_offset_base,
-                            &self.operand_strides,
-                            input_idx,
-                        )?;
-                        let dest_offset =
-                            checked_strided_offset(dest_offset_base, &self.dest_strides, out_idx)?;
-                        unsafe {
-                            (*dest_ptr.offset(dest_offset))
-                                .write(*operand_ptr.offset(operand_offset));
-                        }
-                    }
-                    advance_col_major_index(input_idx, &self.operand_dims);
+                    cursor.advance(&self.generic_copy);
                 }
                 Ok(())
             },
@@ -686,38 +698,29 @@ impl PadPlan {
     where
         T: Copy,
     {
-        let operand_offset_base = operand.offset();
-        let operand_strides = operand.strides();
-        let operand_data = operand.data();
-        let dest_offset_base = dest.offset();
-        let dest_strides = dest.strides();
-        let dest_data = dest.data_mut();
-        let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
-        let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
-        let input_idx = input_idx_storage.as_mut_slice();
-        let out_idx = out_idx_storage.as_mut_slice();
-
-        for _ in 0..self.operand_total {
-            let mut in_bounds = true;
-            for axis in 0..self.operand_dims.len() {
-                let out_pos = i128::from(self.edge_padding_low[axis])
-                    + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
-                if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
-                    in_bounds = false;
-                    break;
-                }
-                out_idx[axis] = out_pos as usize;
+        if self.generic_copy.total == 0 {
+            return Ok(());
+        }
+        let operand_ptr = operand.data().as_ptr();
+        let dest_ptr = dest.data_mut().as_mut_ptr();
+        let source_base = operand
+            .offset()
+            .checked_add(self.generic_copy.source_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let dest_base = dest
+            .offset()
+            .checked_add(self.generic_copy.dest_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
+        let mut cursor = PadCopyState::new(source_base, dest_base, &self.generic_copy);
+        for _ in 0..self.generic_copy.total {
+            unsafe {
+                // INVARIANT: compile-time checked copy spans/base deltas,
+                // validated raw descriptors, and exact plan-layout equality
+                // prove both offsets reachable; positive steps make destinations
+                // injective, so no copy aliases another cursor position.
+                *dest_ptr.offset(cursor.dest_offset) = *operand_ptr.offset(cursor.source_offset);
             }
-            if in_bounds {
-                let operand_offset =
-                    checked_strided_offset(operand_offset_base, operand_strides, input_idx)?;
-                let dest_offset = checked_strided_offset(dest_offset_base, dest_strides, out_idx)?;
-                unsafe {
-                    *dest_data.as_mut_ptr().offset(dest_offset) =
-                        *operand_data.as_ptr().offset(operand_offset);
-                }
-            }
-            advance_col_major_index(input_idx, &self.operand_dims);
+            cursor.advance(&self.generic_copy);
         }
         Ok(())
     }
@@ -732,50 +735,35 @@ impl PadPlan {
     where
         T: Copy + MaybeSendSync,
     {
-        let operand_offset_base = operand.offset();
+        let operand_base = operand
+            .offset()
+            .checked_add(self.generic_copy.source_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
         let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
-        let dest_offset_base = dest.offset();
+        let dest_base = dest
+            .offset()
+            .checked_add(self.generic_copy.dest_base_delta)
+            .ok_or(StridedError::OffsetOverflow)?;
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         crate::threading::parallel_map_reduce(
-            0..self.operand_total,
+            0..self.generic_copy.total,
             nthreads,
             &|range| {
-                let mut input_idx_storage = CoordScratch::new(self.operand_dims.len());
-                let mut out_idx_storage = CoordScratch::new(self.dest_dims.len());
-                let input_idx = input_idx_storage.as_mut_slice();
-                let out_idx = out_idx_storage.as_mut_slice();
-                fill_col_major_index(range.start, &self.operand_dims, input_idx);
+                let mut cursor =
+                    PadCopyState::decode(range.start, operand_base, dest_base, &self.generic_copy)?;
                 let operand_ptr = operand_ptr.as_const();
                 let dest_ptr = dest_ptr.as_ptr();
 
                 for _ in range {
-                    let mut in_bounds = true;
-                    for axis in 0..self.operand_dims.len() {
-                        let out_pos = i128::from(self.edge_padding_low[axis])
-                            + input_idx[axis] as i128 * i128::from(self.interior_step[axis]);
-                        if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
-                            in_bounds = false;
-                            break;
-                        }
-                        out_idx[axis] = out_pos as usize;
+                    unsafe {
+                        // INVARIANT: compile-time checked copy spans/base
+                        // deltas, validated descriptors, exact layout equality,
+                        // and positive injective mapping prove disjoint,
+                        // reachable source/destination offsets per range.
+                        *dest_ptr.offset(cursor.dest_offset) =
+                            *operand_ptr.offset(cursor.source_offset);
                     }
-                    if in_bounds {
-                        let operand_offset = checked_strided_offset(
-                            operand_offset_base,
-                            &self.operand_strides,
-                            input_idx,
-                        )?;
-                        let dest_offset =
-                            checked_strided_offset(dest_offset_base, &self.dest_strides, out_idx)?;
-                        unsafe {
-                            // SAFETY: positive interior steps make the
-                            // input-to-output mapping injective for in-bounds
-                            // positions; the destination layout is also
-                            // injective.
-                            *dest_ptr.offset(dest_offset) = *operand_ptr.offset(operand_offset);
-                        }
-                    }
-                    advance_col_major_index(input_idx, &self.operand_dims);
+                    cursor.advance(&self.generic_copy);
                 }
                 Ok(())
             },
@@ -1174,6 +1162,180 @@ fn checked_pad_output_dim(
     usize::try_from(dim).map_err(|_| StridedError::InvalidAxis { axis, rank })
 }
 
+fn compile_pad_fill_cursor(dims: &[usize], strides: &[isize]) -> Result<PadFillCursor> {
+    let mut steps = AxisVec::with_capacity(dims.len());
+    let mut resets = AxisVec::with_capacity(dims.len());
+    for (&dim, &stride) in dims.iter().zip(strides) {
+        steps.push(stride);
+        resets.push(checked_cursor_reset(stride, dim)?);
+    }
+    check_offset_span(dims, &steps)?;
+    Ok(PadFillCursor { steps, resets })
+}
+
+fn compile_pad_copy_cursor(
+    operand_dims: &[usize],
+    operand_strides: &[isize],
+    dest_dims: &[usize],
+    dest_strides: &[isize],
+    edge_padding_low: &[i64],
+    interior_step: &[i64],
+) -> Result<PadCopyCursor> {
+    let mut shape = AxisVec::with_capacity(operand_dims.len());
+    let mut source_steps = AxisVec::with_capacity(operand_dims.len());
+    let mut source_resets = AxisVec::with_capacity(operand_dims.len());
+    let mut dest_steps = AxisVec::with_capacity(operand_dims.len());
+    let mut dest_resets = AxisVec::with_capacity(operand_dims.len());
+    let mut source_base_delta = 0isize;
+    let mut dest_base_delta = 0isize;
+    let mut copy_empty = false;
+
+    for axis in 0..operand_dims.len() {
+        let (start, end) = checked_pad_valid_interval(
+            operand_dims[axis],
+            dest_dims[axis],
+            edge_padding_low[axis],
+            interior_step[axis],
+        )?;
+        let extent = end - start;
+        shape.push(extent);
+        if !copy_empty && extent != 0 {
+            source_base_delta =
+                checked_offset_add(source_base_delta, operand_strides[axis], start)?;
+            let output_start = i128::from(edge_padding_low[axis])
+                .checked_add(
+                    i128::try_from(start)
+                        .map_err(|_| StridedError::OffsetOverflow)?
+                        .checked_mul(i128::from(interior_step[axis]))
+                        .ok_or(StridedError::OffsetOverflow)?,
+                )
+                .ok_or(StridedError::OffsetOverflow)?;
+            let output_start =
+                usize::try_from(output_start).map_err(|_| StridedError::OffsetOverflow)?;
+            dest_base_delta =
+                checked_offset_add(dest_base_delta, dest_strides[axis], output_start)?;
+        }
+        copy_empty |= extent == 0;
+
+        let source_step = operand_strides[axis];
+        let dest_step = checked_stride_mul_i64(dest_strides[axis], interior_step[axis])?;
+        source_steps.push(source_step);
+        source_resets.push(checked_cursor_reset(source_step, extent)?);
+        dest_steps.push(dest_step);
+        dest_resets.push(checked_cursor_reset(dest_step, extent)?);
+    }
+
+    check_offset_span(&shape, &source_steps)?;
+    check_offset_span(&shape, &dest_steps)?;
+    let total = if shape.iter().any(|&extent| extent == 0) {
+        0
+    } else {
+        checked_total_len(&shape)?
+    };
+
+    Ok(PadCopyCursor {
+        shape,
+        source_base_delta,
+        dest_base_delta,
+        source_steps,
+        source_resets,
+        dest_steps,
+        dest_resets,
+        total,
+    })
+}
+
+fn checked_pad_valid_interval(
+    input_extent: usize,
+    dest_extent: usize,
+    edge_low: i64,
+    step: i64,
+) -> Result<(usize, usize)> {
+    if input_extent == 0 || dest_extent == 0 {
+        return Ok((0, 0));
+    }
+    let step = i128::from(step);
+    let lower = ceil_div_positive(-i128::from(edge_low), step)?;
+    let dest_last = i128::try_from(dest_extent)
+        .map_err(|_| StridedError::OffsetOverflow)?
+        .checked_sub(1)
+        .ok_or(StridedError::OffsetOverflow)?;
+    let upper = floor_div_positive(
+        dest_last
+            .checked_sub(i128::from(edge_low))
+            .ok_or(StridedError::OffsetOverflow)?,
+        step,
+    )?
+    .checked_add(1)
+    .ok_or(StridedError::OffsetOverflow)?;
+    let input_extent = i128::try_from(input_extent).map_err(|_| StridedError::OffsetOverflow)?;
+    let lower = lower.clamp(0, input_extent);
+    let upper = upper.clamp(0, input_extent);
+    if lower >= upper {
+        return Ok((0, 0));
+    }
+    Ok((
+        usize::try_from(lower).map_err(|_| StridedError::OffsetOverflow)?,
+        usize::try_from(upper).map_err(|_| StridedError::OffsetOverflow)?,
+    ))
+}
+
+fn ceil_div_positive(numerator: i128, denominator: i128) -> Result<i128> {
+    if denominator <= 0 {
+        return Err(StridedError::OffsetOverflow);
+    }
+    let quotient = numerator.div_euclid(denominator);
+    let remainder = numerator.rem_euclid(denominator);
+    quotient
+        .checked_add(i128::from(remainder != 0))
+        .ok_or(StridedError::OffsetOverflow)
+}
+
+fn floor_div_positive(numerator: i128, denominator: i128) -> Result<i128> {
+    if denominator <= 0 {
+        return Err(StridedError::OffsetOverflow);
+    }
+    Ok(numerator.div_euclid(denominator))
+}
+
+fn checked_stride_mul_i64(stride: isize, factor: i64) -> Result<isize> {
+    let factor = isize::try_from(factor).map_err(|_| StridedError::OffsetOverflow)?;
+    stride
+        .checked_mul(factor)
+        .ok_or(StridedError::OffsetOverflow)
+}
+
+fn checked_cursor_reset(step: isize, extent: usize) -> Result<isize> {
+    if extent == 0 {
+        return Ok(0);
+    }
+    let last = isize::try_from(extent - 1).map_err(|_| StridedError::OffsetOverflow)?;
+    step.checked_mul(last)
+        .and_then(isize::checked_neg)
+        .ok_or(StridedError::OffsetOverflow)
+}
+
+fn check_offset_span(shape: &[usize], strides: &[isize]) -> Result<()> {
+    let mut min = 0isize;
+    let mut max = 0isize;
+    for (&extent, &stride) in shape.iter().zip(strides) {
+        if extent <= 1 {
+            continue;
+        }
+        let last = isize::try_from(extent - 1).map_err(|_| StridedError::OffsetOverflow)?;
+        let delta = stride
+            .checked_mul(last)
+            .ok_or(StridedError::OffsetOverflow)?;
+        if delta < 0 {
+            min = min.checked_add(delta).ok_or(StridedError::OffsetOverflow)?;
+        } else {
+            max = max.checked_add(delta).ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+    let _ = (min, max);
+    Ok(())
+}
+
 fn is_dense_col_major(dims: &[usize], strides: &[isize]) -> bool {
     let mut expected = 1isize;
     for (&dim, &stride) in dims.iter().zip(strides.iter()) {
@@ -1220,14 +1382,6 @@ fn compile_contiguous_pad_axis0_run(
     })
 }
 
-fn checked_strided_offset(base: isize, strides: &[isize], index: &[usize]) -> Result<isize> {
-    let mut offset = base;
-    for (&stride, &coord) in strides.iter().zip(index.iter()) {
-        offset = checked_offset_add(offset, stride, coord)?;
-    }
-    Ok(offset)
-}
-
 fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
     let coord = isize::try_from(coord).map_err(|_| StridedError::OffsetOverflow)?;
     let scaled = stride
@@ -1252,6 +1406,101 @@ fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
         let dim = shape[axis];
         *coord = linear % dim;
         linear /= dim;
+    }
+}
+
+struct PadFillState {
+    coords: CoordScratch,
+    offset: isize,
+}
+
+impl PadFillState {
+    fn new(base: isize, shape: &[usize], _cursor: &PadFillCursor) -> Self {
+        Self {
+            coords: CoordScratch::new(shape.len()),
+            offset: base,
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn decode(linear: usize, base: isize, shape: &[usize], cursor: &PadFillCursor) -> Result<Self> {
+        let mut state = Self::new(base, shape, cursor);
+        fill_col_major_index(linear, shape, state.coords.as_mut_slice());
+        for (&coord, &step) in state.coords.as_mut_slice().iter().zip(&cursor.steps) {
+            state.offset = checked_offset_add(state.offset, step, coord)?;
+        }
+        Ok(state)
+    }
+
+    #[inline]
+    fn advance(&mut self, shape: &[usize], cursor: &PadFillCursor) {
+        // INVARIANT: precomputed checked offset arithmetic, the validated
+        // descriptor, and exact layout equality prove each incremental offset
+        // remains reachable.
+        for axis in 0..shape.len() {
+            let next = self.coords.as_mut_slice()[axis] + 1;
+            if next < shape[axis] {
+                self.coords.as_mut_slice()[axis] = next;
+                self.offset += cursor.steps[axis];
+                return;
+            }
+            self.coords.as_mut_slice()[axis] = 0;
+            self.offset += cursor.resets[axis];
+        }
+    }
+}
+
+struct PadCopyState {
+    coords: CoordScratch,
+    source_offset: isize,
+    dest_offset: isize,
+}
+
+impl PadCopyState {
+    fn new(source_base: isize, dest_base: isize, cursor: &PadCopyCursor) -> Self {
+        Self {
+            coords: CoordScratch::new(cursor.shape.len()),
+            source_offset: source_base,
+            dest_offset: dest_base,
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn decode(
+        linear: usize,
+        source_base: isize,
+        dest_base: isize,
+        cursor: &PadCopyCursor,
+    ) -> Result<Self> {
+        let mut state = Self::new(source_base, dest_base, cursor);
+        fill_col_major_index(linear, &cursor.shape, state.coords.as_mut_slice());
+        for axis in 0..cursor.shape.len() {
+            let coord = state.coords.as_mut_slice()[axis];
+            state.source_offset =
+                checked_offset_add(state.source_offset, cursor.source_steps[axis], coord)?;
+            state.dest_offset =
+                checked_offset_add(state.dest_offset, cursor.dest_steps[axis], coord)?;
+        }
+        Ok(state)
+    }
+
+    #[inline]
+    fn advance(&mut self, cursor: &PadCopyCursor) {
+        // INVARIANT: compile-time checked steps/resets/offset arithmetic,
+        // validated descriptors, and exact plan-layout equality prove every update below
+        // stays in the reachable source/destination domains.
+        for axis in 0..cursor.shape.len() {
+            let next = self.coords.as_mut_slice()[axis] + 1;
+            if next < cursor.shape[axis] {
+                self.coords.as_mut_slice()[axis] = next;
+                self.source_offset += cursor.source_steps[axis];
+                self.dest_offset += cursor.dest_steps[axis];
+                return;
+            }
+            self.coords.as_mut_slice()[axis] = 0;
+            self.source_offset += cursor.source_resets[axis];
+            self.dest_offset += cursor.dest_resets[axis];
+        }
     }
 }
 
@@ -1383,5 +1632,72 @@ mod tests {
             ],
             Complex64::new(-1.0, 0.0),
         );
+    }
+
+    #[test]
+    fn pad_benchmark_recipes_use_generic_replay() {
+        for (label, rank, crop, nonunit) in [
+            ("compact_rank2", 2usize, false, false),
+            ("compact_rank4", 4, false, false),
+            ("compact_rank8", 8, false, false),
+            ("rank2_negative_crop", 2, true, false),
+            ("rank2_nonunit", 2, false, true),
+        ] {
+            let mut operand_dims = vec![2usize; rank - 1];
+            operand_dims.push(8);
+            let interior = std::iter::once(1i64)
+                .chain(std::iter::repeat_n(0i64, rank - 1))
+                .collect::<Vec<_>>();
+            let mut edge_low = vec![0i64; rank];
+            let mut edge_high = vec![0i64; rank];
+            if crop {
+                edge_low[1] = -1;
+                edge_high[1] = 1;
+            }
+            let operand_strides = if nonunit {
+                vec![2isize, 4]
+            } else {
+                col_major_strides(&operand_dims)
+            };
+            let dest_dims = operand_dims
+                .iter()
+                .zip(&interior)
+                .zip(edge_low.iter().zip(&edge_high))
+                .map(|((&dim, &inner), (&low, &high))| {
+                    (low + (dim as i64 - 1) * (inner + 1) + high + 1) as usize
+                })
+                .collect::<Vec<_>>();
+            let dest_strides = if nonunit {
+                vec![2isize, 6]
+            } else {
+                col_major_strides(&dest_dims)
+            };
+            let plan = PadPlan::compile(
+                &operand_dims,
+                &operand_strides,
+                &dest_dims,
+                &dest_strides,
+                &edge_low,
+                &edge_high,
+                &interior,
+            )
+            .unwrap();
+            assert!(
+                plan.contiguous_axis0_run.is_none(),
+                "{label} unexpectedly selected the axis-0 fast path"
+            );
+            assert!(plan.generic_copy.total > 0, "{label} has no copy domain");
+        }
+    }
+
+    fn col_major_strides(dims: &[usize]) -> Vec<isize> {
+        let mut stride = 1isize;
+        dims.iter()
+            .map(|&dim| {
+                let current = stride;
+                stride *= dim as isize;
+                current
+            })
+            .collect()
     }
 }
