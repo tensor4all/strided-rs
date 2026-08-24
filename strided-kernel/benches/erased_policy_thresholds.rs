@@ -736,6 +736,90 @@ fn bench_pad_fill_and_copy(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_erased_pad_generic_rank_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_pad_generic_rank_layout");
+    for case in profile_cases() {
+        for (label, rank, crop, nonunit) in [
+            ("compact_rank2", 2usize, false, false),
+            ("compact_rank4", 4, false, false),
+            ("compact_rank8", 8, false, false),
+            ("rank2_negative_crop", 2, true, false),
+            ("rank2_nonunit", 2, false, true),
+        ] {
+            let mut operand_dims = vec![2usize; rank - 1];
+            operand_dims.push((case.len / (3 * (1usize << (rank - 2)))).max(1));
+            let interior = vec![1i64; 1]
+                .into_iter()
+                .chain(vec![0; rank - 1])
+                .collect::<Vec<_>>();
+            let mut edge_low = vec![0i64; rank];
+            let mut edge_high = vec![0i64; rank];
+            if crop {
+                edge_low[1] = -1;
+                edge_high[1] = 1;
+            }
+            let operand_strides = if nonunit {
+                vec![2isize, 4]
+            } else {
+                col_major_strides(&operand_dims)
+            };
+            let dest_dims: Vec<_> = operand_dims
+                .iter()
+                .zip(interior.iter())
+                .zip(edge_low.iter().zip(edge_high.iter()))
+                .map(|((&dim, &inner), (&low, &high))| {
+                    (low + (dim as i64 - 1) * (inner + 1) + high + 1) as usize
+                })
+                .collect();
+            let dest_strides = if nonunit {
+                vec![2isize, 6]
+            } else {
+                col_major_strides(&dest_dims)
+            };
+            let span = |dims: &[usize], strides: &[isize]| {
+                dims.iter()
+                    .zip(strides)
+                    .map(|(&dim, &stride)| (dim - 1) * stride as usize)
+                    .sum::<usize>()
+                    + 1
+            };
+            let operand = patterned_i32(span(&operand_dims, &operand_strides));
+            let fill = [-1i32];
+            let plan = ErasedPadPlan::compile(
+                KernelDType::I32,
+                &operand_dims,
+                &operand_strides,
+                &dest_dims,
+                &dest_strides,
+                &edge_low,
+                &edge_high,
+                &interior,
+            )
+            .unwrap();
+            let operand_ref =
+                ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0)
+                    .unwrap();
+            let ctx = context(case);
+            let id = BenchmarkId::new(
+                format!("{label}_{}", context_label(case)),
+                format!("n{}", case.len),
+            );
+            let mut output = vec![0i32; span(&dest_dims, &dest_strides)];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
+            group.bench_function(id, |bencher| {
+                bencher.iter(|| {
+                    plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+                        .unwrap();
+                    black_box(&mut dest);
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_copy_raw_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("erased_copy_raw_path");
     for case in profile_cases() {
@@ -834,6 +918,7 @@ criterion_group! {
         bench_erased_dynamic_slice_generic_rank_layout,
         bench_erased_dynamic_update_generic_rank_layout,
         bench_pad_fill_and_copy,
+        bench_erased_pad_generic_rank_layout,
         bench_copy_raw_path,
         bench_scatter_additive
 }
