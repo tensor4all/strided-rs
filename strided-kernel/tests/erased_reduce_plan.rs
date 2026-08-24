@@ -524,6 +524,34 @@ fn erased_reduce_plan_rank8_reordered_axes_preserve_fold_order() {
 }
 
 #[test]
+fn erased_reduce_plan_fused_rank8_axes_match_contiguous_order() {
+    let src_dims = [2usize; 8];
+    let src_strides = [1isize, 2, 4, 8, 16, 32, 64, 128];
+    let input: Vec<i32> = (0..256).collect();
+    let dest_dims = [2usize];
+    let dest_strides = [1isize];
+    let mut output = [0i32; 2];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::I32,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 1, 2, 3, 4, 5, 6],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&input, &src_dims, &src_strides, 0).unwrap();
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output, [8128, 24512]);
+}
+
+#[test]
 fn erased_reduce_plan_executes_all_axes_sum_into_rank0_scalar() {
     let src_dims = [2usize, 3];
     let src_strides = [1isize, 2];

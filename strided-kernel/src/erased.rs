@@ -1055,31 +1055,34 @@ impl ErasedReducePlan {
             .iter()
             .try_fold(1usize, |total, &axis| total.checked_mul(src_dims[axis]))
             .ok_or(StridedError::OffsetOverflow)?;
-        let outer_axes = kept_axes
-            .iter()
-            .enumerate()
-            .map(|(dest_axis, &src_axis)| {
-                let extent = src_dims[src_axis];
-                Ok(ReduceOuterAxis {
-                    extent,
-                    source_step: src_strides[src_axis],
-                    source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
-                    dest_step: dest_strides[dest_axis],
-                    dest_reset: checked_reduce_reset(extent, dest_strides[dest_axis])?,
+        let outer_axes = compress_reduce_outer_axes(
+            kept_axes
+                .iter()
+                .enumerate()
+                .map(|(dest_axis, &src_axis)| {
+                    let extent = src_dims[src_axis];
+                    Ok(ReduceOuterAxis {
+                        extent,
+                        source_step: src_strides[src_axis],
+                        source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                        dest_step: dest_strides[dest_axis],
+                        dest_reset: checked_reduce_reset(extent, dest_strides[dest_axis])?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let inner_axes = axes
-            .iter()
-            .map(|&src_axis| {
-                let extent = src_dims[src_axis];
-                Ok(ReduceInnerAxis {
-                    extent,
-                    source_step: src_strides[src_axis],
-                    source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let inner_axes = compress_reduce_inner_axes(
+            axes.iter()
+                .map(|&src_axis| {
+                    let extent = src_dims[src_axis];
+                    Ok(ReduceInnerAxis {
+                        extent,
+                        source_step: src_strides[src_axis],
+                        source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?,
+        )?;
         Ok(Self {
             dtype,
             op,
@@ -3792,6 +3795,61 @@ fn checked_reduce_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
     }
     let _ = (min_offset, max_offset);
     Ok(())
+}
+
+fn compress_reduce_outer_axes(axes: Vec<ReduceOuterAxis>) -> Result<Vec<ReduceOuterAxis>> {
+    let mut compressed: Vec<ReduceOuterAxis> = Vec::with_capacity(axes.len());
+    for axis in axes {
+        if let Some(previous) = compressed.last_mut() {
+            let previous_extent =
+                isize::try_from(previous.extent).map_err(|_| StridedError::OffsetOverflow)?;
+            let expected_source = previous
+                .source_step
+                .checked_mul(previous_extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+            let expected_dest = previous
+                .dest_step
+                .checked_mul(previous_extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+            if axis.source_step == expected_source && axis.dest_step == expected_dest {
+                let fused_extent = previous
+                    .extent
+                    .checked_mul(axis.extent)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                previous.extent = fused_extent;
+                previous.source_reset = checked_reduce_reset(fused_extent, previous.source_step)?;
+                previous.dest_reset = checked_reduce_reset(fused_extent, previous.dest_step)?;
+                continue;
+            }
+        }
+        compressed.push(axis);
+    }
+    Ok(compressed)
+}
+
+fn compress_reduce_inner_axes(axes: Vec<ReduceInnerAxis>) -> Result<Vec<ReduceInnerAxis>> {
+    let mut compressed: Vec<ReduceInnerAxis> = Vec::with_capacity(axes.len());
+    for axis in axes {
+        if let Some(previous) = compressed.last_mut() {
+            let previous_extent =
+                isize::try_from(previous.extent).map_err(|_| StridedError::OffsetOverflow)?;
+            let expected_source = previous
+                .source_step
+                .checked_mul(previous_extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+            if axis.source_step == expected_source {
+                let fused_extent = previous
+                    .extent
+                    .checked_mul(axis.extent)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                previous.extent = fused_extent;
+                previous.source_reset = checked_reduce_reset(fused_extent, previous.source_step)?;
+                continue;
+            }
+        }
+        compressed.push(axis);
+    }
+    Ok(compressed)
 }
 
 fn checked_reduce_reset(extent: usize, stride: isize) -> Result<isize> {
