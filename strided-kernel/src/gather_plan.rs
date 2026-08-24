@@ -1737,9 +1737,6 @@ fn validate_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
     if dims.len() != strides.len() {
         return Err(StridedError::StrideLengthMismatch);
     }
-    if dims.contains(&0) {
-        return Ok(());
-    }
     let mut min_offset = 0isize;
     let mut max_offset = 0isize;
     for (&dim, &stride) in dims.iter().zip(strides.iter()) {

@@ -518,6 +518,27 @@ fn gather_compile_rejects_unrepresentable_replay_carry() {
     .unwrap_err();
 
     assert!(matches!(error, StridedError::OffsetOverflow));
+
+    let error = ErasedGatherPlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &[0, usize::MAX],
+        &[1, isize::MAX],
+        &[0, 1],
+        &[1, 1],
+        &[0],
+        &[1],
+        GatherSpec {
+            offset_dims: vec![],
+            collapsed_slice_dims: vec![0, 1],
+            start_index_map: vec![1],
+            index_vector_dim: 1,
+            slice_sizes: vec![1, 1],
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, StridedError::OffsetOverflow));
 }
 
 #[test]

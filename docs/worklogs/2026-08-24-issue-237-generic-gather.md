@@ -240,5 +240,126 @@ Criterion point estimates and confidence intervals:
 The need-before-implementation gate is **PASS**. At medium size, serial generic
 rank 4 is 56.6x and rank 8 is 100.3x slower than the rank-one control, both far
 above 1.0 ms. Rank-8 per-output cost is 2.67x rank 2, exceeding the predeclared
-25% scaling signal. Production implementation may proceed without changing any
-case or gate. Candidate results and final verification remain pending.
+25% scaling signal. Production implementation proceeded without changing any
+case or gate.
+
+## Candidate evidence
+
+Production candidate commit: `d95a387`. The baseline CCD became invalid because
+a sustained unrelated Julia process occupied one sibling above 20%. The
+predeclared protocol permits choosing another valid same-host L3 domain; the
+complete candidate ran on CPUs 9-12 in domain 8-15 after an accepted gate:
+selected cores were 0.0-1.5% busy and the busiest sibling was 19.0%. No other
+timing workload ran concurrently.
+
+| variant | context | size | estimate `[low, high]` |
+|---|---|---:|---:|
+| compact rank 2 | serial | 4,096 | 27.867 us `[27.393, 28.401]` |
+| compact rank 4 | serial | 4,096 | 30.720 us `[29.548, 31.744]` |
+| compact rank 8 | serial | 4,096 | 33.712 us `[32.637, 34.773]` |
+| non-unit rank 2 | serial | 4,096 | 28.444 us `[27.873, 29.148]` |
+| negative rank 2 | serial | 4,096 | 28.679 us `[27.721, 29.544]` |
+| compact rank 2 | max_threads(4) | 4,096 | 27.614 us `[27.255, 28.341]` |
+| compact rank 4 | max_threads(4) | 4,096 | 30.243 us `[29.760, 30.666]` |
+| compact rank 8 | max_threads(4) | 4,096 | 34.068 us `[32.995, 35.676]` |
+| non-unit rank 2 | max_threads(4) | 4,096 | 28.907 us `[27.866, 29.578]` |
+| negative rank 2 | max_threads(4) | 4,096 | 28.348 us `[27.701, 29.091]` |
+| compact rank 2 | serial | 32,768 | 233.65 us `[226.30, 239.17]` |
+| compact rank 4 | serial | 32,768 | 246.07 us `[242.15, 252.75]` |
+| compact rank 8 | serial | 32,768 | 294.42 us `[281.94, 306.25]` |
+| non-unit rank 2 | serial | 32,768 | 223.63 us `[219.22, 227.23]` |
+| negative rank 2 | serial | 32,768 | 225.41 us `[222.00, 228.96]` |
+| compact rank 2 | max_threads(4) | 32,768 | 225.69 us `[221.68, 230.61]` |
+| compact rank 4 | max_threads(4) | 32,768 | 245.96 us `[242.03, 249.51]` |
+| compact rank 8 | max_threads(4) | 32,768 | 286.91 us `[276.73, 299.29]` |
+| non-unit rank 2 | max_threads(4) | 32,768 | 224.20 us `[220.08, 230.53]` |
+| negative rank 2 | max_threads(4) | 32,768 | 227.28 us `[219.68, 231.77]` |
+| compact rank 2 | serial | 262,144 | 1.8166 ms `[1.7647, 1.8604]` |
+| compact rank 4 | serial | 262,144 | 2.0825 ms `[2.0431, 2.1322]` |
+| compact rank 8 | serial | 262,144 | 2.4558 ms `[2.3820, 2.5229]` |
+| non-unit rank 2 | serial | 262,144 | 1.8255 ms `[1.8030, 1.8678]` |
+| negative rank 2 | serial | 262,144 | 1.8131 ms `[1.7850, 1.8544]` |
+| compact rank 2 | max_threads(4) | 262,144 | 547.97 us `[547.62, 548.28]` |
+| compact rank 4 | max_threads(4) | 262,144 | 630.49 us `[630.23, 630.81]` |
+| compact rank 8 | max_threads(4) | 262,144 | 696.52 us `[695.70, 697.57]` |
+| non-unit rank 2 | max_threads(4) | 262,144 | 549.91 us `[549.55, 550.16]` |
+| negative rank 2 | max_threads(4) | 262,144 | 547.38 us `[547.27, 547.53]` |
+| compact rank 2 | serial | 1,048,576 | 7.3620 ms `[7.1240, 7.5266]` |
+| compact rank 4 | serial | 1,048,576 | 8.8040 ms `[8.6655, 8.9074]` |
+| compact rank 8 | serial | 1,048,576 | 9.5136 ms `[9.3448, 9.7056]` |
+| non-unit rank 2 | serial | 1,048,576 | 7.2503 ms `[7.1122, 7.3990]` |
+| negative rank 2 | serial | 1,048,576 | 7.2727 ms `[7.0886, 7.5399]` |
+| compact rank 2 | max_threads(4) | 1,048,576 | 2.1625 ms `[2.1611, 2.1638]` |
+| compact rank 4 | max_threads(4) | 1,048,576 | 2.4755 ms `[2.4740, 2.4772]` |
+| compact rank 8 | max_threads(4) | 1,048,576 | 2.8770 ms `[2.8721, 2.8829]` |
+| non-unit rank 2 | max_threads(4) | 1,048,576 | 2.1878 ms `[2.1869, 2.1892]` |
+| negative rank 2 | max_threads(4) | 1,048,576 | 2.1606 ms `[2.1575, 2.1626]` |
+| rank-one control | serial | 4,096 | 3.9249 us `[3.8439, 4.0174]` |
+| rank-one control | max_threads(4) | 4,096 | 3.9109 us `[3.8486, 3.9521]` |
+| rank-one control | serial | 32,768 | 30.665 us `[30.003, 31.371]` |
+| rank-one control | max_threads(4) | 32,768 | 31.080 us `[30.307, 31.917]` |
+| rank-one control | serial | 262,144 | 241.89 us `[234.20, 256.46]` |
+| rank-one control | max_threads(4) | 262,144 | 120.04 us `[119.96, 120.10]` |
+| rank-one control | serial | 1,048,576 | 1.0278 ms `[1.0008, 1.0502]` |
+| rank-one control | max_threads(4) | 1,048,576 | 449.04 us `[448.84, 449.25]` |
+
+All predeclared performance gates are **PASS**:
+
+- medium serial rank 4: 7.56x faster; rank 8: 11.35x faster;
+- medium four-thread rank 4: 2.65x faster; rank 8: 3.78x faster;
+- medium serial non-unit: 5.71x faster; negative: 5.72x faster;
+- candidate medium rank-8/rank-2 per-output ratio: 1.35, below 1.5;
+- every generic case improved with `p < 0.05`; no generic or rank-one control
+  regressed.
+
+The rank-one controls improved by up to roughly 15% on the candidate CCD,
+showing a host/CCD frequency difference, but the generic improvements are
+57-92% and every primary ratio remains well beyond its gate after that control
+shift.
+
+## Verification and review
+
+Focused verification after implementation:
+
+- default gather/uninitialized integration tests: 79 passed
+- parallel gather/uninitialized/policy tests: 88 passed
+- default and `parallel` `cargo check -p strided-kernel`: pass
+- `cargo fmt --all -- --check`: pass
+- `cargo test --workspace`: 904 passed, 9 ignored
+- `cargo doc --workspace --no-deps`: pass
+- deterministic repository-rules review: pass, no findings
+- repository-rules review script: 83 passed
+
+Local `cargo llvm-cov --workspace --features parallel` ran the complete test
+matrix. The modified `gather_plan.rs` reached 82.95% line coverage, above this
+repository's 80% file threshold. The global checker still reported three
+pre-existing, unmodified files below their configured thresholds:
+`reduce_view.rs` 71.5% < 80%, `static_indexing_plan.rs` 76.3% < 80%, and
+`strided-perm/src/hptt/execute.rs` 57.0% < 65%. They are outside #237; hosted CI
+remains authoritative for the exact PR coverage gate.
+
+A `reviewer-flash` safety/semantic preflight of production candidate `d95a387`
+found no Critical or Important issue and seven Minor observations. Disposition:
+
+- Fixed the zero-dimension span-validation coupling by validating every sibling
+  axis even when total output is zero, and added an overflow regression test.
+  This changes compile-time validation only; timed replay is byte-for-byte
+  unchanged, so the complete candidate benchmark carries forward.
+- Existing INVARIANT/SAFETY comments already state the unchecked replay-delta
+  proof; adding per-element debug span checks would recreate the audited hot-loop
+  cost.
+- The theoretical rank-one `usize`→`isize` and destination-base observations
+  concern the unchanged #236 fast path and remain covered by validated real
+  allocations.
+- Clamped and explicit multi-component performance cases were not added after
+  baseline because the paired protocol forbids changing the declared matrix.
+  Their correctness is covered here; Phase 8's durable benchmark-suite task,
+  already tracked in #213, will add those separate published cases without
+  rewriting this experiment.
+- The different-CCD control shift is disclosed above rather than hidden.
+
+A current-toolchain exploratory `cargo clippy -D warnings` was also run. It is
+not a repository PR gate and reported existing workspace lints across
+`strided-view`/`strided-kernel`; the one new `manual_contains` lint in
+`validate_layout_span` was fixed. Final exact-candidate review and hosted CI
+remain pending.
