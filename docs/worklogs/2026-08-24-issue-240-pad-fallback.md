@@ -183,3 +183,48 @@ Benchmark-only commit `df03ec1` ran the complete baseline on CPUs 1-4 in L3 doma
 | rank1 control | max_threads_4 | large_n1048576 | 128.73 µs `[124.40 µs, 135.89 µs]` |
 
 The need-before-implementation gate is **PASS**. At medium target size, compact rank 2/4/8 serial measured 3.1539/6.6078/13.561 ms; rank 4/8 exceed 1.0 ms and rank 8 is 4.30x rank 2. The non-unit case is 1.56x rank 2. Cases/gates are frozen; production may proceed.
+
+## Candidate implementation and evidence
+
+Production commit `b141365` adds private prepared fill/copy cursor metadata. Valid per-axis source intervals are compiled with checked `i128` ceil/floor arithmetic; checked base deltas, steps, carry resets, and offset spans are prepared once. Initialized/uninitialized and serial/parallel generic replay decode once per range and advance incrementally. Dense fill and contiguous axis-0 copy remain unchanged.
+
+The frozen candidate ran sequentially on CPUs 1-4 with four Rayon workers after a valid L3-domain gate (selected average 7.5%, other-domain-core maximum 0.7%). All 40 generic cells improved with non-overlapping intervals.
+
+| case | context | size | baseline | candidate | speedup | interval-bound speedup |
+|---|---|---:|---:|---:|---:|---:|
+| compact_rank2 | serial | 262144 | 3.1539 ms | 1.2335 ms | 2.56x | 2.39-2.73x |
+| compact_rank4 | serial | 262144 | 6.6078 ms | 1.3668 ms | 4.83x | 4.61-5.06x |
+| compact_rank8 | serial | 262144 | 13.5610 ms | 1.6079 ms | 8.43x | 8.07-8.89x |
+| rank2_negative_crop | serial | 262144 | 3.3040 ms | 1.2749 ms | 2.59x | 2.41-2.82x |
+| rank2_nonunit | serial | 262144 | 4.9075 ms | 2.3353 ms | 2.10x | 1.95-2.28x |
+| compact_rank2 | max_threads_4 | 262144 | 0.5466 ms | 0.4037 ms | 1.35x | 1.34-1.37x |
+| compact_rank4 | max_threads_4 | 262144 | 0.9642 ms | 0.4187 ms | 2.30x | 2.22-2.36x |
+| compact_rank8 | max_threads_4 | 262144 | 1.8034 ms | 0.5151 ms | 3.50x | 3.47-3.54x |
+| rank2_negative_crop | max_threads_4 | 262144 | 0.5461 ms | 0.4010 ms | 1.36x | 1.34-1.39x |
+| rank2_nonunit | max_threads_4 | 262144 | 0.9705 ms | 0.6823 ms | 1.42x | 1.41-1.45x |
+| compact_rank2 | serial | 1048576 | 12.7320 ms | 5.0020 ms | 2.55x | 2.37-2.74x |
+| compact_rank4 | serial | 1048576 | 26.6390 ms | 5.4980 ms | 4.85x | 4.67-5.01x |
+| compact_rank8 | serial | 1048576 | 54.4850 ms | 6.4558 ms | 8.44x | 8.03-8.79x |
+| rank2_negative_crop | serial | 1048576 | 12.7250 ms | 4.8369 ms | 2.63x | 2.50-2.76x |
+| rank2_nonunit | serial | 1048576 | 19.3890 ms | 9.1039 ms | 2.13x | 2.03-2.26x |
+| compact_rank2 | max_threads_4 | 1048576 | 2.0569 ms | 1.4944 ms | 1.38x | 1.37-1.40x |
+| compact_rank4 | max_threads_4 | 1048576 | 3.7116 ms | 1.6353 ms | 2.27x | 2.23-2.32x |
+| compact_rank8 | max_threads_4 | 1048576 | 7.0485 ms | 1.9645 ms | 3.59x | 3.56-3.63x |
+| rank2_negative_crop | max_threads_4 | 1048576 | 2.0578 ms | 1.4749 ms | 1.40x | 1.37-1.42x |
+| rank2_nonunit | max_threads_4 | 1048576 | 3.8132 ms | 2.6143 ms | 1.46x | 1.43-1.49x |
+
+Across all frozen generic cells, estimate speedups were 1.35-9.10x (medium: 1.35-8.43x; large: 1.38-8.44x). The unchanged rank-one control remained stable at medium/large: serial estimates 1.04x/0.97x and four-thread estimates 1.01x/1.05x, with confidence intervals overlapping no change for the only nominal slowdown.
+
+## Verification
+
+- focused initialized/uninitialized default tests: 85 passed
+- focused parallel/static/uninitialized/policy tests: 96 passed
+- rank-8 generic initialized/uninitialized allocation test: zero allocations
+- source-contract tests: 6 passed
+- default workspace: 915 passed, 9 ignored
+- parallel workspace: 989 passed, 9 ignored
+- `cargo check -p strided-kernel --features parallel`: passed
+- deterministic repository-rules review: passed
+- workspace coverage: modified `static_indexing_plan.rs` 81.93%, above the repository 80% threshold. The global script still reports two unchanged baseline deficits (`reduce_view.rs` 71.5% and `hptt/execute.rs` 57.0%).
+
+Exact-final independent review is pending.
