@@ -38,11 +38,13 @@ Tighten existing rule sections rather than adding a new policy section:
    nearby `// INVARIANT:` rationale plus dated worklog/benchmark evidence, or a
    narrowly scoped performance claim with a linked residual issue.
 2. `Performance And Benchmark Discipline` will require work that adds or
-   specializes a fast path, or makes a performance claim, to benchmark at least
-   one case that intentionally misses that fast path and representative rank
-   scaling. A change may instead explicitly scope the claim and link a residual
-   generic-path issue; routine production refactors without a performance claim
-   are not required to add benchmarks solely because they touch kernel code.
+   specializes a fast path to benchmark at least one case that intentionally
+   misses that fast path plus representative rank scaling. Other performance
+   claims must benchmark representative rank scaling and the relevant fallback
+   or layout cases, without inventing a nonexistent fast-path miss. A change may
+   instead explicitly scope the claim and link a residual generic-path issue;
+   routine production refactors without a performance claim are not required to
+   add benchmarks solely because they touch kernel code.
 3. Kernel/permutation source routing will include the performance section.
    Added content matching the concrete terms
    `checked_strided_offset`, `flat_to_multi_index`, `multi_index`,
@@ -93,6 +95,12 @@ begin. The implementation will also fold in its three non-blocking refinements:
   permutation paths so fast-path work outside the current audit files is not a
   blind spot;
 - test the compiled trigger behavior, not merely the prose list.
+
+During parent integration, the first implementation exposed an ambiguity in
+point 2: its original grammar applied the fast-path-miss requirement to every
+performance claim, including operations with no fast path. The revised point 2
+above separates fast-path work from other performance claims. Implementation
+is frozen until `reviewer-flash` reviews this design delta.
 
 Final verification and exact-diff review results will be appended after
 implementation.
