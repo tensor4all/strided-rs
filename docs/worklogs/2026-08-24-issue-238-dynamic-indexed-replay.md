@@ -308,3 +308,38 @@ substituted. After implementation, the entire named-baseline baseline/candidate
 suite will be rerun under the unchanged host protocol; no selective candidate
 row will be promoted. Full attempt-1 and final paired tables will be retained
 in this worklog before PR creation.
+
+## Candidate attempt 2 and design delta
+
+After the approved fusion, candidate commit `c6a8256` completed another full
+96-case named-baseline pair. All generic gates passed: at medium size compact
+slice rank 2/4/8 was 0.47291/0.45819/0.53338 ms and update was
+0.51859/0.50821/0.55401 ms, giving rank ratios 1.128 and 1.068. Every generic
+case improved with `p < 0.05`.
+
+The attempt is nevertheless **FAIL** because unchanged rank-one controls crossed
+the 10% non-regression gate: update serial 4,096 rose from 0.64003 to 0.73246 us
+(+14.4%), and update `max_threads(4)` at 32,768 rose from 5.6335 to 6.3354 us
+(+12.5%). These fast paths branch before generic replay, so the likely source is
+the 256-byte inline `WindowReplay` metadata added to every plan, including
+rank-one plans, which changes plan size/cache behavior. The gate is not relaxed
+and the rows are not excluded.
+
+A second private design delta removes stored replay metadata from
+`DynamicSlicePlan` and `DynamicUpdateSlicePlan`. Compile will invoke
+`WindowReplay::prepare` once and discard the result to validate all spans,
+fusion products, steps, and resets. Generic execution, only after the unchanged
+rank-one fast-path branch, will prepare the same rank-bounded replay state once
+per operation; `AxisVec` remains inline through rank 8, preserving the documented
+no-allocation contract. Parallel execution prepares once before partitioning and
+shares immutable metadata; each worker still performs only one checked range
+start decode. Exact `check_call` layout matching guarantees execution prepares
+the same validated strides and shapes. The per-element loop remains unchanged.
+
+This restores rank-one plan layout and avoids any replay preparation on rank-one
+execution while retaining generic axis fusion. It changes O(rank) operation
+setup only, not the tensor-sized loop, and introduces no public API or heap
+allocation. Implementation is blocked until `reviewer-flash` approves this
+design delta. A fresh complete named-baseline pair under the unchanged protocol
+will determine the final result; failure of any control or generic gate blocks
+promotion again.
