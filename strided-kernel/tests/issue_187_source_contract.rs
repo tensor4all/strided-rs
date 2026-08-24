@@ -3,7 +3,7 @@ fn erased_axis_reduction_uses_prepared_incremental_cursors() {
     let source = include_str!("../src/erased.rs");
     assert!(source.contains("ReduceOuterAxis"));
     assert!(source.contains("ReduceInnerAxis"));
-    assert!(source.contains("checked_reduce_layout_span"));
+    assert!(source.contains("check_reduce_layout_offset_arithmetic"));
     assert!(source.contains("checked_reduce_reset"));
     assert!(source.contains("compress_reduce_outer_axes"));
     assert!(source.contains("compress_reduce_inner_axes"));

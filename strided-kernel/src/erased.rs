@@ -1025,9 +1025,9 @@ impl ErasedReducePlan {
             return Err(StridedError::StrideLengthMismatch);
         }
         checked_total_len(src_dims)?;
-        checked_reduce_layout_span(src_dims, src_strides)?;
+        check_reduce_layout_offset_arithmetic(src_dims, src_strides)?;
         let dest_total = checked_total_len(dest_dims)?;
-        checked_reduce_layout_span(dest_dims, dest_strides)?;
+        check_reduce_layout_offset_arithmetic(dest_dims, dest_strides)?;
         if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
@@ -3810,7 +3810,7 @@ impl<'a> ReduceInnerCursor<'a> {
     }
 }
 
-fn checked_reduce_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
+fn check_reduce_layout_offset_arithmetic(dims: &[usize], strides: &[isize]) -> Result<()> {
     if dims.len() != strides.len() {
         return Err(StridedError::StrideLengthMismatch);
     }
