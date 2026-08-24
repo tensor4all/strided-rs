@@ -337,9 +337,22 @@ start decode. Exact `check_call` layout matching guarantees execution prepares
 the same validated strides and shapes. The per-element loop remains unchanged.
 
 This restores rank-one plan layout and avoids any replay preparation on rank-one
-execution while retaining generic axis fusion. It changes O(rank) operation
-setup only, not the tensor-sized loop, and introduces no public API or heap
-allocation. Implementation is blocked until `reviewer-flash` approves this
+execution while retaining generic axis fusion. Under the benchmarked `parallel`
+feature, temporary rank-bounded metadata uses the existing inline `SmallVec`;
+under the default non-parallel feature, the plan retains compile-time `Vec`
+metadata so execution preserves its existing no-allocation-through-rank-8
+contract. It changes O(rank) operation setup only, not the tensor-sized loop,
+and introduces no public API. Implementation is blocked until `reviewer-flash` approves this
 design delta. A fresh complete named-baseline pair under the unchanged protocol
 will determine the final result; failure of any control or generic gate blocks
 promotion again.
+
+`reviewer-flash` reviewed exact design-delta commit `490a7a3` and returned
+**Correct-to-merge**. It also confirmed that replay metadata preparation is
+compile-guaranteed for exact checked layouts. The pre-existing dynamic-update
+ordering can still copy the operand before a pathological runtime-base offset
+error; this task neither introduces nor changes that contract; it requires a
+pathological isize-magnitude stride/base combination and is not part of the
+replay-performance change. The implementation follows the feature-aware
+storage disposition above and keeps all rank-one execution branches free of
+replay preparation.

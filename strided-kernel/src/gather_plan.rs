@@ -231,6 +231,7 @@ pub struct DynamicSlicePlan {
     dest_strides: AxisVec<isize>,
     slice_sizes: AxisVec<usize>,
     total: usize,
+    #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
 }
 
@@ -251,6 +252,7 @@ pub struct DynamicUpdateSlicePlan {
     dest_strides: AxisVec<isize>,
     total: usize,
     copy_plan: CopyPlan,
+    #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
 }
 
@@ -852,6 +854,9 @@ impl DynamicSlicePlan {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, slice_sizes)?;
+        #[cfg(feature = "parallel")]
+        WindowReplay::compile(slice_sizes, operand_strides, dest_strides)?;
+        #[cfg(not(feature = "parallel"))]
         let replay = WindowReplay::compile(slice_sizes, operand_strides, dest_strides)?;
 
         Ok(Self {
@@ -863,6 +868,7 @@ impl DynamicSlicePlan {
             dest_strides: dest_strides.into(),
             slice_sizes: slice_sizes.into(),
             total,
+            #[cfg(not(feature = "parallel"))]
             replay,
         })
     }
@@ -913,10 +919,15 @@ impl DynamicSlicePlan {
             return self.execute_rank_one_contiguous(dest, operand, starts);
         }
         #[cfg(feature = "parallel")]
+        let replay =
+            WindowReplay::compile(&self.slice_sizes, &self.operand_strides, &self.dest_strides)?;
+        #[cfg(not(feature = "parallel"))]
+        let replay = &self.replay;
+        #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.total);
             if nthreads > 1 {
-                return self.execute_parallel(dest, operand, starts, nthreads);
+                return self.execute_parallel(dest, operand, starts, nthreads, &replay);
             }
         }
 
@@ -930,7 +941,7 @@ impl DynamicSlicePlan {
         )?;
         let source_base =
             checked_strided_offset(operand.offset(), &self.operand_strides, clamped_starts)?;
-        let mut state = self.replay.decode(0, source_base, dest.offset())?;
+        let mut state = replay.decode(0, source_base, dest.offset())?;
         let operand_data = operand.data();
 
         // INVARIANT: compile validated the full operand/destination spans and the
@@ -942,7 +953,7 @@ impl DynamicSlicePlan {
             // SAFETY: the invariant above proves this logical destination offset
             // is in-bounds, and the output layout is injective.
             unsafe { dest.write_at(state.dest_offset, value) };
-            self.replay.advance(&mut state);
+            replay.advance(&mut state);
         }
         Ok(())
     }
@@ -999,6 +1010,7 @@ impl DynamicSlicePlan {
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
         nthreads: usize,
+        replay: &WindowReplay,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1023,7 +1035,7 @@ impl DynamicSlicePlan {
             0..self.total,
             nthreads,
             &|range| {
-                let mut state = self.replay.decode(range.start, source_base, dest_base)?;
+                let mut state = replay.decode(range.start, source_base, dest_base)?;
                 let operand_ptr = operand_ptr.as_const();
                 let dest_ptr = dest_ptr.as_ptr();
 
@@ -1038,7 +1050,7 @@ impl DynamicSlicePlan {
                             .offset(state.dest_offset)
                             .write(operand_ptr.offset(state.source_offset).read());
                     }
-                    self.replay.advance(&mut state);
+                    replay.advance(&mut state);
                 }
                 Ok(())
             },
@@ -1116,6 +1128,9 @@ impl DynamicUpdateSlicePlan {
         }
         validate_window_sizes(operand_dims, update_dims)?;
         let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
+        #[cfg(feature = "parallel")]
+        WindowReplay::compile(update_dims, update_strides, dest_strides)?;
+        #[cfg(not(feature = "parallel"))]
         let replay = WindowReplay::compile(update_dims, update_strides, dest_strides)?;
 
         Ok(Self {
@@ -1129,6 +1144,7 @@ impl DynamicUpdateSlicePlan {
             dest_strides: dest_strides.into(),
             total,
             copy_plan,
+            #[cfg(not(feature = "parallel"))]
             replay,
         })
     }
@@ -1188,10 +1204,15 @@ impl DynamicUpdateSlicePlan {
             return self.execute_rank_one_contiguous(dest, update, starts);
         }
         #[cfg(feature = "parallel")]
+        let replay =
+            WindowReplay::compile(&self.update_dims, &self.update_strides, &self.dest_strides)?;
+        #[cfg(not(feature = "parallel"))]
+        let replay = &self.replay;
+        #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.total);
             if nthreads > 1 {
-                return self.execute_update_parallel(dest, update, starts, nthreads);
+                return self.execute_update_parallel(dest, update, starts, nthreads, &replay);
             }
         }
 
@@ -1205,7 +1226,7 @@ impl DynamicUpdateSlicePlan {
         )?;
         let source_base = update.offset();
         let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, &clamped_starts)?;
-        let mut state = self.replay.decode(0, source_base, dest_base)?;
+        let mut state = replay.decode(0, source_base, dest_base)?;
         let update_data = update.data();
 
         // INVARIANT: the initial CopyPlan has completed before this replay;
@@ -1217,7 +1238,7 @@ impl DynamicUpdateSlicePlan {
             // SAFETY: the copied, injective destination layout proves this write
             // is initialized and in-bounds.
             unsafe { dest.write_at(state.dest_offset, value) };
-            self.replay.advance(&mut state);
+            replay.advance(&mut state);
         }
         Ok(())
     }
@@ -1275,6 +1296,7 @@ impl DynamicUpdateSlicePlan {
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
         nthreads: usize,
+        replay: &WindowReplay,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1298,7 +1320,7 @@ impl DynamicUpdateSlicePlan {
             0..self.total,
             nthreads,
             &|range| {
-                let mut state = self.replay.decode(range.start, source_base, dest_base)?;
+                let mut state = replay.decode(range.start, source_base, dest_base)?;
                 let update_ptr = update_ptr.as_const();
                 let dest_ptr = dest_ptr.as_ptr();
 
@@ -1313,7 +1335,7 @@ impl DynamicUpdateSlicePlan {
                             .offset(state.dest_offset)
                             .write(update_ptr.offset(state.source_offset).read());
                     }
-                    self.replay.advance(&mut state);
+                    replay.advance(&mut state);
                 }
                 Ok(())
             },
