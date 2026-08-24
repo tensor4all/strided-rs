@@ -161,15 +161,20 @@ impl WindowReplay {
 
     #[inline]
     fn advance(&self, state: &mut WindowReplayState) {
-        for (axis, replay_axis) in self.axes.iter().enumerate() {
-            let coord = state.coords[axis];
-            if coord < self.shape[axis] - 1 {
-                state.coords[axis] = coord + 1;
+        for ((coord, &dim), replay_axis) in state
+            .coords
+            .iter_mut()
+            .zip(self.shape.iter())
+            .zip(self.axes.iter())
+        {
+            let next = *coord + 1;
+            if next < dim {
+                *coord = next;
                 state.source_offset += replay_axis.source_step;
                 state.dest_offset += replay_axis.dest_step;
                 return;
             }
-            state.coords[axis] = 0;
+            *coord = 0;
             state.source_offset += replay_axis.source_reset;
             state.dest_offset += replay_axis.dest_reset;
         }
