@@ -26,7 +26,9 @@ control. Generic variants target approximately N destination values and force
 the fallback:
 
 - compact rank 2, 4, and 8 with one interior element on axis 0;
-- rank-2 negative low-edge cropping with compensating positive high edge;
+- rank-2 negative low-edge cropping on axis 1 with compensating positive high
+  edge, while retaining axis-0 interior padding 1 so the contiguous axis-0 run
+  is provably unavailable;
 - rank-2 non-unit source/destination layouts.
 
 For compact rank `r`, the first `r-1` operand axes are extent 2, axis 0 uses
@@ -85,9 +87,13 @@ private generic replay description to `PadPlan`:
    affine padded positions are in bounds.
 
 Compile converts each axis's affine mapping
-`out = edge_low + input * (interior + 1)` into a checked valid input interval.
-Because the step is positive, the Cartesian product of those intervals is
-exactly the writable source subset. Compile precomputes checked source and
+`out = edge_low + input * (interior + 1)` into a checked half-open valid input
+interval. With positive `step`, compute the lower coordinate using checked i128
+ceil-division of `-edge_low / step`, the upper coordinate using checked i128
+floor-division of `(dest_dim - 1 - edge_low) / step`, then clamp both to
+`[0, input_extent]`. Because the step is positive, the Cartesian product of
+those intervals is exactly the writable source subset. The empty axis set
+(rank 0) has copy total 1; any actual empty interval makes copy total 0. Compile precomputes checked source and
 destination base deltas, copy shape, steps, and wrap resets. Fully cropped axes
 produce an empty copy domain. This removes per-element rank scans and avoids
 forming out-of-range destination offsets entirely.
@@ -113,5 +119,12 @@ candidate suite and complete repository gates, and obtain an exact-final
 
 ## Gate status
 
-Design review, benchmark implementation, baseline, candidate, and verification
-are pending.
+`reviewer-flash` reviewed exact design commit `b30145f` with high thinking and
+a read-only boundary. Verdict: **Correct-to-merge** conditional on the benchmark
+fallback and interval clarifications now incorporated above. The benchmark
+negative-crop recipe retains axis-0 interior padding, and a private unit test
+must assert that all benchmark recipes leave `contiguous_axis0_run` unset.
+Generic non-dense fill performance is intentionally not claimed by the timing
+matrix; it remains a correctness/validity target.
+
+Benchmark implementation, baseline, candidate, and verification are pending.
