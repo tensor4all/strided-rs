@@ -118,10 +118,36 @@ impl WindowReplay {
     fn compile(shape: &[usize], source_strides: &[isize], dest_strides: &[isize]) -> Result<Self> {
         validate_layout_span(shape, source_strides)?;
         validate_layout_span(shape, dest_strides)?;
-        let mut axes = AxisVec::with_capacity(shape.len());
+        let mut fused_shape: AxisVec<usize> = AxisVec::with_capacity(shape.len());
+        let mut axes: AxisVec<WindowReplayAxis> = AxisVec::with_capacity(shape.len());
         for (axis, &dim) in shape.iter().enumerate() {
             let source_step = source_strides[axis];
             let dest_step = dest_strides[axis];
+            if let Some(previous_axis) = fused_shape.len().checked_sub(1) {
+                let previous_extent = fused_shape[previous_axis];
+                let previous_extent =
+                    isize::try_from(previous_extent).map_err(|_| StridedError::OffsetOverflow)?;
+                let expected_source = axes[previous_axis]
+                    .source_step
+                    .checked_mul(previous_extent)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                let expected_dest = axes[previous_axis]
+                    .dest_step
+                    .checked_mul(previous_extent)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                if source_step == expected_source && dest_step == expected_dest {
+                    let fused_extent = fused_shape[previous_axis]
+                        .checked_mul(dim)
+                        .ok_or(StridedError::OffsetOverflow)?;
+                    fused_shape[previous_axis] = fused_extent;
+                    axes[previous_axis].source_reset =
+                        checked_replay_reset(fused_extent, axes[previous_axis].source_step)?;
+                    axes[previous_axis].dest_reset =
+                        checked_replay_reset(fused_extent, axes[previous_axis].dest_step)?;
+                    continue;
+                }
+            }
+            fused_shape.push(dim);
             axes.push(WindowReplayAxis {
                 source_step,
                 source_reset: checked_replay_reset(dim, source_step)?,
@@ -130,7 +156,7 @@ impl WindowReplay {
             });
         }
         Ok(Self {
-            shape: shape.into(),
+            shape: fused_shape,
             axes,
         })
     }
@@ -1898,7 +1924,18 @@ impl CoordScratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan};
+    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, WindowReplay};
+
+    #[test]
+    fn window_replay_fuses_only_bilaterally_contiguous_axes() {
+        let compact = WindowReplay::compile(&[2, 3, 4], &[1, 2, 6], &[1, 2, 6]).unwrap();
+        assert_eq!(&compact.shape[..], &[24]);
+        assert_eq!(compact.axes.len(), 1);
+
+        let negative_source = WindowReplay::compile(&[2, 3], &[1, -2], &[1, 2]).unwrap();
+        assert_eq!(&negative_source.shape[..], &[2, 3]);
+        assert_eq!(negative_source.axes.len(), 2);
+    }
 
     #[test]
     fn dynamic_slice_fast_path_is_limited_to_rank_one_contiguous_layouts() {
