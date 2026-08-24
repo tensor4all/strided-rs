@@ -116,11 +116,18 @@ Verification before the exact candidate commit:
 - `python3 -m py_compile scripts/repository-rules-review.py scripts/test-repository-rules-review.py`
 - `git diff --check`
 
-Final deterministic repository-rules review, hosted CI, and exact-diff
-`reviewer-flash` verdict will be recorded after the candidate is committed.
-The exact-diff review noted that anchored `multi_index` can over-route unrelated
-names such as `test_multi_index_2d`; this is accepted because routing only
-supplies applicable rules to the reviewer, while the diff-scoped prompt and
-warn cap prevent it from creating a violation by itself. Removing it would add
-a blind spot for renamed coordinate-reconstruction helpers without improving
-correctness.
+Candidate verification also passed:
+
+- `cargo fmt --all -- --check`
+- `cargo test --workspace`: 899 passed, 9 ignored
+- deterministic repository-rules review: pass, no findings
+- exact-diff `reviewer-flash` review at `ee6d980`: **Correct-to-merge**, no
+  Critical or Important findings
+
+Hosted CI remains the final merge gate. The exact-diff review noted that a
+standalone `multi_index` identifier in an
+unrelated helper or comment can over-route that diff; this is accepted because
+routing only supplies applicable rules to the reviewer, while the diff-scoped
+prompt and warn cap prevent it from creating a violation by itself. Removing it
+would add a blind spot for renamed coordinate-reconstruction helpers without
+improving correctness.
