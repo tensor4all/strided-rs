@@ -154,6 +154,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
                 "Layout And Copy Semantics",
                 "Materialization And Copies",
                 "Unsafe And Fast-Path Boundaries",
+                "Performance And Benchmark Discipline",
             }
         ),
     ),
@@ -165,6 +166,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
                 "Materialization And Copies",
                 "Layout And Copy Semantics",
                 "CPU Threading Contract",
+                "Performance And Benchmark Discipline",
             }
         ),
     ),
@@ -175,6 +177,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
                 "Unsafe And Fast-Path Boundaries",
                 "Layout And Copy Semantics",
                 "CPU Threading Contract",
+                "Performance And Benchmark Discipline",
             }
         ),
     ),
@@ -225,6 +228,18 @@ CONTENT_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     (
         re.compile(r"\bvec!\[|to_vec\(\)|collect::<Vec|materiali[sz]e"),
         frozenset({"Materialization And Copies"}),
+    ),
+    (
+        re.compile(
+            r"\b(?:checked_strided_offset|flat_to_multi_index|multi_index|"
+            r"advance_col_major_index|fill_col_major_index)\b"
+        ),
+        frozenset(
+            {
+                "Layout And Copy Semantics",
+                "Performance And Benchmark Discipline",
+            }
+        ),
     ),
     (
         re.compile(r"col_major|row_major|\bstrides?\b|linear_index"),

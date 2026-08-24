@@ -99,8 +99,22 @@ begin. The implementation will also fold in its three non-blocking refinements:
 During parent integration, the first implementation exposed an ambiguity in
 point 2: its original grammar applied the fast-path-miss requirement to every
 performance claim, including operations with no fast path. The revised point 2
-above separates fast-path work from other performance claims. Implementation
-is frozen until `reviewer-flash` reviews this design delta.
+above separates fast-path work from other performance claims. `reviewer-flash`
+reviewed design-delta commit `f9ac6ee` and returned **Correct-to-merge**, with
+the condition that the revised grammar be propagated to both the rule and
+prompt before final review. The parent applied that correction before resuming
+verification.
 
-Final verification and exact-diff review results will be appended after
-implementation.
+Implementation was delegated to `luna-implementer` with write ownership limited
+to the four rule/review files named in the design. The parent reviewed the full
+diff and additionally changed the prompt-presence test to normalize whitespace
+instead of depending on Markdown line wrapping.
+
+Verification before the exact candidate commit:
+
+- `python3 scripts/test-repository-rules-review.py`: 83 passed
+- `python3 -m py_compile scripts/repository-rules-review.py scripts/test-repository-rules-review.py`
+- `git diff --check`
+
+Final deterministic repository-rules review, hosted CI, and exact-diff
+`reviewer-flash` verdict will be recorded after the candidate is committed.

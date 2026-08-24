@@ -38,6 +38,17 @@ the rules that still apply.
   because downstream callers may break.
 - Do not report private helpers as dead or unused code. The supplied diff chunk
   may omit call sites, and Rust/clippy checks are the authority for unused code.
+- For nested loops, identify loop multiplicity and distinguish per-element
+  work from compile/setup work and one-time serial, worker-range, or
+  traversal-block decoding. Check that static layout mapping in element-scaled loops uses
+  incremental offsets or equivalent precomputed state; data-dependent index
+  reads are not themselves a violation.
+- For fast-path specializations, check both generic fast-path-miss coverage and
+  representative rank scaling. For other performance claims, check
+  representative rank scaling and relevant fallback or layout cases without
+  requiring a nonexistent fast-path miss. Missing benchmark evidence may be at
+  most a `warn` for a routine non-performance kernel refactor that makes no
+  performance claim and does not add or specialize a fast path.
 - Hidden doctest lines that start with `#` are part of the compiled example.
   Do not report use of `?` in a doctest when a hidden `# Ok::<..., Error>(())`
   or equivalent result tail is present.

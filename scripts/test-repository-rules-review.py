@@ -245,6 +245,43 @@ def test_select_rule_sections_routes_view_paths() -> None:
     sections = mod.select_rule_sections(["strided-view/src/view.rs"])
     assert "Layout And Copy Semantics" in sections
     assert "Materialization And Copies" in sections
+    assert "Performance And Benchmark Discipline" in sections
+
+
+def test_select_rule_sections_routes_kernel_and_perm_paths_to_performance() -> None:
+    mod = load_module()
+    for path in (
+        "strided-kernel/src/map.rs",
+        "strided-perm/src/hptt/execute.rs",
+    ):
+        assert "Performance And Benchmark Discipline" in mod.select_rule_sections(
+            [path]
+        ), path
+
+
+def test_select_rule_sections_routes_each_index_replay_trigger() -> None:
+    mod = load_module()
+    path = "notes.txt"
+    terms = (
+        "checked_strided_offset",
+        "flat_to_multi_index",
+        "multi_index",
+        "advance_col_major_index",
+        "fill_col_major_index",
+    )
+    for term in terms:
+        sections = mod.select_rule_sections([path], {path: [(1, f"call {term}()")]})
+        assert "Layout And Copy Semantics" in sections, term
+        assert "Performance And Benchmark Discipline" in sections, term
+
+
+def test_select_rule_sections_ignores_generic_decode_and_offset_noise() -> None:
+    mod = load_module()
+    path = "notes.txt"
+    sections = mod.select_rule_sections(
+        [path], {path: [(1, "decode(offset); generic_index += value;")]}
+    )
+    assert sections == ["Public Boundary Safety", "Public Surface Discipline"]
 
 
 def test_select_rule_sections_routes_bench_paths() -> None:
@@ -1072,6 +1109,24 @@ def test_prompt_file_exists_and_requires_json_only() -> None:
     text = mod.PROMPT_PATH.read_text(encoding="utf-8")
     assert "JSON only" in text
     assert "untrusted data" in text
+
+
+def test_prompt_scopes_hot_loop_and_benchmark_review() -> None:
+    mod = load_module()
+    text = " ".join(mod.PROMPT_PATH.read_text(encoding="utf-8").split())
+    for phrase in (
+        "loop multiplicity",
+        "worker-range",
+        "traversal-block decoding",
+        "per-element",
+        "generic fast-path-miss coverage",
+        "representative rank scaling",
+        "relevant fallback or layout cases",
+        "without requiring a nonexistent fast-path miss",
+        "at most a `warn`",
+        "routine non-performance kernel",
+    ):
+        assert phrase in text, phrase
 
 
 def test_rules_file_documents_einsum_maintenance_ownership() -> None:
