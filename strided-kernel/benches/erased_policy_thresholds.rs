@@ -136,6 +136,113 @@ fn bench_axis_reduce(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Clone, Copy)]
+enum ReduceLayoutVariant {
+    CompactSingle(usize),
+    CompactMulti(usize),
+    NonunitRank4,
+    NegativeRank4,
+}
+
+impl ReduceLayoutVariant {
+    fn label(self) -> String {
+        match self {
+            Self::CompactSingle(rank) => format!("compact_single_rank{rank}"),
+            Self::CompactMulti(rank) => format!("compact_multi_rank{rank}"),
+            Self::NonunitRank4 => "rank4_nonunit_source".to_string(),
+            Self::NegativeRank4 => "rank4_negative_source".to_string(),
+        }
+    }
+}
+
+fn bench_erased_reduce_variant<M: Measurement>(
+    group: &mut BenchmarkGroup<'_, M>,
+    case: BenchCase,
+    variant: ReduceLayoutVariant,
+) {
+    let (rank, reduce_axes) = match variant {
+        ReduceLayoutVariant::CompactSingle(rank) => (rank, vec![0]),
+        ReduceLayoutVariant::CompactMulti(rank) => (rank, (0..rank - 1).collect()),
+        ReduceLayoutVariant::NonunitRank4 | ReduceLayoutVariant::NegativeRank4 => (4, vec![0]),
+    };
+    let mut src_dims = vec![2; rank - 1];
+    src_dims.push(case.len / (1usize << (rank - 1)));
+    let src_strides = match variant {
+        ReduceLayoutVariant::CompactSingle(_) | ReduceLayoutVariant::CompactMulti(_) => {
+            col_major_strides(&src_dims)
+        }
+        ReduceLayoutVariant::NonunitRank4 => vec![2, 4, 8, 16],
+        ReduceLayoutVariant::NegativeRank4 => vec![1, 2, 4, -8],
+    };
+    let kept_axes: Vec<_> = (0..rank)
+        .filter(|axis| !reduce_axes.contains(axis))
+        .collect();
+    let dest_dims: Vec<_> = kept_axes.iter().map(|&axis| src_dims[axis]).collect();
+    let dest_strides = col_major_strides(&dest_dims);
+    let source_offset = match variant {
+        ReduceLayoutVariant::NegativeRank4 => 8 * (src_dims[3] - 1) as isize,
+        _ => 0,
+    };
+    let source_len = match variant {
+        ReduceLayoutVariant::CompactSingle(_) | ReduceLayoutVariant::CompactMulti(_) => case.len,
+        ReduceLayoutVariant::NonunitRank4 => {
+            src_dims
+                .iter()
+                .zip(src_strides.iter())
+                .map(|(&dim, &stride)| (dim - 1) * stride as usize)
+                .sum::<usize>()
+                + 1
+        }
+        ReduceLayoutVariant::NegativeRank4 => case.len,
+    };
+    let input = patterned_f64(source_len);
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &reduce_axes,
+    )
+    .unwrap();
+    let source =
+        ErasedRawStridedRef::from_slice(&input, &src_dims, &src_strides, source_offset).unwrap();
+    let mut output = vec![0.0f64; dest_dims.iter().product()];
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+    let ctx = context(case);
+    let id = BenchmarkId::new(
+        format!("{}_{}", variant.label(), context_label(case)),
+        format!("{}_n{}", case.label, case.len),
+    );
+
+    group.bench_function(id, |bencher| {
+        bencher.iter(|| {
+            plan.execute(&ctx, &mut dest, &source).unwrap();
+            black_box(&mut dest);
+        });
+    });
+}
+
+fn bench_erased_axis_reduce_generic_rank_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_axis_reduce_generic_rank_layout");
+    for case in profile_cases() {
+        for variant in [
+            ReduceLayoutVariant::CompactSingle(2),
+            ReduceLayoutVariant::CompactSingle(4),
+            ReduceLayoutVariant::CompactSingle(8),
+            ReduceLayoutVariant::CompactMulti(4),
+            ReduceLayoutVariant::CompactMulti(8),
+            ReduceLayoutVariant::NonunitRank4,
+            ReduceLayoutVariant::NegativeRank4,
+        ] {
+            bench_erased_reduce_variant(&mut group, case, variant);
+        }
+    }
+    group.finish();
+}
+
 fn bench_gather_take(c: &mut Criterion) {
     let mut group = c.benchmark_group("erased_gather_take");
     for case in profile_cases() {
@@ -719,6 +826,7 @@ criterion_group! {
         .measurement_time(Duration::from_secs(1));
     targets =
         bench_axis_reduce,
+        bench_erased_axis_reduce_generic_rank_layout,
         bench_gather_take,
         bench_erased_gather_generic_rank_layout,
         bench_dynamic_slice,
