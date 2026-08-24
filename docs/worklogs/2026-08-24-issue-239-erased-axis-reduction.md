@@ -101,9 +101,9 @@ Extend only private `ReduceLayout::Axes` metadata with two prepared cursors:
 
 Compile maps kept axes in source order and reduced axes in the caller-supplied
 order, validates signed source/destination spans, and precomputes checked
-step/reset deltas. Adjacent axes may be compressed only when stride/extent
-relations prove the same column-major visit order; otherwise they remain
-separate. This is metadata compression, not a separate execution fast path.
+step/reset deltas. The initial implementation will not compress adjacent axes;
+that optional metadata optimization is deferred unless a frozen candidate gate
+fails and a separately reviewed design delta proves identical visit order.
 
 Serial execution decodes the outer cursor once. Parallel execution decodes once
 per destination worker range. For each output, reduction starts at the current
@@ -114,8 +114,10 @@ the fixed operation identity without forming a source pointer. Rank-0 and
 all-axes reductions preserve existing behavior.
 
 Unchecked hot-loop arithmetic is permitted only with concrete nearby
-`// INVARIANT:` and `// SAFETY:` proofs tied to compile span/delta validation,
-validated raw descriptors, and exact plan-layout checks. Keep full reductions,
+`// INVARIANT:` and `// SAFETY:` proofs naming the complete three-link chain:
+(1) compile-time checked source/destination spans and checked step/reset deltas,
+including `-(extent-1)*stride`; (2) execute-time raw descriptor/pointer bounds
+validation; and (3) exact plan-layout equality before dispatch. Keep full reductions,
 typed `reduce_view`, public enums/APIs, accumulation lanes/order, and threading
 threshold unchanged. Use existing rank-bounded scratch to preserve
 allocation-free execution through rank 8; do not introduce a generic cross-plan
@@ -130,5 +132,12 @@ exact-final-diff `reviewer-flash` verdict before PR creation.
 
 ## Gate status
 
-Design review, benchmark implementation, baseline, candidate, and verification
-are pending.
+`reviewer-flash` reviewed exact design commit `a7880dd` with high thinking and
+a read-only boundary. Verdict: **Correct-to-merge**; benchmark implementation
+may proceed. The safety-proof chain and no-compression initial sequencing are
+now explicit above. The existing rank-2 control uses the same generic axes
+replay and may improve; it remains a valid non-regression control because its
+point estimate may improve but must not regress by more than 10%.
+
+Benchmark implementation, baseline, candidate, and final verification are
+pending.
