@@ -96,4 +96,4 @@ The first candidate command accidentally reused the baseline worktree binary thr
 - deterministic repository-rules preview: passed
 - modified `erased.rs` coverage: 88.34% (threshold 80%); the only global package failure remains the unchanged `reduce_view.rs` baseline deficit
 
-Exact-final independent review is pending.
+Exact-final review of candidate `92fdf0e5` by read-only `reviewer-flash` (high) returned **Correct-to-merge** with no blocking findings. It confirmed cursor/overflow/visit-order safety, unchanged fallback/API/threading/validation order, full correctness/allocation coverage, and transparent benchmark handling. It noted the marginal rank-2 interval bound and cross-core Add-control rerun as nonblocking evidence-quality cautions.
