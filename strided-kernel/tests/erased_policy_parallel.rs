@@ -479,6 +479,44 @@ fn large_erased_pad_matches_serial() {
 }
 
 #[test]
+fn generic_pad_matches_serial_at_threshold_boundaries() {
+    for len in [(1usize << 15) - 1, 1usize << 15, (1usize << 15) + 1] {
+        let dims = [1usize, len];
+        let strides = [1isize, 1];
+        let edge = [0i64, 0];
+        let interior = [1i64, 0];
+        let fill = [-7i32];
+        let operand = (0..len).map(|index| index as i32).collect::<Vec<_>>();
+        let plan = ErasedPadPlan::compile(
+            KernelDType::I32,
+            &dims,
+            &strides,
+            &dims,
+            &strides,
+            &edge,
+            &edge,
+            &interior,
+        )
+        .unwrap();
+        let run = |ctx: ExecContext| {
+            let operand_ref =
+                ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+            let mut output = vec![0i32; len];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
+            plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+                .unwrap();
+            output
+        };
+        assert_eq!(
+            run(bounded_context()),
+            run(ExecContext::serial()),
+            "len={len}"
+        );
+    }
+}
+
+#[test]
 fn large_erased_scatter_matches_serial_with_overlaps() {
     let dims = [LARGE_LEN];
     let strides = [1isize];
