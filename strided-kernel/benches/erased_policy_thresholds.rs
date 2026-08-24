@@ -212,7 +212,10 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
             let src =
                 RawStridedRef::new(&layout.data, &layout.dims, &layout.strides, layout.offset)
                     .unwrap();
-            assert_eq!(current_any_scan(&src), incremental_any_scan(&src));
+            assert_eq!(
+                current_any_scan(&src).unwrap(),
+                incremental_any_scan(&src).unwrap()
+            );
             for (algorithm, scan) in [
                 (
                     "current_scan",
