@@ -3401,41 +3401,46 @@ where
 {
     let mut outer =
         ReduceOuterCursor::decode(0, source_offset_base, dest_offset_base, layout.outer_axes)?;
-    let mut reusable_inner = (layout.inner_axes.len() > RAW_FUSED_RANK_LIMIT)
-        .then(|| ReduceInnerCursor::new(source_offset_base, layout.inner_axes));
-
-    for output in 0..layout.dest_total {
+    // INVARIANT: (1) compile_axes checked signed source/destination spans and
+    // every cursor step/reset, including -(extent-1)*stride; (2) raw input and
+    // output descriptors validated every reachable offset; (3) execute checked
+    // exact plan-layout equality before dispatch.
+    let reduce_inner = |inner: &mut ReduceInnerCursor<'_>| {
         let mut acc = reduce_identity(op);
-        let mut inline_inner;
-        let inner = match &mut reusable_inner {
-            Some(inner) => {
-                inner.reset(outer.source_offset);
-                inner
-            }
-            None => {
-                inline_inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
-                &mut inline_inner
-            }
-        };
-        // INVARIANT: (1) compile_axes checked signed source/destination spans and
-        // every cursor step/reset, including -(extent-1)*stride; (2) raw input
-        // and output descriptors validated every reachable offset; (3) execute
-        // checked exact plan-layout equality before dispatch.
-        // SAFETY: the three-link layout invariant above proves each source
-        // cursor offset is within `source_data`.
         for value_index in 0..layout.reduce_total {
+            // SAFETY: the three-link layout invariant above proves each source
+            // cursor offset is within `source_data`.
             let value = unsafe { *source_data.as_ptr().offset(inner.source_offset) };
             acc = reduce_values(op, acc, reduce_map_value(op, value));
             if value_index + 1 < layout.reduce_total {
                 inner.advance();
             }
         }
+        acc
+    };
 
-        // SAFETY: the three-link layout invariant above proves the destination
-        // cursor offset is an in-bounds logical output offset.
-        unsafe { dest.write_at(outer.dest_offset, acc) };
-        if output + 1 < layout.dest_total {
-            outer.advance();
+    if layout.inner_axes.len() <= RAW_FUSED_RANK_LIMIT {
+        for output in 0..layout.dest_total {
+            let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+            let acc = reduce_inner(&mut inner);
+            // SAFETY: the three-link layout invariant above proves the destination
+            // cursor offset is an in-bounds logical output offset.
+            unsafe { dest.write_at(outer.dest_offset, acc) };
+            if output + 1 < layout.dest_total {
+                outer.advance();
+            }
+        }
+    } else {
+        let mut inner = ReduceInnerCursor::new(source_offset_base, layout.inner_axes);
+        for output in 0..layout.dest_total {
+            inner.reset(outer.source_offset);
+            let acc = reduce_inner(&mut inner);
+            // SAFETY: the three-link layout invariant above proves the destination
+            // cursor offset is an in-bounds logical output offset.
+            unsafe { dest.write_at(outer.dest_offset, acc) };
+            if output + 1 < layout.dest_total {
+                outer.advance();
+            }
         }
     }
     Ok(())
@@ -3561,43 +3566,46 @@ where
             )?;
             let dest_ptr = dest_ptr.as_ptr();
             let source_ptr = source_ptr.as_const();
-            let mut reusable_inner = (layout.inner_axes.len() > RAW_FUSED_RANK_LIMIT)
-                .then(|| ReduceInnerCursor::new(outer.source_offset, layout.inner_axes));
-
-            for output in range {
+            // INVARIANT: (1) compile_axes checked signed source/destination
+            // spans and every cursor step/reset, including -(extent-1)*stride;
+            // (2) raw descriptors validated every reachable pointer offset;
+            // (3) execute checked exact plan-layout equality before dispatch.
+            let reduce_inner = |inner: &mut ReduceInnerCursor<'_>| {
                 let mut acc = reduce_identity(op);
-                let mut inline_inner;
-                let inner = match &mut reusable_inner {
-                    Some(inner) => {
-                        inner.reset(outer.source_offset);
-                        inner
-                    }
-                    None => {
-                        inline_inner =
-                            ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
-                        &mut inline_inner
-                    }
-                };
-                // INVARIANT: (1) compile_axes checked signed source/destination
-                // spans and every cursor step/reset, including
-                // -(extent-1)*stride; (2) raw descriptors validated every
-                // reachable pointer offset; (3) execute checked exact
-                // plan-layout equality before dispatch.
-                // SAFETY: the three-link layout invariant above proves each
-                // source cursor offset is within the source allocation.
                 for value_index in 0..layout.reduce_total {
+                    // SAFETY: the three-link layout invariant above proves each
+                    // source cursor offset is within the source allocation.
                     let value = unsafe { *source_ptr.offset(inner.source_offset) };
                     acc = reduce_values(op, acc, reduce_map_value(op, value));
                     if value_index + 1 < layout.reduce_total {
                         inner.advance();
                     }
                 }
+                acc
+            };
 
-                // SAFETY: the three-link layout invariant above proves this
-                // destination cursor offset is in bounds.
-                unsafe { dest_ptr.offset(outer.dest_offset).write(acc) };
-                if output + 1 < range_end {
-                    outer.advance();
+            if layout.inner_axes.len() <= RAW_FUSED_RANK_LIMIT {
+                for output in range {
+                    let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+                    let acc = reduce_inner(&mut inner);
+                    // SAFETY: the three-link layout invariant above proves this
+                    // destination cursor offset is in bounds.
+                    unsafe { dest_ptr.offset(outer.dest_offset).write(acc) };
+                    if output + 1 < range_end {
+                        outer.advance();
+                    }
+                }
+            } else {
+                let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+                for output in range {
+                    inner.reset(outer.source_offset);
+                    let acc = reduce_inner(&mut inner);
+                    // SAFETY: the three-link layout invariant above proves this
+                    // destination cursor offset is in bounds.
+                    unsafe { dest_ptr.offset(outer.dest_offset).write(acc) };
+                    if output + 1 < range_end {
+                        outer.advance();
+                    }
                 }
             }
             Ok(())
