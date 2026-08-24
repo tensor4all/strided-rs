@@ -28,23 +28,37 @@ Tighten existing rule sections rather than adding a new policy section:
 1. `Layout And Copy Semantics` will prohibit avoidable full-coordinate rebuilds
    and rank-scanning checked-offset helpers inside loops whose trip counts scale
    with tensor elements, windows, or reduced elements after plan validation.
-   One decode per worker range is allowed; execution should then advance
-   coordinates and source/destination offsets incrementally. Data-dependent
-   index reads remain allowed, while static layout mapping remains subject to
-   the rule. A deliberate exception needs a concrete nearby `// INVARIANT:`
-   rationale and benchmark evidence.
-2. `Performance And Benchmark Discipline` will require specialized-fast-path
-   work to benchmark at least one case that intentionally misses the fast path
-   and representative rank scaling, or explicitly scope the claim and link a
-   residual generic-path issue.
-3. Kernel/permutation source routing will include the performance section, and
-   added suspicious offset/decode terms will route both layout and performance
-   sections.
+   The serial path may decode once per traversal; parallel or blocked traversal
+   may decode once per worker range or traversal block, then must advance
+   coordinates and source/destination offsets incrementally. Plan-time
+   injectivity checks, offset-table construction, and worker-range/block
+   initialization are explicitly outside the per-element prohibition.
+   Data-dependent index reads remain allowed, while static layout mapping
+   remains subject to the rule. A deliberate replay exception needs a concrete
+   nearby `// INVARIANT:` rationale plus dated worklog/benchmark evidence, or a
+   narrowly scoped performance claim with a linked residual issue.
+2. `Performance And Benchmark Discipline` will require work that adds or
+   specializes a fast path, or makes a performance claim, to benchmark at least
+   one case that intentionally misses that fast path and representative rank
+   scaling. A change may instead explicitly scope the claim and link a residual
+   generic-path issue; routine production refactors without a performance claim
+   are not required to add benchmarks solely because they touch kernel code.
+3. Kernel/permutation source routing will include the performance section.
+   Added content matching the concrete terms
+   `checked_strided_offset`, `flat_to_multi_index`, `multi_index`,
+   `advance_col_major_index`, `fill_col_major_index`, or `decode` will route
+   both layout and performance sections. Generic `offset` alone is intentionally
+   excluded because it would route nearly every kernel diff.
 4. The review prompt will require reviewers to distinguish per-element work
-   from compile/setup and one-time worker-range decoding, identify nested loop
-   multiplicity, and check generic-fallback benchmark coverage.
+   from compile/setup and one-time worker-range/block decoding, identify nested
+   loop multiplicity, and check generic-fallback benchmark coverage. It will
+   explicitly scope benchmark-evidence findings to fast-path specialization,
+   performance claims, or diffs containing/citing benchmark evidence. Missing
+   benchmark evidence for another routine kernel refactor may be at most a
+   warning, not a blocking finding.
 5. Deterministic routing/prompt tests will prove the new rules reach the
-   reviewer for relevant source diffs.
+   reviewer for relevant source diffs, enumerate the exact content triggers,
+   and assert the prompt's benchmark-scoping and non-blocking guard.
 
 ## Rejected alternatives
 
