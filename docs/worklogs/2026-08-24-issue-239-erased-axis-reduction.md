@@ -210,4 +210,29 @@ Benchmark-only commit `a00e057` ran the complete baseline sequentially on CPUs 1
 | rank2 control | serial | large_n1048576 | 8.3363 ms `[8.0298 ms, 8.6054 ms]` |
 | rank2 control | max_threads_4 | large_n1048576 | 2.0558 ms `[2.0434 ms, 2.0649 ms]` |
 
-The need-before-implementation gate is **PASS**. At medium size, compact single-axis rank 4/8 serial measured 2.5877/4.2516 ms versus the rank-2 control 2.0449 ms; both exceed 1.0 ms and rank 8 is 2.08x the control. The rank-8/rank-2 per-source ratio is 2.09, above the 25% signal. Cases and gates are frozen; production implementation may proceed.
+The need-before-implementation gate is **PASS**. At medium size, compact single-axis rank 4/8 serial measured 2.5877/4.2516 ms versus the rank-2 control 2.0449 ms; both exceed 1.0 ms and rank 8 is 2.08x the control. The rank-8/rank-2 per-source ratio is 2.09, above the 25% signal. Cases and gates were frozen before production implementation.
+
+## Candidate attempt 1 and design delta
+
+Incremental-cursor candidate `1b4265b` completed the full suite after a valid
+load gate. Every case improved with `p < 0.05`, and all gates passed except one:
+medium compact single-axis rank 4 serial improved from 2.5877 to 0.88426 ms,
+only 2.93x versus the predeclared 3x gate. Attempt 1 is therefore **FAIL** and
+cannot be promoted. Rank 8 serial improved 4.41x; all four-thread, multi-axis,
+non-unit, negative, rank-ratio, and control gates passed. No gate or case is
+changed.
+
+The failure activates the design's previously deferred metadata compression.
+Compile will scan each cursor's axes left-to-right in the exact decode order and
+fuse adjacent axes only when the next stride equals the first step times the
+checked accumulated extent. For the outer cursor, this relation must hold for
+both source and destination strides; for the inner cursor it must hold for the
+source stride. Combined extents and recomputed resets remain checked. Negative
+or noncontiguous boundaries stay separate. The generic execution loop,
+reduction order, identities, accumulation functions, partitioning, and public
+API are unchanged; this is private metadata compression, not a new execution
+branch.
+
+Implementation is blocked until `reviewer-flash` approves this design delta.
+Afterward, the complete baseline/candidate suite will be rerun under unchanged
+protocol; failure of the 3x gate again blocks promotion.
