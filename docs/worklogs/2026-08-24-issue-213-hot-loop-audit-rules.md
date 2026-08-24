@@ -48,8 +48,8 @@ Tighten existing rule sections rather than adding a new policy section:
 3. Kernel/permutation source routing will include the performance section.
    Added content matching the concrete terms
    `checked_strided_offset`, `flat_to_multi_index`, `multi_index`,
-   `advance_col_major_index`, `fill_col_major_index`, or `decode` will route
-   both layout and performance sections. Generic `offset` alone is intentionally
+   `advance_col_major_index`, or `fill_col_major_index` will route both layout
+   and performance sections. Generic `offset` alone is intentionally
    excluded because it would route nearly every kernel diff.
 4. The review prompt will require reviewers to distinguish per-element work
    from compile/setup and one-time worker-range/block decoding, identify nested
@@ -118,3 +118,9 @@ Verification before the exact candidate commit:
 
 Final deterministic repository-rules review, hosted CI, and exact-diff
 `reviewer-flash` verdict will be recorded after the candidate is committed.
+The exact-diff review noted that anchored `multi_index` can over-route unrelated
+names such as `test_multi_index_2d`; this is accepted because routing only
+supplies applicable rules to the reviewer, while the diff-scoped prompt and
+warn cap prevent it from creating a violation by itself. Removing it would add
+a blind spot for renamed coordinate-reconstruction helpers without improving
+correctness.
