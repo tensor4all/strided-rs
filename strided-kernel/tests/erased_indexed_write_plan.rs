@@ -1,7 +1,9 @@
+use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use strided_kernel::{
-    ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedRawStridedMut, ErasedRawStridedRef,
-    ErasedScatterPlan, ExecContext, KernelDType, ScatterSpec, StridedError,
+    ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedRawStridedMut, ErasedRawStridedPtr,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScatterPlan, ExecContext, KernelDType,
+    ScatterSpec, StridedError,
 };
 
 #[test]
@@ -435,6 +437,387 @@ fn erased_dynamic_fast_paths_match_generic_replay_for_every_value_dtype() {
             Complex64::new(12.0, 3.0),
         ],
     );
+}
+
+#[test]
+fn dynamic_indexed_compile_rejects_replay_delta_overflow() {
+    let slice_error = ErasedDynamicSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &[2],
+        &[isize::MIN],
+        &[1],
+        &[1],
+        &[2],
+        &[1],
+        &[2],
+    )
+    .unwrap_err();
+    assert!(matches!(slice_error, StridedError::OffsetOverflow));
+
+    let update_error = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &[2],
+        &[1],
+        &[1],
+        &[1],
+        &[2],
+        &[isize::MIN],
+        &[2],
+        &[1],
+    )
+    .unwrap_err();
+    assert!(matches!(update_error, StridedError::OffsetOverflow));
+}
+
+fn layout_bounds(dims: &[usize], strides: &[isize]) -> (isize, isize) {
+    let mut min = 0isize;
+    let mut max = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides) {
+        let extent = (dim - 1) as isize * stride;
+        if extent < 0 {
+            min += extent;
+        } else {
+            max += extent;
+        }
+    }
+    (min, max)
+}
+
+fn layout_storage<T: Copy + Default>(dims: &[usize], strides: &[isize]) -> (Vec<T>, isize) {
+    let (min, max) = layout_bounds(dims, strides);
+    let offset = 3 - min;
+    let len = usize::try_from(offset + max + 1).unwrap();
+    (vec![T::default(); len], offset)
+}
+
+fn layout_offset(base: isize, strides: &[isize], coords: &[usize]) -> usize {
+    let offset = coords
+        .iter()
+        .zip(strides)
+        .fold(base, |offset, (&coord, &stride)| {
+            offset + coord as isize * stride
+        });
+    usize::try_from(offset).unwrap()
+}
+
+fn decode_col_major(mut linear: usize, dims: &[usize]) -> Vec<usize> {
+    dims.iter()
+        .map(|&dim| {
+            let coord = linear % dim;
+            linear /= dim;
+            coord
+        })
+        .collect()
+}
+
+fn logical_total(dims: &[usize]) -> usize {
+    dims.iter().product()
+}
+
+fn assert_initialized_layout(
+    actual: &[i32],
+    expected: &[i32],
+    dims: &[usize],
+    strides: &[isize],
+    offset: isize,
+) {
+    for linear in 0..logical_total(dims) {
+        let coords = decode_col_major(linear, dims);
+        let slot = layout_offset(offset, strides, &coords);
+        assert_eq!(actual[slot], expected[slot], "logical element {linear}");
+    }
+}
+
+fn assert_uninitialized_layout(
+    actual: &[MaybeUninit<i32>],
+    expected: &[i32],
+    dims: &[usize],
+    strides: &[isize],
+    offset: isize,
+) {
+    for linear in 0..logical_total(dims) {
+        let coords = decode_col_major(linear, dims);
+        let slot = layout_offset(offset, strides, &coords);
+        assert_eq!(unsafe { actual[slot].assume_init_ref() }, &expected[slot]);
+    }
+}
+
+fn run_dynamic_layout_case<I>(rank: usize, index_dtype: KernelDType, start_value: i32)
+where
+    I: Copy + Default + From<i32> + strided_kernel::KernelStorageElement,
+{
+    let operand_dims = vec![3usize; rank];
+    let window_dims = vec![2usize; rank];
+    let operand_strides: Vec<_> = (0..rank)
+        .map(|axis| {
+            let stride = 2 * 3isize.pow(u32::try_from(axis).unwrap());
+            if axis == 0 {
+                -stride
+            } else {
+                stride
+            }
+        })
+        .collect();
+    let window_strides: Vec<_> = (0..rank)
+        .map(|axis| {
+            let stride = 2 * 2isize.pow(u32::try_from(axis).unwrap());
+            if axis == 0 {
+                -stride
+            } else {
+                stride
+            }
+        })
+        .collect();
+    let dest_strides = operand_strides.clone();
+    let starts_dims = [rank];
+    let starts_strides = [1isize];
+
+    let (mut operand_data, operand_offset) = layout_storage::<i32>(&operand_dims, &operand_strides);
+    for linear in 0..logical_total(&operand_dims) {
+        let coords = decode_col_major(linear, &operand_dims);
+        let slot = layout_offset(operand_offset, &operand_strides, &coords);
+        operand_data[slot] = 10 + linear as i32;
+    }
+    let operand = ErasedRawStridedRef::from_slice(
+        &operand_data,
+        &operand_dims,
+        &operand_strides,
+        operand_offset,
+    )
+    .unwrap();
+
+    let mut starts_data = vec![I::default(); rank + 4];
+    for (axis, value) in starts_data[2..2 + rank].iter_mut().enumerate() {
+        let _ = axis;
+        *value = I::from(start_value);
+    }
+    let starts =
+        ErasedRawStridedRef::from_slice(&starts_data, &starts_dims, &starts_strides, 2).unwrap();
+
+    let slice = ErasedDynamicSlicePlan::compile(
+        KernelDType::I32,
+        index_dtype,
+        &operand_dims,
+        &operand_strides,
+        &starts_dims,
+        &starts_strides,
+        &window_dims,
+        &window_strides,
+        &window_dims,
+    )
+    .unwrap();
+    let (mut slice_data, slice_offset) = layout_storage::<i32>(&window_dims, &window_strides);
+    slice_data.fill(-777);
+    let mut expected_slice = slice_data.clone();
+    let clamped = if start_value < 0 { 0 } else { 1 };
+    for linear in 0..logical_total(&window_dims) {
+        let coords = decode_col_major(linear, &window_dims);
+        let source_coords: Vec<_> = coords.iter().map(|&coord| coord + clamped).collect();
+        let source_linear = source_coords
+            .iter()
+            .zip(&operand_dims)
+            .enumerate()
+            .map(|(axis, (&coord, &dim))| coord * dim.pow(u32::try_from(axis).unwrap()))
+            .sum::<usize>();
+        let slot = layout_offset(slice_offset, &window_strides, &coords);
+        expected_slice[slot] = 10 + source_linear as i32;
+    }
+    let mut initialized_slice = slice_data;
+    let mut initialized_slice_ref = ErasedRawStridedMut::from_slice_mut(
+        &mut initialized_slice,
+        &window_dims,
+        &window_strides,
+        slice_offset,
+    )
+    .unwrap();
+    slice
+        .execute(
+            &ExecContext::serial(),
+            &mut initialized_slice_ref,
+            &operand,
+            &starts,
+        )
+        .unwrap();
+    assert_initialized_layout(
+        &initialized_slice,
+        &expected_slice,
+        &window_dims,
+        &window_strides,
+        slice_offset,
+    );
+
+    let mut raw_slice = vec![MaybeUninit::<i32>::uninit(); expected_slice.len()];
+    let mut raw_slice_ref = ErasedRawStridedUninitMut::from_uninit_slice(
+        &mut raw_slice,
+        &window_dims,
+        &window_strides,
+        slice_offset,
+    )
+    .unwrap();
+    slice
+        .execute_uninit(
+            &ExecContext::serial(),
+            &mut raw_slice_ref,
+            &ErasedRawStridedPtr::from_ref(&operand),
+            &ErasedRawStridedPtr::from_ref(&starts),
+        )
+        .unwrap();
+    assert_uninitialized_layout(
+        &raw_slice,
+        &expected_slice,
+        &window_dims,
+        &window_strides,
+        slice_offset,
+    );
+
+    let update = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::I32,
+        index_dtype,
+        &operand_dims,
+        &operand_strides,
+        &starts_dims,
+        &starts_strides,
+        &window_dims,
+        &window_strides,
+        &operand_dims,
+        &dest_strides,
+    )
+    .unwrap();
+    let (mut update_data, update_offset) = layout_storage::<i32>(&window_dims, &window_strides);
+    for linear in 0..logical_total(&window_dims) {
+        let coords = decode_col_major(linear, &window_dims);
+        let slot = layout_offset(update_offset, &window_strides, &coords);
+        update_data[slot] = 1000 + linear as i32;
+    }
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&update_data, &window_dims, &window_strides, update_offset)
+            .unwrap();
+    let (mut initialized_update, update_dest_offset) =
+        layout_storage::<i32>(&operand_dims, &dest_strides);
+    initialized_update.fill(-777);
+    let mut expected_update = initialized_update.clone();
+    for linear in 0..logical_total(&operand_dims) {
+        let coords = decode_col_major(linear, &operand_dims);
+        let slot = layout_offset(update_dest_offset, &dest_strides, &coords);
+        expected_update[slot] = 10 + linear as i32;
+    }
+    for linear in 0..logical_total(&window_dims) {
+        let coords = decode_col_major(linear, &window_dims);
+        let dest_coords: Vec<_> = coords.iter().map(|&coord| coord + clamped).collect();
+        let slot = layout_offset(update_dest_offset, &dest_strides, &dest_coords);
+        expected_update[slot] = 1000 + linear as i32;
+    }
+    let mut initialized_update_ref = ErasedRawStridedMut::from_slice_mut(
+        &mut initialized_update,
+        &operand_dims,
+        &dest_strides,
+        update_dest_offset,
+    )
+    .unwrap();
+    update
+        .execute(
+            &ExecContext::serial(),
+            &mut initialized_update_ref,
+            &operand,
+            &update_ref,
+            &starts,
+        )
+        .unwrap();
+    assert_initialized_layout(
+        &initialized_update,
+        &expected_update,
+        &operand_dims,
+        &dest_strides,
+        update_dest_offset,
+    );
+
+    let mut raw_update = vec![MaybeUninit::<i32>::uninit(); expected_update.len()];
+    let mut raw_update_ref = ErasedRawStridedUninitMut::from_uninit_slice(
+        &mut raw_update,
+        &operand_dims,
+        &dest_strides,
+        update_dest_offset,
+    )
+    .unwrap();
+    update
+        .execute_uninit(
+            &ExecContext::serial(),
+            &mut raw_update_ref,
+            &ErasedRawStridedPtr::from_ref(&operand),
+            &ErasedRawStridedPtr::from_ref(&update_ref),
+            &ErasedRawStridedPtr::from_ref(&starts),
+        )
+        .unwrap();
+    assert_uninitialized_layout(
+        &raw_update,
+        &expected_update,
+        &operand_dims,
+        &dest_strides,
+        update_dest_offset,
+    );
+}
+
+#[test]
+fn erased_dynamic_generic_rank_layouts_clamp_and_preserve_updates() {
+    for &rank in &[2usize, 4, 8] {
+        run_dynamic_layout_case::<i32>(rank, KernelDType::I32, -1);
+        run_dynamic_layout_case::<i64>(rank, KernelDType::I64, 99);
+    }
+}
+
+#[test]
+fn erased_dynamic_update_zero_window_still_copies_operand() {
+    let operand_dims = [2usize, 2];
+    let zero_dims = [0usize, 2];
+    let starts_dims = [2usize];
+    let operand = [1i32, 2, 3, 4];
+    let starts = [0i32, 0];
+    let update: [i32; 0] = [];
+    let plan = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &operand_dims,
+        &[1, 2],
+        &starts_dims,
+        &[1],
+        &zero_dims,
+        &[1, 0],
+        &operand_dims,
+        &[1, 2],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&operand, &operand_dims, &[1, 2], 0).unwrap();
+    let update_ref = ErasedRawStridedRef::from_slice(&update, &zero_dims, &[1, 0], 0).unwrap();
+    let starts_ref = ErasedRawStridedRef::from_slice(&starts, &starts_dims, &[1], 0).unwrap();
+    let mut initialized = [0i32; 4];
+    let mut initialized_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut initialized, &operand_dims, &[1, 2], 0).unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut initialized_ref,
+        &source,
+        &update_ref,
+        &starts_ref,
+    )
+    .unwrap();
+    assert_eq!(initialized, operand);
+
+    let mut raw = vec![MaybeUninit::<i32>::uninit(); 4];
+    let mut raw_ref =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &operand_dims, &[1, 2], 0).unwrap();
+    plan.execute_uninit(
+        &ExecContext::serial(),
+        &mut raw_ref,
+        &ErasedRawStridedPtr::from_ref(&source),
+        &ErasedRawStridedPtr::from_ref(&update_ref),
+        &ErasedRawStridedPtr::from_ref(&starts_ref),
+    )
+    .unwrap();
+    for (actual, expected) in raw.iter().zip(operand) {
+        assert_eq!(unsafe { *actual.assume_init_ref() }, expected);
+    }
 }
 
 #[test]

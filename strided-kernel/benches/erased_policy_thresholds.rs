@@ -190,18 +190,18 @@ fn bench_gather_take(c: &mut Criterion) {
 }
 
 #[derive(Clone, Copy)]
-enum GatherVariant {
+enum LayoutVariant {
     Compact(usize),
     NonunitRank2,
     NegativeRank2,
 }
 
-impl GatherVariant {
+impl LayoutVariant {
     fn label(self) -> String {
         match self {
             Self::Compact(rank) => format!("compact_rank{rank}"),
-            Self::NonunitRank2 => "rank2_nonunit_operand_index".to_string(),
-            Self::NegativeRank2 => "rank2_negative_operand".to_string(),
+            Self::NonunitRank2 => "rank2_nonunit_source".to_string(),
+            Self::NegativeRank2 => "rank2_negative_source".to_string(),
         }
     }
 }
@@ -215,11 +215,11 @@ fn varying_starts(batch: usize) -> Vec<i64> {
 fn bench_gather_variant<M: Measurement>(
     group: &mut BenchmarkGroup<'_, M>,
     case: BenchCase,
-    variant: GatherVariant,
+    variant: LayoutVariant,
 ) {
     let (operand_dims, operand_strides, operand_len, operand_offset, index_strides, index_len) =
         match variant {
-            GatherVariant::Compact(rank) => {
+            LayoutVariant::Compact(rank) => {
                 let window = 1usize << (rank - 1);
                 let batch = case.len / window;
                 let mut dims = vec![2; rank - 1];
@@ -227,7 +227,7 @@ fn bench_gather_variant<M: Measurement>(
                 let strides = col_major_strides(&dims);
                 (dims, strides, case.len, 0, vec![1, batch as isize], batch)
             }
-            GatherVariant::NonunitRank2 => {
+            LayoutVariant::NonunitRank2 => {
                 let batch = case.len / 2;
                 (
                     vec![2, batch],
@@ -238,7 +238,7 @@ fn bench_gather_variant<M: Measurement>(
                     2 * batch - 1,
                 )
             }
-            GatherVariant::NegativeRank2 => {
+            LayoutVariant::NegativeRank2 => {
                 let batch = case.len / 2;
                 (
                     vec![2, batch],
@@ -310,13 +310,181 @@ fn bench_erased_gather_generic_rank_layout(c: &mut Criterion) {
     let mut group = c.benchmark_group("erased_gather_generic_rank_layout");
     for case in profile_cases() {
         for variant in [
-            GatherVariant::Compact(2),
-            GatherVariant::Compact(4),
-            GatherVariant::Compact(8),
-            GatherVariant::NonunitRank2,
-            GatherVariant::NegativeRank2,
+            LayoutVariant::Compact(2),
+            LayoutVariant::Compact(4),
+            LayoutVariant::Compact(8),
+            LayoutVariant::NonunitRank2,
+            LayoutVariant::NegativeRank2,
         ] {
             bench_gather_variant(&mut group, case, variant);
+        }
+    }
+    group.finish();
+}
+
+fn bench_dynamic_slice_variant<M: Measurement>(
+    group: &mut BenchmarkGroup<'_, M>,
+    case: BenchCase,
+    variant: LayoutVariant,
+) {
+    let rank = match variant {
+        LayoutVariant::Compact(rank) => rank,
+        LayoutVariant::NonunitRank2 | LayoutVariant::NegativeRank2 => 2,
+    };
+    let batch = case.len / (1usize << (rank - 1));
+    let mut window_dims = vec![2; rank - 1];
+    window_dims.push(batch);
+    let mut operand_dims = window_dims.clone();
+    *operand_dims.last_mut().unwrap() += 128;
+    let (operand_strides, operand_len, operand_offset) = match variant {
+        LayoutVariant::Compact(_) => (
+            col_major_strides(&operand_dims),
+            operand_dims.iter().product(),
+            0,
+        ),
+        LayoutVariant::NonunitRank2 => (vec![2, 4], 4 * (batch + 128) - 1, 0),
+        LayoutVariant::NegativeRank2 => (
+            vec![1, -2],
+            2 * (batch + 127) + 2,
+            2 * (batch + 127) as isize,
+        ),
+    };
+    let dest_strides = col_major_strides(&window_dims);
+    let starts_dims = vec![rank];
+    let starts_strides = vec![1isize];
+    let mut starts = vec![0i64; rank];
+    *starts.last_mut().unwrap() = 64;
+    let operand = patterned_f64(operand_len);
+    let plan = ErasedDynamicSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &operand_dims,
+        &operand_strides,
+        &starts_dims,
+        &starts_strides,
+        &window_dims,
+        &dest_strides,
+        &window_dims,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, operand_offset)
+            .unwrap();
+    let starts_ref =
+        ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
+    let mut output = vec![0.0f64; case.len];
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &dest_strides, 0).unwrap();
+    let ctx = context(case);
+    let id = BenchmarkId::new(
+        format!("{}_{}", variant.label(), context_label(case)),
+        format!("{}_n{}", case.label, case.len),
+    );
+    group.bench_function(id, |bencher| {
+        bencher.iter(|| {
+            plan.execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+                .unwrap();
+            black_box(&mut dest);
+        });
+    });
+}
+
+fn bench_erased_dynamic_slice_generic_rank_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_dynamic_slice_generic_rank_layout");
+    for case in profile_cases() {
+        for variant in [
+            LayoutVariant::Compact(2),
+            LayoutVariant::Compact(4),
+            LayoutVariant::Compact(8),
+            LayoutVariant::NonunitRank2,
+            LayoutVariant::NegativeRank2,
+        ] {
+            bench_dynamic_slice_variant(&mut group, case, variant);
+        }
+    }
+    group.finish();
+}
+
+fn bench_dynamic_update_variant<M: Measurement>(
+    group: &mut BenchmarkGroup<'_, M>,
+    case: BenchCase,
+    variant: LayoutVariant,
+) {
+    let rank = match variant {
+        LayoutVariant::Compact(rank) => rank,
+        LayoutVariant::NonunitRank2 | LayoutVariant::NegativeRank2 => 2,
+    };
+    let batch = case.len / (1usize << (rank - 1));
+    let mut update_dims = vec![2; rank - 1];
+    update_dims.push(batch);
+    let mut padded_dims = update_dims.clone();
+    *padded_dims.last_mut().unwrap() += 128;
+    let operand_strides = col_major_strides(&padded_dims);
+    let update_strides = match variant {
+        LayoutVariant::Compact(_) => col_major_strides(&update_dims),
+        LayoutVariant::NonunitRank2 => vec![2, 4],
+        LayoutVariant::NegativeRank2 => vec![1, -2],
+    };
+    let (update_len, update_offset) = match variant {
+        LayoutVariant::Compact(_) => (case.len, 0),
+        LayoutVariant::NonunitRank2 => (4 * batch - 1, 0),
+        LayoutVariant::NegativeRank2 => (2 * (batch - 1) + 2, 2 * (batch - 1) as isize),
+    };
+    let starts_dims = vec![rank];
+    let starts_strides = vec![1isize];
+    let mut starts = vec![0i32; rank];
+    *starts.last_mut().unwrap() = 64;
+    let operand = patterned_i32(padded_dims.iter().product());
+    let update = patterned_i32(update_len);
+    let plan = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::I32,
+        KernelDType::I32,
+        &padded_dims,
+        &operand_strides,
+        &starts_dims,
+        &starts_strides,
+        &update_dims,
+        &update_strides,
+        &padded_dims,
+        &operand_strides,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &padded_dims, &operand_strides, 0).unwrap();
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&update, &update_dims, &update_strides, update_offset)
+            .unwrap();
+    let starts_ref =
+        ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
+    let mut output = vec![0i32; padded_dims.iter().product()];
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &padded_dims, &operand_strides, 0)
+            .unwrap();
+    let ctx = context(case);
+    let id = BenchmarkId::new(
+        format!("{}_{}", variant.label(), context_label(case)),
+        format!("{}_n{}", case.label, case.len),
+    );
+    group.bench_function(id, |bencher| {
+        bencher.iter(|| {
+            plan.execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
+                .unwrap();
+            black_box(&mut dest);
+        });
+    });
+}
+
+fn bench_erased_dynamic_update_generic_rank_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_dynamic_update_generic_rank_layout");
+    for case in profile_cases() {
+        for variant in [
+            LayoutVariant::Compact(2),
+            LayoutVariant::Compact(4),
+            LayoutVariant::Compact(8),
+            LayoutVariant::NonunitRank2,
+            LayoutVariant::NegativeRank2,
+        ] {
+            bench_dynamic_update_variant(&mut group, case, variant);
         }
     }
     group.finish();
@@ -555,6 +723,8 @@ criterion_group! {
         bench_erased_gather_generic_rank_layout,
         bench_dynamic_slice,
         bench_dynamic_update_slice,
+        bench_erased_dynamic_slice_generic_rank_layout,
+        bench_erased_dynamic_update_generic_rank_layout,
         bench_pad_fill_and_copy,
         bench_copy_raw_path,
         bench_scatter_additive
