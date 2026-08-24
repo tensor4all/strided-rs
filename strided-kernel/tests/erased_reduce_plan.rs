@@ -552,6 +552,53 @@ fn erased_reduce_plan_fused_rank8_axes_match_contiguous_order() {
 }
 
 #[test]
+fn erased_reduce_plan_partially_fused_inner_axes_preserve_order() {
+    let src_dims = [2usize, 3, 2, 2];
+    let src_strides = [1isize, 2, 6, 12];
+    let input: Vec<f64> = (0..24)
+        .map(|index| match index % 3 {
+            0 => 1.0e16,
+            1 => index as f64,
+            _ => -1.0e16,
+        })
+        .collect();
+    let dest_dims = [2usize];
+    let dest_strides = [1isize];
+    let axes = [0usize, 1, 3];
+    let mut output = [0.0f64; 2];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Sum,
+        &src_dims,
+        &src_strides,
+        &dest_dims,
+        &dest_strides,
+        &axes,
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&input, &src_dims, &src_strides, 0).unwrap();
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    let mut expected = [0.0f64; 2];
+    for kept in 0..2 {
+        let mut acc = 0.0;
+        for linear in 0..12 {
+            let axis0 = linear % 2;
+            let axis1 = (linear / 2) % 3;
+            let axis3 = linear / 6;
+            let offset = axis0 + 2 * axis1 + 6 * kept + 12 * axis3;
+            acc += input[offset];
+        }
+        expected[kept] = acc;
+    }
+    assert_eq!(output.map(f64::to_bits), expected.map(f64::to_bits));
+}
+
+#[test]
 fn erased_reduce_plan_executes_all_axes_sum_into_rank0_scalar() {
     let src_dims = [2usize, 3];
     let src_strides = [1isize, 2];

@@ -3401,10 +3401,11 @@ where
 {
     let mut outer =
         ReduceOuterCursor::decode(0, source_offset_base, dest_offset_base, layout.outer_axes)?;
+    let mut inner = ReduceInnerCursor::new(source_offset_base, layout.inner_axes);
 
     for output in 0..layout.dest_total {
         let mut acc = reduce_identity(op);
-        let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+        inner.reset(outer.source_offset);
         // INVARIANT: (1) compile_axes checked signed source/destination spans and
         // every cursor step/reset, including -(extent-1)*stride; (2) raw input
         // and output descriptors validated every reachable offset; (3) execute
@@ -3549,10 +3550,11 @@ where
             )?;
             let dest_ptr = dest_ptr.as_ptr();
             let source_ptr = source_ptr.as_const();
+            let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
 
             for output in range {
                 let mut acc = reduce_identity(op);
-                let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
+                inner.reset(outer.source_offset);
                 // INVARIANT: (1) compile_axes checked signed source/destination
                 // spans and every cursor step/reset, including
                 // -(extent-1)*stride; (2) raw descriptors validated every
@@ -3751,6 +3753,12 @@ impl<'a> ReduceInnerCursor<'a> {
             coords: CoordScratch::new(axes.len()),
             source_offset: source_base,
         }
+    }
+
+    #[inline]
+    fn reset(&mut self, source_base: isize) {
+        self.coords.as_mut_slice().fill(0);
+        self.source_offset = source_base;
     }
 
     #[inline]
