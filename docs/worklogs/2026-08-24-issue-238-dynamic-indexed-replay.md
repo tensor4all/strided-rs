@@ -48,16 +48,22 @@ the N-value window shape, and the same start vector is used. The update group
 times the required full operand copy plus update replay, matching the public
 operation.
 
-Non-unit dynamic slice varies only operand strides while retaining the compact
-destination. Negative dynamic slice uses a negative final operand stride and a
-validated base offset. Non-unit/negative dynamic update varies only update
-strides; operand/destination stay compact so initial-copy cost is comparable.
+Dynamic-slice cases use F64 values and I64 starts, matching their rank-one
+control. Dynamic-update cases use I32 values and I32 starts, likewise matching
+that control. Non-unit dynamic slice varies only operand strides while
+retaining the compact destination. Negative dynamic slice uses a negative final
+operand stride and a validated base offset. Non-unit/negative dynamic update
+varies only update strides; operand/destination stay compact so initial-copy
+cost is comparable.
 Physical buffers are sized from validated reachable spans. Start vectors,
 allocation, plan compilation, and raw descriptor construction remain outside
 timing. Existing rank-one groups remain fast-path controls.
 
 Criterion uses 300 ms warmup, 10 samples, one-second measurement, release mode,
-`RAYON_NUM_THREADS=4`, and benchmark thread override 4. Runs are sequential on
+`RAYON_NUM_THREADS=4`, and benchmark thread override 4. Exactly `2^15` remains
+serial even under the four-thread context because the policy parallelizes only
+lengths greater than `MINTHREADLENGTH`; tests, not this timing row, cover
+below/exact/above-threshold execution equivalence. Runs are sequential on
 AMD EPYC 7713P. Before each complete baseline/candidate suite, select four cores
 in one L3/CCD, require every selected core below 2% busy over four seconds and
 every sibling below 20%, and pin the process with `taskset`; otherwise classify
@@ -71,7 +77,9 @@ Need-before-implementation gate at `medium_n262144`:
   non-unit/negative case must cost at least 25% more than compact rank 2.
 
 If either operation family fails both signals, retain its benchmark evidence
-but do not optimize that family.
+but do not optimize that family. This is an accepted possible outcome for
+update: its mandatory full operand copy is included in both generic and
+rank-one controls and may dominate the 1.0 ms fallback signal.
 
 Predeclared candidate gates, Criterion point estimates:
 
@@ -106,8 +114,10 @@ dynamic update. It stores, per logical window axis:
 - source and destination step;
 - checked source and destination reset/carry delta.
 
-Compile validates source/destination signed layout spans and every delta,
-including negative strides. Execution reads/clamps starts once and computes the
+Compile reuses the existing private `validate_layout_span` and
+`checked_replay_reset` helpers to validate source/destination signed spans and
+every delta, including negative strides; it does not re-derive that arithmetic.
+Execution reads/clamps starts once and computes the
 checked logical window base once. Serial replay decodes state once; parallel
 replay decodes once per worker range. It then advances source/destination
 offsets incrementally in column-major order. `RawStridedRef`/writer validation
@@ -137,5 +147,9 @@ an exact-final-diff `reviewer-flash` verdict before PR creation.
 
 ## Gate status
 
-Design review, benchmark implementation, baseline, candidate, and verification
-are pending.
+`reviewer-flash` reviewed exact design commit `9fa1480` with high thinking and
+a read-only boundary. Verdict: **Correct-to-merge**; benchmark implementation
+may proceed. Its four Minor amendments (matching dtypes, accepted update-family
+need-gate failure, helper reuse, and exact-threshold serial behavior) are folded
+into the text above. Benchmark implementation, baseline, candidate, and final
+verification are pending.
