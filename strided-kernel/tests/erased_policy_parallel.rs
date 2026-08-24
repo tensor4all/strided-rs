@@ -331,6 +331,88 @@ fn large_erased_dynamic_slice_and_update_match_serial() {
 }
 
 #[test]
+fn dynamic_slice_and_update_match_serial_at_threshold_boundaries() {
+    const THRESHOLD: usize = 1 << 15;
+    for len in [THRESHOLD - 2, THRESHOLD, THRESHOLD + 2] {
+        let cols = len / 2;
+        let operand_dims = [3usize, cols];
+        let window_dims = [2usize, cols];
+        let operand_strides = [1isize, 3];
+        let window_strides = [1isize, 2];
+        let starts_dims = [2usize];
+        let starts_strides = [1isize];
+        let operand: Vec<i32> = (0..3 * cols).map(|index| index as i32 - 17).collect();
+        let update: Vec<i32> = (0..len).map(|index| 1000 + index as i32).collect();
+        let starts = [1i64, 0];
+        let source =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let update_ref =
+            ErasedRawStridedRef::from_slice(&update, &window_dims, &window_strides, 0).unwrap();
+        let starts_ref =
+            ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
+        let slice = ErasedDynamicSlicePlan::compile(
+            KernelDType::I32,
+            KernelDType::I64,
+            &operand_dims,
+            &operand_strides,
+            &starts_dims,
+            &starts_strides,
+            &window_dims,
+            &window_strides,
+            &window_dims,
+        )
+        .unwrap();
+        let update_slice = ErasedDynamicUpdateSlicePlan::compile(
+            KernelDType::I32,
+            KernelDType::I64,
+            &operand_dims,
+            &operand_strides,
+            &starts_dims,
+            &starts_strides,
+            &window_dims,
+            &window_strides,
+            &operand_dims,
+            &operand_strides,
+        )
+        .unwrap();
+
+        let run_slice = |ctx: ExecContext| {
+            let mut output = vec![0i32; len];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
+                    .unwrap();
+            slice
+                .execute(&ctx, &mut dest, &source, &starts_ref)
+                .unwrap();
+            output
+        };
+        let run_update = |ctx: ExecContext| {
+            let mut output = vec![0i32; 3 * cols];
+            let mut dest = ErasedRawStridedMut::from_slice_mut(
+                &mut output,
+                &operand_dims,
+                &operand_strides,
+                0,
+            )
+            .unwrap();
+            update_slice
+                .execute(&ctx, &mut dest, &source, &update_ref, &starts_ref)
+                .unwrap();
+            output
+        };
+
+        assert_eq!(
+            run_slice(bounded_context()),
+            run_slice(ExecContext::serial())
+        );
+        assert_eq!(
+            run_update(bounded_context()),
+            run_update(ExecContext::serial())
+        );
+    }
+}
+
+#[test]
 fn large_erased_pad_matches_serial() {
     let operand_dims = [LARGE_LEN];
     let operand_strides = [1isize];

@@ -94,6 +94,88 @@ struct GatherReplayState {
     index_batch_offset: isize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WindowReplayAxis {
+    source_step: isize,
+    source_reset: isize,
+    dest_step: isize,
+    dest_reset: isize,
+}
+
+#[derive(Clone, Debug)]
+struct WindowReplay {
+    shape: AxisVec<usize>,
+    axes: AxisVec<WindowReplayAxis>,
+}
+
+struct WindowReplayState {
+    coords: AxisVec<usize>,
+    source_offset: isize,
+    dest_offset: isize,
+}
+
+impl WindowReplay {
+    fn compile(shape: &[usize], source_strides: &[isize], dest_strides: &[isize]) -> Result<Self> {
+        validate_layout_span(shape, source_strides)?;
+        validate_layout_span(shape, dest_strides)?;
+        let mut axes = AxisVec::with_capacity(shape.len());
+        for (axis, &dim) in shape.iter().enumerate() {
+            let source_step = source_strides[axis];
+            let dest_step = dest_strides[axis];
+            axes.push(WindowReplayAxis {
+                source_step,
+                source_reset: checked_replay_reset(dim, source_step)?,
+                dest_step,
+                dest_reset: checked_replay_reset(dim, dest_step)?,
+            });
+        }
+        Ok(Self {
+            shape: shape.into(),
+            axes,
+        })
+    }
+
+    fn decode(
+        &self,
+        mut linear: usize,
+        source_base: isize,
+        dest_base: isize,
+    ) -> Result<WindowReplayState> {
+        let mut coords = AxisVec::with_capacity(self.shape.len());
+        let mut source_offset = source_base;
+        let mut dest_offset = dest_base;
+        for (axis, &dim) in self.shape.iter().enumerate() {
+            let coord = linear % dim;
+            linear /= dim;
+            let replay_axis = self.axes[axis];
+            coords.push(coord);
+            source_offset = checked_offset_add(source_offset, replay_axis.source_step, coord)?;
+            dest_offset = checked_offset_add(dest_offset, replay_axis.dest_step, coord)?;
+        }
+        Ok(WindowReplayState {
+            coords,
+            source_offset,
+            dest_offset,
+        })
+    }
+
+    #[inline]
+    fn advance(&self, state: &mut WindowReplayState) {
+        for (axis, replay_axis) in self.axes.iter().enumerate() {
+            let coord = state.coords[axis];
+            if coord < self.shape[axis] - 1 {
+                state.coords[axis] = coord + 1;
+                state.source_offset += replay_axis.source_step;
+                state.dest_offset += replay_axis.dest_step;
+                return;
+            }
+            state.coords[axis] = 0;
+            state.source_offset += replay_axis.source_reset;
+            state.dest_offset += replay_axis.dest_reset;
+        }
+    }
+}
+
 /// Scatter configuration shared by generic and erased replay.
 ///
 /// `ScatterPlan` implements tenferro's current additive scatter semantics:
@@ -118,6 +200,7 @@ pub struct DynamicSlicePlan {
     dest_strides: AxisVec<isize>,
     slice_sizes: AxisVec<usize>,
     total: usize,
+    replay: WindowReplay,
 }
 
 /// A compiled dynamic-update-slice traversal.
@@ -137,6 +220,7 @@ pub struct DynamicUpdateSlicePlan {
     dest_strides: AxisVec<isize>,
     total: usize,
     copy_plan: CopyPlan,
+    replay: WindowReplay,
 }
 
 /// A compiled additive scatter traversal.
@@ -724,6 +808,9 @@ impl DynamicSlicePlan {
         checked_total_len(operand_dims)?;
         checked_total_len(start_dims)?;
         let total = checked_total_len(dest_dims)?;
+        validate_layout_span(operand_dims, operand_strides)?;
+        validate_layout_span(start_dims, start_strides)?;
+        validate_layout_span(dest_dims, dest_strides)?;
         if dest_dims != slice_sizes {
             return Err(StridedError::ShapeMismatch(
                 dest_dims.to_vec(),
@@ -734,6 +821,7 @@ impl DynamicSlicePlan {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, slice_sizes)?;
+        let replay = WindowReplay::compile(slice_sizes, operand_strides, dest_strides)?;
 
         Ok(Self {
             operand_dims: operand_dims.into(),
@@ -744,6 +832,7 @@ impl DynamicSlicePlan {
             dest_strides: dest_strides.into(),
             slice_sizes: slice_sizes.into(),
             total,
+            replay,
         })
     }
 
@@ -801,35 +890,28 @@ impl DynamicSlicePlan {
         }
 
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
-        let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
-        let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
         let clamped_starts = starts_storage.as_mut_slice();
-        let dest_idx = dest_idx_storage.as_mut_slice();
-        let operand_idx = operand_idx_storage.as_mut_slice();
         read_clamped_starts(
             starts,
             &self.operand_dims,
             &self.slice_sizes,
             clamped_starts,
         )?;
-
-        let operand_offset_base = operand.offset();
-        let operand_strides = operand.strides();
-        let dest_offset_base = dest.offset();
+        let source_base =
+            checked_strided_offset(operand.offset(), &self.operand_strides, clamped_starts)?;
+        let mut state = self.replay.decode(0, source_base, dest.offset())?;
         let operand_data = operand.data();
 
+        // INVARIANT: compile validated the full operand/destination spans and the
+        // replay window spans; checked bases plus checked reset deltas therefore
+        // keep every current offset reachable without per-element offset scans.
         for _ in 0..self.total {
-            for axis in 0..operand_idx.len() {
-                operand_idx[axis] = clamped_starts[axis] + dest_idx[axis];
-            }
-            let operand_offset =
-                checked_strided_offset(operand_offset_base, operand_strides, operand_idx)?;
-            let dest_offset = checked_strided_offset(dest_offset_base, dest.strides(), dest_idx)?;
-            // SAFETY: the validated plan proves both offsets.
-            let value = unsafe { *operand_data.as_ptr().offset(operand_offset) };
-            // SAFETY: the validated plan proves this logical offset is in-bounds.
-            unsafe { dest.write_at(dest_offset, value) };
-            advance_col_major_index(dest_idx, &self.dest_dims);
+            // SAFETY: the invariant above proves both current offsets are valid.
+            let value = unsafe { *operand_data.as_ptr().offset(state.source_offset) };
+            // SAFETY: the invariant above proves this logical destination offset
+            // is in-bounds, and the output layout is injective.
+            unsafe { dest.write_at(state.dest_offset, value) };
+            self.replay.advance(&mut state);
         }
         Ok(())
     }
@@ -899,9 +981,9 @@ impl DynamicSlicePlan {
             &self.slice_sizes,
             &mut clamped_starts,
         )?;
-
-        let operand_offset_base = operand.offset();
-        let dest_offset_base = dest.offset();
+        let source_base =
+            checked_strided_offset(operand.offset(), &self.operand_strides, &clamped_starts)?;
+        let dest_base = dest.offset();
         let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
@@ -910,34 +992,22 @@ impl DynamicSlicePlan {
             0..self.total,
             nthreads,
             &|range| {
-                let mut dest_idx_storage = CoordScratch::new(self.dest_dims.len());
-                let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
-                let dest_idx = dest_idx_storage.as_mut_slice();
-                let operand_idx = operand_idx_storage.as_mut_slice();
-                fill_col_major_index(range.start, &self.dest_dims, dest_idx);
+                let mut state = self.replay.decode(range.start, source_base, dest_base)?;
                 let operand_ptr = operand_ptr.as_const();
                 let dest_ptr = dest_ptr.as_ptr();
 
+                // INVARIANT: each worker decodes one checked range start. Its
+                // replay range is disjoint, and the injective output layout makes
+                // all writes distinct across workers.
                 for _ in range {
-                    for axis in 0..operand_idx.len() {
-                        operand_idx[axis] = clamped_starts[axis] + dest_idx[axis];
-                    }
-                    let operand_offset = checked_strided_offset(
-                        operand_offset_base,
-                        &self.operand_strides,
-                        operand_idx,
-                    )?;
-                    let dest_offset =
-                        checked_strided_offset(dest_offset_base, &self.dest_strides, dest_idx)?;
+                    // SAFETY: checked replay bases/resets keep both offsets in
+                    // their validated allocations.
                     unsafe {
-                        // SAFETY: dynamic slice writes one value per logical
-                        // output, and compile rejected non-injective
-                        // destination layouts.
                         dest_ptr
-                            .offset(dest_offset)
-                            .write(operand_ptr.offset(operand_offset).read());
+                            .offset(state.dest_offset)
+                            .write(operand_ptr.offset(state.source_offset).read());
                     }
-                    advance_col_major_index(dest_idx, &self.dest_dims);
+                    self.replay.advance(&mut state);
                 }
                 Ok(())
             },
@@ -1000,6 +1070,10 @@ impl DynamicUpdateSlicePlan {
         checked_total_len(operand_dims)?;
         checked_total_len(start_dims)?;
         let total = checked_total_len(update_dims)?;
+        validate_layout_span(operand_dims, operand_strides)?;
+        validate_layout_span(start_dims, start_strides)?;
+        validate_layout_span(update_dims, update_strides)?;
+        validate_layout_span(dest_dims, dest_strides)?;
         if dest_dims != operand_dims {
             return Err(StridedError::ShapeMismatch(
                 dest_dims.to_vec(),
@@ -1011,6 +1085,7 @@ impl DynamicUpdateSlicePlan {
         }
         validate_window_sizes(operand_dims, update_dims)?;
         let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
+        let replay = WindowReplay::compile(update_dims, update_strides, dest_strides)?;
 
         Ok(Self {
             operand_dims: operand_dims.into(),
@@ -1023,6 +1098,7 @@ impl DynamicUpdateSlicePlan {
             dest_strides: dest_strides.into(),
             total,
             copy_plan,
+            replay,
         })
     }
 
@@ -1089,34 +1165,28 @@ impl DynamicUpdateSlicePlan {
         }
 
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
-        let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
-        let mut dest_idx_storage = CoordScratch::new(self.operand_dims.len());
         let clamped_starts = starts_storage.as_mut_slice();
-        let update_idx = update_idx_storage.as_mut_slice();
-        let dest_idx = dest_idx_storage.as_mut_slice();
         read_clamped_starts(
             starts,
             &self.operand_dims,
             &self.update_dims,
             clamped_starts,
         )?;
-
-        let update_offset_base = update.offset();
-        let update_strides = update.strides();
-        let dest_offset_base = dest.offset();
+        let source_base = update.offset();
+        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, &clamped_starts)?;
+        let mut state = self.replay.decode(0, source_base, dest_base)?;
         let update_data = update.data();
 
+        // INVARIANT: the initial CopyPlan has completed before this replay;
+        // compile validated both window spans and the checked bases/resets keep
+        // every update read and destination write reachable.
         for _ in 0..self.total {
-            for axis in 0..dest_idx.len() {
-                dest_idx[axis] = clamped_starts[axis] + update_idx[axis];
-            }
-            let update_offset =
-                checked_strided_offset(update_offset_base, update_strides, update_idx)?;
-            let dest_offset = checked_strided_offset(dest_offset_base, dest.strides(), dest_idx)?;
-            let value = unsafe { *update_data.as_ptr().offset(update_offset) };
-            // SAFETY: the validated plan proves this logical offset is in-bounds.
-            unsafe { dest.write_at(dest_offset, value) };
-            advance_col_major_index(update_idx, &self.update_dims);
+            // SAFETY: checked replay metadata proves the current update read.
+            let value = unsafe { *update_data.as_ptr().offset(state.source_offset) };
+            // SAFETY: the copied, injective destination layout proves this write
+            // is initialized and in-bounds.
+            unsafe { dest.write_at(state.dest_offset, value) };
+            self.replay.advance(&mut state);
         }
         Ok(())
     }
@@ -1187,9 +1257,8 @@ impl DynamicUpdateSlicePlan {
             &self.update_dims,
             &mut clamped_starts,
         )?;
-
-        let update_offset_base = update.offset();
-        let dest_offset_base = dest.offset();
+        let source_base = update.offset();
+        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, &clamped_starts)?;
         let update_ptr = crate::threading::SendPtr(update.data().as_ptr() as *mut T);
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
@@ -1198,34 +1267,22 @@ impl DynamicUpdateSlicePlan {
             0..self.total,
             nthreads,
             &|range| {
-                let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
-                let mut dest_idx_storage = CoordScratch::new(self.operand_dims.len());
-                let update_idx = update_idx_storage.as_mut_slice();
-                let dest_idx = dest_idx_storage.as_mut_slice();
-                fill_col_major_index(range.start, &self.update_dims, update_idx);
+                let mut state = self.replay.decode(range.start, source_base, dest_base)?;
                 let update_ptr = update_ptr.as_const();
                 let dest_ptr = dest_ptr.as_ptr();
 
+                // INVARIANT: the initial operand copy completed before this
+                // replay; workers own disjoint ranges and injective output
+                // layouts make their writes distinct.
                 for _ in range {
-                    for axis in 0..dest_idx.len() {
-                        dest_idx[axis] = clamped_starts[axis] + update_idx[axis];
-                    }
-                    let update_offset = checked_strided_offset(
-                        update_offset_base,
-                        &self.update_strides,
-                        update_idx,
-                    )?;
-                    let dest_offset =
-                        checked_strided_offset(dest_offset_base, &self.dest_strides, dest_idx)?;
+                    // SAFETY: checked replay bases/resets prove both offsets are
+                    // within the initialized update and destination allocations.
                     unsafe {
-                        // SAFETY: each update-domain logical index maps to a
-                        // distinct destination position for a fixed window, and
-                        // compile rejected non-injective destination layouts.
                         dest_ptr
-                            .offset(dest_offset)
-                            .write(update_ptr.offset(update_offset).read());
+                            .offset(state.dest_offset)
+                            .write(update_ptr.offset(state.source_offset).read());
                     }
-                    advance_col_major_index(update_idx, &self.update_dims);
+                    self.replay.advance(&mut state);
                 }
                 Ok(())
             },
@@ -1800,15 +1857,6 @@ fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
             return;
         }
         index[axis] = 0;
-    }
-}
-
-#[cfg(feature = "parallel")]
-fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
-    for (axis, coord) in out.iter_mut().enumerate() {
-        let dim = shape[axis];
-        *coord = linear % dim;
-        linear /= dim;
     }
 }
 
