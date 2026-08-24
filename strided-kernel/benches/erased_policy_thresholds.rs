@@ -243,14 +243,11 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
 
     let mut public_group = c.benchmark_group("erased_integer_zip_preflight");
     for case in cases {
-        for rank in [1usize, 8] {
-            let layout = any_layouts(case.len)
-                .into_iter()
-                .find(|layout| layout.label == format!("compact_rank{rank}"))
-                .unwrap();
+        for layout in any_layouts(case.len) {
+            let dest_strides = col_major_strides(&layout.dims);
             let lhs_data = nonzero_i32(case.len);
-            let lhs = ErasedRawStridedRef::from_slice(&lhs_data, &layout.dims, &layout.strides, 0)
-                .unwrap();
+            let lhs =
+                ErasedRawStridedRef::from_slice(&lhs_data, &layout.dims, &dest_strides, 0).unwrap();
             let rhs = ErasedRawStridedRef::from_slice(
                 &layout.data,
                 &layout.dims,
@@ -264,7 +261,7 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
             for op in [ErasedZipOp::Add, ErasedZipOp::Divide] {
                 public_group.bench_function(
                     BenchmarkId::new(
-                        format!("compact_rank{rank}_{op:?}_{}", context_label(case)),
+                        format!("{}_{op:?}_{}", layout.label, context_label(case)),
                         format!("{}_n{}", case.label, case.len),
                     ),
                     |bencher| {
@@ -272,7 +269,7 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
                         let mut dest = ErasedRawStridedMut::from_slice_mut(
                             &mut output,
                             &layout.dims,
-                            &layout.strides,
+                            &dest_strides,
                             0,
                         )
                         .unwrap();

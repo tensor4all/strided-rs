@@ -14,7 +14,7 @@ Keep `raw_any` private and its signature unchanged.
 2. For rank at most `RAW_FUSED_RANK_LIMIT` (8), use a fixed `[usize; RAW_FUSED_RANK_LIMIT]` coordinate array. Precompute each checked carry reset into a fixed `[isize; RAW_FUSED_RANK_LIMIT]` array once. Start at `src.offset()`, test the current element, and advance axis-0-fastest with checked step/reset additions. This allocates nothing and preserves early exit and visit order.
 3. For rank above 8, retain the existing flat-to-multi-index checked fallback unchanged. Do not introduce a heap cursor or shared cursor abstraction for this one private one-shot scan.
 
-Raw descriptor construction already validates every reachable offset. Checked reset preparation plus checked cursor additions preserve the existing overflow error surface without unchecked pointer arithmetic beyond the already validated final offset dereference.
+Raw descriptor construction already validates every reachable offset. Return on zero total before computing `dim - 1`. On carry, add the prepared `-(dim - 1) * stride` reset directly; do not transiently step one-past-end and subtract `dim * stride`. Checked reset preparation plus checked cursor additions preserve the existing overflow error surface without unchecked pointer arithmetic beyond the already validated final offset dereference.
 
 No public API, dtype dispatch, map replay, integer arithmetic, threading policy, or validation ordering changes. The scan stays serial; only the following zip replay may use the requested execution context.
 
@@ -28,7 +28,7 @@ Add focused tests through the public `erased_zip_into` boundary:
 - rank-2 negative stride/nonzero offset and non-unit holes find reachable zeros but ignore hole zeros;
 - rank 9 exercises the unchanged fallback;
 - both integer dtypes and both divide/remainder operations retain wrapping/nonzero behavior and zero rejection;
-- allocation counting proves successful and rejecting rank-8 preflight allocates zero times after descriptor construction.
+- allocation counting proves successful and rejecting rank-8 preflight allocates zero times after descriptor construction. Use compact serial replay for the successful case so the counted window does not include unrelated parallel/map allocations.
 
 Prefer extending existing `erased_one_shot.rs` and `copy_plan_alloc.rs`; no new test harness.
 
@@ -36,7 +36,7 @@ Prefer extending existing `erased_one_shot.rs` and `copy_plan_alloc.rs`; no new 
 
 Before production edits, extend only the public-control group with compact rank 2/4 and rank-2 negative/non-unit layouts, then run the complete public group as the implementation baseline. Keep the already measured compact rank-1/rank-8 cells unchanged. Candidate reruns the identical group on the same pinned idle L3-domain cores with setup outside timing.
 
-At `N=2^18`, require:
+For negative/non-unit source variants, keep the destination compact and use the strided layout only for the divisor source; a negative-stride mutable destination would be invalid. At `N=2^18`, require:
 
 - compact rank 2 improves at least 1.3x and compact rank 4 or 8 improves at least 2x with non-overlapping intervals;
 - negative/non-unit divide improve in the same direction;
@@ -48,4 +48,4 @@ Record rank/layout/serial/four-thread baseline and candidate evidence. The bench
 
 ## Verification and review gates
 
-Run focused default/parallel tests, allocation tests, default/parallel workspace tests, coverage for the modified production file, docs, formatting, and repository-rules review. Selected reviewer is read-only `reviewer-flash` with high thinking. Production implementation starts only after this design receives `Correct-to-merge`; the exact final diff requires a second `Correct-to-merge` verdict before PR creation.
+Run focused default/parallel tests, allocation tests, default/parallel workspace tests, coverage for the modified production file, docs, formatting, and repository-rules review. Selected reviewer is read-only `reviewer-flash` with high thinking. Pre-implementation review of `a2dd71c0` by read-only `reviewer-flash` (high) returned **Correct-to-merge** with three nonblocking benchmark/allocation/carry-construction cautions, incorporated above. The exact final diff requires a second `Correct-to-merge` verdict before PR creation.
