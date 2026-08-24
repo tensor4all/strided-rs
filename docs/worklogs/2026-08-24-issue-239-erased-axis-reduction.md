@@ -233,6 +233,9 @@ reduction order, identities, accumulation functions, partitioning, and public
 API are unchanged; this is private metadata compression, not a new execution
 branch.
 
-Implementation is blocked until `reviewer-flash` approves this design delta.
-Afterward, the complete baseline/candidate suite will be rerun under unchanged
-protocol; failure of the 3x gate again blocks promotion.
+`reviewer-flash` reviewed exact design-delta commit `c1eea8d` and returned
+**Correct-to-merge**. Implementation must use checked multiplication with the
+accumulated fused extent and recompute resets through `checked_reduce_reset`;
+wrapping or immediate-predecessor-only checks are forbidden. The complete
+baseline/candidate suite will be rerun under unchanged protocol; failure of the
+3x gate again blocks promotion.
