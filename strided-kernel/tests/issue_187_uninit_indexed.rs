@@ -322,11 +322,9 @@ fn gather_generic_window_offset_negative_stride_and_holes() {
         )
         .unwrap();
     }
-    for (offset, value) in [(3usize, 10.0f64), (0, 11.0), (6, 12.0), (3, 13.0)] {
-        let start = offset * core::mem::size_of::<f64>();
-        let _ = (start, value);
+    for (offset, expected) in [(3usize, 10.0f64), (6, 11.0), (2, 12.0), (5, 13.0)] {
+        assert_eq!(unsafe { raw[offset].assume_init_ref() }, &expected);
     }
-    let _ = raw;
 }
 
 #[test]
