@@ -176,6 +176,75 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     });
     assert_eq!(allocations, 0, "erased execute must not allocate");
 
+    let dims = [2usize; 8];
+    let strides = col_major_strides(&dims);
+    let lhs_data = vec![7i64; 256];
+    let rhs_data = vec![3i64; 256];
+    let mut rhs_zero_data = rhs_data.clone();
+    rhs_zero_data[255] = 0;
+    let lhs = ErasedRawStridedRef::from_slice(&lhs_data, &dims, &strides, 0).unwrap();
+    let rhs = ErasedRawStridedRef::from_slice(&rhs_data, &dims, &strides, 0).unwrap();
+    let rhs_zero = ErasedRawStridedRef::from_slice(&rhs_zero_data, &dims, &strides, 0).unwrap();
+    let mut success_dst = vec![0i64; 256];
+    let mut reject_dst = vec![77i64; 256];
+    let mut success_dest =
+        ErasedRawStridedMut::from_slice_mut(&mut success_dst, &dims, &strides, 0).unwrap();
+    let mut reject_dest =
+        ErasedRawStridedMut::from_slice_mut(&mut reject_dst, &dims, &strides, 0).unwrap();
+    let serial = ExecContext::serial();
+    erased_zip_into(
+        KernelDType::I64,
+        ErasedZipOp::Divide,
+        &serial,
+        &mut success_dest,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
+    )
+    .unwrap();
+    assert!(matches!(
+        erased_zip_into(
+            KernelDType::I64,
+            ErasedZipOp::Divide,
+            &serial,
+            &mut reject_dest,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs_zero),
+        ),
+        Err(strided_kernel::StridedError::IntegerDivisionByZero { op: "divide" })
+    ));
+    let success_allocations = count_allocations(|| {
+        erased_zip_into(
+            KernelDType::I64,
+            ErasedZipOp::Divide,
+            &serial,
+            &mut success_dest,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs),
+        )
+        .unwrap();
+    });
+    let rejecting_allocations = count_allocations(|| {
+        assert!(matches!(
+            erased_zip_into(
+                KernelDType::I64,
+                ErasedZipOp::Divide,
+                &serial,
+                &mut reject_dest,
+                &ErasedRawStridedPtr::from_ref(&lhs),
+                &ErasedRawStridedPtr::from_ref(&rhs_zero),
+            ),
+            Err(strided_kernel::StridedError::IntegerDivisionByZero { op: "divide" })
+        ));
+    });
+    assert_eq!(
+        success_allocations, 0,
+        "rank-8 raw_any success must not allocate"
+    );
+    assert_eq!(
+        rejecting_allocations, 0,
+        "rank-8 raw_any rejection must not allocate"
+    );
+
     let dims = [256usize];
     let strides = [1isize];
     let lhs: Vec<f64> = (0..256).map(|value| value as f64).collect();

@@ -4,9 +4,10 @@ use criterion::{
 };
 use std::time::Duration;
 use strided_kernel::{
-    col_major_strides, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
-    ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan,
-    ErasedScatterPlan, ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    col_major_strides, erased_zip_into, ErasedCopyPlan, ErasedDynamicSlicePlan,
+    ErasedDynamicUpdateSlicePlan, ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedReducePlan, ErasedScatterPlan, ErasedZipOp,
+    ExecContext, GatherSpec, KernelDType, RawStridedRef, ReduceOp, ScatterSpec, StridedError,
 };
 
 #[derive(Clone, Copy)]
@@ -97,6 +98,199 @@ fn patterned_f64(len: usize) -> Vec<f64> {
 
 fn patterned_i32(len: usize) -> Vec<i32> {
     (0..len).map(|index| (index % 97) as i32 - 31).collect()
+}
+
+fn nonzero_i32(len: usize) -> Vec<i32> {
+    (0..len).map(|index| 1 + (index % 97) as i32).collect()
+}
+
+struct AnyLayout {
+    label: String,
+    dims: Vec<usize>,
+    strides: Vec<isize>,
+    data: Vec<i32>,
+    offset: isize,
+}
+
+fn any_layouts(len: usize) -> Vec<AnyLayout> {
+    let mut layouts = Vec::new();
+    for rank in [1usize, 2, 4, 8] {
+        let mut dims = vec![2usize; rank.saturating_sub(1)];
+        dims.push(len >> rank.saturating_sub(1));
+        layouts.push(AnyLayout {
+            label: format!("compact_rank{rank}"),
+            strides: col_major_strides(&dims),
+            dims,
+            data: nonzero_i32(len),
+            offset: 0,
+        });
+    }
+    layouts.push(AnyLayout {
+        label: "rank2_negative".to_string(),
+        dims: vec![2, len / 2],
+        strides: vec![-1, 2],
+        data: nonzero_i32(len),
+        offset: 1,
+    });
+    layouts.push(AnyLayout {
+        label: "rank2_nonunit".to_string(),
+        dims: vec![2, len / 2],
+        strides: vec![2, 4],
+        data: nonzero_i32(2 * len),
+        offset: 0,
+    });
+    layouts
+}
+
+fn current_any_scan(src: &RawStridedRef<'_, i32>) -> Result<bool, StridedError> {
+    let total = src
+        .dims()
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)?;
+    for linear in 0..total {
+        let mut remainder = linear;
+        let mut offset = src.offset();
+        for (&dim, &stride) in src.dims().iter().zip(src.strides()) {
+            let index = remainder % dim;
+            remainder /= dim;
+            offset = offset
+                .checked_add(
+                    stride
+                        .checked_mul(index as isize)
+                        .ok_or(StridedError::OffsetOverflow)?,
+                )
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+        if unsafe { *src.data().as_ptr().offset(offset) } == 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn incremental_any_scan(src: &RawStridedRef<'_, i32>) -> Result<bool, StridedError> {
+    let total = src
+        .dims()
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)?;
+    assert!(src.dims().len() <= 8);
+    let mut coords = [0usize; 8];
+    let mut offset = src.offset();
+    for _ in 0..total {
+        if unsafe { *src.data().as_ptr().offset(offset) } == 0 {
+            return Ok(true);
+        }
+        for axis in 0..src.dims().len() {
+            let next = coords[axis] + 1;
+            if next < src.dims()[axis] {
+                coords[axis] = next;
+                offset = offset
+                    .checked_add(src.strides()[axis])
+                    .ok_or(StridedError::OffsetOverflow)?;
+                break;
+            }
+            coords[axis] = 0;
+            let reset = src.strides()[axis]
+                .checked_mul((src.dims()[axis] - 1) as isize)
+                .and_then(isize::checked_neg)
+                .ok_or(StridedError::OffsetOverflow)?;
+            offset = offset
+                .checked_add(reset)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+    Ok(false)
+}
+
+fn bench_raw_any_integer_preflight(c: &mut Criterion) {
+    let cases = profile_cases();
+    let mut scan_group = c.benchmark_group("erased_raw_any_scan");
+    for case in cases.iter().copied().filter(|case| case.threads == 1) {
+        for layout in any_layouts(case.len) {
+            let src =
+                RawStridedRef::new(&layout.data, &layout.dims, &layout.strides, layout.offset)
+                    .unwrap();
+            assert_eq!(
+                current_any_scan(&src).unwrap(),
+                incremental_any_scan(&src).unwrap()
+            );
+            for (algorithm, scan) in [
+                (
+                    "current_scan",
+                    current_any_scan as fn(&RawStridedRef<'_, i32>) -> Result<bool, StridedError>,
+                ),
+                (
+                    "incremental_scan",
+                    incremental_any_scan
+                        as fn(&RawStridedRef<'_, i32>) -> Result<bool, StridedError>,
+                ),
+            ] {
+                scan_group.bench_function(
+                    BenchmarkId::new(
+                        format!("{}_{}", layout.label, algorithm),
+                        format!("{}_n{}", case.label, case.len),
+                    ),
+                    |bencher| {
+                        bencher.iter(|| black_box(scan(black_box(&src)).unwrap()));
+                    },
+                );
+            }
+        }
+    }
+    scan_group.finish();
+
+    let mut public_group = c.benchmark_group("erased_integer_zip_preflight");
+    for case in cases {
+        for layout in any_layouts(case.len) {
+            let dest_strides = col_major_strides(&layout.dims);
+            let lhs_data = nonzero_i32(case.len);
+            let lhs =
+                ErasedRawStridedRef::from_slice(&lhs_data, &layout.dims, &dest_strides, 0).unwrap();
+            let rhs = ErasedRawStridedRef::from_slice(
+                &layout.data,
+                &layout.dims,
+                &layout.strides,
+                layout.offset,
+            )
+            .unwrap();
+            let lhs_ptr = ErasedRawStridedPtr::from_ref(&lhs);
+            let rhs_ptr = ErasedRawStridedPtr::from_ref(&rhs);
+            let ctx = context(case);
+            for op in [ErasedZipOp::Add, ErasedZipOp::Divide] {
+                public_group.bench_function(
+                    BenchmarkId::new(
+                        format!("{}_{op:?}_{}", layout.label, context_label(case)),
+                        format!("{}_n{}", case.label, case.len),
+                    ),
+                    |bencher| {
+                        let mut output = vec![0i32; case.len];
+                        let mut dest = ErasedRawStridedMut::from_slice_mut(
+                            &mut output,
+                            &layout.dims,
+                            &dest_strides,
+                            0,
+                        )
+                        .unwrap();
+                        bencher.iter(|| {
+                            erased_zip_into(
+                                KernelDType::I32,
+                                op,
+                                &ctx,
+                                &mut dest,
+                                &lhs_ptr,
+                                &rhs_ptr,
+                            )
+                            .unwrap();
+                            black_box(&mut dest);
+                        });
+                    },
+                );
+            }
+        }
+    }
+    public_group.finish();
 }
 
 fn bench_axis_reduce(c: &mut Criterion) {
@@ -919,6 +1113,7 @@ criterion_group! {
         bench_erased_dynamic_update_generic_rank_layout,
         bench_pad_fill_and_copy,
         bench_erased_pad_generic_rank_layout,
+        bench_raw_any_integer_preflight,
         bench_copy_raw_path,
         bench_scatter_additive
 }

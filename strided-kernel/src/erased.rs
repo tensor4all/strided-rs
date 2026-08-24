@@ -2422,6 +2422,53 @@ fn raw_any<T: Copy>(
         .iter()
         .try_fold(1usize, |total, &dim| total.checked_mul(dim))
         .ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(false);
+    }
+
+    if src.dims().len() <= RAW_FUSED_RANK_LIMIT {
+        let dims = src.dims();
+        let strides = src.strides();
+        let mut coordinates = [0usize; RAW_FUSED_RANK_LIMIT];
+        let mut resets = [0isize; RAW_FUSED_RANK_LIMIT];
+        for axis in 0..dims.len() {
+            let last = isize::try_from(dims[axis] - 1).map_err(|_| StridedError::OffsetOverflow)?;
+            resets[axis] = strides[axis]
+                .checked_mul(last)
+                .and_then(isize::checked_neg)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+
+        let mut offset = src.offset();
+        loop {
+            // SAFETY: RawStridedRef construction validated every reachable offset.
+            if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
+                return Ok(true);
+            }
+
+            let mut axis = 0;
+            while axis < dims.len() && coordinates[axis] == dims[axis] - 1 {
+                axis += 1;
+            }
+            if axis == dims.len() {
+                break;
+            }
+            for reset_axis in 0..axis {
+                coordinates[reset_axis] = 0;
+                offset = offset
+                    .checked_add(resets[reset_axis])
+                    .ok_or(StridedError::OffsetOverflow)?;
+            }
+            coordinates[axis] = coordinates[axis]
+                .checked_add(1)
+                .ok_or(StridedError::OffsetOverflow)?;
+            offset = offset
+                .checked_add(strides[axis])
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+        return Ok(false);
+    }
+
     for linear in 0..total {
         let mut remainder = linear;
         let mut offset = src.offset();

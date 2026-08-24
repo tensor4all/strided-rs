@@ -333,13 +333,141 @@ fn one_shot_integer_division_is_wrapping_and_zero_is_preflighted() {
                 assert_eq!(actual, expected);
             }
 
-            let rhs = [1 as $ty, 0];
-            let lhs = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
-            let rhs = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
-            let mut actual = [99 as $ty; 2];
+            for op in [ErasedZipOp::Divide, ErasedZipOp::Remainder] {
+                let rhs = [1 as $ty, 0];
+                let lhs = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
+                let rhs = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
+                let mut actual = [99 as $ty; 2];
+                let mut output =
+                    ErasedRawStridedMut::from_slice_mut(&mut actual, &dims, &strides, 0).unwrap();
+                let error = erased_zip_into(
+                    $dtype,
+                    op,
+                    &ExecContext::serial(),
+                    &mut output,
+                    &ErasedRawStridedPtr::from_ref(&lhs),
+                    &ErasedRawStridedPtr::from_ref(&rhs),
+                )
+                .unwrap_err();
+                assert!(matches!(error, StridedError::IntegerDivisionByZero { .. }));
+                assert_eq!(actual, [99, 99]);
+            }
+        }};
+    }
+
+    check!(i32, KernelDType::I32);
+    check!(i64, KernelDType::I64);
+}
+
+#[test]
+fn one_shot_integer_preflight_covers_rank_zero_empty_compact_and_fallback() {
+    let dims: &[usize] = &[];
+    let strides: &[isize] = &[];
+    let lhs = ErasedRawStridedRef::from_slice(&[i32::MIN], dims, strides, 0).unwrap();
+    let rhs = ErasedRawStridedRef::from_slice(&[-1i32], dims, strides, 0).unwrap();
+    let mut actual = [99i32];
+    let mut output = ErasedRawStridedMut::from_slice_mut(&mut actual, dims, strides, 0).unwrap();
+    erased_zip_into(
+        KernelDType::I32,
+        ErasedZipOp::Divide,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
+    )
+    .unwrap();
+    assert_eq!(actual, [i32::MIN]);
+
+    let lhs = ErasedRawStridedRef::from_slice(&[7i32], dims, strides, 0).unwrap();
+    let rhs = ErasedRawStridedRef::from_slice(&[0i32], dims, strides, 0).unwrap();
+    let mut actual = [123i32];
+    let mut output = ErasedRawStridedMut::from_slice_mut(&mut actual, dims, strides, 0).unwrap();
+    assert!(matches!(
+        erased_zip_into(
+            KernelDType::I32,
+            ErasedZipOp::Divide,
+            &ExecContext::serial(),
+            &mut output,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs),
+        ),
+        Err(StridedError::IntegerDivisionByZero { op: "divide" })
+    ));
+    assert_eq!(actual, [123]);
+
+    let empty_dims = [0usize, 2];
+    let empty_strides = [1isize, 0];
+    let lhs =
+        ErasedRawStridedRef::from_slice(&[] as &[i32], &empty_dims, &empty_strides, isize::MAX)
+            .unwrap();
+    let rhs =
+        ErasedRawStridedRef::from_slice(&[] as &[i32], &empty_dims, &empty_strides, isize::MAX)
+            .unwrap();
+    let mut actual: [i32; 0] = [];
+    let mut output =
+        ErasedRawStridedMut::from_slice_mut(&mut actual, &empty_dims, &empty_strides, isize::MAX)
+            .unwrap();
+    erased_zip_into(
+        KernelDType::I32,
+        ErasedZipOp::Divide,
+        &ExecContext::serial(),
+        &mut output,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
+    )
+    .unwrap();
+
+    macro_rules! compact_late_zero {
+        ($rank:expr, $ty:ty, $dtype:expr) => {{
+            let dims = vec![2usize; $rank];
+            let mut strides = Vec::with_capacity($rank);
+            let mut stride = 1isize;
+            for &dim in &dims {
+                strides.push(stride);
+                stride *= dim as isize;
+            }
+            let total = 1usize << $rank;
+            let lhs_data = vec![1 as $ty; total];
+            let mut rhs_data = vec![1 as $ty; total];
+            rhs_data[total - 1] = 0;
+            let lhs = ErasedRawStridedRef::from_slice(&lhs_data, &dims, &strides, 0).unwrap();
+            let rhs = ErasedRawStridedRef::from_slice(&rhs_data, &dims, &strides, 0).unwrap();
+            let mut actual = vec![77 as $ty; total];
             let mut output =
                 ErasedRawStridedMut::from_slice_mut(&mut actual, &dims, &strides, 0).unwrap();
-            let error = erased_zip_into(
+            assert!(matches!(
+                erased_zip_into(
+                    $dtype,
+                    ErasedZipOp::Divide,
+                    &ExecContext::serial(),
+                    &mut output,
+                    &ErasedRawStridedPtr::from_ref(&lhs),
+                    &ErasedRawStridedPtr::from_ref(&rhs),
+                ),
+                Err(StridedError::IntegerDivisionByZero { op: "divide" })
+            ));
+            assert_eq!(actual, vec![77 as $ty; total]);
+        }};
+    }
+
+    compact_late_zero!(1, i32, KernelDType::I32);
+    compact_late_zero!(2, i32, KernelDType::I32);
+    compact_late_zero!(4, i32, KernelDType::I32);
+    compact_late_zero!(8, i32, KernelDType::I32);
+    compact_late_zero!(9, i32, KernelDType::I32);
+
+    macro_rules! negative_nonunit_layout {
+        ($ty:ty, $dtype:expr) => {{
+            let dims = [2usize, 3];
+            let strides = [-2isize, 3];
+            let lhs_data = [1 as $ty; 6];
+            let rhs_data = [1 as $ty, 0, 1, 1, 0, 1, 1, 0, 1];
+            let lhs = ErasedRawStridedRef::from_slice(&lhs_data, &dims, &[1isize, 2], 0).unwrap();
+            let rhs = ErasedRawStridedRef::from_slice(&rhs_data, &dims, &strides, 2).unwrap();
+            let mut actual = [77 as $ty; 6];
+            let mut output =
+                ErasedRawStridedMut::from_slice_mut(&mut actual, &dims, &[1isize, 2], 0).unwrap();
+            erased_zip_into(
                 $dtype,
                 ErasedZipOp::Divide,
                 &ExecContext::serial(),
@@ -347,17 +475,31 @@ fn one_shot_integer_division_is_wrapping_and_zero_is_preflighted() {
                 &ErasedRawStridedPtr::from_ref(&lhs),
                 &ErasedRawStridedPtr::from_ref(&rhs),
             )
-            .unwrap_err();
+            .unwrap();
+            assert_eq!(actual, [1 as $ty; 6]);
+
+            let rhs_data = [1 as $ty, 0, 1, 1, 0, 1, 0, 0, 1];
+            let rhs = ErasedRawStridedRef::from_slice(&rhs_data, &dims, &strides, 2).unwrap();
+            let mut actual = [77 as $ty; 6];
+            let mut output =
+                ErasedRawStridedMut::from_slice_mut(&mut actual, &dims, &[1isize, 2], 0).unwrap();
             assert!(matches!(
-                error,
-                StridedError::IntegerDivisionByZero { op: "divide" }
+                erased_zip_into(
+                    $dtype,
+                    ErasedZipOp::Remainder,
+                    &ExecContext::serial(),
+                    &mut output,
+                    &ErasedRawStridedPtr::from_ref(&lhs),
+                    &ErasedRawStridedPtr::from_ref(&rhs),
+                ),
+                Err(StridedError::IntegerDivisionByZero { op: "remainder" })
             ));
-            assert_eq!(actual, [99, 99]);
+            assert_eq!(actual, [77 as $ty; 6]);
         }};
     }
 
-    check!(i32, KernelDType::I32);
-    check!(i64, KernelDType::I64);
+    negative_nonunit_layout!(i32, KernelDType::I32);
+    negative_nonunit_layout!(i64, KernelDType::I64);
 }
 
 #[test]
