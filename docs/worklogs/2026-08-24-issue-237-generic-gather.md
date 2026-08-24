@@ -165,8 +165,17 @@ above:
   the prior rank-8/rank-2 scattered-write confound.
 
 The f64/i64 benchmark dtype is retained as the representative performance case;
-existing dtype-matrix correctness tests remain required. Because the benchmark
-layout and safety proof changed materially while recording these conditions,
-implementation remains blocked until `reviewer-flash` re-reviews this exact
-design revision. Benchmark implementation, baseline results, candidate results,
-and final verification are pending.
+existing dtype-matrix correctness tests remain required. `reviewer-flash`
+re-reviewed exact design commit `9dfdf05` and returned **Correct-to-merge**;
+benchmark-first implementation may proceed. Its three non-blocking parameter
+conditions are binding:
+
+- the selected operand axis extent is the batch count (at least 2 in every
+  case), and a deterministic permutation spans `[0, extent)` so starts vary;
+- non-unit and negative rank-2 cases keep the same compact destination
+  dims/strides as compact rank 2, varying only operand/index layout;
+- the hot-loop invariant must explicitly state that window offset plus every
+  clamped index contribution remains inside the validated operand span.
+
+Benchmark implementation, baseline results, candidate results, and final
+verification are pending.
