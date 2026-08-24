@@ -127,4 +127,59 @@ must assert that all benchmark recipes leave `contiguous_axis0_run` unset.
 Generic non-dense fill performance is intentionally not claimed by the timing
 matrix; it remains a correctness/validity target.
 
-Benchmark implementation, baseline, candidate, and verification are pending.
+## Baseline evidence
+
+Benchmark-only commit `df03ec1` ran the complete baseline on CPUs 1-4 in L3 domain 0-7 after a valid gate (selected 0.0-1.2%, sibling maximum 6.8%).
+
+| family | variant/context | size | estimate `[low, high]` |
+|---|---|---|---:|
+| generic | compact_rank2_serial | n4096 | 51.580 µs `[49.332 µs, 54.127 µs]` |
+| generic | compact_rank4_serial | n4096 | 105.57 µs `[103.52 µs, 109.91 µs]` |
+| generic | compact_rank8_serial | n4096 | 226.90 µs `[222.69 µs, 231.24 µs]` |
+| generic | rank2_negative_crop_serial | n4096 | 52.621 µs `[50.483 µs, 54.045 µs]` |
+| generic | rank2_nonunit_serial | n4096 | 76.374 µs `[73.935 µs, 78.653 µs]` |
+| generic | compact_rank2_max_threads_4 | n4096 | 49.314 µs `[47.375 µs, 52.041 µs]` |
+| generic | compact_rank4_max_threads_4 | n4096 | 104.04 µs `[99.783 µs, 106.77 µs]` |
+| generic | compact_rank8_max_threads_4 | n4096 | 221.15 µs `[215.30 µs, 227.31 µs]` |
+| generic | rank2_negative_crop_max_threads_4 | n4096 | 50.588 µs `[49.204 µs, 52.910 µs]` |
+| generic | rank2_nonunit_max_threads_4 | n4096 | 73.025 µs `[71.798 µs, 76.086 µs]` |
+| generic | compact_rank2_serial | n32768 | 419.31 µs `[403.54 µs, 433.71 µs]` |
+| generic | compact_rank4_serial | n32768 | 836.96 µs `[796.23 µs, 881.97 µs]` |
+| generic | compact_rank8_serial | n32768 | 1.7168 ms `[1.6474 ms, 1.7880 ms]` |
+| generic | rank2_negative_crop_serial | n32768 | 414.43 µs `[390.74 µs, 433.43 µs]` |
+| generic | rank2_nonunit_serial | n32768 | 612.04 µs `[586.24 µs, 637.66 µs]` |
+| generic | compact_rank2_max_threads_4 | n32768 | 392.18 µs `[383.99 µs, 410.85 µs]` |
+| generic | compact_rank4_max_threads_4 | n32768 | 820.97 µs `[786.29 µs, 867.73 µs]` |
+| generic | compact_rank8_max_threads_4 | n32768 | 1.7366 ms `[1.6872 ms, 1.8005 ms]` |
+| generic | rank2_negative_crop_max_threads_4 | n32768 | 386.69 µs `[378.87 µs, 405.08 µs]` |
+| generic | rank2_nonunit_max_threads_4 | n32768 | 608.50 µs `[581.79 µs, 632.84 µs]` |
+| generic | compact_rank2_serial | n262144 | 3.1539 ms `[3.0601 ms, 3.2661 ms]` |
+| generic | compact_rank4_serial | n262144 | 6.6078 ms `[6.3942 ms, 6.8712 ms]` |
+| generic | compact_rank8_serial | n262144 | 13.561 ms `[13.229 ms, 14.087 ms]` |
+| generic | rank2_negative_crop_serial | n262144 | 3.3040 ms `[3.2245 ms, 3.4226 ms]` |
+| generic | rank2_nonunit_serial | n262144 | 4.9075 ms `[4.6598 ms, 5.1956 ms]` |
+| generic | compact_rank2_max_threads_4 | n262144 | 546.61 µs `[545.90 µs, 547.29 µs]` |
+| generic | compact_rank4_max_threads_4 | n262144 | 964.19 µs `[963.29 µs, 965.38 µs]` |
+| generic | compact_rank8_max_threads_4 | n262144 | 1.8034 ms `[1.7988 ms, 1.8079 ms]` |
+| generic | rank2_negative_crop_max_threads_4 | n262144 | 546.13 µs `[545.72 µs, 546.69 µs]` |
+| generic | rank2_nonunit_max_threads_4 | n262144 | 970.48 µs `[969.25 µs, 972.14 µs]` |
+| generic | compact_rank2_serial | n1048576 | 12.732 ms `[12.216 ms, 13.268 ms]` |
+| generic | compact_rank4_serial | n1048576 | 26.639 ms `[26.254 ms, 27.144 ms]` |
+| generic | compact_rank8_serial | n1048576 | 54.485 ms `[53.077 ms, 56.123 ms]` |
+| generic | rank2_negative_crop_serial | n1048576 | 12.725 ms `[12.365 ms, 13.219 ms]` |
+| generic | rank2_nonunit_serial | n1048576 | 19.389 ms `[18.751 ms, 20.330 ms]` |
+| generic | compact_rank2_max_threads_4 | n1048576 | 2.0569 ms `[2.0555 ms, 2.0603 ms]` |
+| generic | compact_rank4_max_threads_4 | n1048576 | 3.7116 ms `[3.7076 ms, 3.7177 ms]` |
+| generic | compact_rank8_max_threads_4 | n1048576 | 7.0485 ms `[7.0395 ms, 7.0647 ms]` |
+| generic | rank2_negative_crop_max_threads_4 | n1048576 | 2.0578 ms `[2.0553 ms, 2.0603 ms]` |
+| generic | rank2_nonunit_max_threads_4 | n1048576 | 3.8132 ms `[3.8105 ms, 3.8187 ms]` |
+| rank1 control | serial | small_n4096 | 573.82 ns `[550.88 ns, 599.21 ns]` |
+| rank1 control | max_threads_4 | small_n4096 | 463.15 ns `[446.65 ns, 500.34 ns]` |
+| rank1 control | serial | near_threshold_n32768 | 23.523 µs `[22.864 µs, 24.578 µs]` |
+| rank1 control | max_threads_4 | near_threshold_n32768 | 23.662 µs `[22.855 µs, 24.720 µs]` |
+| rank1 control | serial | medium_n262144 | 32.515 µs `[31.566 µs, 34.086 µs]` |
+| rank1 control | max_threads_4 | medium_n262144 | 31.851 µs `[30.679 µs, 33.657 µs]` |
+| rank1 control | serial | large_n1048576 | 132.88 µs `[126.46 µs, 138.21 µs]` |
+| rank1 control | max_threads_4 | large_n1048576 | 128.73 µs `[124.40 µs, 135.89 µs]` |
+
+The need-before-implementation gate is **PASS**. At medium target size, compact rank 2/4/8 serial measured 3.1539/6.6078/13.561 ms; rank 4/8 exceed 1.0 ms and rank 8 is 4.30x rank 2. The non-unit case is 1.56x rank 2. Cases/gates are frozen; production may proceed.
