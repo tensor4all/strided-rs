@@ -177,5 +177,68 @@ conditions are binding:
 - the hot-loop invariant must explicitly state that window offset plus every
   clamped index contribution remains inside the validated operand span.
 
-Benchmark implementation, baseline results, candidate results, and final
-verification are pending.
+## Baseline evidence
+
+Benchmark-only commit: `9bd575f`. The complete baseline ran sequentially on
+CPUs 50-53 in L3 domain 48-55. The accepted four-second load gate measured
+selected cores at 0.0-0.5% busy and every sibling at at most 0.5%, so the run is
+valid.
+
+Criterion point estimates and confidence intervals:
+
+| variant | context | size | estimate `[low, high]` |
+|---|---|---:|---:|
+| compact rank 2 | serial | 4,096 | 155.71 us `[150.03, 162.93]` |
+| compact rank 4 | serial | 4,096 | 242.02 us `[233.56, 247.17]` |
+| compact rank 8 | serial | 4,096 | 434.78 us `[433.94, 435.34]` |
+| non-unit rank 2 | serial | 4,096 | 158.61 us `[154.85, 162.80]` |
+| negative rank 2 | serial | 4,096 | 162.74 us `[162.62, 162.89]` |
+| compact rank 2 | max_threads(4) | 4,096 | 156.22 us `[149.35, 162.59]` |
+| compact rank 4 | max_threads(4) | 4,096 | 239.38 us `[234.82, 244.59]` |
+| compact rank 8 | max_threads(4) | 4,096 | 427.05 us `[419.67, 434.57]` |
+| non-unit rank 2 | max_threads(4) | 4,096 | 160.13 us `[157.43, 163.65]` |
+| negative rank 2 | max_threads(4) | 4,096 | 156.34 us `[152.19, 162.95]` |
+| compact rank 2 | serial | 32,768 | 1.2649 ms `[1.2274, 1.3050]` |
+| compact rank 4 | serial | 32,768 | 1.9775 ms `[1.9767, 1.9783]` |
+| compact rank 8 | serial | 32,768 | 3.4039 ms `[3.3411, 3.4840]` |
+| non-unit rank 2 | serial | 32,768 | 1.2902 ms `[1.2563, 1.3052]` |
+| negative rank 2 | serial | 32,768 | 1.2647 ms `[1.2425, 1.3029]` |
+| compact rank 2 | max_threads(4) | 32,768 | 1.2357 ms `[1.2069, 1.2762]` |
+| compact rank 4 | max_threads(4) | 32,768 | 1.9665 ms `[1.9383, 1.9771]` |
+| compact rank 8 | max_threads(4) | 32,768 | 3.4581 ms `[3.4132, 3.4809]` |
+| non-unit rank 2 | max_threads(4) | 32,768 | 1.3026 ms `[1.2917, 1.3065]` |
+| negative rank 2 | max_threads(4) | 32,768 | 1.3045 ms `[1.3009, 1.3073]` |
+| compact rank 2 | serial | 262,144 | 10.457 ms `[10.442, 10.469]` |
+| compact rank 4 | serial | 262,144 | 15.737 ms `[15.597, 15.821]` |
+| compact rank 8 | serial | 262,144 | 27.882 ms `[27.797, 27.949]` |
+| non-unit rank 2 | serial | 262,144 | 10.418 ms `[10.357, 10.461]` |
+| negative rank 2 | serial | 262,144 | 10.378 ms `[10.372, 10.382]` |
+| compact rank 2 | max_threads(4) | 262,144 | 1.2864 ms `[1.2857, 1.2873]` |
+| compact rank 4 | max_threads(4) | 262,144 | 1.6719 ms `[1.6706, 1.6731]` |
+| compact rank 8 | max_threads(4) | 262,144 | 2.6332 ms `[2.6256, 2.6373]` |
+| non-unit rank 2 | max_threads(4) | 262,144 | 1.2867 ms `[1.2845, 1.2893]` |
+| negative rank 2 | max_threads(4) | 262,144 | 1.2831 ms `[1.2820, 1.2836]` |
+| compact rank 2 | serial | 1,048,576 | 40.147 ms `[38.931, 41.213]` |
+| compact rank 4 | serial | 1,048,576 | 62.498 ms `[61.226, 63.484]` |
+| compact rank 8 | serial | 1,048,576 | 108.37 ms `[106.12, 110.33]` |
+| non-unit rank 2 | serial | 1,048,576 | 41.368 ms `[40.960, 41.602]` |
+| negative rank 2 | serial | 1,048,576 | 41.094 ms `[40.413, 41.508]` |
+| compact rank 2 | max_threads(4) | 1,048,576 | 5.1047 ms `[5.0864, 5.1131]` |
+| compact rank 4 | max_threads(4) | 1,048,576 | 6.6357 ms `[6.6245, 6.6491]` |
+| compact rank 8 | max_threads(4) | 1,048,576 | 10.422 ms `[10.413, 10.429]` |
+| non-unit rank 2 | max_threads(4) | 1,048,576 | 5.1386 ms `[5.1339, 5.1476]` |
+| negative rank 2 | max_threads(4) | 1,048,576 | 5.1339 ms `[5.0843, 5.1579]` |
+| rank-one control | serial | 4,096 | 4.5166 us `[4.4982, 4.5240]` |
+| rank-one control | max_threads(4) | 4,096 | 3.9043 us `[3.8332, 3.9555]` |
+| rank-one control | serial | 32,768 | 36.737 us `[36.735, 36.739]` |
+| rank-one control | max_threads(4) | 32,768 | 36.698 us `[36.505, 36.831]` |
+| rank-one control | serial | 262,144 | 277.95 us `[267.13, 288.66]` |
+| rank-one control | max_threads(4) | 262,144 | 123.51 us `[123.46, 123.57]` |
+| rank-one control | serial | 1,048,576 | 1.1629 ms `[1.1495, 1.1808]` |
+| rank-one control | max_threads(4) | 1,048,576 | 467.26 us `[466.45, 467.95]` |
+
+The need-before-implementation gate is **PASS**. At medium size, serial generic
+rank 4 is 56.6x and rank 8 is 100.3x slower than the rank-one control, both far
+above 1.0 ms. Rank-8 per-output cost is 2.67x rank 2, exceeding the predeclared
+25% scaling signal. Production implementation may proceed without changing any
+case or gate. Candidate results and final verification remain pending.
