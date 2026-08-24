@@ -210,7 +210,7 @@ Benchmark-only commit `a00e057` ran the complete baseline sequentially on CPUs 1
 | rank2 control | serial | large_n1048576 | 8.3363 ms `[8.0298 ms, 8.6054 ms]` |
 | rank2 control | max_threads_4 | large_n1048576 | 2.0558 ms `[2.0434 ms, 2.0649 ms]` |
 
-The need-before-implementation gate is **PASS**. At medium size, compact single-axis rank 4/8 serial measured 2.5877/4.2516 ms versus the rank-2 control 2.0449 ms; both exceed 1.0 ms and rank 8 is 2.08x the control. The rank-8/rank-2 per-source ratio is 2.09, above the 25% signal. Cases and gates were frozen before production implementation.
+The need-before-implementation gate is **PASS**. At medium size, compact single-axis rank 4/8 serial measured 2.5877/4.2516 ms versus the rank-2 control 2.0449 ms; both exceed 1.0 ms and rank 8 is 2.08x the control. The rank-8/rank-2 per-source ratio is 2.08, above the 25% signal. Cases and gates were frozen before production implementation.
 
 ## Candidate attempt 1 and design delta
 
@@ -554,8 +554,13 @@ issues. Minor dispositions:
 - a partial inner-axis fusion ground-truth test was added;
 - the final promotion pair used the same L3 domain for baseline/candidate and
   all margins remain above their gates;
-- rank-2 control improvement was predeclared and retained in the complete table.
+- rank-2 control improvement was predeclared and retained in the complete table;
+- the large multi-axis rank-8 four-thread candidate (2.4542 ms) is 3.4% slower
+  than its serial candidate (2.3723 ms), but still improves 6.45x over the
+  matching four-thread baseline and does not affect any gate. It is retained
+  rather than selectively excluded.
 
 The helper rename does not alter timed execution, so the promotion benchmark
-carries forward. Exact-final `reviewer-flash` review and hosted CI remain
-pending.
+carries forward. The exact-final safety and evidence reviews both returned
+**Correct-to-merge**, with no Critical or Important findings; the two evidence
+Minors are corrected/disclosed above. Hosted CI remains the final merge gate.
