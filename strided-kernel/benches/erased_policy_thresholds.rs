@@ -1,4 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::measurement::Measurement;
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion,
+};
 use std::time::Duration;
 use strided_kernel::{
     col_major_strides, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
@@ -182,6 +185,139 @@ fn bench_gather_take(c: &mut Criterion) {
                 black_box(&mut dest);
             });
         });
+    }
+    group.finish();
+}
+
+#[derive(Clone, Copy)]
+enum GatherVariant {
+    Compact(usize),
+    NonunitRank2,
+    NegativeRank2,
+}
+
+impl GatherVariant {
+    fn label(self) -> String {
+        match self {
+            Self::Compact(rank) => format!("compact_rank{rank}"),
+            Self::NonunitRank2 => "rank2_nonunit_operand_index".to_string(),
+            Self::NegativeRank2 => "rank2_negative_operand".to_string(),
+        }
+    }
+}
+
+fn varying_starts(batch: usize) -> Vec<i64> {
+    (0..batch)
+        .map(|index| ((index * 5 + 1) % batch) as i64)
+        .collect()
+}
+
+fn bench_gather_variant<M: Measurement>(
+    group: &mut BenchmarkGroup<'_, M>,
+    case: BenchCase,
+    variant: GatherVariant,
+) {
+    let (operand_dims, operand_strides, operand_len, operand_offset, index_strides, index_len) =
+        match variant {
+            GatherVariant::Compact(rank) => {
+                let window = 1usize << (rank - 1);
+                let batch = case.len / window;
+                let mut dims = vec![2; rank - 1];
+                dims.push(batch);
+                let strides = col_major_strides(&dims);
+                (dims, strides, case.len, 0, vec![1, batch as isize], batch)
+            }
+            GatherVariant::NonunitRank2 => {
+                let batch = case.len / 2;
+                (
+                    vec![2, batch],
+                    vec![2, 4],
+                    4 * batch - 1,
+                    0,
+                    vec![2, (2 * batch) as isize],
+                    2 * batch - 1,
+                )
+            }
+            GatherVariant::NegativeRank2 => {
+                let batch = case.len / 2;
+                (
+                    vec![2, batch],
+                    vec![1, -2],
+                    case.len,
+                    2 * (batch - 1) as isize,
+                    vec![1, batch as isize],
+                    batch,
+                )
+            }
+        };
+    let batch = operand_dims[operand_dims.len() - 1];
+    let index_dims = vec![batch, 1];
+    let dest_dims = operand_dims.clone();
+    let dest_strides = col_major_strides(&dest_dims);
+    let indices = varying_starts(batch);
+    let mut index_data = vec![0i64; index_len];
+    for (index, &start) in indices.iter().enumerate() {
+        index_data[index * (index_strides[0] as usize)] = start;
+    }
+    let operand = patterned_f64(operand_len);
+    let spec = GatherSpec {
+        offset_dims: (0..operand_dims.len() - 1).collect(),
+        collapsed_slice_dims: vec![operand_dims.len() - 1],
+        start_index_map: vec![operand_dims.len() - 1],
+        index_vector_dim: 1,
+        slice_sizes: operand_dims
+            .iter()
+            .enumerate()
+            .map(|(axis, _)| if axis + 1 == operand_dims.len() { 1 } else { 2 })
+            .collect(),
+    };
+    let plan = ErasedGatherPlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &operand_dims,
+        &operand_strides,
+        &index_dims,
+        &index_strides,
+        &dest_dims,
+        &dest_strides,
+        spec,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, operand_offset)
+            .unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&index_data, &index_dims, &index_strides, 0).unwrap();
+    let mut output = vec![0.0f64; case.len];
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+    let ctx = context(case);
+    let id = BenchmarkId::new(
+        format!("{}_{}", variant.label(), context_label(case)),
+        format!("{}_n{}", case.label, case.len),
+    );
+
+    group.bench_function(id, |bencher| {
+        bencher.iter(|| {
+            plan.execute(&ctx, &mut dest, &operand_ref, &index_ref)
+                .unwrap();
+            black_box(&mut dest);
+        });
+    });
+}
+
+fn bench_erased_gather_generic_rank_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_gather_generic_rank_layout");
+    for case in profile_cases() {
+        for variant in [
+            GatherVariant::Compact(2),
+            GatherVariant::Compact(4),
+            GatherVariant::Compact(8),
+            GatherVariant::NonunitRank2,
+            GatherVariant::NegativeRank2,
+        ] {
+            bench_gather_variant(&mut group, case, variant);
+        }
     }
     group.finish();
 }
@@ -416,6 +552,7 @@ criterion_group! {
     targets =
         bench_axis_reduce,
         bench_gather_take,
+        bench_erased_gather_generic_rank_layout,
         bench_dynamic_slice,
         bench_dynamic_update_slice,
         bench_pad_fill_and_copy,
