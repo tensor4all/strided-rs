@@ -49,3 +49,51 @@ Record rank/layout/serial/four-thread baseline and candidate evidence. The bench
 ## Verification and review gates
 
 Run focused default/parallel tests, allocation tests, default/parallel workspace tests, coverage for the modified production file, docs, formatting, and repository-rules review. Selected reviewer is read-only `reviewer-flash` with high thinking. Pre-implementation review of `a2dd71c0` by read-only `reviewer-flash` (high) returned **Correct-to-merge** with three nonblocking benchmark/allocation/carry-construction cautions, incorporated above. The exact final diff requires a second `Correct-to-merge` verdict before PR creation.
+
+## Candidate evidence
+
+Production commit `b71ea74` implements the reviewed fixed-array cursor and unchanged rank-above-8 fallback. The accepted full paired run used separate Cargo target directories (to prevent cross-worktree artifact reuse) and CPUs 9-12 in L3 domain 8-15 after a valid gate (selected average 1.7%, domain-other maximum 0.3%); baseline and candidate ran sequentially with the frozen environment.
+
+| layout | context | size | baseline divide | candidate divide | speedup | interval-bound speedup |
+|---|---|---:|---:|---:|---:|---:|
+| compact_rank1 | serial | 262144 | 0.9081 ms | 0.8913 ms | 1.02x | 0.98-1.06x |
+| compact_rank2 | serial | 262144 | 1.3159 ms | 0.9894 ms | 1.33x | 1.29-1.38x |
+| compact_rank4 | serial | 262144 | 2.2543 ms | 1.2382 ms | 1.82x | 1.74-1.88x |
+| compact_rank8 | serial | 262144 | 4.1025 ms | 1.2673 ms | 3.24x | 3.16-3.35x |
+| rank2_negative | serial | 262144 | 2.3155 ms | 1.7604 ms | 1.32x | 1.23-1.38x |
+| rank2_nonunit | serial | 262144 | 1.3884 ms | 0.8847 ms | 1.57x | 1.46-1.69x |
+| compact_rank1 | max_threads_4 | 262144 | 0.7408 ms | 0.6286 ms | 1.18x | 1.12-1.23x |
+| compact_rank2 | max_threads_4 | 262144 | 1.2670 ms | 0.6901 ms | 1.84x | 1.80-1.87x |
+| compact_rank4 | max_threads_4 | 262144 | 2.2491 ms | 0.9926 ms | 2.27x | 2.25-2.29x |
+| compact_rank8 | max_threads_4 | 262144 | 4.3492 ms | 1.1466 ms | 3.79x | 3.72-3.86x |
+| rank2_negative | max_threads_4 | 262144 | 1.4965 ms | 0.9391 ms | 1.59x | 1.57-1.62x |
+| rank2_nonunit | max_threads_4 | 262144 | 1.2309 ms | 0.7190 ms | 1.71x | 1.68-1.77x |
+| compact_rank1 | serial | 1048576 | 4.1410 ms | 3.7445 ms | 1.11x | 1.07-1.12x |
+| compact_rank2 | serial | 1048576 | 5.4750 ms | 4.0994 ms | 1.34x | 1.31-1.35x |
+| compact_rank4 | serial | 1048576 | 9.0235 ms | 5.0443 ms | 1.79x | 1.70-1.90x |
+| compact_rank8 | serial | 1048576 | 16.8670 ms | 5.2414 ms | 3.22x | 3.07-3.41x |
+| rank2_negative | serial | 1048576 | 9.8723 ms | 6.9330 ms | 1.42x | 1.39-1.46x |
+| rank2_nonunit | serial | 1048576 | 5.9148 ms | 3.7228 ms | 1.59x | 1.52-1.67x |
+| compact_rank1 | max_threads_4 | 1048576 | 2.9193 ms | 2.4148 ms | 1.21x | 1.20-1.22x |
+| compact_rank2 | max_threads_4 | 1048576 | 4.7288 ms | 2.7797 ms | 1.70x | 1.66-1.73x |
+| compact_rank4 | max_threads_4 | 1048576 | 8.4082 ms | 3.8841 ms | 2.16x | 2.13-2.20x |
+| compact_rank8 | max_threads_4 | 1048576 | 16.4930 ms | 4.5294 ms | 3.64x | 3.58-3.71x |
+| rank2_negative | max_threads_4 | 1048576 | 5.9997 ms | 3.7909 ms | 1.58x | 1.57-1.59x |
+| rank2_nonunit | max_threads_4 | 1048576 | 4.7795 ms | 2.7767 ms | 1.72x | 1.71-1.73x |
+
+At medium size, serial compact rank 2/4/8 improved 1.33/1.82/3.24x; four-thread public calls improved 1.84/2.27/3.79x. Negative/non-unit layouts improved 1.32/1.57x serial and 1.59/1.71x with four threads. Rank-one divide was non-regressed (1.02x serial, 1.18x four-thread). Large results remained directionally consistent.
+
+The first candidate command accidentally reused the baseline worktree binary through a shared Cargo target and was discarded before interpretation. The corrected run used distinct target directories. Because the full paired run showed impossible >10% drift in several unchanged serial Add cells, Add-only baseline/candidate groups were independently rerun on CPUs 41-44 after a second accepted gate; all medium/large Add estimates were within 5.4% and every frozen 10% control gate passed.
+
+## Verification
+
+- focused default and parallel one-shot/allocation tests: 14 passed each
+- default workspace: 916 passed, 9 ignored
+- parallel workspace: 990 passed, 9 ignored
+- `cargo check -p strided-kernel --features parallel`: passed
+- `cargo doc --workspace --no-deps`: passed
+- formatting: passed
+- deterministic repository-rules preview: passed
+- modified `erased.rs` coverage: 88.34% (threshold 80%); the only global package failure remains the unchanged `reduce_view.rs` baseline deficit
+
+Exact-final independent review is pending.
