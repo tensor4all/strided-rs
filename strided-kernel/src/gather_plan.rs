@@ -109,7 +109,7 @@ struct WindowReplay {
 }
 
 struct WindowReplayState {
-    coords: AxisVec<usize>,
+    coords: CoordScratch,
     source_offset: isize,
     dest_offset: isize,
 }
@@ -167,16 +167,20 @@ impl WindowReplay {
         source_base: isize,
         dest_base: isize,
     ) -> Result<WindowReplayState> {
-        let mut coords = AxisVec::with_capacity(self.shape.len());
+        let mut coords = CoordScratch::new(self.shape.len());
         let mut source_offset = source_base;
         let mut dest_offset = dest_base;
-        for (axis, &dim) in self.shape.iter().enumerate() {
-            let coord = linear % dim;
+        for (axis, (&dim, coord)) in self
+            .shape
+            .iter()
+            .zip(coords.as_mut_slice().iter_mut())
+            .enumerate()
+        {
+            *coord = linear % dim;
             linear /= dim;
             let replay_axis = self.axes[axis];
-            coords.push(coord);
-            source_offset = checked_offset_add(source_offset, replay_axis.source_step, coord)?;
-            dest_offset = checked_offset_add(dest_offset, replay_axis.dest_step, coord)?;
+            source_offset = checked_offset_add(source_offset, replay_axis.source_step, *coord)?;
+            dest_offset = checked_offset_add(dest_offset, replay_axis.dest_step, *coord)?;
         }
         Ok(WindowReplayState {
             coords,
@@ -189,6 +193,7 @@ impl WindowReplay {
     fn advance(&self, state: &mut WindowReplayState) {
         for ((coord, &dim), replay_axis) in state
             .coords
+            .as_mut_slice()
             .iter_mut()
             .zip(self.shape.iter())
             .zip(self.axes.iter())
