@@ -171,6 +171,47 @@ fn erased_gather_plan_executes_supported_value_dtype_set() {
 }
 
 #[test]
+fn rank_one_scalar_take_clamps_indices_and_honors_offsets() {
+    let dims = [3usize];
+    let strides = [1isize];
+    let operand = [-1.0f64, 10.0, 20.0, 30.0];
+    let indices = [99i64, -7, 1, 9];
+    let mut output = [-1.0f64; 4];
+    let plan = ErasedGatherPlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &dims,
+        &strides,
+        &dims,
+        &strides,
+        &dims,
+        &strides,
+        GatherSpec {
+            offset_dims: vec![],
+            collapsed_slice_dims: vec![0],
+            start_index_map: vec![0],
+            index_vector_dim: 1,
+            slice_sizes: vec![1],
+        },
+    )
+    .unwrap();
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 1).unwrap();
+    let index_ref = ErasedRawStridedRef::from_slice(&indices, &dims, &strides, 1).unwrap();
+    let mut output_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 1).unwrap();
+
+    plan.execute(
+        &ExecContext::serial(),
+        &mut output_ref,
+        &operand_ref,
+        &index_ref,
+    )
+    .unwrap();
+
+    assert_eq!(output, [-1.0, 10.0, 20.0, 30.0]);
+}
+
+#[test]
 fn erased_gather_plan_rejects_dtype_and_layout_mismatch_before_writing() {
     let operand_dims = [2usize];
     let strides = [1isize];

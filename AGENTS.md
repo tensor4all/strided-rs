@@ -108,11 +108,12 @@ RUSTFLAGS="-C target-cpu=native" cargo bench   # enable AVX2/NEON auto-vectoriza
 
 ## Benchmarking Notes
 
+- Start with [`docs/design/erased-execution-policy.md`](docs/design/erased-execution-policy.md) when changing CPU threading thresholds or prepared-plan fast paths; it links the policy, benchmark, worklog, issue, and external results flow.
 - This workspace's own regression benchmarks live in `<crate>/benches/`.
   Cross-repository comparisons and published results go to
   [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite).
 - Crate READMEs and rustdoc document usage and API contracts, not performance
-  tables. Dated worklogs under `docs/` may quote measurements as evidence.
+  tables. Dated worklogs under `docs/worklogs/` may quote measurements as evidence.
 - Naive baselines must be credible: pointer-based loops with precomputed
   strides, not per-element high-level indexing.
 - Keep setup out of timed regions; use `black_box`.

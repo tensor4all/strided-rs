@@ -316,6 +316,21 @@ impl GatherPlan {
         if self.total == 0 {
             return Ok(());
         }
+        if self.uses_rank_one_scalar_take_path() {
+            #[cfg(feature = "parallel")]
+            {
+                let nthreads = crate::threading::parallel_threads_for_len(self.total);
+                if nthreads > 1 {
+                    return self.execute_rank_one_scalar_take_parallel(
+                        dest,
+                        operand,
+                        start_indices,
+                        nthreads,
+                    );
+                }
+            }
+            return self.execute_rank_one_scalar_take(dest, operand, start_indices);
+        }
         #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.total);
@@ -380,6 +395,102 @@ impl GatherPlan {
             advance_col_major_index(out_idx, &self.dest_dims);
         }
         Ok(())
+    }
+
+    fn uses_rank_one_scalar_take_path(&self) -> bool {
+        self.operand_dims.len() == 1
+            && self.index_dims.len() == 1
+            && self.dest_dims.len() == 1
+            && self.operand_strides[0] == 1
+            && self.index_strides[0] == 1
+            && self.dest_strides[0] == 1
+            && self.spec.offset_dims.is_empty()
+            && self.spec.collapsed_slice_dims.as_slice() == [0]
+            && self.spec.start_index_map.as_slice() == [0]
+            && self.spec.index_vector_dim == 1
+            && self.spec.slice_sizes.as_slice() == [1]
+    }
+
+    fn execute_rank_one_scalar_take<T, I, W>(
+        &self,
+        dest: &mut W,
+        operand: &RawStridedRef<'_, T>,
+        start_indices: &RawStridedRef<'_, I>,
+    ) -> Result<()>
+    where
+        T: Copy,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
+        let mut dest_offset = dest.offset();
+        let mut index_offset = start_indices.offset();
+        let operand_offset = operand.offset();
+        let operand_data = operand.data();
+        let index_data = start_indices.data();
+
+        // INVARIANT: compile and check_call validated compact rank-one layouts,
+        // so incrementing these offsets once per logical element stays within
+        // the validated allocations and cannot overflow isize.
+        for _ in 0..self.total {
+            // SAFETY: the invariant above proves all three offsets are in bounds.
+            unsafe {
+                let start = (*index_data.as_ptr().offset(index_offset)).to_i64();
+                let source_offset = operand_offset + self.clamp_window_start(start, 0) as isize;
+                dest.write_at(dest_offset, *operand_data.as_ptr().offset(source_offset));
+            }
+            dest_offset += 1;
+            index_offset += 1;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "parallel")]
+    fn execute_rank_one_scalar_take_parallel<T, I, W>(
+        &self,
+        dest: &mut W,
+        operand: &RawStridedRef<'_, T>,
+        start_indices: &RawStridedRef<'_, I>,
+        nthreads: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
+        let dest_offset = dest.offset();
+        let operand_offset = operand.offset();
+        let index_offset = start_indices.offset();
+        // SAFETY: check_call validated the writer's complete destination layout.
+        let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
+        let operand_ptr = crate::threading::SendPtr(operand.data().as_ptr() as *mut T);
+        let index_ptr = crate::threading::SendPtr(start_indices.data().as_ptr() as *mut I);
+
+        crate::threading::parallel_map_reduce(
+            0..self.total,
+            nthreads,
+            &|range| {
+                let dest_ptr = dest_ptr.as_ptr();
+                let operand_ptr = operand_ptr.as_const();
+                let index_ptr = index_ptr.as_const();
+                // INVARIANT: the validated compact rank-one layouts map each
+                // output position to one distinct destination offset.
+                for position in range {
+                    let position = position as isize;
+                    // SAFETY: the invariant above proves the source and distinct
+                    // destination offsets are in their validated allocations.
+                    unsafe {
+                        let start = (*index_ptr.offset(index_offset + position)).to_i64();
+                        let source_offset =
+                            operand_offset + self.clamp_window_start(start, 0) as isize;
+                        dest_ptr
+                            .offset(dest_offset + position)
+                            .write(operand_ptr.offset(source_offset).read());
+                    }
+                }
+                Ok(())
+            },
+            &|left, right| left.and(right),
+        )
     }
 
     #[cfg(feature = "parallel")]
@@ -1305,6 +1416,9 @@ impl ScatterPlan {
         if self.batch_elems == 0 || self.window_elems == 0 {
             return Ok(());
         }
+        if self.uses_rank_one_scalar_update_path() {
+            return self.execute_rank_one_scalar_updates(dest, scatter_indices, updates, combine);
+        }
 
         // Overlapping additive updates are order-sensitive, so this remains a
         // deterministic serial replay until a combine-aware parallel plan exists.
@@ -1378,6 +1492,62 @@ impl ScatterPlan {
                 advance_col_major_index(window_idx, &self.window_shape_updates);
             }
             advance_col_major_index(batch_idx, &self.batch_shape);
+        }
+        Ok(())
+    }
+
+    fn uses_rank_one_scalar_update_path(&self) -> bool {
+        self.operand_dims.len() == 1
+            && self.index_dims.len() == 2
+            && self.update_dims.len() == 1
+            && self.dest_dims.len() == 1
+            && self.operand_strides[0] == 1
+            && self.index_strides[0] == 1
+            && self.update_strides[0] == 1
+            && self.dest_strides[0] == 1
+            && self.index_dims[1] == 1
+            && self.spec.update_window_dims.is_empty()
+            && self.spec.inserted_window_dims.as_slice() == [0]
+            && self.spec.scatter_dims_to_operand_dims.as_slice() == [0]
+            && self.spec.index_vector_dim == 1
+            && self.window_elems == 1
+    }
+
+    fn execute_rank_one_scalar_updates<T, I, W>(
+        &self,
+        dest: &mut W,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+        combine: fn(T, T) -> T,
+    ) -> Result<()>
+    where
+        T: Copy,
+        I: GatherIndex,
+        W: ReadModifyWrite<T>,
+    {
+        let mut index_offset = scatter_indices.offset();
+        let mut update_offset = updates.offset();
+        let dest_offset = dest.offset();
+        let index_data = scatter_indices.data();
+        let update_data = updates.data();
+
+        // INVARIANT: compile and check_call validated compact rank-one index
+        // and update layouts. Ordered replay preserves repeated-index semantics.
+        for _ in 0..self.batch_elems {
+            // SAFETY: the invariant above proves index/update reads and the
+            // clamped destination offset are in their validated allocations.
+            unsafe {
+                let start = (*index_data.as_ptr().offset(index_offset)).to_i64();
+                let output_offset =
+                    dest_offset + clamp_window_start(start, self.operand_dims[0], 1) as isize;
+                dest.add_at(
+                    output_offset,
+                    *update_data.as_ptr().offset(update_offset),
+                    combine,
+                );
+            }
+            index_offset += 1;
+            update_offset += 1;
         }
         Ok(())
     }

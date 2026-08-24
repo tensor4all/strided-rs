@@ -72,6 +72,7 @@ See each sub-crate README for usage examples:
 - [`ndarray-opteinsum`](ndarray-opteinsum/README.md) — einsum wrapper for `ndarray` arrays
 
 Performance design notes:
+- [`erased execution policy`](docs/design/erased-execution-policy.md) — serial/parallel thresholds, benchmark commands, and evidence flow
 - [`faer-kernel-writing-guide`](docs/faer-kernel-writing-guide.md) — practical rules for writing hot strided kernels based on faer
 - [`faer_design`](docs/faer_design.md) — SIMD design analysis and optimization plan
 

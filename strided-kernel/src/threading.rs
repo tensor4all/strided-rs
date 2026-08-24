@@ -54,7 +54,9 @@ impl<T> SendPtr<T> {
 }
 
 /// Minimum number of elements to justify multi-threaded execution.
-/// Matches Julia's `MINTHREADLENGTH = 1 << 15`.
+///
+/// See `docs/design/erased-execution-policy.md` for the benchmark and decision
+/// record. Matches Julia's `MINTHREADLENGTH = 1 << 15`.
 #[cfg(feature = "parallel")]
 pub(crate) const MINTHREADLENGTH: usize = 1 << 15;
 
