@@ -187,3 +187,18 @@ Residual scope: arbitrary-rank indexed replay still rebuilds coordinates and
 checked offsets per element. Issue #213 remains the owner for that broader
 incremental-offset work. This change intentionally adds no uniqueness contract
 or parallel additive scatter.
+
+### Review provenance and Phase-9 chronology
+
+PR #236 and exact production/evidence candidate `d993e72` predate the approved
+Phase-9 continuation and its selection of `reviewer-flash` for subsequent
+independently mergeable tasks. The immutable PR body and this worklog record the
+then-applicable read-only DeepSeek cross-model **Correct-to-merge** verdict;
+commits after `d993e72` only closed documentation links. The maintainer-approved
+Phase-9 ledger treated merged #236 (`39111bd7`) as an already completed input,
+not as a task whose pre-implementation gate could be rerun retroactively.
+
+Every later independently mergeable implementation task (#237, #238, #239,
+#240, and measurement-gated #247) records the selected `reviewer-flash`
+design-before-implementation and exact-final verdicts in its dated worklog.
+PR #236: <https://github.com/tensor4all/strided-rs/pull/236>.
