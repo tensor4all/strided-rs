@@ -130,3 +130,60 @@ and returned **Correct-to-merge** for benchmark implementation. Its two
 Important design pins (feature-aware replay storage and exact valid layout
 recipes) plus the imaginary-vector-axis zero offset are incorporated above
 before any production edit.
+
+## Baseline evidence
+
+Benchmark-only commit `9e00906` ran on CPUs 33-36 in L3 domain 32-39. The first gate failed because CPU 34 was 3.3% busy and produced no timing; the accepted retry had every domain core at 0.0%. Generic and rank-one control groups ran sequentially with separate setup outside timing.
+
+| family | case | estimate `[low, high]` |
+|---|---|---:|
+| generic | compact_rank2_serial/n4096 | 110.84 µs `[110.43 µs, 111.96 µs]` |
+| generic | compact_rank4_serial/n4096 | 168.78 µs `[163.92 µs, 177.58 µs]` |
+| generic | compact_rank8_serial/n4096 | 321.33 µs `[319.09 µs, 327.21 µs]` |
+| generic | rank2_negative_update_serial/n4096 | 110.76 µs `[110.32 µs, 111.54 µs]` |
+| generic | rank2_nonunit_update_dest_serial/n4096 | 115.37 µs `[113.36 µs, 117.80 µs]` |
+| generic | compact_rank2_max_threads_4/n4096 | 111.48 µs `[109.99 µs, 113.33 µs]` |
+| generic | compact_rank4_max_threads_4/n4096 | 166.43 µs `[163.28 µs, 170.53 µs]` |
+| generic | compact_rank8_max_threads_4/n4096 | 320.36 µs `[319.45 µs, 322.54 µs]` |
+| generic | rank2_negative_update_max_threads_4/n4096 | 115.48 µs `[111.62 µs, 119.04 µs]` |
+| generic | rank2_nonunit_update_dest_max_threads_4/n4096 | 114.82 µs `[113.44 µs, 116.49 µs]` |
+| generic | compact_rank2_serial/n32768 | 890.99 µs `[881.84 µs, 905.78 µs]` |
+| generic | compact_rank4_serial/n32768 | 1.3737 ms `[1.3136 ms, 1.4369 ms]` |
+| generic | compact_rank8_serial/n32768 | 2.6042 ms `[2.5664 ms, 2.6410 ms]` |
+| generic | rank2_negative_update_serial/n32768 | 893.90 µs `[882.68 µs, 909.40 µs]` |
+| generic | rank2_nonunit_update_dest_serial/n32768 | 928.86 µs `[908.16 µs, 949.21 µs]` |
+| generic | compact_rank2_max_threads_4/n32768 | 895.03 µs `[880.63 µs, 909.66 µs]` |
+| generic | compact_rank4_max_threads_4/n32768 | 1.3262 ms `[1.3083 ms, 1.3508 ms]` |
+| generic | compact_rank8_max_threads_4/n32768 | 2.5926 ms `[2.5638 ms, 2.6405 ms]` |
+| generic | rank2_negative_update_max_threads_4/n32768 | 899.67 µs `[880.96 µs, 928.46 µs]` |
+| generic | rank2_nonunit_update_dest_max_threads_4/n32768 | 917.04 µs `[904.55 µs, 934.53 µs]` |
+| generic | compact_rank2_serial/n262144 | 7.1342 ms `[7.0848 ms, 7.2578 ms]` |
+| generic | compact_rank4_serial/n262144 | 10.872 ms `[10.536 ms, 11.294 ms]` |
+| generic | compact_rank8_serial/n262144 | 21.466 ms `[20.798 ms, 21.874 ms]` |
+| generic | rank2_negative_update_serial/n262144 | 7.3089 ms `[7.0894 ms, 7.5736 ms]` |
+| generic | rank2_nonunit_update_dest_serial/n262144 | 7.4482 ms `[7.2961 ms, 7.6766 ms]` |
+| generic | compact_rank2_max_threads_4/n262144 | 7.1864 ms `[7.0765 ms, 7.3303 ms]` |
+| generic | compact_rank4_max_threads_4/n262144 | 10.608 ms `[10.487 ms, 10.782 ms]` |
+| generic | compact_rank8_max_threads_4/n262144 | 21.294 ms `[20.471 ms, 21.933 ms]` |
+| generic | rank2_negative_update_max_threads_4/n262144 | 7.1282 ms `[7.0605 ms, 7.2760 ms]` |
+| generic | rank2_nonunit_update_dest_max_threads_4/n262144 | 7.3069 ms `[7.2534 ms, 7.4524 ms]` |
+| generic | compact_rank2_serial/n1048576 | 29.578 ms `[28.618 ms, 30.784 ms]` |
+| generic | compact_rank4_serial/n1048576 | 42.301 ms `[41.849 ms, 42.945 ms]` |
+| generic | compact_rank8_serial/n1048576 | 85.050 ms `[83.034 ms, 87.450 ms]` |
+| generic | rank2_negative_update_serial/n1048576 | 29.062 ms `[28.531 ms, 29.860 ms]` |
+| generic | rank2_nonunit_update_dest_serial/n1048576 | 29.226 ms `[28.998 ms, 29.511 ms]` |
+| generic | compact_rank2_max_threads_4/n1048576 | 28.584 ms `[28.353 ms, 28.864 ms]` |
+| generic | compact_rank4_max_threads_4/n1048576 | 42.405 ms `[41.905 ms, 43.040 ms]` |
+| generic | compact_rank8_max_threads_4/n1048576 | 84.010 ms `[83.293 ms, 84.865 ms]` |
+| generic | rank2_negative_update_max_threads_4/n1048576 | 28.885 ms `[28.313 ms, 29.355 ms]` |
+| generic | rank2_nonunit_update_dest_max_threads_4/n1048576 | 29.138 ms `[28.962 ms, 29.507 ms]` |
+| rank1 control | serial/small_n4096 | 14.363 µs `[14.225 µs, 14.534 µs]` |
+| rank1 control | max_threads_4/small_n4096 | 14.524 µs `[14.167 µs, 15.056 µs]` |
+| rank1 control | serial/near_threshold_n32768 | 25.868 µs `[25.692 µs, 26.284 µs]` |
+| rank1 control | max_threads_4/near_threshold_n32768 | 24.551 µs `[24.472 µs, 24.697 µs]` |
+| rank1 control | serial/medium_n262144 | 976.52 µs `[935.70 µs, 1.0109 ms]` |
+| rank1 control | max_threads_4/medium_n262144 | 948.93 µs `[934.12 µs, 967.63 µs]` |
+| rank1 control | serial/large_n1048576 | 3.8509 ms `[3.7950 ms, 3.8960 ms]` |
+| rank1 control | max_threads_4/large_n1048576 | 3.8466 ms `[3.8049 ms, 3.8956 ms]` |
+
+The need-before-implementation gate is **PASS**. At medium size compact rank 2/4/8 serial measured 7.134/10.872/21.466 ms; rank 4/8 exceed 1 ms, and rank 8 costs 3.01x rank 2. Frozen cases and gates may proceed to production implementation.
