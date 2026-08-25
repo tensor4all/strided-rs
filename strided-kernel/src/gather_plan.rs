@@ -114,6 +114,155 @@ struct WindowReplayState {
     dest_offset: isize,
 }
 
+#[derive(Clone, Debug)]
+struct ScatterReplay {
+    batch: WindowReplay,
+    window: WindowReplay,
+    index_component_offsets: AxisVec<isize>,
+}
+
+impl ScatterReplay {
+    fn compile(
+        batch_shape: &[usize],
+        index_dims: &[usize],
+        index_strides: &[isize],
+        index_vector_dim: usize,
+        index_component_count: usize,
+        update_dims: &[usize],
+        update_strides: &[isize],
+        update_window_dims: &[usize],
+        is_update_window_dim: &[bool],
+        window_shape_updates: &[usize],
+        window_dims: &[usize],
+        dest_strides: &[isize],
+    ) -> Result<Self> {
+        let (
+            batch_source_strides,
+            batch_dest_strides,
+            window_source_strides,
+            window_dest_strides,
+            vector_stride,
+        ) = scatter_replay_strides(
+            index_dims,
+            index_strides,
+            index_vector_dim,
+            update_dims,
+            update_strides,
+            update_window_dims,
+            is_update_window_dim,
+            window_dims,
+            dest_strides,
+        );
+        let batch = WindowReplay::compile(batch_shape, &batch_source_strides, &batch_dest_strides)?;
+        let window = WindowReplay::compile(
+            window_shape_updates,
+            &window_source_strides,
+            &window_dest_strides,
+        )?;
+        let mut index_component_offsets = AxisVec::with_capacity(index_component_count);
+        for component in 0..index_component_count {
+            index_component_offsets.push(checked_offset_add(0, vector_stride, component)?);
+        }
+        Ok(Self {
+            batch,
+            window,
+            index_component_offsets,
+        })
+    }
+
+    #[cfg(feature = "parallel")]
+    fn validate(
+        batch_shape: &[usize],
+        index_dims: &[usize],
+        index_strides: &[isize],
+        index_vector_dim: usize,
+        index_component_count: usize,
+        update_dims: &[usize],
+        update_strides: &[isize],
+        update_window_dims: &[usize],
+        is_update_window_dim: &[bool],
+        window_shape_updates: &[usize],
+        window_dims: &[usize],
+        dest_strides: &[isize],
+    ) -> Result<()> {
+        let (
+            batch_source_strides,
+            batch_dest_strides,
+            window_source_strides,
+            window_dest_strides,
+            vector_stride,
+        ) = scatter_replay_strides(
+            index_dims,
+            index_strides,
+            index_vector_dim,
+            update_dims,
+            update_strides,
+            update_window_dims,
+            is_update_window_dim,
+            window_dims,
+            dest_strides,
+        );
+        WindowReplay::compile(batch_shape, &batch_source_strides, &batch_dest_strides)?;
+        WindowReplay::compile(
+            window_shape_updates,
+            &window_source_strides,
+            &window_dest_strides,
+        )?;
+        for component in 0..index_component_count {
+            checked_offset_add(0, vector_stride, component)?;
+        }
+        Ok(())
+    }
+}
+
+fn scatter_replay_strides(
+    index_dims: &[usize],
+    index_strides: &[isize],
+    index_vector_dim: usize,
+    update_dims: &[usize],
+    update_strides: &[isize],
+    update_window_dims: &[usize],
+    is_update_window_dim: &[bool],
+    window_dims: &[usize],
+    dest_strides: &[isize],
+) -> (
+    AxisVec<isize>,
+    AxisVec<isize>,
+    AxisVec<isize>,
+    AxisVec<isize>,
+    isize,
+) {
+    let batch_source_strides = index_dims
+        .iter()
+        .zip(index_strides.iter())
+        .enumerate()
+        .filter_map(|(axis, (_, &stride))| (axis != index_vector_dim).then_some(stride))
+        .collect();
+    let batch_dest_strides = update_dims
+        .iter()
+        .zip(update_strides.iter())
+        .enumerate()
+        .filter_map(|(axis, (_, &stride))| (!is_update_window_dim[axis]).then_some(stride))
+        .collect();
+    let window_source_strides = update_window_dims
+        .iter()
+        .map(|&axis| update_strides[axis])
+        .collect();
+    let window_dest_strides = window_dims.iter().map(|&axis| dest_strides[axis]).collect();
+    let vector_stride = if index_vector_dim < index_dims.len() {
+        index_strides[index_vector_dim]
+    } else {
+        0
+    };
+    (
+        batch_source_strides,
+        batch_dest_strides,
+        window_source_strides,
+        window_dest_strides,
+        vector_stride,
+    )
+}
+
 impl WindowReplay {
     fn compile(shape: &[usize], source_strides: &[isize], dest_strides: &[isize]) -> Result<Self> {
         validate_layout_span(shape, source_strides)?;
@@ -277,14 +426,20 @@ pub struct ScatterPlan {
     dest_dims: AxisVec<usize>,
     dest_strides: AxisVec<isize>,
     spec: ScatterSpec,
+    #[cfg(feature = "parallel")]
     batch_shape: AxisVec<usize>,
+    #[cfg(feature = "parallel")]
     window_dims: AxisVec<usize>,
     window_shape: AxisVec<usize>,
+    #[cfg(feature = "parallel")]
     window_shape_updates: AxisVec<usize>,
+    #[cfg(feature = "parallel")]
     is_update_window_dim: AxisVec<bool>,
     batch_elems: usize,
     window_elems: usize,
     copy_plan: CopyPlan,
+    #[cfg(not(feature = "parallel"))]
+    replay: ScatterReplay,
 }
 
 impl GatherPlan {
@@ -1483,6 +1638,36 @@ impl ScatterPlan {
         let batch_elems = checked_total_len(&batch_shape)?;
         let window_elems = checked_total_len(&window_shape_updates)?;
         let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
+        #[cfg(feature = "parallel")]
+        ScatterReplay::validate(
+            &batch_shape,
+            index_dims,
+            index_strides,
+            spec.index_vector_dim,
+            spec.scatter_dims_to_operand_dims.len(),
+            update_dims,
+            update_strides,
+            &spec.update_window_dims,
+            &is_update_window_dim,
+            &window_shape_updates,
+            &window_dims,
+            dest_strides,
+        )?;
+        #[cfg(not(feature = "parallel"))]
+        let replay = ScatterReplay::compile(
+            &batch_shape,
+            index_dims,
+            index_strides,
+            spec.index_vector_dim,
+            spec.scatter_dims_to_operand_dims.len(),
+            update_dims,
+            update_strides,
+            &spec.update_window_dims,
+            &is_update_window_dim,
+            &window_shape_updates,
+            &window_dims,
+            dest_strides,
+        )?;
 
         Ok(Self {
             operand_dims: operand_dims.into(),
@@ -1494,18 +1679,25 @@ impl ScatterPlan {
             dest_dims: dest_dims.into(),
             dest_strides: dest_strides.into(),
             spec,
+            #[cfg(feature = "parallel")]
             batch_shape,
+            #[cfg(feature = "parallel")]
             window_dims,
             window_shape,
+            #[cfg(feature = "parallel")]
             window_shape_updates,
+            #[cfg(feature = "parallel")]
             is_update_window_dim,
             batch_elems,
             window_elems,
             copy_plan,
+            #[cfg(not(feature = "parallel"))]
+            replay,
         })
     }
 
     /// Execute the prepared additive scatter traversal.
+    #[inline(always)]
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1543,17 +1735,19 @@ impl ScatterPlan {
             })?
     }
 
-    fn execute_updates<T, I, W>(
+    #[inline(always)]
+    fn execute_updates<T, I, W, F>(
         &self,
         dest: &mut W,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
-        combine: fn(T, T) -> T,
+        combine: F,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
+        F: Fn(T, T) -> T + Copy,
     {
         if self.batch_elems == 0 || self.window_elems == 0 {
             return Ok(());
@@ -1561,79 +1755,86 @@ impl ScatterPlan {
         if self.uses_rank_one_scalar_update_path() {
             return self.execute_rank_one_scalar_updates(dest, scatter_indices, updates, combine);
         }
+        self.execute_generic_updates(dest, scatter_indices, updates, combine)
+    }
 
+    #[inline(never)]
+    fn execute_generic_updates<T, I, W, F>(
+        &self,
+        dest: &mut W,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+        combine: F,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: ReadModifyWrite<T>,
+        F: Fn(T, T) -> T + Copy,
+    {
         // Overlapping additive updates are order-sensitive, so this remains a
         // deterministic serial replay until a combine-aware parallel plan exists.
-        let mut batch_idx_storage = CoordScratch::new(self.batch_shape.len());
-        let mut window_idx_storage = CoordScratch::new(self.window_shape_updates.len());
-        let mut update_idx_storage = CoordScratch::new(self.update_dims.len());
+        #[cfg(feature = "parallel")]
+        let replay = ScatterReplay::compile(
+            &self.batch_shape,
+            &self.index_dims,
+            &self.index_strides,
+            self.spec.index_vector_dim,
+            self.spec.scatter_dims_to_operand_dims.len(),
+            &self.update_dims,
+            &self.update_strides,
+            &self.spec.update_window_dims,
+            &self.is_update_window_dim,
+            &self.window_shape_updates,
+            &self.window_dims,
+            &self.dest_strides,
+        )?;
+        #[cfg(not(feature = "parallel"))]
+        let replay = &self.replay;
+
         let mut operand_base_storage = CoordScratch::new(self.operand_dims.len());
-        let mut operand_idx_storage = CoordScratch::new(self.operand_dims.len());
-        let batch_idx = batch_idx_storage.as_mut_slice();
-        let window_idx = window_idx_storage.as_mut_slice();
-        let update_idx = update_idx_storage.as_mut_slice();
         let operand_base = operand_base_storage.as_mut_slice();
-        let operand_idx = operand_idx_storage.as_mut_slice();
-
-        let index_offset_base = scatter_indices.offset();
-        let index_strides = scatter_indices.strides();
+        let mut batch_state = replay
+            .batch
+            .decode(0, scatter_indices.offset(), updates.offset())?;
         let index_data = scatter_indices.data();
-        let update_offset_base = updates.offset();
-        let update_strides = updates.strides();
         let update_data = updates.data();
-        let dest_offset_base = dest.offset();
 
+        // INVARIANT: batch and window replay metadata was checked at compile;
+        // the indirect component loop below is the only data-dependent lookup.
         for _ in 0..self.batch_elems {
             operand_base.fill(0);
-            for (component, &operand_dim) in
-                self.spec.scatter_dims_to_operand_dims.iter().enumerate()
+            for (&component_offset, &operand_axis) in replay
+                .index_component_offsets
+                .iter()
+                .zip(self.spec.scatter_dims_to_operand_dims.iter())
             {
-                let start = index_component(
-                    scatter_indices.dims(),
-                    index_strides,
-                    index_offset_base,
-                    index_data,
-                    self.spec.index_vector_dim,
-                    batch_idx,
-                    component,
-                )?;
-                operand_base[operand_dim] = clamp_window_start(
+                let index_offset = batch_state
+                    .source_offset
+                    .checked_add(component_offset)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                // SAFETY: checked batch replay and component offsets keep this
+                // indirect index read inside the validated index allocation.
+                let start = unsafe { *index_data.as_ptr().offset(index_offset) }.to_i64();
+                operand_base[operand_axis] = clamp_window_start(
                     start,
-                    self.operand_dims[operand_dim],
-                    self.window_shape[operand_dim],
+                    self.operand_dims[operand_axis],
+                    self.window_shape[operand_axis],
                 );
             }
 
-            window_idx.fill(0);
+            let dest_base = checked_strided_offset(dest.offset(), dest.strides(), operand_base)?;
+            let mut window_state = replay
+                .window
+                .decode(0, batch_state.dest_offset, dest_base)?;
             for _ in 0..self.window_elems {
-                let mut batch_axis = 0usize;
-                let mut window_axis = 0usize;
-                for axis in 0..self.update_dims.len() {
-                    if self.is_update_window_dim[axis] {
-                        update_idx[axis] = window_idx[window_axis];
-                        window_axis += 1;
-                    } else {
-                        update_idx[axis] = batch_idx[batch_axis];
-                        batch_axis += 1;
-                    }
-                }
-
-                operand_idx.copy_from_slice(operand_base);
-                for (window_axis, &operand_axis) in self.window_dims.iter().enumerate() {
-                    operand_idx[operand_axis] += window_idx[window_axis];
-                }
-
-                let update_offset =
-                    checked_strided_offset(update_offset_base, update_strides, update_idx)?;
-                let dest_offset =
-                    checked_strided_offset(dest_offset_base, dest.strides(), operand_idx)?;
-                let value = unsafe { *update_data.as_ptr().offset(update_offset) };
-                // SAFETY: copy completion and serial scatter traversal prove
-                // this initialized logical slot is in-bounds.
-                unsafe { dest.add_at(dest_offset, value, combine) };
-                advance_col_major_index(window_idx, &self.window_shape_updates);
+                // SAFETY: copy completion and checked replay state prove both
+                // the update read and initialized destination RMW are valid.
+                let value = unsafe { *update_data.as_ptr().offset(window_state.source_offset) };
+                unsafe { dest.add_at(window_state.dest_offset, value, combine) };
+                replay.window.advance(&mut window_state);
             }
-            advance_col_major_index(batch_idx, &self.batch_shape);
+            replay.batch.advance(&mut batch_state);
         }
         Ok(())
     }
@@ -1655,23 +1856,27 @@ impl ScatterPlan {
             && self.window_elems == 1
     }
 
-    fn execute_rank_one_scalar_updates<T, I, W>(
+    #[inline(always)]
+    fn execute_rank_one_scalar_updates<T, I, W, F>(
         &self,
         dest: &mut W,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
-        combine: fn(T, T) -> T,
+        combine: F,
     ) -> Result<()>
     where
         T: Copy,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
+        F: Fn(T, T) -> T + Copy,
     {
         let mut index_offset = scatter_indices.offset();
         let mut update_offset = updates.offset();
         let dest_offset = dest.offset();
         let index_data = scatter_indices.data();
         let update_data = updates.data();
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = unsafe { dest.data_ptr() };
 
         // INVARIANT: compile and check_call validated compact rank-one index
         // and update layouts. Ordered replay preserves repeated-index semantics.
@@ -1682,11 +1887,11 @@ impl ScatterPlan {
                 let start = (*index_data.as_ptr().offset(index_offset)).to_i64();
                 let output_offset =
                     dest_offset + clamp_window_start(start, self.operand_dims[0], 1) as isize;
-                dest.add_at(
-                    output_offset,
+                let output = dest_ptr.offset(output_offset);
+                output.write(combine(
+                    output.read(),
                     *update_data.as_ptr().offset(update_offset),
-                    combine,
-                );
+                ));
             }
             index_offset += 1;
             update_offset += 1;
@@ -1778,33 +1983,6 @@ where
         out[axis] = clamp_window_start(start, operand_dims[axis], window_sizes[axis]);
     }
     Ok(())
-}
-
-fn index_component<I>(
-    index_dims: &[usize],
-    index_strides: &[isize],
-    index_offset_base: isize,
-    index_data: &[I],
-    index_vector_dim: usize,
-    batch_idx: &[usize],
-    component: usize,
-) -> Result<i64>
-where
-    I: GatherIndex,
-{
-    let mut offset = index_offset_base;
-    let mut batch_axis = 0usize;
-    for axis in 0..index_dims.len() {
-        let coord = if axis == index_vector_dim {
-            component
-        } else {
-            let coord = batch_idx[batch_axis];
-            batch_axis += 1;
-            coord
-        };
-        offset = checked_offset_add(offset, index_strides[axis], coord)?;
-    }
-    Ok(unsafe { *index_data.as_ptr().offset(offset) }.to_i64())
 }
 
 #[inline]
@@ -1908,16 +2086,6 @@ fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize>
     base.checked_add(scaled).ok_or(StridedError::OffsetOverflow)
 }
 
-fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
-    for axis in 0..index.len() {
-        index[axis] += 1;
-        if index[axis] < shape[axis] {
-            return;
-        }
-        index[axis] = 0;
-    }
-}
-
 struct CoordScratch {
     inline: [usize; RAW_FUSED_RANK_LIMIT],
     heap: Option<Vec<usize>>,
@@ -1951,7 +2119,7 @@ impl CoordScratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, WindowReplay};
+    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, ScatterPlan, ScatterSpec, WindowReplay};
 
     #[test]
     fn window_replay_fuses_only_bilaterally_contiguous_axes() {
@@ -1962,6 +2130,47 @@ mod tests {
         let negative_source = WindowReplay::compile(&[2, 3], &[1, -2], &[1, 2]).unwrap();
         assert_eq!(&negative_source.shape[..], &[2, 3]);
         assert_eq!(negative_source.axes.len(), 2);
+    }
+
+    #[test]
+    fn scatter_fast_path_is_limited_to_rank_one_scalar_updates() {
+        let rank_one = ScatterPlan::compile(
+            &[16],
+            &[1],
+            &[16, 1],
+            &[1, 16],
+            &[16],
+            &[1],
+            &[16],
+            &[1],
+            ScatterSpec {
+                update_window_dims: vec![],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+            },
+        )
+        .unwrap();
+        assert!(rank_one.uses_rank_one_scalar_update_path());
+
+        let generic = ScatterPlan::compile(
+            &[4, 2],
+            &[1, 4],
+            &[4, 1],
+            &[1, 4],
+            &[4, 2],
+            &[1, 4],
+            &[4, 2],
+            &[1, 4],
+            ScatterSpec {
+                update_window_dims: vec![1],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+            },
+        )
+        .unwrap();
+        assert!(!generic.uses_rank_one_scalar_update_path());
     }
 
     #[test]

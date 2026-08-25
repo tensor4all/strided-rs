@@ -685,6 +685,75 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     });
     assert_eq!(allocations, 0, "erased scatter execute must not allocate");
 
+    let window_index_dims = [2usize, 1];
+    let window_index_strides = [1isize, 2];
+    let window_indices = [0i64, 1];
+    let window_update_dims = [2usize; 8];
+    let window_update_strides = src_strides.clone();
+    let window_updates = vec![1.0f64; 256];
+    let window_plan = ErasedScatterPlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &src_dims,
+        &src_strides,
+        &window_index_dims,
+        &window_index_strides,
+        &window_update_dims,
+        &window_update_strides,
+        &src_dims,
+        &src_strides,
+        ScatterSpec {
+            update_window_dims: (1..8).collect(),
+            inserted_window_dims: vec![0],
+            scatter_dims_to_operand_dims: vec![0],
+            index_vector_dim: 1,
+        },
+    )
+    .unwrap();
+    let window_index = ErasedRawStridedRef::from_slice(
+        &window_indices,
+        &window_index_dims,
+        &window_index_strides,
+        0,
+    )
+    .unwrap();
+    let window_update = ErasedRawStridedRef::from_slice(
+        &window_updates,
+        &window_update_dims,
+        &window_update_strides,
+        0,
+    )
+    .unwrap();
+    let mut window_dst = vec![0.0f64; 256];
+    let mut window_dest =
+        ErasedRawStridedMut::from_slice_mut(&mut window_dst, &src_dims, &src_strides, 0).unwrap();
+    window_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut window_dest,
+            &source,
+            &window_index,
+            &window_update,
+        )
+        .unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            window_plan
+                .execute(
+                    &ExecContext::serial(),
+                    &mut window_dest,
+                    &source,
+                    &window_index,
+                    &window_update,
+                )
+                .unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "rank-8 windowed scatter execute must not allocate"
+    );
+
     let starts_usize = [0usize; 8];
     let limits = [2usize; 8];
     let slice_steps = [1usize; 8];

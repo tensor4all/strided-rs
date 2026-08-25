@@ -16,6 +16,22 @@ fn erased_axis_reduction_uses_prepared_incremental_cursors() {
 }
 
 #[test]
+fn generic_scatter_uses_prepared_incremental_replay() {
+    let source = include_str!("../src/gather_plan.rs");
+    let body = source
+        .split_once("fn execute_generic_updates")
+        .and_then(|(_, rest)| rest.split_once("fn uses_rank_one_scalar_update_path"))
+        .map(|(body, _)| body)
+        .expect("generic scatter and rank-one replay remain ordered");
+    assert!(body.contains("replay.window.advance"));
+    assert!(body.contains("replay.batch.advance"));
+    assert!(!body.contains("update_idx"));
+    assert!(!body.contains("operand_idx"));
+    assert!(!body.contains("advance_col_major_index"));
+    assert_eq!(body.matches("checked_strided_offset").count(), 1);
+}
+
+#[test]
 fn reduction_uninit_has_no_initialized_backing_conversion() {
     let source = include_str!("../src/erased.rs");
     let reduce = source
