@@ -1752,7 +1752,21 @@ impl ScatterPlan {
         if self.uses_rank_one_scalar_update_path() {
             return self.execute_rank_one_scalar_updates(dest, scatter_indices, updates, combine);
         }
+        self.execute_generic_updates(dest, scatter_indices, updates, combine)
+    }
 
+    fn execute_generic_updates<T, I, W>(
+        &self,
+        dest: &mut W,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+        combine: fn(T, T) -> T,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: ReadModifyWrite<T>,
+    {
         // Overlapping additive updates are order-sensitive, so this remains a
         // deterministic serial replay until a combine-aware parallel plan exists.
         #[cfg(feature = "parallel")]
