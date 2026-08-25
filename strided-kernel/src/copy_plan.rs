@@ -75,6 +75,7 @@ impl<'a, T> ReadModifyWrite<T> for RawStridedMut<'a, T>
 where
     T: Add<Output = T>,
 {
+    #[inline(always)]
     unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
     where
         F: FnOnce(T, T) -> T,
@@ -144,6 +145,7 @@ impl<'a, T> ReadModifyWrite<T> for InitializedRawDest<'a, T>
 where
     T: Add<Output = T>,
 {
+    #[inline(always)]
     unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
     where
         F: FnOnce(T, T) -> T,

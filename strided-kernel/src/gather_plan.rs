@@ -1697,6 +1697,7 @@ impl ScatterPlan {
     }
 
     /// Execute the prepared additive scatter traversal.
+    #[inline(always)]
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
