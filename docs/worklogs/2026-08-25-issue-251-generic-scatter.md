@@ -232,4 +232,4 @@ With output storage black-boxed, the existing rank-one control has no regression
 - formatting and parallel cargo check: passed
 - modified coverage: `gather_plan.rs` 93.14%, `copy_plan.rs` 98.77% (threshold 80%); only unchanged `reduce_view.rs` remains below the global package threshold
 
-Exact-final independent review and hosted CI are pending.
+Exact-final read-only `reviewer-flash` review of candidate `ed9b61ff` with high thinking returned **Correct-to-merge** with no blocking findings. It confirmed cfg-aware replay storage, arbitrary axis mapping, order/safety/wrapping preservation, rank-one behavior, corrected benchmark validity, all gates, tests, allocation, coverage, docs, and rules evidence. Hosted CI remains pending.
