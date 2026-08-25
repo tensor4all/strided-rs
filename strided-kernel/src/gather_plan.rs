@@ -1734,6 +1734,7 @@ impl ScatterPlan {
             })?
     }
 
+    #[inline(always)]
     fn execute_updates<T, I, W>(
         &self,
         dest: &mut W,
@@ -1852,6 +1853,7 @@ impl ScatterPlan {
             && self.window_elems == 1
     }
 
+    #[inline(always)]
     fn execute_rank_one_scalar_updates<T, I, W>(
         &self,
         dest: &mut W,
