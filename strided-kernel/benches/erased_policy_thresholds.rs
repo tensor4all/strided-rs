@@ -1170,7 +1170,7 @@ fn bench_erased_scatter_variant<M: Measurement>(
         bencher.iter(|| {
             plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
                 .unwrap();
-            black_box(&mut dest);
+            black_box(dest.data_as_mut::<i32>().unwrap());
         });
     });
 }
@@ -1243,7 +1243,7 @@ fn bench_scatter_additive(c: &mut Criterion) {
             bencher.iter(|| {
                 plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
                     .unwrap();
-                black_box(&mut dest);
+                black_box(dest.data_as_mut::<f64>().unwrap());
             });
         });
     }
