@@ -187,3 +187,49 @@ Benchmark-only commit `9e00906` ran on CPUs 33-36 in L3 domain 32-39. The first 
 | rank1 control | max_threads_4/large_n1048576 | 3.8466 ms `[3.8049 ms, 3.8956 ms]` |
 
 The need-before-implementation gate is **PASS**. At medium size compact rank 2/4/8 serial measured 7.134/10.872/21.466 ms; rank 4/8 exceed 1 ms, and rank 8 costs 3.01x rank 2. Frozen cases and gates may proceed to production implementation.
+
+## Candidate implementation and corrected paired evidence
+
+Production commits through `eba26e5` add the feature-aware batch/window replay and keep rank-one replay as a direct pointer loop; `e37611a` adds the source contract. Benchmark commit `4a3dacc` fixes a validity flaw discovered by the rank-one control: black-boxing only the erased descriptor let LLVM eliminate or retain destination writes inconsistently. The original `ce8a850` baseline and interim candidate timings are therefore reclassified INCONCLUSIVE and are not used below.
+
+The corrected benchmark black-boxes typed output storage. Corrected baseline branch `5169eba` contains only that benchmark fix on pre-production `9e00906`; candidate `4a3dacc` contains the identical benchmark on the final production tree. Both use separate targets and CPUs 1-4 in L3 domain 0-7. Six baseline gate attempts produced no timing (CPU 0 at 60.9% once and 100% four times, then CPU 4 at 36.8%); the accepted retry had CPU 3 at 0.5% and every other domain core 0.0%. Candidate gate passed first attempt (CPU 0 12.3%, selected maximum 1.3%, all other siblings <=0.5%). Generic and control groups ran sequentially.
+
+| case | context | size | baseline | candidate | speedup | interval-bound speedup |
+|---|---|---:|---:|---:|---:|---:|
+| compact_rank2 | serial | 262144 | 7.1407 ms | 4.5729 ms | 1.56x | 1.52-1.62x |
+| compact_rank4 | serial | 262144 | 10.7580 ms | 1.7254 ms | 6.24x | 6.10-6.37x |
+| compact_rank8 | serial | 262144 | 21.2690 ms | 1.3918 ms | 15.28x | 14.50-16.21x |
+| rank2_negative_update | serial | 262144 | 7.1313 ms | 4.5494 ms | 1.57x | 1.53-1.61x |
+| rank2_nonunit_update_dest | serial | 262144 | 7.4491 ms | 4.7139 ms | 1.58x | 1.52-1.63x |
+| compact_rank2 | max_threads_4 | 262144 | 7.2706 ms | 4.5479 ms | 1.60x | 1.54-1.69x |
+| compact_rank4 | max_threads_4 | 262144 | 10.6910 ms | 1.7290 ms | 6.18x | 6.02-6.34x |
+| compact_rank8 | max_threads_4 | 262144 | 20.8700 ms | 1.3833 ms | 15.09x | 14.63-15.47x |
+| rank2_negative_update | max_threads_4 | 262144 | 7.1501 ms | 4.5345 ms | 1.58x | 1.54-1.62x |
+| rank2_nonunit_update_dest | max_threads_4 | 262144 | 7.5415 ms | 4.7216 ms | 1.60x | 1.53-1.65x |
+| compact_rank2 | serial | 1048576 | 28.5050 ms | 18.1550 ms | 1.57x | 1.54-1.60x |
+| compact_rank4 | serial | 1048576 | 43.3730 ms | 7.6843 ms | 5.64x | 5.53-5.78x |
+| compact_rank8 | serial | 1048576 | 83.4460 ms | 5.8265 ms | 14.32x | 13.87-14.82x |
+| rank2_negative_update | serial | 1048576 | 28.6380 ms | 18.0570 ms | 1.59x | 1.56-1.63x |
+| rank2_nonunit_update_dest | serial | 1048576 | 29.3570 ms | 19.1410 ms | 1.53x | 1.44-1.59x |
+| compact_rank2 | max_threads_4 | 1048576 | 28.6540 ms | 18.7970 ms | 1.52x | 1.46-1.59x |
+| compact_rank4 | max_threads_4 | 1048576 | 42.8740 ms | 7.7766 ms | 5.51x | 5.34-5.70x |
+| compact_rank8 | max_threads_4 | 1048576 | 82.5990 ms | 5.9352 ms | 13.92x | 13.63-14.29x |
+| rank2_negative_update | max_threads_4 | 1048576 | 28.8610 ms | 18.3430 ms | 1.57x | 1.50-1.63x |
+| rank2_nonunit_update_dest | max_threads_4 | 1048576 | 30.2180 ms | 19.2650 ms | 1.57x | 1.49-1.64x |
+
+All corrected performance gates are **PASS**. At medium size compact rank 2/4/8 improves 1.56/6.24/15.28x serial and 1.60/6.18/15.09x with a four-thread context. Negative/non-unit improves 1.57/1.58x serial. Candidate rank-8/rank-2 time ratio is 0.30. Every generic cell at every frozen size/context improved with non-overlapping intervals.
+
+With output storage black-boxed, the existing rank-one control has no regression over 10%: exact-threshold estimates are within 2.8%, medium/large estimates are stable or faster, and the largest point-estimate regression is 2.8%. The accepted implementation preserves deterministic serial update replay; four-thread gains reflect copy policy plus lower replay overhead, not parallel accumulation.
+
+## Verification
+
+- focused default indexed/uninitialized/source-contract: 88 passed
+- focused parallel indexed/uninitialized/policy/source-contract: 99 passed
+- rank-8 allocation test: zero execution allocations
+- default workspace: 922 passed, 9 ignored
+- parallel workspace: 996 passed, 9 ignored
+- `cargo doc --workspace --no-deps`: passed
+- formatting and parallel cargo check: passed
+- modified coverage: `gather_plan.rs` 93.14%, `copy_plan.rs` 98.77% (threshold 80%); only unchanged `reduce_view.rs` remains below the global package threshold
+
+Exact-final independent review and hosted CI are pending.
