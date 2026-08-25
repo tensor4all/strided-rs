@@ -1755,6 +1755,7 @@ impl ScatterPlan {
         self.execute_generic_updates(dest, scatter_indices, updates, combine)
     }
 
+    #[inline(never)]
     fn execute_generic_updates<T, I, W>(
         &self,
         dest: &mut W,
