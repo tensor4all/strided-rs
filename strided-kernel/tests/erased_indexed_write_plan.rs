@@ -918,6 +918,71 @@ fn erased_scatter_windowed_compact_ranks_match_exact_clamped_replay() {
     run_compact_windowed_scatter::<i64>();
 }
 
+#[test]
+fn erased_scatter_replays_imaginary_vector_axis_and_reordered_windows() {
+    let operand_dims = [2usize, 3, 2];
+    let operand_strides = [1isize, 2, 6];
+    let index_dims = [2usize];
+    let index_strides = [1isize];
+    let update_dims = [2usize, 2, 2];
+    let update_strides = [1isize, 2, 4];
+    let indices = [0i64, 2];
+    let operand: Vec<i32> = (0..12).map(|value| 100 + value).collect();
+    let updates: Vec<i32> = (0..8).map(|value| 10 + value).collect();
+    let spec = ScatterSpec {
+        update_window_dims: vec![2, 0],
+        inserted_window_dims: vec![1],
+        scatter_dims_to_operand_dims: vec![1],
+        index_vector_dim: 1,
+    };
+    let plan = ErasedScatterPlan::compile(
+        KernelDType::I32,
+        KernelDType::I64,
+        &operand_dims,
+        &operand_strides,
+        &index_dims,
+        &index_strides,
+        &update_dims,
+        &update_strides,
+        &operand_dims,
+        &operand_strides,
+        spec,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&updates, &update_dims, &update_strides, 0).unwrap();
+
+    let mut expected = operand.clone();
+    for (batch, &start) in indices.iter().enumerate() {
+        let start = start as usize;
+        for window_axis_1 in 0..2 {
+            for window_axis_0 in 0..2 {
+                let update_slot = window_axis_1 + batch * 2 + window_axis_0 * 4;
+                let dest_slot = window_axis_0 + start * 2 + window_axis_1 * 6;
+                expected[dest_slot] = expected[dest_slot].wrapping_add(updates[update_slot]);
+            }
+        }
+    }
+
+    let mut actual = vec![0i32; operand.len()];
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut actual, &operand_dims, &operand_strides, 0)
+            .unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut dest,
+        &operand_ref,
+        &index_ref,
+        &update_ref,
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
 fn run_rank2_layout_scatter<I>(
     update_strides: [isize; 2],
     update_offset: isize,
