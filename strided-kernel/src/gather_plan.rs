@@ -1875,6 +1875,8 @@ impl ScatterPlan {
         let dest_offset = dest.offset();
         let index_data = scatter_indices.data();
         let update_data = updates.data();
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = unsafe { dest.data_ptr() };
 
         // INVARIANT: compile and check_call validated compact rank-one index
         // and update layouts. Ordered replay preserves repeated-index semantics.
@@ -1885,11 +1887,11 @@ impl ScatterPlan {
                 let start = (*index_data.as_ptr().offset(index_offset)).to_i64();
                 let output_offset =
                     dest_offset + clamp_window_start(start, self.operand_dims[0], 1) as isize;
-                dest.add_at(
-                    output_offset,
+                let output = dest_ptr.offset(output_offset);
+                output.write(combine(
+                    output.read(),
                     *update_data.as_ptr().offset(update_offset),
-                    combine,
-                );
+                ));
             }
             index_offset += 1;
             update_offset += 1;
