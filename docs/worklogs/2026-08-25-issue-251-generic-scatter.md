@@ -38,7 +38,15 @@ At compile time:
 3. Build one window replay over `window_shape_updates`. Its source strides are
    update-window strides in `spec.update_window_dims` order; destination strides
    are destination strides in `window_dims` order.
-4. Retain checked spans, steps, carry resets, totals, and the existing copy plan.
+4. When `index_vector_dim == index_dims.len()`, use the single zero component
+   offset; there is no physical vector-axis stride.
+5. Mirror the proven dynamic-update storage disposition: with no `parallel`
+   feature, store one private `ScatterReplay` containing both replays and
+   component offsets; with `parallel`, validate by compiling at plan creation
+   but build SmallVec-backed replay metadata only inside the generic execution
+   branch after the rank-one specialization returns. This keeps the rank-one
+   plan/execution footprint unchanged and generic rank<=8 execution allocation-free.
+6. Retain checked spans, steps, carry resets, totals, and the existing copy plan.
 
 At execution:
 
@@ -71,9 +79,17 @@ For compact rank `r` in 2/4/8:
   repeated destinations in correctness tests, not the timing fixture;
 - updates shape `[batch, 2, ..., 2]`; all compact layouts are column-major.
 
-Add rank-2 negative-update and non-unit update/destination variants with the
-same logical shapes and validated physical holes/offsets. Plan/descriptor/data
-construction remains outside timing. Time execution and black-box destination.
+Add exact rank-2 layout controls with shape `[batch, 2]` and compact indices
+`[batch, 1]` using permutation `(5*i + 1) mod batch`:
+
+- negative update: strides `[-1, batch]`, offset `batch-1`, compact injective
+  destination;
+- non-unit update/destination: strides `[2, 1]`, offset zero, physical length
+  `2*batch`; this row-major-like layout is injective for destination.
+
+Construct every raw descriptor and compile every plan before freezing baseline;
+invalid layouts are a benchmark defect. Plan/descriptor/data construction
+remains outside timing. Time execution and black-box destination.
 
 Use threshold sizes `2^12`, `2^15`, `2^18`, `2^20`, serial and
 `max_threads(4)`, 10 samples, 300 ms warmup, 1 s measurement,
@@ -106,3 +122,11 @@ Run focused default/parallel/indexed/uninitialized/allocation/source-contract
 tests, default/parallel workspace tests, modified-file coverage, docs,
 formatting, deterministic repository-rules review, exact-final independent
 review, and hosted CI.
+
+## Design gate
+
+Read-only `reviewer-flash` with high thinking reviewed exact design `8ebceea9`
+and returned **Correct-to-merge** for benchmark implementation. Its two
+Important design pins (feature-aware replay storage and exact valid layout
+recipes) plus the imaginary-vector-axis zero offset are incorporated above
+before any production edit.
