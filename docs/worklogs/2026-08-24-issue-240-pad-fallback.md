@@ -228,3 +228,34 @@ Across all frozen generic cells, estimate speedups were 1.35-9.10x (medium: 1.35
 - workspace coverage: modified `static_indexing_plan.rs` 81.93%, above the repository 80% threshold. The global script still reports two unchanged baseline deficits (`reduce_view.rs` 71.5% and `hptt/execute.rs` 57.0%).
 
 Exact-final independent review of candidate `e1f01cdd` by `reviewer-flash` (high, read-only) returned **Correct-to-merge** with no blocking findings. It confirmed the interval and pointer-safety proof, serial/parallel and initialized/uninitialized semantics, frozen fallback selection, unchanged fast paths, benchmark gates, and that the two global coverage deficits are unchanged and nonblocking. Hosted CI remains pending until the PR is opened.
+
+## Corrected topology-valid paired evidence
+
+The earlier candidate run recorded above is reclassified **INCONCLUSIVE** because its selected-core load (7.5%) violated the frozen below-2% gate. It must not be used for publication or closure.
+
+A fresh complete baseline/candidate pair used separate target directories and the same CPUs 57-60 in L3 domain 56-63. Baseline gate: every domain core 0.0%. The first candidate gate attempt failed because CPU 56 was fully occupied and produced no timing; the accepted retry gate was CPU 58 at 0.5%, CPUs 57/59/60 at 0.0/0.2/0.0%, CPU 61 at 0.5%, and all others 0.0%. Both accepted runs satisfy selected <2% and siblings <20%. Generic and rank-one groups ran sequentially.
+
+| case | context | size | baseline | candidate | speedup | interval-bound speedup |
+|---|---|---:|---:|---:|---:|---:|
+| compact_rank2 | serial | 262144 | 3.0745 ms | 1.2484 ms | 2.46x | 2.33-2.58x |
+| compact_rank4 | serial | 262144 | 6.2596 ms | 1.4171 ms | 4.42x | 4.29-4.55x |
+| compact_rank8 | serial | 262144 | 12.9650 ms | 1.6938 ms | 7.65x | 7.32-8.01x |
+| rank2_negative_crop | serial | 262144 | 2.9894 ms | 1.3057 ms | 2.29x | 2.17-2.44x |
+| rank2_nonunit | serial | 262144 | 4.5903 ms | 2.3080 ms | 1.99x | 1.94-2.03x |
+| compact_rank2 | max_threads_4 | 262144 | 0.5052 ms | 0.3782 ms | 1.34x | 1.29-1.38x |
+| compact_rank4 | max_threads_4 | 262144 | 0.9148 ms | 0.4385 ms | 2.09x | 2.02-2.16x |
+| compact_rank8 | max_threads_4 | 262144 | 1.7216 ms | 0.5033 ms | 3.42x | 3.32-3.54x |
+| rank2_negative_crop | max_threads_4 | 262144 | 0.5251 ms | 0.3912 ms | 1.34x | 1.31-1.38x |
+| rank2_nonunit | max_threads_4 | 262144 | 0.9298 ms | 0.6615 ms | 1.41x | 1.36-1.46x |
+| compact_rank2 | serial | 1048576 | 12.0370 ms | 5.0502 ms | 2.38x | 2.26-2.48x |
+| compact_rank4 | serial | 1048576 | 24.9910 ms | 5.6468 ms | 4.43x | 4.34-4.55x |
+| compact_rank8 | serial | 1048576 | 54.3200 ms | 6.8029 ms | 7.98x | 7.44-8.64x |
+| rank2_negative_crop | serial | 1048576 | 12.1430 ms | 4.9832 ms | 2.44x | 2.37-2.52x |
+| rank2_nonunit | serial | 1048576 | 18.3070 ms | 9.2013 ms | 1.99x | 1.93-2.03x |
+| compact_rank2 | max_threads_4 | 1048576 | 1.9442 ms | 1.4617 ms | 1.33x | 1.27-1.37x |
+| compact_rank4 | max_threads_4 | 1048576 | 3.5952 ms | 1.6771 ms | 2.14x | 2.09-2.19x |
+| compact_rank8 | max_threads_4 | 1048576 | 6.7470 ms | 1.9370 ms | 3.48x | 3.41-3.60x |
+| rank2_negative_crop | max_threads_4 | 1048576 | 1.9754 ms | 1.4495 ms | 1.36x | 1.32-1.40x |
+| rank2_nonunit | max_threads_4 | 1048576 | 3.7267 ms | 2.6007 ms | 1.43x | 1.40-1.46x |
+
+All corrected gates are **PASS**. At medium size, compact rank 2/4/8 improves 2.46/4.42/7.65x serial and 1.34/2.09/3.42x with four threads; negative-crop/non-unit improves 2.29/1.99x serial and 1.34/1.41x with four threads. The candidate rank-8/rank-2 timing ratio is 1.36. Across rank-one controls the largest candidate regression is 8.2% (large serial), below 10%; medium serial/four-thread controls are within 0.6%. These values supersede the earlier table for publication and closure.
