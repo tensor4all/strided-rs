@@ -47,7 +47,9 @@ pub(crate) trait ReadModifyWrite<T>: OverwriteWriter<T> {
     /// # Safety
     /// The offset must be an in-bounds initialized slot covered by the
     /// traversal's copy and disjointness proof.
-    unsafe fn add_at(&mut self, offset: isize, value: T, combine: fn(T, T) -> T);
+    unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
+    where
+        F: FnOnce(T, T) -> T;
 }
 
 impl<'a, T> OverwriteWriter<T> for RawStridedMut<'a, T> {
@@ -73,7 +75,10 @@ impl<'a, T> ReadModifyWrite<T> for RawStridedMut<'a, T>
 where
     T: Add<Output = T>,
 {
-    unsafe fn add_at(&mut self, offset: isize, value: T, combine: fn(T, T) -> T) {
+    unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
+    where
+        F: FnOnce(T, T) -> T,
+    {
         // SAFETY: the copy or initialized caller proves this logical slot.
         unsafe {
             let ptr = self.data_mut().as_mut_ptr().offset(offset);
@@ -139,7 +144,10 @@ impl<'a, T> ReadModifyWrite<T> for InitializedRawDest<'a, T>
 where
     T: Add<Output = T>,
 {
-    unsafe fn add_at(&mut self, offset: isize, value: T, combine: fn(T, T) -> T) {
+    unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
+    where
+        F: FnOnce(T, T) -> T,
+    {
         debug_assert!(offset >= 0 && (offset as usize) < self.extent);
         // SAFETY: the copy proof and extent check cover this logical slot.
         unsafe {

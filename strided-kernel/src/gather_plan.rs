@@ -1735,17 +1735,18 @@ impl ScatterPlan {
     }
 
     #[inline(always)]
-    fn execute_updates<T, I, W>(
+    fn execute_updates<T, I, W, F>(
         &self,
         dest: &mut W,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
-        combine: fn(T, T) -> T,
+        combine: F,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
+        F: Fn(T, T) -> T + Copy,
     {
         if self.batch_elems == 0 || self.window_elems == 0 {
             return Ok(());
@@ -1757,17 +1758,18 @@ impl ScatterPlan {
     }
 
     #[inline(never)]
-    fn execute_generic_updates<T, I, W>(
+    fn execute_generic_updates<T, I, W, F>(
         &self,
         dest: &mut W,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
-        combine: fn(T, T) -> T,
+        combine: F,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
+        F: Fn(T, T) -> T + Copy,
     {
         // Overlapping additive updates are order-sensitive, so this remains a
         // deterministic serial replay until a combine-aware parallel plan exists.
@@ -1854,17 +1856,18 @@ impl ScatterPlan {
     }
 
     #[inline(always)]
-    fn execute_rank_one_scalar_updates<T, I, W>(
+    fn execute_rank_one_scalar_updates<T, I, W, F>(
         &self,
         dest: &mut W,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
-        combine: fn(T, T) -> T,
+        combine: F,
     ) -> Result<()>
     where
         T: Copy,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
+        F: Fn(T, T) -> T + Copy,
     {
         let mut index_offset = scatter_indices.offset();
         let mut update_offset = updates.offset();
