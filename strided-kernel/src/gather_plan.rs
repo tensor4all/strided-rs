@@ -1951,7 +1951,7 @@ impl CoordScratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, WindowReplay};
+    use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, ScatterPlan, ScatterSpec, WindowReplay};
 
     #[test]
     fn window_replay_fuses_only_bilaterally_contiguous_axes() {
@@ -1962,6 +1962,47 @@ mod tests {
         let negative_source = WindowReplay::compile(&[2, 3], &[1, -2], &[1, 2]).unwrap();
         assert_eq!(&negative_source.shape[..], &[2, 3]);
         assert_eq!(negative_source.axes.len(), 2);
+    }
+
+    #[test]
+    fn scatter_fast_path_is_limited_to_rank_one_scalar_updates() {
+        let rank_one = ScatterPlan::compile(
+            &[16],
+            &[1],
+            &[16, 1],
+            &[1, 16],
+            &[16],
+            &[1],
+            &[16],
+            &[1],
+            ScatterSpec {
+                update_window_dims: vec![],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+            },
+        )
+        .unwrap();
+        assert!(rank_one.uses_rank_one_scalar_update_path());
+
+        let generic = ScatterPlan::compile(
+            &[4, 2],
+            &[1, 4],
+            &[4, 1],
+            &[1, 4],
+            &[4, 2],
+            &[1, 4],
+            &[4, 2],
+            &[1, 4],
+            ScatterSpec {
+                update_window_dims: vec![1],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+            },
+        )
+        .unwrap();
+        assert!(!generic.uses_rank_one_scalar_update_path());
     }
 
     #[test]

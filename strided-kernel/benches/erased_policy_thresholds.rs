@@ -1037,6 +1037,160 @@ fn bench_copy_raw_path(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Clone, Copy)]
+enum ScatterLayoutVariant {
+    Compact(usize),
+    NegativeRank2,
+    NonunitRank2,
+}
+
+impl ScatterLayoutVariant {
+    fn label(self) -> String {
+        match self {
+            Self::Compact(rank) => format!("compact_rank{rank}"),
+            Self::NegativeRank2 => "rank2_negative_update".to_string(),
+            Self::NonunitRank2 => "rank2_nonunit_update_dest".to_string(),
+        }
+    }
+}
+
+fn bench_erased_scatter_variant<M: Measurement>(
+    group: &mut BenchmarkGroup<'_, M>,
+    case: BenchCase,
+    variant: ScatterLayoutVariant,
+) {
+    let (
+        rank,
+        batch,
+        dims,
+        operand_strides,
+        update_strides,
+        update_offset,
+        update_len,
+        dest_strides,
+        dest_offset,
+        dest_len,
+    ) = match variant {
+        ScatterLayoutVariant::Compact(rank) => {
+            let window_elems = 1usize << (rank - 1);
+            let batch = case.len / window_elems;
+            let mut dims = vec![batch];
+            dims.extend((0..rank - 1).map(|_| 2usize));
+            let strides = col_major_strides(&dims);
+            (
+                rank,
+                batch,
+                dims,
+                strides.clone(),
+                strides.clone(),
+                0,
+                case.len,
+                strides,
+                0,
+                case.len,
+            )
+        }
+        ScatterLayoutVariant::NegativeRank2 => {
+            let batch = case.len / 2;
+            let dims = vec![batch, 2];
+            (
+                2,
+                batch,
+                dims,
+                vec![1, batch as isize],
+                vec![-1, batch as isize],
+                (batch - 1) as isize,
+                2 * batch,
+                vec![1, batch as isize],
+                0,
+                case.len,
+            )
+        }
+        ScatterLayoutVariant::NonunitRank2 => {
+            let batch = case.len / 2;
+            let dims = vec![batch, 2];
+            (
+                2,
+                batch,
+                dims,
+                vec![1, batch as isize],
+                vec![2, 1],
+                0,
+                2 * batch,
+                vec![2, 1],
+                0,
+                2 * batch,
+            )
+        }
+    };
+    let index_dims = vec![batch, 1];
+    let index_strides = vec![1isize, batch as isize];
+    let indices: Vec<i64> = (0..batch)
+        .map(|index| ((5 * index + 1) % batch) as i64)
+        .collect();
+    let operand = patterned_i32(case.len);
+    let updates = patterned_i32(update_len);
+    let spec = ScatterSpec {
+        update_window_dims: (1..rank).collect(),
+        inserted_window_dims: vec![0],
+        scatter_dims_to_operand_dims: vec![0],
+        index_vector_dim: 1,
+    };
+    let plan = ErasedScatterPlan::compile(
+        KernelDType::I32,
+        KernelDType::I64,
+        &dims,
+        &operand_strides,
+        &index_dims,
+        &index_strides,
+        &dims,
+        &update_strides,
+        &dims,
+        &dest_strides,
+        spec,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &dims, &operand_strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&updates, &dims, &update_strides, update_offset).unwrap();
+    let ctx = context(case);
+    let id = BenchmarkId::new(
+        format!("{}_{}", variant.label(), context_label(case)),
+        format!("n{}", case.len),
+    );
+
+    group.bench_function(id, |bencher| {
+        let mut output = vec![0i32; dest_len];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &dest_strides, dest_offset)
+                .unwrap();
+        bencher.iter(|| {
+            plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
+                .unwrap();
+            black_box(&mut dest);
+        });
+    });
+}
+
+fn bench_erased_scatter_generic_rank_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_scatter_generic_rank_layout");
+    for case in profile_cases() {
+        for variant in [
+            ScatterLayoutVariant::Compact(2),
+            ScatterLayoutVariant::Compact(4),
+            ScatterLayoutVariant::Compact(8),
+            ScatterLayoutVariant::NegativeRank2,
+            ScatterLayoutVariant::NonunitRank2,
+        ] {
+            bench_erased_scatter_variant(&mut group, case, variant);
+        }
+    }
+    group.finish();
+}
+
 fn bench_scatter_additive(c: &mut Criterion) {
     let mut group = c.benchmark_group("erased_scatter_additive_serial_semantics");
     for case in profile_cases() {
@@ -1115,6 +1269,7 @@ criterion_group! {
         bench_erased_pad_generic_rank_layout,
         bench_raw_any_integer_preflight,
         bench_copy_raw_path,
-        bench_scatter_additive
+        bench_scatter_additive,
+        bench_erased_scatter_generic_rank_layout
 }
 criterion_main!(benches);

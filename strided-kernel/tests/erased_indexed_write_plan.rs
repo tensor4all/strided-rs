@@ -1,9 +1,9 @@
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use strided_kernel::{
-    ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedRawStridedMut, ErasedRawStridedPtr,
-    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScatterPlan, ExecContext, KernelDType,
-    ScatterSpec, StridedError,
+    col_major_strides, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedRawStridedMut,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScatterPlan,
+    ExecContext, KernelDType, ScatterSpec, StridedError,
 };
 
 #[test]
@@ -818,6 +818,262 @@ fn erased_dynamic_update_zero_window_still_copies_operand() {
     for (actual, expected) in raw.iter().zip(operand) {
         assert_eq!(unsafe { *actual.assume_init_ref() }, expected);
     }
+}
+
+fn scatter_window_spec_for_rank(rank: usize) -> ScatterSpec {
+    ScatterSpec {
+        update_window_dims: (1..rank).collect(),
+        inserted_window_dims: vec![0],
+        scatter_dims_to_operand_dims: vec![0],
+        index_vector_dim: 1,
+    }
+}
+
+fn scatter_window_spec() -> ScatterSpec {
+    scatter_window_spec_for_rank(2)
+}
+
+fn run_compact_windowed_scatter<I>()
+where
+    I: Copy + Default + From<i32> + strided_kernel::KernelStorageElement,
+{
+    for &rank in &[2usize, 4, 8] {
+        let batch = 4usize;
+        let window_elems = 1usize << (rank - 1);
+        let mut dims = vec![batch];
+        dims.extend((0..rank - 1).map(|_| 2usize));
+        let strides = col_major_strides(&dims);
+        let total = batch * window_elems;
+        let operand: Vec<i32> = (0..total).map(|value| 1000 + value as i32).collect();
+        let updates: Vec<i32> = (0..total).map(|value| 1 + value as i32).collect();
+        let index_values = [-1, 0, 3, 1];
+        let indices: Vec<I> = index_values.into_iter().map(I::from).collect();
+        let index_dims = [batch, 1usize];
+        let index_strides = [1isize, batch as isize];
+        let mut expected = operand.clone();
+        for (batch_index, &start) in index_values.iter().enumerate() {
+            let start = start.clamp(0, (batch - 1) as i32) as usize;
+            for window_index in 0..window_elems {
+                let dest_linear = start + batch * window_index;
+                let update_linear = batch_index + batch * window_index;
+                expected[dest_linear] = expected[dest_linear].wrapping_add(updates[update_linear]);
+            }
+        }
+
+        let plan = ErasedScatterPlan::compile(
+            KernelDType::I32,
+            if core::mem::size_of::<I>() == core::mem::size_of::<i32>() {
+                KernelDType::I32
+            } else {
+                KernelDType::I64
+            },
+            &dims,
+            &strides,
+            &index_dims,
+            &index_strides,
+            &dims,
+            &strides,
+            &dims,
+            &strides,
+            scatter_window_spec_for_rank(rank),
+        )
+        .unwrap();
+        let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+        let index_ref =
+            ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+        let update_ref = ErasedRawStridedRef::from_slice(&updates, &dims, &strides, 0).unwrap();
+
+        let mut initialized = vec![0i32; total];
+        let mut initialized_ref =
+            ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
+        plan.execute(
+            &ExecContext::serial(),
+            &mut initialized_ref,
+            &operand_ref,
+            &index_ref,
+            &update_ref,
+        )
+        .unwrap();
+        assert_eq!(initialized, expected);
+
+        let mut uninitialized = vec![MaybeUninit::<i32>::uninit(); total];
+        let mut uninitialized_ref =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
+                .unwrap();
+        plan.execute_uninit(
+            &ExecContext::max_threads(4).unwrap(),
+            &mut uninitialized_ref,
+            &ErasedRawStridedPtr::from_ref(&operand_ref),
+            &ErasedRawStridedPtr::from_ref(&index_ref),
+            &ErasedRawStridedPtr::from_ref(&update_ref),
+        )
+        .unwrap();
+        assert_uninitialized_layout(&uninitialized, &expected, &dims, &strides, 0);
+    }
+}
+
+#[test]
+fn erased_scatter_windowed_compact_ranks_match_exact_clamped_replay() {
+    run_compact_windowed_scatter::<i32>();
+    run_compact_windowed_scatter::<i64>();
+}
+
+fn run_rank2_layout_scatter<I>(
+    update_strides: [isize; 2],
+    update_offset: isize,
+    update_len: usize,
+    dest_strides: [isize; 2],
+    dest_offset: isize,
+    dest_len: usize,
+) where
+    I: Copy + Default + From<i32> + strided_kernel::KernelStorageElement,
+{
+    let dims = [4usize, 2];
+    let operand_strides = [1isize, 4];
+    let operand: Vec<i32> = (0..8).map(|value| 100 + value).collect();
+    let indices: Vec<I> = [0, 0, 3, 1].into_iter().map(I::from).collect();
+    let updates: Vec<i32> = vec![0; update_len];
+    let mut updates = updates;
+    for linear in 0..8 {
+        let slot = layout_offset(
+            update_offset,
+            &update_strides,
+            &decode_col_major(linear, &dims),
+        );
+        updates[slot] = 10 + linear as i32;
+    }
+    let index_dims = [4usize, 1];
+    let index_strides = [1isize, 4];
+    let mut expected = vec![-777i32; dest_len];
+    for linear in 0..8 {
+        let coords = decode_col_major(linear, &dims);
+        expected[layout_offset(dest_offset, &dest_strides, &coords)] = operand[linear];
+    }
+    for (batch, &start) in [0usize, 0, 3, 1].iter().enumerate() {
+        for window in 0..2 {
+            let dest_coords = [start, window];
+            let dest_slot = layout_offset(dest_offset, &dest_strides, &dest_coords);
+            let update_slot = layout_offset(update_offset, &update_strides, &[batch, window]);
+            expected[dest_slot] = expected[dest_slot].wrapping_add(updates[update_slot]);
+        }
+    }
+
+    let plan = ErasedScatterPlan::compile(
+        KernelDType::I32,
+        if core::mem::size_of::<I>() == core::mem::size_of::<i32>() {
+            KernelDType::I32
+        } else {
+            KernelDType::I64
+        },
+        &dims,
+        &operand_strides,
+        &index_dims,
+        &index_strides,
+        &dims,
+        &update_strides,
+        &dims,
+        &dest_strides,
+        scatter_window_spec(),
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &dims, &operand_strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&updates, &dims, &update_strides, update_offset).unwrap();
+
+    let mut initialized = vec![-777i32; dest_len];
+    let mut initialized_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &dest_strides, dest_offset)
+            .unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut initialized_ref,
+        &operand_ref,
+        &index_ref,
+        &update_ref,
+    )
+    .unwrap();
+    assert_eq!(initialized, expected);
+
+    let mut uninitialized = vec![MaybeUninit::<i32>::uninit(); dest_len];
+    let mut uninitialized_ref = ErasedRawStridedUninitMut::from_uninit_slice(
+        &mut uninitialized,
+        &dims,
+        &dest_strides,
+        dest_offset,
+    )
+    .unwrap();
+    plan.execute_uninit(
+        &ExecContext::serial(),
+        &mut uninitialized_ref,
+        &ErasedRawStridedPtr::from_ref(&operand_ref),
+        &ErasedRawStridedPtr::from_ref(&index_ref),
+        &ErasedRawStridedPtr::from_ref(&update_ref),
+    )
+    .unwrap();
+    assert_uninitialized_layout(&uninitialized, &expected, &dims, &dest_strides, dest_offset);
+}
+
+#[test]
+fn erased_scatter_windowed_negative_nonunit_and_hole_layouts_match() {
+    run_rank2_layout_scatter::<i32>([-1, 4], 3, 8, [1, 4], 0, 8);
+    run_rank2_layout_scatter::<i64>([-1, 4], 3, 8, [1, 4], 0, 8);
+    run_rank2_layout_scatter::<i32>([2, 1], 0, 8, [2, 1], 1, 9);
+    run_rank2_layout_scatter::<i64>([2, 1], 0, 8, [2, 1], 1, 9);
+}
+
+#[test]
+fn erased_scatter_empty_domain_is_a_noop_for_initialized_and_uninitialized() {
+    let dims = [4usize, 0];
+    let strides = [1isize, 4];
+    let index_dims = [4usize, 1];
+    let index_strides = [1isize, 4];
+    let plan = ErasedScatterPlan::compile(
+        KernelDType::I32,
+        KernelDType::I64,
+        &dims,
+        &strides,
+        &index_dims,
+        &index_strides,
+        &dims,
+        &strides,
+        &dims,
+        &strides,
+        scatter_window_spec(),
+    )
+    .unwrap();
+    let operand: [i32; 0] = [];
+    let indices = [0i64; 4];
+    let updates: [i32; 0] = [];
+    let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+    let index_ref =
+        ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+    let update_ref = ErasedRawStridedRef::from_slice(&updates, &dims, &strides, 0).unwrap();
+    let mut initialized: [i32; 0] = [];
+    let mut initialized_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut initialized_ref,
+        &operand_ref,
+        &index_ref,
+        &update_ref,
+    )
+    .unwrap();
+    let mut uninitialized = Vec::<MaybeUninit<i32>>::new();
+    let mut uninitialized_ref =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
+            .unwrap();
+    plan.execute_uninit(
+        &ExecContext::serial(),
+        &mut uninitialized_ref,
+        &ErasedRawStridedPtr::from_ref(&operand_ref),
+        &ErasedRawStridedPtr::from_ref(&index_ref),
+        &ErasedRawStridedPtr::from_ref(&update_ref),
+    )
+    .unwrap();
 }
 
 #[test]
