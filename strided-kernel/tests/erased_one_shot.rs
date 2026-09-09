@@ -1,9 +1,9 @@
 use num_complex::{Complex32, Complex64};
 use std::ptr::NonNull;
+use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
-    erased_map_into, erased_zip_into, ErasedFusedPlan, ErasedMapOp, ErasedRawStridedMut,
-    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedZipOp, ExecContext, FusedInst, FusedOp,
-    FusedPlan, KernelDType, StridedError,
+    erased_map_into, erased_zip_into, ErasedMapOp, ErasedRawStridedMut, ErasedRawStridedPtr,
+    ErasedRawStridedRef, ErasedZipOp, ExecContext, KernelDType, StridedError,
 };
 
 fn single_op_plan(input_count: usize, op: FusedOp) -> FusedPlan {

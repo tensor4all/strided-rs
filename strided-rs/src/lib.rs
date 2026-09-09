@@ -20,6 +20,11 @@ pub mod kernel {
     pub use strided_kernel::*;
 }
 
+/// Runtime-DAG fused elementwise kernels.
+pub mod fused {
+    pub use strided_fused::*;
+}
+
 /// Binary einsum contractions on strided views.
 #[cfg(any(feature = "faer", feature = "blas", feature = "blas-inject"))]
 pub mod einsum2 {

@@ -7,7 +7,7 @@ to its implementation, benchmark, decision record, and published results.
 
 | Question | Source of truth |
 |---|---|
-| What selects serial versus parallel execution? | `strided-kernel/src/threading.rs` |
+| What selects serial versus parallel execution? | `strided-basic/src/threading.rs` (shared by ordinary and fused execution) |
 | How is the threshold exercised? | `strided-kernel/benches/erased_policy_thresholds.rs` |
 | Why was the current threshold selected? | This document and [strided-rs#163](https://github.com/tensor4all/strided-rs/issues/163) |
 | Where does one implementation session record its evidence? | A dated file under `docs/worklogs/` |

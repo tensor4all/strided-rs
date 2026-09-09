@@ -13,12 +13,12 @@ use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
     batched_outer_product_into, batched_outer_product_into_uninit, broadcast_mul_into,
     broadcast_mul_into_uninit, compare_into, compare_into_uninit, with_execution_policy, CompareOp,
-    ErasedFusedPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, ExecContext, ExecutionPolicy, FusedInst, FusedOp, FusedPlan,
-    Identity, KernelDType, StridedView, StridedViewMut,
+    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
+    ExecContext, ExecutionPolicy, Identity, KernelDType, StridedView, StridedViewMut,
 };
 
 const WARMUPS: usize = 8;

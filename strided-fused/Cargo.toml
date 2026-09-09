@@ -1,0 +1,39 @@
+[package]
+name = "strided-fused"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/strided-fused"
+homepage = "https://github.com/tensor4all/strided-rs"
+description = "Runtime-DAG fused strided CPU kernel execution."
+keywords = ["tensor", "strided", "kernels", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[dependencies]
+strided-basic.workspace = true
+num-complex.workspace = true
+
+[features]
+default = ["simd"]
+parallel = ["strided-basic/parallel"]
+simd = ["strided-basic/simd"]
+
+[dev-dependencies]
+rayon.workspace = true
+num-traits.workspace = true
+criterion.workspace = true
+approx.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+num-complex.workspace = true
+
+[lib]
+bench = false
+
+
+[[bench]]
+name = "fused_elementwise"
+harness = false
