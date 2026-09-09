@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn test_compute_order_handles_empty_inputs_and_destination_reordering() {
+    let dims = [2usize, 3];
+    assert_eq!(compute_order(&dims, &[], None), vec![0, 1]);
+
+    let first = [1isize, 2];
+    let second = [2isize, 1];
+    let strides = vec![&first[..], &second[..]];
+    for dest_index in [None, Some(0), Some(1), Some(2)] {
+        let order = compute_order(&dims, &strides, dest_index);
+        assert_eq!(order.len(), dims.len());
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1]);
+    }
+}
+
+#[test]
 fn test_compute_order_column_major() {
     // Column-major array: strides [1, 4]
     let dims = [4usize, 5];

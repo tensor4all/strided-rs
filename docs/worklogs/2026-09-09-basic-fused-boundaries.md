@@ -76,6 +76,18 @@ serial, capped and nested policies. These runs are not timing benchmarks.
 - Resolved normal dependency metadata confirms no ordinary/fused cross-edge.
   Basic's no-default normal graph contains neither Rayon nor pulp.
 
+## PR correction
+
+PR #254's first CI run passed rustfmt, both OS test jobs, docs and maintenance
+scripts. Coverage alone failed: `strided-basic/src/order.rs` was 65.9% against
+the 80% threshold after its tests moved out of the source file. The uncovered
+branches were valid existing behavior, not dead implementation. One focused
+unit test now exercises empty stride lists and all destination-index forms
+(`None`, first, nonzero, and out-of-range), asserting each result is a
+permutation. Local `cargo llvm-cov --workspace` then reported **58/58 files
+passed**. The correction changes tests only; the implementation and pin remain
+unchanged.
+
 Logs remain at `/tmp/strided-current-*.log`; failed import-conflict attempts are
 retained separately from successful runs. Reapplication/inventory material is
 under `/tmp/strided-current-reapply/`. No fallback implementation was added to
