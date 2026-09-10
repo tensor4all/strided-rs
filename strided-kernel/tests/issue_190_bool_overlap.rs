@@ -182,6 +182,8 @@ fn production_source_contract_has_no_legacy_erased_storage_apis() {
     let production = [
         root.join("strided-view/src"),
         root.join("strided-kernel/src"),
+        root.join("strided-basic/src"),
+        root.join("strided-fused/src"),
         root.join("strided-einsum2/src"),
         root.join("strided-opteinsum/src"),
         root.join("mdarray-opteinsum/src"),
@@ -217,7 +219,14 @@ fn production_source_contract_has_no_legacy_erased_storage_apis() {
             if path.ends_with("strided-view/src/raw.rs") {
                 continue;
             }
-            if path.ends_with("strided-kernel/src/erased.rs") {
+            if [
+                "strided-kernel/src/erased.rs",
+                "strided-basic/src/erased.rs",
+                "strided-fused/src/erased.rs",
+            ]
+            .iter()
+            .any(|owner| path.ends_with(owner))
+            {
                 assert!(!source.contains("std::slice::from_raw_parts"));
                 assert!(!source.contains("std::slice::from_raw_parts_mut"));
                 assert!(!source.contains("core::slice::from_raw_parts"));

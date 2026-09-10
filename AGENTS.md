@@ -39,7 +39,9 @@ license-bearing attributions (`strided-perm` is
 |-------|------|
 | `strided-traits` | Element-operation and scalar traits (`Identity`, `Conj`, `Transpose`, `Adjoint`) |
 | `strided-view` | Dynamic-rank strided views (`StridedView`, `StridedViewMut`, `StridedArray`) and metadata ops |
-| `strided-kernel` | Cache-optimized map/reduce/broadcast kernels, Rayon threading, pulp SIMD (feature `simd`) |
+| `strided-basic` | Shared typed primitives, layout/indexing plans, copy/reduction, execution policy, Rayon and pulp SIMD |
+| `strided-kernel` | Ordinary dtype-erased arithmetic/indexing and re-exported typed APIs |
+| `strided-fused` | Runtime-DAG fused execution using the shared basic implementation |
 | `strided-perm` | Cache-efficient permutation / transpose (HPTT-derived, `src/hptt/`), feature `parallel` |
 | `strided-einsum2` | Binary einsum via GEMM backends |
 | `strided-opteinsum` | N-ary einsum with contraction-order optimization |
