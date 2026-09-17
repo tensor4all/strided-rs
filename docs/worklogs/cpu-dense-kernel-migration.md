@@ -32,3 +32,26 @@ positions, extreme triangular offsets, complex AXPBY, invalid metadata and
 bounded parallel execution must pass. Downstream CPU tests must pass against
 the migrated implementation. Any claimed optimization requires a comparison
 against the recorded baseline; instruction counts are not timing speedups.
+
+## Optimization candidate
+
+Migration baseline: `ec585b8a4bf0af96863a6136f0b1f8e9c1aeadba`.
+The separate benchmark suite has a `dense_kernels` binary with nonzero
+references, explicit `Sequential` policy, an excluded warmup, and the
+`profile_dense` Callgrind collection boundary. Setup, view construction,
+AXPBY state restoration and verification are outside that boundary.
+
+- Triangular masks now copy only kept intervals and fill masked intervals;
+  every output slot is written exactly once.
+- Contiguous multiply uses pulp's ordinary full-vector slice operations,
+  including its MaybeUninit output split. Partial accesses remain only for
+  the tail. This stays in the existing strided SIMD implementation, including
+  the existing exact complex multiply operation.
+- New tests cover all lengths 0..129, unaligned inputs/outputs, sentinels,
+  real/complex types and strided fallback; floating special values are checked.
+
+Strict Clippy under Rust 1.97.1 is currently blocked by pre-existing lints in
+unchanged strided-view and strided-basic code (including `uninit_vec` in
+strided-view/src/view.rs). `--no-deps` still finds 33 existing basic-crate
+errors; none are in the changed dense_update.rs or simd.rs code. This change
+neither silences those lints nor claims a passing strict-lint gate.

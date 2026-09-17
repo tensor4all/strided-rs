@@ -33,7 +33,8 @@ macro_rules! impl_simd_mul_ptr {
     (
         $mul_into:ident,
         $ty:ty,
-        $lanes:ident,
+        $split:ident,
+        $split_uninit:ident,
         $load:ident,
         $mask:ident,
         $store_ptr:ident,
@@ -56,27 +57,30 @@ macro_rules! impl_simd_mul_ptr {
                     debug_assert_eq!(self.len, self.a.len());
                     debug_assert_eq!(self.len, self.b.len());
 
-                    let lanes = S::$lanes;
-                    let mut i = 0usize;
-                    while i + lanes <= self.len {
-                        let va = simd.$load(&self.a[i..i + lanes]);
-                        let vb = simd.$load(&self.b[i..i + lanes]);
-                        unsafe {
-                            simd.$store_ptr(
-                                simd.$mask(0, (lanes * $mask_scale) as _),
-                                self.dst.add(i),
-                                simd.$mul(va, vb),
-                            );
-                        }
-                        i += lanes;
+                    // SAFETY: the caller supplies len writable, nonaliasing
+                    // elements. MaybeUninit does not assert initialized output.
+                    let output = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            self.dst.cast::<core::mem::MaybeUninit<$ty>>(),
+                            self.len,
+                        )
+                    };
+                    let (dest, tail) = S::$split_uninit(output);
+                    let (a, a_tail) = S::$split(self.a);
+                    let (b, b_tail) = S::$split(self.b);
+                    // Full vectors use ordinary stores. Pulp's partial-access
+                    // machinery is needed only for the final incomplete vector.
+                    for ((dst, &a), &b) in dest.iter_mut().zip(a).zip(b) {
+                        dst.write(simd.$mul(a, b));
                     }
-                    if i < self.len {
-                        let va = simd.$load(&self.a[i..]);
-                        let vb = simd.$load(&self.b[i..]);
+                    if !tail.is_empty() {
+                        let va = simd.$load(a_tail);
+                        let vb = simd.$load(b_tail);
+                        // SAFETY: the mask writes exactly the remaining lanes.
                         unsafe {
                             simd.$store_ptr(
-                                simd.$mask(0, ((self.len - i) * $mask_scale) as _),
-                                self.dst.add(i),
+                                simd.$mask(0, (tail.len() * $mask_scale) as _),
+                                tail.as_mut_ptr().cast::<$ty>(),
                                 simd.$mul(va, vb),
                             );
                         }
@@ -93,7 +97,8 @@ macro_rules! impl_simd_mul_ptr {
 impl_simd_mul_ptr!(
     simd_mul_f32_into,
     f32,
-    F32_LANES,
+    as_simd_f32s,
+    as_uninit_mut_simd_f32s,
     partial_load_f32s,
     mask_between_m32s,
     mask_store_ptr_f32s,
@@ -105,7 +110,8 @@ impl_simd_mul_ptr!(
 impl_simd_mul_ptr!(
     simd_mul_f64_into,
     f64,
-    F64_LANES,
+    as_simd_f64s,
+    as_uninit_mut_simd_f64s,
     partial_load_f64s,
     mask_between_m64s,
     mask_store_ptr_f64s,
@@ -117,7 +123,8 @@ impl_simd_mul_ptr!(
 impl_simd_mul_ptr!(
     simd_mul_c32_into,
     num_complex::Complex32,
-    C32_LANES,
+    as_simd_c32s,
+    as_uninit_mut_simd_c32s,
     partial_load_c32s,
     mask_between_m32s,
     mask_store_ptr_c32s,
@@ -129,7 +136,8 @@ impl_simd_mul_ptr!(
 impl_simd_mul_ptr!(
     simd_mul_c64_into,
     num_complex::Complex64,
-    C64_LANES,
+    as_simd_c64s,
+    as_uninit_mut_simd_c64s,
     partial_load_c64s,
     mask_between_m64s,
     mask_store_ptr_c64s,

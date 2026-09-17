@@ -116,12 +116,6 @@ pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
     let rows = shape[0];
     let cols = shape[1];
     for_each_chunk(output, |start, chunk| {
-        // Preserve the original copy-then-mask algorithm for the migration
-        // baseline; the benchmark suite compares subsequent loop changes.
-        let len = chunk.len();
-        for (dst, &src) in chunk.iter_mut().zip(&input[start..start + len]) {
-            dst.write(src);
-        }
         let mut pos = 0;
         while pos < chunk.len() {
             let flat = start + pos;
@@ -129,19 +123,25 @@ pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
             let col = (flat / rows) % cols;
             let count = (rows - row).min(chunk.len() - pos);
             let boundary = col as i128 - k as i128;
-            let (lo, hi) = if upper {
-                (
-                    boundary.saturating_add(1).clamp(0, rows as i128) as usize,
-                    rows,
-                )
+            let split = if upper {
+                boundary.saturating_add(1)
             } else {
-                (0, boundary.clamp(0, rows as i128) as usize)
-            };
-            let begin = lo.max(row);
-            let end = hi.min(row + count);
-            if begin < end {
-                chunk[pos + begin - row..pos + end - row].fill(MaybeUninit::new(fill));
+                boundary
             }
+            .clamp(row as i128, (row + count) as i128) as usize
+                - row;
+            let (low, high) = chunk[pos..pos + count].split_at_mut(split);
+            let (kept, source, masked) = if upper {
+                (low, &input[flat..flat + split], high)
+            } else {
+                (high, &input[flat + split..flat + count], low)
+            };
+            // Full overwrite: never read masked input or copy it only to
+            // overwrite it a second time. Each output element is written once.
+            for (dst, &src) in kept.iter_mut().zip(source) {
+                dst.write(src);
+            }
+            masked.fill(MaybeUninit::new(fill));
             pos += count;
         }
     });
