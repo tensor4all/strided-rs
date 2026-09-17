@@ -243,8 +243,8 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 ///
 /// On success every logical destination element is initialized; holes are
 /// untouched. Accepts identity views; use `map_into` for element operations
-/// such as conjugation. Sequential copies use the permutation engine; bounded
-/// parallel copies retain the map scheduler.
+/// such as conjugation. Sequential strided copies use the permutation engine;
+/// contiguous and bounded parallel copies retain the map implementation.
 ///
 /// # Errors
 /// Returns a shape/rank error for mismatched views, `NonInjectiveOutputLayout`
@@ -279,7 +279,9 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync>(
         .iter()
         .try_fold(1usize, |n, &dim| n.checked_mul(dim))
         .ok_or(StridedError::OffsetOverflow)?;
-    if std::mem::size_of::<T>() == 0 {
+    if std::mem::size_of::<T>() == 0
+        || sequential_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()]).is_some()
+    {
         return map_into(dest, src, MaybeUninit::new);
     }
     #[cfg(feature = "parallel")]

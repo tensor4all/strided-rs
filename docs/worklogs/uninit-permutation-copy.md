@@ -8,6 +8,9 @@ MaybeUninit<T> (same layout), never interprets unwritten destination as T, and
 uses the existing copy engine without a new traversal or pool. Preserve generic
 map for zero-sized types and multi-thread workloads selected by the existing
 bounded execution policy; do not replace parallel copying with serial HPTT.
+The initial kernel-only instruction probe found a contiguous-copy regression
+(~28%) despite reductions for permutations. Preserve the existing contiguous
+map path too; remeasure the corrected implementation before acceptance.
 Validate shape, destination injectivity and element-count arithmetic first.
 Conjugating tenferro materialization keeps its current map implementation.
 
