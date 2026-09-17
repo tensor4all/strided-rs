@@ -1,5 +1,7 @@
 # Dense CPU kernel ownership
 
+2026-09-17; AMD EPYC7713P, explicit 1T diagnostic measurements.
+
 Tenferro's pinned strided branch is `umbrella/issue-burndown-2026-08` at
 `fbd10fa5b70bb462b961cfd9e02faadb6bb95be0`; this change intentionally builds
 on that family split, not the older main branch. The user requested moving
