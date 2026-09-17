@@ -51,6 +51,13 @@ fn layouts_and_holes_match_reference() {
 }
 
 #[test]
+fn broadcast_batches_match_reference() {
+    check(&[3, 2, 2], &[1, 3, 0], 0, &[1, 3, 6], 0, 12);
+    check(&[2, 3, 2], &[0, 1, 3], 0, &[1, 2, 6], 0, 12);
+    check(&[2, 2, 3], &[2, 0, 4], 0, &[1, 2, 4], 0, 12);
+}
+
+#[test]
 fn copy_preserves_complex_bits_and_initializes_all_slots() {
     use num_complex::Complex64;
     let source = [
