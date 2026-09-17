@@ -14,6 +14,10 @@ copy_into(&mut dst.view_mut(), &src.view()).unwrap();
 assert_eq!(dst.get(&[1, 2]), 5.0);
 ```
 
+`copy_into_uninit` copies into `StridedViewMut<MaybeUninit<T>>` without first
+initializing the destination. Success initializes every logical element, not
+unreachable holes. It preserves the shared bounded-thread policy.
+
 `simd` is enabled by default. `parallel` opts into the shared execution policy;
 `ExecContext::serial()` requests the serial path. Features select implementation
 capabilities, not operation families.

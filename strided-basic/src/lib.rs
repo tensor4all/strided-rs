@@ -88,8 +88,8 @@ pub use map_view::{
 };
 pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 pub use ops_view::{
-    add, axpy, copy_conj, copy_into, copy_into_col_major, copy_scale, copy_transpose_scale_into,
-    dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
+    add, axpy, copy_conj, copy_into, copy_into_col_major, copy_into_uninit, copy_scale,
+    copy_transpose_scale_into, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
 };
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,

@@ -11,6 +11,7 @@ use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use num_traits::{One, Zero};
+use std::mem::MaybeUninit;
 use std::ops::{Add, Mul};
 use strided_view::{ElementOp, ElementOpApply};
 
@@ -236,6 +237,63 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
     }
 
     map_into(dest, src, |x| x)
+}
+
+/// Copy initialized values into a potentially uninitialized destination.
+///
+/// On success every logical destination element is initialized; holes are
+/// untouched. Accepts identity views; use `map_into` for element operations
+/// such as conjugation. Sequential copies use the permutation engine; bounded
+/// parallel copies retain the map scheduler.
+///
+/// # Errors
+/// Returns a shape/rank error for mismatched views, `NonInjectiveOutputLayout`
+/// for overlapping destination elements, or `OffsetOverflow` for size overflow.
+///
+/// # Examples
+/// ```
+/// use std::mem::MaybeUninit;
+/// use strided_basic::{copy_into_uninit, StridedView, StridedViewMut};
+/// let src = [1.0_f64, 2.0];
+/// let mut dst = [MaybeUninit::uninit(); 2];
+/// copy_into_uninit(
+///     &mut StridedViewMut::new(&mut dst, &[2], &[1], 0).unwrap(),
+///     &StridedView::new(&src, &[2], &[1], 0).unwrap(),
+/// ).unwrap();
+/// // SAFETY: the successful copy initialized both destination elements.
+/// assert_eq!(unsafe { dst[1].assume_init() }, 2.0);
+/// ```
+pub fn copy_into_uninit<T: Copy + MaybeSendSync>(
+    dest: &mut StridedViewMut<MaybeUninit<T>>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    ensure_same_shape(dest.dims(), src.dims())?;
+    if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
+        return Err(StridedError::NonInjectiveOutputLayout);
+    }
+    if src.is_empty() {
+        return Ok(());
+    }
+    let _len = src
+        .dims()
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)?;
+    if std::mem::size_of::<T>() == 0 {
+        return map_into(dest, src, MaybeUninit::new);
+    }
+    #[cfg(feature = "parallel")]
+    if crate::threading::parallel_threads_for_len(_len) > 1 {
+        return map_into(dest, src, MaybeUninit::new);
+    }
+    let data = src.data();
+    // SAFETY: MaybeUninit<T> has T's size/alignment and accepts every initialized
+    // T representation. The source borrow and its extent are unchanged. No
+    // reference to initialized T is formed over destination storage.
+    let data =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<MaybeUninit<T>>(), data.len()) };
+    let source = StridedView::new(data, src.dims(), src.strides(), src.offset())?;
+    copy_into_col_major(dest, &source)
 }
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
