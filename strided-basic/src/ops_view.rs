@@ -243,8 +243,8 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 ///
 /// On success every logical destination element is initialized; holes are
 /// untouched. Accepts identity views; use `map_into` for element operations
-/// such as conjugation. Sequential strided copies use the permutation engine;
-/// contiguous and bounded parallel copies retain the map implementation.
+/// such as conjugation. Sequential strided f32/f64 copies use the permutation
+/// engine; other types, contiguous and bounded parallel copies retain map.
 ///
 /// # Errors
 /// Returns a shape/rank error for mismatched views, `NonInjectiveOutputLayout`
@@ -263,7 +263,7 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 /// // SAFETY: the successful copy initialized both destination elements.
 /// assert_eq!(unsafe { dst[1].assume_init() }, 2.0);
 /// ```
-pub fn copy_into_uninit<T: Copy + MaybeSendSync>(
+pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     dest: &mut StridedViewMut<MaybeUninit<T>>,
     src: &StridedView<T>,
 ) -> Result<()> {
@@ -279,7 +279,12 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync>(
         .iter()
         .try_fold(1usize, |n, &dim| n.checked_mul(dim))
         .ok_or(StridedError::OffsetOverflow)?;
-    if std::mem::size_of::<T>() == 0
+    // The permutation engine's 4/8-byte paths reinterpret storage as native
+    // floats. Restrict that path to those exact types: arbitrary Copy types can
+    // contain uninitialized padding or have weaker alignment (e.g. Complex32).
+    let native_float = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
+        || std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
+    if !native_float
         || sequential_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()]).is_some()
     {
         return map_into(dest, src, MaybeUninit::new);

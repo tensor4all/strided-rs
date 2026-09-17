@@ -92,6 +92,49 @@ fn invalid_destination_is_unchanged_and_zst_is_supported() {
     .unwrap();
 }
 
+#[test]
+fn tiled_float_copies_preserve_bits_and_padded_types_fall_back() {
+    macro_rules! floats {
+        ($ty:ty, $nan:expr) => {{
+            let values: [$ty; 4] = [$nan, -0.0, <$ty>::INFINITY, <$ty>::NEG_INFINITY];
+            let source: Vec<_> = (0..72).map(|i| values[i % 4]).collect();
+            let mut output = vec![MaybeUninit::uninit(); 72];
+            copy_into_uninit(
+                &mut StridedViewMut::new(&mut output, &[8, 9], &[1, 8], 0).unwrap(),
+                &StridedView::new(&source, &[8, 9], &[9, 1], 0).unwrap(),
+            )
+            .unwrap();
+            for col in 0..9 {
+                for row in 0..8 {
+                    // SAFETY: the successful copy initialized the entire output.
+                    let value = unsafe { output[row + 8 * col].assume_init() };
+                    assert_eq!(value.to_bits(), source[9 * row + col].to_bits());
+                }
+            }
+        }};
+    }
+    floats!(f32, f32::from_bits(0x7fc00042));
+    floats!(f64, f64::from_bits(0x7ff8000000000042));
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Padded(u8, u32);
+    let source = [Padded(1, 11), Padded(2, 22), Padded(3, 33), Padded(4, 44)];
+    let mut output = [MaybeUninit::uninit(); 4];
+    copy_into_uninit(
+        &mut StridedViewMut::new(&mut output, &[2, 2], &[1, 2], 0).unwrap(),
+        &StridedView::new(&source, &[2, 2], &[2, 1], 0).unwrap(),
+    )
+    .unwrap();
+    for (i, expected) in [source[0], source[2], source[1], source[3]]
+        .iter()
+        .enumerate()
+    {
+        // SAFETY: the successful copy initialized each logical Padded value.
+        assert_eq!(unsafe { output[i].assume_init() }, *expected);
+    }
+}
+
 #[cfg(feature = "parallel")]
 #[test]
 fn large_permutation_respects_sequential_and_bounded_policy() {
