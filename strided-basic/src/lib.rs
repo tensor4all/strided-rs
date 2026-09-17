@@ -60,6 +60,7 @@
 
 mod block;
 mod copy_plan;
+mod dense_update;
 mod erased;
 mod erased_common;
 mod exec_context;
@@ -77,6 +78,7 @@ mod reduce_view;
 mod simd;
 mod threading;
 pub use copy_plan::CopyPlan;
+pub use dense_update::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
 pub use erased::{ErasedConcatenatePlan, ErasedCopyPlan, ErasedReducePlan, ReduceOp};
 pub use exec_context::ExecContext;
 pub use execution_policy::{with_execution_policy, ExecutionPolicy};
