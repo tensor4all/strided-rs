@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "strided-basic",
+    "strided-fused",
     "strided-rs",
     "strided-traits",
     "strided-view",
@@ -13,13 +15,15 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/strided-rs"
 
 [workspace.dependencies]
+strided-basic = { version = "0.4.0", path = "strided-basic", default-features = false }
+strided-fused = { version = "0.4.0", path = "strided-fused", default-features = false }
 strided-rs = { version = "0.4.0", path = "strided-rs" }
 strided-traits = { version = "0.4.0", path = "strided-traits" }
 strided-view = { version = "0.4.0", path = "strided-view" }

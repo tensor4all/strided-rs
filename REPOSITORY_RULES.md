@@ -81,9 +81,18 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
   different layout contract.
 - Public flat-buffer constructors, exports, examples, FFI contracts, and docs
   must state or preserve the active layout semantics.
-- Avoid per-element flat-to-multi-index decoding in tensor-sized loops when
-  incremental offsets, blocked traversal, or precomputed stride tables can be
-  used.
+- After plan validation, do not rebuild full coordinates or call rank-scanning
+  checked-offset helpers inside loops whose trip count scales with tensor
+  elements, windows, or reduced elements. A serial traversal may decode once
+  at traversal start; parallel or blocked traversal may decode once per worker
+  range or traversal block, then must advance coordinates and source/destination
+  offsets incrementally. Plan-time injectivity checks, offset-table
+  construction, and worker-range/block initialization are exempt from this
+  per-element restriction. Data-dependent index reads are allowed; static
+  layout mapping remains subject to the restriction. A deliberate replay
+  exception requires a nearby `// INVARIANT:` rationale plus dated
+  worklog/benchmark evidence, or a narrowly scoped claim linked to a residual
+  issue.
 
 ## CPU Threading Contract
 
@@ -114,6 +123,13 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
   decision, provided they state the date and the machine.
 - Use release-mode benchmarks for performance claims. Pin thread counts and
   backend configuration, and do not run benchmark jobs concurrently.
+- Work that adds or specializes a fast path must include a generic
+  fast-path-miss case and representative rank scaling. Other performance claims
+  must include representative rank scaling and the relevant fallback or layout
+  cases without inventing a nonexistent fast-path miss. Alternatively,
+  explicitly scope the claim and link a residual generic-path issue. Routine
+  production kernel refactors without a performance claim have no benchmark
+  obligation solely because they touch kernel code.
 - Benchmark scaling across representative tensor sizes, shapes, layouts, dtypes,
   and thread counts. A single fixed-size speedup is not enough evidence for a
   performance-sensitive change.

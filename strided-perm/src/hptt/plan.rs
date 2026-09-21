@@ -122,8 +122,10 @@ pub(crate) fn build_permute_plan(
     // Phase 3: Determine execution mode and blocking
     let block = block_for_elem_size(elem_size);
 
-    if dim_a == dim_b {
-        // ConstStride1 path: both stride-1 dims are the same
+    if dim_a == dim_b || fused_src[dim_a] != 1 || fused_dst[dim_b] != 1 {
+        // The transpose kernels assume positive unit inner strides on both
+        // operands. Broadcast, negative, and gapped inner axes instead use the
+        // existing strided copy loop, which honors both explicit strides.
         let inner_dim = dim_a;
         let mode = ExecMode::ConstStride1 { inner_dim };
 

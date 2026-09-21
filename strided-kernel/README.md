@@ -1,6 +1,9 @@
 # strided-kernel
 
-Cache-optimized compute kernels over `strided-view` tensors.
+Concrete dtype-erased ordinary arithmetic and indexing dispatch, with the
+checked typed APIs re-exported from `strided-basic`. Runtime-DAG fusion is
+provided by the separate `strided-fused` crate. The two concrete owners do not
+depend on one another.
 
 ## Scope
 

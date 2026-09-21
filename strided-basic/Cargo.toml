@@ -1,0 +1,37 @@
+[package]
+name = "strided-basic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/strided-basic"
+homepage = "https://github.com/tensor4all/strided-rs"
+description = "Shared typed strided CPU primitives and copy/reduction execution."
+keywords = ["tensor", "strided", "kernels", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
+
+[dependencies]
+strided-view.workspace = true
+strided-perm.workspace = true
+num-traits.workspace = true
+num-complex.workspace = true
+rayon = { workspace = true, optional = true }
+smallvec = { workspace = true, optional = true }
+pulp = { workspace = true, optional = true }
+
+[features]
+default = ["simd"]
+parallel = ["dep:rayon", "dep:smallvec", "strided-perm/parallel"]
+simd = ["dep:pulp"]
+
+[dev-dependencies]
+criterion.workspace = true
+approx.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+num-complex.workspace = true
+
+[lib]
+bench = false

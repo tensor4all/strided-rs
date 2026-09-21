@@ -585,6 +585,127 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
 }
 
 #[test]
+fn erased_pad_generic_cursor_matches_rank_scaling_ground_truth() {
+    for rank in [2usize, 4, 8] {
+        let operand_dims = vec![2usize; rank];
+        let operand_strides = (0..rank)
+            .scan(1isize, |stride, _| {
+                let current = *stride;
+                *stride *= 2;
+                Some(current)
+            })
+            .collect::<Vec<_>>();
+        let mut dest_dims = operand_dims.clone();
+        dest_dims[0] = 3;
+        let dest_strides = dest_dims
+            .iter()
+            .scan(1isize, |stride, &dim| {
+                let current = *stride;
+                *stride *= dim as isize;
+                Some(current)
+            })
+            .collect::<Vec<_>>();
+        let edge = vec![0i64; rank];
+        let mut interior = edge.clone();
+        interior[0] = 1;
+        let operand = (0..1usize << rank)
+            .map(|value| value as i32)
+            .collect::<Vec<_>>();
+        let mut dest = vec![-1i32; dest_dims.iter().product()];
+        let plan = ErasedPadPlan::compile(
+            KernelDType::I32,
+            &operand_dims,
+            &operand_strides,
+            &dest_dims,
+            &dest_strides,
+            &edge,
+            &edge,
+            &interior,
+        )
+        .unwrap();
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let mut dest_ref =
+            ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
+        plan.execute(
+            &ExecContext::serial(),
+            &mut dest_ref,
+            &operand_ref,
+            as_bytes(&[-1i32]),
+        )
+        .unwrap();
+
+        let mut expected = vec![-1i32; dest.len()];
+        for (linear, &value) in operand.iter().enumerate() {
+            let mut remainder = linear;
+            let mut output_linear = 0usize;
+            for axis in 0..rank {
+                let coord = remainder % 2;
+                remainder /= 2;
+                output_linear +=
+                    coord * dest_strides[axis] as usize * if axis == 0 { 2 } else { 1 };
+            }
+            expected[output_linear] = value;
+        }
+        assert_eq!(dest, expected, "rank {rank}");
+    }
+}
+
+#[test]
+fn erased_pad_generic_cursor_handles_crops_negative_strides_offsets_and_holes() {
+    let operand_dims = [2usize, 3];
+    let operand_strides = [-1isize, 3];
+    let dest_dims = [3usize, 2];
+    let dest_strides = [-1isize, 4];
+    let edge_low = [0i64, -1];
+    let edge_high = [0i64, 0];
+    let interior = [1i64, 0];
+    let operand = [10i32, 20, 99, 30, 40, 99, 50, 60];
+    let mut dest = [0i32; 7];
+    let plan = ErasedPadPlan::compile(
+        KernelDType::I32,
+        &operand_dims,
+        &operand_strides,
+        &dest_dims,
+        &dest_strides,
+        &edge_low,
+        &edge_high,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 1).unwrap();
+    let mut dest_ref =
+        ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 2).unwrap();
+    plan.execute(
+        &ExecContext::serial(),
+        &mut dest_ref,
+        &operand_ref,
+        as_bytes(&[-7i32]),
+    )
+    .unwrap();
+    assert_eq!(dest, [30, -7, 40, 0, 50, -7, 60]);
+
+    let mut fully_cropped = [0i32; 2];
+    let cropped_plan =
+        ErasedPadPlan::compile(KernelDType::I32, &[2], &[1], &[2], &[1], &[-4], &[3], &[1])
+            .unwrap();
+    let cropped_operand = [1i32, 2];
+    let cropped_ref = ErasedRawStridedRef::from_slice(&cropped_operand, &[2], &[1], 0).unwrap();
+    let mut cropped_dest =
+        ErasedRawStridedMut::from_slice_mut(&mut fully_cropped, &[2], &[1], 0).unwrap();
+    cropped_plan
+        .execute(
+            &ExecContext::serial(),
+            &mut cropped_dest,
+            &cropped_ref,
+            as_bytes(&[-9i32]),
+        )
+        .unwrap();
+    assert_eq!(fully_cropped, [-9, -9]);
+}
+
+#[test]
 fn erased_pad_contiguous_runs_honor_offsets_and_outer_axis_cropping() {
     let dims = [3usize];
     let strides = [1isize];

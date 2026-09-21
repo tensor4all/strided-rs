@@ -15,6 +15,7 @@ strided-traits.workspace = true
 strided-view.workspace = true
 strided-perm.workspace = true
 strided-kernel.workspace = true
+strided-fused = { workspace = true, features = ["simd"] }
 strided-einsum2 = { workspace = true, default-features = false, optional = true }
 strided-opteinsum = { workspace = true, default-features = false, optional = true }
 mdarray-opteinsum = { workspace = true, default-features = false, optional = true }
@@ -34,6 +35,7 @@ faer = [
 parallel = [
     "strided-perm/parallel",
     "strided-kernel/parallel",
+    "strided-fused/parallel",
     "strided-einsum2?/parallel",
     "strided-opteinsum?/parallel",
 ]

@@ -3,12 +3,13 @@ use num_complex::{Complex32, Complex64};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
     batched_outer_product_into, batched_outer_product_into_uninit, broadcast_mul_into,
     broadcast_mul_into_uninit, compare_into, compare_into_uninit, mul_into, mul_into_uninit,
-    CompareOp, ErasedFusedPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, ExecContext, FusedInst, FusedOp, FusedPlan, Identity, KernelDType,
-    StridedError, StridedView, StridedViewMut,
+    CompareOp, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
+    ErasedRawStridedUninitMut, ExecContext, Identity, KernelDType, StridedError, StridedView,
+    StridedViewMut,
 };
 
 fn uninit_view<'a, T>(

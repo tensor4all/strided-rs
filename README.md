@@ -8,7 +8,8 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 The recommended user-facing crate is [`strided-rs`](strided-rs/README.md).
 Use individual crates such as `strided-perm`, `strided-view`, or
 `strided-kernel` directly when you need a smaller dependency surface or a
-lower-level API. All nine workspace crates listed below are maintained.
+lower-level API. All workspace crates listed below are maintained. The new basic/fused packages
+are currently available from this workspace checkout, not yet from crates.io.
 
 ## Workspace Layout
 
@@ -16,7 +17,9 @@ lower-level API. All nine workspace crates listed below are maintained.
 - [`strided-traits`](strided-traits/): shared scalar and element-operation traits
 - [`strided-view`](strided-view/README.md): core dynamic-rank strided view/array types and metadata ops
 - [`strided-perm`](strided-perm/README.md): cache-efficient tensor permutation / transpose
-- [`strided-kernel`](strided-kernel/README.md): cache-optimized elementwise/reduction kernels over strided views
+- [`strided-basic`](strided-basic/README.md): shared typed primitives and copy/concatenation/reduction execution
+- [`strided-kernel`](strided-kernel/README.md): concrete ordinary arithmetic/indexing dispatch and typed APIs
+- [`strided-fused`](strided-fused/README.md): runtime-DAG fused execution
 - [`strided-einsum2`](strided-einsum2/README.md): binary einsum (`einsum2_into`) on strided tensors
 - [`strided-opteinsum`](strided-opteinsum/README.md): N-ary einsum frontend with nested notation and contraction-order optimization
 - [`mdarray-opteinsum`](mdarray-opteinsum/): einsum wrapper for `mdarray` arrays (row-major ↔ column-major transparent conversion)
@@ -65,13 +68,19 @@ See each sub-crate README for usage examples:
 - [`strided-rs`](strided-rs/README.md) — recommended facade crate and executable Quick Start
 - [`strided-view`](strided-view/README.md) — types, view operations
 - [`strided-perm`](strided-perm/README.md) — permutation and transpose kernels
-- [`strided-kernel`](strided-kernel/README.md) — map/reduce/broadcast kernels
+- [`strided-basic`](strided-basic/README.md) — shared primitives and lightweight execution
+- [`strided-kernel`](strided-kernel/README.md) — ordinary erased dispatch and typed APIs
+- [`strided-fused`](strided-fused/README.md) — runtime-DAG fusion
 - [`strided-einsum2`](strided-einsum2/README.md) — binary einsum with GEMM backend
 - [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum
 - [`mdarray-opteinsum`](mdarray-opteinsum/README.md) — einsum wrapper for `mdarray` arrays
 - [`ndarray-opteinsum`](ndarray-opteinsum/README.md) — einsum wrapper for `ndarray` arrays
 
+Design notes:
+- [CPU kernel boundaries](docs/design/cpu-kernel-boundaries.md) — generic code ownership, execution contracts and concrete dispatch
+
 Performance design notes:
+- [`erased execution policy`](docs/design/erased-execution-policy.md) — serial/parallel thresholds, benchmark commands, and evidence flow
 - [`faer-kernel-writing-guide`](docs/faer-kernel-writing-guide.md) — practical rules for writing hot strided kernels based on faer
 - [`faer_design`](docs/faer_design.md) — SIMD design analysis and optimization plan
 

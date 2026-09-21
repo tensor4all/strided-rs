@@ -46,7 +46,9 @@ relationship; the role is stated only on the first row.
 | --- | --- | --- | --- |
 | `strided-traits` | Element-operation and scalar traits (`Identity`, `Conj`, `Transpose`, `Adjoint`) | [Strided.jl](https://github.com/Jutho/Strided.jl) | Port (type-level counterparts of `FN`/`FC`/`FT`/`FA`) |
 | `strided-view` | Dynamic-rank strided views and metadata ops | [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) | Port |
-| `strided-kernel` | Cache-optimized map/reduce/broadcast kernels, threading | [Strided.jl](https://github.com/Jutho/Strided.jl) | Port (fusion, ordering, blocking, `_mapreduce_threaded!`) |
+| `strided-basic` | Shared cache-optimized map/reduce/broadcast kernels, threading | [Strided.jl](https://github.com/Jutho/Strided.jl) | Port (fusion, ordering, blocking, `_mapreduce_threaded!`) |
+| `strided-kernel` | Dtype-erased ordinary arithmetic/indexing adapters | strided-basic / Strided.jl lineage | Separated from the original kernel crate; inherited notices retained |
+| `strided-fused` | Runtime-DAG fused execution | strided-basic / Strided.jl lineage | Shared traversal foundation; inherited notices retained |
 | `strided-perm` | Cache-efficient tensor permutation / transpose | [HPTT](https://github.com/springer13/hptt) | Derived (BSD-3-Clause): algorithm and structure of the C++ implementation; SIMD kernels and autotuning not ported |
 | `strided-einsum2` | Binary einsum via GEMM | — | Original |
 | `strided-opteinsum` | N-ary einsum with contraction-order optimization | [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) | Inspired (design ideas and reference test-case patterns) |
@@ -64,12 +66,12 @@ list is best-effort; corrections and additions are welcome.
 | Algorithm | Component(s) | Original references |
 | --- | --- | --- |
 | Blocked tensor transposition (dimension fusion, macro/micro kernels, recursive loop nest) | `strided-perm` | P. Springer, T. Su, P. Bientinesi, "HPTT: A High-Performance Tensor Transposition C++ Library", [ARRAY 2017](https://doi.org/10.1145/3091966.3091968), [arXiv:1704.04374](https://arxiv.org/abs/1704.04374) |
-| Cache-blocked strided map/reduce (dimension fusion, stride-ordered loops, L1 blocking) | `strided-kernel` | Strided.jl has no accompanying paper; cite the [Strided.jl repository](https://github.com/Jutho/Strided.jl) |
+| Cache-blocked strided map/reduce (dimension fusion, stride-ordered loops, L1 blocking) | `strided-basic` | Strided.jl has no accompanying paper; cite the [Strided.jl repository](https://github.com/Jutho/Strided.jl) |
 
 Every published crate declares its component-specific lineage in its packaged
 `NOTICE`. Crates containing ported or license-derived code also package the
 applicable complete upstream license text in `THIRD-PARTY-LICENSES`:
-`strided-traits` and `strided-kernel` carry Strided.jl's MIT notice,
+`strided-traits`, `strided-basic`, `strided-kernel`, and `strided-fused` carry Strided.jl's MIT notice,
 `strided-view` carries StridedViews.jl's MIT notice, and `strided-perm` carries
 HPTT's BSD-3-Clause notice. The `strided-perm` crate is licensed as
 `(MIT OR Apache-2.0) AND BSD-3-Clause`.
