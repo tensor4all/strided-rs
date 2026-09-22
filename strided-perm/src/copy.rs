@@ -1,9 +1,23 @@
 //! Copy/permutation operations on strided views.
 
+use crate::fuse::FusionPlanError;
 #[cfg(feature = "parallel")]
 use crate::hptt::execute_permute_blocked_par;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
+
+/// Map a permutation planning failure onto the shared view error vocabulary.
+///
+/// Rank and shape are validated before planning, so a length mismatch cannot
+/// reach this point; it still maps to a typed error instead of a panic. An
+/// oversized (typically stride-0 broadcast) extent whose fused product cannot
+/// be represented is reported as an offset overflow (issue #263).
+fn plan_error(err: FusionPlanError) -> StridedError {
+    match err {
+        FusionPlanError::LengthMismatch { .. } => StridedError::StrideLengthMismatch,
+        FusionPlanError::DimensionOverflow => StridedError::OffsetOverflow,
+    }
+}
 
 fn total_len(dims: &[usize]) -> usize {
     dims.iter().product()
@@ -86,7 +100,8 @@ pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) ->
 
     // HPTT-inspired blocked permutation
     let elem_size = std::mem::size_of::<T>();
-    let plan = build_permute_plan(dst_dims, src_strides, dst_strides, elem_size);
+    let plan =
+        build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
     unsafe {
         execute_permute_blocked(src_ptr, dst_ptr, &plan);
     }
@@ -139,7 +154,8 @@ pub fn copy_into_par<T: Copy + Send + Sync>(
     }
 
     let elem_size = std::mem::size_of::<T>();
-    let plan = build_permute_plan(dst_dims, src_strides, dst_strides, elem_size);
+    let plan =
+        build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
     unsafe {
         execute_permute_blocked_par(src_ptr, dst_ptr, &plan);
     }

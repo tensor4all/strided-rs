@@ -3,7 +3,7 @@
 //! Mirrors HPTT C++'s plan construction: bilateral fusion → identify stride-1
 //! dims → determine execution mode → compute loop order → build ComputeNode chain.
 
-use crate::fuse::plan_bilateral_fusion;
+use crate::fuse::{plan_bilateral_fusion, FusionPlanError};
 use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
 
 /// A node in the recursive loop structure.
@@ -87,22 +87,27 @@ pub(crate) struct PermutePlan {
 ///
 /// This is the main entry point. The returned plan is consumed by
 /// `execute_permute_blocked`.
+///
+/// # Errors
+///
+/// Propagates [`FusionPlanError`] from bilateral fusion. Legal stride-0
+/// broadcast views can carry extents whose fused product overflows `usize`
+/// (issue #263), so this is a recoverable planning failure, not an invariant.
 pub(crate) fn build_permute_plan(
     dims: &[usize],
     src_strides: &[isize],
     dst_strides: &[isize],
     elem_size: usize,
-) -> PermutePlan {
+) -> Result<PermutePlan, FusionPlanError> {
     // Phase 1: Bilateral dimension fusion
-    let fusion = plan_bilateral_fusion(dims, src_strides, dst_strides)
-        .expect("HPTT permutation metadata is prevalidated");
+    let fusion = plan_bilateral_fusion(dims, src_strides, dst_strides)?;
     let fused_dims = fusion.dims;
     let fused_src = fusion.src_strides;
     let fused_dst = fusion.dst_strides;
 
     let rank = fused_dims.len();
     if rank == 0 {
-        return PermutePlan {
+        return Ok(PermutePlan {
             fused_dims,
             src_strides: fused_src,
             dst_strides: fused_dst,
@@ -112,7 +117,7 @@ pub(crate) fn build_permute_plan(
             ldb_inner: 0,
             block: 0,
             grouped_tile: None,
-        };
+        });
     }
 
     // Phase 2: Identify stride-1 dimensions
@@ -132,7 +137,7 @@ pub(crate) fn build_permute_plan(
         let loop_order = compute_loop_order_const(&fused_dims, &fused_src, &fused_dst, inner_dim);
         let root = build_compute_nodes(&fused_dims, &fused_src, &fused_dst, &loop_order);
 
-        PermutePlan {
+        Ok(PermutePlan {
             fused_dims,
             src_strides: fused_src.clone(),
             dst_strides: fused_dst.clone(),
@@ -142,7 +147,7 @@ pub(crate) fn build_permute_plan(
             ldb_inner: fused_dst[inner_dim],
             block: 0,
             grouped_tile: None,
-        }
+        })
     } else {
         // Transpose path: 2D micro-kernel
         let legacy_area = fused_dims[dim_a].saturating_mul(fused_dims[dim_b]);
@@ -150,7 +155,7 @@ pub(crate) fn build_permute_plan(
             if let Some((root, grouped_tile)) =
                 try_build_grouped_tile_plan(&fused_dims, &fused_src, &fused_dst, block, legacy_area)
             {
-                return PermutePlan {
+                return Ok(PermutePlan {
                     fused_dims,
                     src_strides: fused_src,
                     dst_strides: fused_dst,
@@ -160,7 +165,7 @@ pub(crate) fn build_permute_plan(
                     ldb_inner: 0,
                     block,
                     grouped_tile: Some(grouped_tile),
-                };
+                });
             }
         }
 
@@ -175,7 +180,7 @@ pub(crate) fn build_permute_plan(
             compute_loop_order_transpose(&fused_dims, &fused_src, &fused_dst, dim_a, dim_b);
         let root = build_compute_nodes(&fused_dims, &fused_src, &fused_dst, &loop_order);
 
-        PermutePlan {
+        Ok(PermutePlan {
             fused_dims,
             src_strides: fused_src,
             dst_strides: fused_dst,
@@ -185,7 +190,7 @@ pub(crate) fn build_permute_plan(
             ldb_inner,
             block,
             grouped_tile: None,
-        }
+        })
     }
 }
 
@@ -436,7 +441,7 @@ mod tests {
     #[test]
     fn test_build_plan_identity() {
         // Identity: src and dst both col-major → fuses to single dim → ConstStride1
-        let plan = build_permute_plan(&[2, 3, 4], &[1, 2, 6], &[1, 2, 6], 8);
+        let plan = build_permute_plan(&[2, 3, 4], &[1, 2, 6], &[1, 2, 6], 8).unwrap();
         assert_eq!(plan.fused_dims, vec![24]);
         assert!(matches!(plan.mode, ExecMode::ConstStride1 { .. }));
     }
@@ -444,7 +449,7 @@ mod tests {
     #[test]
     fn test_build_plan_transpose_2d() {
         // 2D transpose: src [1, 4], dst [5, 1]
-        let plan = build_permute_plan(&[4, 5], &[1, 4], &[5, 1], 8);
+        let plan = build_permute_plan(&[4, 5], &[1, 4], &[5, 1], 8).unwrap();
         assert_eq!(plan.fused_dims, vec![4, 5]);
         match plan.mode {
             ExecMode::Transpose { dim_a, dim_b } => {
@@ -465,7 +470,7 @@ mod tests {
         // 3D: dims [4,2,3], src strides [6,1,2], dst [1,4,8]
         // Bilateral fusion: dims 1-2 fuse (src: 2*1=2 == strides[2], dst: 2*4=8 == strides[2])
         // After fusion: dims [4, 6], src [6, 1], dst [1, 4]
-        let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8);
+        let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8).unwrap();
         assert_eq!(plan.fused_dims, vec![4, 6]);
         match plan.mode {
             ExecMode::Transpose { dim_a, dim_b } => {
@@ -487,7 +492,7 @@ mod tests {
         let src_strides = vec![1, 8, 2, 4]; // scattered
         let dst_strides = vec![1, 2, 4, 8]; // col-major
 
-        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8);
+        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8).unwrap();
 
         // Bilateral fusion: dims 2-3 fuse (src: 2→4 contiguous, dst: 4→8 contiguous)
         // Result: 3 fused dims
@@ -511,7 +516,7 @@ mod tests {
         ];
         let dst_strides = (0..24).map(|i| 1isize << i).collect::<Vec<_>>();
 
-        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8);
+        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8).unwrap();
 
         assert!(matches!(plan.mode, ExecMode::GroupedTranspose));
         let grouped = plan.grouped_tile.as_ref().expect("grouped tile plan");
@@ -526,7 +531,7 @@ mod tests {
         let src_strides = vec![256isize, 1, 65536];
         let dst_strides = vec![1isize, 256, 65536];
 
-        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8);
+        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8).unwrap();
 
         assert!(matches!(plan.mode, ExecMode::Transpose { .. }));
         assert!(plan.grouped_tile.is_none());
@@ -534,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_build_plan_rank0() {
-        let plan = build_permute_plan(&[], &[], &[], 8);
+        let plan = build_permute_plan(&[], &[], &[], 8).unwrap();
         assert!(matches!(plan.mode, ExecMode::Scalar));
         assert!(plan.root.is_none());
     }

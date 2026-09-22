@@ -643,7 +643,7 @@ mod tests {
     fn test_execute_identity_copy() {
         let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut dst = vec![0.0f64; 6];
-        let plan = build_permute_plan(&[2, 3], &[1, 2], &[1, 2], 8);
+        let plan = build_permute_plan(&[2, 3], &[1, 2], &[1, 2], 8).unwrap();
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -657,7 +657,7 @@ mod tests {
         // dst col-major [2, 3]: strides [1, 2]
         let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut dst = vec![0.0f64; 6];
-        let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8);
+        let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -674,7 +674,7 @@ mod tests {
         let mut dst = vec![0.0f64; total];
 
         // Permuted: dims [4,2,3], strides [6,1,2], dst col-major [1,4,8]
-        let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8);
+        let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8).unwrap();
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -701,7 +701,7 @@ mod tests {
         let mut dst = vec![0.0f64; total];
 
         // Permuted [3,1,0,2]: dims [5,3,2,4], strides [24,2,1,6], dst [1,5,15,30]
-        let plan = build_permute_plan(&[5, 3, 2, 4], &[24, 2, 1, 6], &[1, 5, 15, 30], 8);
+        let plan = build_permute_plan(&[5, 3, 2, 4], &[24, 2, 1, 6], &[1, 5, 15, 30], 8).unwrap();
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -730,7 +730,8 @@ mod tests {
         let mut dst = vec![0.0f64; total];
 
         // Permuted [4,0,1,2,3]: dims [3,2,2,2,2], strides [16,1,2,4,8], dst [1,3,6,12,24]
-        let plan = build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8);
+        let plan =
+            build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8).unwrap();
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -757,7 +758,7 @@ mod tests {
     fn test_execute_rank0_scalar() {
         let src = vec![42.0f64];
         let mut dst = vec![0.0f64];
-        let plan = build_permute_plan(&[], &[], &[], 8);
+        let plan = build_permute_plan(&[], &[], &[], 8).unwrap();
         unsafe {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -769,7 +770,7 @@ mod tests {
     fn test_execute_par_transpose_2d() {
         let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut dst = vec![0.0f64; 6];
-        let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8);
+        let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
         unsafe {
             execute_permute_blocked_par(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -785,7 +786,7 @@ mod tests {
         let mut dst = vec![0.0f64; total];
 
         // [256, 256, 256] col-major, transpose [2, 0, 1]
-        let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8);
+        let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8).unwrap();
         unsafe {
             execute_permute_blocked_par(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
@@ -808,7 +809,7 @@ mod tests {
     #[test]
     fn test_transpose_tile_rows_cover_rootless_3d_transpose() {
         let n = 256;
-        let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8);
+        let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8).unwrap();
         assert!(plan.root.is_none());
 
         let ExecMode::Transpose { dim_a, dim_b } = plan.mode else {
@@ -834,7 +835,7 @@ mod tests {
             let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
             let mut dst_par = vec![0.0f64; total];
             let mut dst_serial = vec![0.0f64; total];
-            let plan = build_permute_plan(&[n, n], &[n as isize, 1], &[1, n as isize], 8);
+            let plan = build_permute_plan(&[n, n], &[n as isize, 1], &[1, n as isize], 8).unwrap();
 
             unsafe {
                 execute_permute_blocked_par(src.as_ptr(), dst_par.as_mut_ptr(), &plan);
