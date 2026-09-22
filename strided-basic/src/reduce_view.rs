@@ -310,12 +310,14 @@ where
                 let n = len as usize;
                 let out_slice =
                     unsafe { std::slice::from_raw_parts_mut(out_ptr.offset(offsets[0]), n) };
-                // First reduction element → initialize output
+                // First reduction element: fold it into `init` so a
+                // non-identity seed is kept (issue #231). Writing without
+                // reading the pre-seeded output keeps the original traffic.
                 let src0 = unsafe { std::slice::from_raw_parts(src_ptr.offset(offsets[1]), n) };
                 for i in 0..n {
-                    out_slice[i] = map_fn(Op::apply(src0[i]));
+                    out_slice[i] = reduce_fn(init.clone(), map_fn(Op::apply(src0[i])));
                 }
-                // Remaining reduction elements → accumulate
+                // Remaining reduction elements: accumulate
                 for k in 1..axis_len {
                     let src_k = unsafe {
                         std::slice::from_raw_parts(
