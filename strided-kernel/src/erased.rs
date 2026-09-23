@@ -1355,15 +1355,27 @@ fn execute_one_shot_map<T: OneShotScalar>(
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
     let input = erased_raw_ref::<T>(input)?;
 
-    // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
-
-    unsafe {
-        strided_basic::execution::map_raw_into_validated::<T, T, Identity>(
-            &mut dest,
-            &input,
-            |value| T::map(op, value),
-            validated,
-        )
+    // The op is matched once here so each arm replays a loop whose closure
+    // names a constant op. After inlining, `T::map` folds to one arithmetic
+    // expression and the contiguous and threaded leaf loops can vectorize.
+    macro_rules! replay {
+        ($op:ident) => {
+            // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+            unsafe {
+                strided_basic::execution::map_raw_into_validated::<T, T, Identity>(
+                    &mut dest,
+                    &input,
+                    |value| T::map(ErasedMapOp::$op, value),
+                    validated,
+                )
+            }
+        };
+    }
+    match op {
+        ErasedMapOp::Negate => replay!(Negate),
+        ErasedMapOp::Conj => replay!(Conj),
+        ErasedMapOp::Abs => replay!(Abs),
+        ErasedMapOp::Sign => replay!(Sign),
     }
 }
 
@@ -1435,15 +1447,36 @@ fn execute_one_shot_zip<T: OneShotScalar>(
     let dest_data = dest.data_as_mut::<T>()?;
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
-    unsafe {
-        strided_basic::execution::zip_map2_raw_into_validated::<T, T, T, Identity, Identity>(
-            &mut dest,
-            &lhs,
-            &rhs,
-            |lhs, rhs| T::zip(op, lhs, rhs),
-            validated,
-        )
+    // The op is matched once here so each arm replays a loop whose closure
+    // names a constant op; see `execute_one_shot_map`.
+    macro_rules! replay {
+        ($op:ident) => {
+            // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+            unsafe {
+                strided_basic::execution::zip_map2_raw_into_validated::<
+                    T,
+                    T,
+                    T,
+                    Identity,
+                    Identity,
+                >(
+                    &mut dest,
+                    &lhs,
+                    &rhs,
+                    |lhs, rhs| T::zip(ErasedZipOp::$op, lhs, rhs),
+                    validated,
+                )
+            }
+        };
+    }
+    match op {
+        ErasedZipOp::Add => replay!(Add),
+        ErasedZipOp::Subtract => replay!(Subtract),
+        ErasedZipOp::Multiply => replay!(Multiply),
+        ErasedZipOp::Divide => replay!(Divide),
+        ErasedZipOp::Remainder => replay!(Remainder),
+        ErasedZipOp::Maximum => replay!(Maximum),
+        ErasedZipOp::Minimum => replay!(Minimum),
     }
 }
 
@@ -1510,22 +1543,24 @@ macro_rules! impl_real_one_shot_scalar {
                     ErasedZipOp::Multiply => lhs * rhs,
                     ErasedZipOp::Divide => lhs / rhs,
                     ErasedZipOp::Remainder => lhs % rhs,
+                    // Both arms are written as selects (non short circuit `|`)
+                    // so the element loop vectorizes. The result is unchanged:
+                    // any NaN operand gives the canonical NaN, otherwise ties
+                    // such as `+0.0` against `-0.0` return `lhs`.
                     ErasedZipOp::Maximum => {
-                        if lhs.is_nan() || rhs.is_nan() {
+                        let picked = if lhs >= rhs { lhs } else { rhs };
+                        if lhs.is_nan() | rhs.is_nan() {
                             <$ty>::NAN
-                        } else if lhs >= rhs {
-                            lhs
                         } else {
-                            rhs
+                            picked
                         }
                     }
                     ErasedZipOp::Minimum => {
-                        if lhs.is_nan() || rhs.is_nan() {
+                        let picked = if lhs <= rhs { lhs } else { rhs };
+                        if lhs.is_nan() | rhs.is_nan() {
                             <$ty>::NAN
-                        } else if lhs <= rhs {
-                            lhs
                         } else {
-                            rhs
+                            picked
                         }
                     }
                 }

@@ -1,8 +1,9 @@
 //! Reduce operations on dynamic-rank strided views.
 
+#[cfg(feature = "parallel")]
+use crate::kernel::same_contiguous_layout;
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block_preordered, same_contiguous_layout,
-    sequential_contiguous_layout, total_len,
+    build_plan_fused, for_each_inner_block_preordered, sequential_contiguous_layout, total_len,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
@@ -29,21 +30,7 @@ where
     R: Fn(U, U) -> U + MaybeSync,
     U: Clone + MaybeSendSync,
 {
-    reduce_impl(src, map_fn, reduce_fn, init, true)
-}
-
-pub(crate) fn reduce_serial<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
-    src: &StridedView<T, Op>,
-    map_fn: M,
-    reduce_fn: R,
-    init: U,
-) -> Result<U>
-where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
-{
-    reduce_impl(src, map_fn, reduce_fn, init, false)
+    reduce_impl(src, map_fn, reduce_fn, init)
 }
 
 fn reduce_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
@@ -51,7 +38,6 @@ fn reduce_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     map_fn: M,
     reduce_fn: R,
     init: U,
-    allow_ambient_parallel: bool,
 ) -> Result<U>
 where
     M: Fn(T) -> U + MaybeSync,
@@ -62,11 +48,7 @@ where
     let src_dims = src.dims();
     let src_strides = src.strides();
 
-    let contiguous = if allow_ambient_parallel {
-        sequential_contiguous_layout(src_dims, &[src_strides])?
-    } else {
-        same_contiguous_layout(src_dims, &[src_strides])
-    };
+    let contiguous = sequential_contiguous_layout(src_dims, &[src_strides])?;
     if contiguous.is_some() {
         let len = total_len(src_dims)?;
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -85,11 +67,7 @@ where
     #[cfg(feature = "parallel")]
     {
         let total = total_len(src_dims)?;
-        let nthreads = if allow_ambient_parallel {
-            crate::execution_policy::rayon_threads()
-        } else {
-            1
-        };
+        let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH
             && nthreads > 1
             && same_contiguous_layout(src_dims, &[src_strides]).is_some()
@@ -121,11 +99,7 @@ where
     #[cfg(feature = "parallel")]
     {
         let total = total_len(&fused_dims)?;
-        let nthreads = if allow_ambient_parallel {
-            crate::execution_policy::rayon_threads()
-        } else {
-            1
-        };
+        let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             // False sharing avoidance: space output slots by cache line size
             let spacing = (64 / std::mem::size_of::<U>()).max(1);
