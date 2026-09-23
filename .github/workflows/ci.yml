@@ -40,6 +40,9 @@ jobs:
       - name: Run tests
         run: cargo test --profile ci
 
+      - name: Run parallel feature tests
+        run: cargo test --profile ci -p strided-basic -p strided-kernel --features parallel
+
       - name: Run facade README doctests
         run: cargo test --profile ci -p strided-rs --doc
 

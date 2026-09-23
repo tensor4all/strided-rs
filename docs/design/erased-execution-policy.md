@@ -35,7 +35,14 @@ inputs also stay serial.
 
 The policy-aware parallel replay currently covers:
 
-- axis reductions, partitioned over independent outputs;
+- full reductions, partitioned over layout traversal ranges that each run the
+  serial run kernel, with partials combined in a fixed tree;
+- axis reductions, partitioned over independent outputs. Their threshold
+  domain is the number of source elements read (outputs times reduced
+  elements), not the output count, so shapes such as a 2048 by 2048 matrix
+  reduced along one axis split; the worker count is capped by the output
+  count. This measure was adopted for issue #269; its benchmark record is
+  pending in that issue;
 - gather, partitioned over independent outputs;
 - dynamic slice;
 - the overwrite phase of dynamic update slice; and

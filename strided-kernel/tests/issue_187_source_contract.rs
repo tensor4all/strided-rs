@@ -7,12 +7,17 @@ fn erased_axis_reduction_uses_prepared_incremental_cursors() {
     assert!(source.contains("checked_reduce_reset"));
     assert!(source.contains("compress_reduce_outer_axes"));
     assert!(source.contains("compress_reduce_inner_axes"));
-    let axes = source
-        .split_once("fn execute_reduce_axes_serial_data")
-        .and_then(|(_, rest)| rest.split_once("#[cfg(feature = \"parallel\")]"))
+    // Serial and parallel axis replay share one range kernel.
+    let kernels = include_str!("../../strided-basic/src/erased/reduce_kernel.rs");
+    let axes = kernels
+        .split_once("pub(super) unsafe fn reduce_axes_range")
+        .and_then(|(_, rest)| rest.split_once("unsafe fn sequential_fold"))
         .map(|(body, _)| body)
-        .expect("axis serial replay remains ordered");
+        .expect("axis range replay remains ordered");
+    assert!(axes.contains("ReduceOuterCursor::decode"));
+    assert!(axes.contains("outer.advance()"));
     assert!(!axes.contains("checked_strided_offset"));
+    assert!(!axes.contains("checked_offset_add"));
 }
 
 #[test]

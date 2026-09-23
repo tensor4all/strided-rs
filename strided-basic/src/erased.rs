@@ -3,7 +3,12 @@ use crate::*;
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
-const SERIAL_REDUCE_LANES: usize = 8;
+mod reduce_kernel;
+
+use reduce_kernel::{
+    reduce_axes_range, reduce_full_range, AxesRange, FullTraversal, MaxKernel, MinKernel,
+    ProductKernel, ReduceKernel, SumKernel, SumSquaresKernel,
+};
 
 trait ReduceWriter<T> {
     fn offset(&self) -> isize;
@@ -250,6 +255,42 @@ pub enum ReduceOp {
 /// This is the erased replay boundary for full-tensor scalar reductions and
 /// axis reductions with a fixed output layout. It supports only operations with
 /// an unambiguous identity value in the selected dtype.
+///
+/// # Evaluation order
+///
+/// The op is matched once per execution; every loop runs a kernel
+/// specialized for one `(dtype, op)` pair. Integer results are exact
+/// (wrapping) and [`ReduceOp::Max`] / [`ReduceOp::Min`] do not depend on
+/// order, so the rules below only affect the rounding of floating point and
+/// complex [`ReduceOp::Sum`], [`ReduceOp::Product`] and
+/// [`ReduceOp::SumSquares`]. Two details of float max and min follow the
+/// visit order: a NaN input makes the result NaN, but which NaN (payload and
+/// sign) is returned is unspecified, and when the extremum is a zero its sign
+/// is unspecified if both `+0.0` and `-0.0` occur.
+///
+/// * Full reductions (from [`Self::compile`], or [`Self::compile_axes`]
+///   with every axis reduced) visit the source in a layout derived order:
+///   extent one axes are dropped, the rest are ordered by increasing
+///   absolute stride and contiguous axes are fused into runs. Each run is
+///   reduced by the SIMD kernel (unit stride, `simd` feature), a sixteen
+///   lane kernel (other unit stride runs) or an eight lane kernel (strided
+///   runs), and runs are combined left to right. A dense column major
+///   source therefore reduces exactly like one contiguous slice.
+/// * With a parallel context and more than `MINTHREADLENGTH` elements, a
+///   full reduction splits the traversal into one deterministic range per
+///   worker thread. Each range runs the same run kernel as the serial path
+///   and the partials are combined in a fixed tree. The result is bitwise
+///   repeatable for a fixed layout and thread count, but may differ between
+///   thread counts and from the serial result.
+/// * Axis reductions with kept axes compute every output independently, so
+///   the result never depends on the context or thread count. Each output
+///   folds its reduced elements sequentially in caller reduced axis order,
+///   except that a unit stride leading reduced run (after fusing adjacent
+///   reduced axes) of length at least 16 is reduced by the contiguous run
+///   kernel, with runs folded in order. When instead the leading kept axis
+///   has unit stride, adjacent outputs are accumulated as a block from one
+///   contiguous source run per reduced element; each output still folds in
+///   caller reduced axis order.
 #[derive(Clone, Debug)]
 pub struct ErasedReducePlan {
     dtype: KernelDType,
@@ -262,18 +303,20 @@ enum ReduceLayout {
     Full {
         dims: Vec<usize>,
         src_strides: Vec<isize>,
+        traversal: FullTraversal,
     },
     Axes {
         src_dims: Vec<usize>,
         src_strides: Vec<isize>,
         dest_dims: Vec<usize>,
         dest_strides: Vec<isize>,
-        axes: Vec<usize>,
-        kept_axes: Vec<usize>,
         outer_axes: Vec<ReduceOuterAxis>,
         inner_axes: Vec<ReduceInnerAxis>,
         dest_total: usize,
         reduce_total: usize,
+        /// Set when every source axis is reduced; the plan then runs the
+        /// full-reduction traversal.
+        full: Option<FullTraversal>,
     },
 }
 
@@ -315,9 +358,6 @@ impl ReduceLayout {
 
 #[derive(Clone, Copy, Debug)]
 struct AxesLayout<'a> {
-    src_dims: &'a [usize],
-    axes: &'a [usize],
-    kept_axes: &'a [usize],
     outer_axes: &'a [ReduceOuterAxis],
     inner_axes: &'a [ReduceInnerAxis],
     dest_total: usize,
@@ -337,12 +377,14 @@ impl ErasedReducePlan {
             return Err(StridedError::StrideLengthMismatch);
         }
         checked_total_len(dims)?;
+        let traversal = FullTraversal::compile(dims, src_strides)?;
         Ok(Self {
             dtype,
             op,
             layout: ReduceLayout::Full {
                 dims: dims.to_vec(),
                 src_strides: src_strides.to_vec(),
+                traversal,
             },
         })
     }
@@ -425,6 +467,11 @@ impl ErasedReducePlan {
                 })
                 .collect::<Result<Vec<_>>>()?,
         )?;
+        let full = if kept_axes.is_empty() {
+            Some(FullTraversal::compile(src_dims, src_strides)?)
+        } else {
+            None
+        };
         Ok(Self {
             dtype,
             op,
@@ -433,12 +480,11 @@ impl ErasedReducePlan {
                 src_strides: src_strides.to_vec(),
                 dest_dims: dest_dims.to_vec(),
                 dest_strides: dest_strides.to_vec(),
-                axes: axes.to_vec(),
-                kept_axes,
                 outer_axes,
                 inner_axes,
                 dest_total,
                 reduce_total,
+                full,
             },
         })
     }
@@ -783,42 +829,39 @@ where
     Ok(())
 }
 
-fn execute_reduce<T, W>(
-    op: ReduceOp,
+/// Whether a reduction context runs on the caller thread without entering
+/// the scheduler.
+fn reduce_context_is_serial(ctx: &ExecContext) -> bool {
+    ctx.is_serial()
+        || ctx
+            .max_threads_limit()
+            .is_some_and(|max_threads| max_threads.get() == 1)
+}
+
+fn execute_reduce_full<T, W, K>(
     ctx: &ExecContext,
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
+    traversal: &FullTraversal,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
 {
-    let use_serial = ctx.is_serial()
-        || ctx
-            .max_threads_limit()
-            .is_some_and(|max_threads| max_threads.get() == 1);
-    let value = if use_serial {
-        if let Some(value) = reduce_contiguous_serial(op, src) {
-            value
-        } else {
-            let source = erased_view::<T>(src)?;
-            crate::reduce_view::reduce_serial(
-                &source,
-                |value| reduce_map_value(op, value),
-                |a, b| reduce_values(op, a, b),
-                reduce_identity(op),
-            )?
-        }
+    let source = src.data_as::<T>()?;
+    let total = traversal.total();
+    let value = if total == 0 {
+        K::identity()
+    } else if reduce_context_is_serial(ctx) {
+        // INVARIANT: (1) FullTraversal::compile checked every step/reset of
+        // the source layout; (2) the raw source descriptor validated every
+        // reachable offset; (3) execute checked exact plan-layout equality.
+        // SAFETY: the three-link invariant proves every traversal offset is
+        // readable, and `0..total` is non-empty.
+        unsafe { reduce_full_range::<T, K>(source.as_ptr(), src.offset(), traversal, 0..total)? }
     } else {
-        let source = erased_view::<T>(src)?;
-        ctx.run(|| {
-            crate::reduce(
-                &source,
-                |value| reduce_map_value(op, value),
-                |a, b| reduce_values(op, a, b),
-                reduce_identity(op),
-            )
-        })?
+        ctx.run(|| reduce_full_policy::<T, K>(source, src.offset(), traversal))?
     };
 
     // SAFETY: validated rank-zero destination layout proves the offset.
@@ -826,67 +869,43 @@ where
     Ok(())
 }
 
-fn reduce_contiguous_serial<T>(op: ReduceOp, src: &ErasedRawStridedRef<'_>) -> Option<T>
+fn reduce_full_policy<T, K>(
+    source: &[T],
+    source_base: isize,
+    traversal: &FullTraversal,
+) -> Result<T>
 where
     T: ErasedReduceScalar,
+    K: ReduceKernel<T>,
 {
-    crate::kernel::same_contiguous_layout(src.dims(), &[src.strides()])?;
-    let len = checked_total_len(src.dims()).ok()?;
-    if len == 0 {
-        return Some(reduce_identity(op));
-    }
-
-    let source_data = src.data_as::<T>().ok()?;
-    let start = usize::try_from(src.offset()).ok()?;
-    let end = start.checked_add(len)?;
-    let values = source_data.get(start..end)?;
-    Some(match op {
-        ReduceOp::Sum => T::try_simd_sum(values)
-            .unwrap_or_else(|| reduce_contiguous_lanes(values, T::zero(), T::reduce_sum)),
-        ReduceOp::Product => T::try_simd_product(values)
-            .unwrap_or_else(|| reduce_contiguous_lanes(values, T::one(), T::reduce_product)),
-        ReduceOp::SumSquares => T::try_simd_sum_squares(values).unwrap_or_else(|| {
-            reduce_contiguous_mapped_lanes(
-                values,
-                T::zero(),
-                |value| T::reduce_product(value, value),
-                T::reduce_sum,
-            )
-        }),
-        ReduceOp::Max => reduce_contiguous_lanes(values, T::max_identity(), T::reduce_max),
-        ReduceOp::Min => reduce_contiguous_lanes(values, T::min_identity(), T::reduce_min),
-    })
-}
-
-#[inline]
-fn reduce_contiguous_lanes<T>(values: &[T], identity: T, combine: impl Fn(T, T) -> T) -> T
-where
-    T: Copy,
-{
-    reduce_contiguous_mapped_lanes(values, identity, |value| value, combine)
-}
-
-#[inline]
-fn reduce_contiguous_mapped_lanes<T>(
-    values: &[T],
-    identity: T,
-    map: impl Fn(T) -> T,
-    combine: impl Fn(T, T) -> T,
-) -> T
-where
-    T: Copy,
-{
-    let mut lanes = [identity; SERIAL_REDUCE_LANES];
-    let mut chunks = values.chunks_exact(SERIAL_REDUCE_LANES);
-    for chunk in chunks.by_ref() {
-        for lane in 0..SERIAL_REDUCE_LANES {
-            lanes[lane] = combine(lanes[lane], map(chunk[lane]));
+    let total = traversal.total();
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = crate::threading::parallel_threads_for_len(total);
+        if nthreads > 1 {
+            let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
+            return crate::threading::parallel_map_reduce(
+                0..total,
+                nthreads,
+                &|range| {
+                    // SAFETY: same three-link invariant as the serial call in
+                    // `execute_reduce_full`; each worker range is non-empty.
+                    unsafe {
+                        reduce_full_range::<T, K>(
+                            source_ptr.as_const(),
+                            source_base,
+                            traversal,
+                            range,
+                        )
+                    }
+                },
+                &|left, right| Ok(K::combine(left?, right?)),
+            );
         }
     }
-    for (lane, &value) in chunks.remainder().iter().enumerate() {
-        lanes[lane] = combine(lanes[lane], map(value));
-    }
-    lanes.into_iter().fold(identity, combine)
+    // SAFETY: same three-link invariant as the serial call in
+    // `execute_reduce_full`; `0..total` is non-empty.
+    unsafe { reduce_full_range::<T, K>(source.as_ptr(), source_base, traversal, 0..total) }
 }
 
 fn dispatch_reduce<T, W>(
@@ -900,37 +919,61 @@ where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
 {
+    // The op is matched once per execution; every loop below is generic over
+    // the selected kernel type.
+    match op {
+        ReduceOp::Sum => dispatch_reduce_kernel::<T, W, SumKernel>(layout, ctx, dest, src),
+        ReduceOp::Product => dispatch_reduce_kernel::<T, W, ProductKernel>(layout, ctx, dest, src),
+        ReduceOp::SumSquares => {
+            dispatch_reduce_kernel::<T, W, SumSquaresKernel>(layout, ctx, dest, src)
+        }
+        ReduceOp::Max => dispatch_reduce_kernel::<T, W, MaxKernel>(layout, ctx, dest, src),
+        ReduceOp::Min => dispatch_reduce_kernel::<T, W, MinKernel>(layout, ctx, dest, src),
+    }
+}
+
+fn dispatch_reduce_kernel<T, W, K>(
+    layout: &ReduceLayout,
+    ctx: &ExecContext,
+    dest: &mut W,
+    src: &ErasedRawStridedRef<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
     match layout {
-        ReduceLayout::Full { .. } => execute_reduce::<T, W>(op, ctx, dest, src),
+        ReduceLayout::Full { traversal, .. } => {
+            execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)
+        }
         ReduceLayout::Axes {
-            src_dims,
-            axes,
-            kept_axes,
             outer_axes,
             inner_axes,
             dest_total,
             reduce_total,
+            full,
             ..
-        } => execute_reduce_axes::<T, W>(
-            op,
-            ctx,
-            dest,
-            src,
-            AxesLayout {
-                src_dims,
-                axes,
-                kept_axes,
-                outer_axes,
-                inner_axes,
-                dest_total: *dest_total,
-                reduce_total: *reduce_total,
-            },
-        ),
+        } => {
+            if let Some(traversal) = full {
+                return execute_reduce_full::<T, W, K>(ctx, dest, src, traversal);
+            }
+            execute_reduce_axes::<T, W, K>(
+                ctx,
+                dest,
+                src,
+                AxesLayout {
+                    outer_axes,
+                    inner_axes,
+                    dest_total: *dest_total,
+                    reduce_total: *reduce_total,
+                },
+            )
+        }
     }
 }
 
-fn execute_reduce_axes<T, W>(
-    op: ReduceOp,
+fn execute_reduce_axes<T, W, K>(
     ctx: &ExecContext,
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
@@ -939,150 +982,99 @@ fn execute_reduce_axes<T, W>(
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
 {
-    if layout.kept_axes.is_empty()
-        && layout.axes.len() == layout.src_dims.len()
-        && layout.dest_total == 1
-    {
-        return execute_reduce::<T, W>(op, ctx, dest, src);
-    }
-
     if layout.dest_total == 0 {
         return Ok(());
     }
 
     if layout.reduce_total == 0 {
         if ctx.is_serial() {
-            execute_reduce_axes_identity_serial(op, dest, layout)
+            execute_reduce_axes_identity_serial::<T, W, K>(dest, layout)
         } else {
-            ctx.run(|| execute_reduce_axes_identity_policy(op, dest, layout))
+            ctx.run(|| execute_reduce_axes_identity_policy::<T, W, K>(dest, layout))
         }
-    } else if ctx.is_serial() {
-        execute_reduce_axes_serial::<T, W>(op, dest, src, layout)
+    } else if reduce_context_is_serial(ctx) {
+        execute_reduce_axes_policy::<T, W, K>(dest, src, layout, false)
     } else {
-        ctx.run(|| execute_reduce_axes_policy::<T, W>(op, dest, src, layout))
+        ctx.run(|| execute_reduce_axes_policy::<T, W, K>(dest, src, layout, true))
     }
 }
 
-fn execute_reduce_axes_policy<T, W>(
-    op: ReduceOp,
+fn execute_reduce_axes_policy<T, W, K>(
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
     layout: AxesLayout<'_>,
+    allow_parallel: bool,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
 {
     let source_data = src.data_as::<T>()?;
-    let dest_offset_base = dest.offset();
+    let source_base = src.offset();
+    let dest_base = dest.offset();
+    // SAFETY: the validated reduction writer owns the destination allocation.
+    let dest_ptr = unsafe { dest.ptr() };
     #[cfg(feature = "parallel")]
-    {
-        let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
+    if allow_parallel {
+        // The threshold counts source elements read (outputs times reduced
+        // elements), as documented in docs/design/erased-execution-policy.md,
+        // so a few thousand outputs with long reductions still split. Worker
+        // ranges partition the independent outputs; with the output block
+        // kernel this splits along the contiguous kept axis.
+        let work = layout.dest_total.saturating_mul(layout.reduce_total);
+        let nthreads = crate::threading::parallel_threads_for_len(work).min(layout.dest_total);
         if nthreads > 1 {
-            return execute_reduce_axes_parallel(
-                op,
-                dest_offset_base,
-                dest,
-                src.offset(),
-                source_data,
-                layout,
+            let dest_ptr = crate::threading::SendPtr(dest_ptr);
+            let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
+            return crate::threading::parallel_map_reduce(
+                0..layout.dest_total,
                 nthreads,
+                &|range| {
+                    let parts = AxesRange {
+                        source: source_ptr.as_const(),
+                        source_base,
+                        dest: dest_ptr.as_ptr(),
+                        dest_base,
+                        outer_axes: layout.outer_axes,
+                        inner_axes: layout.inner_axes,
+                        reduce_total: layout.reduce_total,
+                    };
+                    // SAFETY: see `execute_reduce_axes_policy` serial call.
+                    unsafe { reduce_axes_range::<T, K>(parts, range) }
+                },
+                &|left, right| left.and(right),
             );
         }
     }
+    #[cfg(not(feature = "parallel"))]
+    let _ = allow_parallel;
 
-    execute_reduce_axes_serial_data(
-        op,
-        dest_offset_base,
-        dest,
-        src.offset(),
-        source_data,
-        layout,
-    )
-}
-
-fn execute_reduce_axes_serial<T, W>(
-    op: ReduceOp,
-    dest: &mut W,
-    src: &ErasedRawStridedRef<'_>,
-    layout: AxesLayout<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-    W: ReduceWriter<T>,
-{
-    let source_data = src.data_as::<T>()?;
-    execute_reduce_axes_serial_data(op, dest.offset(), dest, src.offset(), source_data, layout)
-}
-
-fn execute_reduce_axes_serial_data<T, W>(
-    op: ReduceOp,
-    dest_offset_base: isize,
-    dest: &mut W,
-    source_offset_base: isize,
-    source_data: &[T],
-    layout: AxesLayout<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-    W: ReduceWriter<T>,
-{
-    let mut outer =
-        ReduceOuterCursor::decode(0, source_offset_base, dest_offset_base, layout.outer_axes)?;
-    // INVARIANT: (1) compile_axes checked signed source/destination spans and
-    // every cursor step/reset, including -(extent-1)*stride; (2) raw input and
-    // output descriptors validated every reachable offset; (3) execute checked
-    // exact plan-layout equality before dispatch.
-    let reduce_inner = |inner: &mut ReduceInnerCursor<'_>| {
-        let mut acc = reduce_identity(op);
-        for value_index in 0..layout.reduce_total {
-            // SAFETY: the three-link layout invariant above proves each source
-            // cursor offset is within `source_data`.
-            let value = unsafe { *source_data.as_ptr().offset(inner.source_offset) };
-            acc = reduce_values(op, acc, reduce_map_value(op, value));
-            if value_index + 1 < layout.reduce_total {
-                inner.advance();
-            }
-        }
-        acc
+    let parts = AxesRange {
+        source: source_data.as_ptr(),
+        source_base,
+        dest: dest_ptr,
+        dest_base,
+        outer_axes: layout.outer_axes,
+        inner_axes: layout.inner_axes,
+        reduce_total: layout.reduce_total,
     };
-
-    if layout.inner_axes.len() <= RAW_FUSED_RANK_LIMIT {
-        for output in 0..layout.dest_total {
-            let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
-            let acc = reduce_inner(&mut inner);
-            // SAFETY: the three-link layout invariant above proves the destination
-            // cursor offset is an in-bounds logical output offset.
-            unsafe { dest.write_at(outer.dest_offset, acc) };
-            if output + 1 < layout.dest_total {
-                outer.advance();
-            }
-        }
-    } else {
-        let mut inner = ReduceInnerCursor::new(source_offset_base, layout.inner_axes);
-        for output in 0..layout.dest_total {
-            inner.reset(outer.source_offset);
-            let acc = reduce_inner(&mut inner);
-            // SAFETY: the three-link layout invariant above proves the destination
-            // cursor offset is an in-bounds logical output offset.
-            unsafe { dest.write_at(outer.dest_offset, acc) };
-            if output + 1 < layout.dest_total {
-                outer.advance();
-            }
-        }
-    }
-    Ok(())
+    // INVARIANT: (1) compile_axes checked signed source/destination spans and
+    // every cursor step/reset; (2) raw input and output descriptors validated
+    // every reachable offset; (3) execute checked exact plan-layout equality
+    // before dispatch. Output ranges are disjoint, and the initialized entry
+    // holds distinct borrows while the uninit entry rejected overlap.
+    // SAFETY: the three-link invariant above; `reduce_total` is nonzero.
+    unsafe { reduce_axes_range::<T, K>(parts, 0..layout.dest_total) }
 }
 
-fn execute_reduce_axes_identity_serial<T, W>(
-    op: ReduceOp,
-    dest: &mut W,
-    layout: AxesLayout<'_>,
-) -> Result<()>
+fn execute_reduce_axes_identity_serial<T, W, K>(dest: &mut W, layout: AxesLayout<'_>) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
 {
     let mut outer = ReduceOuterCursor::decode(0, 0, dest.offset(), layout.outer_axes)?;
     for output in 0..layout.dest_total {
@@ -1093,34 +1085,30 @@ where
         // SAFETY: the three-link layout invariant proves this destination
         // cursor offset is in bounds; the source pointer is intentionally never
         // formed for an empty reduction domain.
-        unsafe { dest.write_at(outer.dest_offset, reduce_identity(op)) };
+        unsafe { dest.write_at(outer.dest_offset, K::identity()) };
         if output + 1 < layout.dest_total {
             outer.advance();
         }
     }
     Ok(())
 }
-fn execute_reduce_axes_identity_policy<T, W>(
-    op: ReduceOp,
-    dest: &mut W,
-    layout: AxesLayout<'_>,
-) -> Result<()>
+fn execute_reduce_axes_identity_policy<T, W, K>(dest: &mut W, layout: AxesLayout<'_>) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
 {
     #[cfg(feature = "parallel")]
     {
         let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
         if nthreads > 1 {
-            return execute_reduce_axes_identity_parallel(op, dest, layout, nthreads);
+            return execute_reduce_axes_identity_parallel::<T, W, K>(dest, layout, nthreads);
         }
     }
-    execute_reduce_axes_identity_serial(op, dest, layout)
+    execute_reduce_axes_identity_serial::<T, W, K>(dest, layout)
 }
 #[cfg(feature = "parallel")]
-fn execute_reduce_axes_identity_parallel<T, W>(
-    op: ReduceOp,
+fn execute_reduce_axes_identity_parallel<T, W, K>(
     dest: &mut W,
     layout: AxesLayout<'_>,
     nthreads: usize,
@@ -1128,6 +1116,7 @@ fn execute_reduce_axes_identity_parallel<T, W>(
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
 {
     // SAFETY: the validated reduction writer owns the destination allocation.
     let dest_ptr = crate::threading::SendPtr(unsafe { dest.ptr() });
@@ -1148,11 +1137,7 @@ where
                 // exact plan-layout equality before dispatch.
                 // SAFETY: the three-link layout invariant proves this
                 // destination offset is in bounds; no source pointer is formed.
-                unsafe {
-                    dest_ptr
-                        .offset(outer.dest_offset)
-                        .write(reduce_identity(op))
-                };
+                unsafe { dest_ptr.offset(outer.dest_offset).write(K::identity()) };
                 if output + 1 < range_end {
                     outer.advance();
                 }
@@ -1161,122 +1146,6 @@ where
         },
         &|left, right| left.and(right),
     )
-}
-#[cfg(feature = "parallel")]
-fn execute_reduce_axes_parallel<T, W>(
-    op: ReduceOp,
-    dest_offset_base: isize,
-    dest: &mut W,
-    source_offset_base: isize,
-    source_data: &[T],
-    layout: AxesLayout<'_>,
-    nthreads: usize,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-    W: ReduceWriter<T>,
-{
-    // SAFETY: the validated reduction writer owns the destination allocation.
-    let dest_ptr = crate::threading::SendPtr(unsafe { dest.ptr() });
-    let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
-    crate::threading::parallel_map_reduce(
-        0..layout.dest_total,
-        nthreads,
-        &|range| {
-            let range_end = range.end;
-            let mut outer = ReduceOuterCursor::decode(
-                range.start,
-                source_offset_base,
-                dest_offset_base,
-                layout.outer_axes,
-            )?;
-            let dest_ptr = dest_ptr.as_ptr();
-            let source_ptr = source_ptr.as_const();
-            // INVARIANT: (1) compile_axes checked signed source/destination
-            // spans and every cursor step/reset, including -(extent-1)*stride;
-            // (2) raw descriptors validated every reachable pointer offset;
-            // (3) execute checked exact plan-layout equality before dispatch.
-            let reduce_inner = |inner: &mut ReduceInnerCursor<'_>| {
-                let mut acc = reduce_identity(op);
-                for value_index in 0..layout.reduce_total {
-                    // SAFETY: the three-link layout invariant above proves each
-                    // source cursor offset is within the source allocation.
-                    let value = unsafe { *source_ptr.offset(inner.source_offset) };
-                    acc = reduce_values(op, acc, reduce_map_value(op, value));
-                    if value_index + 1 < layout.reduce_total {
-                        inner.advance();
-                    }
-                }
-                acc
-            };
-
-            if layout.inner_axes.len() <= RAW_FUSED_RANK_LIMIT {
-                for output in range {
-                    let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
-                    let acc = reduce_inner(&mut inner);
-                    // SAFETY: the three-link layout invariant above proves this
-                    // destination cursor offset is in bounds.
-                    unsafe { dest_ptr.offset(outer.dest_offset).write(acc) };
-                    if output + 1 < range_end {
-                        outer.advance();
-                    }
-                }
-            } else {
-                let mut inner = ReduceInnerCursor::new(outer.source_offset, layout.inner_axes);
-                for output in range {
-                    inner.reset(outer.source_offset);
-                    let acc = reduce_inner(&mut inner);
-                    // SAFETY: the three-link layout invariant above proves this
-                    // destination cursor offset is in bounds.
-                    unsafe { dest_ptr.offset(outer.dest_offset).write(acc) };
-                    if output + 1 < range_end {
-                        outer.advance();
-                    }
-                }
-            }
-            Ok(())
-        },
-        &|left, right| left.and(right),
-    )
-}
-
-#[inline]
-fn reduce_identity<T>(op: ReduceOp) -> T
-where
-    T: ErasedReduceScalar,
-{
-    match op {
-        ReduceOp::Sum => T::zero(),
-        ReduceOp::Product => T::one(),
-        ReduceOp::SumSquares => T::zero(),
-        ReduceOp::Max => T::max_identity(),
-        ReduceOp::Min => T::min_identity(),
-    }
-}
-
-#[inline]
-fn reduce_values<T>(op: ReduceOp, a: T, b: T) -> T
-where
-    T: ErasedReduceScalar,
-{
-    match op {
-        ReduceOp::Sum => T::reduce_sum(a, b),
-        ReduceOp::Product => T::reduce_product(a, b),
-        ReduceOp::SumSquares => T::reduce_sum(a, b),
-        ReduceOp::Max => T::reduce_max(a, b),
-        ReduceOp::Min => T::reduce_min(a, b),
-    }
-}
-
-#[inline]
-fn reduce_map_value<T>(op: ReduceOp, value: T) -> T
-where
-    T: ErasedReduceScalar,
-{
-    match op {
-        ReduceOp::Sum | ReduceOp::Product | ReduceOp::Max | ReduceOp::Min => value,
-        ReduceOp::SumSquares => T::reduce_product(value, value),
-    }
 }
 
 trait ErasedReduceScalar:
@@ -1325,19 +1194,33 @@ macro_rules! impl_float_erased_reduce_scalar {
 
                 #[inline(always)]
                 fn reduce_max(lhs: Self, rhs: Self) -> Self {
-                    if lhs.is_nan() || rhs.is_nan() {
-                        <$ty>::NAN
+                    // Select form: both sides are evaluated and the NaN test
+                    // picks the result, so lane loops lower to compare and
+                    // blend instead of a data dependent branch.
+                    // A NaN `lhs` is kept by the second test and a NaN
+                    // `rhs` fails the comparison, so NaN propagates from
+                    // either side. Equal values (including +0.0 and -0.0)
+                    // return `rhs`.
+                    if (lhs > rhs) | lhs.is_nan() {
+                        lhs
                     } else {
-                        lhs.max(rhs)
+                        rhs
                     }
                 }
 
                 #[inline(always)]
                 fn reduce_min(lhs: Self, rhs: Self) -> Self {
-                    if lhs.is_nan() || rhs.is_nan() {
-                        <$ty>::NAN
+                    // Select form: both sides are evaluated and the NaN test
+                    // picks the result, so lane loops lower to compare and
+                    // blend instead of a data dependent branch.
+                    // A NaN `lhs` is kept by the second test and a NaN
+                    // `rhs` fails the comparison, so NaN propagates from
+                    // either side. Equal values (including +0.0 and -0.0)
+                    // return `rhs`.
+                    if (lhs < rhs) | lhs.is_nan() {
+                        lhs
                     } else {
-                        lhs.min(rhs)
+                        rhs
                     }
                 }
             }
@@ -1473,6 +1356,12 @@ impl<'a> ReduceOuterCursor<'a> {
             source_offset,
             dest_offset,
         })
+    }
+
+    /// Coordinate along the first (fastest) compressed outer axis.
+    #[inline]
+    fn leading_coord(&self) -> usize {
+        self.coords.first()
     }
 
     #[inline]
@@ -1647,6 +1536,14 @@ impl CoordScratch {
                 heap: Some(vec![0; len]),
                 len,
             }
+        }
+    }
+
+    #[inline]
+    fn first(&self) -> usize {
+        match &self.heap {
+            Some(heap) => heap.first().copied().unwrap_or(0),
+            None => self.inline[0],
         }
     }
 
