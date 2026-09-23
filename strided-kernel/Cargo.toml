@@ -11,17 +11,19 @@ categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
 strided-basic.workspace = true
+# Compatibility re-exports of the fused API that strided-kernel 0.4.0 exposed
+# (issue #261); new code should depend on strided-fused directly.
+strided-fused.workspace = true
 num-complex.workspace = true
 
 [features]
 default = ["simd"]
-parallel = ["strided-basic/parallel"]
-simd = ["strided-basic/simd"]
+parallel = ["strided-basic/parallel", "strided-fused/parallel"]
+simd = ["strided-basic/simd", "strided-fused/simd"]
 
 [dev-dependencies]
 rayon.workspace = true
 num-traits.workspace = true
-strided-fused = { path = "../strided-fused", default-features = false }
 criterion.workspace = true
 approx.workspace = true
 rand.workspace = true
