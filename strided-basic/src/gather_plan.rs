@@ -7,7 +7,8 @@
 
 use core::{mem::MaybeUninit, ops::Add};
 
-use crate::copy_plan::{CopyPlan, OverwriteWriter, ReadModifyWrite};
+use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
+use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
 use crate::{
     MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
 };
@@ -385,6 +386,10 @@ pub struct DynamicSlicePlan {
     dest_strides: AxisVec<isize>,
     slice_sizes: AxisVec<usize>,
     total: usize,
+    /// Fused window traversal (dest strides, operand strides) replayed at the
+    /// runtime source base; `None` above
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    window: Option<FusedPairLayout>,
     #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
 }
@@ -406,6 +411,10 @@ pub struct DynamicUpdateSlicePlan {
     dest_strides: AxisVec<isize>,
     total: usize,
     copy_plan: CopyPlan,
+    /// Fused update window traversal (dest strides, update strides) replayed
+    /// at the runtime destination base; `None` above
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    window: Option<FusedPairLayout>,
     #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
 }
@@ -1028,6 +1037,7 @@ impl DynamicSlicePlan {
             dest_strides: dest_strides.into(),
             slice_sizes: slice_sizes.into(),
             total,
+            window: fuse_pair_layout(slice_sizes, dest_strides, operand_strides),
             #[cfg(not(feature = "parallel"))]
             replay,
         })
@@ -1078,6 +1088,9 @@ impl DynamicSlicePlan {
         if self.uses_rank_one_contiguous_path() {
             return self.execute_rank_one_contiguous(dest, operand, starts);
         }
+        if let Some(window) = &self.window {
+            return self.execute_fused_window(dest, operand, starts, window);
+        }
         #[cfg(feature = "parallel")]
         let replay =
             WindowReplay::compile(&self.slice_sizes, &self.operand_strides, &self.dest_strides)?;
@@ -1114,6 +1127,59 @@ impl DynamicSlicePlan {
             // is in-bounds, and the output layout is injective.
             unsafe { dest.write_at(state.dest_offset, value) };
             replay.advance(&mut state);
+        }
+        Ok(())
+    }
+
+    /// Replay the compiled fused window from the clamped runtime source base.
+    ///
+    /// The window is a CopyPlan-style fused layout, so full inner runs are
+    /// replayed with a pointer loop (slice copies for unit strides) and the
+    /// work is split across workers above the repository threshold.
+    fn execute_fused_window<T, I, W>(
+        &self,
+        dest: &mut W,
+        operand: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+        window: &FusedPairLayout,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
+        let mut starts_storage = CoordScratch::new(self.operand_dims.len());
+        let clamped_starts = starts_storage.as_mut_slice();
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.slice_sizes,
+            clamped_starts,
+        )?;
+        let source_base =
+            checked_strided_offset(operand.offset(), &self.operand_strides, clamped_starts)?;
+        let dest_base = dest.offset();
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = unsafe { dest.data_ptr() }.cast::<MaybeUninit<T>>();
+        // SAFETY: `window` fuses `slice_sizes` with the checked destination
+        // and operand strides. The clamped window `start + slice_sizes` lies
+        // inside `operand_dims`, so every source offset from `source_base` is
+        // an offset the validated operand view can reach; the destination has
+        // exactly `slice_sizes` dims and its validated layout reaches every
+        // destination offset. Compile proved the destination injective, and
+        // the exclusive writer borrow does not overlap the shared operand.
+        // Writing `MaybeUninit::new` is valid for both initialized and
+        // uninitialized destination slots.
+        unsafe {
+            replay_fused_raw(
+                dest_ptr,
+                dest_base,
+                operand.data().as_ptr(),
+                source_base,
+                window,
+                |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
+                |value: T| value,
+            );
         }
         Ok(())
     }
@@ -1310,6 +1376,7 @@ impl DynamicUpdateSlicePlan {
             dest_strides: dest_strides.into(),
             total,
             copy_plan,
+            window: fuse_pair_layout(update_dims, dest_strides, update_strides),
             #[cfg(not(feature = "parallel"))]
             replay,
         })
@@ -1369,6 +1436,9 @@ impl DynamicUpdateSlicePlan {
         if self.uses_rank_one_contiguous_path() {
             return self.execute_rank_one_contiguous(dest, update, starts);
         }
+        if let Some(window) = &self.window {
+            return self.execute_fused_window(dest, update, starts, window);
+        }
         #[cfg(feature = "parallel")]
         let replay =
             WindowReplay::compile(&self.update_dims, &self.update_strides, &self.dest_strides)?;
@@ -1405,6 +1475,52 @@ impl DynamicUpdateSlicePlan {
             // is initialized and in-bounds.
             unsafe { dest.write_at(state.dest_offset, value) };
             replay.advance(&mut state);
+        }
+        Ok(())
+    }
+
+    /// Replay the compiled fused update window at the clamped runtime
+    /// destination base (see [`DynamicSlicePlan`]'s fused window replay).
+    fn execute_fused_window<T, I, W>(
+        &self,
+        dest: &mut W,
+        update: &RawStridedRef<'_, T>,
+        starts: &RawStridedRef<'_, I>,
+        window: &FusedPairLayout,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+        I: GatherIndex,
+        W: OverwriteWriter<T>,
+    {
+        let mut starts_storage = CoordScratch::new(self.operand_dims.len());
+        let clamped_starts = starts_storage.as_mut_slice();
+        read_clamped_starts(
+            starts,
+            &self.operand_dims,
+            &self.update_dims,
+            clamped_starts,
+        )?;
+        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, clamped_starts)?;
+        // SAFETY: the validated writer owns the destination allocation.
+        let dest_ptr = unsafe { dest.data_ptr() }.cast::<MaybeUninit<T>>();
+        // SAFETY: `window` fuses `update_dims` with the checked destination
+        // and update strides. The update view has exactly `update_dims` and
+        // its validated layout reaches every source offset; the clamped window
+        // lies inside `dest_dims`, so every destination offset from
+        // `dest_base` is reachable through the validated destination layout.
+        // Compile proved the destination injective, and the exclusive writer
+        // borrow does not overlap the shared update.
+        unsafe {
+            replay_fused_raw(
+                dest_ptr,
+                dest_base,
+                update.data().as_ptr(),
+                update.offset(),
+                window,
+                |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
+                |value: T| value,
+            );
         }
         Ok(())
     }

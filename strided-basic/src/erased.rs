@@ -694,6 +694,24 @@ where
         plan.check_input_layout(position, &input_ref)?;
         plan.segment_offset(position, dest_offset)?;
     }
+    if plan.prefers_whole_plan() {
+        let input_refs = inputs
+            .iter()
+            .map(|input| {
+                let input_data = input.data_as::<T>()?;
+                Ok(unsafe {
+                    RawStridedRef::new_unchecked(
+                        input_data,
+                        input.dims(),
+                        input.strides(),
+                        input.offset(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Splits the concatenated index space across and within segments.
+        return plan.execute(&mut dest_ref, &input_refs);
+    }
     for (position, input) in inputs.iter().enumerate() {
         let input_data = input.data_as::<T>()?;
         let input_ref = unsafe {
@@ -729,6 +747,29 @@ where
         };
         plan.check_input_layout(position, &input_ref)?;
         plan.segment_offset(position, dest_offset)?;
+    }
+    if plan.prefers_whole_plan() {
+        let inputs = inputs
+            .iter()
+            // SAFETY: input/output overlap was rejected before forming references.
+            .map(|input| unsafe { input.try_as_ref_after_no_overlap() })
+            .collect::<Result<Vec<_>>>()?;
+        let input_refs = inputs
+            .iter()
+            .map(|input| {
+                let input_data = input.data_as::<T>()?;
+                Ok(unsafe {
+                    RawStridedRef::new_unchecked(
+                        input_data,
+                        input.dims(),
+                        input.strides(),
+                        input.offset(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Splits the concatenated index space across and within segments.
+        return plan.execute_uninit(&mut dest_ref, &input_refs);
     }
     for (position, input) in inputs.iter().enumerate() {
         // SAFETY: input/output overlap was rejected before forming references.
