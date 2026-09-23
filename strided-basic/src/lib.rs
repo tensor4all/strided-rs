@@ -116,5 +116,8 @@ pub use gather_plan::{
     DynamicSlicePlan, DynamicUpdateSlicePlan, GatherIndex, GatherPlan, GatherSpec, ScatterPlan,
     ScatterSpec,
 };
-pub use outer_product::{batched_outer_product_into, batched_outer_product_into_uninit};
+pub use outer_product::{
+    batched_outer_product_into, batched_outer_product_into_uninit, plan_lazy_outer_product,
+    LazyOuterProductLayout,
+};
 pub use static_indexing_plan::{ConcatenatePlan, PadPlan, ReversePlan, SlicePlan};

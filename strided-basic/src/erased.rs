@@ -225,6 +225,24 @@ pub enum ReduceOp {
     /// Each input is first multiplied by itself without FMA contraction, then
     /// accumulated under the same association policy as [`Self::Sum`].
     SumSquares,
+    /// NaN-propagating maximum for `f32`/`f64`, ordered maximum for
+    /// `i32`/`i64`.
+    ///
+    /// Any NaN operand makes the result the canonical NaN of the dtype. The
+    /// identity written for an empty reduction is `-inf` for floats and the
+    /// dtype minimum for integers. Complex and `bool` dtypes are rejected.
+    /// When the reduced values contain both `-0.0` and `+0.0`, which zero is
+    /// returned is unspecified.
+    Max,
+    /// NaN-propagating minimum for `f32`/`f64`, ordered minimum for
+    /// `i32`/`i64`.
+    ///
+    /// Any NaN operand makes the result the canonical NaN of the dtype. The
+    /// identity written for an empty reduction is `+inf` for floats and the
+    /// dtype maximum for integers. Complex and `bool` dtypes are rejected.
+    /// When the reduced values contain both `-0.0` and `+0.0`, which zero is
+    /// returned is unspecified.
+    Min,
 }
 
 /// Dtype-erased reduction wrapper.
@@ -606,6 +624,16 @@ fn check_reduce_op_dtype(dtype: KernelDType, op: ReduceOp) -> Result<()> {
             dtype: dtype.label(),
         });
     }
+    if matches!(op, ReduceOp::Max | ReduceOp::Min)
+        && !matches!(
+            dtype,
+            KernelDType::F32 | KernelDType::F64 | KernelDType::I32 | KernelDType::I64
+        )
+    {
+        return Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        });
+    }
     check_reduce_dtype(dtype)
 }
 
@@ -784,6 +812,8 @@ where
                 T::reduce_sum,
             )
         }),
+        ReduceOp::Max => reduce_contiguous_lanes(values, T::max_identity(), T::reduce_max),
+        ReduceOp::Min => reduce_contiguous_lanes(values, T::min_identity(), T::reduce_min),
     })
 }
 
@@ -1172,12 +1202,14 @@ where
 #[inline]
 fn reduce_identity<T>(op: ReduceOp) -> T
 where
-    T: One + Zero,
+    T: ErasedReduceScalar,
 {
     match op {
         ReduceOp::Sum => T::zero(),
         ReduceOp::Product => T::one(),
         ReduceOp::SumSquares => T::zero(),
+        ReduceOp::Max => T::max_identity(),
+        ReduceOp::Min => T::min_identity(),
     }
 }
 
@@ -1190,6 +1222,8 @@ where
         ReduceOp::Sum => T::reduce_sum(a, b),
         ReduceOp::Product => T::reduce_product(a, b),
         ReduceOp::SumSquares => T::reduce_sum(a, b),
+        ReduceOp::Max => T::reduce_max(a, b),
+        ReduceOp::Min => T::reduce_min(a, b),
     }
 }
 
@@ -1199,7 +1233,7 @@ where
     T: ErasedReduceScalar,
 {
     match op {
-        ReduceOp::Sum | ReduceOp::Product => value,
+        ReduceOp::Sum | ReduceOp::Product | ReduceOp::Max | ReduceOp::Min => value,
         ReduceOp::SumSquares => T::reduce_product(value, value),
     }
 }
@@ -1216,9 +1250,15 @@ trait ErasedReduceScalar:
 {
     fn reduce_sum(lhs: Self, rhs: Self) -> Self;
     fn reduce_product(lhs: Self, rhs: Self) -> Self;
+    /// Identity of [`ReduceOp::Max`]; unreachable for dtypes the plan rejects.
+    fn max_identity() -> Self;
+    /// Identity of [`ReduceOp::Min`]; unreachable for dtypes the plan rejects.
+    fn min_identity() -> Self;
+    fn reduce_max(lhs: Self, rhs: Self) -> Self;
+    fn reduce_min(lhs: Self, rhs: Self) -> Self;
 }
 
-macro_rules! impl_default_erased_reduce_scalar {
+macro_rules! impl_float_erased_reduce_scalar {
     ($($ty:ty),* $(,)?) => {
         $(
             impl ErasedReduceScalar for $ty {
@@ -1230,6 +1270,72 @@ macro_rules! impl_default_erased_reduce_scalar {
                 #[inline(always)]
                 fn reduce_product(lhs: Self, rhs: Self) -> Self {
                     lhs * rhs
+                }
+
+                #[inline(always)]
+                fn max_identity() -> Self {
+                    <$ty>::NEG_INFINITY
+                }
+
+                #[inline(always)]
+                fn min_identity() -> Self {
+                    <$ty>::INFINITY
+                }
+
+                #[inline(always)]
+                fn reduce_max(lhs: Self, rhs: Self) -> Self {
+                    if lhs.is_nan() || rhs.is_nan() {
+                        <$ty>::NAN
+                    } else {
+                        lhs.max(rhs)
+                    }
+                }
+
+                #[inline(always)]
+                fn reduce_min(lhs: Self, rhs: Self) -> Self {
+                    if lhs.is_nan() || rhs.is_nan() {
+                        <$ty>::NAN
+                    } else {
+                        lhs.min(rhs)
+                    }
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! impl_complex_erased_reduce_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ErasedReduceScalar for $ty {
+                #[inline(always)]
+                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
+                    lhs + rhs
+                }
+
+                #[inline(always)]
+                fn reduce_product(lhs: Self, rhs: Self) -> Self {
+                    lhs * rhs
+                }
+
+                fn max_identity() -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Max at compile time.
+                    unreachable!("complex max reduction is rejected at plan compile")
+                }
+
+                fn min_identity() -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Min at compile time.
+                    unreachable!("complex min reduction is rejected at plan compile")
+                }
+
+                fn reduce_max(_lhs: Self, _rhs: Self) -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Max at compile time.
+                    unreachable!("complex max reduction is rejected at plan compile")
+                }
+
+                fn reduce_min(_lhs: Self, _rhs: Self) -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Min at compile time.
+                    unreachable!("complex min reduction is rejected at plan compile")
                 }
             }
         )*
@@ -1249,12 +1355,34 @@ macro_rules! impl_wrapping_erased_reduce_scalar {
                 fn reduce_product(lhs: Self, rhs: Self) -> Self {
                     lhs.wrapping_mul(rhs)
                 }
+
+                #[inline(always)]
+                fn max_identity() -> Self {
+                    <$ty>::MIN
+                }
+
+                #[inline(always)]
+                fn min_identity() -> Self {
+                    <$ty>::MAX
+                }
+
+                #[inline(always)]
+                fn reduce_max(lhs: Self, rhs: Self) -> Self {
+                    lhs.max(rhs)
+                }
+
+                #[inline(always)]
+                fn reduce_min(lhs: Self, rhs: Self) -> Self {
+                    lhs.min(rhs)
+                }
             }
         )*
     };
 }
 
-impl_default_erased_reduce_scalar!(f32, f64, Complex32, Complex64);
+impl_float_erased_reduce_scalar!(f32, f64);
+
+impl_complex_erased_reduce_scalar!(Complex32, Complex64);
 
 impl_wrapping_erased_reduce_scalar!(i32, i64);
 
