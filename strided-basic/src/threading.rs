@@ -139,6 +139,68 @@ where
     );
 }
 
+/// Copy `len` contiguous elements, chunked across workers above the
+/// repository threshold ([`parallel_threads_for_len`]) and as one direct
+/// `copy_nonoverlapping` otherwise (always, without the `parallel` feature).
+///
+/// # Safety
+///
+/// `src..src + len` must be readable and `dst..dst + len` writable for the
+/// whole call, the two ranges must not overlap, and no other thread may
+/// access the destination range concurrently.
+pub(crate) unsafe fn copy_contiguous<T: Copy + crate::MaybeSendSync>(
+    src: *const T,
+    dst: *mut T,
+    len: usize,
+) {
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = parallel_threads_for_len(len);
+        if nthreads > 1 {
+            let src = SendPtr(src as *mut T);
+            let dst = SendPtr(dst);
+            parallel_for_each(0..len, nthreads, &|range| {
+                // SAFETY: `range` lies inside `0..len`, and worker ranges are
+                // disjoint, so each worker copies an exclusive destination
+                // chunk from the caller-validated source range.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.as_const().add(range.start),
+                        dst.as_ptr().add(range.start),
+                        range.len(),
+                    );
+                }
+            });
+            return;
+        }
+    }
+    // SAFETY: the caller guarantees both ranges are valid and disjoint.
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+/// Fill a contiguous slice, chunked across workers above the repository
+/// threshold and as one serial `fill` otherwise.
+pub(crate) fn fill_contiguous<T: Copy + crate::MaybeSendSync>(dst: &mut [T], value: T) {
+    #[cfg(feature = "parallel")]
+    {
+        let len = dst.len();
+        let nthreads = parallel_threads_for_len(len);
+        if nthreads > 1 {
+            let dst = SendPtr(dst.as_mut_ptr());
+            parallel_for_each(0..len, nthreads, &|range| {
+                // SAFETY: `range` lies inside the exclusively borrowed slice
+                // and worker ranges are disjoint.
+                let chunk = unsafe {
+                    core::slice::from_raw_parts_mut(dst.as_ptr().add(range.start), range.len())
+                };
+                chunk.fill(value);
+            });
+            return;
+        }
+    }
+    dst.fill(value);
+}
+
 pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
@@ -401,6 +463,28 @@ pub(crate) fn test_pool(threads: usize) -> std::sync::Arc<rayon::ThreadPool> {
             .build()
             .unwrap(),
     )
+}
+
+/// Run `operation` once under a serial [`crate::ExecContext`] and once under a
+/// four-thread one inside a four-worker pool, and return both results.
+///
+/// The parallel run asserts that the repository gate actually opens for a
+/// length above [`MINTHREADLENGTH`], so equivalence tests with such sizes
+/// exercise the parallel branches.
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) fn run_serial_and_parallel<R: Send>(operation: impl Fn() -> R + Sync) -> (R, R) {
+    let serial = crate::ExecContext::serial().run(|| {
+        assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1), 1);
+        operation()
+    });
+    let parallel = test_pool(4).install(|| {
+        crate::ExecContext::max_threads(4).unwrap().run(|| {
+            assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1), 4);
+            assert_eq!(parallel_threads_for_len(MINTHREADLENGTH), 1);
+            operation()
+        })
+    });
+    (serial, parallel)
 }
 
 #[cfg(all(test, feature = "parallel"))]

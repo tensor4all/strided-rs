@@ -17,7 +17,7 @@ use core::{
 
 use crate::map_view::map_raw_into;
 use crate::ops_view::{copy_conj, copy_into, copy_scale};
-use crate::raw_ops::{apply_fused_pair, fuse_pair_layout, FusedPairLayout};
+use crate::raw_ops::{apply_fused_range, fuse_pair_layout, fused_total, FusedPairLayout};
 use crate::{
     ElementOpApply, Identity, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError,
 };
@@ -201,6 +201,14 @@ pub struct CopyPlan {
 }
 
 impl CopyPlan {
+    /// The fused traversal, or `None` above
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    #[cfg(feature = "parallel")]
+    #[inline]
+    pub(crate) fn fused_layout(&self) -> Option<&FusedPairLayout> {
+        self.fused.as_ref()
+    }
+
     pub(crate) fn execute_uninit_then<'a, T, R>(
         &self,
         dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
@@ -257,7 +265,7 @@ impl CopyPlan {
     /// compiled layout. Buffer bounds against that layout were already proven
     /// by [`RawStridedRef::new`]/[`RawStridedMut::new`] (or asserted by the
     /// caller of the `new_unchecked` constructors), so layout equality is the
-    /// complete precondition for the unsafe-free fused replay below.
+    /// complete precondition for the pointer-based fused replay below.
     fn check_call<D, S>(
         &self,
         dest: &RawStridedMut<'_, D>,
@@ -288,7 +296,7 @@ impl CopyPlan {
         self.check_call(dest, src)?;
         match &self.fused {
             Some(layout) => {
-                apply_fused_pair(
+                replay_fused(
                     dest,
                     src,
                     layout,
@@ -315,7 +323,7 @@ impl CopyPlan {
         self.check_call(dest, src)?;
         match &self.fused {
             Some(layout) => {
-                apply_fused_pair(
+                replay_fused(
                     dest,
                     src,
                     layout,
@@ -342,7 +350,7 @@ impl CopyPlan {
         self.check_call(dest, src)?;
         match &self.fused {
             Some(layout) => {
-                apply_fused_pair(
+                replay_fused(
                     dest,
                     src,
                     layout,
@@ -368,7 +376,7 @@ impl CopyPlan {
         self.check_call(dest, src)?;
         match &self.fused {
             Some(layout) => {
-                apply_fused_pair(
+                replay_fused(
                     dest,
                     src,
                     layout,
@@ -382,6 +390,80 @@ impl CopyPlan {
     }
 }
 
+/// Replay a compiled fused layout, splitting it across worker threads when the
+/// repository threshold and the active execution policy allow it.
+///
+/// Parallel replay is sound only because [`CopyPlan::compile`] proved the
+/// destination layout injective: disjoint logical ranges then write disjoint
+/// destination slots. The logical index space `0..total` (column-major over
+/// the fused axes) is split into contiguous worker ranges, which divides the
+/// outer fused axes and, when there are fewer outer positions than workers,
+/// also chunks long inner runs (for example a rank-1 contiguous copy).
+fn replay_fused<D, S, Apply, Op>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    layout: &FusedPairLayout,
+    apply: Apply,
+    op: Op,
+) where
+    D: Copy + MaybeSendSync,
+    S: Copy + MaybeSendSync,
+    Apply: Fn(&mut D, S) + MaybeSendSync,
+    Op: Fn(S) -> S + MaybeSendSync,
+{
+    let total = fused_total(layout);
+    if total == 0 {
+        return;
+    }
+    let src_ptr = src.data().as_ptr();
+    let src_base = src.offset();
+    let dst_base = dest.offset();
+    let dst_ptr = dest.data_mut().as_mut_ptr();
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = crate::threading::parallel_threads_for_len(total);
+        if nthreads > 1 {
+            let dst_ptr = crate::threading::SendPtr(dst_ptr);
+            let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
+            crate::threading::parallel_for_each(0..total, nthreads, &|range| {
+                // SAFETY: as for the serial call below; in addition the
+                // worker ranges are disjoint and the compiled destination
+                // layout is injective, so no two workers write the same slot,
+                // and the source is only read.
+                unsafe {
+                    apply_fused_range(
+                        dst_ptr.as_ptr(),
+                        dst_base,
+                        src_ptr.as_const(),
+                        src_base,
+                        layout,
+                        range.start,
+                        range.len(),
+                        &apply,
+                        &op,
+                    );
+                }
+            });
+            return;
+        }
+    }
+    // SAFETY: `check_call` proved both views carry exactly the compiled
+    // layout, and `RawStridedRef`/`RawStridedMut` guarantee every offset
+    // reachable through that layout lies inside their data. `layout` is the
+    // fusion of that layout, so every logical index in `0..total` is an
+    // in-bounds slot of both. The exclusive destination borrow cannot overlap
+    // the shared source borrow.
+    unsafe {
+        apply_fused_range(
+            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply, &op,
+        );
+    }
+}
+
 #[cfg(test)]
 #[path = "copy_plan/tests/tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "parallel"))]
+#[path = "copy_plan/tests/parallel_tests.rs"]
+mod parallel_tests;
