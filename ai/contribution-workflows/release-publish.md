@@ -19,15 +19,15 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Confirm all nine package file lists contain their license and provenance files:
+Confirm all eleven package file lists contain their license and provenance files:
 
 ```bash
 set -euo pipefail
 
 for crate in \
-  strided-traits strided-view strided-perm strided-kernel \
-  strided-einsum2 strided-opteinsum mdarray-opteinsum \
-  ndarray-opteinsum strided-rs
+  strided-traits strided-view strided-perm strided-basic \
+  strided-fused strided-kernel strided-einsum2 strided-opteinsum \
+  mdarray-opteinsum ndarray-opteinsum strided-rs
 do
   package_files=$(cargo package -p "$crate" --list)
   printf '%s\n' "$package_files"
@@ -35,7 +35,7 @@ do
     grep -Fxq "$required" <<<"$package_files"
   done
   case "$crate" in
-    strided-traits|strided-view|strided-perm|strided-kernel)
+    strided-traits|strided-view|strided-perm|strided-basic|strided-fused|strided-kernel)
       grep -Fxq THIRD-PARTY-LICENSES <<<"$package_files"
       ;;
     *)
@@ -50,8 +50,9 @@ done
 
 Every package must contain `LICENSE-APACHE`, `LICENSE-MIT`, and its
 package-specific `NOTICE`. Only `strided-traits`, `strided-view`,
-`strided-kernel`, and `strided-perm` contain ported or license-derived code, so
-only those archives contain `THIRD-PARTY-LICENSES`.
+`strided-perm`, `strided-basic`, `strided-fused`, and `strided-kernel` contain
+ported or license-derived code, so only those archives contain
+`THIRD-PARTY-LICENSES`.
 
 ## 2. Tag before publishing
 
@@ -84,7 +85,7 @@ git switch --detach v0.4.0
 test -z "$(git status --porcelain)"
 ```
 
-The detached tag checkout is the publication source. Do not create all nine
+The detached tag checkout is the publication source. Do not create all eleven
 archives at once: Cargo cannot package a crate whose v0.4 workspace
 prerequisites are not yet available from crates.io.
 
@@ -95,12 +96,14 @@ Process one crate completely before starting the next, in this exact order:
 1. `strided-traits`
 2. `strided-view`
 3. `strided-perm`
-4. `strided-kernel`
-5. `strided-einsum2`
-6. `strided-opteinsum`
-7. `mdarray-opteinsum`
-8. `ndarray-opteinsum`
-9. `strided-rs`
+4. `strided-basic`
+5. `strided-fused`
+6. `strided-kernel`
+7. `strided-einsum2`
+8. `strided-opteinsum`
+9. `mdarray-opteinsum`
+10. `ndarray-opteinsum`
+11. `strided-rs`
 
 The adapters occupy the same dependency layer and may be processed in either
 order. For every crate, first query crates.io for the exact version. An absent
@@ -134,7 +137,7 @@ verify_archive() {
     tar -xOf "$archive" "$prefix/$required" | cmp - "$crate/$required"
   done
   case "$crate" in
-    strided-traits|strided-view|strided-perm|strided-kernel)
+    strided-traits|strided-view|strided-perm|strided-basic|strided-fused|strided-kernel)
       tar -xOf "$archive" "$prefix/THIRD-PARTY-LICENSES" |
         cmp - "$crate/THIRD-PARTY-LICENSES"
       ;;
@@ -149,9 +152,9 @@ verify_archive() {
 }
 
 for crate in \
-  strided-traits strided-view strided-perm strided-kernel \
-  strided-einsum2 strided-opteinsum mdarray-opteinsum \
-  ndarray-opteinsum strided-rs
+  strided-traits strided-view strided-perm strided-basic \
+  strided-fused strided-kernel strided-einsum2 strided-opteinsum \
+  mdarray-opteinsum ndarray-opteinsum strided-rs
 do
   test -z "$(git status --porcelain)"
 
