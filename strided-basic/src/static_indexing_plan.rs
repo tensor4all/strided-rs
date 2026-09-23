@@ -98,6 +98,10 @@ pub struct ConcatenatePlan {
     dest_dims: AxisVec<usize>,
     dest_strides: AxisVec<isize>,
     dest_offset_deltas: Vec<isize>,
+    /// Logical start of each segment in the concatenated index space
+    /// (segment totals prefix sums); the last entry is the destination total.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    segment_starts: Vec<usize>,
     copy_plans: Vec<CopyPlan>,
 }
 
@@ -383,7 +387,7 @@ impl PadPlan {
             let dest_slice = dest_data
                 .get_mut(dest_offset..dest_end)
                 .ok_or(StridedError::OffsetOverflow)?;
-            dest_slice.fill(fill);
+            crate::threading::fill_contiguous(dest_slice, fill);
             return Ok(());
         }
         #[cfg(feature = "parallel")]
@@ -403,53 +407,14 @@ impl PadPlan {
         run: ContiguousPadAxis0Run,
     ) -> Result<()>
     where
-        T: Copy,
+        T: Copy + MaybeSendSync,
     {
-        if run.len == 0 {
-            return Ok(());
-        }
-        let outer_dims = &self.operand_dims[1..];
-        let outer_total = checked_total_len(outer_dims)?;
-        let mut outer_idx_storage = CoordScratch::new(outer_dims.len());
-        let outer_idx = outer_idx_storage.as_mut_slice();
-        let operand_ptr = operand.data().as_ptr();
+        let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr();
-
-        for _ in 0..outer_total {
-            let mut operand_offset =
-                checked_offset_add(operand.offset(), self.operand_strides[0], run.operand_start)?;
-            let mut dest_offset =
-                checked_offset_add(dest.offset(), self.dest_strides[0], run.dest_start)?;
-            let mut in_bounds = true;
-            for (outer_axis, &coord) in outer_idx.iter().enumerate() {
-                let axis = outer_axis + 1;
-                let out_pos = i128::from(self.edge_padding_low[axis])
-                    + coord as i128 * i128::from(self.interior_step[axis]);
-                if out_pos < 0 || out_pos >= self.dest_dims[axis] as i128 {
-                    in_bounds = false;
-                    break;
-                }
-                operand_offset =
-                    checked_offset_add(operand_offset, self.operand_strides[axis], coord)?;
-                dest_offset =
-                    checked_offset_add(dest_offset, self.dest_strides[axis], out_pos as usize)?;
-            }
-            if in_bounds {
-                unsafe {
-                    // SAFETY: compile requires unit axis-0 strides, the clipped
-                    // run is in bounds, and the destination layout is injective.
-                    // RawStridedMut's exclusive borrow cannot overlap the
-                    // RawStridedRef's shared borrow in safe Rust.
-                    core::ptr::copy_nonoverlapping(
-                        operand_ptr.offset(operand_offset),
-                        dest_ptr.offset(dest_offset),
-                        run.len,
-                    );
-                }
-            }
-            advance_col_major_index(outer_idx, outer_dims);
-        }
-        Ok(())
+        // SAFETY: `check_call` proved `dest` carries the compiled destination
+        // layout, so its validated data covers every reachable destination
+        // slot, and the exclusive borrow is the only access during the call.
+        unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run) }
     }
 
     fn copy_operand_axis0_runs_uninit<T>(
@@ -459,23 +424,107 @@ impl PadPlan {
         run: ContiguousPadAxis0Run,
     ) -> Result<()>
     where
-        T: Copy,
+        T: Copy + MaybeSendSync,
+    {
+        let dest_offset = dest.offset();
+        let dest_ptr = dest.data_mut().as_mut_ptr().cast::<T>();
+        // SAFETY: as in `copy_operand_axis0_runs`; `MaybeUninit<T>` has the
+        // layout of `T`, and only writes go through the cast pointer.
+        unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run) }
+    }
+
+    /// Copy every in-bounds axis-0 run of the operand into the destination.
+    ///
+    /// With at least as many runs as workers (above the repository
+    /// threshold) the runs are split across workers; otherwise runs are
+    /// copied in order and each long run is chunked across workers by
+    /// [`crate::threading::copy_contiguous`].
+    ///
+    /// # Safety
+    ///
+    /// `dest_ptr` must be the data pointer of a destination whose layout is
+    /// exactly the compiled destination layout from `dest_offset`, valid for
+    /// writes to every reachable slot, with no concurrent access.
+    unsafe fn copy_axis0_runs_raw<T>(
+        &self,
+        dest_ptr: *mut T,
+        dest_offset: isize,
+        operand: &RawStridedRef<'_, T>,
+        run: ContiguousPadAxis0Run,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
     {
         if run.len == 0 {
             return Ok(());
         }
         let outer_dims = &self.operand_dims[1..];
         let outer_total = checked_total_len(outer_dims)?;
+        #[cfg(feature = "parallel")]
+        {
+            let copied = outer_total.saturating_mul(run.len);
+            let nthreads = crate::threading::parallel_threads_for_len(copied);
+            if nthreads > 1 && outer_total >= nthreads {
+                let dest_ptr = crate::threading::SendPtr(dest_ptr);
+                return crate::threading::parallel_map_reduce(
+                    0..outer_total,
+                    nthreads,
+                    &|range| {
+                        let mut outer_idx_storage = CoordScratch::new(outer_dims.len());
+                        let outer_idx = outer_idx_storage.as_mut_slice();
+                        fill_col_major_index(range.start, outer_dims, outer_idx);
+                        // SAFETY: the caller's contract covers every run, and
+                        // disjoint outer ranges write disjoint runs because the
+                        // compiled destination layout is injective.
+                        unsafe {
+                            self.copy_axis0_run_range(
+                                dest_ptr.as_ptr(),
+                                dest_offset,
+                                operand,
+                                run,
+                                outer_idx,
+                                range.len(),
+                            )
+                        }
+                    },
+                    &|left, right| left.and(right),
+                );
+            }
+        }
         let mut outer_idx_storage = CoordScratch::new(outer_dims.len());
         let outer_idx = outer_idx_storage.as_mut_slice();
-        let operand_ptr = operand.data().as_ptr();
-        let dest_ptr = dest.data_mut().as_mut_ptr();
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            self.copy_axis0_run_range(dest_ptr, dest_offset, operand, run, outer_idx, outer_total)
+        }
+    }
 
-        for _ in 0..outer_total {
+    /// Copy `count` consecutive axis-0 runs starting at outer coordinate
+    /// `outer_idx` (column-major over axes `1..`), advancing it in place.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::copy_axis0_runs_raw`], and no other thread may write the
+    /// destination runs visited by this call.
+    unsafe fn copy_axis0_run_range<T>(
+        &self,
+        dest_ptr: *mut T,
+        dest_offset: isize,
+        operand: &RawStridedRef<'_, T>,
+        run: ContiguousPadAxis0Run,
+        outer_idx: &mut [usize],
+        count: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let outer_dims = &self.operand_dims[1..];
+        let operand_ptr = operand.data().as_ptr();
+        for _ in 0..count {
             let mut operand_offset =
                 checked_offset_add(operand.offset(), self.operand_strides[0], run.operand_start)?;
-            let mut dest_offset =
-                checked_offset_add(dest.offset(), self.dest_strides[0], run.dest_start)?;
+            let mut dest_run_offset =
+                checked_offset_add(dest_offset, self.dest_strides[0], run.dest_start)?;
             let mut in_bounds = true;
             for (outer_axis, &coord) in outer_idx.iter().enumerate() {
                 let axis = outer_axis + 1;
@@ -487,14 +536,19 @@ impl PadPlan {
                 }
                 operand_offset =
                     checked_offset_add(operand_offset, self.operand_strides[axis], coord)?;
-                dest_offset =
-                    checked_offset_add(dest_offset, self.dest_strides[axis], out_pos as usize)?;
+                dest_run_offset =
+                    checked_offset_add(dest_run_offset, self.dest_strides[axis], out_pos as usize)?;
             }
             if in_bounds {
+                // SAFETY: compile requires unit axis-0 strides, the clipped
+                // run is in bounds of the validated operand and destination,
+                // and the destination layout is injective. RawStridedMut's
+                // exclusive borrow cannot overlap the RawStridedRef's shared
+                // borrow in safe Rust.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
+                    crate::threading::copy_contiguous(
                         operand_ptr.offset(operand_offset),
-                        dest_ptr.offset(dest_offset).cast::<T>(),
+                        dest_ptr.offset(dest_run_offset),
                         run.len,
                     );
                 }
@@ -787,6 +841,14 @@ impl PadPlan {
     }
 }
 
+#[cfg(feature = "parallel")]
+struct ConcatSegment<'a, T> {
+    layout: &'a crate::raw_ops::FusedPairLayout,
+    dest_offset: isize,
+    src_ptr: crate::threading::SendPtr<T>,
+    src_offset: isize,
+}
+
 impl ConcatenatePlan {
     /// Compile a multi-input concatenate plan for fixed input and destination layouts.
     pub fn compile(
@@ -827,6 +889,8 @@ impl ConcatenatePlan {
         let mut stored_input_strides = Vec::with_capacity(input_dims.len());
         let mut dest_offset_deltas = Vec::with_capacity(input_dims.len());
         let mut copy_plans = Vec::with_capacity(input_dims.len());
+        let mut segment_starts = Vec::with_capacity(input_dims.len() + 1);
+        segment_starts.push(0usize);
         let mut axis_base = 0usize;
 
         for (dims, strides) in input_dims.iter().zip(input_strides.iter()) {
@@ -836,7 +900,11 @@ impl ConcatenatePlan {
             if strides.len() != rank {
                 return Err(StridedError::StrideLengthMismatch);
             }
-            checked_total_len(dims)?;
+            let segment_total = checked_total_len(dims)?;
+            let segment_end = segment_starts[segment_starts.len() - 1]
+                .checked_add(segment_total)
+                .ok_or(StridedError::OffsetOverflow)?;
+            segment_starts.push(segment_end);
             for dim in 0..rank {
                 if dim == axis {
                     expected_dest_dims[axis] = expected_dest_dims[axis]
@@ -871,6 +939,7 @@ impl ConcatenatePlan {
             dest_dims: dest_dims.into(),
             dest_strides: dest_strides.into(),
             dest_offset_deltas,
+            segment_starts,
             copy_plans,
         })
     }
@@ -894,6 +963,10 @@ impl ConcatenatePlan {
         for (position, input) in inputs.iter().enumerate() {
             self.check_input_layout(position, input)?;
             self.segment_offset(position, dest.offset())?;
+        }
+        #[cfg(feature = "parallel")]
+        if self.try_execute_parallel(dest, inputs, |dst: &mut T, value| *dst = value)? {
+            return Ok(());
         }
         for (position, input) in inputs.iter().enumerate() {
             self.execute_segment(position, dest, input)?;
@@ -921,10 +994,93 @@ impl ConcatenatePlan {
             self.check_input_layout(position, input)?;
             self.segment_offset(position, dest.offset())?;
         }
+        #[cfg(feature = "parallel")]
+        if self.try_execute_parallel(dest, inputs, |dst: &mut MaybeUninit<T>, value| {
+            dst.write(value);
+        })? {
+            return Ok(());
+        }
         for (position, input) in inputs.iter().enumerate() {
             self.execute_segment_uninit(position, dest, input)?;
         }
         Ok(())
+    }
+
+    /// Replay all segments as one logical index space split across workers.
+    ///
+    /// Splitting the concatenated space (instead of fanning out per segment)
+    /// keeps many small segments parallel as a group and splits a large
+    /// segment across workers, with one fork-join for the whole call. Returns
+    /// `Ok(false)` without writing when the serial per-segment path must run:
+    /// the destination is at most the repository threshold, the active policy
+    /// allows one thread, or a segment exceeds the fused-rank limit.
+    ///
+    /// The caller must have validated every input layout and segment offset.
+    #[cfg(feature = "parallel")]
+    fn try_execute_parallel<D, T, Apply>(
+        &self,
+        dest: &mut RawStridedMut<'_, D>,
+        inputs: &[RawStridedRef<'_, T>],
+        apply: Apply,
+    ) -> Result<bool>
+    where
+        D: Copy + MaybeSendSync,
+        T: Copy + MaybeSendSync,
+        Apply: Fn(&mut D, T) + MaybeSendSync,
+    {
+        let total = self.segment_starts[self.segment_starts.len() - 1];
+        let nthreads = crate::threading::parallel_threads_for_len(total);
+        if nthreads <= 1 {
+            return Ok(false);
+        }
+        let mut segments = Vec::with_capacity(inputs.len());
+        for (position, input) in inputs.iter().enumerate() {
+            let Some(layout) = self.copy_plans[position].fused_layout() else {
+                return Ok(false);
+            };
+            segments.push(ConcatSegment {
+                layout,
+                dest_offset: self.segment_offset(position, dest.offset())?,
+                src_ptr: crate::threading::SendPtr(input.data().as_ptr() as *mut T),
+                src_offset: input.offset(),
+            });
+        }
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        let starts = &self.segment_starts;
+        let segments = &segments;
+        crate::threading::parallel_for_each(0..total, nthreads, &|range| {
+            // First segment whose end lies past the range start.
+            let mut position = starts[1..].partition_point(|&end| end <= range.start);
+            while position < segments.len() && starts[position] < range.end {
+                let segment = &segments[position];
+                let local_start = range.start.max(starts[position]) - starts[position];
+                let local_end = range.end.min(starts[position + 1]) - starts[position];
+                // SAFETY: `check_dest_layout`/`check_input_layout` proved the
+                // views carry the compiled layouts, so each segment window
+                // (input dims, destination strides, checked segment offset) is
+                // a sub-layout of the validated destination and each input
+                // layout is in-bounds of its data. The destination layout is
+                // injective and the segments occupy disjoint ranges of the
+                // concatenation axis, so disjoint logical ranges write
+                // disjoint slots; inputs are shared borrows that cannot alias
+                // the exclusive destination borrow.
+                unsafe {
+                    crate::raw_ops::apply_fused_range(
+                        dest_ptr.as_ptr(),
+                        segment.dest_offset,
+                        segment.src_ptr.as_const(),
+                        segment.src_offset,
+                        segment.layout,
+                        local_start,
+                        local_end - local_start,
+                        &apply,
+                        &|value| value,
+                    );
+                }
+                position += 1;
+            }
+        });
+        Ok(true)
     }
 
     pub(crate) fn check_dest_layout<T>(&self, dest: &RawStridedMut<'_, T>) -> Result<()> {
@@ -1538,3 +1694,7 @@ impl CoordScratch {
 #[cfg(test)]
 #[path = "static_indexing_plan/tests/tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "parallel"))]
+#[path = "static_indexing_plan/tests/parallel_tests.rs"]
+mod parallel_tests;

@@ -1130,7 +1130,7 @@ impl DynamicSlicePlan {
         starts: &RawStridedRef<'_, I>,
     ) -> Result<()>
     where
-        T: Copy,
+        T: Copy + MaybeSendSync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1158,7 +1158,13 @@ impl DynamicSlicePlan {
         // SAFETY: bounds were checked above and the writer owns the logical
         // destination storage.
         unsafe {
-            core::ptr::copy_nonoverlapping(source.as_ptr(), dest_ptr.add(dest_start), self.total);
+            // Chunked across workers above the repository threshold; each
+            // worker writes a disjoint chunk of the checked destination run.
+            crate::threading::copy_contiguous(
+                source.as_ptr(),
+                dest_ptr.add(dest_start),
+                self.total,
+            );
         }
         Ok(())
     }
@@ -1418,7 +1424,7 @@ impl DynamicUpdateSlicePlan {
         starts: &RawStridedRef<'_, I>,
     ) -> Result<()>
     where
-        T: Copy,
+        T: Copy + MaybeSendSync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1444,7 +1450,13 @@ impl DynamicUpdateSlicePlan {
         let dest_ptr = unsafe { dest.data_ptr() };
         // SAFETY: the checked ranges are inside the destination allocation.
         unsafe {
-            core::ptr::copy_nonoverlapping(update.as_ptr(), dest_ptr.add(dest_start), self.total);
+            // Chunked across workers above the repository threshold; each
+            // worker writes a disjoint chunk of the checked destination run.
+            crate::threading::copy_contiguous(
+                update.as_ptr(),
+                dest_ptr.add(dest_start),
+                self.total,
+            );
         }
         Ok(())
     }
@@ -2120,3 +2132,7 @@ impl CoordScratch {
 #[cfg(test)]
 #[path = "gather_plan/tests/tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "parallel"))]
+#[path = "gather_plan/tests/parallel_tests.rs"]
+mod parallel_tests;
