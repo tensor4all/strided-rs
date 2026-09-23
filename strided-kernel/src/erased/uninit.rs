@@ -737,8 +737,7 @@ fn uninit_clamp<T: OneShotScalar>(
     let hi = erased_view::<T>(hi)?;
     let mut dest = uninit_view_mut::<T>(dest)?;
     zip_map3_into(&mut dest, &x, &lo, &hi, |x, lo, hi| {
-        let raised = T::zip(ErasedZipOp::Maximum, lo, x);
-        MaybeUninit::new(T::zip(ErasedZipOp::Minimum, hi, raised))
+        MaybeUninit::new(T::clamp(x, lo, hi))
     })
 }
 

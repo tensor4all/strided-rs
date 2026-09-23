@@ -1502,6 +1502,12 @@ trait OneShotScalar: Copy + crate::MaybeSendSync + KernelStorageElement + 'stati
     fn supports_zip(op: ErasedZipOp) -> bool;
     fn map(op: ErasedMapOp, value: Self) -> Self;
     fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self;
+    /// `minimum(hi, maximum(lo, x))`, the composition clamp promises.
+    #[inline(always)]
+    fn clamp(x: Self, lo: Self, hi: Self) -> Self {
+        let raised = Self::zip(ErasedZipOp::Maximum, lo, x);
+        Self::zip(ErasedZipOp::Minimum, hi, raised)
+    }
 }
 
 macro_rules! impl_real_one_shot_scalar {
@@ -1563,6 +1569,21 @@ macro_rules! impl_real_one_shot_scalar {
                             picked
                         }
                     }
+                }
+            }
+
+            // Same result as the default composition: any NaN operand gives
+            // the canonical NaN and ties return the bound. Testing NaN once
+            // over the three operands, instead of once per step, keeps the
+            // loop at memory bandwidth.
+            #[inline(always)]
+            fn clamp(x: Self, lo: Self, hi: Self) -> Self {
+                let raised = if lo >= x { lo } else { x };
+                let lowered = if hi <= raised { hi } else { raised };
+                if x.is_nan() | lo.is_nan() | hi.is_nan() {
+                    <$ty>::NAN
+                } else {
+                    lowered
                 }
             }
         }
