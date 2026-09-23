@@ -656,17 +656,19 @@ impl<'a> ContiguousMulOuterCursor<'a> {
                 continue;
             }
 
-            self.coords[i] += 1;
-            self.a_offset += self.a_strides[axis];
-            self.b_offset += self.b_strides[axis];
-
-            if self.coords[i] < dim {
+            // Advance only when another position along this axis follows,
+            // and rewind from the last one, so offsets stay reachable.
+            if self.coords[i] + 1 < dim {
+                self.coords[i] += 1;
+                self.a_offset += self.a_strides[axis];
+                self.b_offset += self.b_strides[axis];
                 break;
             }
 
+            let last = (dim - 1) as isize;
             self.coords[i] = 0;
-            self.a_offset -= dim as isize * self.a_strides[axis];
-            self.b_offset -= dim as isize * self.b_strides[axis];
+            self.a_offset -= last * self.a_strides[axis];
+            self.b_offset -= last * self.b_strides[axis];
         }
     }
 }
@@ -783,7 +785,11 @@ fn try_contiguous_range_mul<
     b_ptr: *const B,
     b_strides: &[isize],
 ) -> bool {
-    let total = total_len(dims);
+    // An overflowing element count falls back to the general path, which
+    // reports it as `OffsetOverflow`.
+    let Ok(total) = total_len(dims) else {
+        return false;
+    };
     if total == 0 {
         return true;
     }
@@ -1188,8 +1194,8 @@ fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op
     f: impl Fn(A) -> D + MaybeSync,
     _validated: ValidatedDestinationLayout,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         simd::dispatch_if_large(len, || {
@@ -1202,7 +1208,7 @@ fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
     let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<A>());
-    let total = total_len(dst_dims);
+    let total = total_len(dst_dims)?;
 
     // Small tensor fast path: skip compute_order and compute_block_sizes
     let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
@@ -1213,7 +1219,7 @@ fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
@@ -1517,8 +1523,8 @@ fn zip_map2_parts_into_validated<
     f: impl Fn(A, B) -> D + MaybeSync,
     _validated: ValidatedDestinationLayout,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
@@ -1534,7 +1540,7 @@ fn zip_map2_parts_into_validated<
     let elem_size = std::mem::size_of::<D>()
         .max(std::mem::size_of::<A>())
         .max(std::mem::size_of::<B>());
-    let total = total_len(dst_dims);
+    let total = total_len(dst_dims)?;
 
     // Small tensor fast path: skip compute_order and compute_block_sizes
     let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
@@ -1545,7 +1551,7 @@ fn zip_map2_parts_into_validated<
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
@@ -1625,8 +1631,8 @@ fn mul_identity_into_raw<
     debug_assert_eq!(dst_dims.len(), a_strides.len());
     debug_assert_eq!(dst_dims.len(), b_strides.len());
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         if unsafe { O::try_contiguous(dst_ptr, len, sa, sb) } {
@@ -1642,7 +1648,7 @@ fn mul_identity_into_raw<
     let elem_size = std::mem::size_of::<D>()
         .max(std::mem::size_of::<A>())
         .max(std::mem::size_of::<B>());
-    let total = total_len(dst_dims);
+    let total = total_len(dst_dims)?;
 
     if try_contiguous_range_mul::<O, D, A, B>(
         dst_ptr,
@@ -1664,7 +1670,7 @@ fn mul_identity_into_raw<
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
@@ -2023,10 +2029,10 @@ pub(crate) fn zip_map3_into_validated<
     if sequential_contiguous_layout(
         dst_dims,
         &[dst_strides, a.strides(), b.strides(), c.strides()],
-    )
+    )?
     .is_some()
     {
-        let len = total_len(dst_dims);
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
@@ -2044,7 +2050,7 @@ pub(crate) fn zip_map3_into_validated<
         .max(std::mem::size_of::<A>())
         .max(std::mem::size_of::<B>())
         .max(std::mem::size_of::<C>());
-    let total = total_len(dst_dims);
+    let total = total_len(dst_dims)?;
 
     // Small tensor fast path: skip compute_order and compute_block_sizes
     let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
@@ -2055,7 +2061,7 @@ pub(crate) fn zip_map3_into_validated<
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;
@@ -2189,10 +2195,10 @@ pub(crate) fn zip_map4_into_validated<
             c.strides(),
             e.strides(),
         ],
-    )
+    )?
     .is_some()
     {
-        let len = total_len(dst_dims);
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
@@ -2223,7 +2229,7 @@ pub(crate) fn zip_map4_into_validated<
         .max(std::mem::size_of::<B>())
         .max(std::mem::size_of::<C>())
         .max(std::mem::size_of::<E>());
-    let total = total_len(dst_dims);
+    let total = total_len(dst_dims)?;
 
     // Small tensor fast path: skip compute_order and compute_block_sizes
     let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
@@ -2234,7 +2240,7 @@ pub(crate) fn zip_map4_into_validated<
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             use crate::threading::SendPtr;

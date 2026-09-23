@@ -72,11 +72,18 @@ pub(crate) fn fuse_pair_layout(
     }
     let mut fused = 0usize;
     for axis in 1..layout.rank {
-        let extent = layout.dims[fused] as isize;
-        if layout.dst_strides[fused].checked_mul(extent) == Some(layout.dst_strides[axis])
-            && layout.src_strides[fused].checked_mul(extent) == Some(layout.src_strides[axis])
-        {
-            layout.dims[fused] *= layout.dims[axis];
+        // A merged extent that overflows (possible for a stride-0 broadcast
+        // whose element count exceeds usize) leaves the axes unfused.
+        let merged = isize::try_from(layout.dims[fused])
+            .ok()
+            .filter(|&extent| {
+                layout.dst_strides[fused].checked_mul(extent) == Some(layout.dst_strides[axis])
+                    && layout.src_strides[fused].checked_mul(extent)
+                        == Some(layout.src_strides[axis])
+            })
+            .and_then(|_| layout.dims[fused].checked_mul(layout.dims[axis]));
+        if let Some(merged) = merged {
+            layout.dims[fused] = merged;
         } else {
             fused += 1;
             layout.dims[fused] = layout.dims[axis];
@@ -129,19 +136,24 @@ pub(crate) fn apply_fused_pair<D, S, Apply, Op>(
                 apply(&mut dst_data[dst_position], op(src_data[src_position]));
             }
         }
+        // Advance an axis only when another position along it follows, and
+        // rewind it from its last position, so every intermediate base is a
+        // reachable offset of a validated layout (issue #243 follow-up): a
+        // layout ending within one stride of `isize::MAX` must not overflow.
         let mut axis = 1;
         loop {
             if axis >= layout.rank {
                 return;
             }
-            index[axis] += 1;
-            dst_base += layout.dst_strides[axis];
-            src_base += layout.src_strides[axis];
-            if index[axis] < layout.dims[axis] {
+            if index[axis] + 1 < layout.dims[axis] {
+                index[axis] += 1;
+                dst_base += layout.dst_strides[axis];
+                src_base += layout.src_strides[axis];
                 break;
             }
-            dst_base -= layout.dims[axis] as isize * layout.dst_strides[axis];
-            src_base -= layout.dims[axis] as isize * layout.src_strides[axis];
+            let last = (layout.dims[axis] - 1) as isize;
+            dst_base -= last * layout.dst_strides[axis];
+            src_base -= last * layout.src_strides[axis];
             index[axis] = 0;
             axis += 1;
         }
@@ -155,6 +167,9 @@ fn ensure_same_dims(dst: &[usize], src: &[usize]) -> Result<()> {
             src.to_vec(),
         ));
     }
+    // Reject an element count beyond usize (a huge stride-0 broadcast)
+    // instead of replaying it.
+    crate::kernel::total_len(dst)?;
     Ok(())
 }
 

@@ -358,6 +358,11 @@ fn classify_outer_axes(
 }
 
 fn checked_axes_product(dims: &[usize], axes: &[usize]) -> Result<usize> {
+    // A zero extent makes the group empty even when the other extents
+    // overflow.
+    if axes.iter().any(|&axis| dims[axis] == 0) {
+        return Ok(0);
+    }
     axes.iter().try_fold(1usize, |acc, &axis| {
         acc.checked_mul(dims[axis])
             .ok_or(StridedError::OffsetOverflow)

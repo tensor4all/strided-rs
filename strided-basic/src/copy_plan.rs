@@ -239,13 +239,9 @@ impl CopyPlan {
         if dims.len() != dst_strides.len() || dims.len() != src_strides.len() {
             return Err(StridedError::StrideLengthMismatch);
         }
-        if dims
-            .iter()
-            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-            .is_none()
-        {
-            return Err(StridedError::OffsetOverflow);
-        }
+        // A zero-sized layout has zero elements even when its other extents
+        // overflow; only a nonempty overflowing count is rejected.
+        crate::kernel::total_len(dims)?;
         if !crate::layout_check::is_injective_layout(dims, dst_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }

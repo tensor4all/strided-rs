@@ -42,34 +42,15 @@ fn pick_off(rng: &mut StdRng) -> isize {
     c[rng.gen_range(0..c.len())]
 }
 
-/// The operand copy (`CopyPlan`) odometer steps one stride past each axis
-/// before rewinding, which overflows in debug builds when the reachable span
-/// sits within one stride of `isize::MAX`. That is a separate copy-kernel
-/// hazard tracked outside #243, so this probe keeps a one-stride headroom.
-fn copy_headroom(dims: &[usize], strides: &[isize], offset: isize) -> bool {
-    let mut max = offset;
-    for (&d, &s) in dims.iter().zip(strides) {
-        if s > 0 {
-            max = match max.checked_add(s * (d as isize - 1)) {
-                Some(v) => v,
-                None => return false,
-            };
-        }
-    }
-    let widest = strides.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-    isize::try_from(widest)
-        .ok()
-        .and_then(|w| max.checked_add(w))
-        .is_some()
-}
-
 /// Issue #243 asked whether a validated plan can fail after the operand copy
 /// has already mutated `dest`. Every fallible step after the copy (clamped
 /// start read, update-window base, replay decode) stays inside the
 /// already-validated reachable span of `dest`, `update`, and `starts`, so a
 /// plan whose `compile` and `check_call` succeed must never return `Err` from
 /// the post-copy phase. Zero-sized elements let the probe use offsets and
-/// strides near `isize::MAX`.
+/// strides near `isize::MAX`, including layouts whose reachable span ends
+/// within one stride of it (the operand copy must not step past the last
+/// position of an axis before rewinding).
 #[test]
 fn issue_243_validated_layouts_never_fail_after_copy() {
     let mut rng = StdRng::seed_from_u64(243);
@@ -104,9 +85,6 @@ fn issue_243_validated_layouts_never_fail_after_copy() {
         else {
             continue;
         };
-        if !copy_headroom(&dims, &ds, doff) || !copy_headroom(&dims, &os, ooff) {
-            continue;
-        }
         tried += 1;
         if dims
             .iter()
