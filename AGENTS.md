@@ -67,7 +67,9 @@ cargo test --workspace       # all tests
 `REPOSITORY_RULES.md`. It runs from the trusted base revision and treats PR
 contents as data: the PR head is fetched for `git diff` only, never checked out
 or executed. Findings are posted as a single updating PR comment; only
-`block`-severity findings fail CI.
+`block`-severity findings fail CI. The external LLM pass is permanently
+disabled, matching tenferro-rs: CI runs the deterministic checks only, with
+`--dry-run --llm-skipped-reason ...`.
 
 Preview the review locally before pushing:
 
@@ -76,20 +78,17 @@ python3 scripts/repository-rules-review.py --base main --worktree --dry-run
 python3 scripts/test-repository-rules-review.py   # the script's own tests
 ```
 
-Drop the `--dry-run` to include the LLM pass; it needs `DEEPSEEK_API_KEY` in the
-environment or in a repo-root `.env` (`pip install -r scripts/requirements-dev.txt`).
-
-The system prompt lives in `ai/prompts/repository-rules-review.md`. Two
-deterministic checks run before the LLM and independently of it: secret-shaped
-text in added lines blocks the upload entirely, and the **Deprecated Tree
-Freeze** rejects source changes under `deprecated/`.
+Two deterministic checks run: secret-shaped text in added lines is blocked,
+and the **Deprecated Tree Freeze** rejects source changes under `deprecated/`.
+The LLM prompt in `ai/prompts/repository-rules-review.md` is kept but unused
+while the LLM pass is disabled.
 
 Maintainer escape hatches, both requiring the `maintain`/`admin` role and
 reapplication after the latest push:
 
 | Label | Effect |
 |-------|--------|
-| `rules-review:no-llm` | Skips the LLM pass; deterministic checks still run |
+| `rules-review:no-llm` | Legacy; the LLM pass is already disabled |
 | `rules-review:waive` | Waives the review entirely |
 
 When adding a `## ` section to `REPOSITORY_RULES.md`, also route it in
