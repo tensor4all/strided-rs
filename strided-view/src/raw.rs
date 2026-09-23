@@ -107,6 +107,18 @@ impl KernelDType {
 }
 
 fn validate_erased_buffer(dtype: KernelDType, data: &[u8]) -> Result<usize> {
+    let element_count = validate_erased_buffer_extent(dtype, data)?;
+    if element_count != 0 && dtype.requires_valid_byte_values() {
+        validate_bool_bytes(data)?;
+    }
+    Ok(element_count)
+}
+
+/// Validate the length and alignment of erased storage, without reading it.
+///
+/// Typed constructors call this alone: `KernelStorageElement` is sealed, so a
+/// `&[T]` already holds valid values of `T::DTYPE`.
+fn validate_erased_buffer_extent(dtype: KernelDType, data: &[u8]) -> Result<usize> {
     let element_size = dtype.size_of();
     if data.len() % element_size != 0 {
         return Err(StridedError::ByteLengthMismatch {
@@ -128,12 +140,22 @@ fn validate_erased_buffer(dtype: KernelDType, data: &[u8]) -> Result<usize> {
             alignment,
         });
     }
-    if dtype.requires_valid_byte_values() {
-        if let Some(&value) = data.iter().find(|&&value| value > 1) {
-            return Err(StridedError::InvalidBoolByte { value });
-        }
-    }
     Ok(element_count)
+}
+
+/// Reject any byte other than 0 or 1.
+///
+/// The OR fold has no early exit, so it vectorizes and runs at memory
+/// bandwidth; a byte by byte `find` does not, and cost more than the select
+/// kernel it guarded. The slow scan runs only to report the offending byte.
+fn validate_bool_bytes(data: &[u8]) -> Result<()> {
+    if data.iter().fold(0u8, |acc, &value| acc | value) <= 1 {
+        return Ok(());
+    }
+    match data.iter().find(|&&value| value > 1) {
+        Some(&value) => Err(StridedError::InvalidBoolByte { value }),
+        None => Ok(()),
+    }
 }
 
 fn validate_erased_buffer_layout(
@@ -315,7 +337,7 @@ impl<'a> ErasedRawStridedRef<'a> {
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
         let bytes = unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_len) };
-        let element_count = validate_erased_buffer(dtype, bytes)?;
+        let element_count = validate_erased_buffer_extent(dtype, bytes)?;
         validate_bounds(element_count, dims, strides, offset)?;
         Ok(Self {
             dtype,
@@ -419,7 +441,7 @@ impl<'a> ErasedRawStridedMut<'a> {
             .ok_or(StridedError::OffsetOverflow)?;
         let data =
             unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), byte_len) };
-        let element_count = validate_erased_buffer(dtype, data)?;
+        let element_count = validate_erased_buffer_extent(dtype, data)?;
         validate_bounds(element_count, dims, strides, offset)?;
         Ok(Self {
             dtype,
@@ -872,6 +894,39 @@ mod tests {
         check!(bool, true);
         check!(Complex32, Complex32::new(1.0, 0.0));
         check!(Complex64, Complex64::new(1.0, 0.0));
+    }
+
+    #[test]
+    fn raw_bool_descriptor_reports_the_first_invalid_byte() {
+        let mut bytes = vec![1u8; 4096];
+        bytes[4000] = 3;
+        bytes[4001] = 9;
+        let dims = [bytes.len()];
+        let strides = [1isize];
+        let ptr = NonNull::new(bytes.as_mut_ptr()).unwrap();
+        let erased = unsafe {
+            ErasedRawStridedPtr::from_raw_parts(
+                KernelDType::Bool,
+                ptr,
+                bytes.len(),
+                &dims,
+                &strides,
+                0,
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            unsafe { erased.try_as_ref_after_no_overlap() },
+            Err(crate::StridedError::InvalidBoolByte { value: 3 })
+        ));
+
+        // Write through the handed off pointer so no reborrow of `bytes`
+        // invalidates it.
+        unsafe {
+            *ptr.as_ptr().add(4000) = 0;
+            *ptr.as_ptr().add(4001) = 1;
+        }
+        assert!(unsafe { erased.try_as_ref_after_no_overlap() }.is_ok());
     }
 
     #[test]

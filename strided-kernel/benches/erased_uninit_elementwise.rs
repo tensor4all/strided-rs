@@ -1,10 +1,14 @@
 //! Paired regression benchmark: dtype-erased uninit elementwise entries against
-//! the typed uninit kernels they dispatch to.
+//! the typed uninit kernels they dispatch to, and the ternary entries against a
+//! plain slice loop.
 //!
 //! The erased entries select the runtime operation once, outside the element
 //! loop. This benchmark guards that the erased dispatch stays at typed-kernel
 //! parity across sizes and layouts, including a transposed input that misses
-//! the contiguous fast path.
+//! the contiguous fast path. The ternary `select` and `clamp` rows guard the
+//! per-call work around the loop too: a byte by byte `bool` validation once
+//! cost more than the select itself, and a NaN test per `clamp` step doubled
+//! its time, and neither showed up in any binary row.
 //!
 //! `RAYON_NUM_THREADS=1 cargo bench -p strided-kernel --bench erased_uninit_elementwise`
 //!
@@ -16,9 +20,10 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use strided_kernel::{
-    erased_map_into_uninit, erased_zip_into_uninit, map_into, zip_map2_into, ErasedMapOp,
-    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, ExecContext,
-    KernelDType, StridedView, StridedViewMut,
+    erased_clamp_into_uninit, erased_map_into_uninit, erased_select_into_uninit,
+    erased_zip_into_uninit, map_into, zip_map2_into, ErasedMapOp, ErasedRawStridedPtr,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, ExecContext, KernelDType,
+    StridedView, StridedViewMut,
 };
 
 const WARMUPS: usize = 6;
@@ -166,6 +171,98 @@ where
     );
 }
 
+/// `dest = if pred { on_true } else { on_false }` with an irregular predicate.
+///
+/// The ternary rows compare against a plain slice loop, not the typed
+/// `zip_map3_into`, so a slow loop shared by the typed and erased paths also
+/// shows in the ratio.
+fn bench_select(len: usize) {
+    let dims = [len];
+    let strides = [1];
+    let pred: Vec<bool> = (0..len).map(|index| (index * 7919) % 13 < 6).collect();
+    let on_true = values(len, 1.0);
+    let on_false = values(len, 2.0);
+    let mut typed_out = vec![MaybeUninit::<f64>::uninit(); len];
+    let mut erased_out = vec![MaybeUninit::<f64>::uninit(); len];
+    let pred_ref = ErasedRawStridedRef::from_slice(&pred, &dims, &strides, 0).unwrap();
+    let true_ref = ErasedRawStridedRef::from_slice(&on_true, &dims, &strides, 0).unwrap();
+    let false_ref = ErasedRawStridedRef::from_slice(&on_false, &dims, &strides, 0).unwrap();
+    let ctx = ExecContext::serial();
+    measure_pair(
+        &format!("select,vector,{len}"),
+        len,
+        || {
+            for (((out, &p), &a), &b) in
+                typed_out.iter_mut().zip(&pred).zip(&on_true).zip(&on_false)
+            {
+                *out = MaybeUninit::new(if p { a } else { b });
+            }
+            black_box(&typed_out);
+        },
+        || {
+            let mut dest =
+                ErasedRawStridedUninitMut::from_uninit_slice(&mut erased_out, &dims, &strides, 0)
+                    .unwrap();
+            erased_select_into_uninit(
+                KernelDType::F64,
+                &ctx,
+                &mut dest,
+                &ErasedRawStridedPtr::from_ref(&pred_ref),
+                &ErasedRawStridedPtr::from_ref(&true_ref),
+                &ErasedRawStridedPtr::from_ref(&false_ref),
+            )
+            .unwrap();
+            black_box(&erased_out);
+        },
+    );
+}
+
+/// `clamp(x, lo, hi)` against a plain slice loop that tests NaN once per element.
+fn bench_clamp(len: usize) {
+    let dims = [len];
+    let strides = [1];
+    let x = values(len, 0.0);
+    let lo = vec![-0.25; len];
+    let hi = vec![0.25; len];
+    let mut typed_out = vec![MaybeUninit::<f64>::uninit(); len];
+    let mut erased_out = vec![MaybeUninit::<f64>::uninit(); len];
+    let x_ref = ErasedRawStridedRef::from_slice(&x, &dims, &strides, 0).unwrap();
+    let lo_ref = ErasedRawStridedRef::from_slice(&lo, &dims, &strides, 0).unwrap();
+    let hi_ref = ErasedRawStridedRef::from_slice(&hi, &dims, &strides, 0).unwrap();
+    let ctx = ExecContext::serial();
+    measure_pair(
+        &format!("clamp,vector,{len}"),
+        len,
+        || {
+            for (((out, &x), &lo), &hi) in typed_out.iter_mut().zip(&x).zip(&lo).zip(&hi) {
+                let raised = if lo >= x { lo } else { x };
+                let lowered = if hi <= raised { hi } else { raised };
+                *out = MaybeUninit::new(if x.is_nan() | lo.is_nan() | hi.is_nan() {
+                    f64::NAN
+                } else {
+                    lowered
+                });
+            }
+            black_box(&typed_out);
+        },
+        || {
+            let mut dest =
+                ErasedRawStridedUninitMut::from_uninit_slice(&mut erased_out, &dims, &strides, 0)
+                    .unwrap();
+            erased_clamp_into_uninit(
+                KernelDType::F64,
+                &ctx,
+                &mut dest,
+                &ErasedRawStridedPtr::from_ref(&x_ref),
+                &ErasedRawStridedPtr::from_ref(&lo_ref),
+                &ErasedRawStridedPtr::from_ref(&hi_ref),
+            )
+            .unwrap();
+            black_box(&erased_out);
+        },
+    );
+}
+
 fn bench_map<F>(op: ErasedMapOp, label: &str, typed_op: F, len: usize)
 where
     F: Fn(f64) -> f64 + Copy + Send + Sync,
@@ -227,7 +324,13 @@ fn main() {
             Layout::Vector,
             len,
         );
+        bench_select(len);
+        bench_clamp(len);
         bench_map(ErasedMapOp::Negate, "negate", |a| -a, len);
         bench_map(ErasedMapOp::Abs, "abs", |a: f64| a.abs(), len);
     }
+    // A clamp that tested NaN at each step matched the loop at 1 << 20 but
+    // took twice as long once its four streams left the cache.
+    bench_select(1 << 23);
+    bench_clamp(1 << 23);
 }

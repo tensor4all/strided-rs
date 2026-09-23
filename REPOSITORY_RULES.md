@@ -166,6 +166,16 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
   new entry point, adds its rows in the same change or links a benchmark suite
   PR. Defects in #269 surfaced only downstream in tenferro because the suite
   measured typed entries at one thread only.
+- Ternary and predicated families (`select`, `clamp`) count as operation
+  families too. Their regression rows compare against a plain slice loop rather
+  than the typed `zip_map3_into`, so a slow loop shared by both paths still
+  shows, and include a size well past the last level cache: a per-step NaN test
+  in `clamp` matched the loop at 2^20 elements and cost 1.7x at 2^23.
+- Validation that reads operand data, such as the `bool` byte check, is part of
+  the kernel's cost. Write it as a fold without an early exit so it vectorizes,
+  and skip it where the type already guarantees validity (the sealed typed
+  constructors). A byte by byte `find` over the predicate once cost more than
+  the `select` it guarded, and no binary row could see it.
 - Benchmark harnesses must enforce and verify the thread count they report: use
   a bounded pool or an explicit execution context and assert the effective
   count at startup. A thread flag or environment variable that is requested but

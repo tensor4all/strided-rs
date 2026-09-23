@@ -994,12 +994,8 @@ unsafe fn inner_loop_map3<
         let src_c = std::slice::from_raw_parts(cp, len);
         let dst = std::slice::from_raw_parts_mut(dp, len);
         simd::dispatch_if_large(len, || {
-            for i in 0..len {
-                dst[i] = f(
-                    OpA::apply(src_a[i]),
-                    OpB::apply(src_b[i]),
-                    OpC::apply(src_c[i]),
-                );
+            for (((d, &a), &b), &c) in dst.iter_mut().zip(src_a).zip(src_b).zip(src_c) {
+                *d = f(OpA::apply(a), OpB::apply(b), OpC::apply(c));
             }
         });
     } else {
@@ -2038,8 +2034,8 @@ pub(crate) fn zip_map3_into_validated<
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
         simd::dispatch_if_large(len, || {
-            for i in 0..len {
-                dst[i] = f(OpA::apply(sa[i]), OpB::apply(sb[i]), OpC::apply(sc[i]));
+            for (((d, &a), &b), &c) in dst.iter_mut().zip(sa).zip(sb).zip(sc) {
+                *d = f(OpA::apply(a), OpB::apply(b), OpC::apply(c));
             }
         });
         return Ok(());
