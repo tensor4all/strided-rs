@@ -56,18 +56,25 @@ pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
                 continue;
             }
 
-            // s[i] should equal dims[i-1] * s[i-1] for fusion
-            let expected = result[i - 1] as isize * strides[i - 1];
-            if strides[i] != expected {
+            // s[i] should equal dims[i-1] * s[i-1] for fusion. A product
+            // that does not fit in isize cannot equal a stored stride.
+            let expected = isize::try_from(result[i - 1])
+                .ok()
+                .and_then(|dim| dim.checked_mul(strides[i - 1]));
+            if expected != Some(strides[i]) {
                 can_merge = false;
                 break;
             }
         }
 
         if can_merge {
-            // Fuse dimensions: merge dimension i into i-1
-            result[i - 1] *= result[i];
-            result[i] = 1;
+            // Fuse dimensions: merge dimension i into i-1. An extent product
+            // that overflows (possible for zero-sized or broadcast views,
+            // which validate without forming it) leaves the axes unfused.
+            if let Some(merged) = result[i - 1].checked_mul(result[i]) {
+                result[i - 1] = merged;
+                result[i] = 1;
+            }
         }
     }
 
@@ -191,16 +198,18 @@ pub(crate) fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> 
     for strides in all_strides {
         let strides = strides.as_ref();
         for i in 0..n {
-            costs[i] = costs[i].min(strides[i].abs());
+            costs[i] = costs[i].min(strides[i].checked_abs().unwrap_or(isize::MAX));
         }
     }
 
-    // Transform: zero -> 1, nonzero -> 2*abs
+    // Transform: zero -> 1, nonzero -> 2*abs. Costs only rank axes, so a
+    // stride beyond isize::MAX / 2 (reachable with zero-sized elements)
+    // saturates instead of overflowing.
     for cost in &mut costs {
         if *cost == 0 {
             *cost = 1;
         } else {
-            *cost *= 2;
+            *cost = cost.saturating_mul(2);
         }
     }
 

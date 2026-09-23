@@ -85,6 +85,12 @@ pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) ->
             src_dims.to_vec(),
         ));
     }
+    // A zero-sized view has nothing to copy. It validates without its other
+    // extents or strides forming an in-range product, so neither the
+    // contiguous fast path nor the permutation planner may see it.
+    if dst_dims.contains(&0) {
+        return Ok(());
+    }
 
     let dst_ptr = dest.as_mut_ptr();
     let src_ptr = src.ptr();
@@ -139,6 +145,12 @@ pub fn copy_into_par<T: Copy + Send + Sync>(
             dst_dims.to_vec(),
             src_dims.to_vec(),
         ));
+    }
+    // A zero-sized view has nothing to copy. It validates without its other
+    // extents or strides forming an in-range product, so neither the
+    // contiguous fast path nor the permutation planner may see it.
+    if dst_dims.contains(&0) {
+        return Ok(());
     }
 
     let dst_ptr = dest.as_mut_ptr();

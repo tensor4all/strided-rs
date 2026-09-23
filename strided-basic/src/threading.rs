@@ -172,7 +172,7 @@ pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
-    let total = crate::kernel::total_len(dest.dims());
+    let total = crate::kernel::total_len(dest.dims())?;
     let current_pool_threads = current_pool_threads();
     let parallel_eligible = crate::execution_policy::permutation_copy_parallel_eligible(
         crate::execution_policy::active_policy(),
@@ -286,7 +286,7 @@ where
         taskindex: usize,
         in_fanout: bool,
     ) -> Result<()> {
-        let total: usize = dims.iter().product();
+        let total = crate::kernel::total_len(dims)?;
 
         // Base case: single thread or below threshold
         if nthreads <= 1 || total <= MINTHREADLENGTH {

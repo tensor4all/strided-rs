@@ -207,8 +207,8 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         if Op::IS_IDENTITY {
             debug_assert!(
                 {
@@ -285,7 +285,7 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     let native_float = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
         || std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
     if !native_float
-        || sequential_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()]).is_some()
+        || sequential_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()])?.is_some()
     {
         return map_into(dest, src, MaybeUninit::new);
     }
@@ -332,8 +332,8 @@ pub fn add<
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         simd::dispatch_if_large(len, || {
@@ -352,7 +352,7 @@ pub fn add<
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
@@ -433,8 +433,8 @@ pub fn mul<
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         simd::dispatch_if_large(len, || {
@@ -453,7 +453,7 @@ pub fn mul<
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
@@ -537,8 +537,8 @@ where
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         simd::dispatch_if_large(len, || {
@@ -557,7 +557,7 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
@@ -647,8 +647,8 @@ where
     let a_strides = a.strides();
     let b_strides = b.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides]).is_some() {
-        let len = total_len(dst_dims);
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides])?.is_some() {
+        let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
@@ -670,7 +670,7 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             let dst_send = SendPtr(dst_ptr);
@@ -765,7 +765,7 @@ pub fn sum<
     // SIMD fast path: contiguous Identity view with SIMD support
     if Op::IS_IDENTITY {
         if same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
-            let len = total_len(src.dims());
+            let len = total_len(src.dims())?;
             let src_slice = unsafe { std::slice::from_raw_parts(src.ptr(), len) };
 
             #[cfg(feature = "parallel")]
@@ -802,10 +802,9 @@ where
     let a_strides = a.strides();
     let b_strides = b.strides();
     let a_dims = a.dims();
+    let len = total_len(a_dims)?;
 
     if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
-        let len = total_len(a_dims);
-
         // SIMD fast path: both contiguous, both Identity ops, same type
         if OpA::IS_IDENTITY
             && OpB::IS_IDENTITY
@@ -1605,11 +1604,14 @@ where
     let src_dims = src.dims();
     let expected_dims = [src_dims[1], src_dims[0]];
     ensure_same_shape(dest.dims(), &expected_dims)?;
+    // Reject an element count beyond usize (a huge stride-0 broadcast) up
+    // front instead of looping over it.
+    total_len(src_dims)?;
 
     if scale == T::zero() {
         unsafe {
             if same_contiguous_layout(dest.dims(), &[dest.strides()]).is_some() {
-                fill_contiguous(dest.as_mut_ptr(), total_len(dest.dims()), T::zero());
+                fill_contiguous(dest.as_mut_ptr(), total_len(dest.dims())?, T::zero());
             } else {
                 fill_2d(
                     dest.as_mut_ptr(),

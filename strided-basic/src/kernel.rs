@@ -4,7 +4,7 @@
 //! `_mapreduce_kernel!` pattern for cache-optimized strided array operations.
 
 use crate::fuse::{compress_dims, fuse_dims};
-use crate::{block, order, Result};
+use crate::{block, order, Result, StridedError};
 
 /// Maximum total elements for the small tensor fast path.
 /// Tensors at or below this size skip `compute_order` and `compute_block_sizes`
@@ -238,32 +238,53 @@ where
 // Macro-generated rank-specialized kernels (inner-block callback)
 // ============================================================================
 
+// Every loop below advances an offset only when another position along its
+// level follows, and each loop rewinds its own level on completion. Offsets
+// therefore only ever hold reachable positions of the validated layouts (plus
+// the caller's initial offsets), so no intermediate value can overflow even
+// when a layout ends within one stride of `isize::MAX` (issue #243
+// follow-up). The rewind distance is the difference of two reachable offsets,
+// so it is representable as well.
+
 /// Element-level nested loops for ranks >= 2.
 ///
 /// Iterates over the element block, calling `f` at each innermost position.
 /// Levels are listed from outermost to innermost (excluding level 0 which is
 /// the callback level). For a rank-N kernel, element levels are N-1, N-2, ..., 1.
+/// Each level leaves the offsets where it found them.
 macro_rules! elem_loops {
     // Base case: single level (innermost element level).
-    // Iterates blens[$lv] times, calling f then advancing by stride[$lv].
+    // Iterates blens[$lv] times, calling f and advancing by stride[$lv]
+    // between calls.
     ($offsets:ident, $strides:ident, $f:ident, $blens:ident, $is:ident; $lv:literal) => {
-        for _ in 0..$blens[$lv] {
+        for _i in 0..$blens[$lv] {
             $f($offsets, $blens[0], &$is)?;
-            for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
-                *o += s[$lv];
+            if _i + 1 < $blens[$lv] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += s[$lv];
+                }
             }
         }
+        let _back = $blens[$lv].saturating_sub(1) as isize;
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= _back * s[$lv];
+        }
     };
-    // Recursive case: outermost level wraps inner levels.
-    // After the inner loop, resets the inner level's offset and advances this level.
+    // Recursive case: outermost level wraps inner levels, which rewind
+    // themselves; this level advances between inner passes.
     ($offsets:ident, $strides:ident, $f:ident, $blens:ident, $is:ident;
      $lv:literal, $next:literal $(, $rest:literal)*) => {
-        for _ in 0..$blens[$lv] {
+        for _i in 0..$blens[$lv] {
             elem_loops!($offsets, $strides, $f, $blens, $is; $next $(, $rest)*);
-            for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
-                *o -= ($blens[$next] as isize) * s[$next];
-                *o += s[$lv];
+            if _i + 1 < $blens[$lv] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += s[$lv];
+                }
             }
+        }
+        let _back = $blens[$lv].saturating_sub(1) as isize;
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= _back * s[$lv];
         }
     };
 }
@@ -271,39 +292,50 @@ macro_rules! elem_loops {
 /// Block-level nested while loops for ranks >= 2.
 ///
 /// Each block level iterates over tiles of the corresponding dimension.
-/// At level 0 (innermost), element loops are executed. After each inner body,
-/// offsets are adjusted to reset the inner dimension and advance the current level.
+/// At level 0 (innermost), element loops are executed. Each block level
+/// advances to the next tile only when one follows and rewinds itself on
+/// completion; inner levels rewind themselves.
 macro_rules! block_loop {
     // Base case: single block level (the innermost).
-    // Runs element loops, then resets top element level and advances this block level.
     ($dims:ident, $blocks:ident, $strides:ident, $offsets:ident, $f:ident,
      $blens:ident, $is:ident; elem=[$($el:literal),+]; $lv0:literal; top=$top:literal) => {{
         let mut _j = 0usize;
+        let mut _advanced = 0usize;
         while _j < $dims[$lv0] {
             $blens[$lv0] = $blocks[$lv0].max(1).min($dims[$lv0]).min($dims[$lv0] - _j);
             elem_loops!($offsets, $strides, $f, $blens, $is; $($el),+);
-            for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
-                *o -= ($blens[$top] as isize) * s[$top];
-                *o += ($blens[$lv0] as isize) * s[$lv0];
-            }
             _j += $blens[$lv0];
+            if _j < $dims[$lv0] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += ($blens[$lv0] as isize) * s[$lv0];
+                }
+                _advanced = _j;
+            }
+        }
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= (_advanced as isize) * s[$lv0];
         }
     }};
     // Recursive case: outer block level wraps inner block levels.
-    // After the inner body, resets the next-inner dimension and advances this level.
     ($dims:ident, $blocks:ident, $strides:ident, $offsets:ident, $f:ident,
      $blens:ident, $is:ident; elem=[$($el:literal),+];
      $lv:literal, $next:literal $(, $rest:literal)*; top=$top:literal) => {{
         let mut _j = 0usize;
+        let mut _advanced = 0usize;
         while _j < $dims[$lv] {
             $blens[$lv] = $blocks[$lv].max(1).min($dims[$lv]).min($dims[$lv] - _j);
             block_loop!($dims, $blocks, $strides, $offsets, $f, $blens, $is;
                 elem=[$($el),+]; $next $(, $rest)*; top=$top);
-            for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
-                *o -= ($dims[$next] as isize) * s[$next];
-                *o += ($blens[$lv] as isize) * s[$lv];
-            }
             _j += $blens[$lv];
+            if _j < $dims[$lv] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += ($blens[$lv] as isize) * s[$lv];
+                }
+                _advanced = _j;
+            }
+        }
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= (_advanced as isize) * s[$lv];
         }
     }};
 }
@@ -313,6 +345,7 @@ macro_rules! block_loop {
 /// For rank 1 there are no element loops; only a single block loop on dim 0.
 /// For rank >= 2, block loops nest from outermost to innermost (dim 0), and
 /// element loops nest from dim N-1 down to dim 1 inside the innermost block.
+/// The offsets are back at their starting values on return.
 macro_rules! make_kernel {
     // Rank 1: single block loop, no element nesting.
     ($name:ident, rank=1) => {
@@ -332,16 +365,20 @@ macro_rules! make_kernel {
             let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
 
             let mut j0 = 0usize;
+            let mut advanced = 0usize;
             while j0 < d0 {
                 let blen0 = b0.min(d0 - j0);
                 f(offsets, blen0, &inner_strides)?;
-                for (o, s) in offsets.iter_mut().zip(strides.iter()) {
-                    *o += (blen0 as isize) * s[0];
-                }
                 j0 += blen0;
+                if j0 < d0 {
+                    for (o, s) in offsets.iter_mut().zip(strides.iter()) {
+                        *o += (blen0 as isize) * s[0];
+                    }
+                    advanced = j0;
+                }
             }
             for (o, s) in offsets.iter_mut().zip(strides.iter()) {
-                *o -= (d0 as isize) * s[0];
+                *o -= (advanced as isize) * s[0];
             }
             Ok(())
         }
@@ -367,9 +404,6 @@ macro_rules! make_kernel {
             let mut blens = [0usize; $rank];
             block_loop!(dims, blocks, strides, offsets, f, blens, inner_strides;
                 elem=[$($el),+]; $($blk),+; top=$top);
-            for (o, s) in offsets.iter_mut().zip(strides.iter()) {
-                *o -= (dims[$top] as isize) * s[$top];
-            }
             Ok(())
         }
     };
@@ -451,35 +485,46 @@ where
     // Current position for each outer level (1..rank-1). Level 0 uses block loop.
     let mut idx = vec![0usize; rank];
 
+    // As in the rank-specialized kernels, offsets advance only when another
+    // position follows and each level rewinds from its last position, so they
+    // never leave the reachable span.
+    if dims.contains(&0) {
+        return Ok(());
+    }
     loop {
         // Level 0: callback over contiguous block fragments.
         let mut j0 = 0usize;
+        let mut advanced = 0usize;
         while j0 < d0 {
             let blen0 = b0.min(d0 - j0);
             f(offsets, blen0, &inner_strides)?;
-            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset += (blen0 as isize) * s[0];
-            }
             j0 += blen0;
+            if j0 < d0 {
+                for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                    *offset += (blen0 as isize) * s[0];
+                }
+                advanced = j0;
+            }
         }
         for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-            *offset -= (d0 as isize) * s[0];
+            *offset -= (advanced as isize) * s[0];
         }
 
         // Carry-style increment for outer levels.
         let mut level = 1usize;
         loop {
-            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset += s[level];
-            }
-            idx[level] += 1;
-            if idx[level] < dims[level] {
+            if idx[level] + 1 < dims[level] {
+                idx[level] += 1;
+                for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                    *offset += s[level];
+                }
                 break;
             }
 
+            let last = (dims[level] - 1) as isize;
             idx[level] = 0;
             for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
-                *offset -= (dims[level] as isize) * s[level];
+                *offset -= last * s[level];
             }
             level += 1;
             if level == rank {
@@ -612,11 +657,20 @@ pub(crate) fn contiguous_layout(dims: &[usize], strides: &[isize]) -> Option<Con
     Some(ContiguousLayout::ColMajor)
 }
 
-pub(crate) fn total_len(dims: &[usize]) -> usize {
-    if dims.is_empty() {
-        return 1;
+/// Checked element count of `dims`.
+///
+/// A shape containing a zero extent has zero elements even when the product
+/// of its other extents would overflow; such views pass
+/// `strided_view::validate_bounds`, so this must not form that product. A
+/// nonempty shape whose element count exceeds `usize::MAX` (for example a
+/// huge stride-0 broadcast) returns [`StridedError::OffsetOverflow`].
+pub(crate) fn total_len(dims: &[usize]) -> Result<usize> {
+    if dims.contains(&0) {
+        return Ok(0);
     }
-    dims.iter().product()
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)
 }
 
 /// Whether the sequential contiguous fast path should be used.
@@ -660,15 +714,18 @@ pub(crate) fn same_contiguous_layout(
 
 /// Returns the common contiguous layout only when the sequential fast path
 /// should be used (total elements <= threading threshold).
+///
+/// Returns [`StridedError::OffsetOverflow`] when the element count of `dims`
+/// does not fit in `usize`.
 #[inline]
 pub(crate) fn sequential_contiguous_layout(
     dims: &[usize],
     strides_list: &[&[isize]],
-) -> Option<ContiguousLayout> {
-    if !use_sequential_fast_path(total_len(dims)) {
-        return None;
+) -> Result<Option<ContiguousLayout>> {
+    if !use_sequential_fast_path(total_len(dims)?) {
+        return Ok(None);
     }
-    same_contiguous_layout(dims, strides_list)
+    Ok(same_contiguous_layout(dims, strides_list))
 }
 
 #[cfg(test)]

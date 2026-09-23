@@ -257,7 +257,7 @@ fn contiguous_range_mul_single_thread_computes_large_broadcast_mul() {
     let lhs = [1isize, 3, 9, 27, 81, 0, 0, 0, 0, 0];
     let rhs = [0isize, 0, 0, 0, 0, 1, 3, 9, 27, 81];
     let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
-    let total = total_len(&dims);
+    let total = total_len(&dims).unwrap();
     let block_len = plan.inner_len.max(1).saturating_mul(plan.row_len.max(1));
     let outer_groups = total.div_ceil(block_len);
 

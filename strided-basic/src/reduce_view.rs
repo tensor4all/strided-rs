@@ -63,12 +63,12 @@ where
     let src_strides = src.strides();
 
     let contiguous = if allow_ambient_parallel {
-        sequential_contiguous_layout(src_dims, &[src_strides])
+        sequential_contiguous_layout(src_dims, &[src_strides])?
     } else {
         same_contiguous_layout(src_dims, &[src_strides])
     };
     if contiguous.is_some() {
-        let len = total_len(src_dims);
+        let len = total_len(src_dims)?;
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
         return Ok(simd::dispatch_if_large(len, || {
             let mut acc = init;
@@ -84,7 +84,7 @@ where
     // which uses scalar pointer-offset loops.
     #[cfg(feature = "parallel")]
     {
-        let total = total_len(src_dims);
+        let total = total_len(src_dims)?;
         let nthreads = if allow_ambient_parallel {
             crate::execution_policy::rayon_threads()
         } else {
@@ -120,7 +120,7 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        let total: usize = fused_dims.iter().product();
+        let total = total_len(&fused_dims)?;
         let nthreads = if allow_ambient_parallel {
             crate::execution_policy::rayon_threads()
         } else {
@@ -245,6 +245,9 @@ where
     let src_dims = src.dims();
     let src_strides = src.strides();
     let src_ptr = src.ptr();
+    // Reject an element count beyond usize (a huge stride-0 broadcast) up
+    // front instead of allocating and looping over it.
+    total_len(src_dims)?;
 
     let out_dims: Vec<usize> = src_dims
         .iter()
@@ -270,7 +273,7 @@ where
         return StridedArray::from_parts(vec![acc], &[1], &strides, 0);
     }
 
-    let total_out: usize = out_dims.iter().product();
+    let total_out = total_len(&out_dims)?;
     let out_strides = col_major_strides(&out_dims);
     let mut out =
         StridedArray::from_parts(vec![init.clone(); total_out], &out_dims, &out_strides, 0)?;

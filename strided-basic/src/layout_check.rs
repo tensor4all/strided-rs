@@ -240,9 +240,9 @@ fn validate_injective_layout_inputs(dims: &[usize], strides: &[isize]) -> Option
         return None;
     }
 
-    let total = dims
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+    // A zero-sized layout is trivially injective even when the product of
+    // its other extents would overflow.
+    let total = crate::kernel::total_len(dims).ok()?;
     if total <= 1 {
         return Some(total);
     }
