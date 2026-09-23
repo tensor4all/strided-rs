@@ -3,6 +3,12 @@ use core::ops::Add;
 use num_complex::{Complex32, Complex64};
 use strided_basic::execution::check_static_indexing_dtype;
 use strided_basic::execution::{check_dtype, validate_uninit_no_overlap};
+
+mod uninit;
+pub use uninit::{
+    erased_broadcast_mul_into_uninit, erased_clamp_into_uninit, erased_compare_into_uninit,
+    erased_map_into_uninit, erased_select_into_uninit, erased_zip_into_uninit,
+};
 /// Runtime unary operation for [`erased_map_into`].
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1599,11 +1605,15 @@ macro_rules! impl_complex_one_shot_scalar {
                     ErasedMapOp::Conj => value.conj(),
                     ErasedMapOp::Abs => Self::new(value.norm(), 0.0),
                     ErasedMapOp::Sign => {
-                        let norm = value.norm();
-                        if norm == 0.0 {
+                        if value.re == 0.0 && value.im == 0.0 {
                             Self::new(0.0, 0.0)
                         } else {
-                            value / Self::new(norm, 0.0)
+                            // Divide the components by the real modulus: complex
+                            // division squares the divisor's components, which
+                            // underflows for tiny magnitudes such as 1e-200 in
+                            // f64 and yields NaN instead of the unit phase.
+                            let norm = value.norm();
+                            Self::new(value.re / norm, value.im / norm)
                         }
                     }
                 }
@@ -1695,69 +1705,69 @@ fn raw_any<T: Copy>(
         return Ok(false);
     }
 
-    if src.dims().len() <= RAW_FUSED_RANK_LIMIT {
-        let dims = src.dims();
-        let strides = src.strides();
+    let rank = src.dims().len();
+    if rank <= RAW_FUSED_RANK_LIMIT {
         let mut coordinates = [0usize; RAW_FUSED_RANK_LIMIT];
         let mut resets = [0isize; RAW_FUSED_RANK_LIMIT];
-        for axis in 0..dims.len() {
-            let last = isize::try_from(dims[axis] - 1).map_err(|_| StridedError::OffsetOverflow)?;
-            resets[axis] = strides[axis]
-                .checked_mul(last)
-                .and_then(isize::checked_neg)
-                .ok_or(StridedError::OffsetOverflow)?;
-        }
+        raw_any_odometer(
+            src,
+            predicate,
+            &mut coordinates[..rank],
+            &mut resets[..rank],
+        )
+    } else {
+        // Ranks above the fused limit keep the same incremental-offset
+        // odometer; only the cursor storage moves to the heap.
+        let mut coordinates = vec![0usize; rank];
+        let mut resets = vec![0isize; rank];
+        raw_any_odometer(src, predicate, &mut coordinates, &mut resets)
+    }
+}
 
-        let mut offset = src.offset();
-        loop {
-            // SAFETY: RawStridedRef construction validated every reachable offset.
-            if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
-                return Ok(true);
-            }
-
-            let mut axis = 0;
-            while axis < dims.len() && coordinates[axis] == dims[axis] - 1 {
-                axis += 1;
-            }
-            if axis == dims.len() {
-                break;
-            }
-            for reset_axis in 0..axis {
-                coordinates[reset_axis] = 0;
-                offset = offset
-                    .checked_add(resets[reset_axis])
-                    .ok_or(StridedError::OffsetOverflow)?;
-            }
-            coordinates[axis] = coordinates[axis]
-                .checked_add(1)
-                .ok_or(StridedError::OffsetOverflow)?;
-            offset = offset
-                .checked_add(strides[axis])
-                .ok_or(StridedError::OffsetOverflow)?;
-        }
-        return Ok(false);
+fn raw_any_odometer<T: Copy>(
+    src: &RawStridedRef<'_, T>,
+    predicate: impl Fn(T) -> bool + Copy,
+    coordinates: &mut [usize],
+    resets: &mut [isize],
+) -> Result<bool> {
+    let dims = src.dims();
+    let strides = src.strides();
+    // INVARIANT: the caller rejected empty extents, so every `dim - 1` is valid.
+    for axis in 0..dims.len() {
+        let last = isize::try_from(dims[axis] - 1).map_err(|_| StridedError::OffsetOverflow)?;
+        resets[axis] = strides[axis]
+            .checked_mul(last)
+            .and_then(isize::checked_neg)
+            .ok_or(StridedError::OffsetOverflow)?;
     }
 
-    for linear in 0..total {
-        let mut remainder = linear;
-        let mut offset = src.offset();
-        for (&dim, &stride) in src.dims().iter().zip(src.strides()) {
-            let index = remainder % dim;
-            remainder /= dim;
-            offset = offset
-                .checked_add(
-                    stride
-                        .checked_mul(index as isize)
-                        .ok_or(StridedError::OffsetOverflow)?,
-                )
-                .ok_or(StridedError::OffsetOverflow)?;
-        }
+    let mut offset = src.offset();
+    loop {
         // SAFETY: RawStridedRef construction validated every reachable offset.
         if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
             return Ok(true);
         }
+
+        let mut axis = 0;
+        while axis < dims.len() && coordinates[axis] == dims[axis] - 1 {
+            axis += 1;
+        }
+        if axis == dims.len() {
+            return Ok(false);
+        }
+        for reset_axis in 0..axis {
+            coordinates[reset_axis] = 0;
+            offset = offset
+                .checked_add(resets[reset_axis])
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+        coordinates[axis] = coordinates[axis]
+            .checked_add(1)
+            .ok_or(StridedError::OffsetOverflow)?;
+        offset = offset
+            .checked_add(strides[axis])
+            .ok_or(StridedError::OffsetOverflow)?;
     }
-    Ok(false)
 }
 
 fn check_index_dtype(dtype: KernelDType) -> Result<()> {
