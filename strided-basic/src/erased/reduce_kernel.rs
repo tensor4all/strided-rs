@@ -27,10 +27,23 @@ pub(super) const AXIS_RUN_KERNEL_MIN_LEN: usize = 2 * REDUCE_LANES;
 /// output block kernel.
 pub(super) const AXIS_OUTPUT_BLOCK_MIN_LEN: usize = 16;
 
-/// Maximum number of adjacent outputs the output block kernel accumulates at
-/// once. The accumulator block stays in L1 (8 KiB for `Complex64`) while
-/// each reduced step streams one contiguous source run of the same length.
-pub(super) const AXIS_OUTPUT_BLOCK: usize = 512;
+/// Byte budget of the output block kernel's accumulator block.
+///
+/// Each reduced step streams one contiguous source run as long as the block,
+/// so a longer block gives the hardware prefetcher longer runs between the
+/// jumps of the reduced stride; 64 KiB still stays in L1 or L2 on current
+/// cores.
+pub(super) const AXIS_OUTPUT_BLOCK_BYTES: usize = 64 * 1024;
+
+/// Number of reduced steps the output block kernel folds per pass over the
+/// accumulator block, which divides accumulator load and store traffic by
+/// this factor without changing the per output order.
+pub(super) const AXIS_OUTPUT_BLOCK_STEPS: usize = 4;
+
+/// Number of adjacent outputs one accumulator block holds for `T`.
+fn axis_output_block_len<T>() -> usize {
+    (AXIS_OUTPUT_BLOCK_BYTES / core::mem::size_of::<T>().max(1)).max(AXIS_OUTPUT_BLOCK_MIN_LEN)
+}
 
 /// One reduction operation, fixed at compile time.
 pub(super) trait ReduceKernel<T: ErasedReduceScalar>: 'static {
@@ -141,9 +154,15 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for MinKernel {
     }
 }
 
+/// Number of accumulators of [`lanes_contiguous`].
+///
+/// Sixteen lanes give eight independent 128-bit chains for `f64`, enough to
+/// hide the compare and select latency of max and min on NEON and AVX2.
+pub(super) const CONTIGUOUS_REDUCE_LANES: usize = 16;
+
 /// Multi-accumulator kernel over a contiguous run.
 ///
-/// Lane `i` folds elements `i, i + 8, ...` in order, the remainder is folded
+/// Lane `i` folds elements `i, i + 16, ...` in order, the remainder is folded
 /// into the first lanes, and the lanes are folded left to right.
 #[inline(always)]
 fn lanes_contiguous<T, K>(values: &[T]) -> T
@@ -152,8 +171,8 @@ where
     K: ReduceKernel<T> + ?Sized,
 {
     crate::simd::dispatch_if_large(values.len(), || {
-        let mut lanes = [K::identity(); REDUCE_LANES];
-        let mut chunks = values.chunks_exact(REDUCE_LANES);
+        let mut lanes = [K::identity(); CONTIGUOUS_REDUCE_LANES];
+        let mut chunks = values.chunks_exact(CONTIGUOUS_REDUCE_LANES);
         for chunk in chunks.by_ref() {
             for (lane, &value) in lanes.iter_mut().zip(chunk) {
                 *lane = K::combine(*lane, K::map(value));
@@ -450,27 +469,54 @@ where
         AxesStrategy::OutputBlocks => {
             let block_axis = parts.outer_axes[0];
             let mut inner = ReduceInnerCursor::new(0, parts.inner_axes);
-            let mut acc = [K::identity(); AXIS_OUTPUT_BLOCK];
+            let block = axis_output_block_len::<T>().min(range.len());
+            let mut acc = vec![K::identity(); block];
             let mut output = range.start;
             while output < range.end {
                 // A block stays inside one run of the leading kept axis and
                 // inside the worker range.
                 let block_room = block_axis.extent - outer.leading_coord();
-                let len = block_room.min(range.end - output).min(AXIS_OUTPUT_BLOCK);
+                let len = block_room.min(range.end - output).min(block);
                 let acc = &mut acc[..len];
                 acc.fill(K::identity());
                 inner.reset(outer.source_offset);
-                for value_index in 0..reduce_total {
+                let mut offsets = [0isize; AXIS_OUTPUT_BLOCK_STEPS];
+                let mut value_index = 0;
+                // Fold several reduced steps per pass; each slot still
+                // combines its values in reduced order.
+                while value_index + AXIS_OUTPUT_BLOCK_STEPS <= reduce_total {
+                    for offset in &mut offsets {
+                        *offset = inner.source_offset;
+                        value_index += 1;
+                        if value_index < reduce_total {
+                            inner.advance();
+                        }
+                    }
                     // SAFETY: the `len` adjacent outputs of this block read
                     // `len` reachable unit-stride source elements along the
                     // leading kept axis at every reduced position.
+                    let [v0, v1, v2, v3] = offsets.map(|offset| unsafe {
+                        core::slice::from_raw_parts(source.offset(offset), len)
+                    });
+                    for (index, slot) in acc.iter_mut().enumerate() {
+                        let mut value = *slot;
+                        value = K::combine(value, K::map(v0[index]));
+                        value = K::combine(value, K::map(v1[index]));
+                        value = K::combine(value, K::map(v2[index]));
+                        value = K::combine(value, K::map(v3[index]));
+                        *slot = value;
+                    }
+                }
+                while value_index < reduce_total {
+                    // SAFETY: as above, for one reduced position.
                     let values = unsafe {
                         core::slice::from_raw_parts(source.offset(inner.source_offset), len)
                     };
                     for (slot, &value) in acc.iter_mut().zip(values) {
                         *slot = K::combine(*slot, K::map(value));
                     }
-                    if value_index + 1 < reduce_total {
+                    value_index += 1;
+                    if value_index < reduce_total {
                         inner.advance();
                     }
                 }

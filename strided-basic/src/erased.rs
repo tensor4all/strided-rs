@@ -263,14 +263,18 @@ pub enum ReduceOp {
 /// (wrapping) and [`ReduceOp::Max`] / [`ReduceOp::Min`] do not depend on
 /// order, so the rules below only affect the rounding of floating point and
 /// complex [`ReduceOp::Sum`], [`ReduceOp::Product`] and
-/// [`ReduceOp::SumSquares`].
+/// [`ReduceOp::SumSquares`]. Two details of float max and min follow the
+/// visit order: a NaN input makes the result NaN, but which NaN (payload and
+/// sign) is returned is unspecified, and when the extremum is a zero its sign
+/// is unspecified if both `+0.0` and `-0.0` occur.
 ///
 /// * Full reductions (from [`Self::compile`], or [`Self::compile_axes`]
 ///   with every axis reduced) visit the source in a layout derived order:
 ///   extent one axes are dropped, the rest are ordered by increasing
 ///   absolute stride and contiguous axes are fused into runs. Each run is
-///   reduced by the SIMD kernel (unit stride, `simd` feature) or an eight
-///   lane kernel, and runs are combined left to right. A dense column major
+///   reduced by the SIMD kernel (unit stride, `simd` feature), a sixteen
+///   lane kernel (other unit stride runs) or an eight lane kernel (strided
+///   runs), and runs are combined left to right. A dense column major
 ///   source therefore reduces exactly like one contiguous slice.
 /// * With a parallel context and more than `MINTHREADLENGTH` elements, a
 ///   full reduction splits the traversal into one deterministic range per
@@ -1193,11 +1197,14 @@ macro_rules! impl_float_erased_reduce_scalar {
                     // Select form: both sides are evaluated and the NaN test
                     // picks the result, so lane loops lower to compare and
                     // blend instead of a data dependent branch.
-                    let picked = lhs.max(rhs);
-                    if lhs.is_nan() | rhs.is_nan() {
-                        <$ty>::NAN
+                    // A NaN `lhs` is kept by the second test and a NaN
+                    // `rhs` fails the comparison, so NaN propagates from
+                    // either side. Equal values (including +0.0 and -0.0)
+                    // return `rhs`.
+                    if (lhs > rhs) | lhs.is_nan() {
+                        lhs
                     } else {
-                        picked
+                        rhs
                     }
                 }
 
@@ -1206,11 +1213,14 @@ macro_rules! impl_float_erased_reduce_scalar {
                     // Select form: both sides are evaluated and the NaN test
                     // picks the result, so lane loops lower to compare and
                     // blend instead of a data dependent branch.
-                    let picked = lhs.min(rhs);
-                    if lhs.is_nan() | rhs.is_nan() {
-                        <$ty>::NAN
+                    // A NaN `lhs` is kept by the second test and a NaN
+                    // `rhs` fails the comparison, so NaN propagates from
+                    // either side. Equal values (including +0.0 and -0.0)
+                    // return `rhs`.
+                    if (lhs < rhs) | lhs.is_nan() {
+                        lhs
                     } else {
-                        picked
+                        rhs
                     }
                 }
             }
