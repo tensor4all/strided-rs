@@ -3,9 +3,12 @@
 //!
 //! This lives in its own integration-test binary because it installs a
 //! counting global allocator; keeping it isolated avoids counting noise from
-//! unrelated tests.
+//! unrelated tests. Serial windows count only the calling thread, because the
+//! test harness and runtime threads can allocate at any time and a process
+//! wide count made the typed baseline window flaky on Linux CI.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,6 +27,16 @@ struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation() {
+    ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+    // `try_with` fails only during thread teardown, when nothing is counted.
+    let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+}
+
 fn as_bytes<T>(data: &[T]) -> &[u8] {
     unsafe {
         core::slice::from_raw_parts(
@@ -35,7 +48,7 @@ fn as_bytes<T>(data: &[T]) -> &[u8] {
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        record_allocation();
         System.alloc(layout)
     }
 
@@ -44,7 +57,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        record_allocation();
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -52,7 +65,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
+/// Allocations made by the calling thread while `run` executes.
 fn count_allocations(run: impl FnOnce()) -> usize {
+    let before = THREAD_ALLOCATIONS.with(Cell::get);
+    run();
+    THREAD_ALLOCATIONS.with(Cell::get) - before
+}
+
+/// Allocations made by every thread while `run` executes, so a parallel
+/// context's worker allocations are counted too.
+fn count_allocations_all_threads(run: impl FnOnce()) -> usize {
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     run();
     ALLOCATIONS.load(Ordering::SeqCst) - before
@@ -75,7 +97,7 @@ fn assert_fused_uninit_allocation_parity(ctx: &ExecContext, fused_plan: FusedPla
     let mut initialized_dest =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
     plan.execute(ctx, &mut initialized_dest, &inputs).unwrap();
-    let initialized_allocations = count_allocations(|| {
+    let initialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
             plan.execute(ctx, &mut initialized_dest, &inputs).unwrap();
         }
@@ -86,7 +108,7 @@ fn assert_fused_uninit_allocation_parity(ctx: &ExecContext, fused_plan: FusedPla
             .unwrap();
     plan.execute_uninit(ctx, &mut uninitialized_dest, &input_ptrs)
         .unwrap();
-    let uninitialized_allocations = count_allocations(|| {
+    let uninitialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
             plan.execute_uninit(ctx, &mut uninitialized_dest, &input_ptrs)
                 .unwrap();
@@ -972,7 +994,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut initialized_dest =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
     plan.execute(&ctx, &mut initialized_dest, &inputs).unwrap();
-    let initialized_allocations = count_allocations(|| {
+    let initialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
             plan.execute(&ctx, &mut initialized_dest, &inputs).unwrap();
         }
@@ -984,7 +1006,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
             .unwrap();
     plan.execute_uninit(&ctx, &mut uninitialized_dest, &input_ptrs)
         .unwrap();
-    let uninitialized_allocations = count_allocations(|| {
+    let uninitialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
             plan.execute_uninit(&ctx, &mut uninitialized_dest, &input_ptrs)
                 .unwrap();
