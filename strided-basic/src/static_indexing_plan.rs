@@ -1108,6 +1108,21 @@ impl ConcatenatePlan {
         self.input_dims.len()
     }
 
+    /// Whether the whole-plan entry would replay in parallel under the
+    /// active execution policy. Erased callers use it to keep the
+    /// allocation-free per-segment loop for serial execution.
+    pub(crate) fn prefers_whole_plan(&self) -> bool {
+        #[cfg(feature = "parallel")]
+        {
+            let total = self.segment_starts[self.segment_starts.len() - 1];
+            crate::threading::parallel_threads_for_len(total) > 1
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn segment_offset(&self, position: usize, dest_offset: isize) -> Result<isize> {
         dest_offset
             .checked_add(self.dest_offset_deltas[position])

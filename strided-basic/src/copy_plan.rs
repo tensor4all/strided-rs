@@ -411,14 +411,53 @@ fn replay_fused<D, S, Apply, Op>(
     Apply: Fn(&mut D, S) + MaybeSendSync,
     Op: Fn(S) -> S + MaybeSendSync,
 {
-    let total = fused_total(layout);
-    if total == 0 {
-        return;
-    }
     let src_ptr = src.data().as_ptr();
     let src_base = src.offset();
     let dst_base = dest.offset();
     let dst_ptr = dest.data_mut().as_mut_ptr();
+    // SAFETY: `check_call` proved both views carry exactly the compiled
+    // layout, and `RawStridedRef`/`RawStridedMut` guarantee every offset
+    // reachable through that layout lies inside their data. `layout` is the
+    // fusion of that layout, so every logical index in `0..total` is an
+    // in-bounds slot of both. The compiled destination layout is injective
+    // and the exclusive destination borrow cannot overlap the shared source
+    // borrow.
+    unsafe { replay_fused_raw(dst_ptr, dst_base, src_ptr, src_base, layout, apply, op) }
+}
+
+/// Pointer-level fused replay shared by [`CopyPlan`] and the dynamic slice
+/// plans, which replay a fused window layout at a runtime base offset.
+///
+/// Splits `0..total` across workers when the repository threshold and the
+/// active execution policy allow more than one thread, otherwise runs the
+/// serial kernel directly.
+///
+/// # Safety
+///
+/// Every logical index of `layout`, mapped through its destination strides
+/// from `dst_base` and its source strides from `src_base`, must be an
+/// in-bounds slot of the destination and source allocations. The
+/// destination strides must be injective over `layout`, the destination
+/// must not overlap the source, and nothing else may access the destination
+/// slots during the call.
+pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    layout: &FusedPairLayout,
+    apply: Apply,
+    op: Op,
+) where
+    D: Copy + MaybeSendSync,
+    S: Copy + MaybeSendSync,
+    Apply: Fn(&mut D, S) + MaybeSendSync,
+    Op: Fn(S) -> S + MaybeSendSync,
+{
+    let total = fused_total(layout);
+    if total == 0 {
+        return;
+    }
     #[cfg(feature = "parallel")]
     {
         let nthreads = crate::threading::parallel_threads_for_len(total);
@@ -426,10 +465,10 @@ fn replay_fused<D, S, Apply, Op>(
             let dst_ptr = crate::threading::SendPtr(dst_ptr);
             let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
             crate::threading::parallel_for_each(0..total, nthreads, &|range| {
-                // SAFETY: as for the serial call below; in addition the
-                // worker ranges are disjoint and the compiled destination
-                // layout is injective, so no two workers write the same slot,
-                // and the source is only read.
+                // SAFETY: the caller contract makes every index in bounds;
+                // the worker ranges are disjoint and the destination strides
+                // injective, so no two workers write the same slot, and the
+                // source is only read.
                 unsafe {
                     apply_fused_range(
                         dst_ptr.as_ptr(),
@@ -447,12 +486,7 @@ fn replay_fused<D, S, Apply, Op>(
             return;
         }
     }
-    // SAFETY: `check_call` proved both views carry exactly the compiled
-    // layout, and `RawStridedRef`/`RawStridedMut` guarantee every offset
-    // reachable through that layout lies inside their data. `layout` is the
-    // fusion of that layout, so every logical index in `0..total` is an
-    // in-bounds slot of both. The exclusive destination borrow cannot overlap
-    // the shared source borrow.
+    // SAFETY: forwarded caller contract over the full range `0..total`.
     unsafe {
         apply_fused_range(
             dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply, &op,
