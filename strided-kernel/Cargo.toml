@@ -64,6 +64,10 @@ harness = false
 required-features = ["parallel"]
 
 [[bench]]
+name = "erased_uninit_elementwise"
+harness = false
+
+[[bench]]
 name = "issue_184_uninit_replay"
 harness = false
 required-features = ["parallel"]

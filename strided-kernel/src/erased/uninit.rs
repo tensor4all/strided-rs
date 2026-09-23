@@ -524,7 +524,22 @@ fn uninit_map<T: OneShotScalar>(
             dtype: T::one_shot_dtype_label(),
         });
     }
-    uninit_map_with::<T, T>(dest, input, |value| T::map(op, value))
+    // Select the operation once, outside the element loop, so each replay
+    // closure is monomorphic and the inner loop can vectorize.
+    match op {
+        ErasedMapOp::Negate => {
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Negate, value))
+        }
+        ErasedMapOp::Conj => {
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Conj, value))
+        }
+        ErasedMapOp::Abs => {
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Abs, value))
+        }
+        ErasedMapOp::Sign => {
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Sign, value))
+        }
+    }
 }
 
 fn uninit_map_with<D, A>(
@@ -577,16 +592,31 @@ fn uninit_zip<T: OneShotScalar>(
         return Err(StridedError::IntegerDivisionByZero { op: op.label() });
     }
     let mut dest = uninit_raw_mut::<T>(dest)?;
-    // SAFETY: matching shapes and this destination layout were validated above,
-    // and the caller rejected input/output overlap.
-    unsafe {
-        zip_map2_raw_into_validated::<MaybeUninit<T>, T, T, Identity, Identity>(
-            &mut dest,
-            &lhs,
-            &rhs,
-            |lhs, rhs| MaybeUninit::new(T::zip(op, lhs, rhs)),
-            validated,
-        )
+    // Select the operation once, outside the element loop, so each replay
+    // closure is monomorphic and the inner loop can vectorize.
+    macro_rules! replay {
+        ($op:ident) => {
+            // SAFETY: matching shapes and this destination layout were
+            // validated above, and the caller rejected input/output overlap.
+            unsafe {
+                zip_map2_raw_into_validated::<MaybeUninit<T>, T, T, Identity, Identity>(
+                    &mut dest,
+                    &lhs,
+                    &rhs,
+                    |lhs, rhs| MaybeUninit::new(T::zip(ErasedZipOp::$op, lhs, rhs)),
+                    validated,
+                )
+            }
+        };
+    }
+    match op {
+        ErasedZipOp::Add => replay!(Add),
+        ErasedZipOp::Subtract => replay!(Subtract),
+        ErasedZipOp::Multiply => replay!(Multiply),
+        ErasedZipOp::Divide => replay!(Divide),
+        ErasedZipOp::Remainder => replay!(Remainder),
+        ErasedZipOp::Maximum => replay!(Maximum),
+        ErasedZipOp::Minimum => replay!(Minimum),
     }
 }
 
