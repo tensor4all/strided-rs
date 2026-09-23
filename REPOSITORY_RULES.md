@@ -63,6 +63,17 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 - After validation, hot loops should not repeat avoidable per-element range
   checks. Prefer direct slice iteration, pre-loop assertions, or localized
   unchecked access only when the invariant is clear and tested.
+- Dtype-erased and op-erased entries (`erased_*`, `Erased*Plan`) must resolve
+  the runtime operation, dtype, and conjugation flags once per call, or once
+  per worker range, and then run a loop monomorphized for that operation. Do
+  not pass a closure that matches on a runtime op value (for example
+  `|a, b| T::zip(op, a, b)`) into a loop whose trip count scales with tensor
+  elements: the per-element op reload and branch prevents vectorization. This
+  applies to serial fast paths and to parallel leaves alike
+  ([#269](https://github.com/tensor4all/strided-rs/issues/269)).
+- An erased entry must stay within 1.25x of the typed entry for the same
+  operation, dtype, layout, and thread count. A larger gap is a defect, not an
+  accepted cost of type erasure.
 
 ## Materialization And Copies
 
@@ -105,6 +116,18 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 - If a tensor-sized CPU operation remains a dedicated sequential loop because no
   strided/backend-native parallel primitive fits the indexing pattern yet, add
   a nearby comment naming that rationale.
+- The parallel branch must run the same inner kernel quality as the serial
+  branch: lane or SIMD leaves, multiple accumulators for reductions, and
+  per-op monomorphized loops. A tuned kernel that is reachable only under a
+  serial execution context, while the parallel branch falls back to a generic
+  single-accumulator or runtime-dispatch loop, is a defect. For tensor-sized
+  benchmark cases, four threads must not be slower than one thread.
+- Early-return fast paths (contiguous `copy_nonoverlapping`, contiguous run
+  copies, single-segment plans) must not bypass the parallel branch for
+  tensor-sized inputs. Every prepared plan whose work scales with tensor
+  elements (copy, slice, reverse, concatenate, pad, dynamic slice, gather,
+  reductions) either has a parallel branch under the repository threshold or
+  carries the sequential-rationale comment required above.
 - Provider-owned threading such as BLAS/OpenMP must be controlled by the
   provider's thread variables. Do not mix independent thread policies inside a
   single benchmark run without documenting it.
@@ -135,6 +158,21 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
   performance-sensitive change.
 - Naive baselines must be credible. For contiguous hot loops, prefer raw
   pointer baselines over high-level indexing baselines.
+- Every public erased operation family (elementwise unary and binary ops,
+  reductions including max and min over all axes and single axes, structural
+  copy plans) must have rows in the benchmark suite's kernel scaling page at one
+  and four threads, paired against the typed entry, a raw pointer baseline,
+  and Julia. Adding an operation family, or routing an existing one through a
+  new entry point, adds its rows in the same change or links a benchmark suite
+  PR. Defects in #269 surfaced only downstream in tenferro because the suite
+  measured typed entries at one thread only.
+- Benchmark harnesses must enforce and verify the thread count they report: use
+  a bounded pool or an explicit execution context and assert the effective
+  count at startup. A thread flag or environment variable that is requested but
+  not verified does not count as pinning.
+- A claim that a contiguous hot loop is vectorized or dispatch-free should be
+  backed by codegen evidence (disassembly of the hot loop) in the PR, not only
+  by a single timing.
 - Keep setup and allocation out of timed regions unless the benchmark name and
   documentation explicitly say setup cost is included.
 
