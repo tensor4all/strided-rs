@@ -499,6 +499,7 @@ fn clamp_uninit_propagates_nan_and_prefers_hi_when_bounds_cross() {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn naive_broadcast_mul<T: Copy>(
     out_dims: &[usize],
     lhs: &[T],
@@ -532,6 +533,7 @@ fn naive_broadcast_mul<T: Copy>(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn broadcast_mul<T: KernelStorageElement + Copy>(
     dtype: KernelDType,
     ctx: &ExecContext,
@@ -766,11 +768,11 @@ fn lazy_outer_product_layout_filled_by_broadcast_mul_matches_logical_product() {
     // The base is written in physical order and read back through the strides.
     for i in 0..2 {
         for j in 0..3 {
-            for k in 0..4 {
+            for (k, &rhs_k) in rhs[..4].iter().enumerate() {
                 let at = i as isize * layout.output_strides[0]
                     + j as isize * layout.output_strides[1]
                     + k as isize * layout.output_strides[2];
-                assert_eq!(base[at as usize], lhs[i * 3 + j] * rhs[k]);
+                assert_eq!(base[at as usize], lhs[i * 3 + j] * rhs_k);
             }
         }
     }
@@ -898,7 +900,6 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
-    drop(dest);
     assert!(init(output).iter().all(|&v| v == 99.0));
 }
 
