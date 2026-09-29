@@ -2,15 +2,10 @@
 members = [
     "strided-basic",
     "strided-fused",
-    "strided-rs",
     "strided-traits",
     "strided-view",
     "strided-perm",
     "strided-kernel",
-    "strided-einsum2",
-    "strided-opteinsum",
-    "mdarray-opteinsum",
-    "ndarray-opteinsum",
 ]
 resolver = "2"
 
@@ -24,27 +19,15 @@ repository = "https://github.com/tensor4all/strided-rs"
 [workspace.dependencies]
 strided-basic = { version = "0.4.4", path = "strided-basic", default-features = false }
 strided-fused = { version = "0.4.4", path = "strided-fused", default-features = false }
-strided-rs = { version = "0.4.4", path = "strided-rs" }
 strided-traits = { version = "0.4.4", path = "strided-traits" }
 strided-view = { version = "0.4.4", path = "strided-view" }
 strided-perm = { version = "0.4.4", path = "strided-perm" }
 strided-kernel = { version = "0.4.4", path = "strided-kernel" }
-strided-einsum2 = { version = "0.4.4", path = "strided-einsum2", default-features = false }
-strided-opteinsum = { version = "0.4.4", path = "strided-opteinsum", default-features = false }
-mdarray-opteinsum = { version = "0.4.4", path = "mdarray-opteinsum", default-features = false }
-ndarray-opteinsum = { version = "0.4.4", path = "ndarray-opteinsum", default-features = false }
 
 approx = "0.5"
-cblas-inject = "0.1.2"
-cblas-sys = "0.2"
 criterion = "0.5"
-faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }
-faer-traits = "0.24"
-mdarray = "0.8.0"
-ndarray = "0.17"
 num-complex = "0.4"
 num-traits = "0.2"
-omeco = "0.2"
 pulp = "0.22"
 rand = "0.8"
 rand_distr = "0.4"

@@ -8,7 +8,7 @@
 //! # Dependency graph
 //!
 //! ```text
-//! strided-view -> strided-perm -> strided-kernel -> strided-einsum2
+//! strided-view -> strided-perm -> strided-kernel
 //! ```
 
 #[cfg(test)]

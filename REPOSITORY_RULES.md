@@ -3,12 +3,6 @@
 These rules are adapted from `tenferro-rs/REPOSITORY_RULES.md` for the current
 strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 
-## Einsum Maintenance Ownership
-
-- `strided-einsum2` is the minimum binary CPU einsum implementation.
-- `strided-opteinsum` is its maintained N-ary frontend.
-- `mdarray-opteinsum` and `ndarray-opteinsum` remain maintained adapters.
-
 ## Deprecated Tree Freeze
 
 - Everything under `deprecated/` remains retired per

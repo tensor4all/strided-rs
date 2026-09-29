@@ -138,9 +138,8 @@ ALWAYS_SECTIONS = frozenset(
     }
 )
 
-# Sections a human reviewer owns; never routed to the LLM. Maintenance
-# ownership is repository context rather than a delta-reviewable restriction.
-HUMAN_ONLY_SECTIONS: frozenset[str] = frozenset({"Einsum Maintenance Ownership"})
+# Sections a human reviewer owns; never routed to the LLM.
+HUMAN_ONLY_SECTIONS: frozenset[str] = frozenset()
 
 SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     (

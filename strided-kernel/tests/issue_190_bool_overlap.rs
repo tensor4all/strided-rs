@@ -184,11 +184,6 @@ fn production_source_contract_has_no_legacy_erased_storage_apis() {
         root.join("strided-kernel/src"),
         root.join("strided-basic/src"),
         root.join("strided-fused/src"),
-        root.join("strided-einsum2/src"),
-        root.join("strided-opteinsum/src"),
-        root.join("mdarray-opteinsum/src"),
-        root.join("ndarray-opteinsum/src"),
-        root.join("strided-rs/src"),
     ];
     let forbidden = [
         "ErasedRawStridedRef::new",

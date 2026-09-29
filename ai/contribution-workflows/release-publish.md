@@ -19,15 +19,14 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Confirm all eleven package file lists contain their license and provenance files:
+Confirm all six package file lists contain their license and provenance files:
 
 ```bash
 set -euo pipefail
 
 for crate in \
   strided-traits strided-view strided-perm strided-basic \
-  strided-fused strided-kernel strided-einsum2 strided-opteinsum \
-  mdarray-opteinsum ndarray-opteinsum strided-rs
+  strided-fused strided-kernel
 do
   package_files=$(cargo package -p "$crate" --list)
   printf '%s\n' "$package_files"
@@ -85,7 +84,7 @@ git switch --detach v0.4.0
 test -z "$(git status --porcelain)"
 ```
 
-The detached tag checkout is the publication source. Do not create all eleven
+The detached tag checkout is the publication source. Do not create all six
 archives at once: Cargo cannot package a crate whose v0.4 workspace
 prerequisites are not yet available from crates.io.
 
@@ -99,14 +98,8 @@ Process one crate completely before starting the next, in this exact order:
 4. `strided-basic`
 5. `strided-fused`
 6. `strided-kernel`
-7. `strided-einsum2`
-8. `strided-opteinsum`
-9. `mdarray-opteinsum`
-10. `ndarray-opteinsum`
-11. `strided-rs`
 
-The adapters occupy the same dependency layer and may be processed in either
-order. For every crate, first query crates.io for the exact version. An absent
+For every crate, first query crates.io for the exact version. An absent
 version is packaged, inspected, dry-run, published, and awaited. An existing
 version is skipped only after its registry archive passes the same provenance
 checks. Thus every prerequisite is registry-visible before Cargo packages a
@@ -153,8 +146,7 @@ verify_archive() {
 
 for crate in \
   strided-traits strided-view strided-perm strided-basic \
-  strided-fused strided-kernel strided-einsum2 strided-opteinsum \
-  mdarray-opteinsum ndarray-opteinsum strided-rs
+  strided-fused strided-kernel
 do
   test -z "$(git status --porcelain)"
 
@@ -214,4 +206,4 @@ is safe only because every existing version is downloaded and
 provenance-verified against the tag before it is skipped. Any network failure,
 HTTP result other than 200 or 404, or archive mismatch aborts the release. Do
 not edit a manifest, repackage with different metadata, or publish a dependent
-early. After the facade is visible, leave the detached checkout unchanged.
+early. After the last crate is visible, leave the detached checkout unchanged.

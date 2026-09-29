@@ -53,11 +53,13 @@ AWS = "AKIA" + "ABCDEFGHIJKLMNOP"
 SK = "sk-" + "0123456789abcdef0123456789abcdef"
 VALUE = "abcdefghij" + "klmnopqrst"
 BEARER = "Authorization: Bearer " + VALUE
-MAINTAINED_EINSUM_CRATES = (
-    "strided-einsum2",
-    "strided-opteinsum",
-    "mdarray-opteinsum",
-    "ndarray-opteinsum",
+MAINTAINED_CRATES = (
+    "strided-traits",
+    "strided-view",
+    "strided-perm",
+    "strided-basic",
+    "strided-fused",
+    "strided-kernel",
 )
 
 
@@ -290,9 +292,9 @@ def test_select_rule_sections_routes_bench_paths() -> None:
     assert "Performance And Benchmark Discipline" in sections
 
 
-def test_select_rule_sections_does_not_freeze_maintained_einsum_crates() -> None:
+def test_select_rule_sections_does_not_freeze_maintained_crates() -> None:
     mod = load_module()
-    for crate in MAINTAINED_EINSUM_CRATES:
+    for crate in MAINTAINED_CRATES:
         sections = mod.select_rule_sections([f"{crate}/src/lib.rs"])
         assert "Deprecated Tree Freeze" not in sections, crate
     assert "Deprecated Tree Freeze" in mod.select_rule_sections(
@@ -327,12 +329,12 @@ def test_build_rules_payload_returns_requested_section_bodies() -> None:
     assert "Public Surface Discipline" not in payload
 
 
-# --- maintained einsum crates -----------------------------------------------
+# --- maintained crates ------------------------------------------------------
 
 
-def test_maintained_einsum_crates_are_not_deterministically_frozen() -> None:
+def test_maintained_crates_are_not_deterministically_frozen() -> None:
     mod = load_module()
-    for crate in MAINTAINED_EINSUM_CRATES:
+    for crate in MAINTAINED_CRATES:
         path = f"{crate}/src/lib.rs"
         diff = make_diff(path, ["fn maintained() -> usize { 1 }"])
         assert mod.deterministic_checks(
@@ -1133,13 +1135,9 @@ def test_prompt_scopes_hot_loop_and_benchmark_review() -> None:
         assert phrase in text, phrase
 
 
-def test_rules_file_documents_einsum_maintenance_ownership() -> None:
+def test_rules_file_documents_the_deprecated_tree_freeze() -> None:
     mod = load_module()
-    ownership = mod.parse_repository_rules_sections()["Einsum Maintenance Ownership"]
-    for crate in MAINTAINED_EINSUM_CRATES:
-        assert crate in ownership, crate
-    assert "minimum binary CPU einsum implementation" in ownership
-    assert "maintained N-ary frontend" in ownership
+    assert "Einsum Maintenance Ownership" not in mod.parse_repository_rules_sections()
     deprecated = mod.parse_repository_rules_sections()["Deprecated Tree Freeze"]
     assert "deprecated/" in deprecated
 

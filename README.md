@@ -1,29 +1,27 @@
 # strided-rs
 
-`strided-rs` is a Rust workspace for strided tensor views, kernels, and einsum.
+`strided-rs` is a Rust workspace for strided tensor views and kernels.
 It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 [StridedViews.jl](https://github.com/Jutho/StridedViews.jl), and
 [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl).
 
-The recommended user-facing crate is [`strided-rs`](strided-rs/README.md).
-Use individual crates such as `strided-perm`, `strided-view`, or
-`strided-kernel` directly when you need a smaller dependency surface or a
-lower-level API. All workspace crates listed below are maintained. The new basic/fused packages
+Depend on the individual crates you need, for example `strided-view` for the
+view types, `strided-perm` for permutation and `strided-kernel` for
+arithmetic. All workspace crates listed below are maintained. The new basic/fused packages
 are currently available from this workspace checkout, not yet from crates.io.
 
 ## Workspace Layout
 
-- [`strided-rs`](strided-rs/README.md): facade crate that re-exports the main workspace APIs
 - [`strided-traits`](strided-traits/): shared scalar and element-operation traits
 - [`strided-view`](strided-view/README.md): core dynamic-rank strided view/array types and metadata ops
 - [`strided-perm`](strided-perm/README.md): cache-efficient tensor permutation / transpose
 - [`strided-basic`](strided-basic/README.md): shared typed primitives and copy/concatenation/reduction execution
 - [`strided-kernel`](strided-kernel/README.md): concrete ordinary arithmetic/indexing dispatch and typed APIs
 - [`strided-fused`](strided-fused/README.md): runtime-DAG fused execution
-- [`strided-einsum2`](strided-einsum2/README.md): binary einsum (`einsum2_into`) on strided tensors
-- [`strided-opteinsum`](strided-opteinsum/README.md): N-ary einsum frontend with nested notation and contraction-order optimization
-- [`mdarray-opteinsum`](mdarray-opteinsum/): einsum wrapper for `mdarray` arrays (row-major ↔ column-major transparent conversion)
-- [`ndarray-opteinsum`](ndarray-opteinsum/): einsum wrapper for `ndarray` arrays (direct strides passthrough)
+
+The `strided-rs` facade and the einsum crates (`strided-einsum2`,
+`strided-opteinsum`, `mdarray-opteinsum`, `ndarray-opteinsum`) were removed
+from the workspace after 0.4.4; their published releases remain on crates.io.
 
 ## Features
 
@@ -36,11 +34,12 @@ are currently available from this workspace checkout, not yet from crates.io.
 
 ## Installation
 
-Add the facade crate from crates.io:
+Add the crates you use from crates.io, for example:
 
 ```toml
 [dependencies]
-strided-rs = "0.4"
+strided-view = "0.4"
+strided-kernel = "0.4"
 ```
 
 ## Documentation
@@ -61,20 +60,16 @@ CI also builds rustdoc on PRs and deploys workspace docs to GitHub Pages on `mai
 
 ## Quick Start
 
-See the [`strided-rs` Quick Start](strided-rs/README.md#quick-start). The Rust
-example there is included in crate docs and verified by doctests in CI.
+See the [`strided-basic`](strided-basic/README.md) and
+[`strided-fused`](strided-fused/README.md) READMEs; their Rust examples are
+included in crate docs and verified by doctests in CI.
 
 See each sub-crate README for usage examples:
-- [`strided-rs`](strided-rs/README.md) — recommended facade crate and executable Quick Start
 - [`strided-view`](strided-view/README.md) — types, view operations
 - [`strided-perm`](strided-perm/README.md) — permutation and transpose kernels
 - [`strided-basic`](strided-basic/README.md) — shared primitives and lightweight execution
 - [`strided-kernel`](strided-kernel/README.md) — ordinary erased dispatch and typed APIs
 - [`strided-fused`](strided-fused/README.md) — runtime-DAG fusion
-- [`strided-einsum2`](strided-einsum2/README.md) — binary einsum with GEMM backend
-- [`strided-opteinsum`](strided-opteinsum/README.md) — N-ary einsum
-- [`mdarray-opteinsum`](mdarray-opteinsum/README.md) — einsum wrapper for `mdarray` arrays
-- [`ndarray-opteinsum`](ndarray-opteinsum/README.md) — einsum wrapper for `ndarray` arrays
 
 Design notes:
 - [CPU kernel boundaries](docs/design/cpu-kernel-boundaries.md) — generic code ownership, execution contracts and concrete dispatch
@@ -97,8 +92,8 @@ This crate is inspired by and ports functionality from:
 - [StridedViews.jl](https://github.com/Jutho/StridedViews.jl) by Jutho
 - [HPTT](https://github.com/springer13/hptt) by Paul Springer, Tong Su, and
   Paolo Bientinesi, whose transpose algorithm `strided-perm` reimplements
-- [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) for
-  `strided-opteinsum` design ideas and reference test-case patterns
+- [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) for the design
+  ideas and reference test-case patterns of the former `strided-opteinsum`
 
 A per-component table of which external projects each crate builds on, and
 the algorithm-origin references, is maintained in the

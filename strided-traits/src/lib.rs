@@ -1,7 +1,7 @@
 //! Shared traits for the strided-rs ecosystem.
 //!
 //! This crate provides the core trait definitions that are shared across
-//! `strided-view`, `strided-kernel`, `strided-einsum2`, and external crates
+//! `strided-view`, `strided-kernel`, and external crates
 //! (e.g., `tropical-gemm`).
 //!
 //! External crates can depend on `strided-traits` to implement traits for
