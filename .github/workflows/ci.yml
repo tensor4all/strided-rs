@@ -43,9 +43,6 @@ jobs:
       - name: Run parallel feature tests
         run: cargo test --profile ci -p strided-basic -p strided-kernel --features parallel
 
-      - name: Run facade README doctests
-        run: cargo test --profile ci -p strided-rs --doc
-
       - name: Report Cargo artifact usage
         if: always()
         run: |

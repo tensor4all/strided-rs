@@ -19,7 +19,7 @@ exact baseline, preservation checks and remaining cross-repository work.
 
 The two concrete operation owners depend on `strided-basic`, never on each
 other. The basic package has no normal dependency on either concrete owner.
-The complete `strided-rs` facade composes ordinary and fused capabilities.
+A consumer that needs both depends on both crates.
 
 This cut is about code-generation ownership, not forbidding typed arithmetic in
 basic. Keeping generic code and its private helpers together avoids exposing

@@ -50,11 +50,13 @@ relationship; the role is stated only on the first row.
 | `strided-kernel` | Dtype-erased ordinary arithmetic/indexing adapters | strided-basic / Strided.jl lineage | Separated from the original kernel crate; inherited notices retained |
 | `strided-fused` | Runtime-DAG fused execution | strided-basic / Strided.jl lineage | Shared traversal foundation; inherited notices retained |
 | `strided-perm` | Cache-efficient tensor permutation / transpose | [HPTT](https://github.com/springer13/hptt) | Derived (BSD-3-Clause): algorithm and structure of the C++ implementation; SIMD kernels and autotuning not ported |
-| `strided-einsum2` | Binary einsum via GEMM | — | Original |
-| `strided-opteinsum` | N-ary einsum with contraction-order optimization | [OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) | Inspired (design ideas and reference test-case patterns) |
-| `mdarray-opteinsum` | Einsum adapter for `mdarray` | [mdarray](https://crates.io/crates/mdarray) | Compatible (adapter) |
-| `ndarray-opteinsum` | Einsum adapter for `ndarray` | [ndarray](https://crates.io/crates/ndarray) | Compatible (adapter) |
-| `strided-rs` | User-facing facade crate | — | Original |
+
+The `strided-rs` facade (original) and the einsum crates were removed from
+the workspace after 0.4.4; their published releases keep this provenance: `strided-einsum2` (binary einsum via
+GEMM, original), `strided-opteinsum` (N-ary einsum, inspired by
+[OMEinsum.jl](https://github.com/under-Peter/OMEinsum.jl) design ideas and
+reference test-case patterns), and the `mdarray-opteinsum` /
+`ndarray-opteinsum` adapters.
 
 ## Algorithm origins
 

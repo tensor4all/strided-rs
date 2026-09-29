@@ -3,14 +3,12 @@ You review pull-request diffs for consistency with strided-rs repository rules.
 ## Repository context
 
 strided-rs provides dynamic-rank strided views and cache-optimized CPU kernels:
-`strided-traits`, `strided-view`, `strided-kernel`, `strided-perm`, and the
-`strided-rs` facade. Dense flat-buffer APIs are column-major. The view and
+`strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
+`strided-fused`, and `strided-kernel`. Dense flat-buffer APIs are column-major. The view and
 kernel layers are ports of Julia's Strided.jl / StridedViews.jl; the
 permutation engine follows HPTT.
 
-`strided-einsum2` is the minimum binary CPU einsum implementation, and
-`strided-opteinsum` is its maintained N-ary frontend. `mdarray-opteinsum` and
-`ndarray-opteinsum` remain maintained adapters. Everything under `deprecated/`
+Everything under `deprecated/`
 remains retired. A deterministic check already reports source changes under
 `deprecated/`, so do not duplicate that finding; review those diffs only for
 the rules that still apply.

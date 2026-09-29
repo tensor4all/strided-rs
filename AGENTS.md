@@ -43,11 +43,6 @@ license-bearing attributions (`strided-perm` is
 | `strided-kernel` | Ordinary dtype-erased arithmetic/indexing and re-exported typed APIs |
 | `strided-fused` | Runtime-DAG fused execution using the shared basic implementation |
 | `strided-perm` | Cache-efficient permutation / transpose (HPTT-derived, `src/hptt/`), feature `parallel` |
-| `strided-einsum2` | Binary einsum via GEMM backends |
-| `strided-opteinsum` | N-ary einsum with contraction-order optimization |
-| `mdarray-opteinsum` | Einsum adapter for `mdarray` (row-major conversion at the boundary) |
-| `ndarray-opteinsum` | Einsum adapter for `ndarray` (direct stride passthrough) |
-| `strided-rs` | User-facing facade re-exporting the workspace APIs |
 
 Dense flat-buffer APIs are column-major; see `REPOSITORY_RULES.md` for the
 layout and copy-semantics contracts.
