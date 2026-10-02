@@ -451,6 +451,29 @@ struct ContiguousMulRangePlan {
     b_row_stride: isize,
 }
 
+impl ContiguousMulRangePlan {
+    /// Whether running the plan row by row, without cache blocking, is sound
+    /// for performance.
+    ///
+    /// The destination is walked contiguously, so a unit-stride or broadcast
+    /// (stride 0) input streams along with it. An input read at any other
+    /// stride along the fast axis (a transposed operand) is swept across the
+    /// whole fast axis once per row, touching a new cache line per element and
+    /// again on the next row; the blocked kernel tiles that access. The one
+    /// exception is the SIMD transposed-scalar tile, which blocks itself.
+    fn walks_inputs_without_blocking(&self) -> bool {
+        let streams = |stride: isize| stride == 0 || stride == 1;
+        if streams(self.a_fast_stride) && streams(self.b_fast_stride) {
+            return true;
+        }
+        #[cfg(feature = "parallel")]
+        if transposed_scalar_tile_kind(self).is_some() {
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(feature = "parallel")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransposedScalarTileKind {
@@ -800,6 +823,9 @@ fn try_contiguous_range_mul<
     let Some(plan) = contiguous_mul_range_plan(dims, dst_strides, a_strides, b_strides) else {
         return false;
     };
+    if !plan.walks_inputs_without_blocking() {
+        return false;
+    }
 
     let inner_len = plan.inner_len.max(1);
     let row_len = plan.row_len.max(1);
