@@ -314,6 +314,38 @@ pub(crate) fn mapreduce_threaded<F>(
 where
     F: Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync,
 {
+    // The recursive splitter (rayon join) is compiled once; the leaf is `dyn`,
+    // called once per leaf region.
+    mapreduce_threaded_dyn(
+        dims,
+        blocks,
+        strides_list,
+        offsets,
+        costs,
+        nthreads,
+        spacing,
+        taskindex,
+        f,
+    )
+}
+
+/// The leaf callback of a threaded region.
+#[cfg(feature = "parallel")]
+type LeafFn<'a> = &'a (dyn Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync);
+
+#[cfg(feature = "parallel")]
+#[inline(never)]
+fn mapreduce_threaded_dyn(
+    dims: &[usize],
+    blocks: &[usize],
+    strides_list: &[Vec<isize>],
+    offsets: &[isize],
+    costs: &[isize],
+    nthreads: usize,
+    spacing: isize,
+    taskindex: usize,
+    f: LeafFn<'_>,
+) -> Result<()> {
     ThreadedMapReduce {
         blocks,
         strides_list,
@@ -326,20 +358,17 @@ where
 }
 
 #[cfg(feature = "parallel")]
-struct ThreadedMapReduce<'a, F> {
+struct ThreadedMapReduce<'a> {
     blocks: &'a [usize],
     strides_list: &'a [Vec<isize>],
     costs: &'a [isize],
     spacing: isize,
     policy: crate::ExecutionPolicy,
-    operation: &'a F,
+    operation: LeafFn<'a>,
 }
 
 #[cfg(feature = "parallel")]
-impl<F> ThreadedMapReduce<'_, F>
-where
-    F: Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync,
-{
+impl ThreadedMapReduce<'_> {
     fn run(
         &self,
         dims: &[usize],

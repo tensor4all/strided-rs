@@ -34,6 +34,12 @@ use crate::fuse::compute_costs;
 #[cfg(feature = "parallel")]
 use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH};
 
+/// The per-inner-block callback: `(offsets, len, strides)`.
+#[cfg(feature = "parallel")]
+type Body<'a> = &'a (dyn Fn(&[isize], usize, &[isize]) + Sync);
+#[cfg(not(feature = "parallel"))]
+type Body<'a> = &'a dyn Fn(&[isize], usize, &[isize]);
+
 /// A raw pointer that may cross threads: dereferenced only at the validated,
 /// disjoint (for the destination) offsets the traversal generates.
 struct Raw<T>(*mut T);
@@ -67,10 +73,17 @@ fn validate_destination(dims: &[usize], strides: &[isize]) -> Result<()> {
 /// The destination layout must already be validated injective, which makes
 /// the blocks' destination regions disjoint when they run on different
 /// threads.
-fn run_update<F>(dims: &[usize], strides_list: &[&[isize]], elem_size: usize, body: F) -> Result<()>
-where
-    F: Fn(&[isize], usize, &[isize]) + MaybeSync,
-{
+///
+/// Not generic: the traversal and threading machinery is compiled once here,
+/// and each operation passes its inner loop as a `dyn` callback. The call is
+/// per inner block (a run of elements), never per element, so it costs nothing
+/// measurable while keeping the machinery out of every caller's monomorphization.
+fn run_update(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_size: usize,
+    body: Body<'_>,
+) -> Result<()> {
     let total = total_len(dims)?;
     if total == 0 {
         return Ok(());
@@ -266,7 +279,7 @@ where
         dest.dims(),
         &[dest.strides()],
         std::mem::size_of::<D>(),
-        |offsets, len, strides| {
+        &|offsets, len, strides| {
             // SAFETY: the destination is injective and in bounds; blocks are disjoint.
             unsafe {
                 inner_loop_update1::<D, OpD>(dp.get().offset(offsets[0]), strides[0], len, &f);
@@ -314,7 +327,7 @@ where
         dest.dims(),
         &[dest.strides(), a.strides()],
         std::mem::size_of::<D>().max(std::mem::size_of::<A>()),
-        |offsets, len, strides| {
+        &|offsets, len, strides| {
             // SAFETY: bounds are the views'; `a` is a distinct borrow from `dest`.
             unsafe {
                 inner_loop_update2::<D, A, OpD, OpA>(
@@ -379,7 +392,7 @@ where
         std::mem::size_of::<D>()
             .max(std::mem::size_of::<A>())
             .max(std::mem::size_of::<B>()),
-        |offsets, len, strides| {
+        &|offsets, len, strides| {
             // SAFETY: bounds are the views'; `a`, `b` are distinct borrows from `dest`.
             unsafe {
                 inner_loop_update3::<D, A, B, OpD, OpA, OpB>(
