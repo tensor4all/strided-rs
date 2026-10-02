@@ -46,6 +46,12 @@ impl<T> Copy for Raw<T> {}
 // SAFETY: see the type documentation; every user upholds it.
 unsafe impl<T> Send for Raw<T> {}
 unsafe impl<T> Sync for Raw<T> {}
+impl<T> Raw<T> {
+    // A method, so closures capture the whole wrapper rather than its field.
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
 
 fn validate_destination(dims: &[usize], strides: &[isize]) -> Result<()> {
     if is_injective_layout(dims, strides) {
@@ -263,7 +269,7 @@ where
         |offsets, len, strides| {
             // SAFETY: the destination is injective and in bounds; blocks are disjoint.
             unsafe {
-                inner_loop_update1::<D, OpD>(dp.0.offset(offsets[0]), strides[0], len, &f);
+                inner_loop_update1::<D, OpD>(dp.get().offset(offsets[0]), strides[0], len, &f);
             }
         },
     )
@@ -312,9 +318,9 @@ where
             // SAFETY: bounds are the views'; `a` is a distinct borrow from `dest`.
             unsafe {
                 inner_loop_update2::<D, A, OpD, OpA>(
-                    dp.0.offset(offsets[0]),
+                    dp.get().offset(offsets[0]),
                     strides[0],
-                    ap.0.offset(offsets[1]).cast_const(),
+                    ap.get().offset(offsets[1]).cast_const(),
                     strides[1],
                     len,
                     &f,
@@ -377,11 +383,11 @@ where
             // SAFETY: bounds are the views'; `a`, `b` are distinct borrows from `dest`.
             unsafe {
                 inner_loop_update3::<D, A, B, OpD, OpA, OpB>(
-                    dp.0.offset(offsets[0]),
+                    dp.get().offset(offsets[0]),
                     strides[0],
-                    ap.0.offset(offsets[1]).cast_const(),
+                    ap.get().offset(offsets[1]).cast_const(),
                     strides[1],
-                    bp.0.offset(offsets[2]).cast_const(),
+                    bp.get().offset(offsets[2]).cast_const(),
                     strides[2],
                     len,
                     &f,
