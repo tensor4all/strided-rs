@@ -284,3 +284,66 @@ fn contiguous_range_mul_single_thread_computes_large_broadcast_mul() {
     ));
     assert!(out.iter().all(|&x| x == 6.0));
 }
+
+#[test]
+fn test_range_plan_walks_streaming_inputs_without_blocking() {
+    let dims = [256usize, 256];
+    let dst = [1isize, 256];
+
+    for (lhs, rhs) in [([1isize, 256], [1isize, 256]), ([1, 256], [0, 1])] {
+        let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
+        assert!(plan.walks_inputs_without_blocking());
+    }
+}
+
+#[test]
+fn test_range_plan_declines_transposed_input() {
+    let dims = [256usize, 256];
+    let dst = [1isize, 256];
+
+    // Either operand read at the row stride along the destination's fast axis.
+    for (lhs, rhs) in [([1isize, 256], [256isize, 1]), ([256, 1], [1, 256])] {
+        let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
+        assert!(!plan.walks_inputs_without_blocking());
+    }
+}
+
+#[test]
+fn test_range_plan_keeps_transposed_scalar_tile_only_with_parallel() {
+    let dims = [5usize, 5, 7, 11];
+    let dst = [1isize, 5, 25, 175];
+    let lhs = [5isize, 1, 0, 25];
+    let rhs = [0isize, 0, 1, 7];
+    let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
+
+    assert_eq!(
+        plan.walks_inputs_without_blocking(),
+        cfg!(feature = "parallel")
+    );
+}
+
+#[test]
+fn test_mul_into_transposed_rhs_above_range_threshold_matches_reference() {
+    // 384 * 384 elements is above `CONTIGUOUS_RANGE_MIN_LEN`, so the contiguous
+    // range path would be taken without the blocking gate.
+    let n = 384usize;
+    let dims = [n, n];
+    let col = [1isize, n as isize];
+    let row = [n as isize, 1];
+    let a: Vec<f64> = (0..n * n).map(|i| (i % 97) as f64 + 0.5).collect();
+    let b: Vec<f64> = (0..n * n).map(|i| (i % 89) as f64 - 3.0).collect();
+    let mut d = vec![0.0f64; n * n];
+
+    {
+        let av = StridedView::<f64, Identity>::new(&a, &dims, &col, 0).unwrap();
+        let bv = StridedView::<f64, Identity>::new(&b, &dims, &row, 0).unwrap();
+        let mut dv = StridedViewMut::<f64>::new(&mut d, &dims, &col, 0).unwrap();
+        mul_into(&mut dv, &av, &bv).unwrap();
+    }
+
+    for j in 0..n {
+        for i in 0..n {
+            assert_eq!(d[i + j * n], a[i + j * n] * b[i * n + j]);
+        }
+    }
+}
