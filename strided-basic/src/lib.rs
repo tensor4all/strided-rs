@@ -22,6 +22,11 @@
 //! - [`map_into`]: Apply a function element-wise from source to destination
 //! - [`zip_map2_into`], [`zip_map3_into`], [`zip_map4_into`]: Multi-array element-wise operations
 //!
+//! ## In-place Update Operations
+//!
+//! - [`map_update_into`], [`zip_update2_into`], [`zip_update3_into`]: `dest[i] = f(dest[i], inputs...)`,
+//!   reading the old destination without a second view of it
+//!
 //! ## Reduce Operations
 //!
 //! - [`reduce`]: Full reduction with map function
@@ -77,6 +82,7 @@ mod raw_ops;
 mod reduce_view;
 mod simd;
 mod threading;
+mod update_view;
 pub use copy_plan::CopyPlan;
 pub use dense_update::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
 pub use erased::{ErasedConcatenatePlan, ErasedCopyPlan, ErasedReducePlan, ReduceOp};
@@ -98,6 +104,7 @@ pub use reduce_view::{reduce, reduce_axis};
 pub use simd::MaybeSimdOps;
 pub use strided_view::view;
 pub use strided_view::*;
+pub use update_view::{map_update_into, zip_update2_into, zip_update3_into};
 /// Block memory size for cache-optimized iteration (L1 cache target).
 ///
 /// Operations are blocked into tiles that fit within this size to maximize cache hits.
