@@ -547,6 +547,12 @@ where
 ///
 /// This avoids the redundant re-ordering and per-callback `Vec` allocation
 /// that `for_each_inner_block_with_offsets` previously incurred.
+///
+/// The block-walking machinery is compiled once (`preordered_dyn`): a generic
+/// caller only instantiates its own callback, reached through one indirect call
+/// per inner block (a run of elements, never per element). Keeping the walk
+/// generic would duplicate it for every operation, dtype and element-op
+/// combination of every downstream crate.
 #[inline]
 pub(crate) fn for_each_inner_block_preordered<F>(
     dims: &[usize],
@@ -558,6 +564,19 @@ pub(crate) fn for_each_inner_block_preordered<F>(
 where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
+    preordered_dyn(dims, blocks, strides, initial_offsets, &mut f)
+}
+
+type BlockFn<'a> = &'a mut dyn FnMut(&[isize], usize, &[isize]) -> Result<()>;
+
+#[inline(never)]
+fn preordered_dyn(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[Vec<isize>],
+    initial_offsets: &[isize],
+    mut f: BlockFn<'_>,
+) -> Result<()> {
     let rank = dims.len();
     if rank == 0 {
         return f(initial_offsets, 1, &[]);
