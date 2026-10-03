@@ -1637,7 +1637,7 @@ macro_rules! impl_integer_one_shot_scalar {
 }
 
 macro_rules! impl_complex_one_shot_scalar {
-    ($ty:ty, $label:literal) => {
+    ($ty:ty, $label:literal, $div:path) => {
         impl OneShotScalar for $ty {
             fn one_shot_dtype_label() -> &'static str {
                 $label
@@ -1681,7 +1681,7 @@ macro_rules! impl_complex_one_shot_scalar {
                     ErasedZipOp::Add => lhs + rhs,
                     ErasedZipOp::Subtract => lhs - rhs,
                     ErasedZipOp::Multiply => lhs * rhs,
-                    ErasedZipOp::Divide => lhs / rhs,
+                    ErasedZipOp::Divide => $div(lhs, rhs),
                     ErasedZipOp::Remainder | ErasedZipOp::Maximum | ErasedZipOp::Minimum => {
                         unreachable!("unsupported complex one-shot op")
                     }
@@ -1699,9 +1699,9 @@ impl_integer_one_shot_scalar!(i32, "i32");
 
 impl_integer_one_shot_scalar!(i64, "i64");
 
-impl_complex_one_shot_scalar!(Complex32, "c32");
+impl_complex_one_shot_scalar!(Complex32, "c32", strided_basic::robust_complex_divide_f32);
 
-impl_complex_one_shot_scalar!(Complex64, "c64");
+impl_complex_one_shot_scalar!(Complex64, "c64", strided_basic::robust_complex_divide_f64);
 
 impl OneShotScalar for bool {
     fn one_shot_dtype_label() -> &'static str {
