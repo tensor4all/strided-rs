@@ -434,7 +434,9 @@ fn zip_matches_naive_for_every_op_layout_and_context() {
                                     ErasedZipOp::Add => a + b,
                                     ErasedZipOp::Subtract => a - b,
                                     ErasedZipOp::Multiply => a * b,
-                                    _ => a / b,
+                                    // Division is the scale-robust Baudin–Smith
+                                    // path, not `num_complex`'s `|b|²` form.
+                                    _ => strided_kernel::robust_complex_divide_f64(a, b),
                                 }
                             }),
                             &format!("c64 {what}"),

@@ -645,3 +645,63 @@ fn integer_division_preflight_handles_high_rank_iteratively() {
     .unwrap();
     assert_eq!(actual, [i32::MIN]);
 }
+
+/// Scale-robust complex division: the textbook `|b|²` denominator overflows
+/// here, so the Baudin–Smith path must keep the representable quotient.
+#[test]
+fn one_shot_complex_divide_is_scale_robust() {
+    fn divide_once(lhs: &[Complex64], rhs: &[Complex64]) -> Complex64 {
+        let dims = [lhs.len()];
+        let strides = [1isize];
+        let mut out = vec![Complex64::default(); lhs.len()];
+        let lhs_ref = ErasedRawStridedRef::from_slice(lhs, &dims, &strides, 0).unwrap();
+        let rhs_ref = ErasedRawStridedRef::from_slice(rhs, &dims, &strides, 0).unwrap();
+        let mut out_mut =
+            ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &strides, 0).unwrap();
+        erased_zip_into(
+            KernelDType::C64,
+            ErasedZipOp::Divide,
+            &ExecContext::serial(),
+            &mut out_mut,
+            &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        )
+        .unwrap();
+        out[0]
+    }
+
+    // 1 / (2^600 + 2^600 i) == 2^-601 (1 - i)
+    let huge = 2f64.powi(600);
+    let quotient = divide_once(&[Complex64::new(1.0, 0.0)], &[Complex64::new(huge, huge)]);
+    let expected = 2f64.powi(-601);
+    assert!(
+        (quotient.re - expected).abs() <= expected * 1e-15,
+        "{quotient:?}"
+    );
+    assert!(
+        (quotient.im + expected).abs() <= expected * 1e-15,
+        "{quotient:?}"
+    );
+
+    // 1 / (2^-600 + 2^-600 i) == 2^599 (1 - i)
+    let tiny = 2f64.powi(-600);
+    let quotient = divide_once(&[Complex64::new(1.0, 0.0)], &[Complex64::new(tiny, tiny)]);
+    let expected = 2f64.powi(599);
+    assert!(
+        (quotient.re - expected).abs() <= expected * 1e-15,
+        "{quotient:?}"
+    );
+    assert!(
+        (quotient.im + expected).abs() <= expected * 1e-15,
+        "{quotient:?}"
+    );
+
+    // The erased one-shot and the fused plan agree on the edge case.
+    assert_binary_matches_plan(
+        KernelDType::C64,
+        &[Complex64::new(1.0, 0.0)],
+        &[Complex64::new(huge, huge)],
+        ErasedZipOp::Divide,
+        FusedOp::Divide,
+    );
+}

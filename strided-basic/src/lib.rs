@@ -64,6 +64,7 @@
 //! - Contiguous arrays use fast paths bypassing the blocking machinery
 
 mod block;
+mod complex_div;
 mod copy_plan;
 mod dense_update;
 mod erased;
@@ -83,6 +84,7 @@ mod reduce_view;
 mod simd;
 mod threading;
 mod update_view;
+pub use complex_div::{robust_complex_divide_f32, robust_complex_divide_f64};
 pub use copy_plan::CopyPlan;
 pub use dense_update::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
 pub use erased::{ErasedConcatenatePlan, ErasedCopyPlan, ErasedReducePlan, ReduceOp};

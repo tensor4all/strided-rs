@@ -234,7 +234,7 @@ macro_rules! impl_real_fused_scalar {
 }
 
 macro_rules! impl_complex_fused_scalar {
-    ($ty:ty) => {
+    ($ty:ty, $div:path) => {
         impl FusedScalar for $ty {
             #[inline(always)]
             fn fused_add(self, rhs: Self) -> Self {
@@ -258,7 +258,7 @@ macro_rules! impl_complex_fused_scalar {
 
             #[inline(always)]
             fn fused_divide(self, rhs: Self) -> Self {
-                self / rhs
+                $div(self, rhs)
             }
 
             #[inline(always)]
@@ -344,8 +344,14 @@ macro_rules! impl_complex_fused_scalar {
 
 impl_real_fused_scalar!(f32);
 impl_real_fused_scalar!(f64);
-impl_complex_fused_scalar!(num_complex::Complex32);
-impl_complex_fused_scalar!(num_complex::Complex64);
+impl_complex_fused_scalar!(
+    num_complex::Complex32,
+    strided_basic::robust_complex_divide_f32
+);
+impl_complex_fused_scalar!(
+    num_complex::Complex64,
+    strided_basic::robust_complex_divide_f64
+);
 
 macro_rules! impl_signed_integer_fused_scalar {
     ($ty:ty, $label:literal) => {
