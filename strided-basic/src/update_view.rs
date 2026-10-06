@@ -146,6 +146,8 @@ fn run_update(
     )
 }
 
+// INVARIANT: validated layouts keep all dereferences in bounds. Wrapping
+// advances permit an unused final cursor outside a reversed/gapped allocation.
 /// Unary inner loop: `d[i] = f(OpD(d[i]))`.
 ///
 /// # Safety
@@ -168,7 +170,7 @@ unsafe fn inner_loop_update1<D: Copy, OpD: ElementOp<D>>(
         let mut dp = dp;
         for _ in 0..len {
             *dp = f(OpD::apply(*dp));
-            dp = dp.offset(ds);
+            dp = dp.wrapping_offset(ds);
         }
     }
 }
@@ -199,8 +201,8 @@ unsafe fn inner_loop_update2<D: Copy, A: Copy, OpD: ElementOp<D>, OpA: ElementOp
         let (mut dp, mut ap) = (dp, ap);
         for _ in 0..len {
             *dp = f(OpD::apply(*dp), OpA::apply(*ap));
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
         }
     }
 }
@@ -241,9 +243,9 @@ unsafe fn inner_loop_update3<
         let (mut dp, mut ap, mut bp) = (dp, ap, bp);
         for _ in 0..len {
             *dp = f(OpD::apply(*dp), OpA::apply(*ap), OpB::apply(*bp));
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
         }
     }
 }

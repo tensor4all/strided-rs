@@ -29,6 +29,8 @@ use crate::threading::{
 // This mirrors the inner_loop_map* helpers in map_view.rs.
 // ============================================================================
 
+// INVARIANT: validated layouts keep all dereferences in bounds. Wrapping
+// advances permit an unused final cursor outside a reversed/gapped allocation.
 /// Inner loop for add: `dst[i] += Op::apply(src[i])`.
 #[inline(always)]
 unsafe fn inner_loop_add<D: Copy + Add<S, Output = D>, S: Copy, Op: ElementOp<S>>(
@@ -51,8 +53,8 @@ unsafe fn inner_loop_add<D: Copy + Add<S, Output = D>, S: Copy, Op: ElementOp<S>
         let mut sp = sp;
         for _ in 0..len {
             *dp = *dp + Op::apply(*sp);
-            dp = dp.offset(ds);
-            sp = sp.offset(ss);
+            dp = dp.wrapping_offset(ds);
+            sp = sp.wrapping_offset(ss);
         }
     }
 }
@@ -79,8 +81,8 @@ unsafe fn inner_loop_mul<D: Copy + Mul<S, Output = D>, S: Copy, Op: ElementOp<S>
         let mut sp = sp;
         for _ in 0..len {
             *dp = *dp * Op::apply(*sp);
-            dp = dp.offset(ds);
-            sp = sp.offset(ss);
+            dp = dp.wrapping_offset(ds);
+            sp = sp.wrapping_offset(ss);
         }
     }
 }
@@ -113,8 +115,8 @@ unsafe fn inner_loop_axpy<
         let mut sp = sp;
         for _ in 0..len {
             *dp = alpha * Op::apply(*sp) + *dp;
-            dp = dp.offset(ds);
-            sp = sp.offset(ss);
+            dp = dp.wrapping_offset(ds);
+            sp = sp.wrapping_offset(ss);
         }
     }
 }
@@ -151,9 +153,9 @@ unsafe fn inner_loop_fma<
         let mut bp = bp;
         for _ in 0..len {
             *dp = *dp + OpA::apply(*ap) * OpB::apply(*bp);
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
         }
     }
 }
@@ -187,8 +189,8 @@ unsafe fn inner_loop_dot<
         let mut bp = bp;
         for _ in 0..len {
             acc = acc + OpA::apply(*ap) * OpB::apply(*bp);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
         }
     }
     acc
