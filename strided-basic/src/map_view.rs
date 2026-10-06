@@ -166,6 +166,9 @@ fn validate_typed_no_overlap<D, A, Op: ElementOp<A>>(
 // This is the Rust equivalent of Julia's @simd on the innermost loop.
 // ============================================================================
 
+// INVARIANT: validated layouts keep every dereferenced cursor in bounds.
+// Pointwise leaves use wrapping advances: the unused final cursor may lie
+// outside the allocation for negative or gapped strides.
 /// Unary inner loop: `dest[i] = f(Op::apply(src[i]))` for `len` elements.
 #[inline(always)]
 unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>>(
@@ -189,8 +192,8 @@ unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>>(
         let mut sp = sp;
         for _ in 0..len {
             *dp = f(Op::apply(*sp));
-            dp = dp.offset(ds);
-            sp = sp.offset(ss);
+            dp = dp.wrapping_offset(ds);
+            sp = sp.wrapping_offset(ss);
         }
     }
 }
@@ -250,7 +253,7 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
         simd::dispatch_if_large(len, || {
             for d in dst.iter_mut() {
                 *d = f(OpA::apply(*ap), b);
-                ap = ap.offset(a_s);
+                ap = ap.wrapping_offset(a_s);
             }
         });
     } else if ds == 1 && a_s == 0 {
@@ -260,7 +263,7 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
         simd::dispatch_if_large(len, || {
             for d in dst.iter_mut() {
                 *d = f(a, OpB::apply(*bp));
-                bp = bp.offset(b_s);
+                bp = bp.wrapping_offset(b_s);
             }
         });
     } else {
@@ -269,9 +272,9 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
         let mut bp = bp;
         for _ in 0..len {
             *dp = f(OpA::apply(*ap), OpB::apply(*bp));
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
         }
     }
 }
@@ -415,14 +418,14 @@ unsafe fn inner_loop_mul2<
         let mut ap = ap;
         for i in 0..len {
             O::write(dp.add(i), multiply_value(*ap, b));
-            ap = ap.offset(a_s);
+            ap = ap.wrapping_offset(a_s);
         }
     } else if ds == 1 && a_s == 0 {
         let a = *ap;
         let mut bp = bp;
         for i in 0..len {
             O::write(dp.add(i), multiply_value(a, *bp));
-            bp = bp.offset(b_s);
+            bp = bp.wrapping_offset(b_s);
         }
     } else {
         let mut dp = dp;
@@ -430,9 +433,9 @@ unsafe fn inner_loop_mul2<
         let mut bp = bp;
         for _ in 0..len {
             O::write(dp, multiply_value(*ap, *bp));
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
         }
     }
 }
@@ -1031,10 +1034,10 @@ unsafe fn inner_loop_map3<
         let mut cp = cp;
         for _ in 0..len {
             *dp = f(OpA::apply(*ap), OpB::apply(*bp), OpC::apply(*cp));
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
-            cp = cp.offset(c_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
+            cp = cp.wrapping_offset(c_s);
         }
     }
 }
@@ -1094,11 +1097,11 @@ unsafe fn inner_loop_map4<
                 OpC::apply(*cp),
                 OpE::apply(*ep),
             );
-            dp = dp.offset(ds);
-            ap = ap.offset(a_s);
-            bp = bp.offset(b_s);
-            cp = cp.offset(c_s);
-            ep = ep.offset(e_s);
+            dp = dp.wrapping_offset(ds);
+            ap = ap.wrapping_offset(a_s);
+            bp = bp.wrapping_offset(b_s);
+            cp = cp.wrapping_offset(c_s);
+            ep = ep.wrapping_offset(e_s);
         }
     }
 }
