@@ -3,7 +3,15 @@ use crate::*;
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
+mod arg_reduce;
+mod line;
+mod norm;
 mod reduce_kernel;
+mod scan;
+
+pub use arg_reduce::{ArgReduceOp, ErasedArgReducePlan};
+pub use norm::{ErasedNormPlan, NormKind, NormSpec};
+pub use scan::{ErasedScanPlan, ScanOp, ScanOptions};
 
 use reduce_kernel::{
     reduce_axes_range, reduce_full_range, AxesRange, FullTraversal, MaxKernel, MinKernel,

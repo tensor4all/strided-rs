@@ -11,7 +11,7 @@ exact baseline, preservation checks and remaining cross-repository work.
   initialization and provenance contracts.
 - `strided-basic` owns generic typed primitives, layout/planning/iteration,
   execution policy, SIMD support, and concrete copy/concatenation/reduction
-  replay. Generic indexing and overwrite receipts stay with their validation.
+  replay, including the single-axis scan, arg-reduction and fused norm plans. Generic indexing and overwrite receipts stay with their validation.
 - `strided-kernel` owns concrete dtype-erased ordinary arithmetic and indexed
   replay. It also provides the shared checked typed APIs for ordinary users.
 - `strided-fused` owns the runtime-DAG interpreter, static fused specializations,

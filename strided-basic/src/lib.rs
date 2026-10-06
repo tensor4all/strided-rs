@@ -87,7 +87,10 @@ mod update_view;
 pub use complex_div::{robust_complex_divide_f32, robust_complex_divide_f64};
 pub use copy_plan::CopyPlan;
 pub use dense_update::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
-pub use erased::{ErasedConcatenatePlan, ErasedCopyPlan, ErasedReducePlan, ReduceOp};
+pub use erased::{
+    ArgReduceOp, ErasedArgReducePlan, ErasedConcatenatePlan, ErasedCopyPlan, ErasedNormPlan,
+    ErasedReducePlan, ErasedScanPlan, NormKind, NormSpec, ReduceOp, ScanOp, ScanOptions,
+};
 pub use exec_context::ExecContext;
 pub use execution_policy::{with_execution_policy, ExecutionPolicy};
 pub use map_view::{
