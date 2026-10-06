@@ -1,6 +1,6 @@
 //! Dtype-erased cumulative scans along one axis.
 
-use super::line::{for_each_unit, LineLayout, UnitPtr, PANEL};
+use super::line::{for_each_unit, LineLayout, UnitKernel, UnitPtr, PANEL};
 use super::{
     check_reduce_layout_offset_arithmetic, checked_total_len, reduce_uninit_writer, reduce_writer,
     ReduceWriter,
@@ -477,39 +477,83 @@ impl ErasedScanPlan {
         let n = layout.axis_len;
         let ss = layout.src_axis_stride;
         let ds = layout.dest_axis_stride;
-        let unit = |so: isize, d_o: isize, width: usize| {
-            // SAFETY: see the invariant at the `for_each_unit` call.
-            unsafe {
-                if width == 1 {
-                    scan_line::<T, K, EXCLUSIVE, REVERSE>(
-                        source.get(),
-                        so,
-                        ss,
-                        target.get(),
-                        d_o,
-                        ds,
-                        n,
-                    )
-                } else {
-                    scan_panel::<T, K, EXCLUSIVE, REVERSE>(
-                        source.get(),
-                        so,
-                        ss,
-                        target.get(),
-                        d_o,
-                        ds,
-                        n,
-                        width,
-                    )
-                }
-            }
+        let kernel = ScanUnit::<T, K, EXCLUSIVE, REVERSE> {
+            source,
+            target,
+            n,
+            ss,
+            ds,
+            _kernel: core::marker::PhantomData,
         };
         // INVARIANT: (1) compile checked the signed source/destination spans
         // and every cursor step/reset; (2) the raw descriptors validated every
         // reachable offset; (3) execute checked exact plan-layout equality.
         // Units cover disjoint lines, so their destination writes are disjoint.
         // SAFETY: the three-link invariant above.
-        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), &unit) }
+        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), kernel) }
+    }
+}
+
+/// Per-unit scan kernel of one execution.
+struct ScanUnit<T, K, const EXCLUSIVE: bool, const REVERSE: bool> {
+    source: UnitPtr<T>,
+    target: UnitPtr<T>,
+    n: usize,
+    ss: isize,
+    ds: isize,
+    _kernel: core::marker::PhantomData<fn() -> K>,
+}
+
+impl<T, K, const EXCLUSIVE: bool, const REVERSE: bool> Clone
+    for ScanUnit<T, K, EXCLUSIVE, REVERSE>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T, K, const EXCLUSIVE: bool, const REVERSE: bool> Copy for ScanUnit<T, K, EXCLUSIVE, REVERSE> {}
+
+impl<T, K, const EXCLUSIVE: bool, const REVERSE: bool> UnitKernel
+    for ScanUnit<T, K, EXCLUSIVE, REVERSE>
+where
+    T: ScanScalar,
+    K: ScanKernel<T>,
+{
+    #[inline(always)]
+    unsafe fn unit(self, so: isize, d_o: isize, width: usize) {
+        let Self {
+            source,
+            target,
+            n,
+            ss,
+            ds,
+            ..
+        } = self;
+        // SAFETY: the caller passes offsets of the validated layout.
+        unsafe {
+            if width == 1 {
+                scan_line::<T, K, EXCLUSIVE, REVERSE>(
+                    source.get(),
+                    so,
+                    ss,
+                    target.get(),
+                    d_o,
+                    ds,
+                    n,
+                )
+            } else {
+                scan_panel::<T, K, EXCLUSIVE, REVERSE>(
+                    source.get(),
+                    so,
+                    ss,
+                    target.get(),
+                    d_o,
+                    ds,
+                    n,
+                    width,
+                )
+            }
+        }
     }
 }
 

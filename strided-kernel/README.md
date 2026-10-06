@@ -9,6 +9,9 @@ depend on one another.
 
 - Unary/Binary/N-ary map kernels (`map_into`, `zip_map*_into`)
 - Reductions (`reduce`, `reduce_axis`)
+- Single-axis erased plans: cumulative scans (`ErasedScanPlan`), `argmax` /
+  `argmin` (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm`
+  (`ErasedNormPlan`); their tie, NaN and rounding contracts are in the rustdoc
 - Utility ops (`copy_into`, `add`, `dot`, `sum`, `symmetrize_into`)
 - Optional parallel execution via `parallel` feature (Rayon)
 

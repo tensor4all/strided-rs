@@ -1,6 +1,6 @@
 //! Dtype-erased fused `layer_norm` / `rms_norm` along one axis.
 
-use super::line::{for_each_unit, LineLayout, UnitPtr, PANEL};
+use super::line::{for_each_unit, LineLayout, UnitKernel, UnitPtr, PANEL};
 use super::{
     check_reduce_layout_offset_arithmetic, checked_total_len, reduce_uninit_writer, reduce_writer,
     ReduceWriter,
@@ -583,30 +583,11 @@ impl ErasedNormPlan {
             ss: layout.src_axis_stride,
             ds: layout.dest_axis_stride,
         };
-        let unit = |so: isize, d_o: isize, width: usize| {
-            // SAFETY: see the invariant at the `for_each_unit` call.
-            unsafe {
-                if width == 1 {
-                    norm_line::<T, LAYER, WEIGHT, BIAS>(
-                        source.get(),
-                        so,
-                        target.get(),
-                        d_o,
-                        line,
-                        affine,
-                    )
-                } else {
-                    norm_panel::<T, LAYER, WEIGHT, BIAS>(
-                        source.get(),
-                        so,
-                        target.get(),
-                        d_o,
-                        width,
-                        line,
-                        affine,
-                    )
-                }
-            }
+        let kernel = NormUnit::<T, LAYER, WEIGHT, BIAS> {
+            source,
+            target,
+            line,
+            affine,
         };
         // INVARIANT: (1) compile checked the signed source, destination,
         // weight and bias spans and every cursor step/reset; (2) the raw
@@ -614,7 +595,53 @@ impl ErasedNormPlan {
         // exact plan-layout equality for all four descriptors. Units cover
         // disjoint lines, so their destination writes are disjoint.
         // SAFETY: the three-link invariant above.
-        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), &unit) }
+        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), kernel) }
+    }
+}
+
+/// Per-unit normalization kernel of one execution.
+#[derive(Clone, Copy)]
+struct NormUnit<T, const LAYER: bool, const WEIGHT: bool, const BIAS: bool> {
+    source: UnitPtr<T>,
+    target: UnitPtr<T>,
+    line: Line<T>,
+    affine: Affine<T>,
+}
+
+impl<T: NormScalar, const LAYER: bool, const WEIGHT: bool, const BIAS: bool> UnitKernel
+    for NormUnit<T, LAYER, WEIGHT, BIAS>
+{
+    #[inline(always)]
+    unsafe fn unit(self, so: isize, d_o: isize, width: usize) {
+        let Self {
+            source,
+            target,
+            line,
+            affine,
+        } = self;
+        // SAFETY: the caller passes offsets of the validated layout.
+        unsafe {
+            if width == 1 {
+                norm_line::<T, LAYER, WEIGHT, BIAS>(
+                    source.get(),
+                    so,
+                    target.get(),
+                    d_o,
+                    line,
+                    affine,
+                )
+            } else {
+                norm_panel::<T, LAYER, WEIGHT, BIAS>(
+                    source.get(),
+                    so,
+                    target.get(),
+                    d_o,
+                    width,
+                    line,
+                    affine,
+                )
+            }
+        }
     }
 }
 
@@ -715,14 +742,14 @@ macro_rules! impl_norm_scalar {
 impl_norm_scalar!(f32, f64);
 
 /// Independent partial sums of the contiguous line kernels.
-const NORM_LANES: usize = 8;
+const NORM_LANES: usize = 16;
 
 /// Sum of `map(x)` over a contiguous slice with [`NORM_LANES`] partial sums.
 #[inline(always)]
 fn lane_sum<T: NormScalar>(values: &[T], map: impl Fn(T) -> T) -> T {
     let mut partial = [T::ZERO; NORM_LANES];
     let mut chunks = values.chunks_exact(NORM_LANES);
-    for chunk in &mut chunks {
+    for chunk in chunks.by_ref() {
         for (partial, &value) in partial.iter_mut().zip(chunk) {
             *partial = *partial + map(value);
         }
@@ -731,10 +758,9 @@ fn lane_sum<T: NormScalar>(values: &[T], map: impl Fn(T) -> T) -> T {
     for &value in chunks.remainder() {
         tail = tail + map(value);
     }
-    // Fixed pairwise combination of the partial sums.
-    let a = (partial[0] + partial[1]) + (partial[2] + partial[3]);
-    let b = (partial[4] + partial[5]) + (partial[6] + partial[7]);
-    (a + b) + tail
+    // A left fold of the partial sums: a pairwise tree here makes the
+    // vectorizer split the accumulators into two-lane groups.
+    partial.into_iter().fold(T::ZERO, |acc, value| acc + value) + tail
 }
 
 /// Sum of `map(x)` over a strided line, sequentially.
@@ -852,19 +878,69 @@ unsafe fn norm_line<T: NormScalar, const LAYER: bool, const WEIGHT: bool, const 
     // SAFETY: the caller guarantees every offset below.
     unsafe {
         let stats = line_stats::<T, LAYER>(src, so, line);
-        let mut s = so;
-        let mut d = d_o;
-        for k in 0..line.n {
-            let mut y = stats.apply(src.offset(s).read());
+        let src = src.offset(so);
+        let dst = dst.offset(d_o);
+        let (w, ws) = match affine.weight {
+            Some(p) if WEIGHT => (p.ptr.get().offset(p.offset) as *const T, p.stride),
+            _ => (src, 0),
+        };
+        let (b, bs) = match affine.bias {
+            Some(p) if BIAS => (p.ptr.get().offset(p.offset) as *const T, p.stride),
+            _ => (src, 0),
+        };
+        let unit = |stride: isize| stride == 1 || stride == 0;
+        if line.ss == 1 && line.ds == 1 && unit(ws) && unit(bs) {
+            // Literal unit strides let the compiler emit a contiguous loop.
+            norm_output::<T, WEIGHT, BIAS>(
+                src,
+                1,
+                dst,
+                1,
+                w,
+                ws.min(1),
+                b,
+                bs.min(1),
+                line.n,
+                stats,
+            );
+        } else {
+            norm_output::<T, WEIGHT, BIAS>(src, line.ss, dst, line.ds, w, ws, b, bs, line.n, stats);
+        }
+    }
+}
+
+/// Output pass of one line, indexing every operand from its base.
+///
+/// # Safety
+///
+/// `src + k * ss`, `dst + k * ds`, and (when present) `w + k * ws` and
+/// `b + k * bs` are valid for `k < n`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn norm_output<T: NormScalar, const WEIGHT: bool, const BIAS: bool>(
+    src: *const T,
+    ss: isize,
+    dst: *mut T,
+    ds: isize,
+    w: *const T,
+    ws: isize,
+    b: *const T,
+    bs: isize,
+    n: usize,
+    stats: Stats<T>,
+) {
+    for k in 0..n as isize {
+        // SAFETY: the caller guarantees every offset.
+        unsafe {
+            let mut y = stats.apply(src.offset(k * ss).read());
             if WEIGHT {
-                y = y * affine.weight.unwrap_unchecked().at(k);
+                y = y * w.offset(k * ws).read();
             }
             if BIAS {
-                y = y + affine.bias.unwrap_unchecked().at(k);
+                y = y + b.offset(k * bs).read();
             }
-            dst.offset(d).write(y);
-            s += line.ss;
-            d += line.ds;
+            // Raw write: the destination may be uninitialized.
+            dst.offset(k * ds).write(y);
         }
     }
 }

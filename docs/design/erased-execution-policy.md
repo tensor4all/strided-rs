@@ -43,6 +43,14 @@ The policy-aware parallel replay currently covers:
   reduced along one axis split; the worker count is capped by the output
   count. This measure was adopted for issue #269; its benchmark record is
   pending in that issue;
+- the single-axis plans (`ErasedScanPlan`, `ErasedArgReducePlan`,
+  `ErasedNormPlan`), partitioned over independent units: one line along the
+  plan axis, or, when that axis is strided but a kept axis is contiguous, a
+  block of up to 64 adjacent lines. The threshold domain is the number of
+  source elements and the worker count is capped by the unit count. Each
+  line's result is independent of the partition, so these plans are bitwise
+  identical at every thread count (see the
+  [worklog](../worklogs/2026-10-06-axis-scan-argreduce-norm.md));
 - gather, partitioned over independent outputs;
 - dynamic slice;
 - the overwrite phase of dynamic update slice; and

@@ -76,3 +76,8 @@ required-features = ["parallel"]
 name = "issue_187_uninit_indexed"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "axis_ops"
+harness = false
+required-features = ["parallel"]

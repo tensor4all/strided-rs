@@ -176,7 +176,7 @@ impl LineLayout {
     }
 
     /// Number of lines in the unit at the given panel-axis coordinate.
-    #[inline]
+    #[inline(always)]
     fn width(&self, leading_coord: usize) -> usize {
         match self.panel_extent {
             Some(extent) => (extent - leading_coord * PANEL).min(PANEL),
@@ -185,32 +185,52 @@ impl LineLayout {
     }
 }
 
+/// The per-unit kernel of one plan execution, monomorphized for one dtype
+/// and operation.
+pub(super) trait UnitKernel: Copy + crate::MaybeSendSync {
+    /// Processes the unit whose first line starts at the given source and
+    /// destination element offsets; `width` is 1 in line mode.
+    ///
+    /// # Safety
+    ///
+    /// The offsets must come from the plan's validated [`LineLayout`] and the
+    /// descriptors it was checked against.
+    unsafe fn unit(self, source_offset: isize, dest_offset: isize, width: usize);
+}
+
 /// Visits every unit of `layout`, serially or across workers.
 ///
-/// `unit(source_offset, dest_offset, width)` is called once per unit with the
-/// element offsets of the unit's first line; `width` is 1 in line mode.
+/// Each worker range runs inside one runtime SIMD dispatch (the `simd`
+/// feature), so the inlined kernel loops are compiled for the widest vector
+/// unit the host supports.
 ///
 /// # Safety
 ///
-/// The caller guarantees that `unit` is safe to call for every offset pair
+/// The caller guarantees that `kernel` is safe to call for every offset pair
 /// the compiled layout produces from the given bases (the plan validated the
 /// source and destination descriptors against the layout), and that distinct
 /// units write disjoint destination elements.
-pub(super) unsafe fn for_each_unit<F>(
+pub(super) unsafe fn for_each_unit<K: UnitKernel>(
     ctx: &ExecContext,
     layout: &LineLayout,
     source_base: isize,
     dest_base: isize,
-    unit: &F,
-) -> Result<()>
-where
-    F: Fn(isize, isize, usize) + crate::MaybeSync,
-{
+    kernel: K,
+) -> Result<()> {
     if layout.is_empty() {
         return Ok(());
     }
+    let task = |range: Range<usize>| {
+        dispatch_range(RangeTask {
+            layout,
+            source_base,
+            dest_base,
+            range,
+            kernel,
+        })
+    };
     if super::reduce_context_is_serial(ctx) {
-        return run_units(layout, source_base, dest_base, 0..layout.units, unit);
+        return task(0..layout.units);
     }
     ctx.run(|| {
         #[cfg(feature = "parallel")]
@@ -221,35 +241,66 @@ where
                 return crate::threading::parallel_map_reduce(
                     0..layout.units,
                     nthreads,
-                    &|range| run_units(layout, source_base, dest_base, range, unit),
+                    &task,
                     &|left, right| left.and(right),
                 );
             }
         }
-        run_units(layout, source_base, dest_base, 0..layout.units, unit)
+        task(0..layout.units)
     })
 }
 
-/// Runs one contiguous range of units, decoding the cursor once.
-fn run_units<F>(
-    layout: &LineLayout,
+/// One contiguous range of units.
+struct RangeTask<'a, K> {
+    layout: &'a LineLayout,
     source_base: isize,
     dest_base: isize,
     range: Range<usize>,
-    unit: &F,
-) -> Result<()>
-where
-    F: Fn(isize, isize, usize),
-{
+    kernel: K,
+}
+
+#[cfg(feature = "simd")]
+impl<K: UnitKernel> pulp::WithSimd for RangeTask<'_, K> {
+    type Output = Result<()>;
+
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, _simd: S) -> Self::Output {
+        run_units(self)
+    }
+}
+
+#[cfg(feature = "simd")]
+fn dispatch_range<K: UnitKernel>(task: RangeTask<'_, K>) -> Result<()> {
+    pulp::Arch::new().dispatch(task)
+}
+
+#[cfg(not(feature = "simd"))]
+fn dispatch_range<K: UnitKernel>(task: RangeTask<'_, K>) -> Result<()> {
+    run_units(task)
+}
+
+/// Runs one contiguous range of units, decoding the cursor once.
+#[inline(always)]
+fn run_units<K: UnitKernel>(task: RangeTask<'_, K>) -> Result<()> {
+    let RangeTask {
+        layout,
+        source_base,
+        dest_base,
+        range,
+        kernel,
+    } = task;
     let end = range.end;
     let mut cursor =
         ReduceOuterCursor::decode(range.start, source_base, dest_base, &layout.outer_axes)?;
     for index in range {
-        unit(
-            cursor.source_offset,
-            cursor.dest_offset,
-            layout.width(cursor.leading_coord()),
-        );
+        // SAFETY: the caller of `for_each_unit` guarantees every cursor offset.
+        unsafe {
+            kernel.unit(
+                cursor.source_offset,
+                cursor.dest_offset,
+                layout.width(cursor.leading_coord()),
+            )
+        };
         if index + 1 < end {
             cursor.advance();
         }
@@ -261,8 +312,15 @@ where
 ///
 /// Workers only touch disjoint destination units and shared read-only
 /// sources; the owning plan establishes that before dispatch.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(super) struct UnitPtr<T>(pub(super) *mut T);
+
+impl<T> Clone for UnitPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for UnitPtr<T> {}
 
 // SAFETY: see the type docs; the plan proves disjoint writes and shared reads.
 unsafe impl<T> Send for UnitPtr<T> {}

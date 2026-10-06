@@ -1,6 +1,6 @@
 //! Dtype-erased `argmax` / `argmin` along one axis.
 
-use super::line::{for_each_unit, LineLayout, UnitPtr, PANEL};
+use super::line::{for_each_unit, LineLayout, UnitKernel, UnitPtr, PANEL};
 use super::{
     check_reduce_layout_offset_arithmetic, checked_total_len, reduce_uninit_writer, reduce_writer,
     ReduceWriter,
@@ -446,32 +446,66 @@ impl ErasedArgReducePlan {
         let n = layout.axis_len;
         let ss = layout.src_axis_stride;
         let lane = layout.dest_lane_stride;
-        let unit = |so: isize, d_o: isize, width: usize| {
-            // SAFETY: see the invariant at the `for_each_unit` call.
-            unsafe {
-                if width == 1 {
-                    let index = arg_line::<T, F, D>(source.get(), so, ss, n);
-                    target.get().offset(d_o).write(I::from_index(index));
-                } else {
-                    arg_panel::<T, I, F, D>(
-                        source.get(),
-                        so,
-                        ss,
-                        n,
-                        target.get(),
-                        d_o,
-                        lane,
-                        width,
-                    );
-                }
-            }
+        let kernel = ArgUnit::<T, I, F, D> {
+            source,
+            target,
+            n,
+            ss,
+            lane,
+            _ops: core::marker::PhantomData,
         };
         // INVARIANT: (1) compile checked the signed source/destination spans
         // and every cursor step/reset, and rejected an empty axis; (2) the raw
         // descriptors validated every reachable offset; (3) execute checked
         // exact plan-layout equality. Units own disjoint outputs.
         // SAFETY: the three-link invariant above.
-        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), &unit) }
+        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), kernel) }
+    }
+}
+
+/// Per-unit arg-reduction kernel of one execution.
+struct ArgUnit<T, I, F, D> {
+    source: UnitPtr<T>,
+    target: UnitPtr<I>,
+    n: usize,
+    ss: isize,
+    lane: isize,
+    _ops: core::marker::PhantomData<fn() -> (F, D)>,
+}
+
+impl<T, I, F, D> Clone for ArgUnit<T, I, F, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T, I, F, D> Copy for ArgUnit<T, I, F, D> {}
+
+impl<T, I, F, D> UnitKernel for ArgUnit<T, I, F, D>
+where
+    T: KernelStorageElement + MaybeSendSync,
+    I: ArgIndex,
+    F: KeyFn<T>,
+    D: Direction,
+{
+    #[inline(always)]
+    unsafe fn unit(self, so: isize, d_o: isize, width: usize) {
+        let Self {
+            source,
+            target,
+            n,
+            ss,
+            lane,
+            ..
+        } = self;
+        // SAFETY: the caller passes offsets of the validated layout.
+        unsafe {
+            if width == 1 {
+                let index = arg_line::<T, F, D>(source.get(), so, ss, n);
+                target.get().offset(d_o).write(I::from_index(index));
+            } else {
+                arg_panel::<T, I, F, D>(source.get(), so, ss, n, target.get(), d_o, lane, width);
+            }
+        }
     }
 }
 
@@ -513,7 +547,9 @@ impl ArgIndex for i64 {
 }
 
 /// Comparable key of an element.
-pub(super) trait OrderKey: Copy {
+pub(super) trait OrderKey: Copy + PartialEq {
+    /// Whether the key is NaN (never for integer keys).
+    fn key_is_nan(self) -> bool;
     /// Whether `candidate` replaces `best` for a maximum: strictly greater,
     /// or the first NaN.
     fn beats_max(candidate: Self, best: Self) -> bool;
@@ -525,6 +561,10 @@ pub(super) trait OrderKey: Copy {
 macro_rules! impl_float_key {
     ($($ty:ty),*) => {$(
         impl OrderKey for $ty {
+            #[inline(always)]
+            fn key_is_nan(self) -> bool {
+                self.is_nan()
+            }
             #[inline(always)]
             fn beats_max(candidate: Self, best: Self) -> bool {
                 // Select form without a data dependent branch; a NaN `best`
@@ -543,6 +583,10 @@ impl_float_key!(f32, f64);
 macro_rules! impl_int_key {
     ($($ty:ty),*) => {$(
         impl OrderKey for $ty {
+            #[inline(always)]
+            fn key_is_nan(self) -> bool {
+                false
+            }
             #[inline(always)]
             fn beats_max(candidate: Self, best: Self) -> bool {
                 candidate > best
@@ -652,7 +696,16 @@ impl Direction for Less {
     }
 }
 
+/// Independent lanes of the contiguous winner search.
+const ARG_LANES: usize = 8;
+
 /// Index of the winning element of one line.
+///
+/// A unit-stride line runs two passes: a lane-parallel search for the winning
+/// key (NaN if the line has one), then a scan for the first element whose key
+/// equals it (or is NaN). Equal keys tie, so the second pass returns the
+/// lowest index of the winner, exactly as the sequential scan used for
+/// strided lines.
 ///
 /// # Safety
 ///
@@ -664,8 +717,36 @@ where
     F: KeyFn<T>,
     D: Direction,
 {
-    // SAFETY: the caller guarantees every visited offset and `n > 0`.
+    // SAFETY: the caller guarantees every visited offset and `n > 0`; a unit
+    // stride line is `n` contiguous elements.
     unsafe {
+        if ss == 1 {
+            let values = core::slice::from_raw_parts(src.offset(so), n);
+            let mut lanes = [F::key(values[0]); ARG_LANES];
+            let mut chunks = values.chunks_exact(ARG_LANES);
+            for chunk in &mut chunks {
+                for (lane, &value) in lanes.iter_mut().zip(chunk) {
+                    let key = F::key(value);
+                    *lane = if D::beats(key, *lane) { key } else { *lane };
+                }
+            }
+            // Which NaN or which signed zero wins here does not matter: the
+            // second pass matches by NaN-ness or by equality.
+            let mut winner = lanes[0];
+            let tail = chunks.remainder().iter().map(|&value| F::key(value));
+            for key in lanes[1..].iter().copied().chain(tail) {
+                if D::beats(key, winner) {
+                    winner = key;
+                }
+            }
+            let found = if winner.key_is_nan() {
+                values.iter().position(|&value| F::key(value).key_is_nan())
+            } else {
+                values.iter().position(|&value| F::key(value) == winner)
+            };
+            // INVARIANT: the winner is the key of some element of the line.
+            return found.unwrap_or(0);
+        }
         let mut best = F::key(src.offset(so).read());
         let mut best_index = 0;
         let mut offset = so;
