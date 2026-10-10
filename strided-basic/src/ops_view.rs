@@ -245,8 +245,9 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 ///
 /// On success every logical destination element is initialized; holes are
 /// untouched. Accepts identity views; use `map_into` for element operations
-/// such as conjugation. Sequential strided f32/f64 copies use the permutation
-/// engine; other types, contiguous and bounded parallel copies retain map.
+/// such as conjugation. Equal contiguous f32/f64 layouts and every other type
+/// keep the element map; a non-contiguous f32/f64 copy uses the permutation
+/// engine, serial or parallel, under the active execution policy.
 ///
 /// # Errors
 /// Returns a shape/rank error for mismatched views, `NonInjectiveOutputLayout`
@@ -286,13 +287,13 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     // contain uninitialized padding or have weaker alignment (e.g. Complex32).
     let native_float = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
         || std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
+    // Equal contiguous layouts go to the element map, whose contiguous path
+    // parallelizes a large copy; the permutation engine has only a serial
+    // contiguous shortcut. Non-contiguous native-float copies use the
+    // permutation engine, serial or parallel.
     if !native_float
-        || sequential_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()])?.is_some()
+        || same_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()]).is_some()
     {
-        return map_into(dest, src, MaybeUninit::new);
-    }
-    #[cfg(feature = "parallel")]
-    if crate::threading::parallel_threads_for_len(_len) > 1 {
         return map_into(dest, src, MaybeUninit::new);
     }
     let data = src.data();
@@ -302,6 +303,14 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     let data =
         unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<MaybeUninit<T>>(), data.len()) };
     let source = StridedView::new(data, src.dims(), src.strides(), src.offset())?;
+    #[cfg(feature = "parallel")]
+    {
+        // INVARIANT: the permutation engine selects its float paths by element
+        // size and only stores into the destination, so an uninitialized
+        // destination with an initialized source is valid.
+        return crate::threading::copy_permuted_with_active_policy(dest, &source);
+    }
+    #[cfg(not(feature = "parallel"))]
     copy_into_col_major(dest, &source)
 }
 

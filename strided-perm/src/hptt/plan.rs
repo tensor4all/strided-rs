@@ -152,9 +152,25 @@ pub(crate) fn build_permute_plan(
         // Transpose path: 2D micro-kernel
         let legacy_area = fused_dims[dim_a].saturating_mul(fused_dims[dim_b]);
         if legacy_area < block.saturating_mul(block) {
-            if let Some((root, grouped_tile)) =
-                try_build_grouped_tile_plan(&fused_dims, &fused_src, &fused_dst, block, legacy_area)
-            {
+            // The grouped path covers the dims the 2D micro-kernel cannot, by
+            // tiling a source-contiguous group against a destination-contiguous
+            // one. Its `target` is the smallest per-group extent worth taking,
+            // so it sets the length of the destination-contiguous run written in
+            // the inner loop. The micro-kernel block (16 elements = 128 bytes for
+            // f64) leaves runs shorter than a page, which defeats sequential
+            // first-touch and streaming on a fresh output; a small multiple of it
+            // restores long runs without pushing the tile out of cache.
+            // INVARIANT: `block` is the micro-kernel extent for this element size,
+            // so `block * 2` keeps the inner run at several cache lines without
+            // enlarging the outer step so far that it defeats the tile's locality.
+            let grouped_target = block.saturating_mul(2);
+            if let Some((root, grouped_tile)) = try_build_grouped_tile_plan(
+                &fused_dims,
+                &fused_src,
+                &fused_dst,
+                grouped_target,
+                legacy_area,
+            ) {
                 return Ok(PermutePlan {
                     fused_dims,
                     src_strides: fused_src,
@@ -204,6 +220,11 @@ fn find_stride1_dim(dims: &[usize], strides: &[isize]) -> usize {
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
+
+/// Upper bound on a grouped tile dimension group, as a multiple of the group
+/// target. Keeps a grouped tile a cache-sized tile instead of letting one huge
+/// axis absorb the rest of the permutation.
+const MAX_GROUP_LEN_MULTIPLE: usize = 64;
 
 /// BLOCK size for a given element size (matches HPTT's blocking_ = micro * 4).
 fn block_for_elem_size(elem_size: usize) -> usize {
@@ -286,11 +307,21 @@ fn select_contiguous_group(
             match strides[d].cmp(&expected) {
                 std::cmp::Ordering::Less => continue,
                 std::cmp::Ordering::Equal => {
-                    group.push(d);
-                    len = len.saturating_mul(dims[d]);
                     if len >= target {
                         break;
                     }
+                    // `target` is a stopping threshold, not an upper bound. Stop
+                    // before an axis whose inclusion would grow the group past a
+                    // bounded multiple of it, so the tile stays a cache tile and
+                    // the remaining axes keep driving the outer loop (and with it
+                    // the parallel domain). A first axis larger than the bound is
+                    // still taken: dimensions are atomic.
+                    let next_len = len.saturating_mul(dims[d]);
+                    if next_len > target.saturating_mul(MAX_GROUP_LEN_MULTIPLE) {
+                        break;
+                    }
+                    group.push(d);
+                    len = next_len;
                     expected = base.saturating_mul(len as isize);
                 }
                 std::cmp::Ordering::Greater => break,

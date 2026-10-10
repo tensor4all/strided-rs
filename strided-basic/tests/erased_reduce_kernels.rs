@@ -840,3 +840,40 @@ fn strided_axis_of_column_major_matrix_uses_column_sweep() {
         }
     }
 }
+
+/// Rounding-sensitive values: the output-block kernel must keep the sequential
+/// per-output order for the multiplicative families too, and must compute the
+/// square as a separate product before the add rather than fusing it into an
+/// FMA, which the naive reference does not.
+#[test]
+fn strided_axis_inexact_matches_scalar_for_multiplicative_ops() {
+    for (rows, cols) in [(600usize, 61usize), (2048, 33)] {
+        for (op, label) in [
+            (ReduceOp::Product, "product"),
+            (ReduceOp::SumSquares, "sum_squares"),
+        ] {
+            let case = AxesCase {
+                name: "matrix axis 1 inexact",
+                src_dims: vec![rows, cols],
+                src_strides: vec![1, rows as isize],
+                src_offset: 0,
+                dest_strides: vec![1],
+                axes: vec![1],
+            };
+            let data: Vec<f64> = (0..rows * cols)
+                .map(|i| 1.0 + (i as f64 * 0.61).sin() * 0.125)
+                .collect();
+            let (dest_dims, expected) = axes_reference(op, &data, &case);
+            for (ctx_name, ctx) in contexts() {
+                let got = run_axes(op, &ctx, &data, &case, &dest_dims);
+                for (index, (&g, &e)) in got.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        e.to_bits(),
+                        "{label} {rows}x{cols} {ctx_name} out[{index}]: got {g}, expected {e}"
+                    );
+                }
+            }
+        }
+    }
+}

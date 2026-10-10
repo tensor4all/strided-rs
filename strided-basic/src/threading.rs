@@ -242,10 +242,16 @@ pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync>(
         current_pool_threads,
     );
     if total > MINTHREADLENGTH && parallel_eligible {
-        with_permutation_copy_scheduler(|| strided_perm::copy_into_par(dest, src))
-    } else {
-        copy_permuted_serial(dest, src)
+        return with_permutation_copy_scheduler(|| strided_perm::copy_into_par(dest, src));
     }
+    if total > MINTHREADLENGTH && current_pool_threads > 1 {
+        // A bounded policy (`Rayon { max_threads }` below the pool size) is not
+        // eligible for the permutation engine's own parallel entry, but the
+        // element map honours the same policy budget, so it keeps more workers
+        // than the serial permutation copy would.
+        return crate::map_view::map_into(dest, src, |value| value);
+    }
+    copy_permuted_serial(dest, src)
 }
 
 #[cfg(feature = "parallel")]
