@@ -221,6 +221,11 @@ fn find_stride1_dim(dims: &[usize], strides: &[isize]) -> usize {
         .unwrap_or(0)
 }
 
+/// Upper bound on a grouped tile dimension group, as a multiple of the group
+/// target. Keeps a grouped tile a cache-sized tile instead of letting one huge
+/// axis absorb the rest of the permutation.
+const MAX_GROUP_LEN_MULTIPLE: usize = 64;
+
 /// BLOCK size for a given element size (matches HPTT's blocking_ = micro * 4).
 fn block_for_elem_size(elem_size: usize) -> usize {
     match elem_size {
@@ -302,11 +307,21 @@ fn select_contiguous_group(
             match strides[d].cmp(&expected) {
                 std::cmp::Ordering::Less => continue,
                 std::cmp::Ordering::Equal => {
-                    group.push(d);
-                    len = len.saturating_mul(dims[d]);
                     if len >= target {
                         break;
                     }
+                    // `target` is a stopping threshold, not an upper bound. Stop
+                    // before an axis whose inclusion would grow the group past a
+                    // bounded multiple of it, so the tile stays a cache tile and
+                    // the remaining axes keep driving the outer loop (and with it
+                    // the parallel domain). A first axis larger than the bound is
+                    // still taken: dimensions are atomic.
+                    let next_len = len.saturating_mul(dims[d]);
+                    if next_len > target.saturating_mul(MAX_GROUP_LEN_MULTIPLE) {
+                        break;
+                    }
+                    group.push(d);
+                    len = next_len;
                     expected = base.saturating_mul(len as isize);
                 }
                 std::cmp::Ordering::Greater => break,

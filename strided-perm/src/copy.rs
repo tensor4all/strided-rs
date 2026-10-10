@@ -126,6 +126,35 @@ pub fn copy_into_col_major<T: Copy>(
     copy_into(dst, src)
 }
 
+/// Conservative sufficient proof that distinct destination elements are
+/// distinct offsets.
+///
+/// Axes with extent > 1 are visited in ascending stride. An axis is separated
+/// when its positive stride lands strictly past the offset span already covered
+/// by the smaller-stride axes, so the two offset sets cannot meet. A negative,
+/// zero, or interleaved stride is left unresolved: the parallel entry then
+/// keeps the serial engine rather than let two workers write one offset. A
+/// layout that fails this test can still be injective; only the parallel fast
+/// path is withheld.
+fn destination_offsets_are_separated(dims: &[usize], strides: &[isize]) -> bool {
+    let mut axes: Vec<(isize, usize)> = dims
+        .iter()
+        .copied()
+        .zip(strides.iter().copied())
+        .filter(|&(dim, _)| dim > 1)
+        .map(|(dim, stride)| (stride, dim))
+        .collect();
+    axes.sort_by_key(|&(stride, _)| stride.unsigned_abs());
+    let mut span: u128 = 0;
+    for (stride, dim) in axes {
+        if stride <= 0 || stride as u128 <= span {
+            return false;
+        }
+        span = span.saturating_add((dim as u128 - 1).saturating_mul(stride as u128));
+    }
+    true
+}
+
 /// Copy elements from source to destination with Rayon parallelism.
 ///
 /// Parallelizes the outermost block loop of the HPTT-inspired permutation.
@@ -157,6 +186,13 @@ pub fn copy_into_par<T: Copy + Send + Sync>(
     let src_ptr = src.ptr();
     let dst_strides = dest.strides();
     let src_strides = src.strides();
+
+    if !destination_offsets_are_separated(dst_dims, dst_strides) {
+        // Each tile is written by one worker; an unresolved destination layout
+        // could map two tiles onto one offset, which is a data race under
+        // parallel execution. Keep the serial engine for that case.
+        return copy_into(dest, src);
+    }
 
     // Fast path: both contiguous (memcpy is already bandwidth-limited)
     if is_both_contiguous(dst_dims, dst_strides, src_strides) {
@@ -374,14 +410,25 @@ mod tests {
         assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
     }
 
+    #[test]
+    fn destination_separation_rejects_overlapping_strides() {
+        assert!(destination_offsets_are_separated(&[3, 16384], &[1, 3]));
+        // The first axis' offsets (stride 2) interleave the second axis' (stride
+        // 1), so the parallel entry must keep the serial engine.
+        assert!(!destination_offsets_are_separated(&[3, 16384], &[2, 1]));
+        assert!(!destination_offsets_are_separated(&[4], &[-1]));
+        assert!(destination_offsets_are_separated(&[1, 1], &[0, 1]));
+    }
+
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_transpose_splits_the_full_tile_grid_for_a_short_row_extent() {
         // The source's unit-stride extent is the short side of the transpose, so
-        // the whole kernel would be a single row tile over `block`. The parallel
-        // entry must split the column tiles too; a row-only split would leave the
-        // work on one worker. The result is checked element by element.
-        let rows = 4096usize;
+        // the whole kernel would be a single row tile over `block`, and the total
+        // is above the threading threshold. The parallel entry must split the
+        // column tiles too; a row-only split would leave the work on one worker.
+        // The result is checked element by element.
+        let rows = 20000usize;
         let cols = 3usize;
         let data: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
         let src =

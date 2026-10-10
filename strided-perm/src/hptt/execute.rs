@@ -97,20 +97,49 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
     let root = match &plan.root {
         Some(r) => r,
         None => {
-            if let ExecMode::Transpose { dim_a, dim_b } = plan.mode {
-                dispatch_blocked_2d_par(
-                    src,
-                    dst,
-                    plan.fused_dims[dim_a],
-                    plan.fused_dims[dim_b],
-                    plan.lda_inner,
-                    plan.ldb_inner,
-                    plan.block,
-                    std::mem::size_of::<T>(),
-                );
-                return;
+            match plan.mode {
+                ExecMode::Transpose { dim_a, dim_b } => {
+                    dispatch_blocked_2d_par(
+                        src,
+                        dst,
+                        plan.fused_dims[dim_a],
+                        plan.fused_dims[dim_b],
+                        plan.lda_inner,
+                        plan.ldb_inner,
+                        plan.block,
+                        std::mem::size_of::<T>(),
+                    );
+                }
+                ExecMode::ConstStride1 { inner_dim } => {
+                    // One strided stream with no enclosing loop: split its
+                    // elements across workers instead of running it on one.
+                    let count = plan.fused_dims[inner_dim];
+                    let src_stride = plan.src_strides[inner_dim];
+                    let dst_stride = plan.dst_strides[inner_dim];
+                    let nthreads = rayon::current_num_threads().max(1);
+                    let chunk = count.div_ceil(nthreads).max(1);
+                    let src_addr = src as usize;
+                    let dst_addr = dst as usize;
+                    let chunks = count.div_ceil(chunk).max(1);
+                    (0..chunks).into_par_iter().for_each(|c| {
+                        let start = c * chunk;
+                        if start >= count {
+                            return;
+                        }
+                        let len = chunk.min(count - start);
+                        let s = (src_addr as isize
+                            + start as isize * src_stride * (std::mem::size_of::<T>() as isize))
+                            as *const T;
+                        let d = (dst_addr as isize
+                            + start as isize * dst_stride * (std::mem::size_of::<T>() as isize))
+                            as *mut T;
+                        unsafe { const_stride1_copy(s, d, len, src_stride, dst_stride) };
+                    });
+                }
+                _ => {
+                    execute_permute_blocked(src, dst, plan);
+                }
             }
-            execute_permute_blocked(src, dst, plan);
             return;
         }
     };
