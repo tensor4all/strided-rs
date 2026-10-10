@@ -59,6 +59,25 @@ pub(super) trait ReduceKernel<T: ErasedReduceScalar>: 'static {
     fn contiguous(values: &[T]) -> T {
         lanes_contiguous::<T, Self>(values)
     }
+
+    /// Folds one unit-stride source run into the adjacent-output accumulator
+    /// block, preserving the per-output reduced order.
+    #[inline(always)]
+    fn combine_block(acc: &mut [T], values: &[T]) {
+        scalar_combine_block::<T, Self>(acc, values);
+    }
+}
+
+/// Per-output scalar fold used by [`ReduceKernel::combine_block`]'s default and
+/// by kernels without a SIMD block path.
+#[inline(always)]
+fn scalar_combine_block<T: ErasedReduceScalar, K: ReduceKernel<T> + ?Sized>(
+    acc: &mut [T],
+    values: &[T],
+) {
+    for (slot, &value) in acc.iter_mut().zip(values) {
+        *slot = K::combine(*slot, K::map(value));
+    }
 }
 
 pub(super) struct SumKernel;
@@ -84,6 +103,12 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for SumKernel {
     fn contiguous(values: &[T]) -> T {
         T::try_simd_sum(values).unwrap_or_else(|| lanes_contiguous::<T, Self>(values))
     }
+    #[inline(always)]
+    fn combine_block(acc: &mut [T], values: &[T]) {
+        if !T::try_simd_add_block(acc, values) {
+            scalar_combine_block::<T, Self>(acc, values);
+        }
+    }
 }
 
 impl<T: ErasedReduceScalar> ReduceKernel<T> for ProductKernel {
@@ -103,6 +128,12 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for ProductKernel {
     fn contiguous(values: &[T]) -> T {
         T::try_simd_product(values).unwrap_or_else(|| lanes_contiguous::<T, Self>(values))
     }
+    #[inline(always)]
+    fn combine_block(acc: &mut [T], values: &[T]) {
+        if !T::try_simd_mul_block(acc, values) {
+            scalar_combine_block::<T, Self>(acc, values);
+        }
+    }
 }
 
 impl<T: ErasedReduceScalar> ReduceKernel<T> for SumSquaresKernel {
@@ -121,6 +152,12 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for SumSquaresKernel {
     #[inline(always)]
     fn contiguous(values: &[T]) -> T {
         T::try_simd_sum_squares(values).unwrap_or_else(|| lanes_contiguous::<T, Self>(values))
+    }
+    #[inline(always)]
+    fn combine_block(acc: &mut [T], values: &[T]) {
+        if !T::try_simd_sum_squares_block(acc, values) {
+            scalar_combine_block::<T, Self>(acc, values);
+        }
     }
 }
 
@@ -498,23 +535,17 @@ where
                     let [v0, v1, v2, v3] = offsets.map(|offset| unsafe {
                         core::slice::from_raw_parts(source.offset(offset), len)
                     });
-                    for (index, slot) in acc.iter_mut().enumerate() {
-                        let mut value = *slot;
-                        value = K::combine(value, K::map(v0[index]));
-                        value = K::combine(value, K::map(v1[index]));
-                        value = K::combine(value, K::map(v2[index]));
-                        value = K::combine(value, K::map(v3[index]));
-                        *slot = value;
-                    }
+                    K::combine_block(acc, v0);
+                    K::combine_block(acc, v1);
+                    K::combine_block(acc, v2);
+                    K::combine_block(acc, v3);
                 }
                 while value_index < reduce_total {
                     // SAFETY: as above, for one reduced position.
                     let values = unsafe {
                         core::slice::from_raw_parts(source.offset(inner.source_offset), len)
                     };
-                    for (slot, &value) in acc.iter_mut().zip(values) {
-                        *slot = K::combine(*slot, K::map(value));
-                    }
+                    K::combine_block(acc, values);
                     value_index += 1;
                     if value_index < reduce_total {
                         inner.advance();
