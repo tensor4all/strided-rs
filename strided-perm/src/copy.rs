@@ -374,6 +374,31 @@ mod tests {
         assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
     }
 
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_transpose_splits_the_full_tile_grid_for_a_short_row_extent() {
+        // The source's unit-stride extent is the short side of the transpose, so
+        // the whole kernel would be a single row tile over `block`. The parallel
+        // entry must split the column tiles too; a row-only split would leave the
+        // work on one worker. The result is checked element by element.
+        let rows = 4096usize;
+        let cols = 3usize;
+        let data: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+        let src =
+            StridedArray::<f64>::from_parts(data, &[rows, cols], &[cols as isize, 1], 0).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let mut dst = StridedArray::<f64>::col_major(&[rows, cols]);
+        pool.install(|| copy_into_par(&mut dst.view_mut(), &src.view()).unwrap());
+        for r in 0..rows {
+            for c in 0..cols {
+                assert_eq!(dst.get(&[r, c]), (r * cols + c) as f64);
+            }
+        }
+    }
+
     #[test]
     fn test_copy_shape_mismatch() {
         let src = StridedArray::<f64>::col_major(&[2, 3]);

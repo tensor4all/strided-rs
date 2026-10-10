@@ -152,9 +152,25 @@ pub(crate) fn build_permute_plan(
         // Transpose path: 2D micro-kernel
         let legacy_area = fused_dims[dim_a].saturating_mul(fused_dims[dim_b]);
         if legacy_area < block.saturating_mul(block) {
-            if let Some((root, grouped_tile)) =
-                try_build_grouped_tile_plan(&fused_dims, &fused_src, &fused_dst, block, legacy_area)
-            {
+            // The grouped path covers the dims the 2D micro-kernel cannot, by
+            // tiling a source-contiguous group against a destination-contiguous
+            // one. Its `target` is the smallest per-group extent worth taking,
+            // so it sets the length of the destination-contiguous run written in
+            // the inner loop. The micro-kernel block (16 elements = 128 bytes for
+            // f64) leaves runs shorter than a page, which defeats sequential
+            // first-touch and streaming on a fresh output; a small multiple of it
+            // restores long runs without pushing the tile out of cache.
+            // INVARIANT: `block` is the micro-kernel extent for this element size,
+            // so `block * 2` keeps the inner run at several cache lines without
+            // enlarging the outer step so far that it defeats the tile's locality.
+            let grouped_target = block.saturating_mul(2);
+            if let Some((root, grouped_tile)) = try_build_grouped_tile_plan(
+                &fused_dims,
+                &fused_src,
+                &fused_dst,
+                grouped_target,
+                legacy_area,
+            ) {
                 return Ok(PermutePlan {
                     fused_dims,
                     src_strides: fused_src,

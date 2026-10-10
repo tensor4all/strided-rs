@@ -490,28 +490,31 @@ unsafe fn parallel_blocked_transpose_2d_f64(
     block: usize,
 ) {
     let row_tiles = transpose_tile_rows(size_a, block);
+    let col_tiles = transpose_tile_rows(size_b, block);
     let src_addr = src as usize;
     let dst_addr = dst as usize;
 
-    (0..row_tiles).into_par_iter().for_each(|tile_a| {
+    // Split the whole row x column tile grid, not only the row tiles. A
+    // near-vector-shaped transpose (for example 3 x N) has a single row tile, so
+    // a row-only split would run the entire kernel on one worker.
+    (0..row_tiles * col_tiles).into_par_iter().for_each(|tile| {
+        let tile_a = tile / col_tiles;
+        let tile_b = tile % col_tiles;
         let ia = tile_a * block;
         let ba = block.min(size_a - ia);
+        let ib = tile_b * block;
+        let bb = block.min(size_b - ib);
         let src_base = src_addr as *const f64;
         let dst_base = dst_addr as *mut f64;
-        let mut ib = 0usize;
-        while ib < size_b {
-            let bb = block.min(size_b - ib);
-            unsafe {
-                macro_kernel_f64(
-                    src_base.offset(ia as isize + ib as isize * lda),
-                    lda,
-                    ba,
-                    dst_base.offset(ib as isize + ia as isize * ldb),
-                    ldb,
-                    bb,
-                );
-            }
-            ib += block;
+        unsafe {
+            macro_kernel_f64(
+                src_base.offset(ia as isize + ib as isize * lda),
+                lda,
+                ba,
+                dst_base.offset(ib as isize + ia as isize * ldb),
+                ldb,
+                bb,
+            );
         }
     });
 }
@@ -528,28 +531,31 @@ unsafe fn parallel_blocked_transpose_2d_f32(
     block: usize,
 ) {
     let row_tiles = transpose_tile_rows(size_a, block);
+    let col_tiles = transpose_tile_rows(size_b, block);
     let src_addr = src as usize;
     let dst_addr = dst as usize;
 
-    (0..row_tiles).into_par_iter().for_each(|tile_a| {
+    // Split the whole row x column tile grid, not only the row tiles. A
+    // near-vector-shaped transpose (for example 3 x N) has a single row tile, so
+    // a row-only split would run the entire kernel on one worker.
+    (0..row_tiles * col_tiles).into_par_iter().for_each(|tile| {
+        let tile_a = tile / col_tiles;
+        let tile_b = tile % col_tiles;
         let ia = tile_a * block;
         let ba = block.min(size_a - ia);
+        let ib = tile_b * block;
+        let bb = block.min(size_b - ib);
         let src_base = src_addr as *const f32;
         let dst_base = dst_addr as *mut f32;
-        let mut ib = 0usize;
-        while ib < size_b {
-            let bb = block.min(size_b - ib);
-            unsafe {
-                macro_kernel_f32(
-                    src_base.offset(ia as isize + ib as isize * lda),
-                    lda,
-                    ba,
-                    dst_base.offset(ib as isize + ia as isize * ldb),
-                    ldb,
-                    bb,
-                );
-            }
-            ib += block;
+        unsafe {
+            macro_kernel_f32(
+                src_base.offset(ia as isize + ib as isize * lda),
+                lda,
+                ba,
+                dst_base.offset(ib as isize + ia as isize * ldb),
+                ldb,
+                bb,
+            );
         }
     });
 }
@@ -566,28 +572,31 @@ unsafe fn parallel_blocked_transpose_2d_fallback<T: Copy + Send + Sync>(
     block: usize,
 ) {
     let row_tiles = transpose_tile_rows(size_a, block);
+    let col_tiles = transpose_tile_rows(size_b, block);
     let src_addr = src as usize;
     let dst_addr = dst as usize;
 
-    (0..row_tiles).into_par_iter().for_each(|tile_a| {
+    // Split the whole row x column tile grid, not only the row tiles. A
+    // near-vector-shaped transpose (for example 3 x N) has a single row tile, so
+    // a row-only split would run the entire kernel on one worker.
+    (0..row_tiles * col_tiles).into_par_iter().for_each(|tile| {
+        let tile_a = tile / col_tiles;
+        let tile_b = tile % col_tiles;
         let ia = tile_a * block;
         let ba = block.min(size_a - ia);
+        let ib = tile_b * block;
+        let bb = block.min(size_b - ib);
         let src_base = src_addr as *const T;
         let dst_base = dst_addr as *mut T;
-        let mut ib = 0usize;
-        while ib < size_b {
-            let bb = block.min(size_b - ib);
-            unsafe {
-                macro_kernel_fallback(
-                    src_base.offset(ia as isize + ib as isize * lda),
-                    lda,
-                    ba,
-                    dst_base.offset(ib as isize + ia as isize * ldb),
-                    ldb,
-                    bb,
-                );
-            }
-            ib += block;
+        unsafe {
+            macro_kernel_fallback(
+                src_base.offset(ia as isize + ib as isize * lda),
+                lda,
+                ba,
+                dst_base.offset(ib as isize + ia as isize * ldb),
+                ldb,
+                bb,
+            );
         }
     });
 }
