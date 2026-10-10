@@ -495,9 +495,6 @@ pub(crate) unsafe fn try_mul_transposed_scalar_lhs_2d<D: 'static, A: 'static, B:
     false
 }
 
-/// Minimum accumulator-block length worth a SIMD dispatch.
-const BLOCK_FOLD_MIN_LEN: usize = 16;
-
 /// Trait for types that may have SIMD-accelerated sum/dot operations.
 ///
 /// Default implementations return `None` (no SIMD available).
@@ -509,21 +506,11 @@ pub trait MaybeSimdOps: Copy + Sized {
     fn try_simd_dot(_a: &[Self], _b: &[Self]) -> Option<Self> {
         None
     }
-    /// Fold a unit-stride value run into adjacent accumulators (`acc[i] +=
-    /// values[i]`). Returns false when no SIMD path applies.
-    fn try_simd_add_block(_acc: &mut [Self], _values: &[Self]) -> bool {
-        false
-    }
 }
 
 pub(crate) trait MaybeSimdProduct: Copy + Sized {
     fn try_simd_product(_src: &[Self]) -> Option<Self> {
         None
-    }
-    /// Fold a unit-stride value run into adjacent accumulators (`acc[i] *=
-    /// values[i]`). Returns false when no SIMD path applies.
-    fn try_simd_mul_block(_acc: &mut [Self], _values: &[Self]) -> bool {
-        false
     }
 }
 
@@ -531,9 +518,26 @@ pub(crate) trait MaybeSimdSumSquares: Copy + Sized {
     fn try_simd_sum_squares(_src: &[Self]) -> Option<Self> {
         None
     }
-    /// Fold a unit-stride value run and its squares into adjacent accumulators
-    /// (`acc[i] += values[i] * values[i]`). Returns false when no SIMD path
-    /// applies.
+}
+
+/// Minimum accumulator-block length worth a SIMD dispatch.
+#[cfg(feature = "simd")]
+const BLOCK_FOLD_MIN_LEN: usize = 16;
+
+/// SIMD fold of one unit-stride value run into adjacent accumulators.
+///
+/// This is a reduction-kernel implementation hook, not part of the public
+/// surface. Every method requires `acc.len() == values.len()`; the reduction
+/// callers always pass the same block length for both, so the vector loop and
+/// the scalar tail cover exactly the same indices. A method returns false when
+/// no SIMD path applies and leaves `acc` untouched.
+pub(crate) trait MaybeSimdBlockFold: Copy + Sized {
+    fn try_simd_add_block(_acc: &mut [Self], _values: &[Self]) -> bool {
+        false
+    }
+    fn try_simd_mul_block(_acc: &mut [Self], _values: &[Self]) -> bool {
+        false
+    }
     fn try_simd_sum_squares_block(_acc: &mut [Self], _values: &[Self]) -> bool {
         false
     }
@@ -546,6 +550,7 @@ macro_rules! impl_no_simd {
             impl MaybeSimdOps for $t {}
             impl MaybeSimdProduct for $t {}
             impl MaybeSimdSumSquares for $t {}
+            impl MaybeSimdBlockFold for $t {}
         )*
     };
 }
@@ -564,6 +569,10 @@ impl<T: num_traits::Num + Copy + Clone + std::ops::Neg<Output = T>> MaybeSimdSum
     for num_complex::Complex<T>
 {
 }
+impl<T: num_traits::Num + Copy + Clone + std::ops::Neg<Output = T>> MaybeSimdBlockFold
+    for num_complex::Complex<T>
+{
+}
 
 // f32/f64: SIMD-accelerated when feature enabled, no-op otherwise
 #[cfg(not(feature = "simd"))]
@@ -579,10 +588,16 @@ impl MaybeSimdOps for f64 {}
 impl MaybeSimdProduct for f64 {}
 #[cfg(not(feature = "simd"))]
 impl MaybeSimdSumSquares for f64 {}
+#[cfg(not(feature = "simd"))]
+impl MaybeSimdBlockFold for f32 {}
+#[cfg(not(feature = "simd"))]
+impl MaybeSimdBlockFold for f64 {}
 
 #[cfg(feature = "simd")]
 mod simd_impls {
-    use super::{MaybeSimdOps, MaybeSimdProduct, MaybeSimdSumSquares, BLOCK_FOLD_MIN_LEN};
+    use super::{
+        MaybeSimdBlockFold, MaybeSimdOps, MaybeSimdProduct, MaybeSimdSumSquares, BLOCK_FOLD_MIN_LEN,
+    };
     use pulp::{Simd, WithSimd};
 
     impl MaybeSimdOps for f32 {
@@ -627,29 +642,6 @@ mod simd_impls {
         fn try_simd_dot(a: &[f32], b: &[f32]) -> Option<f32> {
             try_simd_dot_f32(a, b)
         }
-        fn try_simd_add_block(acc: &mut [f32], values: &[f32]) -> bool {
-            if acc.len() < BLOCK_FOLD_MIN_LEN {
-                return false;
-            }
-            struct AddBlock<'a, 'b>(&'a mut [f32], &'b [f32]);
-            impl pulp::WithSimd for AddBlock<'_, '_> {
-                type Output = ();
-                #[inline(always)]
-                fn with_simd<S: Simd>(self, simd: S) {
-                    let (ah, at) = S::as_mut_simd_f32s(self.0);
-                    let (vh, vt) = S::as_simd_f32s(self.1);
-                    let n = ah.len().min(vh.len());
-                    for i in 0..n {
-                        ah[i] = simd.add_f32s(ah[i], vh[i]);
-                    }
-                    for (a, &v) in at.iter_mut().zip(vt) {
-                        *a += v;
-                    }
-                }
-            }
-            pulp::Arch::new().dispatch(AddBlock(acc, values));
-            true
-        }
     }
 
     impl MaybeSimdProduct for f32 {
@@ -690,57 +682,9 @@ mod simd_impls {
 
             Some(pulp::Arch::new().dispatch(Product(src)))
         }
-        fn try_simd_mul_block(acc: &mut [f32], values: &[f32]) -> bool {
-            if acc.len() < BLOCK_FOLD_MIN_LEN {
-                return false;
-            }
-            struct MulBlock<'a, 'b>(&'a mut [f32], &'b [f32]);
-            impl pulp::WithSimd for MulBlock<'_, '_> {
-                type Output = ();
-                #[inline(always)]
-                fn with_simd<S: Simd>(self, simd: S) {
-                    let (ah, at) = S::as_mut_simd_f32s(self.0);
-                    let (vh, vt) = S::as_simd_f32s(self.1);
-                    let n = ah.len().min(vh.len());
-                    for i in 0..n {
-                        ah[i] = simd.mul_f32s(ah[i], vh[i]);
-                    }
-                    for (a, &v) in at.iter_mut().zip(vt) {
-                        *a *= v;
-                    }
-                }
-            }
-            pulp::Arch::new().dispatch(MulBlock(acc, values));
-            true
-        }
     }
 
     impl MaybeSimdSumSquares for f32 {
-        fn try_simd_sum_squares_block(acc: &mut [f32], values: &[f32]) -> bool {
-            if acc.len() < BLOCK_FOLD_MIN_LEN {
-                return false;
-            }
-            struct SumSquaresBlock<'a, 'b>(&'a mut [f32], &'b [f32]);
-            impl pulp::WithSimd for SumSquaresBlock<'_, '_> {
-                type Output = ();
-                #[inline(always)]
-                fn with_simd<S: Simd>(self, simd: S) {
-                    let (ah, at) = S::as_mut_simd_f32s(self.0);
-                    let (vh, vt) = S::as_simd_f32s(self.1);
-                    let n = ah.len().min(vh.len());
-                    for i in 0..n {
-                        let sq = simd.mul_f32s(vh[i], vh[i]);
-                        ah[i] = simd.add_f32s(ah[i], sq);
-                    }
-                    for (a, &v) in at.iter_mut().zip(vt) {
-                        *a += v * v;
-                    }
-                }
-            }
-            pulp::Arch::new().dispatch(SumSquaresBlock(acc, values));
-            true
-        }
-
         fn try_simd_sum_squares(src: &[f32]) -> Option<f32> {
             struct SumSquares<'a>(&'a [f32]);
             impl<'a> WithSimd for SumSquares<'a> {
@@ -830,6 +774,80 @@ mod simd_impls {
         Some(pulp::Arch::new().dispatch(Dot { a, b }))
     }
 
+    impl MaybeSimdBlockFold for f32 {
+        fn try_simd_add_block(acc: &mut [f32], values: &[f32]) -> bool {
+            if acc.len() < BLOCK_FOLD_MIN_LEN {
+                return false;
+            }
+            struct AddBlock<'a, 'b>(&'a mut [f32], &'b [f32]);
+            impl pulp::WithSimd for AddBlock<'_, '_> {
+                type Output = ();
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) {
+                    let (ah, at) = S::as_mut_simd_f32s(self.0);
+                    let (vh, vt) = S::as_simd_f32s(self.1);
+                    // Equal block lengths are the trait contract, so the vector
+                    // prefix and the scalar tail cover the same indices.
+                    for (a, &v) in ah.iter_mut().zip(vh) {
+                        *a = simd.add_f32s(*a, v);
+                    }
+                    for (a, &v) in at.iter_mut().zip(vt) {
+                        *a += v;
+                    }
+                }
+            }
+            pulp::Arch::new().dispatch(AddBlock(acc, values));
+            true
+        }
+
+        fn try_simd_mul_block(acc: &mut [f32], values: &[f32]) -> bool {
+            if acc.len() < BLOCK_FOLD_MIN_LEN {
+                return false;
+            }
+            struct MulBlock<'a, 'b>(&'a mut [f32], &'b [f32]);
+            impl pulp::WithSimd for MulBlock<'_, '_> {
+                type Output = ();
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) {
+                    let (ah, at) = S::as_mut_simd_f32s(self.0);
+                    let (vh, vt) = S::as_simd_f32s(self.1);
+                    for (a, &v) in ah.iter_mut().zip(vh) {
+                        *a = simd.mul_f32s(*a, v);
+                    }
+                    for (a, &v) in at.iter_mut().zip(vt) {
+                        *a *= v;
+                    }
+                }
+            }
+            pulp::Arch::new().dispatch(MulBlock(acc, values));
+            true
+        }
+
+        fn try_simd_sum_squares_block(acc: &mut [f32], values: &[f32]) -> bool {
+            if acc.len() < BLOCK_FOLD_MIN_LEN {
+                return false;
+            }
+            struct SumSquaresBlock<'a, 'b>(&'a mut [f32], &'b [f32]);
+            impl pulp::WithSimd for SumSquaresBlock<'_, '_> {
+                type Output = ();
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) {
+                    let (ah, at) = S::as_mut_simd_f32s(self.0);
+                    let (vh, vt) = S::as_simd_f32s(self.1);
+                    for (a, &v) in ah.iter_mut().zip(vh) {
+                        let sq = simd.mul_f32s(v, v);
+                        *a = simd.add_f32s(*a, sq);
+                    }
+                    for (a, &v) in at.iter_mut().zip(vt) {
+                        *a += v * v;
+                    }
+                }
+            }
+            pulp::Arch::new().dispatch(SumSquaresBlock(acc, values));
+            true
+        }
+    }
+
     impl MaybeSimdOps for f64 {
         fn try_simd_sum(src: &[f64]) -> Option<f64> {
             struct Sum<'a>(&'a [f64]);
@@ -872,29 +890,6 @@ mod simd_impls {
         fn try_simd_dot(a: &[f64], b: &[f64]) -> Option<f64> {
             try_simd_dot_f64(a, b)
         }
-        fn try_simd_add_block(acc: &mut [f64], values: &[f64]) -> bool {
-            if acc.len() < BLOCK_FOLD_MIN_LEN {
-                return false;
-            }
-            struct AddBlock<'a, 'b>(&'a mut [f64], &'b [f64]);
-            impl pulp::WithSimd for AddBlock<'_, '_> {
-                type Output = ();
-                #[inline(always)]
-                fn with_simd<S: Simd>(self, simd: S) {
-                    let (ah, at) = S::as_mut_simd_f64s(self.0);
-                    let (vh, vt) = S::as_simd_f64s(self.1);
-                    let n = ah.len().min(vh.len());
-                    for i in 0..n {
-                        ah[i] = simd.add_f64s(ah[i], vh[i]);
-                    }
-                    for (a, &v) in at.iter_mut().zip(vt) {
-                        *a += v;
-                    }
-                }
-            }
-            pulp::Arch::new().dispatch(AddBlock(acc, values));
-            true
-        }
     }
 
     impl MaybeSimdProduct for f64 {
@@ -935,57 +930,9 @@ mod simd_impls {
 
             Some(pulp::Arch::new().dispatch(Product(src)))
         }
-        fn try_simd_mul_block(acc: &mut [f64], values: &[f64]) -> bool {
-            if acc.len() < BLOCK_FOLD_MIN_LEN {
-                return false;
-            }
-            struct MulBlock<'a, 'b>(&'a mut [f64], &'b [f64]);
-            impl pulp::WithSimd for MulBlock<'_, '_> {
-                type Output = ();
-                #[inline(always)]
-                fn with_simd<S: Simd>(self, simd: S) {
-                    let (ah, at) = S::as_mut_simd_f64s(self.0);
-                    let (vh, vt) = S::as_simd_f64s(self.1);
-                    let n = ah.len().min(vh.len());
-                    for i in 0..n {
-                        ah[i] = simd.mul_f64s(ah[i], vh[i]);
-                    }
-                    for (a, &v) in at.iter_mut().zip(vt) {
-                        *a *= v;
-                    }
-                }
-            }
-            pulp::Arch::new().dispatch(MulBlock(acc, values));
-            true
-        }
     }
 
     impl MaybeSimdSumSquares for f64 {
-        fn try_simd_sum_squares_block(acc: &mut [f64], values: &[f64]) -> bool {
-            if acc.len() < BLOCK_FOLD_MIN_LEN {
-                return false;
-            }
-            struct SumSquaresBlock<'a, 'b>(&'a mut [f64], &'b [f64]);
-            impl pulp::WithSimd for SumSquaresBlock<'_, '_> {
-                type Output = ();
-                #[inline(always)]
-                fn with_simd<S: Simd>(self, simd: S) {
-                    let (ah, at) = S::as_mut_simd_f64s(self.0);
-                    let (vh, vt) = S::as_simd_f64s(self.1);
-                    let n = ah.len().min(vh.len());
-                    for i in 0..n {
-                        let sq = simd.mul_f64s(vh[i], vh[i]);
-                        ah[i] = simd.add_f64s(ah[i], sq);
-                    }
-                    for (a, &v) in at.iter_mut().zip(vt) {
-                        *a += v * v;
-                    }
-                }
-            }
-            pulp::Arch::new().dispatch(SumSquaresBlock(acc, values));
-            true
-        }
-
         fn try_simd_sum_squares(src: &[f64]) -> Option<f64> {
             struct SumSquares<'a>(&'a [f64]);
             impl<'a> WithSimd for SumSquares<'a> {
@@ -1073,6 +1020,80 @@ mod simd_impls {
         }
 
         Some(pulp::Arch::new().dispatch(Dot { a, b }))
+    }
+
+    impl MaybeSimdBlockFold for f64 {
+        fn try_simd_add_block(acc: &mut [f64], values: &[f64]) -> bool {
+            if acc.len() < BLOCK_FOLD_MIN_LEN {
+                return false;
+            }
+            struct AddBlock<'a, 'b>(&'a mut [f64], &'b [f64]);
+            impl pulp::WithSimd for AddBlock<'_, '_> {
+                type Output = ();
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) {
+                    let (ah, at) = S::as_mut_simd_f64s(self.0);
+                    let (vh, vt) = S::as_simd_f64s(self.1);
+                    // Equal block lengths are the trait contract, so the vector
+                    // prefix and the scalar tail cover the same indices.
+                    for (a, &v) in ah.iter_mut().zip(vh) {
+                        *a = simd.add_f64s(*a, v);
+                    }
+                    for (a, &v) in at.iter_mut().zip(vt) {
+                        *a += v;
+                    }
+                }
+            }
+            pulp::Arch::new().dispatch(AddBlock(acc, values));
+            true
+        }
+
+        fn try_simd_mul_block(acc: &mut [f64], values: &[f64]) -> bool {
+            if acc.len() < BLOCK_FOLD_MIN_LEN {
+                return false;
+            }
+            struct MulBlock<'a, 'b>(&'a mut [f64], &'b [f64]);
+            impl pulp::WithSimd for MulBlock<'_, '_> {
+                type Output = ();
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) {
+                    let (ah, at) = S::as_mut_simd_f64s(self.0);
+                    let (vh, vt) = S::as_simd_f64s(self.1);
+                    for (a, &v) in ah.iter_mut().zip(vh) {
+                        *a = simd.mul_f64s(*a, v);
+                    }
+                    for (a, &v) in at.iter_mut().zip(vt) {
+                        *a *= v;
+                    }
+                }
+            }
+            pulp::Arch::new().dispatch(MulBlock(acc, values));
+            true
+        }
+
+        fn try_simd_sum_squares_block(acc: &mut [f64], values: &[f64]) -> bool {
+            if acc.len() < BLOCK_FOLD_MIN_LEN {
+                return false;
+            }
+            struct SumSquaresBlock<'a, 'b>(&'a mut [f64], &'b [f64]);
+            impl pulp::WithSimd for SumSquaresBlock<'_, '_> {
+                type Output = ();
+                #[inline(always)]
+                fn with_simd<S: Simd>(self, simd: S) {
+                    let (ah, at) = S::as_mut_simd_f64s(self.0);
+                    let (vh, vt) = S::as_simd_f64s(self.1);
+                    for (a, &v) in ah.iter_mut().zip(vh) {
+                        let sq = simd.mul_f64s(v, v);
+                        *a = simd.add_f64s(*a, sq);
+                    }
+                    for (a, &v) in at.iter_mut().zip(vt) {
+                        *a += v * v;
+                    }
+                }
+            }
+            pulp::Arch::new().dispatch(SumSquaresBlock(acc, values));
+            true
+        }
     }
 }
 

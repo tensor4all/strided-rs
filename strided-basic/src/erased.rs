@@ -1165,6 +1165,7 @@ trait ErasedReduceScalar:
     + crate::simd::MaybeSimdOps
     + crate::simd::MaybeSimdProduct
     + crate::simd::MaybeSimdSumSquares
+    + crate::simd::MaybeSimdBlockFold
 {
     fn reduce_sum(lhs: Self, rhs: Self) -> Self;
     fn reduce_product(lhs: Self, rhs: Self) -> Self;
