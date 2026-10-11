@@ -16,7 +16,7 @@ use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use core::mem::MaybeUninit;
 use std::ops::Mul;
-use strided_view::ElementOp;
+use strided_view::{ElementOp, Identity};
 
 #[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
@@ -170,18 +170,49 @@ fn validate_typed_no_overlap<D, A, Op: ElementOp<A>>(
 // Pointwise leaves use wrapping advances: the unused final cursor may lie
 // outside the allocation for negative or gapped strides.
 /// Unary inner loop: `dest[i] = f(Op::apply(src[i]))` for `len` elements.
-#[inline(always)]
-unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>>(
+///
+/// A vectorized kernel a map operation offers its flat runs to.
+///
+/// [`NoKernel`] is what the entry points without a kernel pass, so the check it introduces is
+/// monomorphized away; [`SliceKernel`] adapts the closure a caller supplied.
+trait MapKernel<A, D> {
+    /// Writes every element of `dst` from `src`, or writes nothing and returns `false`.
+    fn apply(&self, src: &[A], dst: &mut [D]) -> bool;
+}
+
+struct NoKernel;
+
+impl<A, D> MapKernel<A, D> for NoKernel {
+    #[inline(always)]
+    fn apply(&self, _src: &[A], _dst: &mut [D]) -> bool {
+        false
+    }
+}
+
+struct SliceKernel<K>(K);
+
+impl<A, D, K: Fn(&[A], &mut [D]) -> bool> MapKernel<A, D> for SliceKernel<K> {
+    #[inline(always)]
+    fn apply(&self, src: &[A], dst: &mut [D]) -> bool {
+        (self.0)(src, dst)
+    }
+}
+
+unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>, K: MapKernel<A, D>>(
     dp: *mut D,
     ds: isize,
     sp: *const A,
     ss: isize,
     len: usize,
     f: &impl Fn(A) -> D,
+    kernel: &K,
 ) {
     if ds == 1 && ss == 1 {
         let src = std::slice::from_raw_parts(sp, len);
         let dst = std::slice::from_raw_parts_mut(dp, len);
+        if kernel.apply(src, dst) {
+            return;
+        }
         simd::dispatch_if_large(len, || {
             for (d, s) in dst.iter_mut().zip(src.iter()) {
                 *d = f(Op::apply(*s));
@@ -1115,7 +1146,7 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     src: &StridedView<A, Op>,
     f: impl Fn(A) -> D + MaybeSync,
 ) -> Result<()> {
-    map_parts_into::<D, A, Op>(
+    map_parts_into::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
@@ -1123,6 +1154,7 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
         src.dims(),
         src.strides(),
         f,
+        &NoKernel,
     )
 }
 
@@ -1137,14 +1169,73 @@ pub(crate) fn map_into_validated<
     validated: ValidatedDestinationLayout,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
-    map_parts_into_validated::<D, A, Op>(
+    map_parts_into_validated::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
         src.ptr(),
         src.strides(),
         f,
+        &NoKernel,
         validated,
+    )
+}
+
+/// Apply an element-wise function into a potentially uninitialized destination, handing a
+/// vectorized kernel the flat runs it can take.
+///
+/// `kernel` is offered a flat, unit-stride run whenever this crate has one to give: the whole
+/// buffer when the two views share a contiguous layout and the operation runs sequentially, and
+/// one block at a time on the parallel path. It must write every element of the run or write
+/// nothing — returning `false` makes that run fall back to `scalar`, element by element. Runs whose
+/// strides are not both 1 never reach it. It is called from whichever threads this crate's
+/// execution policy selected, so it must be `Sync`.
+///
+/// The point of the entry point is that a caller which owns vector kernels — a SIMD math library,
+/// say — reuses this crate's layout logic and this crate's threading decision instead of
+/// rebuilding either. `scalar` and `kernel` must agree up to the caller's own error bound; this
+/// crate only guarantees that every destination element is written exactly once.
+///
+/// # Examples
+/// ```
+/// use std::mem::MaybeUninit;
+/// use strided_basic::{map_into_uninit_with_kernel, StridedView, StridedViewMut};
+///
+/// let src = vec![1.0f64, 2.0, 3.0];
+/// let mut out = vec![MaybeUninit::<f64>::uninit(); 3];
+/// let mut dest = StridedViewMut::new(&mut out, &[3], &[1], 0).unwrap();
+/// let source = StridedView::new(&src, &[3], &[1], 0).unwrap();
+/// let kernel = |src: &[f64], dst: &mut [MaybeUninit<f64>]| {
+///     for (slot, value) in dst.iter_mut().zip(src) {
+///         slot.write(value * 2.0);
+///     }
+///     true
+/// };
+/// map_into_uninit_with_kernel(&mut dest, &source, kernel, |x| x * 2.0).unwrap();
+/// // SAFETY: the kernel wrote every element.
+/// let values: Vec<f64> = out.into_iter().map(|x| unsafe { x.assume_init() }).collect();
+/// assert_eq!(values, [2.0, 4.0, 6.0]);
+/// ```
+///
+/// # Errors
+/// Returns [`StridedError::ShapeMismatch`] when the shapes differ and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout cannot be proven
+/// injective.
+pub fn map_into_uninit_with_kernel<T: Copy + MaybeSendSync>(
+    dest: &mut StridedViewMut<MaybeUninit<T>>,
+    src: &StridedView<T>,
+    kernel: impl Fn(&[T], &mut [MaybeUninit<T>]) -> bool + Sync,
+    scalar: impl Fn(T) -> T + MaybeSync,
+) -> Result<()> {
+    map_parts_into::<MaybeUninit<T>, T, Identity, _>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.dims(),
+        src.strides(),
+        |value| MaybeUninit::new(scalar(value)),
+        &SliceKernel(kernel),
     )
 }
 
@@ -1153,7 +1244,7 @@ pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op:
     src: &crate::RawStridedRef<'_, A>,
     f: impl Fn(A) -> D + MaybeSync,
 ) -> Result<()> {
-    map_parts_into::<D, A, Op>(
+    map_parts_into::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
@@ -1161,6 +1252,7 @@ pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op:
         src.dims(),
         src.strides(),
         f,
+        &NoKernel,
     )
 }
 
@@ -1175,19 +1267,25 @@ pub(crate) fn map_raw_into_validated<
     validated: ValidatedDestinationLayout,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
-    map_parts_into_validated::<D, A, Op>(
+    map_parts_into_validated::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
         src.ptr(),
         src.strides(),
         f,
+        &NoKernel,
         validated,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn map_parts_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+fn map_parts_into<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    Op: ElementOp<A>,
+    K: MapKernel<A, D> + Sync,
+>(
     dst_ptr: *mut D,
     dst_dims: &[usize],
     dst_strides: &[isize],
@@ -1195,34 +1293,48 @@ fn map_parts_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementO
     src_dims: &[usize],
     src_strides: &[isize],
     f: impl Fn(A) -> D + MaybeSync,
+    kernel: &K,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, src_dims)?;
     let validated = validate_destination_layout(dst_dims, dst_strides)?;
-    map_parts_into_validated::<D, A, Op>(
+    map_parts_into_validated::<D, A, Op, K>(
         dst_ptr,
         dst_dims,
         dst_strides,
         src_ptr,
         src_strides,
         f,
+        kernel,
         validated,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+fn map_parts_into_validated<
+    D: Copy + MaybeSendSync,
+    A: Copy + MaybeSendSync,
+    Op: ElementOp<A>,
+    K: MapKernel<A, D> + Sync,
+>(
     dst_ptr: *mut D,
     dst_dims: &[usize],
     dst_strides: &[isize],
     src_ptr: *const A,
     src_strides: &[isize],
     f: impl Fn(A) -> D + MaybeSync,
+    kernel: &K,
     _validated: ValidatedDestinationLayout,
 ) -> Result<()> {
     if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
         let len = total_len(dst_dims)?;
+        // SAFETY: the contiguous-layout check proves that `dst` and `src` address `len` elements in
+        // the same order starting at their base pointer, so each is exactly a flat run of `len`
+        // elements.
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
+        if kernel.apply(src, dst) {
+            return Ok(());
+        }
         simd::dispatch_if_large(len, || {
             for i in 0..len {
                 dst[i] = f(Op::apply(src[i]));
@@ -1272,7 +1384,9 @@ fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op
                             let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
                             let sp = unsafe { src_send.as_const().offset(offsets[1]) };
                             unsafe {
-                                inner_loop_map1::<D, A, Op>(dp, strides[0], sp, strides[1], len, &f)
+                                inner_loop_map1::<D, A, Op, K>(
+                                    dp, strides[0], sp, strides[1], len, &f, kernel,
+                                )
                             };
                             Ok(())
                         },
@@ -1291,7 +1405,9 @@ fn map_parts_into_validated<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op
         |offsets, len, strides| {
             let dp = unsafe { dst_ptr.offset(offsets[0]) };
             let sp = unsafe { src_ptr.offset(offsets[1]) };
-            unsafe { inner_loop_map1::<D, A, Op>(dp, strides[0], sp, strides[1], len, &f) };
+            unsafe {
+                inner_loop_map1::<D, A, Op, K>(dp, strides[0], sp, strides[1], len, &f, kernel)
+            };
             Ok(())
         },
     )
