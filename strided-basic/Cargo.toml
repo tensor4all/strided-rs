@@ -35,3 +35,8 @@ num-complex.workspace = true
 
 [lib]
 bench = false
+
+[[bench]]
+name = "map_uninit_kernel"
+harness = false
+required-features = ["parallel"]
