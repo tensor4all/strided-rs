@@ -95,7 +95,8 @@ pub use exec_context::ExecContext;
 pub use execution_policy::{with_execution_policy, ExecutionPolicy};
 pub use map_view::{
     broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
-    mul_into, mul_into_uninit, zip_map2_into, zip_map3_into, zip_map4_into, CompareOp,
+    map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
+    zip_map4_into, CompareOp,
 };
 pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 pub use ops_view::{
