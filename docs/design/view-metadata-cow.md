@@ -100,3 +100,29 @@ A view's metadata is `Cow<'a, [usize]>` / `Cow<'a, [isize]>`:
 - No kernel strategy, threshold or fast path changed, so no benchmark row is
   added and no performance claim is made here beyond the construction
   measurements above.
+
+## Measured after
+
+AMD Ryzen AI 9 HX 470, Linux x86-64, rustc 1.99.0, release, `taskset -c 2`
+(1T), 1e6 iterations, `strided-view/examples/view_cost_portable.rs` — the same
+file compiled against `origin/main` (0.4.8) and this branch (0.5.0), median of
+three rounds:
+
+| | 0.4.8 | 0.5.0 |
+| --- | --- | --- |
+| one `StridedView::new` | 26.8 ns | 2.7 ns |
+| three views (a, b, d) | 81.3 ns | 7.7 ns |
+| `RawStridedRef::new` (untouched control) | 2.3 ns | 2.3 ns |
+
+End to end in the caller, one warm prepared `BinaryPlan<f64>` over 2x2
+column-major operands with `Exec::serial_with_workspace` (explicit 1T),
+`cpueinsum-rs/crates/cpueinsum/examples/op_overhead.rs`:
+
+| route | 0.4.8 | 0.5.0 |
+| --- | --- | --- |
+| `execute_into`, three views built per call | 92.5 ns/call | 20.2 ns/call |
+| `execute_slices` (no view) | 18.3 ns/call | 18.7 ns/call |
+| wrapper delta | 74.2 ns | 1.6 ns |
+
+The three views alone fall from 74.0 ns to 5.2 ns, which is the whole of the
+delta; the call is no longer distinguishable from the slice path.
