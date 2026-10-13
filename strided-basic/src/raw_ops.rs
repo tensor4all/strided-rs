@@ -1,12 +1,11 @@
 //! Allocation-free copy/axpy over borrowed raw strided layouts.
 //!
-//! [`StridedView`]/[`StridedViewMut`] own their metadata (`Arc<[usize]>` /
-//! `Arc<[isize]>`) and the map/zip kernels build a traversal plan per call;
-//! for small replay copies that fixed cost dominates. These entry points take
-//! [`RawStridedRef`]/[`RawStridedMut`] (borrowed metadata), fuse the stride
-//! pair into a stack-allocated loop nest, and run plain loops - no heap
-//! allocation on any call path with rank at most [`RAW_FUSED_RANK_LIMIT`].
-//! Higher ranks fall back to the view-based kernels.
+//! The map/zip kernels build a traversal plan per call; for small replay
+//! copies that fixed cost dominates. These entry points take
+//! [`RawStridedRef`]/[`RawStridedMut`], fuse the stride pair into a
+//! stack-allocated loop nest, and run plain loops - no heap allocation on any
+//! call path with rank at most [`RAW_FUSED_RANK_LIMIT`]. Higher ranks fall
+//! back to the view-based kernels.
 
 use crate::ops_view::{axpy, copy_scale};
 use crate::{ElementOpApply, RawStridedMut, RawStridedRef, Result};

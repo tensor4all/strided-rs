@@ -24,8 +24,8 @@ fn check3<OD: ElementOp<C64>, OA: ElementOp<C64>, OB: ElementOp<C64>>() {
     let b = vals(2, n);
     let start = vals(3, m * n);
     // A reversed on both axes, B broadcast along axis 0, D row-major.
-    let av =
-        StridedView::<C64, OA>::new(&a, &dims, &[-1, -(m as isize)], (m * n - 1) as isize).unwrap();
+    let a_strides = [-1isize, -(m as isize)];
+    let av = StridedView::<C64, OA>::new(&a, &dims, &a_strides, (m * n - 1) as isize).unwrap();
     let bv = StridedView::<C64, OB>::new(&b, &dims, &[0, 1], 0).unwrap();
     let ds = [n as isize, 1];
     let mut got = start.clone();
@@ -96,10 +96,12 @@ fn threaded_update_equals_serial_and_formula() {
     let start = vals(8, m * n);
     let run = |ctx: ExecContext| {
         let mut out = start.clone();
-        let av = StridedView::<C64, Identity>::new(&a, &dims, &[n as isize, 1], 0).unwrap();
-        let bv = StridedView::<C64, Conj>::new(&b, &dims, &[1, m as isize], 0).unwrap();
+        let row_major = [n as isize, 1];
+        let col_major = [1isize, m as isize];
+        let av = StridedView::<C64, Identity>::new(&a, &dims, &row_major, 0).unwrap();
+        let bv = StridedView::<C64, Conj>::new(&b, &dims, &col_major, 0).unwrap();
         ctx.run(|| {
-            let mut dv = StridedViewMut::new(&mut out, &dims, &[1, m as isize], 0).unwrap();
+            let mut dv = StridedViewMut::new(&mut out, &dims, &col_major, 0).unwrap();
             zip_update3_into::<_, _, _, Conj, Identity, Conj>(&mut dv, &av, &bv, |d, a, b| {
                 d + a * b
             })

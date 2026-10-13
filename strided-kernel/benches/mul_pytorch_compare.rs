@@ -421,7 +421,8 @@ fn run_batched_outer_noncompact_torchlike_output<T: BenchScalar>(
     let rhs = make_col_major::<T>(&[o, t], 18);
     let mut out = StridedArray::<T>::col_major(&[j, k, o, t]);
     let out_strides = [j as isize, 1, (j * k) as isize, (j * k * o) as isize];
-    let mut out_view = StridedViewMut::new(out.data_mut(), &[j, k, o, t], &out_strides, 0).unwrap();
+    let out_dims = [j, k, o, t];
+    let mut out_view = StridedViewMut::new(out.data_mut(), &out_dims, &out_strides, 0).unwrap();
     measure(|| {
         batched_outer_product_into(&mut out_view, &lhs, &rhs.view(), 2, 1).unwrap();
         black_box(out_view.as_mut_ptr());

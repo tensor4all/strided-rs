@@ -35,7 +35,10 @@ fn test_map_into_transposed() {
 fn assert_map_arity_rejects_noninjective_destination(len: usize) {
     let source = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64);
     let mut output = [7.0_f64];
-    let mut dest = strided_basic::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+    let dims = [len];
+    let broadcast_stride = [0isize];
+    let mut dest =
+        strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
     let error = map_into(&mut dest, &source.view(), |x| x + 1.0);
 
@@ -52,7 +55,10 @@ fn assert_zip_map2_arity_rejects_noninjective_destination(len: usize) {
     let a = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64);
     let b = StridedArray::<f64>::from_fn_col_major(&[len], |idx| (2 * idx[0]) as f64);
     let mut output = [7.0_f64];
-    let mut dest = strided_basic::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+    let dims = [len];
+    let broadcast_stride = [0isize];
+    let mut dest =
+        strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
     let error = zip_map2_into(&mut dest, &a.view(), &b.view(), |x, y| x + y);
 
@@ -187,7 +193,10 @@ fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
     let lhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 1.0);
     let rhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 2.0);
     let mut output = [7.0_f64];
-    let mut dest = strided_basic::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+    let dims = [len];
+    let broadcast_stride = [0isize];
+    let mut dest =
+        strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
     let error = mul_into(&mut dest, &lhs.view(), &rhs.view());
 
@@ -197,7 +206,10 @@ fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
     let lhs = StridedArray::<f64>::from_fn_col_major(&[1], |_| 2.0);
     let rhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 2.0);
     let mut output = [7.0_f64];
-    let mut dest = strided_basic::StridedViewMut::new(&mut output, &[len], &[0], 0).unwrap();
+    let dims = [len];
+    let broadcast_stride = [0isize];
+    let mut dest =
+        strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
     let error = broadcast_mul_into(&mut dest, &lhs.view(), &[0], &rhs.view(), &[0]);
 

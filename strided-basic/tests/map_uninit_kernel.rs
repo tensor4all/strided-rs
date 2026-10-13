@@ -150,8 +150,10 @@ fn the_parallel_path_offers_each_block_a_run() {
                 max_threads: NonZeroUsize::new(4).unwrap(),
             },
             || {
-                let mut dest = StridedViewMut::new(&mut out, &[extent], &[1], 0).unwrap();
-                let view = StridedView::new(&source, &[extent], &[1], 0).unwrap();
+                let dims = [extent];
+                let unit = [1isize];
+                let mut dest = StridedViewMut::new(&mut out, &dims, &unit, 0).unwrap();
+                let view = StridedView::new(&source, &dims, &unit, 0).unwrap();
                 map_into_uninit_with_kernel(
                     &mut dest,
                     &view,

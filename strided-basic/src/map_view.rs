@@ -2009,12 +2009,23 @@ fn broadcast_strides_for_axes(
     Ok(strides)
 }
 
+/// A view of `view`'s data with stride-0 broadcast axes, owning the metadata.
+///
+/// The metadata is computed for this call only and the caller's `dest` must
+/// stay mutable while the returned view is used, so the view cannot borrow it.
 fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     view: &StridedView<'a, T, Op>,
     target_dims: &[usize],
     strides: &[isize],
 ) -> StridedView<'a, T, Op> {
-    unsafe { StridedView::new_unchecked(view.data(), target_dims, strides, view.offset()) }
+    unsafe {
+        StridedView::new_owned_unchecked(
+            view.data(),
+            target_dims.to_vec(),
+            strides.to_vec(),
+            view.offset(),
+        )
+    }
 }
 
 /// Broadcasted element-wise multiplication: `dest[i] = a[i] * b[i]`.

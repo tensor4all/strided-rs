@@ -72,7 +72,7 @@ pub fn check_static_indexing_dtype(dtype: KernelDType) -> Result<()> {
         }),
     }
 }
-/// Borrow initialized element storage with owning view metadata.
+/// Borrow initialized element storage and its descriptor metadata.
 ///
 /// # Examples
 ///

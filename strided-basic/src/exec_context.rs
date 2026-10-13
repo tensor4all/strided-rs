@@ -100,6 +100,59 @@ impl ExecContext {
     }
 }
 
+#[cfg(feature = "parallel")]
+impl ExecContext {
+    /// Enter `pool` for `operation`, bounding fanout to `max_threads` workers.
+    ///
+    /// Placement belongs to the caller: this never creates a pool, and the
+    /// operation runs on the pool it is handed rather than on whichever pool
+    /// happens to be installed, so a host that already owns a pool shares that
+    /// one with these kernels instead of risking a second team.
+    ///
+    /// The width is clamped to the pool's worker count. A width of one enters no
+    /// Rayon machinery at all and `operation` sees [`ExecContext::serial`]. When
+    /// the calling thread is already a worker of `pool`, the operation runs in
+    /// place rather than nesting a second team.
+    ///
+    /// # Errors
+    ///
+    /// [`StridedError::InvalidThreadBudget`] when `max_threads` is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_basic::ExecContext;
+    ///
+    /// let pool = rayon::ThreadPoolBuilder::new()
+    ///     .num_threads(2)
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(ExecContext::run_on(&pool, 1, |ctx| ctx.is_serial()).unwrap());
+    /// let limit = ExecContext::run_on(&pool, 2, |ctx| ctx.max_threads_limit()).unwrap();
+    /// assert_eq!(limit.map(|value| value.get()), Some(2));
+    /// ```
+    pub fn run_on<R: Send>(
+        pool: &rayon::ThreadPool,
+        max_threads: usize,
+        operation: impl FnOnce(ExecContext) -> R + Send,
+    ) -> Result<R> {
+        let budget = NonZeroUsize::new(max_threads)
+            .ok_or(StridedError::InvalidThreadBudget { max_threads })?;
+        let width = budget.get().min(pool.current_num_threads());
+        if width <= 1 {
+            let ctx = Self::serial();
+            return Ok(ctx.run(|| operation(ctx)));
+        }
+        let ctx = Self::max_threads(width)?;
+        let run = move || ctx.run(|| operation(ctx));
+        if pool.current_thread_index().is_some() {
+            Ok(run())
+        } else {
+            Ok(pool.install(run))
+        }
+    }
+}
+
 impl Default for ExecContext {
     #[inline]
     fn default() -> Self {
