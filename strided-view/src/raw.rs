@@ -736,10 +736,10 @@ impl<'a, T> RawStridedRef<'a, T> {
         }
     }
 
-    /// Convert to an immutable owning-metadata view.
+    /// Convert to an immutable view, borrowing this descriptor's metadata.
     ///
-    /// This is for compatibility paths. Hot prepared paths should use the raw
-    /// accessors directly and avoid this conversion.
+    /// The conversion allocates nothing; hot prepared paths use the raw
+    /// accessors directly all the same.
     #[inline]
     pub fn as_view(&self) -> StridedView<'a, T, Identity> {
         unsafe { StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset) }
@@ -837,19 +837,19 @@ impl<'a, T> RawStridedMut<'a, T> {
         }
     }
 
-    /// Convert to an immutable owning-metadata view.
+    /// Convert to an immutable view, borrowing this descriptor's metadata.
     ///
-    /// This is for compatibility paths. Hot prepared paths should use the raw
-    /// accessors directly and avoid this conversion.
+    /// The conversion allocates nothing; hot prepared paths use the raw
+    /// accessors directly all the same.
     #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
         unsafe { StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 
-    /// Convert to a mutable owning-metadata view.
+    /// Convert to a mutable view, borrowing this descriptor's metadata.
     ///
-    /// This is for compatibility paths. Hot prepared paths should use the raw
-    /// accessors directly and avoid this conversion.
+    /// The conversion allocates nothing; hot prepared paths use the raw
+    /// accessors directly all the same.
     #[inline]
     pub fn as_view_mut(&mut self) -> StridedViewMut<'_, T> {
         unsafe { StridedViewMut::new_unchecked(self.data, self.dims, self.strides, self.offset) }

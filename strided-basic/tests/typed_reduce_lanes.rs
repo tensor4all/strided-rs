@@ -202,7 +202,9 @@ fn typed_contiguous_fold_seeds_init_once() {
     // lane count and the vector width.
     for len in [0usize, 1, 15, 16, 31, 32, 33, 47, 48, 100, 1001] {
         let data = int_data(len);
-        let view = StridedView::<i64>::new(&data, &[len], &[1], 0).unwrap();
+        let dims = [len];
+        let unit = [1isize];
+        let view = StridedView::<i64>::new(&data, &dims, &unit, 0).unwrap();
         let want = data.iter().fold(1000i64, |acc, &x| acc.wrapping_add(x));
         let got = with_execution_policy(ExecutionPolicy::Sequential, || {
             reduce(&view, |x| x, i64::wrapping_add, 1000).unwrap()
@@ -281,7 +283,8 @@ fn typed_reduce_axis_column_sweep_is_thread_count_independent() {
     let data: Vec<f64> = (0..dims[0] * dims[1])
         .map(|i| 1.0 / (1.0 + i as f64))
         .collect();
-    let view = StridedView::<f64>::new(&data, &dims, &[1, dims[0] as isize], 0).unwrap();
+    let strides = [1isize, dims[0] as isize];
+    let view = StridedView::<f64>::new(&data, &dims, &strides, 0).unwrap();
     let want: Vec<f64> = (0..dims[0])
         .map(|i| (0..dims[1]).fold(0.25, |acc, j| acc + data[i + j * dims[0]]))
         .collect();

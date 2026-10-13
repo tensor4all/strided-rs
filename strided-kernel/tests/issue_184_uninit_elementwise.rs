@@ -14,7 +14,7 @@ use strided_kernel::{
 
 fn uninit_view<'a, T>(
     data: &'a mut [MaybeUninit<T>],
-    dims: &[usize],
+    dims: &'a [usize],
 ) -> StridedViewMut<'a, MaybeUninit<T>> {
     StridedViewMut::new(data, dims, &[1], 0).unwrap()
 }

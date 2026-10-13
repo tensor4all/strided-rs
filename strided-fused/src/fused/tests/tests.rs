@@ -271,8 +271,10 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
     let len = MINTHREADLENGTH + 65;
     let lhs = vec![ThreadTracked(1); len];
     let rhs = vec![ThreadTracked(2); len];
-    let lhs = StridedView::new(&lhs, &[len], &[1], 0).unwrap();
-    let rhs = StridedView::new(&rhs, &[len], &[1], 0).unwrap();
+    let dims = [len];
+    let unit = [1isize];
+    let lhs = StridedView::new(&lhs, &dims, &unit, 0).unwrap();
+    let rhs = StridedView::new(&rhs, &dims, &unit, 0).unwrap();
     let inputs = [lhs, rhs];
     let plan = FusedPlan {
         input_count: 2,
@@ -286,7 +288,7 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
 
     let caller = std::thread::current().id();
     let mut output = vec![MaybeUninit::uninit(); len];
-    let mut dest = StridedViewMut::new(&mut output, &[len], &[1], 0).unwrap();
+    let mut dest = StridedViewMut::new(&mut output, &dims, &unit, 0).unwrap();
     let validated = validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
     UNINIT_WORKER_IDS.lock().unwrap().clear();
     with_execution_policy(ExecutionPolicy::Rayon { max_threads: four }, || {
@@ -295,7 +297,7 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
     assert_eq!(*UNINIT_WORKER_IDS.lock().unwrap(), vec![caller]);
 
     let mut output = vec![MaybeUninit::uninit(); len];
-    let mut dest = StridedViewMut::new(&mut output, &[len], &[1], 0).unwrap();
+    let mut dest = StridedViewMut::new(&mut output, &dims, &unit, 0).unwrap();
     let validated = validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
     UNINIT_WORKER_IDS.lock().unwrap().clear();
     let ctx = ExecContext::max_threads(2).unwrap();

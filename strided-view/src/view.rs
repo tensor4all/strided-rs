@@ -6,10 +6,15 @@
 //! - [`StridedView`]: Immutable dynamic-rank strided view with lazy element operations
 //! - [`StridedViewMut`]: Mutable dynamic-rank strided view (Identity op only)
 //! - [`StridedArray`]: Owned strided multidimensional array
+//!
+//! A view's shape and strides are `Cow<'a, [_]>`: [`StridedView::new`] borrows
+//! the caller's layout and allocates nothing, while [`StridedView::new_owned`]
+//! (and every derived view, such as [`StridedView::permute`]) owns the layout it
+//! computed. Neither touches a reference count.
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
-use std::sync::Arc;
 
 use crate::element_op::{ComposableElementOp, ElementOp, ElementOpApply, Identity};
 use crate::{Result, StridedError};
@@ -112,19 +117,20 @@ pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
 /// Dynamic-rank immutable strided view with lazy element operations.
 ///
 /// This is the Julia-equivalent `StridedView` type with:
-/// - Dynamic rank (dims/strides are heap-allocated)
+/// - Dynamic rank, with metadata borrowed ([`StridedView::new`], no allocation)
+///   or owned ([`StridedView::new_owned`], for computed metadata)
 /// - Lazy element operations via the `Op` type parameter
 /// - Zero-copy transformations (permute, transpose, adjoint, conj)
 ///
 /// # Type Parameters
-/// - `'a`: Lifetime of the underlying data
+/// - `'a`: Lifetime of the underlying data and of borrowed metadata
 /// - `T`: Element type
 /// - `Op`: Element operation applied lazily on access (default: `Identity`)
 pub struct StridedView<'a, T, Op = Identity> {
     ptr: *const T,
     data: &'a [T],
-    dims: Arc<[usize]>,
-    strides: Arc<[isize]>,
+    dims: Cow<'a, [usize]>,
+    strides: Cow<'a, [isize]>,
     offset: isize,
     _op: PhantomData<Op>,
 }
@@ -155,48 +161,100 @@ impl<T: std::fmt::Debug, Op> std::fmt::Debug for StridedView<'_, T, Op> {
     }
 }
 
+/// The cached base pointer of a view over `data` at `offset`.
+///
+/// An empty layout gets the dangling pointer rather than `data + offset`: a
+/// zero-sized extent may sit at an offset no element of `data` reaches.
+#[inline]
+fn base_ptr<T>(data: &[T], dims: &[usize], offset: isize) -> *const T {
+    if empty_layout(dims) {
+        empty_const_ptr()
+    } else {
+        unsafe { data.as_ptr().offset(offset) }
+    }
+}
+
+/// A view from already-validated metadata, with the element op chosen here.
+#[inline]
+fn from_meta<'a, T, Op>(
+    data: &'a [T],
+    dims: Cow<'a, [usize]>,
+    strides: Cow<'a, [isize]>,
+    offset: isize,
+) -> StridedView<'a, T, Op> {
+    StridedView {
+        ptr: base_ptr(data, &dims, offset),
+        data,
+        dims,
+        strides,
+        offset,
+        _op: PhantomData,
+    }
+}
+
 impl<'a, T, Op> StridedView<'a, T, Op> {
-    /// Create a new immutable strided view from a borrowed slice.
-    pub fn new(data: &'a [T], dims: &[usize], strides: &[isize], offset: isize) -> Result<Self> {
+    /// Create an immutable strided view that borrows the caller's metadata.
+    ///
+    /// This is the allocation-free constructor: `dims` and `strides` must
+    /// outlive the view, which every caller that keeps its layouts does.
+    pub fn new(
+        data: &'a [T],
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
-        let ptr = if empty_layout(dims) {
-            empty_const_ptr()
-        } else {
-            unsafe { data.as_ptr().offset(offset) }
-        };
-        Ok(Self {
-            ptr,
+        Ok(from_meta(
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            Cow::Borrowed(dims),
+            Cow::Borrowed(strides),
             offset,
-            _op: PhantomData,
-        })
+        ))
     }
 
-    /// Create a view without bounds checking.
+    /// Create an immutable strided view that owns computed metadata.
+    ///
+    /// For a caller that computes `dims`/`strides` next to the view, as a
+    /// helper returning a view must. Prefer [`StridedView::new`] otherwise.
+    pub fn new_owned(
+        data: &'a [T],
+        dims: Vec<usize>,
+        strides: Vec<isize>,
+        offset: isize,
+    ) -> Result<Self> {
+        validate_bounds(data.len(), &dims, &strides, offset)?;
+        Ok(from_meta(
+            data,
+            Cow::Owned(dims),
+            Cow::Owned(strides),
+            offset,
+        ))
+    }
+
+    /// Create a view without bounds checking, borrowing the caller's metadata.
     ///
     /// # Safety
     /// The caller must ensure all index combinations stay within bounds.
     pub unsafe fn new_unchecked(
         data: &'a [T],
-        dims: &[usize],
-        strides: &[isize],
+        dims: &'a [usize],
+        strides: &'a [isize],
         offset: isize,
     ) -> Self {
-        let ptr = if empty_layout(dims) {
-            empty_const_ptr()
-        } else {
-            data.as_ptr().offset(offset)
-        };
-        Self {
-            ptr,
-            data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
-            offset,
-            _op: PhantomData,
-        }
+        from_meta(data, Cow::Borrowed(dims), Cow::Borrowed(strides), offset)
+    }
+
+    /// Create a view without bounds checking, owning the metadata.
+    ///
+    /// # Safety
+    /// As [`StridedView::new_unchecked`].
+    pub unsafe fn new_owned_unchecked(
+        data: &'a [T],
+        dims: Vec<usize>,
+        strides: Vec<isize>,
+        offset: isize,
+    ) -> Self {
+        from_meta(data, Cow::Owned(dims), Cow::Owned(strides), offset)
     }
 
     /// Returns the shape (dimension sizes) of this view.
@@ -265,14 +323,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         }
         let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
         let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
-        Ok(StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::from(new_dims),
-            strides: Arc::from(new_strides),
-            offset: self.offset,
-            _op: PhantomData,
-        })
+        Ok(from_meta(
+            self.data,
+            Cow::Owned(new_dims),
+            Cow::Owned(new_strides),
+            self.offset,
+        ))
     }
 
     /// Create a diagonal view by fusing repeated axis pairs via stride trick (zero-copy).
@@ -317,14 +373,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
             strides.remove(ax);
         }
 
-        unsafe {
-            Ok(StridedView::new_unchecked(
-                self.data(),
-                &dims,
-                &strides,
-                self.offset(),
-            ))
-        }
+        Ok(from_meta(
+            self.data(),
+            Cow::Owned(dims),
+            Cow::Owned(strides),
+            self.offset(),
+        ))
     }
 
     /// Broadcast this view to a target shape.
@@ -350,14 +404,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
                 ));
             }
         }
-        Ok(StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::from(target_dims),
-            strides: Arc::from(new_strides),
-            offset: self.offset,
-            _op: PhantomData,
-        })
+        Ok(from_meta(
+            self.data,
+            Cow::Owned(target_dims.to_vec()),
+            Cow::Owned(new_strides),
+            self.offset,
+        ))
     }
 }
 
@@ -370,14 +422,12 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
         if self.dims.len() != 2 {
             return Err(StridedError::RankMismatch(self.dims.len(), 2));
         }
-        Ok(StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::new([self.dims[1], self.dims[0]]),
-            strides: Arc::new([self.strides[1], self.strides[0]]),
-            offset: self.offset,
-            _op: PhantomData,
-        })
+        Ok(from_meta(
+            self.data,
+            Cow::Owned(vec![self.dims[1], self.dims[0]]),
+            Cow::Owned(vec![self.strides[1], self.strides[0]]),
+            self.offset,
+        ))
     }
 
     /// Adjoint (conjugate transpose) of a 2D view.
@@ -387,14 +437,12 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
         if self.dims.len() != 2 {
             return Err(StridedError::RankMismatch(self.dims.len(), 2));
         }
-        Ok(StridedView {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::new([self.dims[1], self.dims[0]]),
-            strides: Arc::new([self.strides[1], self.strides[0]]),
-            offset: self.offset,
-            _op: PhantomData,
-        })
+        Ok(from_meta(
+            self.data,
+            Cow::Owned(vec![self.dims[1], self.dims[0]]),
+            Cow::Owned(vec![self.strides[1], self.strides[0]]),
+            self.offset,
+        ))
     }
 
     /// Complex conjugate (compose Conj without changing dims/strides).
@@ -455,8 +503,8 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
 pub struct StridedViewMut<'a, T> {
     ptr: *mut T,
     data: &'a mut [T],
-    dims: Arc<[usize]>,
-    strides: Arc<[isize]>,
+    dims: Cow<'a, [usize]>,
+    strides: Cow<'a, [isize]>,
     offset: isize,
 }
 
@@ -473,50 +521,55 @@ impl<T: std::fmt::Debug> std::fmt::Debug for StridedViewMut<'_, T> {
 }
 
 impl<'a, T> StridedViewMut<'a, T> {
-    /// Create a new mutable strided view.
-    pub fn new(
+    /// A view from already-validated metadata.
+    #[inline]
+    fn from_meta(
         data: &'a mut [T],
-        dims: &[usize],
-        strides: &[isize],
+        dims: Cow<'a, [usize]>,
+        strides: Cow<'a, [isize]>,
         offset: isize,
-    ) -> Result<Self> {
-        validate_bounds(data.len(), dims, strides, offset)?;
-        let ptr = if empty_layout(dims) {
+    ) -> Self {
+        let ptr = if empty_layout(&dims) {
             empty_mut_ptr()
         } else {
             unsafe { data.as_mut_ptr().offset(offset) }
         };
-        Ok(Self {
+        Self {
             ptr,
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims,
+            strides,
             offset,
-        })
+        }
     }
 
-    /// Create without bounds checking.
+    /// Create a mutable view that borrows the caller's metadata: no allocation.
+    pub fn new(
+        data: &'a mut [T],
+        dims: &'a [usize],
+        strides: &'a [isize],
+        offset: isize,
+    ) -> Result<Self> {
+        validate_bounds(data.len(), dims, strides, offset)?;
+        Ok(Self::from_meta(
+            data,
+            Cow::Borrowed(dims),
+            Cow::Borrowed(strides),
+            offset,
+        ))
+    }
+
+    /// Create without bounds checking, borrowing the caller's metadata.
     ///
     /// # Safety
     /// Caller must ensure all index combinations stay within bounds.
     pub unsafe fn new_unchecked(
         data: &'a mut [T],
-        dims: &[usize],
-        strides: &[isize],
+        dims: &'a [usize],
+        strides: &'a [isize],
         offset: isize,
     ) -> Self {
-        let ptr = if empty_layout(dims) {
-            empty_mut_ptr()
-        } else {
-            data.as_mut_ptr().offset(offset)
-        };
-        Self {
-            ptr,
-            data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
-            offset,
-        }
+        Self::from_meta(data, Cow::Borrowed(dims), Cow::Borrowed(strides), offset)
     }
 
     /// Returns the shape (dimension sizes) of this view.
@@ -600,22 +653,24 @@ impl<'a, T> StridedViewMut<'a, T> {
         }
         let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
         let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
-        Ok(StridedViewMut {
-            ptr: self.ptr,
-            data: self.data,
-            dims: Arc::from(new_dims),
-            strides: Arc::from(new_strides),
-            offset: self.offset,
-        })
+        Ok(Self::from_meta(
+            self.data,
+            Cow::Owned(new_dims),
+            Cow::Owned(new_strides),
+            self.offset,
+        ))
     }
 
     /// Reborrow as an immutable view.
+    ///
+    /// The reborrow shares this view's metadata by borrowing it, so it allocates
+    /// nothing even when the metadata is owned.
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
         StridedView {
             ptr: self.ptr as *const T,
             data: unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.data.len()) },
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            dims: Cow::Borrowed(self.dims.as_ref()),
+            strides: Cow::Borrowed(self.strides.as_ref()),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -657,8 +712,8 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
 /// Supports both column-major (Julia default) and row-major (C default) layouts.
 pub struct StridedArray<T> {
     data: Vec<T>,
-    dims: Arc<[usize]>,
-    strides: Arc<[isize]>,
+    dims: Vec<usize>,
+    strides: Vec<isize>,
     offset: isize,
 }
 
@@ -691,8 +746,8 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }
@@ -704,8 +759,8 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = row_major_strides(dims);
         Self {
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }
@@ -731,8 +786,8 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }
@@ -758,8 +813,8 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }
@@ -776,8 +831,8 @@ impl<T> StridedArray<T> {
         validate_bounds(data.len(), dims, strides, offset)?;
         Ok(Self {
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides: strides.to_vec(),
             offset,
         })
     }
@@ -834,8 +889,8 @@ impl<T> StridedArray<T> {
         StridedView {
             ptr,
             data: &self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            dims: Cow::Borrowed(&self.dims),
+            strides: Cow::Borrowed(&self.strides),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -851,8 +906,8 @@ impl<T> StridedArray<T> {
         StridedViewMut {
             ptr,
             data: &mut self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            dims: Cow::Borrowed(&self.dims),
+            strides: Cow::Borrowed(&self.strides),
             offset: self.offset,
         }
     }
@@ -880,8 +935,8 @@ impl<T> StridedArray<T> {
         let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
         Ok(Self {
             data: self.data,
-            dims: Arc::from(new_dims),
-            strides: Arc::from(new_strides),
+            dims: new_dims,
+            strides: new_strides,
             offset: self.offset,
         })
     }
@@ -921,8 +976,8 @@ impl<T: Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data: buf,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }
@@ -940,8 +995,8 @@ impl<T: Copy> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }
@@ -959,8 +1014,8 @@ impl<T: Copy> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data: buf,
-            dims: Arc::from(dims),
-            strides: Arc::from(strides),
+            dims: dims.to_vec(),
+            strides,
             offset: 0,
         }
     }

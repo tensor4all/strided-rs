@@ -16,9 +16,12 @@ macro_rules! check {
                     let mut out = vec![MaybeUninit::uninit(); len + 2];
                     out[0].write(sentinel);
                     out[len + 1].write(sentinel);
-                    let av = StridedView::<$ty>::new(&a, &[len], &[stride], 1).unwrap();
-                    let bv = StridedView::<$ty>::new(&b, &[len], &[1], 1).unwrap();
-                    let mut dst = StridedViewMut::new(&mut out, &[len], &[1], 1).unwrap();
+                    let dims = [len];
+                    let a_strides = [stride];
+                    let unit = [1isize];
+                    let av = StridedView::<$ty>::new(&a, &dims, &a_strides, 1).unwrap();
+                    let bv = StridedView::<$ty>::new(&b, &dims, &unit, 1).unwrap();
+                    let mut dst = StridedViewMut::new(&mut out, &dims, &unit, 1).unwrap();
                     mul_into_uninit(&mut dst, &av, &bv).unwrap();
                     // SAFETY: sentinels were written above; kernel success
                     // initializes only the requested interior view.
