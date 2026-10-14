@@ -314,8 +314,13 @@ fn erased_reduce_plan_product_matches_the_left_fold() {
 /// the unit-stride path and through a strided one.
 #[test]
 fn erased_reduce_plan_product_reports_only_real_overflow() {
+    // Reciprocal factors far enough apart that a lane's partial product leaves the
+    // f64 range. `2.0`/`0.5` over 1000 elements only reaches 2^500, which is
+    // representable, so it would not exercise the defect at all.
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
     let alternating: Vec<f64> = (0..1000)
-        .map(|i| if i % 2 == 0 { 2.0 } else { 0.5 })
+        .map(|i| if i % 2 == 0 { big } else { small })
         .collect();
 
     // Unit-stride run.
