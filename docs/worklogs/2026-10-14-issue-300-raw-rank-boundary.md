@@ -145,6 +145,22 @@ the benchmark page; they are deliberately not part of this change.
   the two-operand view ops through the fused traversal is the fix, but it changes
   the view API's blocking/parallel strategy and needs its own protocol.
 
+## Release
+
+Only `strided-basic` changed, so only it moves: `0.5.0 -> 0.5.1` (patch; no public
+API change). It now carries an explicit `[package] version` instead of
+`version.workspace = true`, and `[workspace.dependencies] strided-basic` is
+`0.5.1`. `strided-traits`, `strided-view`, `strided-perm`, `strided-fused` and
+`strided-kernel` stay at `0.5.0`.
+
+The packaged manifest confirms the split: `strided-basic 0.5.1` requires
+`strided-view`/`strided-perm` at `0.5.0` (a caret range), so releasing it does not
+force new releases of the core crates. `strided-kernel`'s test-only change does
+not warrant a bump. Publication order stays
+`strided-traits` -> `strided-view` -> `strided-perm`/`strided-basic` ->
+`strided-fused`/`strided-kernel`, and is a human step; the version-bump recipe is
+in the `version-bump` skill.
+
 ## Remaining
 
 - The single-run contiguous `axpy_raw` case above is a real, narrow regression on
