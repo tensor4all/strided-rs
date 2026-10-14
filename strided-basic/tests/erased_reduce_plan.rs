@@ -1175,3 +1175,57 @@ fn erased_reduce_plan_sum_squares_rejects_non_float_dtypes() {
         assert!(matches!(err, StridedError::UnsupportedDType { .. }));
     }
 }
+
+/// The parallel full-reduction split is disabled for a non-reassociable kernel, so
+/// this run must produce the ordered value even inside a two-thread pool.
+///
+/// The pool is explicit because the ambient one is not: `ExecContext::max_threads`
+/// only *caps* the pool it runs in, and the default feature set does not build the
+/// parallel path at all, so a `max_threads(2)` context alone proves nothing about it
+/// (independent review of #2150's coverage).
+#[cfg(feature = "parallel")]
+#[test]
+fn erased_reduce_plan_product_is_ordered_inside_an_explicit_two_thread_pool() {
+    use rayon::ThreadPoolBuilder;
+
+    // The parallel full-reduction split only engages above the threading threshold,
+    // so the run has to be longer than that or the guard is never reached: with too
+    // short a run the test passes whether the guard is there or not (independent
+    // review of the first version of this test, which used 1000 elements).
+    const SPLIT_THRESHOLD: usize = 32_768;
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let mut values = vec![1.0f64; 2 * SPLIT_THRESHOLD];
+    values[0] = small;
+    values[SPLIT_THRESHOLD] = big;
+    values[SPLIT_THRESHOLD + 1] = big;
+    // Ordered: `small * 1... * big * big * 1... = big`. Folded by halves, the second
+    // half is `big * big` on its own, which is `infinity`.
+    let dims = [values.len()];
+    let strides = [1isize];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&values, &dims, &strides, 0).unwrap();
+    let context = ExecContext::max_threads(2).unwrap();
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("a two-thread pool");
+    let ordered = pool.install(|| {
+        assert_eq!(
+            rayon::current_num_threads(),
+            2,
+            "the test must run inside a two-wide pool for the split to be reachable"
+        );
+        let mut output = [0.0f64];
+        let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+        plan.execute(&context, &mut dest, &source).unwrap();
+        output[0]
+    });
+
+    assert_eq!(
+        ordered, big,
+        "a worker split would combine `small * big` with `big * big` and report infinity"
+    );
+}
