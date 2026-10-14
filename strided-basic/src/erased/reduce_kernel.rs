@@ -418,10 +418,26 @@ where
         // source offset, so every element of this run is readable.
         let start = runs.source_offset + col as isize * run_stride;
         // SAFETY: see the invariant above and the function contract.
-        let partial = unsafe { reduce_run::<T, K>(source.offset(start), run_stride, len) };
+        let partial = if K::reassociable() {
+            // SAFETY: see the invariant above and the function contract.
+            unsafe { reduce_run::<T, K>(source.offset(start), run_stride, len) }
+        } else {
+            // A per-run partial is itself a reassociation of this output's
+            // factors, so a non-reassociable kernel folds the run into the
+            // accumulator element by element (tenferro-rs#2150).
+            let mut folded = acc.unwrap_or_else(K::identity);
+            let mut cursor = source.offset(start);
+            for _ in 0..len {
+                // SAFETY: the run start is reachable and the run covers `len`
+                // elements, by the invariant above.
+                folded = K::combine(folded, K::map(unsafe { *cursor }));
+                cursor = cursor.wrapping_offset(run_stride);
+            }
+            folded
+        };
         acc = Some(match acc {
-            Some(acc) => K::combine(acc, partial),
-            None => partial,
+            Some(acc) if K::reassociable() => K::combine(acc, partial),
+            _ => partial,
         });
         remaining -= len;
         if remaining == 0 {

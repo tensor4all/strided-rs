@@ -889,7 +889,14 @@ where
     let total = traversal.total();
     #[cfg(feature = "parallel")]
     {
-        let nthreads = crate::threading::parallel_threads_for_len(total);
+        // Splitting reassociates one output element's factors across worker
+        // ranges, so only a kernel that may be reassociated takes it
+        // (tenferro-rs#2150).
+        let nthreads = if K::reassociable() {
+            crate::threading::parallel_threads_for_len(total)
+        } else {
+            1
+        };
         if nthreads > 1 {
             let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
             return crate::threading::parallel_map_reduce(
