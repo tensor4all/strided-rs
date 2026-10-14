@@ -367,6 +367,78 @@ fn erased_reduce_plan_product_reports_only_real_overflow() {
     assert!(output[0].is_infinite());
 }
 
+/// A full reduction can split one output's factors over several runs of the
+/// layout. Source order must carry one accumulator through them: offset 2 is
+/// never visited (padding), so the runs are `[2^-600, 1]` and `[2^600, 2^600]`.
+/// Multiplying the independently folded runs gives `2^1200 = inf`, but the
+/// ordered product is the representable `2^600`.
+#[test]
+fn erased_reduce_plan_full_product_carries_one_accumulator_across_runs() {
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let dims = [2usize, 2];
+    let strides = [1isize, 3];
+    // Offset 2 is padding: the traversal visits {0, 1} and {3, 4} only. A NaN
+    // there makes an out-of-run read fail loudly instead of silently passing.
+    let storage = [small, 1.0, f64::NAN, big, big];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&storage, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output[0], big);
+}
+
+/// The axis `ContiguousRuns` strategy splits one output's factors over two
+/// unit-stride runs: `[2^-600, fifteen ones]` and `[2^600, 2^600, fourteen
+/// ones]`. Folding each run separately gives `2^-600 * inf = inf`; the ordered
+/// product is `2^600`. Both the serial and the two-worker dispatch (work
+/// `2048 * 32` exceeds `MINTHREADLENGTH`) must carry the accumulator across the
+/// runs.
+#[test]
+fn erased_reduce_plan_axis_product_carries_one_accumulator_across_runs() {
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let kept = 2048usize;
+    let stride = 34usize;
+    let dims = [16usize, 2, kept];
+    let strides = [1isize, 17, stride as isize];
+    let mut storage = vec![1.0f64; kept * stride];
+    for output in 0..kept {
+        let base = output * stride;
+        storage[base] = small;
+        storage[base + 17] = big;
+        storage[base + 18] = big;
+    }
+    let dest_dims = [kept];
+    let dest_strides = [1isize];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Product,
+        &dims,
+        &strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 1],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&storage, &dims, &strides, 0).unwrap();
+
+    for ctx in [ExecContext::serial(), ExecContext::max_threads(2).unwrap()] {
+        let mut output = vec![0.0f64; kept];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        plan.execute(&ctx, &mut dest, &source).unwrap();
+        let bad = output.iter().position(|&value| value != big);
+        let bad_value = bad.map(|index| output[index]);
+        assert_eq!(bad, None, "output {bad:?} is {bad_value:?}, expected {big}");
+    }
+}
+
 #[test]
 fn erased_reduce_plan_executes_remaining_supported_dtype_set() {
     let dims = [2usize];
