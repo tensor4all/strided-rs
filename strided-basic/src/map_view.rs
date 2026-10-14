@@ -1239,6 +1239,12 @@ pub fn map_into_uninit_with_kernel<T: Copy + MaybeSendSync>(
     )
 }
 
+/// Map a raw destination from a raw source without preparing a plan.
+///
+/// Only the raw-replay unit tests need this entry now; the crate's production
+/// callers either go through the fused traversal (raw ops, `CopyPlan`) or
+/// [`map_raw_into_validated`].
+#[cfg(test)]
 pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
@@ -1310,6 +1316,25 @@ fn map_parts_into<
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Apply `f` (with the element operation) over a fully contiguous pair.
+///
+/// Kept out of line, and out of the caller's dispatch frame, so that it cannot
+/// change the code shape of the blocked kernels below; the operation is moved in
+/// by value because a dispatched closure that only borrows it stays scalar
+/// (tensor4all/strided-rs#301).
+#[inline(never)]
+fn map_contiguous<D: Copy, A: Copy, Op: ElementOp<A>>(
+    dst: &mut [D],
+    src: &[A],
+    f: impl Fn(A) -> D,
+) {
+    simd::dispatch_if_large(dst.len(), move || {
+        for i in 0..dst.len() {
+            dst[i] = f(Op::apply(src[i]));
+        }
+    });
+}
+
 fn map_parts_into_validated<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
@@ -1335,11 +1360,7 @@ fn map_parts_into_validated<
         if kernel.apply(src, dst) {
             return Ok(());
         }
-        simd::dispatch_if_large(len, || {
-            for i in 0..len {
-                dst[i] = f(Op::apply(src[i]));
-            }
-        });
+        map_contiguous::<D, A, Op>(dst, src, f);
         return Ok(());
     }
 
