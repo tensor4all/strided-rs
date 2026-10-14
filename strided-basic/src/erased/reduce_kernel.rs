@@ -60,6 +60,20 @@ pub(super) trait ReduceKernel<T: ErasedReduceScalar>: 'static {
         lanes_contiguous::<T, Self>(values)
     }
 
+    /// Whether the kernel may reassociate its partial results across lanes,
+    /// chunks and runs.
+    ///
+    /// Sum-like kernels are safe to reassociate. A floating-point product is not:
+    /// a lane that sees only factors above one overflows to `inf` while another
+    /// that sees only factors below one underflows to `0`, and the combine is
+    /// `inf * 0 = NaN` even when the mathematical product is representable over
+    /// the run as a whole. [`ProductKernel`] therefore reports `false` and its
+    /// runs are reduced in source order (tenferro-rs#2150).
+    #[inline(always)]
+    fn reassociable() -> bool {
+        true
+    }
+
     /// Folds one unit-stride source run into the adjacent-output accumulator
     /// block, preserving the per-output reduced order.
     #[inline(always)]
@@ -125,8 +139,19 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for ProductKernel {
         T::reduce_product(lhs, rhs)
     }
     #[inline(always)]
+    fn reassociable() -> bool {
+        false
+    }
+    #[inline(always)]
     fn contiguous(values: &[T]) -> T {
-        T::try_simd_product(values).unwrap_or_else(|| lanes_contiguous::<T, Self>(values))
+        // INVARIANT: unlike the sum-like kernels this one does not split the run
+        // into lanes or SIMD vectors. Reassociating a product can overflow one
+        // partial to `inf` and underflow another to `0`, and `inf * 0` is `NaN`
+        // where the source-order product is a representable value (tenferro-rs
+        // #2150). The factors are folded in the order the source presents them.
+        values.iter().fold(Self::identity(), |acc, &value| {
+            Self::combine(acc, Self::map(value))
+        })
     }
     #[inline(always)]
     fn combine_block(acc: &mut [T], values: &[T]) {
@@ -265,9 +290,20 @@ where
     if stride == 1 {
         // SAFETY: a unit-stride readable run is a valid shared slice.
         K::contiguous(unsafe { core::slice::from_raw_parts(ptr, len) })
-    } else {
+    } else if K::reassociable() {
         // SAFETY: forwarded caller contract.
         unsafe { lanes_strided::<T, K>(ptr, stride, len) }
+    } else {
+        // A non-reassociable kernel folds the strided run in source order rather
+        // than assigning lanes (tenferro-rs#2150).
+        let mut acc = K::identity();
+        let mut cursor = ptr;
+        for _ in 0..len {
+            // SAFETY: the caller proves every element of the run is readable.
+            acc = K::combine(acc, K::map(unsafe { *cursor }));
+            cursor = cursor.wrapping_offset(stride);
+        }
+        acc
     }
 }
 

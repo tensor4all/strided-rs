@@ -278,8 +278,13 @@ fn erased_reduce_plan_contiguous_fast_path_honors_offset_and_empty_layout() {
     assert_eq!(empty_output, [1.0]);
 }
 
+/// A product is reduced in source order, so this run reports what the left fold
+/// reports: the `f64::MAX` factors followed by the smallest subnormals underflow
+/// to zero. Reassociating the run used to overflow it to `inf` and combine that
+/// with a lane's `0` into `NaN`, losing a result that is representable
+/// (tenferro-rs#2150).
 #[test]
-fn erased_reduce_plan_product_documents_reassociated_overflow_classification() {
+fn erased_reduce_plan_product_matches_the_left_fold() {
     let dims = [65usize];
     let strides = [1isize];
     let mut input = [1.0f64; 65];
@@ -299,7 +304,62 @@ fn erased_reduce_plan_product_documents_reassociated_overflow_classification() {
         .unwrap();
 
     assert_eq!(left_fold, 0.0);
-    assert!(!output[0].is_finite());
+    assert_eq!(output[0], left_fold);
+}
+
+/// A representable product is no longer lost to a lane that ran away, and a
+/// product that leaves the dtype's range still reports that. The alternating run
+/// is the shape that produced `NaN` here: one lane saw only `2.0` and overflowed
+/// while another saw only `0.5` and underflowed. The same run is reduced through
+/// the unit-stride path and through a strided one.
+#[test]
+fn erased_reduce_plan_product_reports_only_real_overflow() {
+    let alternating: Vec<f64> = (0..1000)
+        .map(|i| if i % 2 == 0 { 2.0 } else { 0.5 })
+        .collect();
+
+    // Unit-stride run.
+    let dims = [alternating.len()];
+    let strides = [1isize];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&alternating, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert_eq!(output[0], 1.0);
+
+    // The same run split over two contiguous runs: axis 1 is strided in this
+    // column-major block, so the plan reduces the runs in order and combines them.
+    let dims = [2usize, alternating.len()];
+    let strides = [1isize, 2];
+    let mut interleaved = Vec::with_capacity(2 * alternating.len());
+    for value in &alternating {
+        interleaved.push(1.0);
+        interleaved.push(*value);
+    }
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&interleaved, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert_eq!(output[0], 1.0);
+
+    // A product that genuinely leaves the range still reports it.
+    let runaway = vec![2.0f64; 2000];
+    let dims = [runaway.len()];
+    let strides = [1isize];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&runaway, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert!(output[0].is_infinite());
 }
 
 #[test]
