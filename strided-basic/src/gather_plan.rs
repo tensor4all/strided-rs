@@ -387,8 +387,9 @@ pub struct DynamicSlicePlan {
     slice_sizes: AxisVec<usize>,
     total: usize,
     /// Fused window traversal (dest strides, operand strides) replayed at the
-    /// runtime source base; `None` above
-    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    /// runtime source base; `None` when its fused rank exceeds
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT), in which case
+    /// `replay`/`execute_parallel` walk the window instead.
     window: Option<FusedPairLayout>,
     #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
@@ -412,8 +413,9 @@ pub struct DynamicUpdateSlicePlan {
     total: usize,
     copy_plan: CopyPlan,
     /// Fused update window traversal (dest strides, update strides) replayed
-    /// at the runtime destination base; `None` above
-    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    /// at the runtime destination base; `None` when its fused rank exceeds
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT), in which case
+    /// `replay`/`execute_update_parallel` walk the window instead.
     window: Option<FusedPairLayout>,
     #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,

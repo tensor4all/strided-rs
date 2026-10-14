@@ -129,13 +129,23 @@ fn dynamic_slice_fused_window_matches_reference_for_general_layouts() {
             vec![2, 4, 2],
             vec![3, 0, 1],
         ),
-        // rank 9: above the fused rank limit, uses the window replay fallback
+        // rank 9 original, but its singleton window axes collapse: fusion now
+        // happens before the fused/inline choice, so this stays on the fused path
         (
             vec![2; 9],
             vec![1, 2, 4, 8, 16, 32, 64, 128, 256],
             0,
             vec![1; 9],
             vec![1; 9],
+        ),
+        // rank 9 and genuinely non-fusible (padded operand strides): the fused
+        // window is unavailable, so the window replay fallback runs
+        (
+            vec![2; 9],
+            vec![1, 3, 7, 15, 31, 63, 127, 255, 511],
+            0,
+            vec![2; 9],
+            vec![0; 9],
         ),
     ];
     for (dims, strides, offset, window, starts) in cases {
@@ -260,4 +270,59 @@ fn dynamic_update_slice_fused_window_matches_reference() {
     // uninit execute initializes every reachable slot.
     let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
     assert_eq!(uninit, expected);
+}
+
+/// The fused window is chosen by *fused* rank, so an original rank above the
+/// limit still uses it when its window collapses, and a genuinely non-fusible
+/// window keeps the compiled non-fused replay.
+#[test]
+fn dynamic_slice_window_uses_fused_replay_only_when_it_fuses() {
+    let dims = vec![2usize; 9];
+    let starts = [9usize];
+    let start_strides = [1isize];
+
+    // Singleton window axes collapse to one fused axis.
+    let window = vec![1usize; 9];
+    let dest_strides = vec![1isize; 9];
+    let plan = DynamicSlicePlan::compile(
+        &dims,
+        &[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        &starts,
+        &start_strides,
+        &window,
+        &dest_strides,
+        &window,
+    )
+    .unwrap();
+    assert!(
+        plan.window.is_some(),
+        "a rank-9 singleton window fuses and must not fall back"
+    );
+
+    // Padded operand strides cannot merge any window axis.
+    let padded = [1isize, 3, 7, 15, 31, 63, 127, 255, 511];
+    let window = vec![2usize; 9];
+    let dest_strides: Vec<isize> = {
+        let mut out = vec![0isize; 9];
+        let mut scale = 1isize;
+        for axis in (0..9).rev() {
+            out[axis] = scale;
+            scale *= window[axis] as isize;
+        }
+        out
+    };
+    let plan = DynamicSlicePlan::compile(
+        &dims,
+        &padded,
+        &starts,
+        &start_strides,
+        &window,
+        &dest_strides,
+        &window,
+    )
+    .unwrap();
+    assert!(
+        plan.window.is_none(),
+        "a non-fusible rank-9 window keeps the non-fused replay"
+    );
 }
