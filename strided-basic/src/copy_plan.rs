@@ -6,7 +6,7 @@
 //! (see issue #139). [`CopyPlan`] splits the work: [`CopyPlan::compile`]
 //! validates the layout pair and builds the fused traversal once,
 //! [`CopyPlan::execute`]/[`CopyPlan::execute_scale`]/[`CopyPlan::execute_conj`]
-//! replay it with no planning and no heap allocation for ranks at most
+//! replay it with no planning and no heap allocation for fused ranks at most
 //! [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
 
 use core::{
@@ -15,16 +15,17 @@ use core::{
     ops::{Add, Mul},
 };
 
-use crate::map_view::map_raw_into;
-use crate::ops_view::{copy_conj, copy_into, copy_scale};
-use crate::raw_ops::{apply_fused_range, fuse_pair_layout, fused_total, FusedPairLayout};
-use crate::{
-    ElementOpApply, Identity, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError,
+use crate::raw_ops::{
+    apply_fused_range, apply_spilled_range, fuse_pair_traversal, fused_total, FusedAxis,
+    FusedPairLayout, PairTraversal,
 };
+use crate::{ElementOpApply, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
 
 // Same pattern as map_view.rs / outer_product.rs: stack storage when the
 // parallel feature pulls in smallvec, plain Vec otherwise. Only `compile`
-// touches these; `execute*` never allocates either way.
+// touches these; `execute*` never allocates for them. (A spilled fused layout
+// needs one cursor allocation per replayed range, so a parallel `execute*` can
+// allocate once per worker range.)
 #[cfg(feature = "parallel")]
 type AxisVec<T> = smallvec::SmallVec<[T; crate::RAW_FUSED_RANK_LIMIT]>;
 #[cfg(not(feature = "parallel"))]
@@ -170,8 +171,8 @@ where
 /// Overlapping `src`/`dest` memory is not supported, matching the rest of the
 /// crate.
 ///
-/// Ranks above [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT) are supported through the view-based
-/// kernels; only that fallback path may allocate.
+/// Ranks above [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT) are supported by the same fused
+/// traversal, which then stores its axes in one rank-bounded allocation.
 ///
 /// # Example
 ///
@@ -195,18 +196,15 @@ pub struct CopyPlan {
     dims: AxisVec<usize>,
     dst_strides: AxisVec<isize>,
     src_strides: AxisVec<isize>,
-    /// `None` when rank exceeds [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT); `execute*` then
-    /// falls back to the view-based kernels.
-    fused: Option<FusedPairLayout>,
+    fused: PairTraversal,
 }
 
 impl CopyPlan {
-    /// The fused traversal, or `None` above
-    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    /// `None` when the fused traversal is stored in the rank-bounded spill.
     #[cfg(feature = "parallel")]
     #[inline]
     pub(crate) fn fused_layout(&self) -> Option<&FusedPairLayout> {
-        self.fused.as_ref()
+        self.fused.inline()
     }
 
     pub(crate) fn execute_uninit_then<'a, T, R>(
@@ -257,7 +255,7 @@ impl CopyPlan {
             dims: dims.into(),
             dst_strides: dst_strides.into(),
             src_strides: src_strides.into(),
-            fused: fuse_pair_layout(dims, dst_strides, src_strides),
+            fused: fuse_pair_traversal(dims, dst_strides, src_strides),
         })
     }
 
@@ -294,24 +292,20 @@ impl CopyPlan {
         T: Copy + MaybeSendSync,
     {
         self.check_call(dest, src)?;
-        match &self.fused {
-            Some(layout) => {
-                replay_fused(
-                    dest,
-                    src,
-                    layout,
-                    |dst, value| {
-                        dst.write(value);
-                    },
-                    |value| value,
-                );
-                Ok(())
-            }
-            None => map_raw_into::<MaybeUninit<T>, T, Identity>(dest, src, MaybeUninit::new),
-        }
+        replay_fused(
+            dest,
+            src,
+            &self.fused,
+            |dst, value| {
+                dst.write(value);
+            },
+            |value| value,
+        );
+        Ok(())
     }
 
-    /// `dest = src`. Allocation-free for ranks at most [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    /// `dest = src`. Allocation-free for fused ranks at most
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
     pub fn execute<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -321,22 +315,17 @@ impl CopyPlan {
         T: Copy + MaybeSendSync,
     {
         self.check_call(dest, src)?;
-        match &self.fused {
-            Some(layout) => {
-                replay_fused(
-                    dest,
-                    src,
-                    layout,
-                    |dst, value| *dst = value,
-                    |value: T| value,
-                );
-                Ok(())
-            }
-            None => copy_into(&mut dest.as_view_mut(), &src.as_view()),
-        }
+        replay_fused(
+            dest,
+            src,
+            &self.fused,
+            |dst, value| *dst = value,
+            |value: T| value,
+        );
+        Ok(())
     }
 
-    /// `dest = scale * src`. Allocation-free for ranks at most
+    /// `dest = scale * src`. Allocation-free for fused ranks at most
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
     pub fn execute_scale<T>(
         &self,
@@ -348,22 +337,17 @@ impl CopyPlan {
         T: Copy + Mul<T, Output = T> + MaybeSendSync,
     {
         self.check_call(dest, src)?;
-        match &self.fused {
-            Some(layout) => {
-                replay_fused(
-                    dest,
-                    src,
-                    layout,
-                    |dst, value| *dst = value,
-                    |value: T| scale * value,
-                );
-                Ok(())
-            }
-            None => copy_scale(&mut dest.as_view_mut(), &src.as_view(), scale),
-        }
+        replay_fused(
+            dest,
+            src,
+            &self.fused,
+            |dst, value| *dst = value,
+            |value: T| scale * value,
+        );
+        Ok(())
     }
 
-    /// `dest = conj(src)`. Allocation-free for ranks at most
+    /// `dest = conj(src)`. Allocation-free for fused ranks at most
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
     pub fn execute_conj<T>(
         &self,
@@ -374,19 +358,14 @@ impl CopyPlan {
         T: Copy + ElementOpApply + MaybeSendSync,
     {
         self.check_call(dest, src)?;
-        match &self.fused {
-            Some(layout) => {
-                replay_fused(
-                    dest,
-                    src,
-                    layout,
-                    |dst, value| *dst = value,
-                    |value: T| value.conj(),
-                );
-                Ok(())
-            }
-            None => copy_conj(&mut dest.as_view_mut(), &src.as_view()),
-        }
+        replay_fused(
+            dest,
+            src,
+            &self.fused,
+            |dst, value| *dst = value,
+            |value: T| value.conj(),
+        );
+        Ok(())
     }
 }
 
@@ -402,7 +381,7 @@ impl CopyPlan {
 fn replay_fused<D, S, Apply, Op>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
-    layout: &FusedPairLayout,
+    traversal: &PairTraversal,
     apply: Apply,
     op: Op,
 ) where
@@ -417,12 +396,21 @@ fn replay_fused<D, S, Apply, Op>(
     let dst_ptr = dest.data_mut().as_mut_ptr();
     // SAFETY: `check_call` proved both views carry exactly the compiled
     // layout, and `RawStridedRef`/`RawStridedMut` guarantee every offset
-    // reachable through that layout lies inside their data. `layout` is the
+    // reachable through that layout lies inside their data. `traversal` is the
     // fusion of that layout, so every logical index in `0..total` is an
     // in-bounds slot of both. The compiled destination layout is injective
     // and the exclusive destination borrow cannot overlap the shared source
     // borrow.
-    unsafe { replay_fused_raw(dst_ptr, dst_base, src_ptr, src_base, layout, apply, op) }
+    unsafe {
+        match traversal {
+            PairTraversal::Inline(layout) => {
+                replay_fused_raw(dst_ptr, dst_base, src_ptr, src_base, layout, apply, op)
+            }
+            PairTraversal::Spilled(axes) => {
+                replay_spilled_raw(dst_ptr, dst_base, src_ptr, src_base, axes, apply, op)
+            }
+        }
+    }
 }
 
 /// Pointer-level fused replay shared by [`CopyPlan`] and the dynamic slice
@@ -465,8 +453,8 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
             let dst_ptr = crate::threading::SendPtr(dst_ptr);
             let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
             crate::threading::parallel_for_each(0..total, nthreads, &|range| {
-                // SAFETY: the caller contract makes every index in bounds;
-                // the worker ranges are disjoint and the destination strides
+                // SAFETY: the caller contract makes every index in bounds; the
+                // worker ranges are disjoint and the destination strides
                 // injective, so no two workers write the same slot, and the
                 // source is only read.
                 unsafe {
@@ -490,6 +478,73 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
     unsafe {
         apply_fused_range(
             dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply, &op,
+        );
+    }
+}
+
+/// Pointer-level replay of a spilled axis list.
+///
+/// Mirrors [`replay_fused_raw`] including its worker split; kept separate so
+/// that the inline replay keeps the shape it had before spilled layouts
+/// existed.
+///
+/// # Safety
+///
+/// Every logical index of `axes`, mapped through its destination strides from
+/// `dst_base` and its source strides from `src_base`, must be an in-bounds slot
+/// of the destination and source allocations. The destination strides must be
+/// injective over `axes`, the destination must not overlap the source, and
+/// nothing else may access the destination slots during the call.
+pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    axes: &[FusedAxis],
+    apply: Apply,
+    op: Op,
+) where
+    D: Copy + MaybeSendSync,
+    S: Copy + MaybeSendSync,
+    Apply: Fn(&mut D, S) + MaybeSendSync,
+    Op: Fn(S) -> S + MaybeSendSync,
+{
+    let total = axes.iter().map(|axis| axis.dim).product::<usize>();
+    if total == 0 {
+        return;
+    }
+    #[cfg(feature = "parallel")]
+    {
+        let nthreads = crate::threading::parallel_threads_for_len(total);
+        if nthreads > 1 {
+            let dst_ptr = crate::threading::SendPtr(dst_ptr);
+            let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
+            crate::threading::parallel_for_each(0..total, nthreads, &|range| {
+                // SAFETY: the caller contract makes every index in bounds; the
+                // worker ranges are disjoint and the destination strides
+                // injective, so no two workers write the same slot, and the
+                // source is only read.
+                unsafe {
+                    apply_spilled_range(
+                        dst_ptr.as_ptr(),
+                        dst_base,
+                        src_ptr.as_const(),
+                        src_base,
+                        axes,
+                        range.start,
+                        range.len(),
+                        &apply,
+                        &op,
+                    );
+                }
+            });
+            return;
+        }
+    }
+    // SAFETY: forwarded caller contract over the full range `0..total`.
+    unsafe {
+        apply_spilled_range(
+            dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &apply, &op,
         );
     }
 }

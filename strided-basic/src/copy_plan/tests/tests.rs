@@ -148,13 +148,15 @@ fn plan_execute_scale_and_conj() {
 }
 
 #[test]
-fn plan_rank_above_limit_falls_back_to_view_kernels() {
+fn plan_rank_above_inline_limit_uses_spilled_fused_traversal() {
     let dims = [2usize; 9];
     let dst: Vec<isize> = (0..9).map(|axis| 1isize << axis).collect();
     let src: Vec<isize> = (0..9).rev().map(|axis| 1isize << axis).collect();
     let source_data = fill_f64(512);
     let plan = CopyPlan::compile(&dims, &dst, &src).unwrap();
-    assert!(plan.fused.is_none());
+    // Every axis is padded (stride 2*2^k), so fusion cannot reduce the rank:
+    // the traversal spills instead of leaving the fused path.
+    assert_eq!(plan.fused.rank(), 9);
 
     let mut expected = vec![0.0f64; 512];
     {
@@ -168,7 +170,7 @@ fn plan_rank_above_limit_falls_back_to_view_kernels() {
     plan.execute(&mut dest, &source).unwrap();
     assert_eq!(actual, expected);
 
-    // Fallback also serves scale and conj.
+    // The spilled traversal also serves scale and conj.
     let mut scaled = vec![0.0f64; 512];
     let mut dest = RawStridedMut::new(&mut scaled, &dims, &dst, 0).unwrap();
     plan.execute_scale(&mut dest, &source, 2.0).unwrap();
@@ -255,7 +257,7 @@ fn execute_rejects_layout_drift() {
 #[test]
 fn identity_layout_uses_single_fused_axis() {
     let plan = CopyPlan::compile(&[2, 3, 4], &[12, 4, 1], &[12, 4, 1]).unwrap();
-    let fused = plan.fused.expect("rank 3 stays on the fused path");
+    let fused = plan.fused.inline().expect("rank 3 stays on the fused path");
     assert_eq!(fused.rank, 1);
     assert_eq!(fused.dims[0], 24);
 }

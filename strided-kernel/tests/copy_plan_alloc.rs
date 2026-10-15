@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use num_complex::Complex64;
 use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
-    erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan, ErasedConcatenatePlan,
-    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedMapOp,
-    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
+    copy_scale_raw, erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan,
+    ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
+    ErasedMapOp, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
     ErasedRawStridedUninitMut, ErasedReducePlan, ErasedReversePlan, ErasedScatterPlan,
     ErasedSlicePlan, ErasedZipOp, ExecContext, Identity, KernelDType, RawStridedMut, RawStridedRef,
     ReduceOp, ScatterSpec, StridedView, StridedViewMut,
@@ -158,6 +158,41 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         }
     });
     assert_eq!(allocations, 0, "execute/execute_scale must not allocate");
+
+    // Above the inline limit the fused traversal spills, but every allocation
+    // stays bounded by the rank, never by the element count: the raw call
+    // builds one spilled layout plus one cursor, and a prepared plan allocates
+    // only the cursor per execution.
+    let dims = [2usize; 9];
+    let dst_strides: Vec<isize> = (0..9).map(|axis| 1isize << axis).collect();
+    let src_strides: Vec<isize> = (0..9).rev().map(|axis| 1isize << axis).collect();
+    let src: Vec<f64> = (0..512).map(|value| value as f64).collect();
+    let mut dst = vec![0.0f64; 512];
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+    let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            copy_scale_raw(&mut dest, &source, 1.0).unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 32,
+        "a spilled rank-9 raw call must allocate one layout and one cursor per call"
+    );
+
+    let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
+    plan.execute(&mut dest, &source).unwrap();
+    let allocations = count_allocations(|| {
+        for _ in 0..16 {
+            plan.execute(&mut dest, &source).unwrap();
+            plan.execute_scale(&mut dest, &source, 2.0).unwrap();
+        }
+    });
+    assert_eq!(
+        allocations, 32,
+        "a spilled rank-9 plan must allocate one cursor per execution"
+    );
 
     let dims = [4usize, 4];
     let strides = [1isize, 4];
