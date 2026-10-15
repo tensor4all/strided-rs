@@ -60,6 +60,20 @@ pub(super) trait ReduceKernel<T: ErasedReduceScalar>: 'static {
         lanes_contiguous::<T, Self>(values)
     }
 
+    /// Whether the kernel may reassociate its partial results across lanes,
+    /// chunks and runs.
+    ///
+    /// Sum-like kernels are safe to reassociate. A floating-point product is not:
+    /// a lane that sees only factors above one overflows to `inf` while another
+    /// that sees only factors below one underflows to `0`, and the combine is
+    /// `inf * 0 = NaN` even when the mathematical product is representable over
+    /// the run as a whole. [`ProductKernel`] therefore reports `false` and its
+    /// runs are reduced in source order (tenferro-rs#2150).
+    #[inline(always)]
+    fn reassociable() -> bool {
+        true
+    }
+
     /// Folds one unit-stride source run into the adjacent-output accumulator
     /// block, preserving the per-output reduced order.
     #[inline(always)]
@@ -125,8 +139,19 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for ProductKernel {
         T::reduce_product(lhs, rhs)
     }
     #[inline(always)]
+    fn reassociable() -> bool {
+        false
+    }
+    #[inline(always)]
     fn contiguous(values: &[T]) -> T {
-        T::try_simd_product(values).unwrap_or_else(|| lanes_contiguous::<T, Self>(values))
+        // INVARIANT: unlike the sum-like kernels this one does not split the run
+        // into lanes or SIMD vectors. Reassociating a product can overflow one
+        // partial to `inf` and underflow another to `0`, and `inf * 0` is `NaN`
+        // where the source-order product is a representable value (tenferro-rs
+        // #2150). The factors are folded in the order the source presents them.
+        values.iter().fold(Self::identity(), |acc, &value| {
+            Self::combine(acc, Self::map(value))
+        })
     }
     #[inline(always)]
     fn combine_block(acc: &mut [T], values: &[T]) {
@@ -252,6 +277,28 @@ where
     lanes.into_iter().fold(K::identity(), K::combine)
 }
 
+/// Folds one run into `acc` in source order.
+///
+/// A separate run product would be a reassociation of this output's factors, so
+/// kernels that must not reassociate carry one accumulator through every run
+/// (tenferro-rs#2150).
+///
+/// # Safety
+/// `ptr.offset(i * stride)` must be a readable element for every `i < len`.
+#[inline(always)]
+unsafe fn fold_run_ordered<T, K>(mut acc: T, ptr: *const T, stride: isize, len: usize) -> T
+where
+    T: ErasedReduceScalar,
+    K: ReduceKernel<T>,
+{
+    let mut cursor = ptr;
+    for _ in 0..len {
+        acc = K::combine(acc, K::map(unsafe { *cursor }));
+        cursor = cursor.wrapping_offset(stride);
+    }
+    acc
+}
+
 /// Reduces one run of `len` elements starting at `ptr`.
 ///
 /// # Safety
@@ -265,9 +312,14 @@ where
     if stride == 1 {
         // SAFETY: a unit-stride readable run is a valid shared slice.
         K::contiguous(unsafe { core::slice::from_raw_parts(ptr, len) })
-    } else {
+    } else if K::reassociable() {
         // SAFETY: forwarded caller contract.
         unsafe { lanes_strided::<T, K>(ptr, stride, len) }
+    } else {
+        // A non-reassociable kernel folds the strided run in source order rather
+        // than assigning lanes (tenferro-rs#2150).
+        // SAFETY: forwarded caller contract.
+        unsafe { fold_run_ordered::<T, K>(K::identity(), ptr, stride, len) }
     }
 }
 
@@ -382,10 +434,27 @@ where
         // source offset, so every element of this run is readable.
         let start = runs.source_offset + col as isize * run_stride;
         // SAFETY: see the invariant above and the function contract.
-        let partial = unsafe { reduce_run::<T, K>(source.offset(start), run_stride, len) };
+        let partial = if K::reassociable() {
+            // SAFETY: see the invariant above and the function contract.
+            unsafe { reduce_run::<T, K>(source.offset(start), run_stride, len) }
+        } else {
+            // A per-run partial is itself a reassociation of this output's
+            // factors, so a non-reassociable kernel carries one accumulator
+            // through every run (tenferro-rs#2150).
+            // SAFETY: the run start is reachable and the run covers `len`
+            // elements, by the invariant above.
+            unsafe {
+                fold_run_ordered::<T, K>(
+                    acc.unwrap_or_else(K::identity),
+                    source.offset(start),
+                    run_stride,
+                    len,
+                )
+            }
+        };
         acc = Some(match acc {
-            Some(acc) => K::combine(acc, partial),
-            None => partial,
+            Some(acc) if K::reassociable() => K::combine(acc, partial),
+            _ => partial,
         });
         remaining -= len;
         if remaining == 0 {
@@ -485,16 +554,41 @@ where
             for output in range.clone() {
                 runs.reset(outer.source_offset);
                 // SAFETY: each run is `run_len` reachable unit-stride elements.
-                let mut acc = K::contiguous(unsafe {
-                    core::slice::from_raw_parts(source.offset(runs.source_offset), run_len)
-                });
+                let mut acc = if K::reassociable() {
+                    // SAFETY: each run is `run_len` reachable unit-stride elements.
+                    K::contiguous(unsafe {
+                        core::slice::from_raw_parts(source.offset(runs.source_offset), run_len)
+                    })
+                } else {
+                    // SAFETY: as above, for the first reachable run.
+                    unsafe {
+                        fold_run_ordered::<T, K>(
+                            K::identity(),
+                            source.offset(runs.source_offset),
+                            1,
+                            run_len,
+                        )
+                    }
+                };
                 for _ in 1..run_count {
                     runs.advance();
-                    // SAFETY: as above, for the next reachable run.
-                    let partial = K::contiguous(unsafe {
-                        core::slice::from_raw_parts(source.offset(runs.source_offset), run_len)
-                    });
-                    acc = K::combine(acc, partial);
+                    if K::reassociable() {
+                        // SAFETY: as above, for the next reachable run.
+                        let partial = K::contiguous(unsafe {
+                            core::slice::from_raw_parts(source.offset(runs.source_offset), run_len)
+                        });
+                        acc = K::combine(acc, partial);
+                    } else {
+                        // SAFETY: as above, for the next reachable run.
+                        acc = unsafe {
+                            fold_run_ordered::<T, K>(
+                                acc,
+                                source.offset(runs.source_offset),
+                                1,
+                                run_len,
+                            )
+                        };
+                    }
                 }
                 // SAFETY: the destination cursor offset is reachable.
                 unsafe { dest.offset(outer.dest_offset).write(acc) };

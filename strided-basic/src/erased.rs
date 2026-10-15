@@ -283,19 +283,27 @@ pub enum ReduceOp {
 ///   reduced by the SIMD kernel (unit stride, `simd` feature), a sixteen
 ///   lane kernel (other unit stride runs) or an eight lane kernel (strided
 ///   runs), and runs are combined left to right. A dense column major
-///   source therefore reduces exactly like one contiguous slice.
+///   source therefore reduces exactly like one contiguous slice. Exception:
+///   [`ReduceOp::Product`] is not reassociable, so each run is folded in
+///   source order (no SIMD or lane splitting) and one accumulator is carried
+///   across the runs of an output instead of combining per-run partials.
 /// * With a parallel context and more than `MINTHREADLENGTH` elements, a
-///   full reduction splits the traversal into one deterministic range per
-///   worker thread. Each range runs the same run kernel as the serial path
-///   and the partials are combined in a fixed tree. The result is bitwise
-///   repeatable for a fixed layout and thread count, but may differ between
-///   thread counts and from the serial result.
+///   full reduction that may be reassociated splits the traversal into one
+///   deterministic range per worker thread. Each range runs the same run
+///   kernel as the serial path and the partials are combined in a fixed tree.
+///   The result is bitwise repeatable for a fixed layout and thread count, but
+///   may differ between thread counts and from the serial result. A
+///   non-reassociable [`ReduceOp::Product`] full reduction never splits, so it
+///   stays in source order for every context.
 /// * Axis reductions with kept axes compute every output independently, so
 ///   the result never depends on the context or thread count. Each output
 ///   folds its reduced elements sequentially in caller reduced axis order,
 ///   except that a unit stride leading reduced run (after fusing adjacent
 ///   reduced axes) of length at least 16 is reduced by the contiguous run
-///   kernel, with runs folded in order. When instead the leading kept axis
+///   kernel, with runs folded in order. A non-reassociable
+///   [`ReduceOp::Product`] folds each run in source order and carries one
+///   accumulator across the runs rather than multiplying per-run partials.
+///   When instead the leading kept axis
 ///   has unit stride, adjacent outputs are accumulated as a block from one
 ///   contiguous source run per reduced element; each output still folds in
 ///   caller reduced axis order.
@@ -889,7 +897,14 @@ where
     let total = traversal.total();
     #[cfg(feature = "parallel")]
     {
-        let nthreads = crate::threading::parallel_threads_for_len(total);
+        // Splitting reassociates one output element's factors across worker
+        // ranges, so only a kernel that may be reassociated takes it
+        // (tenferro-rs#2150).
+        let nthreads = if K::reassociable() {
+            crate::threading::parallel_threads_for_len(total)
+        } else {
+            1
+        };
         if nthreads > 1 {
             let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
             return crate::threading::parallel_map_reduce(

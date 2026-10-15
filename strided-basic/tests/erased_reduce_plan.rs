@@ -278,8 +278,13 @@ fn erased_reduce_plan_contiguous_fast_path_honors_offset_and_empty_layout() {
     assert_eq!(empty_output, [1.0]);
 }
 
+/// A product is reduced in source order, so this run reports what the left fold
+/// reports: the `f64::MAX` factors followed by the smallest subnormals underflow
+/// to zero. Reassociating the run used to overflow it to `inf` and combine that
+/// with a lane's `0` into `NaN`, losing a result that is representable
+/// (tenferro-rs#2150).
 #[test]
-fn erased_reduce_plan_product_documents_reassociated_overflow_classification() {
+fn erased_reduce_plan_product_matches_the_left_fold() {
     let dims = [65usize];
     let strides = [1isize];
     let mut input = [1.0f64; 65];
@@ -299,7 +304,139 @@ fn erased_reduce_plan_product_documents_reassociated_overflow_classification() {
         .unwrap();
 
     assert_eq!(left_fold, 0.0);
-    assert!(!output[0].is_finite());
+    assert_eq!(output[0], left_fold);
+}
+
+/// A representable product is no longer lost to a lane that ran away, and a
+/// product that leaves the dtype's range still reports that. The alternating run
+/// is the shape that produced `NaN` here: one lane saw only `2.0` and overflowed
+/// while another saw only `0.5` and underflowed. The same run is reduced through
+/// the unit-stride path and through a strided one.
+#[test]
+fn erased_reduce_plan_product_reports_only_real_overflow() {
+    // Reciprocal factors far enough apart that a lane's partial product leaves the
+    // f64 range. `2.0`/`0.5` over 1000 elements only reaches 2^500, which is
+    // representable, so it would not exercise the defect at all.
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let alternating: Vec<f64> = (0..1000)
+        .map(|i| if i % 2 == 0 { big } else { small })
+        .collect();
+
+    // Unit-stride run.
+    let dims = [alternating.len()];
+    let strides = [1isize];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&alternating, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert_eq!(output[0], 1.0);
+
+    // The same run split over two contiguous runs: axis 1 is strided in this
+    // column-major block, so the plan reduces the runs in order and combines them.
+    let dims = [2usize, alternating.len()];
+    let strides = [1isize, 2];
+    let mut interleaved = Vec::with_capacity(2 * alternating.len());
+    for value in &alternating {
+        interleaved.push(1.0);
+        interleaved.push(*value);
+    }
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&interleaved, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert_eq!(output[0], 1.0);
+
+    // A product that genuinely leaves the range still reports it.
+    let runaway = vec![2.0f64; 2000];
+    let dims = [runaway.len()];
+    let strides = [1isize];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&runaway, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+    assert!(output[0].is_infinite());
+}
+
+/// A full reduction can split one output's factors over several runs of the
+/// layout. Source order must carry one accumulator through them: offset 2 is
+/// never visited (padding), so the runs are `[2^-600, 1]` and `[2^600, 2^600]`.
+/// Multiplying the independently folded runs gives `2^1200 = inf`, but the
+/// ordered product is the representable `2^600`.
+#[test]
+fn erased_reduce_plan_full_product_carries_one_accumulator_across_runs() {
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let dims = [2usize, 2];
+    let strides = [1isize, 3];
+    // Offset 2 is padding: the traversal visits {0, 1} and {3, 4} only. A NaN
+    // there makes an out-of-run read fail loudly instead of silently passing.
+    let storage = [small, 1.0, f64::NAN, big, big];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&storage, &dims, &strides, 0).unwrap();
+    let mut output = [0.0f64];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+
+    plan.execute(&ExecContext::serial(), &mut dest, &source)
+        .unwrap();
+
+    assert_eq!(output[0], big);
+}
+
+/// The axis `ContiguousRuns` strategy splits one output's factors over two
+/// unit-stride runs: `[2^-600, fifteen ones]` and `[2^600, 2^600, fourteen
+/// ones]`. Folding each run separately gives `2^-600 * inf = inf`; the ordered
+/// product is `2^600`. Both the serial and the two-worker dispatch (work
+/// `2048 * 32` exceeds `MINTHREADLENGTH`) must carry the accumulator across the
+/// runs.
+#[test]
+fn erased_reduce_plan_axis_product_carries_one_accumulator_across_runs() {
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let kept = 2048usize;
+    let stride = 34usize;
+    let dims = [16usize, 2, kept];
+    let strides = [1isize, 17, stride as isize];
+    let mut storage = vec![1.0f64; kept * stride];
+    for output in 0..kept {
+        let base = output * stride;
+        storage[base] = small;
+        storage[base + 17] = big;
+        storage[base + 18] = big;
+    }
+    let dest_dims = [kept];
+    let dest_strides = [1isize];
+    let plan = ErasedReducePlan::compile_axes(
+        KernelDType::F64,
+        ReduceOp::Product,
+        &dims,
+        &strides,
+        &dest_dims,
+        &dest_strides,
+        &[0, 1],
+    )
+    .unwrap();
+    let source = ErasedRawStridedRef::from_slice(&storage, &dims, &strides, 0).unwrap();
+
+    for ctx in [ExecContext::serial(), ExecContext::max_threads(2).unwrap()] {
+        let mut output = vec![0.0f64; kept];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        plan.execute(&ctx, &mut dest, &source).unwrap();
+        let bad = output.iter().position(|&value| value != big);
+        let bad_value = bad.map(|index| output[index]);
+        assert_eq!(bad, None, "output {bad:?} is {bad_value:?}, expected {big}");
+    }
 }
 
 #[test]
@@ -1037,4 +1174,58 @@ fn erased_reduce_plan_sum_squares_rejects_non_float_dtypes() {
         let err = ErasedReducePlan::compile(dtype, ReduceOp::SumSquares, &[1], &[1]).unwrap_err();
         assert!(matches!(err, StridedError::UnsupportedDType { .. }));
     }
+}
+
+/// The parallel full-reduction split is disabled for a non-reassociable kernel, so
+/// this run must produce the ordered value even inside a two-thread pool.
+///
+/// The pool is explicit because the ambient one is not: `ExecContext::max_threads`
+/// only *caps* the pool it runs in, and the default feature set does not build the
+/// parallel path at all, so a `max_threads(2)` context alone proves nothing about it
+/// (independent review of #2150's coverage).
+#[cfg(feature = "parallel")]
+#[test]
+fn erased_reduce_plan_product_is_ordered_inside_an_explicit_two_thread_pool() {
+    use rayon::ThreadPoolBuilder;
+
+    // The parallel full-reduction split only engages above the threading threshold,
+    // so the run has to be longer than that or the guard is never reached: with too
+    // short a run the test passes whether the guard is there or not (independent
+    // review of the first version of this test, which used 1000 elements).
+    const SPLIT_THRESHOLD: usize = 32_768;
+    let big = 2f64.powi(600);
+    let small = 2f64.powi(-600);
+    let mut values = vec![1.0f64; 2 * SPLIT_THRESHOLD];
+    values[0] = small;
+    values[SPLIT_THRESHOLD] = big;
+    values[SPLIT_THRESHOLD + 1] = big;
+    // Ordered: `small * 1... * big * big * 1... = big`. Folded by halves, the second
+    // half is `big * big` on its own, which is `infinity`.
+    let dims = [values.len()];
+    let strides = [1isize];
+    let plan =
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+    let source = ErasedRawStridedRef::from_slice(&values, &dims, &strides, 0).unwrap();
+    let context = ExecContext::max_threads(2).unwrap();
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("a two-thread pool");
+    let ordered = pool.install(|| {
+        assert_eq!(
+            rayon::current_num_threads(),
+            2,
+            "the test must run inside a two-wide pool for the split to be reachable"
+        );
+        let mut output = [0.0f64];
+        let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
+        plan.execute(&context, &mut dest, &source).unwrap();
+        output[0]
+    });
+
+    assert_eq!(
+        ordered, big,
+        "a worker split would combine `small * big` with `big * big` and report infinity"
+    );
 }
