@@ -14,11 +14,15 @@ Machine for every number below: AMD EPYC 7713P, shared host, release builds.
 No public item was removed or renamed. The only addition is the
 `#[non_exhaustive]` variant `ReduceOp::StableProduct`.
 
-The workspace dependency entries move to `strided-view 0.5.1`,
-`strided-basic 0.5.3` and `strided-fused 0.5.1` as caret ranges. The published
-manifests of `strided-basic` and `strided-fused` therefore require the
-soundness fixes in `strided-view 0.5.1` and the `strided-basic` they were
-tested with.
+The workspace dependency entries move to `strided-basic 0.5.3` and
+`strided-fused 0.5.1` as caret ranges, so the published `strided-fused`
+requires the `strided-basic` it was tested with. The `strided-view` requirement
+deliberately stays at `0.5.0`. The published providers pin `strided-view =0.5.0`
+exactly (`tcontract 0.2.2`, `cpueinsum 0.2.2`, `cpueinsum-blas 0.2.2`,
+`tlinalg 0.2.0`), and `strided-basic` uses no item added in 0.5.1. A 0.5.1
+floor would therefore force every provider to be re-released before tenferro
+could take this release. `strided-view 0.5.1` is still published for direct
+users, and providers pick it up when they next relax or bump their pin.
 
 Publish order: `strided-view` → `strided-basic` → `strided-fused`. Publishing
 is done by the maintainer.
@@ -46,7 +50,10 @@ measured case (axis 1, extreme exponents, 1T).
 
 ## Downstream
 
-tenferro-rs pins `strided-basic =0.5.2` and `strided-fused =0.5.0`. When it bumps
+tenferro-rs pins `strided-basic =0.5.2` and `strided-fused =0.5.0`. Moving it to
+`strided-basic 0.5.3` also needs a `tcontract` release, because `tcontract 0.2.2`
+pins `strided-basic =0.5.2`, and then the matching `cpueinsum` /
+`cpueinsum-blas` releases, which pin `tcontract =0.2.2`. When tenferro-rs bumps
 to this release:
 
 - `reduce_prod` follows the new `Product` default. The tests
