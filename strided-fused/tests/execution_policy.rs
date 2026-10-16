@@ -832,14 +832,17 @@ fn nested_rayon_operation_is_sequential_inside_an_outer_worker_partition() {
         let nested_started = AtomicBool::new(false);
         let nested_participants = Arc::new(Participants::default());
         let observed = Arc::clone(&nested_participants);
-        let scope_caller = std::thread::current().id();
 
         with_execution_policy(ExecutionPolicy::Rayon { max_threads: two }, || {
             map_into(
                 &mut outer_destination.view_mut(),
                 &outer_source.view(),
                 |value| {
-                    if std::thread::current().id() != scope_caller
+                    // Trigger inside the second outer partition, whichever thread
+                    // runs it: with work stealing the caller may run both halves
+                    // when no worker steals in time, so a "not the caller thread"
+                    // condition can never fire on a slow or loaded runner.
+                    if value >= (LARGE_LEN / 2) as f64
                         && !nested_started.swap(true, Ordering::SeqCst)
                     {
                         let source =
