@@ -309,17 +309,37 @@ fn test_range_plan_declines_transposed_input() {
 }
 
 #[test]
-fn test_range_plan_keeps_transposed_scalar_tile_only_with_parallel() {
+fn test_range_plan_keeps_transposed_scalar_tile_without_parallel() {
     let dims = [5usize, 5, 7, 11];
     let dst = [1isize, 5, 25, 175];
     let lhs = [5isize, 1, 0, 25];
     let rhs = [0isize, 0, 1, 7];
     let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
 
+    // The transposed-scalar tile is serial cache blocking, not Rayon fan-out,
+    // so single-thread kernel selection must be identical with and without the
+    // `parallel` feature. This test is compiled under every feature set and
+    // asserts the same selection unconditionally.
     assert_eq!(
-        plan.walks_inputs_without_blocking(),
-        cfg!(feature = "parallel")
+        transposed_scalar_tile_kind(&plan),
+        Some(TransposedScalarTileKind::RhsScalar)
     );
+    assert!(plan.walks_inputs_without_blocking());
+}
+
+#[test]
+fn test_range_plan_declines_transposed_scalar_tile_with_large_inner_aspect() {
+    // 1024:64 is a 16x inner:row aspect. The tiled kernel's strided destination
+    // writes lose to the generic blocked plan there, so the detector declines
+    // and the plan does not claim to walk its inputs without blocking.
+    let dims = [1024usize, 64];
+    let dst = [1isize, 1024];
+    let lhs = [64isize, 1];
+    let rhs = [0isize, 0];
+    let plan = contiguous_mul_range_plan(&dims, &dst, &lhs, &rhs).unwrap();
+
+    assert_eq!(transposed_scalar_tile_kind(&plan), None);
+    assert!(!plan.walks_inputs_without_blocking());
 }
 
 #[test]

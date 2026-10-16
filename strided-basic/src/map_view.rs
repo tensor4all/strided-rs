@@ -32,6 +32,16 @@ type AxisVec<T> = Vec<T>;
 
 const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
 
+/// Largest fused inner:row aspect at which the tiled transposed-scalar kernel
+/// is selected.
+///
+/// The cache-tiled kernel wins or ties the generic blocked plan across the
+/// measured shape/dtype table (u4-tiled #210), except when the fused inner run
+/// is more than 8x the row extent: then its strided destination writes lose to
+/// the blocked plan on f64 (`4096x256` ~1.4x, `8192x256` ~1.3x at 1T), so the
+/// detector declines and the generic path runs.
+const TRANSPOSED_SCALAR_TILE_MAX_INNER_ROW_ASPECT: usize = 8;
+
 /// Internal validation marker used by kernel-family execution adapters.
 ///
 /// This marker is not bound to a destination. It does not authorize unchecked
@@ -494,13 +504,12 @@ impl ContiguousMulRangePlan {
     /// stride along the fast axis (a transposed operand) is swept across the
     /// whole fast axis once per row, touching a new cache line per element and
     /// again on the next row; the blocked kernel tiles that access. The one
-    /// exception is the SIMD transposed-scalar tile, which blocks itself.
+    /// exception is the transposed-scalar tile, which blocks itself.
     fn walks_inputs_without_blocking(&self) -> bool {
         let streams = |stride: isize| stride == 0 || stride == 1;
         if streams(self.a_fast_stride) && streams(self.b_fast_stride) {
             return true;
         }
-        #[cfg(feature = "parallel")]
         if transposed_scalar_tile_kind(self).is_some() {
             return true;
         }
@@ -508,15 +517,16 @@ impl ContiguousMulRangePlan {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransposedScalarTileKind {
     RhsScalar,
     LhsScalar,
 }
 
-#[cfg(feature = "parallel")]
 fn transposed_scalar_tile_kind(plan: &ContiguousMulRangePlan) -> Option<TransposedScalarTileKind> {
+    if plan.inner_len > TRANSPOSED_SCALAR_TILE_MAX_INNER_ROW_ASPECT.saturating_mul(plan.row_len) {
+        return None;
+    }
     let row_len = isize::try_from(plan.row_len).ok()?;
     if plan.a_fast_stride == row_len
         && plan.a_row_stride == 1
@@ -748,14 +758,12 @@ unsafe fn run_contiguous_mul_row_block<
 ) {
     let inner_len = plan.inner_len.max(1);
     let row_len = plan.row_len.max(1);
-    #[cfg(feature = "parallel")]
     let block_len = inner_len.saturating_mul(row_len);
 
-    #[cfg(feature = "parallel")]
     if total.saturating_sub(base_index) >= block_len {
-        match transposed_scalar_tile_kind(plan) {
+        let tiled = match transposed_scalar_tile_kind(plan) {
             Some(TransposedScalarTileKind::RhsScalar) => {
-                if simd::try_mul_transposed_scalar_rhs_2d::<D, A, B>(
+                simd::try_mul_transposed_scalar_rhs_2d::<D, A, B>(
                     dst_ptr.add(base_index).cast::<D>(),
                     a_ptr.offset(base_a_offset),
                     b_ptr.offset(base_b_offset),
@@ -763,12 +771,10 @@ unsafe fn run_contiguous_mul_row_block<
                     row_len,
                     plan.a_fast_stride,
                     plan.a_row_stride,
-                ) {
-                    return;
-                }
+                )
             }
             Some(TransposedScalarTileKind::LhsScalar) => {
-                if simd::try_mul_transposed_scalar_lhs_2d::<D, A, B>(
+                simd::try_mul_transposed_scalar_lhs_2d::<D, A, B>(
                     dst_ptr.add(base_index).cast::<D>(),
                     a_ptr.offset(base_a_offset),
                     b_ptr.offset(base_b_offset),
@@ -776,11 +782,12 @@ unsafe fn run_contiguous_mul_row_block<
                     row_len,
                     plan.b_fast_stride,
                     plan.b_row_stride,
-                ) {
-                    return;
-                }
+                )
             }
-            None => {}
+            None => false,
+        };
+        if tiled {
+            return;
         }
     }
 
