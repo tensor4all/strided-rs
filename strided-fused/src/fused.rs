@@ -14,6 +14,8 @@ use strided_basic::execution::{
 };
 use strided_basic::{with_execution_policy, ExecutionPolicy};
 
+mod chunk;
+
 #[cfg(feature = "parallel")]
 use strided_basic::execution::compute_costs;
 #[cfg(feature = "parallel")]
@@ -1096,6 +1098,37 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
     }
 }
 
+/// Seed for the chunk register file, or `None` when this scalar has no vector
+/// kernels (or there is no input to seed from).
+#[inline]
+fn chunk_seed<T: FusedScalar>(inputs: &[StridedView<'_, T>]) -> Option<T> {
+    if inputs.is_empty() || !chunk::is_real_chunk_scalar::<T>() {
+        return None;
+    }
+    // SAFETY: callers reach this with a non-empty destination, and every input
+    // shares the destination shape, so the first input has a readable element.
+    Some(unsafe { *inputs[0].ptr() })
+}
+
+/// Register file for `seed`, or an empty one when the chunked path is declined.
+#[inline]
+fn register_file<T: FusedScalar>(plan: &FusedPlan, seed: Option<T>) -> Vec<T> {
+    match seed {
+        Some(seed) => chunk::new_register_file(plan, seed),
+        None => Vec::new(),
+    }
+}
+
+/// Inputs the chunked path reads straight from the operand, empty when it is
+/// declined.
+#[inline]
+fn direct_inputs<T: FusedScalar>(plan: &FusedPlan, seed: Option<T>) -> Vec<bool> {
+    match seed {
+        Some(_) => chunk::single_use_inputs(plan),
+        None => Vec::new(),
+    }
+}
+
 fn interpret_fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],
@@ -1142,6 +1175,8 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
 
             let costs = unsafe { compute_costs(&ordered_strides) };
             let initial_offsets = vec![0isize; ordered_strides.len()];
+            let seed = chunk_seed(inputs);
+            let operands = dst_ptrs.len() + input_ptrs.len();
             let run_partition = |dims: &[usize],
                                  blocks: &[usize],
                                  strides_list: &[Vec<isize>],
@@ -1150,7 +1185,24 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                 let dst_ptrs: Vec<*mut T> = dst_send.iter().map(|ptr| ptr.as_ptr()).collect();
                 let input_ptrs: Vec<*const T> =
                     input_send.iter().map(|ptr| ptr.as_const()).collect();
+                let mut regs = register_file(plan, seed);
+                let direct = direct_inputs(plan, seed);
                 let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+                    if seed.is_some() && chunk::block_is_contiguous(strides, operands) {
+                        // SAFETY: validated shapes/layouts and the derived block bound every access.
+                        unsafe {
+                            chunk::replay_chunked(
+                                &dst_ptrs,
+                                &input_ptrs,
+                                plan,
+                                offsets,
+                                len,
+                                &direct,
+                                &mut regs,
+                            );
+                        }
+                        return Ok(());
+                    }
                     // SAFETY: validated shapes/layouts and the derived block bound every access.
                     unsafe {
                         interpret_inner_loop(&dst_ptrs, &input_ptrs, plan, offsets, len, strides);
@@ -1214,7 +1266,26 @@ fn interpret_fused_elementwise_into_serial<T: FusedScalar>(
     };
 
     let initial_offsets = vec![0isize; ordered_strides.len()];
+    let seed = chunk_seed(inputs);
+    let operands = dst_ptrs.len() + input_ptrs.len();
+    let mut regs = register_file(plan, seed);
+    let direct = direct_inputs(plan, seed);
     let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+        if seed.is_some() && chunk::block_is_contiguous(strides, operands) {
+            // SAFETY: validated shapes/layouts and the derived block bound every access.
+            unsafe {
+                chunk::replay_chunked(
+                    &dst_ptrs,
+                    &input_ptrs,
+                    plan,
+                    offsets,
+                    len,
+                    &direct,
+                    &mut regs,
+                );
+            }
+            return Ok(());
+        }
         // SAFETY: validated shapes/layouts and the derived block bound every access.
         unsafe {
             interpret_inner_loop(&dst_ptrs, &input_ptrs, plan, offsets, len, strides);
@@ -1320,6 +1391,8 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
             let costs = unsafe { compute_costs(&ordered_strides) };
             let initial_offsets = vec![0isize; ordered_strides.len()];
+            let seed = chunk_seed(inputs);
+            let operands = 1 + input_ptrs.len();
             let run_partition = |dims: &[usize],
                                  blocks: &[usize],
                                  strides_list: &[Vec<isize>],
@@ -1327,7 +1400,24 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
              -> Result<()> {
                 let input_ptrs: Vec<*const T> =
                     input_send.iter().map(|ptr| ptr.as_const()).collect();
+                let mut regs = register_file(plan, seed);
+                let direct = direct_inputs(plan, seed);
                 let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+                    if seed.is_some() && chunk::block_is_contiguous(strides, operands) {
+                        // SAFETY: validated shapes/layouts and the derived block bound every access.
+                        unsafe {
+                            chunk::replay_chunked_uninit(
+                                dst_send.as_ptr(),
+                                &input_ptrs,
+                                plan,
+                                offsets,
+                                len,
+                                &direct,
+                                &mut regs,
+                            );
+                        }
+                        return Ok(());
+                    }
                     // SAFETY: validated shapes/layouts and the derived block bound every access.
                     unsafe {
                         interpret_inner_loop_uninit(
@@ -1364,7 +1454,26 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
     }
 
     let initial_offsets = vec![0isize; ordered_strides.len()];
+    let seed = chunk_seed(inputs);
+    let operands = 1 + input_ptrs.len();
+    let mut regs = register_file(plan, seed);
+    let direct = direct_inputs(plan, seed);
     let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+        if seed.is_some() && chunk::block_is_contiguous(strides, operands) {
+            // SAFETY: validated shapes/layouts and the derived block bound every access.
+            unsafe {
+                chunk::replay_chunked_uninit(
+                    dst_ptr,
+                    &input_ptrs,
+                    plan,
+                    offsets,
+                    len,
+                    &direct,
+                    &mut regs,
+                );
+            }
+            return Ok(());
+        }
         // SAFETY: validated shapes/layouts and the derived block bound every access.
         unsafe {
             interpret_inner_loop_uninit(dst_ptr, &input_ptrs, plan, offsets, len, strides);
@@ -1396,9 +1505,23 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
 ///   elements never map to the same memory address.
 ///
 /// The implementation dispatches known single-output plans to existing static
-/// `map_into`/`zip_map*_into` kernels and uses a generic interpreter fallback
-/// for arbitrary validated DAGs. Overlapping source/destination memory is not
-/// supported by the strided kernels generally.
+/// `map_into`/`zip_map*_into` kernels, replays a block that is contiguous for
+/// every operand through a chunked register machine, and falls back to a
+/// per-element interpreter for arbitrary validated DAGs. Overlapping
+/// source/destination memory is not supported by the strided kernels generally.
+///
+/// # Numerics
+///
+/// The chunked replay evaluates `Exp`, `Log`, `Sin`, `Cos`, `Tanh` and `Expm1`
+/// with the `elem-simd-math` slice kernels — the same kernels a per-instruction
+/// dispatch through [`strided_basic::map_into_uninit_with_kernel`] uses, so the
+/// fused and the non-fused route agree with each other. Against `std`'s scalar
+/// functions those six instructions differ by at most one ULP of their own
+/// output magnitude; a chain of them multiplies that difference by the output
+/// magnitude, so an exponential chain is not bit-stable to `std`. `Log1p` and
+/// every other instruction (`Add`, `Multiply`, `Negate`, `Conj`, `Divide`,
+/// `Abs`, `Maximum`, `Minimum`, `Clamp`, `Sqrt`, `Rsqrt`, `Pow`) keep the scalar
+/// `FusedScalar` methods and are bit-identical to the per-element replay.
 ///
 /// Real `Maximum`, `Minimum`, and `Clamp` use Rust `f32`/`f64` `max`/`min`
 /// semantics. Complex `Abs` returns the norm in the real component; complex

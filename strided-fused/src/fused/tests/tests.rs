@@ -130,13 +130,34 @@ fn run_interpreter(plan: &FusedPlan, arrays: &[StridedArray<f64>]) -> Vec<f64> {
 }
 
 fn assert_static_matches_interpreter(plan: FusedPlan, arrays: &[StridedArray<f64>]) {
+    assert_static_matches_interpreter_within(plan, arrays, 0.0)
+}
+
+/// `ulp_budget` is relative to the larger magnitude, in units of
+/// `f64::EPSILON`; `0.0` demands bit equality. The interpreter's analytic
+/// instructions now run through the vector kernels, documented at 1.0 ULP,
+/// while the static specialization still calls the scalar functions; every
+/// other instruction kind is exact in both.
+fn assert_static_matches_interpreter_within(
+    plan: FusedPlan,
+    arrays: &[StridedArray<f64>],
+    ulp_budget: f64,
+) {
     let (used_static, static_values) = run_static(&plan, arrays);
     let interpreter_values = run_interpreter(&plan, arrays);
 
     assert!(used_static, "plan should use static specialization");
     assert_eq!(static_values.len(), interpreter_values.len());
     for (actual, expected) in static_values.iter().zip(interpreter_values.iter()) {
-        assert!((actual - expected).abs() < 1e-12);
+        if actual == expected || (actual.is_nan() && expected.is_nan()) {
+            continue;
+        }
+        let scale = actual.abs().max(expected.abs()).max(f64::MIN_POSITIVE);
+        let measured = (actual - expected).abs() / scale / f64::EPSILON;
+        assert!(
+            measured <= ulp_budget,
+            "{actual} vs {expected} is {measured} ULP"
+        );
     }
 }
 
@@ -457,7 +478,9 @@ fn specializes_exp_of_multiply_add_chain() {
         ],
     };
 
-    assert_static_matches_interpreter(plan, &[a, b, c]);
+    // The one analytic instruction is worth one ULP of its own output
+    // magnitude, which the scalar comparison rejects at `exp(13.5)`.
+    assert_static_matches_interpreter_within(plan, &[a, b, c], 2.0);
 }
 
 #[test]
