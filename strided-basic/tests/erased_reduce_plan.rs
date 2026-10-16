@@ -94,6 +94,26 @@ fn erased_reduce_plan_integer_full_reductions_use_wrapping_arithmetic() {
     assert_eq!(product_output, [i64::MAX.wrapping_mul(2)]);
 }
 
+/// No-SIMD reference for the serial full-sum kernel: the sixteen-lane fold
+/// documented for `ErasedReducePlan` (lane `i` accumulates elements
+/// `i, i + 16, ...` in order, the remainder folds into the first lanes, then
+/// the lanes fold left to right). `MaybeSimdOps::try_simd_sum` is the same
+/// contract when the `simd` feature is on; this helper pins it when it is off.
+fn sixteen_lane_sum(values: &[f64]) -> f64 {
+    const LANES: usize = 16;
+    let mut lanes = [0.0f64; LANES];
+    let mut chunks = values.chunks_exact(LANES);
+    for chunk in chunks.by_ref() {
+        for (lane, &value) in lanes.iter_mut().zip(chunk) {
+            *lane += value;
+        }
+    }
+    for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+        *lane += value;
+    }
+    lanes.into_iter().fold(0.0, |acc, lane| acc + lane)
+}
+
 #[test]
 fn erased_reduce_plan_serial_full_sum_uses_fixed_multi_accumulator_order() {
     let dims = [9usize];
@@ -118,7 +138,8 @@ fn erased_reduce_plan_serial_full_sum_uses_fixed_multi_accumulator_order() {
     )
     .unwrap();
 
-    let expected = <f64 as MaybeSimdOps>::try_simd_sum(&input).unwrap_or(7.0);
+    let expected =
+        <f64 as MaybeSimdOps>::try_simd_sum(&input).unwrap_or_else(|| sixteen_lane_sum(&input));
     assert_eq!(serial_output[0].to_bits(), expected.to_bits());
     assert_eq!(one_thread_output[0].to_bits(), serial_output[0].to_bits());
 }
@@ -278,24 +299,24 @@ fn erased_reduce_plan_contiguous_fast_path_honors_offset_and_empty_layout() {
     assert_eq!(empty_output, [1.0]);
 }
 
-/// A product is reduced in source order, so this run reports what the left fold
-/// reports: the `f64::MAX` factors followed by the smallest subnormals underflow
-/// to zero. Reassociating the run used to overflow it to `inf` and combine that
-/// with a lane's `0` into `NaN`, losing a result that is representable
-/// (tenferro-rs#2150).
+/// Genuine subnormal factors are not representable by the stable product's
+/// exponent tracker, so that output falls back to the source-order fold: the
+/// `f64::MAX` factors followed by the smallest subnormals underflow to zero,
+/// exactly what the left fold reports (R-numerics-01, tenferro-rs#2150).
 #[test]
-fn erased_reduce_plan_product_matches_the_left_fold() {
+fn erased_reduce_plan_stable_product_falls_back_for_subnormals() {
     let dims = [65usize];
     let strides = [1isize];
     let mut input = [1.0f64; 65];
     input[0] = f64::MAX;
-    input[1] = f64::MIN_POSITIVE;
-    input[2] = f64::MIN_POSITIVE;
-    input[3] = f64::MIN_POSITIVE;
+    input[1] = f64::from_bits(1);
+    input[2] = f64::from_bits(1);
+    input[3] = f64::from_bits(1);
     input[32] = f64::MAX;
     let left_fold = input.iter().copied().fold(1.0, |acc, value| acc * value);
     let plan =
-        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
+            .unwrap();
     let source = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
@@ -309,11 +330,11 @@ fn erased_reduce_plan_product_matches_the_left_fold() {
 
 /// A representable product is no longer lost to a lane that ran away, and a
 /// product that leaves the dtype's range still reports that. The alternating run
-/// is the shape that produced `NaN` here: one lane saw only `2.0` and overflowed
-/// while another saw only `0.5` and underflowed. The same run is reduced through
-/// the unit-stride path and through a strided one.
+/// is the shape that produced `NaN` with the reassociated product: one lane saw
+/// only `big` and overflowed while another saw only `small` and underflowed. The
+/// same run is reduced through the unit-stride path and through a strided one.
 #[test]
-fn erased_reduce_plan_product_reports_only_real_overflow() {
+fn erased_reduce_plan_stable_product_reports_only_real_overflow() {
     // Reciprocal factors far enough apart that a lane's partial product leaves the
     // f64 range. `2.0`/`0.5` over 1000 elements only reaches 2^500, which is
     // representable, so it would not exercise the defect at all.
@@ -327,7 +348,8 @@ fn erased_reduce_plan_product_reports_only_real_overflow() {
     let dims = [alternating.len()];
     let strides = [1isize];
     let plan =
-        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
+            .unwrap();
     let source = ErasedRawStridedRef::from_slice(&alternating, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
@@ -345,7 +367,8 @@ fn erased_reduce_plan_product_reports_only_real_overflow() {
         interleaved.push(*value);
     }
     let plan =
-        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
+            .unwrap();
     let source = ErasedRawStridedRef::from_slice(&interleaved, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
@@ -358,7 +381,8 @@ fn erased_reduce_plan_product_reports_only_real_overflow() {
     let dims = [runaway.len()];
     let strides = [1isize];
     let plan =
-        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
+            .unwrap();
     let source = ErasedRawStridedRef::from_slice(&runaway, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
@@ -368,12 +392,13 @@ fn erased_reduce_plan_product_reports_only_real_overflow() {
 }
 
 /// A full reduction can split one output's factors over several runs of the
-/// layout. Source order must carry one accumulator through them: offset 2 is
-/// never visited (padding), so the runs are `[2^-600, 1]` and `[2^600, 2^600]`.
-/// Multiplying the independently folded runs gives `2^1200 = inf`, but the
-/// ordered product is the representable `2^600`.
+/// layout, and the stable accumulator must carry its mantissa and exponent
+/// through them: offset 2 is never visited (padding), so the runs are
+/// `[2^-600, 1]` and `[2^600, 2^600]`. Scaling each independently and combining
+/// gives `2^1200 = inf` with a raw product, but the exact exponent sum is the
+/// representable `2^600`.
 #[test]
-fn erased_reduce_plan_full_product_carries_one_accumulator_across_runs() {
+fn erased_reduce_plan_full_stable_product_carries_one_accumulator_across_runs() {
     let big = 2f64.powi(600);
     let small = 2f64.powi(-600);
     let dims = [2usize, 2];
@@ -382,7 +407,8 @@ fn erased_reduce_plan_full_product_carries_one_accumulator_across_runs() {
     // there makes an out-of-run read fail loudly instead of silently passing.
     let storage = [small, 1.0, f64::NAN, big, big];
     let plan =
-        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
+            .unwrap();
     let source = ErasedRawStridedRef::from_slice(&storage, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
@@ -395,12 +421,12 @@ fn erased_reduce_plan_full_product_carries_one_accumulator_across_runs() {
 
 /// The axis `ContiguousRuns` strategy splits one output's factors over two
 /// unit-stride runs: `[2^-600, fifteen ones]` and `[2^600, 2^600, fourteen
-/// ones]`. Folding each run separately gives `2^-600 * inf = inf`; the ordered
-/// product is `2^600`. Both the serial and the two-worker dispatch (work
-/// `2048 * 32` exceeds `MINTHREADLENGTH`) must carry the accumulator across the
-/// runs.
+/// ones]`. Scaling each run separately gives `2^-600 * inf = inf` with a raw
+/// product; the exact exponent sum is `2^600`. Both the serial and the
+/// two-worker dispatch (work `2048 * 32` exceeds `MINTHREADLENGTH`) must carry
+/// the mantissa/exponent accumulator across the runs.
 #[test]
-fn erased_reduce_plan_axis_product_carries_one_accumulator_across_runs() {
+fn erased_reduce_plan_axis_stable_product_carries_one_accumulator_across_runs() {
     let big = 2f64.powi(600);
     let small = 2f64.powi(-600);
     let kept = 2048usize;
@@ -418,7 +444,7 @@ fn erased_reduce_plan_axis_product_carries_one_accumulator_across_runs() {
     let dest_strides = [1isize];
     let plan = ErasedReducePlan::compile_axes(
         KernelDType::F64,
-        ReduceOp::Product,
+        ReduceOp::StableProduct,
         &dims,
         &strides,
         &dest_dims,
@@ -1176,8 +1202,10 @@ fn erased_reduce_plan_sum_squares_rejects_non_float_dtypes() {
     }
 }
 
-/// The parallel full-reduction split is disabled for a non-reassociable kernel, so
-/// this run must produce the ordered value even inside a two-thread pool.
+/// The stable product may split a full reduction across workers: each worker
+/// carries its own mantissa/exponent accumulator, so combining `small` from the
+/// first half with `big * big` from the second still scales to the representable
+/// `big` instead of overflowing one worker to `infinity`.
 ///
 /// The pool is explicit because the ambient one is not: `ExecContext::max_threads`
 /// only *caps* the pool it runs in, and the default feature set does not build the
@@ -1185,7 +1213,7 @@ fn erased_reduce_plan_sum_squares_rejects_non_float_dtypes() {
 /// (independent review of #2150's coverage).
 #[cfg(feature = "parallel")]
 #[test]
-fn erased_reduce_plan_product_is_ordered_inside_an_explicit_two_thread_pool() {
+fn erased_reduce_plan_stable_product_carries_the_exponent_across_a_two_thread_pool() {
     use rayon::ThreadPoolBuilder;
 
     // The parallel full-reduction split only engages above the threading threshold,
@@ -1199,12 +1227,14 @@ fn erased_reduce_plan_product_is_ordered_inside_an_explicit_two_thread_pool() {
     values[0] = small;
     values[SPLIT_THRESHOLD] = big;
     values[SPLIT_THRESHOLD + 1] = big;
-    // Ordered: `small * 1... * big * big * 1... = big`. Folded by halves, the second
-    // half is `big * big` on its own, which is `infinity`.
+    // Exact exponent sum: `small * 1... * big * big * 1... = big`. A raw worker
+    // split would compute the second half as `big * big = infinity` and combine
+    // it with the first half's `small`, also reaching infinity rather than `big`.
     let dims = [values.len()];
     let strides = [1isize];
     let plan =
-        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides).unwrap();
+        ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
+            .unwrap();
     let source = ErasedRawStridedRef::from_slice(&values, &dims, &strides, 0).unwrap();
     let context = ExecContext::max_threads(2).unwrap();
 
@@ -1212,7 +1242,7 @@ fn erased_reduce_plan_product_is_ordered_inside_an_explicit_two_thread_pool() {
         .num_threads(2)
         .build()
         .expect("a two-thread pool");
-    let ordered = pool.install(|| {
+    let scaled = pool.install(|| {
         assert_eq!(
             rayon::current_num_threads(),
             2,
@@ -1225,7 +1255,7 @@ fn erased_reduce_plan_product_is_ordered_inside_an_explicit_two_thread_pool() {
     });
 
     assert_eq!(
-        ordered, big,
-        "a worker split would combine `small * big` with `big * big` and report infinity"
+        scaled, big,
+        "the exponent sum must survive the worker split and report {big:e}"
     );
 }

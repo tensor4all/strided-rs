@@ -138,18 +138,14 @@ impl ExecContext {
     ) -> Result<R> {
         let budget = NonZeroUsize::new(max_threads)
             .ok_or(StridedError::InvalidThreadBudget { max_threads })?;
-        let width = budget.get().min(pool.current_num_threads());
-        if width <= 1 {
-            let ctx = Self::serial();
-            return Ok(ctx.run(|| operation(ctx)));
-        }
-        let ctx = Self::max_threads(width)?;
-        let run = move || ctx.run(|| operation(ctx));
-        if pool.current_thread_index().is_some() {
-            Ok(run())
-        } else {
-            Ok(pool.install(run))
-        }
+        crate::threading::run_on_pool(pool, budget, move |width| {
+            let ctx = if width <= 1 {
+                Self::serial()
+            } else {
+                Self::max_threads(width)?
+            };
+            Ok(ctx.run(|| operation(ctx)))
+        })
     }
 }
 

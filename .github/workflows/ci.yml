@@ -41,7 +41,7 @@ jobs:
         run: cargo test --profile ci
 
       - name: Run parallel feature tests
-        run: cargo test --profile ci -p strided-basic -p strided-kernel --features parallel
+        run: cargo test --profile ci -p strided-basic -p strided-kernel -p strided-fused --features parallel
 
       - name: Report Cargo artifact usage
         if: always()

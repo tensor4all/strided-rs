@@ -57,7 +57,6 @@ fn test_try_mul_contiguous_complex32() {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[test]
 fn test_transposed_scalar_rhs_2d_f64_source_contiguous() {
     let inner_len = 5usize;
@@ -89,7 +88,6 @@ fn test_transposed_scalar_rhs_2d_f64_source_contiguous() {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[test]
 fn test_transposed_scalar_lhs_2d_f32_source_contiguous() {
     let inner_len = 5usize;
@@ -123,7 +121,6 @@ fn test_transposed_scalar_lhs_2d_f32_source_contiguous() {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[test]
 fn test_transposed_scalar_rhs_2d_handles_short_rows() {
     let inner_len = 8usize;
@@ -155,7 +152,6 @@ fn test_transposed_scalar_rhs_2d_handles_short_rows() {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[test]
 fn test_transposed_scalar_2d_handles_small_square_tiles() {
     let inner_len = 4usize;
@@ -204,7 +200,6 @@ fn test_transposed_scalar_2d_handles_small_square_tiles() {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[test]
 fn test_transposed_scalar_rhs_2d_complex64_source_contiguous() {
     let inner_len = 5usize;
@@ -242,7 +237,6 @@ fn test_transposed_scalar_rhs_2d_complex64_source_contiguous() {
     }
 }
 
-#[cfg(feature = "parallel")]
 #[test]
 fn test_transposed_scalar_lhs_2d_complex32_source_contiguous() {
     let inner_len = 5usize;

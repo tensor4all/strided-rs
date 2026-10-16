@@ -15,7 +15,8 @@ pub use scan::{ErasedScanPlan, ScanOp, ScanOptions};
 
 use reduce_kernel::{
     reduce_axes_range, reduce_full_range, AxesRange, FullTraversal, MaxKernel, MinKernel,
-    ProductKernel, ReduceKernel, SumKernel, SumSquaresKernel,
+    ReassociatedProductKernel, ReduceKernel, StableProductKernel, StableProductScalar, SumKernel,
+    SumSquaresKernel,
 };
 
 trait ReduceWriter<T> {
@@ -233,6 +234,19 @@ impl ErasedConcatenatePlan {
 pub enum ReduceOp {
     Sum,
     Product,
+    /// Reassociated, overflow/underflow-safe product.
+    ///
+    /// Tracks a signed mantissa and an exact integer exponent per lane, so
+    /// factors outside the dtype range do not overflow or underflow a partial.
+    /// The reduction is reassociated and threaded like [`Self::Sum`].
+    ///
+    /// A zero, subnormal, infinite or NaN input cannot be represented by the
+    /// exponent-tracked accumulator; the affected output is then recomputed in
+    /// source order, keeping IEEE propagation (`0 * inf = NaN`, a zero or an
+    /// infinity result) identical to the sequential fold. For integers this is
+    /// the reassociated wrapping product and for complex dtypes the
+    /// source-order product.
+    StableProduct,
     /// Sum of same-dtype rounded squares.
     ///
     /// Each input is first multiplied by itself without FMA contraction, then
@@ -270,11 +284,28 @@ pub enum ReduceOp {
 /// specialized for one `(dtype, op)` pair. Integer results are exact
 /// (wrapping) and [`ReduceOp::Max`] / [`ReduceOp::Min`] do not depend on
 /// order, so the rules below only affect the rounding of floating point and
-/// complex [`ReduceOp::Sum`], [`ReduceOp::Product`] and
-/// [`ReduceOp::SumSquares`]. Two details of float max and min follow the
+/// complex [`ReduceOp::Sum`], [`ReduceOp::Product`], [`ReduceOp::StableProduct`]
+/// and [`ReduceOp::SumSquares`]. Two details of float max and min follow the
 /// visit order: a NaN input makes the result NaN, but which NaN (payload and
 /// sign) is returned is unspecified, and when the extremum is a zero its sign
 /// is unspecified if both `+0.0` and `-0.0` occur.
+///
+/// [`ReduceOp::Product`] is the reassociated product, matching PyTorch: it
+/// splits each run into lanes, uses the SIMD product where available, threads a
+/// full reduction, and combines the partials in a fixed tree. It is fast and
+/// never recomputes an output, but reassociating can overflow a lane to `inf`
+/// and underflow another to `0`, whose `inf * 0` combine is `NaN`; an
+/// alternating `2.0`/`0.5` input at `2^600`/`2^-600` scale can therefore give
+/// `NaN` where the source-order product is representable (tenferro-rs#2150).
+///
+/// [`ReduceOp::StableProduct`] avoids that. For `f32`/`f64` it tracks a signed
+/// mantissa and an exact integer exponent per lane and across runs and workers,
+/// so a partial cannot overflow or underflow; the final value is scaled with a
+/// correctly rounded `ldexp`. An input that is zero, subnormal, infinite or NaN
+/// cannot be represented this way, so an output that saw one is recomputed in
+/// source order, preserving IEEE propagation. It is reassociated and threaded
+/// like [`ReduceOp::Product`] otherwise. For integers it is the reassociated
+/// wrapping product and for complex dtypes the source-order product.
 ///
 /// * Full reductions (from [`Self::compile`], or [`Self::compile_axes`]
 ///   with every axis reduced) visit the source in a layout derived order:
@@ -283,27 +314,19 @@ pub enum ReduceOp {
 ///   reduced by the SIMD kernel (unit stride, `simd` feature), a sixteen
 ///   lane kernel (other unit stride runs) or an eight lane kernel (strided
 ///   runs), and runs are combined left to right. A dense column major
-///   source therefore reduces exactly like one contiguous slice. Exception:
-///   [`ReduceOp::Product`] is not reassociable, so each run is folded in
-///   source order (no SIMD or lane splitting) and one accumulator is carried
-///   across the runs of an output instead of combining per-run partials.
+///   source therefore reduces exactly like one contiguous slice.
 /// * With a parallel context and more than `MINTHREADLENGTH` elements, a
-///   full reduction that may be reassociated splits the traversal into one
-///   deterministic range per worker thread. Each range runs the same run
-///   kernel as the serial path and the partials are combined in a fixed tree.
-///   The result is bitwise repeatable for a fixed layout and thread count, but
-///   may differ between thread counts and from the serial result. A
-///   non-reassociable [`ReduceOp::Product`] full reduction never splits, so it
-///   stays in source order for every context.
+///   full reduction splits the traversal into one deterministic range per
+///   worker thread. Each range runs the same run kernel as the serial path and
+///   the partials are combined in a fixed tree. The result is bitwise
+///   repeatable for a fixed layout and thread count, but may differ between
+///   thread counts and from the serial result.
 /// * Axis reductions with kept axes compute every output independently, so
 ///   the result never depends on the context or thread count. Each output
 ///   folds its reduced elements sequentially in caller reduced axis order,
 ///   except that a unit stride leading reduced run (after fusing adjacent
 ///   reduced axes) of length at least 16 is reduced by the contiguous run
-///   kernel, with runs folded in order. A non-reassociable
-///   [`ReduceOp::Product`] folds each run in source order and carries one
-///   accumulator across the runs rather than multiplying per-run partials.
-///   When instead the leading kept axis
+///   kernel, with runs folded in order. When instead the leading kept axis
 ///   has unit stride, adjacent outputs are accumulated as a block from one
 ///   contiguous source run per reduced element; each output still folds in
 ///   caller reduced axis order.
@@ -859,7 +882,7 @@ fn execute_reduce_full<T, W, K>(
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
     traversal: &FullTraversal,
-) -> Result<()>
+) -> Result<bool>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
@@ -867,29 +890,37 @@ where
 {
     let source = src.data_as::<T>()?;
     let total = traversal.total();
-    let value = if total == 0 {
-        K::identity()
-    } else if reduce_context_is_serial(ctx) {
+    if total == 0 {
+        // SAFETY: validated rank-zero destination layout proves the offset.
+        unsafe { dest.write_at(dest.offset(), K::finish(K::identity())) };
+        return Ok(false);
+    }
+    let acc = if reduce_context_is_serial(ctx) {
         // INVARIANT: (1) FullTraversal::compile checked every step/reset of
         // the source layout; (2) the raw source descriptor validated every
         // reachable offset; (3) execute checked exact plan-layout equality.
         // SAFETY: the three-link invariant proves every traversal offset is
-        // readable, and `0..total` is non-empty.
+        // readable.
         unsafe { reduce_full_range::<T, K>(source.as_ptr(), src.offset(), traversal, 0..total)? }
     } else {
         ctx.run(|| reduce_full_policy::<T, K>(source, src.offset(), traversal))?
     };
 
+    if K::needs_ordered_fallback(&acc) {
+        // The caller re-runs this layout with `K::Fallback`; the destination is
+        // left untouched so nothing observable is written twice.
+        return Ok(true);
+    }
     // SAFETY: validated rank-zero destination layout proves the offset.
-    unsafe { dest.write_at(dest.offset(), value) };
-    Ok(())
+    unsafe { dest.write_at(dest.offset(), K::finish(acc)) };
+    Ok(false)
 }
 
 fn reduce_full_policy<T, K>(
     source: &[T],
     source_base: isize,
     traversal: &FullTraversal,
-) -> Result<T>
+) -> Result<K::Acc>
 where
     T: ErasedReduceScalar,
     K: ReduceKernel<T>,
@@ -899,7 +930,9 @@ where
     {
         // Splitting reassociates one output element's factors across worker
         // ranges, so only a kernel that may be reassociated takes it
-        // (tenferro-rs#2150).
+        // (tenferro-rs#2150). A stable accumulator that detects an
+        // unrepresentable factor sets the fallback flag, and the caller then
+        // recomputes the whole output in source order.
         let nthreads = if K::reassociable() {
             crate::threading::parallel_threads_for_len(total)
         } else {
@@ -927,7 +960,7 @@ where
         }
     }
     // SAFETY: same three-link invariant as the serial call in
-    // `execute_reduce_full`; `0..total` is non-empty.
+    // `execute_reduce_full`.
     unsafe { reduce_full_range::<T, K>(source.as_ptr(), source_base, traversal, 0..total) }
 }
 
@@ -946,7 +979,12 @@ where
     // the selected kernel type.
     match op {
         ReduceOp::Sum => dispatch_reduce_kernel::<T, W, SumKernel>(layout, ctx, dest, src),
-        ReduceOp::Product => dispatch_reduce_kernel::<T, W, ProductKernel>(layout, ctx, dest, src),
+        ReduceOp::Product => {
+            dispatch_reduce_kernel::<T, W, ReassociatedProductKernel>(layout, ctx, dest, src)
+        }
+        ReduceOp::StableProduct => {
+            dispatch_reduce_kernel::<T, W, StableProductKernel>(layout, ctx, dest, src)
+        }
         ReduceOp::SumSquares => {
             dispatch_reduce_kernel::<T, W, SumSquaresKernel>(layout, ctx, dest, src)
         }
@@ -966,9 +1004,9 @@ where
     W: ReduceWriter<T>,
     K: ReduceKernel<T>,
 {
-    match layout {
+    let fallback = match layout {
         ReduceLayout::Full { traversal, .. } => {
-            execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)
+            execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)?
         }
         ReduceLayout::Axes {
             outer_axes,
@@ -978,22 +1016,32 @@ where
             full,
             ..
         } => {
-            if let Some(traversal) = full {
-                return execute_reduce_full::<T, W, K>(ctx, dest, src, traversal);
+            let axes = AxesLayout {
+                outer_axes,
+                inner_axes,
+                dest_total: *dest_total,
+                reduce_total: *reduce_total,
+            };
+            match full {
+                Some(traversal) => execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)?,
+                None => {
+                    // An axis reduction falls back per output inside
+                    // `reduce_axes_range`; it never asks for a layout-wide
+                    // recompute.
+                    execute_reduce_axes::<T, W, K>(ctx, dest, src, axes)?;
+                    false
+                }
             }
-            execute_reduce_axes::<T, W, K>(
-                ctx,
-                dest,
-                src,
-                AxesLayout {
-                    outer_axes,
-                    inner_axes,
-                    dest_total: *dest_total,
-                    reduce_total: *reduce_total,
-                },
-            )
         }
+    };
+    if fallback {
+        // Only a full reduction (one output) requests the layout-wide
+        // recompute; `K::Fallback` must not itself request a fallback, so this
+        // recurses at most once. Scalar kernels use `Fallback = Self` and never
+        // set the flag, so the branch is unreachable for them.
+        return dispatch_reduce_kernel::<T, W, K::Fallback>(layout, ctx, dest, src);
     }
+    Ok(())
 }
 
 fn execute_reduce_axes<T, W, K>(
@@ -1108,7 +1156,7 @@ where
         // SAFETY: the three-link layout invariant proves this destination
         // cursor offset is in bounds; the source pointer is intentionally never
         // formed for an empty reduction domain.
-        unsafe { dest.write_at(outer.dest_offset, K::identity()) };
+        unsafe { dest.write_at(outer.dest_offset, K::finish(K::identity())) };
         if output + 1 < layout.dest_total {
             outer.advance();
         }
@@ -1160,7 +1208,11 @@ where
                 // exact plan-layout equality before dispatch.
                 // SAFETY: the three-link layout invariant proves this
                 // destination offset is in bounds; no source pointer is formed.
-                unsafe { dest_ptr.offset(outer.dest_offset).write(K::identity()) };
+                unsafe {
+                    dest_ptr
+                        .offset(outer.dest_offset)
+                        .write(K::finish(K::identity()))
+                };
                 if output + 1 < range_end {
                     outer.advance();
                 }
@@ -1181,6 +1233,7 @@ trait ErasedReduceScalar:
     + crate::simd::MaybeSimdProduct
     + crate::simd::MaybeSimdSumSquares
     + crate::simd::MaybeSimdBlockFold
+    + StableProductScalar
 {
     fn reduce_sum(lhs: Self, rhs: Self) -> Self;
     fn reduce_product(lhs: Self, rhs: Self) -> Self;

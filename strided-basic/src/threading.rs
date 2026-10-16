@@ -201,6 +201,29 @@ pub(crate) fn fill_contiguous<T: Copy + crate::MaybeSendSync>(dst: &mut [T], val
     dst.fill(value);
 }
 
+/// Fill `len` contiguous destination elements that may be uninitialized.
+///
+/// [`fill_contiguous`] forms a `&mut [T]`, which is undefined behaviour over
+/// uninitialized storage (for example a fresh `bool` buffer). This sibling
+/// views the same span as `[MaybeUninit<T>]`, which has no validity invariant,
+/// and reuses the existing chunking.
+///
+/// # Safety
+///
+/// `dst..dst + len` must be writable for the whole call and no other thread
+/// may access the destination range concurrently.
+pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + crate::MaybeSendSync>(
+    dst: *mut T,
+    len: usize,
+    value: T,
+) {
+    // SAFETY: `MaybeUninit<T>` has no validity invariant, so the span is a
+    // valid `[MaybeUninit<T>]`; `fill_contiguous` writes every element.
+    let span =
+        unsafe { core::slice::from_raw_parts_mut(dst.cast::<core::mem::MaybeUninit<T>>(), len) };
+    fill_contiguous(span, core::mem::MaybeUninit::new(value));
+}
+
 pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
@@ -222,6 +245,28 @@ mod default_tests;
 #[cfg(feature = "parallel")]
 pub(crate) fn current_pool_threads() -> usize {
     rayon::current_num_threads()
+}
+
+/// Runs `operation` on `pool`, clamping `budget` to the pool's worker count and
+/// entering the pool only when the caller is not already one of its workers and
+/// the effective width permits fanout.
+///
+/// This is the only place [`crate::ExecContext::run_on`] touches the Rayon
+/// pool; the policy construction stays in `exec_context.rs` and the placement
+/// stays next to the rest of the repository's Rayon interaction.
+#[cfg(feature = "parallel")]
+pub(crate) fn run_on_pool<T: Send>(
+    pool: &rayon::ThreadPool,
+    budget: core::num::NonZeroUsize,
+    operation: impl FnOnce(usize) -> T + Send,
+) -> T {
+    let width = budget.get().min(pool.current_num_threads());
+    let run = move || operation(width);
+    if width <= 1 || pool.current_thread_index().is_some() {
+        run()
+    } else {
+        pool.install(run)
+    }
 }
 
 #[cfg(feature = "parallel")]

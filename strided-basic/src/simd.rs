@@ -208,10 +208,8 @@ pub(crate) unsafe fn try_mul_contiguous_ptr<D: 'static, A: 'static, B: 'static>(
     false
 }
 
-#[cfg(feature = "parallel")]
 const TRANSPOSE_TILE: usize = 8;
 
-#[cfg(feature = "parallel")]
 unsafe fn mul_transposed_scalar_rhs_source_contiguous<T>(
     dst: *mut T,
     src: *const T,
@@ -249,28 +247,6 @@ unsafe fn mul_transposed_scalar_rhs_source_contiguous<T>(
     }
 }
 
-#[cfg(feature = "parallel")]
-unsafe fn mul_transposed_scalar_rhs_dst_contiguous<T>(
-    dst: *mut T,
-    src: *const T,
-    scalar: T,
-    inner_len: usize,
-    row_len: usize,
-    src_fast_stride: isize,
-    src_row_stride: isize,
-) where
-    T: Copy + std::ops::Mul<Output = T>,
-{
-    for row in 0..row_len {
-        let dst_base = dst.add(row * inner_len);
-        let src_base = src.offset(row as isize * src_row_stride);
-        for inner in 0..inner_len {
-            *dst_base.add(inner) = *src_base.offset(inner as isize * src_fast_stride) * scalar;
-        }
-    }
-}
-
-#[cfg(feature = "parallel")]
 unsafe fn mul_transposed_scalar_lhs_source_contiguous<T>(
     dst: *mut T,
     scalar: T,
@@ -308,109 +284,7 @@ unsafe fn mul_transposed_scalar_lhs_source_contiguous<T>(
     }
 }
 
-#[cfg(feature = "parallel")]
-unsafe fn mul_transposed_scalar_lhs_dst_contiguous<T>(
-    dst: *mut T,
-    scalar: T,
-    src: *const T,
-    inner_len: usize,
-    row_len: usize,
-    src_fast_stride: isize,
-    src_row_stride: isize,
-) where
-    T: Copy + std::ops::Mul<Output = T>,
-{
-    for row in 0..row_len {
-        let dst_base = dst.add(row * inner_len);
-        let src_base = src.offset(row as isize * src_row_stride);
-        for inner in 0..inner_len {
-            *dst_base.add(inner) = scalar * *src_base.offset(inner as isize * src_fast_stride);
-        }
-    }
-}
-
-#[cfg(feature = "parallel")]
-#[inline(always)]
-pub(crate) unsafe fn mul_transposed_scalar_rhs_2d_typed<T>(
-    dst: *mut T,
-    src: *const T,
-    scalar: T,
-    inner_len: usize,
-    row_len: usize,
-    src_fast_stride: isize,
-    src_row_stride: isize,
-) where
-    T: Copy + std::ops::Mul<Output = T>,
-{
-    if row_len > inner_len {
-        unsafe {
-            mul_transposed_scalar_rhs_source_contiguous(
-                dst,
-                src,
-                scalar,
-                inner_len,
-                row_len,
-                src_fast_stride,
-                src_row_stride,
-            );
-        }
-    } else {
-        unsafe {
-            mul_transposed_scalar_rhs_dst_contiguous(
-                dst,
-                src,
-                scalar,
-                inner_len,
-                row_len,
-                src_fast_stride,
-                src_row_stride,
-            );
-        }
-    }
-}
-
-#[cfg(feature = "parallel")]
-#[inline(always)]
-pub(crate) unsafe fn mul_transposed_scalar_lhs_2d_typed<T>(
-    dst: *mut T,
-    scalar: T,
-    src: *const T,
-    inner_len: usize,
-    row_len: usize,
-    src_fast_stride: isize,
-    src_row_stride: isize,
-) where
-    T: Copy + std::ops::Mul<Output = T>,
-{
-    if row_len > inner_len {
-        unsafe {
-            mul_transposed_scalar_lhs_source_contiguous(
-                dst,
-                scalar,
-                src,
-                inner_len,
-                row_len,
-                src_fast_stride,
-                src_row_stride,
-            );
-        }
-    } else {
-        unsafe {
-            mul_transposed_scalar_lhs_dst_contiguous(
-                dst,
-                scalar,
-                src,
-                inner_len,
-                row_len,
-                src_fast_stride,
-                src_row_stride,
-            );
-        }
-    }
-}
-
 #[inline]
-#[cfg(feature = "parallel")]
 pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B: 'static>(
     dst: *mut D,
     src: *const A,
@@ -429,7 +303,7 @@ pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B:
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
                 unsafe {
-                    mul_transposed_scalar_rhs_2d_typed(
+                    mul_transposed_scalar_rhs_source_contiguous(
                         dst.cast::<$ty>(),
                         src.cast::<$ty>(),
                         *scalar.cast::<$ty>(),
@@ -453,7 +327,6 @@ pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B:
 }
 
 #[inline]
-#[cfg(feature = "parallel")]
 pub(crate) unsafe fn try_mul_transposed_scalar_lhs_2d<D: 'static, A: 'static, B: 'static>(
     dst: *mut D,
     scalar: *const A,
@@ -472,7 +345,7 @@ pub(crate) unsafe fn try_mul_transposed_scalar_lhs_2d<D: 'static, A: 'static, B:
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
                 unsafe {
-                    mul_transposed_scalar_lhs_2d_typed(
+                    mul_transposed_scalar_lhs_source_contiguous(
                         dst.cast::<$ty>(),
                         *scalar.cast::<$ty>(),
                         src.cast::<$ty>(),

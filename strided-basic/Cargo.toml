@@ -44,3 +44,8 @@ bench = false
 name = "map_uninit_kernel"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "product_reduce"
+harness = false
+required-features = ["parallel"]

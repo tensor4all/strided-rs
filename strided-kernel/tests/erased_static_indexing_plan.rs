@@ -926,3 +926,76 @@ fn erased_static_indexing_plans_reject_mismatches_before_writing() {
     assert!(matches!(err, StridedError::InvalidBoolByte { value: 2 }));
     assert_eq!(bool_dest, [false, false]);
 }
+
+#[test]
+fn erased_pad_single_pass_columns_matches_dense_generic_result() {
+    // Dense column-major 5x4 operand padded to 9x8 with two edge rows/columns
+    // on every side, so the typed plan selects the single-pass column write.
+    let operand_dims = [5usize, 4];
+    let operand_strides = [1isize, 5];
+    let dest_dims = [9usize, 8];
+    let dest_strides = [1isize, 9];
+    let edge_low = [2i64, 2];
+    let edge_high = [2i64, 2];
+    let interior = [0i64, 0];
+    let operand: Vec<f64> = (1..=20).map(|value| value as f64).collect();
+    let fill = [-1.0f64];
+
+    let plan = ErasedPadPlan::compile(
+        KernelDType::F64,
+        &operand_dims,
+        &operand_strides,
+        &dest_dims,
+        &dest_strides,
+        &edge_low,
+        &edge_high,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
+
+    let mut initialized = vec![fill[0]; 72];
+    {
+        let mut dest_ref =
+            ErasedRawStridedMut::from_slice_mut(&mut initialized, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute(
+            &ExecContext::serial(),
+            &mut dest_ref,
+            &operand_ref,
+            as_bytes(&fill),
+        )
+        .unwrap();
+    }
+
+    let mut storage = vec![MaybeUninit::new(f64::NAN); 72];
+    {
+        let mut dest_ref = ErasedRawStridedUninitMut::from_uninit_slice(
+            &mut storage,
+            &dest_dims,
+            &dest_strides,
+            0,
+        )
+        .unwrap();
+        plan.execute_uninit(
+            &ExecContext::serial(),
+            &mut dest_ref,
+            &operand_ptr,
+            as_bytes(&fill),
+        )
+        .unwrap();
+    }
+    let values = assume_init_vec(storage);
+    assert_eq!(values, initialized);
+    assert!(values.iter().all(|value| !value.is_nan()));
+
+    let at = |row: usize, col: usize| values[row + col * dest_dims[0]];
+    assert_eq!(at(0, 0), fill[0]);
+    assert_eq!(at(0, 2), fill[0]);
+    assert_eq!(at(2, 0), fill[0]);
+    assert_eq!(at(2, 2), 1.0);
+    assert_eq!(at(6, 5), 20.0);
+    assert_eq!(at(8, 7), fill[0]);
+}

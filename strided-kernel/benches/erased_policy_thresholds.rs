@@ -930,6 +930,53 @@ fn bench_pad_fill_and_copy(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_pad_edge_padding_2d(c: &mut Criterion) {
+    let mut group = c.benchmark_group("erased_pad_edge_padding_2d");
+    // Dense column-major 4096x4096 destination with 48 elements of padding on
+    // every edge and a 4000x4000 operand: each destination element is written
+    // once by the typed single-pass column path.
+    let operand_dims = [4000usize, 4000];
+    let operand_strides = [1isize, 4000];
+    let dest_dims = [4096usize, 4096];
+    let dest_strides = [1isize, 4096];
+    let edge = [48i64, 48];
+    let interior = [0i64, 0];
+    let fill = [-1.0f64];
+    let operand = patterned_f64(operand_dims[0] * operand_dims[1]);
+    let plan = ErasedPadPlan::compile(
+        KernelDType::F64,
+        &operand_dims,
+        &operand_strides,
+        &dest_dims,
+        &dest_strides,
+        &edge,
+        &edge,
+        &interior,
+    )
+    .unwrap();
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    for (label, threads) in [("serial", 1usize), ("max_threads_4", 4)] {
+        let ctx = if threads == 1 {
+            ExecContext::serial()
+        } else {
+            ExecContext::max_threads(threads).unwrap()
+        };
+        group.bench_function(label, |bencher| {
+            let mut output = vec![0.0f64; dest_dims[0] * dest_dims[1]];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
+                    .unwrap();
+            bencher.iter(|| {
+                plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+                    .unwrap();
+                black_box(&mut dest);
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_erased_pad_generic_rank_layout(c: &mut Criterion) {
     let mut group = c.benchmark_group("erased_pad_generic_rank_layout");
     for case in profile_cases() {
@@ -1266,6 +1313,7 @@ criterion_group! {
         bench_erased_dynamic_slice_generic_rank_layout,
         bench_erased_dynamic_update_generic_rank_layout,
         bench_pad_fill_and_copy,
+        bench_pad_edge_padding_2d,
         bench_erased_pad_generic_rank_layout,
         bench_raw_any_integer_preflight,
         bench_copy_raw_path,
