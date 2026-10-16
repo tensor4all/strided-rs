@@ -140,23 +140,35 @@ fn assert_static_matches_interpreter(plan: FusedPlan, arrays: &[StridedArray<f64
     }
 }
 
-#[cfg(feature = "parallel")]
-#[test]
-fn uninitialized_nonserial_replay_selects_every_static_family() {
-    use crate::ExecContext;
-
-    fn run(plan: FusedPlan, arrays: &[StridedArray<f64>]) {
+/// Replay one plan per static family through `ctx`, reporting each destination.
+fn replay_all_static_families(ctx: crate::ExecContext, mut collect: impl FnMut(&[f64])) {
+    let mut run = |plan: FusedPlan, arrays: &[StridedArray<f64>]| {
         let inputs: Vec<_> = arrays.iter().map(|array| array.view()).collect();
         let mut output = vec![MaybeUninit::uninit(); arrays[0].len()];
-        let mut dest = StridedViewMut::new(&mut output, arrays[0].dims(), &[1], 0).unwrap();
-        let validated =
-            validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
-        ExecContext::max_threads(2).unwrap().run(|| {
-            fused_elementwise_into_uninit(&mut dest, &inputs, &plan, false, validated).unwrap();
-        });
-    }
+        {
+            let mut dest = StridedViewMut::new(&mut output, arrays[0].dims(), &[1], 0).unwrap();
+            let validated =
+                validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
+            ctx.run(|| {
+                fused_elementwise_into_uninit(
+                    &mut dest,
+                    &inputs,
+                    &plan,
+                    ctx.is_serial(),
+                    validated,
+                )
+                .unwrap();
+            });
+        }
+        // SAFETY: every plan here has a single output and fully overwrites the destination.
+        collect(
+            &output
+                .iter()
+                .map(|value| unsafe { value.assume_init() })
+                .collect::<Vec<_>>(),
+        );
+    };
 
-    reset_uninitialized_static_family_hits();
     let a = input(&[4.0, 9.0, 16.0]);
     let b = input(&[2.0, 3.0, 4.0]);
     let c = input(&[1.0, 1.5, 2.0]);
@@ -258,8 +270,35 @@ fn uninitialized_nonserial_replay_selects_every_static_family() {
         },
         &[a, b, c, d],
     );
+}
 
+#[test]
+fn uninitialized_nonserial_replay_selects_every_static_family() {
+    use crate::ExecContext;
+
+    reset_uninitialized_static_family_hits();
+    replay_all_static_families(ExecContext::max_threads(2).unwrap(), |_| {});
     assert_eq!(uninitialized_static_family_hits(), [1; 7]);
+}
+
+#[test]
+fn uninitialized_serial_replay_selects_every_static_family() {
+    reset_uninitialized_static_family_hits();
+    replay_all_static_families(crate::ExecContext::serial(), |_| {});
+    assert_eq!(uninitialized_static_family_hits(), [1; 7]);
+}
+
+#[test]
+fn uninitialized_replay_agrees_between_serial_and_bounded_contexts() {
+    use crate::ExecContext;
+
+    let mut serial = Vec::new();
+    replay_all_static_families(ExecContext::serial(), |values| serial.push(values.to_vec()));
+    let mut bounded = Vec::new();
+    replay_all_static_families(ExecContext::max_threads(2).unwrap(), |values| {
+        bounded.push(values.to_vec())
+    });
+    assert_eq!(serial, bounded);
 }
 
 #[cfg(feature = "parallel")]
@@ -546,6 +585,22 @@ fn validate_plan_rejects_out_of_range_output() {
         }],
     };
     assert!(validate_plan(&plan, 1, 1).is_err());
+}
+
+#[test]
+fn uninitialized_serial_replay_accepts_an_empty_destination() {
+    let dims = [0usize, 3];
+    let strides = [3isize, 1];
+    let a = StridedArray::<f64>::from_parts(vec![], &dims, &strides, 0).unwrap();
+    let b = StridedArray::<f64>::from_parts(vec![], &dims, &strides, 0).unwrap();
+    let inputs = [a.view(), b.view()];
+    let mut output: Vec<MaybeUninit<f64>> = Vec::new();
+    let mut dest = StridedViewMut::new(&mut output, &dims, &strides, 0).unwrap();
+    let validated = validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
+    let plan = single_op(2, FusedOp::Add, vec![0, 1]);
+    crate::ExecContext::serial().run(|| {
+        fused_elementwise_into_uninit(&mut dest, &inputs, &plan, true, validated).unwrap();
+    });
 }
 
 #[test]
