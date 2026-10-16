@@ -1104,15 +1104,52 @@ pub(super) struct AxesRange<'a, T> {
     pub(super) reduce_total: usize,
 }
 
+/// Recomputes one axis output in source order with [`ReduceKernel::Fallback`].
+///
+/// The stable product uses this when its accumulator could not represent the
+/// output's factors. Outputs are independent, so only the flagged output is
+/// recomputed; the caller's other outputs keep the stable result.
+///
+/// # Safety
+/// `source.offset(source_offset)` must start a reachable reduced run of
+/// `reduce_total` elements visited by `inner_axes`.
+#[inline(always)]
+unsafe fn fallback_axes_output<T, K>(
+    source: *const T,
+    inner_axes: &[ReduceInnerAxis],
+    source_offset: isize,
+    reduce_total: usize,
+) -> T
+where
+    T: ErasedReduceScalar,
+    K: ReduceKernel<T>,
+{
+    let mut inner = ReduceInnerCursor::new(0, inner_axes);
+    inner.reset(source_offset);
+    // SAFETY: forwarded caller contract; `K::Fallback` never requests another
+    // fallback, so this fold is the source-order recomputation.
+    let acc = unsafe { sequential_fold::<T, K::Fallback>(source, &mut inner, reduce_total) };
+    K::Fallback::finish(acc)
+}
+
+/// Source offset of output `index` inside the current output block, one kept
+/// axis step apart. Checked once per flagged fallback output, never per element.
+#[inline]
+fn block_output_source_offset(base: isize, step: isize, index: usize) -> Result<isize> {
+    let index = isize::try_from(index).map_err(|_| StridedError::OffsetOverflow)?;
+    let delta = step
+        .checked_mul(index)
+        .ok_or(StridedError::OffsetOverflow)?;
+    base.checked_add(delta).ok_or(StridedError::OffsetOverflow)
+}
+
 /// Reduces outputs `range` of an axis reduction.
 ///
 /// Every output is computed independently from its own reduced elements, so
 /// the result for an output does not depend on how outputs are split across
-/// worker ranges.
-///
-/// Returns `true` when at least one output's accumulator asked for the
-/// ordered fallback, i.e. the caller must recompute the whole range with
-/// [`ReduceKernel::Fallback`].
+/// worker ranges. An output whose stable accumulator cannot represent its
+/// factors is recomputed in source order on its own; the other outputs keep
+/// the stable result.
 ///
 /// # Safety
 /// `parts.source` and `parts.dest` must point to `T` storage whose reachable
@@ -1122,19 +1159,18 @@ pub(super) struct AxesRange<'a, T> {
 pub(super) unsafe fn reduce_axes_range<T, K>(
     parts: AxesRange<'_, T>,
     range: Range<usize>,
-) -> Result<bool>
+) -> Result<()>
 where
     T: ErasedReduceScalar,
     K: ReduceKernel<T>,
 {
     if range.is_empty() {
-        return Ok(false);
+        return Ok(());
     }
     let source = parts.source;
     let dest = parts.dest;
     let reduce_total = parts.reduce_total;
     debug_assert!(reduce_total != 0);
-    let mut fallback = false;
     // Decode once per worker range, then advance incrementally.
     let mut outer = ReduceOuterCursor::decode(
         range.start,
@@ -1191,8 +1227,20 @@ where
                         };
                     }
                 }
-                fallback |= K::needs_ordered_fallback(&acc);
-                let value = K::finish(acc);
+                let value = if K::needs_ordered_fallback(&acc) {
+                    // SAFETY: `outer.source_offset` starts this output's
+                    // reduced run.
+                    unsafe {
+                        fallback_axes_output::<T, K>(
+                            source,
+                            parts.inner_axes,
+                            outer.source_offset,
+                            reduce_total,
+                        )
+                    }
+                } else {
+                    K::finish(acc)
+                };
                 // SAFETY: the destination cursor offset is reachable.
                 unsafe { dest.offset(outer.dest_offset).write(value) };
                 if output + 1 < range.end {
@@ -1248,8 +1296,8 @@ where
                         inner.advance();
                     }
                 }
-                fallback |= acc.iter().any(K::needs_ordered_fallback);
-                if block_axis.dest_step == 1 && K::SCALAR_ACC {
+                let block_needs_fallback = acc.iter().any(K::needs_ordered_fallback);
+                if block_axis.dest_step == 1 && K::SCALAR_ACC && !block_needs_fallback {
                     // SAFETY: with `SCALAR_ACC` the accumulator is
                     // layout-identical to `T`, and the block outputs are
                     // `len` reachable unit-stride destination elements,
@@ -1264,8 +1312,27 @@ where
                 } else {
                     for (index, &value) in acc.iter().enumerate() {
                         let offset = outer.dest_offset + index as isize * block_axis.dest_step;
+                        let output_value = if K::needs_ordered_fallback(&value) {
+                            // SAFETY: adjacent outputs of this block start a
+                            // reachable reduced run one kept-axis step apart.
+                            let source_offset = block_output_source_offset(
+                                outer.source_offset,
+                                block_axis.source_step,
+                                index,
+                            )?;
+                            unsafe {
+                                fallback_axes_output::<T, K>(
+                                    source,
+                                    parts.inner_axes,
+                                    source_offset,
+                                    reduce_total,
+                                )
+                            }
+                        } else {
+                            K::finish(value)
+                        };
                         // SAFETY: the block outputs are reachable destination offsets.
-                        unsafe { dest.offset(offset).write(K::finish(value)) };
+                        unsafe { dest.offset(offset).write(output_value) };
                     }
                 }
                 for _ in 0..len {
@@ -1282,8 +1349,20 @@ where
                 inner.reset(outer.source_offset);
                 // SAFETY: forwarded layout invariant.
                 let acc = unsafe { sequential_fold::<T, K>(source, &mut inner, reduce_total) };
-                fallback |= K::needs_ordered_fallback(&acc);
-                let value = K::finish(acc);
+                let value = if K::needs_ordered_fallback(&acc) {
+                    // SAFETY: `outer.source_offset` starts this output's
+                    // reduced run.
+                    unsafe {
+                        fallback_axes_output::<T, K>(
+                            source,
+                            parts.inner_axes,
+                            outer.source_offset,
+                            reduce_total,
+                        )
+                    }
+                } else {
+                    K::finish(acc)
+                };
                 // SAFETY: the destination cursor offset is reachable.
                 unsafe { dest.offset(outer.dest_offset).write(value) };
                 if output + 1 < range.end {
@@ -1292,7 +1371,7 @@ where
             }
         }
     }
-    Ok(fallback)
+    Ok(())
 }
 
 /// Folds `count` elements visited by `inner` in cursor order.

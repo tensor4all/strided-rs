@@ -359,3 +359,65 @@ fn col_major_strides(dims: &[usize]) -> Vec<isize> {
         })
         .collect()
 }
+
+#[test]
+fn axis0_columns_match_fallback_for_rank_five_small_axis0() {
+    // Axis-0 extent 1 and 2 keep the single-pass column write selected while
+    // the outer odometer has four axes to carry, so the incremental operand
+    // offset must track entering and leaving the in-bounds interval per axis.
+    assert_axis0_columns_match_fallback(
+        &[1, 3, 4, 2, 5],
+        &[1, 1, 3, 12, 24],
+        &[1, 5, 6, 5, 8],
+        &[0, 1, 1, 2, 1],
+        &[0, 1, 1, 1, 2],
+    );
+    assert_axis0_columns_match_fallback(
+        &[2, 3, 4, 2, 5],
+        &[1, 2, 6, 24, 48],
+        &[4, 5, 6, 5, 8],
+        &[1, 1, 1, 2, 1],
+        &[1, 1, 1, 1, 2],
+    );
+}
+
+#[test]
+fn axis0_columns_uninit_writes_bool_slots() {
+    // A `bool` destination with genuinely uninitialized backing storage: the
+    // single-pass column write must fill pad spans through `MaybeUninit<bool>`
+    // and never form a `&mut [bool]` over uninitialized memory.
+    let operand_dims = [1usize, 3, 4, 2, 5];
+    let operand_strides = [1isize, 1, 3, 12, 24];
+    let dest_dims = [2usize, 5, 6, 5, 8];
+    let dest_strides = col_major_strides(&dest_dims);
+    let edge_low = [1i64, 1, 1, 2, 1];
+    let edge_high = [0i64, 1, 1, 1, 2];
+    let plan = PadPlan::compile(
+        &operand_dims,
+        &operand_strides,
+        &dest_dims,
+        &dest_strides,
+        &edge_low,
+        &edge_high,
+        &[0i64; 5],
+    )
+    .unwrap();
+    assert!(plan.has_contiguous_axis0_columns());
+
+    let operand: Vec<bool> = (0..120).map(|index| index % 2 == 0).collect();
+    let source = RawStridedRef::new(&operand, &operand_dims, &operand_strides, 0).unwrap();
+    let dest_total = dest_dims.iter().product();
+    let mut storage = vec![MaybeUninit::<bool>::uninit(); dest_total];
+    let mut dest = RawStridedMut::new(&mut storage, &dest_dims, &dest_strides, 0).unwrap();
+    plan.execute_uninit(&mut dest, &source, false).unwrap();
+    // SAFETY: every reachable destination slot was written by the plan.
+    let values: Vec<bool> = storage
+        .iter()
+        .map(|slot| unsafe { slot.assume_init() })
+        .collect();
+
+    let mut reference = vec![false; dest_total];
+    let mut dest = RawStridedMut::new(&mut reference, &dest_dims, &dest_strides, 0).unwrap();
+    plan.execute(&mut dest, &source, false).unwrap();
+    assert_eq!(values, reference);
+}

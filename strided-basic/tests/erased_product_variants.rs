@@ -861,3 +861,196 @@ fn stable_product_complex_is_source_order() {
     );
     assert_eq!((got.re, got.im), (expected.re, expected.im));
 }
+
+/// An axis reduction falls back per output. An output whose stable
+/// accumulator sees a zero/subnormal factor is recomputed in source order on
+/// its own, while the other outputs keep the exponent-tracked result. The
+/// former whole-layout fallback recomputed every output with `OrderedProduct`,
+/// which turns a representable `1.0` into `inf` when the factors cancel across
+/// the dtype range.
+#[test]
+fn stable_product_axis_fallback_is_per_output() {
+    let pow2 = |e: i32| f64::from_bits(((e + 1023) as u64) << 52);
+
+    // Sequential (strided runs): the verified counterexample, column-major
+    // [4, 2] reduced along axis 0. Column 0 cancels across the exponent range
+    // to exactly 1.0; column 1 contains a zero.
+    let sequential_data = vec![
+        pow2(600),
+        pow2(600),
+        pow2(-600),
+        pow2(-600),
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+    ];
+    let sequential_dims = [4usize, 2];
+    let sequential_strides = [1isize, 4];
+
+    // ContiguousRuns: a unit-stride reduced axis at least
+    // `AXIS_RUN_KERNEL_MIN_LEN` long. Column 0 has a zero; columns 1 and 2
+    // cancel to 1.0 but overflow a raw fold.
+    let mut contiguous_data = vec![1.0f64; 64 * 3];
+    contiguous_data[0] = 0.0;
+    for column in 1..3 {
+        contiguous_data[64 * column] = pow2(600);
+        contiguous_data[64 * column + 1] = pow2(600);
+        contiguous_data[64 * column + 2] = pow2(-600);
+        contiguous_data[64 * column + 3] = pow2(-600);
+    }
+    let contiguous_dims = [64usize, 3];
+    let contiguous_strides = [1isize, 64];
+
+    // OutputBlocks: a unit-stride leading kept axis at least
+    // `AXIS_OUTPUT_BLOCK_MIN_LEN` long, reduced along the strided axis. Row 5
+    // has a zero; the others cancel to 1.0.
+    let mut blocks_data = vec![1.0f64; 64 * 32];
+    blocks_data[5] = 0.0;
+    for row in 0..64 {
+        if row == 5 {
+            continue;
+        }
+        blocks_data[row] = pow2(600);
+        blocks_data[64 + row] = pow2(600);
+        blocks_data[128 + row] = pow2(-600);
+        blocks_data[192 + row] = pow2(-600);
+    }
+    let blocks_dims = [64usize, 32];
+    let blocks_strides = [1isize, 64];
+
+    let mut expected_sequential = vec![1.0f64; 2];
+    expected_sequential[1] = 0.0;
+    let mut expected_contiguous = vec![1.0f64; 3];
+    expected_contiguous[0] = 0.0;
+    let mut expected_blocks = vec![1.0f64; 64];
+    expected_blocks[5] = 0.0;
+
+    let run = |ctx: &ExecContext, label: &str| {
+        let got = run_axes(
+            KernelDType::F64,
+            ReduceOp::StableProduct,
+            ctx,
+            &sequential_data,
+            &sequential_dims,
+            &sequential_strides,
+            &[2],
+            &[1isize],
+            &[0],
+        );
+        assert_eq!(got, expected_sequential, "sequential {label}");
+
+        let got = run_axes(
+            KernelDType::F64,
+            ReduceOp::StableProduct,
+            ctx,
+            &contiguous_data,
+            &contiguous_dims,
+            &contiguous_strides,
+            &[3],
+            &[1isize],
+            &[0],
+        );
+        assert_eq!(got, expected_contiguous, "contiguous-runs {label}");
+
+        let got = run_axes(
+            KernelDType::F64,
+            ReduceOp::StableProduct,
+            ctx,
+            &blocks_data,
+            &blocks_dims,
+            &blocks_strides,
+            &[64],
+            &[1isize],
+            &[1],
+        );
+        assert_eq!(got, expected_blocks, "output-blocks {label}");
+    };
+
+    run(&ExecContext::serial(), "serial");
+    #[cfg(feature = "parallel")]
+    with_two_workers(|ctx| run(ctx, "2T"));
+}
+
+/// Fixed expected-bit cases for the stable product's correctly rounded
+/// `mantissa * 2^exponent` step. The high-precision reference duplicates the
+/// production `ldexp` and works in `f64`, so it cannot see the rounding that
+/// decides a subnormal tie, a signed zero, or the overflow boundary. These
+/// inputs are exact products of a small odd integer and powers of two, so the
+/// expected bits are hand-computable.
+#[test]
+fn stable_product_fixed_bit_rounding_boundaries() {
+    let pow2_f64 = |e: i32| f64::from_bits(((e + 1023) as u64) << 52);
+    let pow2_f32 = |e: i32| f32::from_bits(((e + 127) as u32) << 23);
+
+    let full_f64 = |data: &[f64]| {
+        run_full(
+            KernelDType::F64,
+            ReduceOp::StableProduct,
+            &ExecContext::serial(),
+            data,
+            &[data.len()],
+            &[1isize],
+        )
+    };
+    let full_f32 = |data: &[f32]| {
+        run_full(
+            KernelDType::F32,
+            ReduceOp::StableProduct,
+            &ExecContext::serial(),
+            data,
+            &[data.len()],
+            &[1isize],
+        )
+    };
+
+    // f64 subnormal round-to-even: 3 * 2^-1075 = 1.5 * 2^-1074, exactly halfway
+    // between the subnormals 2^-1074 (odd) and 2^-1073 (even). The even
+    // neighbour wins, so the result is `from_bits(2)`.
+    let got = full_f64(&[3.0 * pow2_f64(-500), pow2_f64(-575)]);
+    assert_eq!(
+        got.to_bits(),
+        2,
+        "f64 subnormal tie: {} ({:#018x})",
+        got,
+        got.to_bits()
+    );
+
+    // f64 signed zero: the zero factor forces the ordered fallback, which
+    // keeps the sign.
+    let got = full_f64(&[-0.0, 3.0]);
+    assert_eq!(got.to_bits(), 0x8000_0000_0000_0000);
+
+    // f64 overflow boundary: the largest power-of-two finite value stays
+    // finite and one step more overflows.
+    assert_eq!(
+        full_f64(&[pow2_f64(600), pow2_f64(423)]).to_bits(),
+        0x7fe0_0000_0000_0000
+    );
+    assert_eq!(
+        full_f64(&[pow2_f64(600), pow2_f64(424)]).to_bits(),
+        0x7ff0_0000_0000_0000
+    );
+
+    // f32 subnormal round-to-even: 3 * 2^-150 = 1.5 * 2^-149, halfway between
+    // the subnormals 2^-149 (odd) and 2^-148 (even).
+    let got = full_f32(&[3.0 * pow2_f32(-50), pow2_f32(-100)]);
+    assert_eq!(
+        got.to_bits(),
+        2,
+        "f32 subnormal tie: {} ({:#010x})",
+        got,
+        got.to_bits()
+    );
+
+    // f32 signed zero and overflow boundary.
+    assert_eq!(full_f32(&[-0.0, 3.0]).to_bits(), 0x8000_0000);
+    assert_eq!(
+        full_f32(&[pow2_f32(100), pow2_f32(27)]).to_bits(),
+        0x7f00_0000
+    );
+    assert_eq!(
+        full_f32(&[pow2_f32(100), pow2_f32(28)]).to_bits(),
+        0x7f80_0000
+    );
+}

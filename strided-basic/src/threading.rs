@@ -201,6 +201,29 @@ pub(crate) fn fill_contiguous<T: Copy + crate::MaybeSendSync>(dst: &mut [T], val
     dst.fill(value);
 }
 
+/// Fill `len` contiguous destination elements that may be uninitialized.
+///
+/// [`fill_contiguous`] forms a `&mut [T]`, which is undefined behaviour over
+/// uninitialized storage (for example a fresh `bool` buffer). This sibling
+/// views the same span as `[MaybeUninit<T>]`, which has no validity invariant,
+/// and reuses the existing chunking.
+///
+/// # Safety
+///
+/// `dst..dst + len` must be writable for the whole call and no other thread
+/// may access the destination range concurrently.
+pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + crate::MaybeSendSync>(
+    dst: *mut T,
+    len: usize,
+    value: T,
+) {
+    // SAFETY: `MaybeUninit<T>` has no validity invariant, so the span is a
+    // valid `[MaybeUninit<T>]`; `fill_contiguous` writes every element.
+    let span =
+        unsafe { core::slice::from_raw_parts_mut(dst.cast::<core::mem::MaybeUninit<T>>(), len) };
+    fill_contiguous(span, core::mem::MaybeUninit::new(value));
+}
+
 pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,

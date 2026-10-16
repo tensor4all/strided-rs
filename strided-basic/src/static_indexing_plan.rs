@@ -109,7 +109,6 @@ struct ContiguousPadAxis0Columns {
     low0: usize,
     high0: usize,
     run_len: usize,
-    operand_axis0_start: isize,
     operand_outer_dims: AxisVec<usize>,
     operand_outer_strides: AxisVec<isize>,
     dest_outer_dims: AxisVec<usize>,
@@ -497,7 +496,7 @@ impl PadPlan {
         // layout, so its validated data covers every reachable destination
         // slot, and the exclusive borrow is the only access during the call.
         unsafe {
-            self.write_axis0_columns_raw(
+            self.write_axis0_columns_raw::<T, false>(
                 dest_ptr,
                 dest_offset,
                 operand_ptr,
@@ -525,7 +524,7 @@ impl PadPlan {
         // SAFETY: as in `execute_axis0_columns`; `MaybeUninit<T>` has the
         // layout of `T`, and only writes go through the cast pointer.
         unsafe {
-            self.write_axis0_columns_raw(
+            self.write_axis0_columns_raw::<T, true>(
                 dest_ptr,
                 dest_offset,
                 operand_ptr,
@@ -553,7 +552,7 @@ impl PadPlan {
     /// slot and no other access may overlap the call; the operand may only be
     /// read at coordinates that are copied, but no read is performed for a
     /// padding-only column.
-    unsafe fn write_axis0_columns_raw<T>(
+    unsafe fn write_axis0_columns_raw<T, const UNINIT: bool>(
         &self,
         dest_ptr: *mut T,
         dest_offset: isize,
@@ -569,9 +568,6 @@ impl PadPlan {
         if column_total == 0 {
             return Ok(());
         }
-        let operand_offset = operand_offset
-            .checked_add(columns.operand_axis0_start)
-            .ok_or(StridedError::OffsetOverflow)?;
         #[cfg(feature = "parallel")]
         {
             let nthreads = crate::threading::parallel_threads_for_len(self.dest_total);
@@ -592,7 +588,7 @@ impl PadPlan {
                         // covers every reachable slot. Padding-only columns
                         // never read the operand.
                         unsafe {
-                            self.write_axis0_columns_range(
+                            self.write_axis0_columns_range::<T, UNINIT>(
                                 dest_ptr.as_ptr(),
                                 dest_offset,
                                 operand_ptr.as_const(),
@@ -613,7 +609,7 @@ impl PadPlan {
         let outer_idx = outer_idx_storage.as_mut_slice();
         // SAFETY: forwarded from this function's contract.
         unsafe {
-            self.write_axis0_columns_range(
+            self.write_axis0_columns_range::<T, UNINIT>(
                 dest_ptr,
                 dest_offset,
                 operand_ptr,
@@ -635,7 +631,7 @@ impl PadPlan {
     /// As for [`Self::write_axis0_columns_raw`], and no other thread may write
     /// the destination columns visited by this call.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn write_axis0_columns_range<T>(
+    unsafe fn write_axis0_columns_range<T, const UNINIT: bool>(
         &self,
         dest_ptr: *mut T,
         dest_offset: isize,
@@ -655,25 +651,26 @@ impl PadPlan {
         }
         let mut dest_column_offset =
             checked_offset_add(dest_offset, columns.dest_axis0_step, column_start)?;
-        for _ in 0..count {
-            let mut operand_column_offset = operand_offset;
-            let mut in_bounds = true;
-            for (axis, &coord) in outer_idx.iter().enumerate() {
-                let Some(q) = coord.checked_sub(columns.edge_low_outer[axis]) else {
-                    in_bounds = false;
-                    break;
-                };
-                if q >= columns.operand_outer_dims[axis] {
-                    in_bounds = false;
-                    break;
+        // Carry the operand column offset and in-bounds count through the outer
+        // odometer instead of rescanning every outer axis per column. Only axes
+        // currently in bounds contribute a `stride * q` term, so every product
+        // is one the validated operand layout already produced.
+        let mut operand_column_offset = operand_offset;
+        let mut out_of_bounds = 0usize;
+        for (axis, &coord) in outer_idx.iter().enumerate() {
+            match in_bounds_outer_coord(columns, axis, coord) {
+                Some(q) => {
+                    operand_column_offset = checked_offset_add(
+                        operand_column_offset,
+                        columns.operand_outer_strides[axis],
+                        q,
+                    )?;
                 }
-                operand_column_offset = checked_offset_add(
-                    operand_column_offset,
-                    columns.operand_outer_strides[axis],
-                    q,
-                )?;
+                None => out_of_bounds += 1,
             }
-            if in_bounds {
+        }
+        for _ in 0..count {
+            if out_of_bounds == 0 {
                 let low_len = columns.low0;
                 let run_len = columns.run_len;
                 let high_len = columns.high0;
@@ -684,33 +681,89 @@ impl PadPlan {
                 // axis-0 elements. The destination layout is injective and
                 // this call owns the whole column.
                 unsafe {
-                    fill_raw_span(dest_ptr.offset(dest_column_offset), low_len, fill);
+                    if UNINIT {
+                        fill_raw_span_uninit(dest_ptr.offset(dest_column_offset), low_len, fill);
+                    } else {
+                        fill_raw_span(dest_ptr.offset(dest_column_offset), low_len, fill);
+                    }
                     crate::threading::copy_contiguous(
                         operand_ptr.offset(operand_column_offset),
                         dest_ptr.offset(dest_column_offset + low_len as isize),
                         run_len,
                     );
-                    fill_raw_span(
-                        dest_ptr.offset(dest_column_offset + low_len as isize + run_len as isize),
-                        high_len,
-                        fill,
-                    );
+                    if UNINIT {
+                        fill_raw_span_uninit(
+                            dest_ptr
+                                .offset(dest_column_offset + low_len as isize + run_len as isize),
+                            high_len,
+                            fill,
+                        );
+                    } else {
+                        fill_raw_span(
+                            dest_ptr
+                                .offset(dest_column_offset + low_len as isize + run_len as isize),
+                            high_len,
+                            fill,
+                        );
+                    }
                 }
             } else {
                 // SAFETY: as for the in-bounds branch; a padding-only column
                 // never reads the operand.
                 unsafe {
-                    fill_raw_span(
-                        dest_ptr.offset(dest_column_offset),
-                        columns.dest_axis0_len,
-                        fill,
-                    );
+                    if UNINIT {
+                        fill_raw_span_uninit(
+                            dest_ptr.offset(dest_column_offset),
+                            columns.dest_axis0_len,
+                            fill,
+                        );
+                    } else {
+                        fill_raw_span(
+                            dest_ptr.offset(dest_column_offset),
+                            columns.dest_axis0_len,
+                            fill,
+                        );
+                    }
                 }
             }
-            advance_col_major_index(outer_idx, &columns.dest_outer_dims);
+            // Advance the destination column, the outer odometer, and the
+            // incremental operand offset / in-bounds count together.
             dest_column_offset = dest_column_offset
                 .checked_add(columns.dest_axis0_step)
                 .ok_or(StridedError::OffsetOverflow)?;
+            for (axis, coord) in outer_idx.iter_mut().enumerate() {
+                let was_in_bounds = in_bounds_outer_coord(columns, axis, *coord);
+                if let Some(q) = was_in_bounds {
+                    let q = isize::try_from(q).map_err(|_| StridedError::OffsetOverflow)?;
+                    let scaled = columns.operand_outer_strides[axis]
+                        .checked_mul(q)
+                        .ok_or(StridedError::OffsetOverflow)?;
+                    operand_column_offset = operand_column_offset
+                        .checked_sub(scaled)
+                        .ok_or(StridedError::OffsetOverflow)?;
+                }
+                *coord += 1;
+                let wrapped = *coord >= columns.dest_outer_dims[axis];
+                if wrapped {
+                    *coord = 0;
+                }
+                let is_in_bounds = in_bounds_outer_coord(columns, axis, *coord);
+                if let Some(q) = is_in_bounds {
+                    operand_column_offset = checked_offset_add(
+                        operand_column_offset,
+                        columns.operand_outer_strides[axis],
+                        q,
+                    )?;
+                }
+                match (was_in_bounds.is_some(), is_in_bounds.is_some()) {
+                    (false, true) => out_of_bounds -= 1,
+                    (true, false) => out_of_bounds += 1,
+                    _ => {}
+                }
+                if !wrapped {
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -1887,7 +1940,6 @@ fn compile_contiguous_pad_axis0_columns(
         low0,
         high0,
         run_len: run.len,
-        operand_axis0_start: isize::try_from(run.operand_start).ok()?,
         operand_outer_dims,
         operand_outer_strides,
         dest_outer_dims,
@@ -1912,12 +1964,38 @@ unsafe fn fill_raw_span<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: 
     crate::threading::fill_contiguous(span, fill);
 }
 
+/// Fill a disjoint raw destination span that may be uninitialized.
+///
+/// # Safety
+///
+/// `ptr..ptr + len` must be a writable destination span with no concurrent
+/// access from another worker.
+unsafe fn fill_raw_span_uninit<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: T) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: the caller guarantees the exact writable span; the
+    // `MaybeUninit` view never forms a `&mut [T]` over uninitialized memory.
+    unsafe { crate::threading::fill_contiguous_uninit(ptr, len, fill) };
+}
+
 fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
     let coord = isize::try_from(coord).map_err(|_| StridedError::OffsetOverflow)?;
     let scaled = stride
         .checked_mul(coord)
         .ok_or(StridedError::OffsetOverflow)?;
     base.checked_add(scaled).ok_or(StridedError::OffsetOverflow)
+}
+
+/// The operand coordinate contributed by one outer axis, or `None` when the
+/// axis falls outside the operand's in-bounds interval.
+fn in_bounds_outer_coord(
+    columns: &ContiguousPadAxis0Columns,
+    axis: usize,
+    coord: usize,
+) -> Option<usize> {
+    let q = coord.checked_sub(columns.edge_low_outer[axis])?;
+    (q < columns.operand_outer_dims[axis]).then_some(q)
 }
 
 fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {

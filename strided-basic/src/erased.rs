@@ -1024,14 +1024,21 @@ where
             };
             match full {
                 Some(traversal) => execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)?,
-                None => execute_reduce_axes::<T, W, K>(ctx, dest, src, axes)?,
+                None => {
+                    // An axis reduction falls back per output inside
+                    // `reduce_axes_range`; it never asks for a layout-wide
+                    // recompute.
+                    execute_reduce_axes::<T, W, K>(ctx, dest, src, axes)?;
+                    false
+                }
             }
         }
     };
     if fallback {
-        // `K::Fallback` must not itself request a fallback, so this recurses at
-        // most once. Scalar kernels use `Fallback = Self` and never set the
-        // flag, so the branch is unreachable for them.
+        // Only a full reduction (one output) requests the layout-wide
+        // recompute; `K::Fallback` must not itself request a fallback, so this
+        // recurses at most once. Scalar kernels use `Fallback = Self` and never
+        // set the flag, so the branch is unreachable for them.
         return dispatch_reduce_kernel::<T, W, K::Fallback>(layout, ctx, dest, src);
     }
     Ok(())
@@ -1042,14 +1049,14 @@ fn execute_reduce_axes<T, W, K>(
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
     layout: AxesLayout<'_>,
-) -> Result<bool>
+) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
     K: ReduceKernel<T>,
 {
     if layout.dest_total == 0 {
-        return Ok(false);
+        return Ok(());
     }
 
     if layout.reduce_total == 0 {
@@ -1058,7 +1065,6 @@ where
         } else {
             ctx.run(|| execute_reduce_axes_identity_policy::<T, W, K>(dest, layout))
         }
-        .map(|()| false)
     } else if reduce_context_is_serial(ctx) {
         execute_reduce_axes_policy::<T, W, K>(dest, src, layout, false)
     } else {
@@ -1071,7 +1077,7 @@ fn execute_reduce_axes_policy<T, W, K>(
     src: &ErasedRawStridedRef<'_>,
     layout: AxesLayout<'_>,
     allow_parallel: bool,
-) -> Result<bool>
+) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
@@ -1110,7 +1116,7 @@ where
                     // SAFETY: see `execute_reduce_axes_policy` serial call.
                     unsafe { reduce_axes_range::<T, K>(parts, range) }
                 },
-                &|left, right| Ok(left? | right?),
+                &|left, right| left.and(right),
             );
         }
     }

@@ -284,62 +284,6 @@ unsafe fn mul_transposed_scalar_lhs_source_contiguous<T>(
     }
 }
 
-#[inline(always)]
-pub(crate) unsafe fn mul_transposed_scalar_rhs_2d_typed<T>(
-    dst: *mut T,
-    src: *const T,
-    scalar: T,
-    inner_len: usize,
-    row_len: usize,
-    src_fast_stride: isize,
-    src_row_stride: isize,
-) where
-    T: Copy + std::ops::Mul<Output = T>,
-{
-    // The cache-tiled source-contiguous form wins or ties the generic blocked
-    // plan across the measured shape/dtype table; the old row-by-row
-    // destination-contiguous form was systematically slower and is deleted.
-    // See the u4-tiled (#210) commit message for the table.
-    unsafe {
-        mul_transposed_scalar_rhs_source_contiguous(
-            dst,
-            src,
-            scalar,
-            inner_len,
-            row_len,
-            src_fast_stride,
-            src_row_stride,
-        );
-    }
-}
-
-#[inline(always)]
-pub(crate) unsafe fn mul_transposed_scalar_lhs_2d_typed<T>(
-    dst: *mut T,
-    scalar: T,
-    src: *const T,
-    inner_len: usize,
-    row_len: usize,
-    src_fast_stride: isize,
-    src_row_stride: isize,
-) where
-    T: Copy + std::ops::Mul<Output = T>,
-{
-    // See `mul_transposed_scalar_rhs_2d_typed`: the tiled source-contiguous
-    // form replaced the slower destination-contiguous form everywhere.
-    unsafe {
-        mul_transposed_scalar_lhs_source_contiguous(
-            dst,
-            scalar,
-            src,
-            inner_len,
-            row_len,
-            src_fast_stride,
-            src_row_stride,
-        );
-    }
-}
-
 #[inline]
 pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B: 'static>(
     dst: *mut D,
@@ -359,7 +303,7 @@ pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B:
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
                 unsafe {
-                    mul_transposed_scalar_rhs_2d_typed(
+                    mul_transposed_scalar_rhs_source_contiguous(
                         dst.cast::<$ty>(),
                         src.cast::<$ty>(),
                         *scalar.cast::<$ty>(),
@@ -401,7 +345,7 @@ pub(crate) unsafe fn try_mul_transposed_scalar_lhs_2d<D: 'static, A: 'static, B:
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
                 unsafe {
-                    mul_transposed_scalar_lhs_2d_typed(
+                    mul_transposed_scalar_lhs_source_contiguous(
                         dst.cast::<$ty>(),
                         *scalar.cast::<$ty>(),
                         src.cast::<$ty>(),
