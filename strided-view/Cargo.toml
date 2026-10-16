@@ -1,6 +1,7 @@
 [package]
 name = "strided-view"
-version.workspace = true
+# Versioned per crate (see docs/worklogs/2026-10-17-cpu-perf-batch-release.md).
+version = "0.5.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
