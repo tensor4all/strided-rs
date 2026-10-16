@@ -700,12 +700,78 @@ fn bounded_mul_and_broadcast_mul_cover_range_partitions_exactly_once() {
     });
 }
 
-#[test]
-fn reduce_axis_remains_caller_threaded_under_all_explicit_policies() {
-    const ROWS: usize = 257;
-    const COLS: usize = 129;
-    const LEN: usize = ROWS * COLS;
+const REDUCE_AXIS_ROWS: usize = 257;
+const REDUCE_AXIS_COLS: usize = 129;
 
+fn run_tracked_reduce_axis(
+    policy: ExecutionPolicy,
+    required_concurrency: usize,
+) -> (Participants, StridedArray<usize>, Arc<[AtomicUsize]>) {
+    let source =
+        StridedArray::<usize>::from_fn_col_major(&[REDUCE_AXIS_ROWS, REDUCE_AXIS_COLS], |index| {
+            index[0] + REDUCE_AXIS_ROWS * index[1]
+        });
+    let participants = Arc::new(if required_concurrency >= 2 {
+        Participants::requiring(required_concurrency)
+    } else {
+        Participants::default()
+    });
+    let observed = Arc::clone(&participants);
+    let coverage = exact_coverage(REDUCE_AXIS_ROWS * REDUCE_AXIS_COLS);
+    let covered = Arc::clone(&coverage);
+    let output = with_execution_policy(policy, || {
+        reduce_axis(
+            &source.view(),
+            1,
+            |index| {
+                covered[index].fetch_add(1, Ordering::SeqCst);
+                observed.observe();
+                index
+            },
+            |left, right| left + right,
+            0usize,
+        )
+        .unwrap()
+    });
+    drop(observed);
+    (Arc::into_inner(participants).unwrap(), output, coverage)
+}
+
+fn assert_reduce_axis_rows(output: &StridedArray<usize>) {
+    for row in 0..REDUCE_AXIS_ROWS {
+        let expected = REDUCE_AXIS_COLS * row
+            + REDUCE_AXIS_ROWS * REDUCE_AXIS_COLS * (REDUCE_AXIS_COLS - 1) / 2;
+        assert_eq!(output.get(&[row]), expected);
+    }
+}
+
+/// Sequential `reduce_axis` never fans out: it stays on the calling thread and
+/// reads every source element exactly once.
+#[test]
+fn sequential_reduce_axis_stays_on_the_calling_thread() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+
+    pool.install(|| {
+        let caller = std::thread::current().id();
+        let (participants, output, coverage) =
+            run_tracked_reduce_axis(ExecutionPolicy::Sequential, 1);
+
+        assert_eq!(participants.max_active(), 1);
+        assert_eq!(participants.thread_ids(), vec![caller]);
+        assert_exactly_once(&coverage);
+        assert_reduce_axis_rows(&output);
+    });
+}
+
+/// Above the threading threshold `reduce_axis` partitions outputs across at
+/// most `max_threads` workers. Each output is computed by one worker, so every
+/// source element is read exactly once and the result does not depend on the
+/// thread count.
+#[test]
+fn rayon_reduce_axis_respects_the_thread_budget() {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
         .build()
@@ -713,41 +779,13 @@ fn reduce_axis_remains_caller_threaded_under_all_explicit_policies() {
     let two = NonZeroUsize::new(2).unwrap();
 
     pool.install(|| {
-        let caller = std::thread::current().id();
-        for policy in [
-            ExecutionPolicy::Sequential,
-            ExecutionPolicy::Rayon { max_threads: two },
-        ] {
-            let source = StridedArray::<usize>::from_fn_col_major(&[ROWS, COLS], |index| {
-                index[0] + ROWS * index[1]
-            });
-            let participants = Arc::new(Participants::default());
-            let observed = Arc::clone(&participants);
-            let coverage = exact_coverage(LEN);
-            let covered = Arc::clone(&coverage);
-            let output = with_execution_policy(policy, || {
-                reduce_axis(
-                    &source.view(),
-                    1,
-                    |index| {
-                        covered[index].fetch_add(1, Ordering::SeqCst);
-                        observed.observe();
-                        index
-                    },
-                    |left, right| left + right,
-                    0usize,
-                )
-                .unwrap()
-            });
+        let (participants, output, coverage) =
+            run_tracked_reduce_axis(ExecutionPolicy::Rayon { max_threads: two }, 2);
 
-            assert_eq!(participants.max_active(), 1);
-            assert_eq!(participants.thread_ids(), vec![caller]);
-            assert_exactly_once(&coverage);
-            for row in 0..ROWS {
-                let expected = COLS * row + ROWS * COLS * (COLS - 1) / 2;
-                assert_eq!(output.get(&[row]), expected);
-            }
-        }
+        assert_eq!(participants.max_active(), 2);
+        assert!(participants.thread_ids().len() <= 2);
+        assert_exactly_once(&coverage);
+        assert_reduce_axis_rows(&output);
     });
 }
 
@@ -1093,10 +1131,19 @@ fn rayon_fused_path_caps_concurrent_participants() {
 fn parallel_source_violations(relative: &std::path::Path, source: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let threading_module = std::path::Path::new("strided-basic/src/threading.rs");
+    // Public API type annotations that must name the runtime type even though
+    // the interaction itself is implemented in `threading.rs`. These lines only
+    // declare the boundary; they perform no scheduling. Keep the list to exact
+    // signatures so any other `rayon` use outside `threading.rs` still fails.
+    let approved_boundary_signatures: [(&std::path::Path, &str); 1] = [(
+        std::path::Path::new("strided-basic/src/exec_context.rs"),
+        "pool: &rayon::ThreadPool,",
+    )];
     let approved_central_identifiers = [
         ("rayon::join(", 2usize),
         ("rayon::current_num_threads()", 1),
         ("rayon::ThreadPool>", 1),
+        ("rayon::ThreadPool,", 1),
         ("rayon::ThreadPoolBuilder::new()", 1),
         ("strided_perm::copy_into_par(", 1),
         ("strided_perm::copy_into(", 1),
@@ -1119,10 +1166,15 @@ fn parallel_source_violations(relative: &std::path::Path, source: &str) -> Vec<S
         }
 
         if relative != threading_module {
-            violations.push(format!(
-                "{}:{line_number}: parallel-runtime identifier exists outside threading.rs",
-                relative.display()
-            ));
+            let approved_boundary = approved_boundary_signatures
+                .iter()
+                .any(|(path, signature)| relative == *path && code.trim() == *signature);
+            if !approved_boundary {
+                violations.push(format!(
+                    "{}:{line_number}: parallel-runtime identifier exists outside threading.rs",
+                    relative.display()
+                ));
+            }
             continue;
         }
 

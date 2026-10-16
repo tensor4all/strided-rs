@@ -224,6 +224,28 @@ pub(crate) fn current_pool_threads() -> usize {
     rayon::current_num_threads()
 }
 
+/// Runs `operation` on `pool`, clamping `budget` to the pool's worker count and
+/// entering the pool only when the caller is not already one of its workers and
+/// the effective width permits fanout.
+///
+/// This is the only place [`crate::ExecContext::run_on`] touches the Rayon
+/// pool; the policy construction stays in `exec_context.rs` and the placement
+/// stays next to the rest of the repository's Rayon interaction.
+#[cfg(feature = "parallel")]
+pub(crate) fn run_on_pool<T: Send>(
+    pool: &rayon::ThreadPool,
+    budget: core::num::NonZeroUsize,
+    operation: impl FnOnce(usize) -> T + Send,
+) -> T {
+    let width = budget.get().min(pool.current_num_threads());
+    let run = move || operation(width);
+    if width <= 1 || pool.current_thread_index().is_some() {
+        run()
+    } else {
+        pool.install(run)
+    }
+}
+
 #[cfg(feature = "parallel")]
 fn with_permutation_copy_scheduler<R>(operation: impl FnOnce() -> R) -> R {
     crate::execution_policy::with_scheduler_suspended(operation)
