@@ -12,6 +12,7 @@ use strided_basic::execution::{
     map_into_validated, validate_destination_layout_without_alloc, zip_map2_into_validated,
     zip_map3_into_validated, zip_map4_into_validated, ValidatedDestinationLayout,
 };
+use strided_basic::{with_execution_policy, ExecutionPolicy};
 
 #[cfg(feature = "parallel")]
 use strided_basic::execution::compute_costs;
@@ -795,12 +796,12 @@ impl StaticFusedKind {
     }
 }
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 fn reset_uninitialized_static_family_hits() {
     UNINITIALIZED_STATIC_FAMILY_HITS.set([0; 7]);
 }
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 fn uninitialized_static_family_hits() -> [usize; 7] {
     UNINITIALIZED_STATIC_FAMILY_HITS.get()
 }
@@ -1016,16 +1017,52 @@ fn try_static_specialization<T: FusedScalar>(
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
 ) -> Result<bool> {
+    try_static_specialization_scoped(dests, inputs, plan, false)
+}
+
+/// Static specialization with an explicit serial request.
+///
+/// The specialized kernels choose their own fanout from the ambient execution
+/// policy, so a serial caller pins [`ExecutionPolicy::Sequential`] while they
+/// run. Skipping the specialization instead is what made serial replay fall
+/// back to the per-element interpreter (tensor4all/strided-rs#305).
+fn try_static_specialization_scoped<T: FusedScalar>(
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+    serial: bool,
+) -> Result<bool> {
     if dests.len() != 1 {
         return Ok(false);
     }
     let validated = validate_destination_layout_without_alloc(dests[0].dims(), dests[0].strides())?;
-    try_static_specialization_validated::<T, InitializedStaticOutput>(
+    try_static_specialization_validated_scoped::<T, InitializedStaticOutput>(
         &mut dests[0],
         inputs,
         plan,
         validated,
+        serial,
     )
+}
+
+fn try_static_specialization_validated_scoped<T, O>(
+    dest: &mut StridedViewMut<'_, O::Value>,
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+    validated: ValidatedDestinationLayout,
+    serial: bool,
+) -> Result<bool>
+where
+    T: FusedScalar,
+    O: StaticOutput<T>,
+{
+    if serial {
+        with_execution_policy(ExecutionPolicy::Sequential, || {
+            try_static_specialization_validated::<T, O>(dest, inputs, plan, validated)
+        })
+    } else {
+        try_static_specialization_validated::<T, O>(dest, inputs, plan, validated)
+    }
 }
 
 unsafe fn interpret_inner_loop<T: FusedScalar>(
@@ -1203,6 +1240,9 @@ pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
 ) -> Result<()> {
     validate_plan_for_scalar::<T>(plan, inputs.len(), dests.len())?;
     validate_shapes(dests, inputs)?;
+    if try_static_specialization_scoped(dests, inputs, plan, true)? {
+        return Ok(());
+    }
     interpret_fused_elementwise_into_serial(dests, inputs, plan)
 }
 
@@ -1236,18 +1276,14 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
     serial: bool,
     validated: ValidatedDestinationLayout,
 ) -> Result<()> {
-    #[cfg(not(feature = "parallel"))]
-    let _ = serial;
     validate_plan_for_scalar::<T>(plan, inputs.len(), 1)?;
     for input in inputs {
         ensure_same_shape(dest.dims(), input.dims())?;
     }
 
-    if !serial
-        && try_static_specialization_validated::<T, UninitializedStaticOutput>(
-            dest, inputs, plan, validated,
-        )?
-    {
+    if try_static_specialization_validated_scoped::<T, UninitializedStaticOutput>(
+        dest, inputs, plan, validated, serial,
+    )? {
         return Ok(());
     }
 
