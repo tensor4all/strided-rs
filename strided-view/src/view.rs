@@ -84,6 +84,33 @@ pub(crate) fn validate_bounds(
     Ok(())
 }
 
+/// Offset of `indices` inside `dims`/`strides`, relative to `base`.
+///
+/// # Panics
+///
+/// Panics when `indices` is not the full index for `dims`, an index is out of
+/// bounds, or an indexed offset does not fit `isize`. Every panicking element
+/// accessor below reports those conditions through this helper.
+#[inline]
+fn indexed_offset(dims: &[usize], strides: &[isize], indices: &[usize], base: isize) -> isize {
+    assert_eq!(indices.len(), dims.len(), "wrong number of indices");
+    let mut offset = base;
+    for (i, &index) in indices.iter().enumerate() {
+        assert!(
+            index < dims[i],
+            "index {} out of bounds for dim {}",
+            index,
+            dims[i]
+        );
+        offset = isize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(strides[i]))
+            .and_then(|step| offset.checked_add(step))
+            .expect("index offset overflow");
+    }
+    offset
+}
+
 /// Compute column-major strides (Julia default: first index varies fastest).
 pub fn col_major_strides(dims: &[usize]) -> Vec<isize> {
     let rank = dims.len();
@@ -126,6 +153,19 @@ pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
 /// - `'a`: Lifetime of the underlying data and of borrowed metadata
 /// - `T`: Element type
 /// - `Op`: Element operation applied lazily on access (default: `Identity`)
+///
+/// # Auto traits
+///
+/// The view borrows its elements, so it is `Send` only when `T: Sync` (a
+/// shared slice is). A view of non-`Sync` data is not `Send`:
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// use strided_view::StridedView;
+///
+/// fn assert_send<T: Send>() {}
+/// assert_send::<StridedView<'static, Cell<i32>>>();
+/// ```
 pub struct StridedView<'a, T, Op = Identity> {
     ptr: *const T,
     data: &'a [T],
@@ -135,7 +175,7 @@ pub struct StridedView<'a, T, Op = Identity> {
     _op: PhantomData<Op>,
 }
 
-unsafe impl<T: Send, Op: Send> Send for StridedView<'_, T, Op> {}
+unsafe impl<T: Sync, Op: Send> Send for StridedView<'_, T, Op> {}
 unsafe impl<T: Sync, Op: Sync> Sync for StridedView<'_, T, Op> {}
 
 impl<T, Op> Clone for StridedView<'_, T, Op> {
@@ -339,6 +379,16 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// - The higher-numbered axis is removed
     /// - Pairs use **original** axis numbering
     ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::InvalidAxis`] when a pair names an axis outside
+    /// the rank or names the same axis twice, and
+    /// [`StridedError::OffsetOverflow`] when a fused stride does not fit
+    /// `isize` or the fused layout reaches past the backing allocation. Two
+    /// pairs may share an axis (`A[i,i,i]` is `[(0, 1), (0, 2)]`), but a pair
+    /// pattern that folds one axis into itself or into both ends of another
+    /// pair can address elements outside the backing data and is rejected.
+    ///
     /// # Example
     /// `A[i,i,j]` shape=`[n,n,m]` strides=`[s0,s1,s2]` -> shape=`[n,m]` strides=`[s0+s1, s2]`
     pub fn diagonal_view(&self, axis_pairs: &[(usize, usize)]) -> Result<StridedView<'a, T, Op>> {
@@ -349,7 +399,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         let mut axes_to_remove = Vec::new();
         for &(a, b) in axis_pairs {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            if lo >= ndim || hi >= ndim {
+            if hi >= ndim {
                 return Err(StridedError::InvalidAxis {
                     axis: hi,
                     rank: ndim,
@@ -361,7 +411,9 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
                     rank: ndim,
                 });
             }
-            strides[lo] += strides[hi];
+            strides[lo] = strides[lo]
+                .checked_add(strides[hi])
+                .ok_or(StridedError::OffsetOverflow)?;
             dims[lo] = dims[lo].min(dims[hi]);
             axes_to_remove.push(hi);
         }
@@ -372,6 +424,11 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
             dims.remove(ax);
             strides.remove(ax);
         }
+
+        // The fusion re-uses an already updated stride when a pair shares an
+        // axis with an earlier pair, so the result carries no bound proof of
+        // its own and is validated here instead (tensor4all/strided-rs#204).
+        validate_bounds(self.data().len(), &dims, &strides, self.offset())?;
 
         Ok(from_meta(
             self.data(),
@@ -463,19 +520,14 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
 /// Element access: requires `Op: ElementOp<T>`.
 impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
     /// Get an element with the element operation applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `indices.len()` is not the view's rank, an index is out of
+    /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
-        assert_eq!(indices.len(), self.dims.len(), "wrong number of indices");
-        let mut idx = 0isize;
-        for (i, &index) in indices.iter().enumerate() {
-            assert!(
-                index < self.dims[i],
-                "index {} out of bounds for dim {}",
-                index,
-                self.dims[i]
-            );
-            idx += index as isize * self.strides[i];
-        }
-        Op::apply(unsafe { *self.ptr.offset(idx) })
+        let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        Op::apply(unsafe { *self.ptr.offset(offset) })
     }
 
     /// Get an element without bounds checking.
@@ -679,26 +731,26 @@ impl<'a, T> StridedViewMut<'a, T> {
 
 impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// Get an element.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `indices.len()` is not the view's rank, an index is out of
+    /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
-        assert_eq!(indices.len(), self.dims.len());
-        let mut idx = 0isize;
-        for (i, &index) in indices.iter().enumerate() {
-            assert!(index < self.dims[i]);
-            idx += index as isize * self.strides[i];
-        }
-        unsafe { *self.ptr.offset(idx) }
+        let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        unsafe { *self.ptr.offset(offset) }
     }
 
     /// Set an element.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `indices.len()` is not the view's rank, an index is out of
+    /// bounds, or the indexed offset does not fit `isize`.
     pub fn set(&mut self, indices: &[usize], value: T) {
-        assert_eq!(indices.len(), self.dims.len());
-        let mut idx = 0isize;
-        for (i, &index) in indices.iter().enumerate() {
-            assert!(index < self.dims[i]);
-            idx += index as isize * self.strides[i];
-        }
+        let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
         unsafe {
-            *self.ptr.offset(idx) = value;
+            *self.ptr.offset(offset) = value;
         }
     }
 }
@@ -1023,19 +1075,24 @@ impl<T: Copy> StridedArray<T> {
 
 impl<T: Copy> StridedArray<T> {
     /// Get an element by multi-dimensional index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `indices.len()` is not the array's rank, an index is out of
+    /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         self.view().get(indices)
     }
 
     /// Set an element by multi-dimensional index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `indices.len()` is not the array's rank, an index is out of
+    /// bounds, or the indexed offset does not fit `isize`.
     pub fn set(&mut self, indices: &[usize], value: T) {
-        assert_eq!(indices.len(), self.dims.len());
-        let mut idx = self.offset;
-        for (i, &index) in indices.iter().enumerate() {
-            assert!(index < self.dims[i]);
-            idx += index as isize * self.strides[i];
-        }
-        self.data[idx as usize] = value;
+        let offset = indexed_offset(&self.dims, &self.strides, indices, self.offset);
+        self.data[offset as usize] = value;
     }
 }
 
@@ -1043,23 +1100,15 @@ impl<T: Copy> Index<&[usize]> for StridedArray<T> {
     type Output = T;
 
     fn index(&self, indices: &[usize]) -> &T {
-        let mut idx = self.offset;
-        for (i, &index) in indices.iter().enumerate() {
-            assert!(index < self.dims[i]);
-            idx += index as isize * self.strides[i];
-        }
-        &self.data[idx as usize]
+        let offset = indexed_offset(&self.dims, &self.strides, indices, self.offset);
+        &self.data[offset as usize]
     }
 }
 
 impl<T: Copy> IndexMut<&[usize]> for StridedArray<T> {
     fn index_mut(&mut self, indices: &[usize]) -> &mut T {
-        let mut idx = self.offset;
-        for (i, &index) in indices.iter().enumerate() {
-            assert!(index < self.dims[i]);
-            idx += index as isize * self.strides[i];
-        }
-        &mut self.data[idx as usize]
+        let offset = indexed_offset(&self.dims, &self.strides, indices, self.offset);
+        &mut self.data[offset as usize]
     }
 }
 
@@ -1375,6 +1424,30 @@ mod tests {
     }
 
     #[test]
+    fn test_diagonal_view_rejects_pairs_that_leave_the_backing() {
+        let data: Vec<f64> = (0..8).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[2, 2, 2], &[4, 2, 1], 0).unwrap();
+        // Axis 2 is folded into both axis 0 and axis 1, so the result reaches
+        // offset 8 of a length-8 backing.
+        assert!(view.diagonal_view(&[(0, 2), (1, 2)]).is_err());
+        // The same pair twice doubles one axis's stride contribution.
+        assert!(view.diagonal_view(&[(0, 1), (0, 1)]).is_err());
+    }
+
+    #[test]
+    fn test_diagonal_view_fuses_a_shared_low_axis_in_bounds() {
+        // A[i,i,i] is [(0, 1), (0, 2)]: axis 0 carries both fused strides and
+        // the result stays inside the backing.
+        let data: Vec<f64> = (0..8).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[2, 2, 2], &[4, 2, 1], 0).unwrap();
+        let diag = view.diagonal_view(&[(0, 1), (0, 2)]).unwrap();
+        assert_eq!(diag.dims(), &[2]);
+        assert_eq!(diag.strides(), &[7]);
+        assert_eq!(diag.get(&[0]), 0.0);
+        assert_eq!(diag.get(&[1]), 7.0);
+    }
+
+    #[test]
     fn test_custom_type_without_element_op_apply() {
         // Custom Copy type that does NOT implement ElementOpApply.
         // Should work with Identity views (StridedView<T> default).
@@ -1403,5 +1476,29 @@ mod tests {
         let perm = view.permute(&[1, 0]).unwrap();
         assert_eq!(perm.get(&[0, 0]), MyScalar(1.0));
         assert_eq!(perm.get(&[0, 1]), MyScalar(3.0)); // transposed
+    }
+
+    #[test]
+    #[should_panic(expected = "wrong number of indices")]
+    fn test_index_rejects_a_short_index() {
+        let arr = StridedArray::from_parts(vec![0.0f64; 4], &[2, 2], &[2, 1], 0).unwrap();
+        // Without the rank check this reads an element the index does not name.
+        let _ = arr[&[1][..]];
+    }
+
+    #[test]
+    #[should_panic(expected = "wrong number of indices")]
+    fn test_view_get_rejects_a_short_index() {
+        let data = vec![0.0f64; 4];
+        let view = StridedView::<f64>::new(&data, &[2, 2], &[2, 1], 0).unwrap();
+        let _ = view.get(&[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_view_set_rejects_an_out_of_bounds_index() {
+        let mut data = vec![0.0f64; 4];
+        let mut view = StridedViewMut::<f64>::new(&mut data, &[2, 2], &[2, 1], 0).unwrap();
+        view.set(&[2, 0], 1.0);
     }
 }
