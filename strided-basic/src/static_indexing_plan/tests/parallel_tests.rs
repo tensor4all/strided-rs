@@ -359,6 +359,16 @@ fn pad_plan_serial_and_parallel_contexts_agree() {
             vec![0, 0],
             None,
         ),
+        // dense destination with a unit axis-0 operand stride but a reversed
+        // outer operand stride (single-pass column write)
+        (
+            vec![101, 43],
+            vec![1, -101],
+            vec![2, 1],
+            vec![1, 0],
+            vec![0, 0],
+            None,
+        ),
         // interior padding and negative operand stride (generic path)
         (
             vec![1_001, 41],
@@ -443,6 +453,72 @@ fn pad_plan_serial_and_parallel_contexts_agree() {
             &dest_strides,
             &expected,
             &format!("pad {dims:?} low {low:?}"),
+            |dest| plan.execute(dest, &source, fill).unwrap(),
+            |dest| plan.execute_uninit(dest, &source, fill).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn axis0_columns_single_pass_serial_and_parallel_contexts_agree() {
+    // (operand dims, edge low, edge high); every case selects the single-pass
+    // column write and the largest is well past the parallel threshold.
+    type Case = (Vec<usize>, Vec<i64>, Vec<i64>);
+    let cases: Vec<Case> = vec![
+        (vec![2_097_152], vec![128], vec![128]),
+        (vec![1_001, 41], vec![1, 3], vec![2, 0]),
+        (vec![129, 131, 7], vec![1, 2, 3], vec![3, 1, 2]),
+        (vec![65_537, 3], vec![0, 0], vec![5, 2]),
+    ];
+    for (dims, low, high) in cases {
+        let rank = dims.len();
+        let strides = col_major(&dims);
+        let dest_dims: Vec<usize> = (0..rank)
+            .map(|a| (low[a] + dims[a] as i64 + high[a]) as usize)
+            .collect();
+        let dest_strides = col_major(&dest_dims);
+        let interior = vec![0i64; rank];
+        let plan = PadPlan::compile(
+            &dims,
+            &strides,
+            &dest_dims,
+            &dest_strides,
+            &low,
+            &high,
+            &interior,
+        )
+        .unwrap();
+        assert!(
+            plan.has_contiguous_axis0_columns(),
+            "rank {rank} should select the single-pass column write"
+        );
+
+        let (data, base) = operand(&dims, &strides, 1);
+        let source = RawStridedRef::new(&data, &dims, &strides, base).unwrap();
+        let fill = -5i64;
+        let mut expected = Vec::new();
+        for_each_index(&dest_dims, |idx| {
+            let mut src = Vec::with_capacity(rank);
+            let mut in_bounds = true;
+            for a in 0..rank {
+                let shifted = idx[a] as i64 - low[a];
+                if shifted < 0 || shifted as usize >= dims[a] {
+                    in_bounds = false;
+                    break;
+                }
+                src.push(shifted as usize);
+            }
+            expected.push(if in_bounds {
+                1 + linear(&dims, &src) as i64
+            } else {
+                fill
+            });
+        });
+        check_both(
+            &dest_dims,
+            &dest_strides,
+            &expected,
+            &format!("axis0 columns {dims:?} low {low:?}"),
             |dest| plan.execute(dest, &source, fill).unwrap(),
             |dest| plan.execute_uninit(dest, &source, fill).unwrap(),
         );

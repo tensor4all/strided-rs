@@ -44,8 +44,11 @@ pub struct ReversePlan {
 
 /// A compiled pad traversal.
 ///
-/// Replay first fills every destination element with the caller-provided fill
+/// Replay fills every destination element with the caller-provided fill
 /// scalar, then copies reachable input positions into the padded output.
+/// A dense column-major destination with a unit-stride axis-0 operand and
+/// non-negative edges without interior spacing instead writes disjoint spans
+/// (low pad, operand run, high pad) per column so each element is written once.
 #[derive(Clone, Debug)]
 pub struct PadPlan {
     operand_dims: AxisVec<usize>,
@@ -58,6 +61,7 @@ pub struct PadPlan {
     dest_total: usize,
     contiguous_dest_fill: bool,
     contiguous_axis0_run: Option<ContiguousPadAxis0Run>,
+    contiguous_axis0_columns: Option<ContiguousPadAxis0Columns>,
     generic_fill: PadFillCursor,
     generic_copy: PadCopyCursor,
 }
@@ -85,6 +89,31 @@ struct ContiguousPadAxis0Run {
     operand_start: usize,
     dest_start: usize,
     len: usize,
+}
+
+/// Prepared single-pass write for a dense column-major destination whose
+/// axis-0 operand stride is one and whose edges are non-negative with no
+/// interior spacing on any axis.
+///
+/// Replay walks destination columns. Each column writes its low pad, copies
+/// the operand axis-0 run, and writes its high pad; columns with no reachable
+/// operand coordinate write the whole column as padding. Every reachable
+/// destination slot is therefore written exactly once, and the write spans of
+/// distinct columns are disjoint because the destination layout is injective.
+#[derive(Clone, Debug)]
+struct ContiguousPadAxis0Columns {
+    /// Number of destination columns, `dest_dims[0]` elements each.
+    column_total: usize,
+    dest_axis0_len: usize,
+    dest_axis0_step: isize,
+    low0: usize,
+    high0: usize,
+    run_len: usize,
+    operand_axis0_start: isize,
+    operand_outer_dims: AxisVec<usize>,
+    operand_outer_strides: AxisVec<isize>,
+    dest_outer_dims: AxisVec<usize>,
+    edge_low_outer: AxisVec<usize>,
 }
 
 /// A compiled multi-input concatenate traversal.
@@ -300,6 +329,18 @@ impl PadPlan {
             edge_padding_low,
             &interior_step,
         );
+        let contiguous_axis0_columns = contiguous_axis0_run.and_then(|run| {
+            compile_contiguous_pad_axis0_columns(
+                operand_dims,
+                operand_strides,
+                dest_dims,
+                edge_padding_low,
+                edge_padding_high,
+                &interior_step,
+                contiguous_dest_fill,
+                run,
+            )
+        });
         let generic_fill = compile_pad_fill_cursor(dest_dims, dest_strides)?;
         let generic_copy = compile_pad_copy_cursor(
             operand_dims,
@@ -321,6 +362,7 @@ impl PadPlan {
             dest_total,
             contiguous_dest_fill,
             contiguous_axis0_run,
+            contiguous_axis0_columns,
             generic_fill,
             generic_copy,
         })
@@ -337,11 +379,13 @@ impl PadPlan {
         T: Copy + MaybeSendSync,
     {
         self.check_call(dest, operand)?;
-        self.fill_dest(dest, fill)?;
-
         if self.operand_total == 0 {
-            return Ok(());
+            return self.fill_dest(dest, fill);
         }
+        if let Some(columns) = &self.contiguous_axis0_columns {
+            return self.execute_axis0_columns(dest, operand, fill, columns);
+        }
+        self.fill_dest(dest, fill)?;
         if let Some(run) = self.contiguous_axis0_run {
             return self.copy_operand_axis0_runs(dest, operand, run);
         }
@@ -359,11 +403,13 @@ impl PadPlan {
         T: Copy + MaybeSendSync,
     {
         self.check_call(dest, operand)?;
-        self.fill_dest(dest, MaybeUninit::new(fill))?;
-
         if self.operand_total == 0 {
-            return Ok(());
+            return self.fill_dest(dest, MaybeUninit::new(fill));
         }
+        if let Some(columns) = &self.contiguous_axis0_columns {
+            return self.execute_axis0_columns_uninit(dest, operand, fill, columns);
+        }
+        self.fill_dest(dest, MaybeUninit::new(fill))?;
         if let Some(run) = self.contiguous_axis0_run {
             return self.copy_operand_axis0_runs_uninit(dest, operand, run);
         }
@@ -431,6 +477,242 @@ impl PadPlan {
         // SAFETY: as in `copy_operand_axis0_runs`; `MaybeUninit<T>` has the
         // layout of `T`, and only writes go through the cast pointer.
         unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run) }
+    }
+
+    fn execute_axis0_columns<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        fill: T,
+        columns: &ContiguousPadAxis0Columns,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let dest_offset = dest.offset();
+        let dest_ptr = dest.data_mut().as_mut_ptr();
+        let operand_offset = operand.offset();
+        let operand_ptr = operand.data().as_ptr();
+        // SAFETY: `check_call` proved `dest` carries the compiled destination
+        // layout, so its validated data covers every reachable destination
+        // slot, and the exclusive borrow is the only access during the call.
+        unsafe {
+            self.write_axis0_columns_raw(
+                dest_ptr,
+                dest_offset,
+                operand_ptr,
+                operand_offset,
+                fill,
+                columns,
+            )
+        }
+    }
+
+    fn execute_axis0_columns_uninit<T>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        operand: &RawStridedRef<'_, T>,
+        fill: T,
+        columns: &ContiguousPadAxis0Columns,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let dest_offset = dest.offset();
+        let dest_ptr = dest.data_mut().as_mut_ptr().cast::<T>();
+        let operand_offset = operand.offset();
+        let operand_ptr = operand.data().as_ptr();
+        // SAFETY: as in `execute_axis0_columns`; `MaybeUninit<T>` has the
+        // layout of `T`, and only writes go through the cast pointer.
+        unsafe {
+            self.write_axis0_columns_raw(
+                dest_ptr,
+                dest_offset,
+                operand_ptr,
+                operand_offset,
+                fill,
+                columns,
+            )
+        }
+    }
+
+    /// Write every destination column as disjoint low-pad, operand-run, and
+    /// high-pad spans.
+    ///
+    /// With at least as many columns as workers (above the repository
+    /// threshold) the columns are split across workers; otherwise columns run
+    /// in order and each long span is chunked across workers by
+    /// [`crate::threading::copy_contiguous`] and
+    /// [`crate::threading::fill_contiguous`].
+    ///
+    /// # Safety
+    ///
+    /// `dest_ptr` and `operand_ptr` must be the data pointers of descriptors
+    /// whose layouts are exactly the compiled layouts from `dest_offset` and
+    /// `operand_offset`. The destination must be writable at every reachable
+    /// slot and no other access may overlap the call; the operand may only be
+    /// read at coordinates that are copied, but no read is performed for a
+    /// padding-only column.
+    unsafe fn write_axis0_columns_raw<T>(
+        &self,
+        dest_ptr: *mut T,
+        dest_offset: isize,
+        operand_ptr: *const T,
+        operand_offset: isize,
+        fill: T,
+        columns: &ContiguousPadAxis0Columns,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        let column_total = columns.column_total;
+        if column_total == 0 {
+            return Ok(());
+        }
+        let operand_offset = operand_offset
+            .checked_add(columns.operand_axis0_start)
+            .ok_or(StridedError::OffsetOverflow)?;
+        #[cfg(feature = "parallel")]
+        {
+            let nthreads = crate::threading::parallel_threads_for_len(self.dest_total);
+            if nthreads > 1 && column_total >= nthreads {
+                let dest_ptr = crate::threading::SendPtr(dest_ptr);
+                let operand_ptr = crate::threading::SendPtr(operand_ptr as *mut T);
+                return crate::threading::parallel_map_reduce(
+                    0..column_total,
+                    nthreads,
+                    &|range| {
+                        let mut outer_idx_storage =
+                            CoordScratch::new(columns.dest_outer_dims.len());
+                        let outer_idx = outer_idx_storage.as_mut_slice();
+                        fill_col_major_index(range.start, &columns.dest_outer_dims, outer_idx);
+                        // SAFETY: worker ranges are disjoint; the destination
+                        // is dense column-major, so distinct columns occupy
+                        // disjoint contiguous slots, and the caller's contract
+                        // covers every reachable slot. Padding-only columns
+                        // never read the operand.
+                        unsafe {
+                            self.write_axis0_columns_range(
+                                dest_ptr.as_ptr(),
+                                dest_offset,
+                                operand_ptr.as_const(),
+                                operand_offset,
+                                fill,
+                                columns,
+                                outer_idx,
+                                range.start,
+                                range.len(),
+                            )
+                        }
+                    },
+                    &|left, right| left.and(right),
+                );
+            }
+        }
+        let mut outer_idx_storage = CoordScratch::new(columns.dest_outer_dims.len());
+        let outer_idx = outer_idx_storage.as_mut_slice();
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            self.write_axis0_columns_range(
+                dest_ptr,
+                dest_offset,
+                operand_ptr,
+                operand_offset,
+                fill,
+                columns,
+                outer_idx,
+                0,
+                column_total,
+            )
+        }
+    }
+
+    /// Write `count` destination columns starting at linear column
+    /// `column_start`, advancing `outer_idx` in place.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::write_axis0_columns_raw`], and no other thread may write
+    /// the destination columns visited by this call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn write_axis0_columns_range<T>(
+        &self,
+        dest_ptr: *mut T,
+        dest_offset: isize,
+        operand_ptr: *const T,
+        operand_offset: isize,
+        fill: T,
+        columns: &ContiguousPadAxis0Columns,
+        outer_idx: &mut [usize],
+        column_start: usize,
+        count: usize,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync,
+    {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut dest_column_offset =
+            checked_offset_add(dest_offset, columns.dest_axis0_step, column_start)?;
+        for _ in 0..count {
+            let mut operand_column_offset = operand_offset;
+            let mut in_bounds = true;
+            for (axis, &coord) in outer_idx.iter().enumerate() {
+                let Some(q) = coord.checked_sub(columns.edge_low_outer[axis]) else {
+                    in_bounds = false;
+                    break;
+                };
+                if q >= columns.operand_outer_dims[axis] {
+                    in_bounds = false;
+                    break;
+                }
+                operand_column_offset = checked_offset_add(
+                    operand_column_offset,
+                    columns.operand_outer_strides[axis],
+                    q,
+                )?;
+            }
+            if in_bounds {
+                let low_len = columns.low0;
+                let run_len = columns.run_len;
+                let high_len = columns.high0;
+                // SAFETY: the compiled run span and the dense column layout
+                // place the low pad, operand run, and high pad at disjoint
+                // offsets inside this column; the operand run was validated by
+                // the descriptor bounds and `run_len` copies only in-bounds
+                // axis-0 elements. The destination layout is injective and
+                // this call owns the whole column.
+                unsafe {
+                    fill_raw_span(dest_ptr.offset(dest_column_offset), low_len, fill);
+                    crate::threading::copy_contiguous(
+                        operand_ptr.offset(operand_column_offset),
+                        dest_ptr.offset(dest_column_offset + low_len as isize),
+                        run_len,
+                    );
+                    fill_raw_span(
+                        dest_ptr.offset(dest_column_offset + low_len as isize + run_len as isize),
+                        high_len,
+                        fill,
+                    );
+                }
+            } else {
+                // SAFETY: as for the in-bounds branch; a padding-only column
+                // never reads the operand.
+                unsafe {
+                    fill_raw_span(
+                        dest_ptr.offset(dest_column_offset),
+                        columns.dest_axis0_len,
+                        fill,
+                    );
+                }
+            }
+            advance_col_major_index(outer_idx, &columns.dest_outer_dims);
+            dest_column_offset = dest_column_offset
+                .checked_add(columns.dest_axis0_step)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+        Ok(())
     }
 
     /// Copy every in-bounds axis-0 run of the operand into the destination.
@@ -567,6 +849,11 @@ impl PadPlan {
     #[cfg(test)]
     fn has_contiguous_dest_fill(&self) -> bool {
         self.contiguous_dest_fill
+    }
+
+    #[cfg(test)]
+    fn has_contiguous_axis0_columns(&self) -> bool {
+        self.contiguous_axis0_columns.is_some()
     }
 
     fn fill_dest_serial<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T) -> Result<()>
@@ -1551,6 +1838,78 @@ fn compile_contiguous_pad_axis0_run(
         dest_start: usize::try_from(dest_start).ok()?,
         len: usize::try_from(len).ok()?,
     })
+}
+
+/// Compile the disjoint-span column write for the dense, non-cropping,
+/// no-interior-padding class, or `None` to keep the fill-then-copy fallback.
+#[allow(clippy::too_many_arguments)]
+fn compile_contiguous_pad_axis0_columns(
+    operand_dims: &[usize],
+    operand_strides: &[isize],
+    dest_dims: &[usize],
+    edge_padding_low: &[i64],
+    edge_padding_high: &[i64],
+    interior_step: &[i64],
+    contiguous_dest_fill: bool,
+    run: ContiguousPadAxis0Run,
+) -> Option<ContiguousPadAxis0Columns> {
+    if run.len == 0 || !contiguous_dest_fill || dest_dims.is_empty() {
+        return None;
+    }
+    if edge_padding_low.iter().any(|&low| low < 0)
+        || edge_padding_high.iter().any(|&high| high < 0)
+        || interior_step.iter().any(|&step| step != 1)
+    {
+        return None;
+    }
+
+    let rank = operand_dims.len();
+    let dest_axis0_len = dest_dims[0];
+    let dest_axis0_step = isize::try_from(dest_axis0_len).ok()?;
+    let column_total = checked_total_len(&dest_dims[1..]).ok()?;
+    let mut operand_outer_dims = AxisVec::with_capacity(rank - 1);
+    let mut operand_outer_strides = AxisVec::with_capacity(rank - 1);
+    let mut dest_outer_dims = AxisVec::with_capacity(rank - 1);
+    let mut edge_low_outer = AxisVec::with_capacity(rank - 1);
+    for axis in 1..rank {
+        operand_outer_dims.push(operand_dims[axis]);
+        operand_outer_strides.push(operand_strides[axis]);
+        dest_outer_dims.push(dest_dims[axis]);
+        edge_low_outer.push(usize::try_from(edge_padding_low[axis]).ok()?);
+    }
+
+    let low0 = run.dest_start;
+    let high0 = dest_axis0_len.checked_sub(low0)?.checked_sub(run.len)?;
+    Some(ContiguousPadAxis0Columns {
+        column_total,
+        dest_axis0_len,
+        dest_axis0_step,
+        low0,
+        high0,
+        run_len: run.len,
+        operand_axis0_start: isize::try_from(run.operand_start).ok()?,
+        operand_outer_dims,
+        operand_outer_strides,
+        dest_outer_dims,
+        edge_low_outer,
+    })
+}
+
+/// Fill a disjoint raw destination span, chunked across workers when the
+/// active policy allows it.
+///
+/// # Safety
+///
+/// `ptr..ptr + len` must be a writable destination span with no concurrent
+/// access from another worker.
+unsafe fn fill_raw_span<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: T) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: the caller guarantees the exact writable span; the slice is not
+    // retained past `fill_contiguous`.
+    let span = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+    crate::threading::fill_contiguous(span, fill);
 }
 
 fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
