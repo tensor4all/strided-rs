@@ -26,6 +26,7 @@ strided-kernel = { version = "0.5.0", path = "strided-kernel" }
 
 approx = "0.5"
 criterion = "0.5"
+elem-simd-math = "0.1.0"
 num-complex = "0.4"
 num-traits = "0.2"
 pulp = "0.22"
