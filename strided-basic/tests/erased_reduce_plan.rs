@@ -94,6 +94,26 @@ fn erased_reduce_plan_integer_full_reductions_use_wrapping_arithmetic() {
     assert_eq!(product_output, [i64::MAX.wrapping_mul(2)]);
 }
 
+/// No-SIMD reference for the serial full-sum kernel: the sixteen-lane fold
+/// documented for `ErasedReducePlan` (lane `i` accumulates elements
+/// `i, i + 16, ...` in order, the remainder folds into the first lanes, then
+/// the lanes fold left to right). `MaybeSimdOps::try_simd_sum` is the same
+/// contract when the `simd` feature is on; this helper pins it when it is off.
+fn sixteen_lane_sum(values: &[f64]) -> f64 {
+    const LANES: usize = 16;
+    let mut lanes = [0.0f64; LANES];
+    let mut chunks = values.chunks_exact(LANES);
+    for chunk in chunks.by_ref() {
+        for (lane, &value) in lanes.iter_mut().zip(chunk) {
+            *lane += value;
+        }
+    }
+    for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+        *lane += value;
+    }
+    lanes.into_iter().fold(0.0, |acc, lane| acc + lane)
+}
+
 #[test]
 fn erased_reduce_plan_serial_full_sum_uses_fixed_multi_accumulator_order() {
     let dims = [9usize];
@@ -118,7 +138,8 @@ fn erased_reduce_plan_serial_full_sum_uses_fixed_multi_accumulator_order() {
     )
     .unwrap();
 
-    let expected = <f64 as MaybeSimdOps>::try_simd_sum(&input).unwrap_or(7.0);
+    let expected =
+        <f64 as MaybeSimdOps>::try_simd_sum(&input).unwrap_or_else(|| sixteen_lane_sum(&input));
     assert_eq!(serial_output[0].to_bits(), expected.to_bits());
     assert_eq!(one_thread_output[0].to_bits(), serial_output[0].to_bits());
 }
