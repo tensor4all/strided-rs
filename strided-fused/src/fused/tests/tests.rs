@@ -650,3 +650,195 @@ fn is_injective_layout_rejects_unrepresentable_offset_spans() {
     assert!(!is_injective_layout(&[2, 2], &[positive, isize::MAX]));
     assert!(!is_injective_layout(&[2, 2], &[negative, isize::MIN]));
 }
+
+/// Observation state for the broadcast partition regression. It is separate
+/// from `UNINIT_WORKER_IDS` so the two parallel tests do not race.
+#[cfg(feature = "parallel")]
+static BROADCAST_WORKER_IDS: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "parallel")]
+static BROADCAST_ADDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "parallel")]
+#[derive(Clone, Copy)]
+struct BroadcastTracked(u64);
+
+#[cfg(feature = "parallel")]
+impl FusedScalar for BroadcastTracked {
+    fn fused_add(self, rhs: Self) -> Self {
+        BROADCAST_ADDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = std::thread::current().id();
+        {
+            let mut ids = BROADCAST_WORKER_IDS.lock().unwrap();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        for _ in 0..64 {
+            std::hint::spin_loop();
+        }
+        Self(self.0.wrapping_add(rhs.0))
+    }
+
+    fn fused_multiply(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_mul(rhs.0))
+    }
+
+    fn fused_negate(self) -> Self {
+        self
+    }
+
+    fn fused_conj(self) -> Self {
+        self
+    }
+
+    fn fused_divide(self, _rhs: Self) -> Self {
+        self
+    }
+
+    fn fused_abs(self) -> Self {
+        self
+    }
+
+    fn fused_maximum(self, _rhs: Self) -> Self {
+        self
+    }
+
+    fn fused_minimum(self, _rhs: Self) -> Self {
+        self
+    }
+
+    fn fused_clamp(self, _min: Self, _max: Self) -> Self {
+        self
+    }
+
+    fn fused_exp(self) -> Self {
+        self
+    }
+
+    fn fused_log(self) -> Self {
+        self
+    }
+
+    fn fused_sin(self) -> Self {
+        self
+    }
+
+    fn fused_cos(self) -> Self {
+        self
+    }
+
+    fn fused_tanh(self) -> Self {
+        self
+    }
+
+    fn fused_sqrt(self) -> Self {
+        self
+    }
+
+    fn fused_rsqrt(self) -> Self {
+        self
+    }
+
+    fn fused_pow(self, _rhs: Self) -> Self {
+        self
+    }
+
+    fn fused_expm1(self) -> Self {
+        self
+    }
+
+    fn fused_log1p(self) -> Self {
+        self
+    }
+}
+
+/// Regression (R-performance-09): the fused replay of an inner-axis broadcast
+/// must split across workers, not run in one partition behind the whole-tensor
+/// cache block. `[1023, 67]` is odd, above the threading threshold, and below
+/// the splitter's 1024 guard, so it exercises the shared block normalization.
+#[cfg(feature = "parallel")]
+#[test]
+fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
+    use crate::{ExecContext, StridedView, StridedViewMut};
+    use core::mem::MaybeUninit;
+    use std::sync::atomic::Ordering;
+
+    let rows = 1023usize;
+    let cols = 67usize;
+    let len = rows * cols;
+    let dims = [rows, cols];
+    let out_strides = [1isize, rows as isize];
+    let broadcast_strides = [0isize, 1isize];
+    let peer_strides = [1isize, rows as isize];
+
+    let a: Vec<BroadcastTracked> = (0..cols).map(|c| BroadcastTracked(c as u64)).collect();
+    let b: Vec<BroadcastTracked> = (0..len).map(|i| BroadcastTracked(i as u64)).collect();
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![3],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Conj,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Add,
+                inputs: vec![2, 1],
+            },
+        ],
+    };
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let a_view = StridedView::new(&a, &dims, &broadcast_strides, 0).unwrap();
+        let b_view = StridedView::new(&b, &dims, &peer_strides, 0).unwrap();
+        let inputs = [a_view, b_view];
+        let ctx = ExecContext::max_threads(4).unwrap();
+
+        BROADCAST_WORKER_IDS.lock().unwrap().clear();
+        BROADCAST_ADDS.store(0, Ordering::SeqCst);
+        let mut output = vec![BroadcastTracked(0); len];
+        {
+            let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
+            ctx.run(|| {
+                fused_elementwise_into(&mut [dest], &inputs, &plan).unwrap();
+            });
+        }
+        assert_eq!(
+            BROADCAST_ADDS.load(Ordering::SeqCst),
+            len,
+            "initialized replay must evaluate Add exactly once per element"
+        );
+        let workers = BROADCAST_WORKER_IDS.lock().unwrap().len();
+        assert!(
+            workers > 1,
+            "initialized broadcast replay must split across workers, saw {workers}"
+        );
+
+        BROADCAST_WORKER_IDS.lock().unwrap().clear();
+        BROADCAST_ADDS.store(0, Ordering::SeqCst);
+        let mut raw = vec![MaybeUninit::<BroadcastTracked>::uninit(); len];
+        {
+            let mut dest = StridedViewMut::new(&mut raw, &dims, &out_strides, 0).unwrap();
+            let validated =
+                validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
+            ctx.run(|| {
+                fused_elementwise_into_uninit(&mut dest, &inputs, &plan, false, validated).unwrap();
+            });
+        }
+        assert_eq!(
+            BROADCAST_ADDS.load(Ordering::SeqCst),
+            len,
+            "uninitialized replay must evaluate Add exactly once per element"
+        );
+        let workers = BROADCAST_WORKER_IDS.lock().unwrap().len();
+        assert!(
+            workers > 1,
+            "uninitialized broadcast replay must split across workers, saw {workers}"
+        );
+    });
+}

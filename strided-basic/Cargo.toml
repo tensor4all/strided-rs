@@ -49,3 +49,8 @@ required-features = ["parallel"]
 name = "product_reduce"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "broadcast_zip"
+harness = false
+required-features = ["parallel"]
