@@ -20,6 +20,7 @@
 
 pub mod auxiliary;
 mod element_op;
+pub mod injectivity;
 mod raw;
 pub mod view;
 
@@ -83,6 +84,13 @@ pub type AxisVec = tinyvec::TinyVec<[usize; INLINE_RANK]>;
 pub use element_op::{
     Adjoint, ComposableElementOp, Compose, Conj, ElementOp, ElementOpApply, Identity, Transpose,
 };
+
+// ============================================================================
+// Layout validation
+// ============================================================================
+pub use injectivity::is_injective_layout;
+#[doc(hidden)]
+pub use injectivity::{axes_are_separated, is_injective_layout_without_alloc};
 
 // ============================================================================
 // View-based types

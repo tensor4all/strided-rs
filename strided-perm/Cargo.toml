@@ -12,6 +12,7 @@ categories = ["science", "mathematics", "algorithms"]
 [dependencies]
 strided-view.workspace = true
 thiserror.workspace = true
+tinyvec.workspace = true
 rayon = { workspace = true, optional = true }
 
 [features]

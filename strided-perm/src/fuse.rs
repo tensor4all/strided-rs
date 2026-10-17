@@ -3,6 +3,18 @@
 //! This module implements the core dimension fusion algorithm that merges
 //! contiguous dimensions to reduce iteration complexity.
 
+use strided_view::INLINE_RANK;
+use tinyvec::TinyVec;
+
+/// Fused axis extents, inline up to [`INLINE_RANK`].
+///
+/// Part of the public [`BilateralFusionPlan`]; a rank above the inline
+/// capacity spills to the heap instead of erroring.
+pub type FusionDimVec = TinyVec<[usize; INLINE_RANK]>;
+
+/// Fused source or destination strides, inline up to [`INLINE_RANK`].
+pub type FusionStrideVec = TinyVec<[isize; INLINE_RANK]>;
+
 /// Fuse contiguous dimensions across multiple arrays.
 ///
 /// This function fuses subsequent dimensions that are contiguous in memory
@@ -160,11 +172,11 @@ pub fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BilateralFusionPlan {
     /// Fused non-trivial dimensions in iteration order.
-    pub dims: Vec<usize>,
+    pub dims: FusionDimVec,
     /// Source strides corresponding to [`Self::dims`].
-    pub src_strides: Vec<isize>,
+    pub src_strides: FusionStrideVec,
     /// Destination strides corresponding to [`Self::dims`].
-    pub dst_strides: Vec<isize>,
+    pub dst_strides: FusionStrideVec,
 }
 
 /// Failure while validating or constructing a bilateral fusion plan.
@@ -215,9 +227,9 @@ pub fn plan_bilateral_fusion(
     }
 
     let mut plan = BilateralFusionPlan {
-        dims: Vec::with_capacity(dims.len()),
-        src_strides: Vec::with_capacity(dims.len()),
-        dst_strides: Vec::with_capacity(dims.len()),
+        dims: FusionDimVec::with_capacity(dims.len()),
+        src_strides: FusionStrideVec::with_capacity(dims.len()),
+        dst_strides: FusionStrideVec::with_capacity(dims.len()),
     };
 
     for ((&dim, &src_stride), &dst_stride) in dims.iter().zip(src_strides).zip(dst_strides) {
@@ -257,7 +269,7 @@ fn fuse_dims_bilateral(
     dims: &[usize],
     src_strides: &[isize],
     dst_strides: &[isize],
-) -> (Vec<usize>, Vec<isize>, Vec<isize>) {
+) -> (FusionDimVec, FusionStrideVec, FusionStrideVec) {
     let plan = plan_bilateral_fusion(dims, src_strides, dst_strides).unwrap();
     (plan.dims, plan.src_strides, plan.dst_strides)
 }
@@ -292,9 +304,9 @@ mod tests {
         let src_strides = vec![1, 2, 4, 8];
         let dst_strides = vec![1, 2, 4, 8];
         let (fd, fs, fds) = fuse_dims_bilateral(&dims, &src_strides, &dst_strides);
-        assert_eq!(fd, vec![16]);
-        assert_eq!(fs, vec![1]);
-        assert_eq!(fds, vec![1]);
+        assert_eq!(&fd[..], &[16]);
+        assert_eq!(&fs[..], &[1]);
+        assert_eq!(&fds[..], &[1]);
     }
 
     #[test]
@@ -305,9 +317,9 @@ mod tests {
         let src_strides = vec![1, 2, 100]; // 0-1 contiguous, 1-2 not
         let dst_strides = vec![1, 2, 6]; // all contiguous
         let (fd, fs, fds) = fuse_dims_bilateral(&dims, &src_strides, &dst_strides);
-        assert_eq!(fd, vec![6, 4]); // first two fuse
-        assert_eq!(fs, vec![1, 100]);
-        assert_eq!(fds, vec![1, 6]);
+        assert_eq!(&fd[..], &[6, 4]); // first two fuse
+        assert_eq!(&fs[..], &[1, 100]);
+        assert_eq!(&fds[..], &[1, 6]);
     }
 
     #[test]
@@ -317,9 +329,9 @@ mod tests {
         let src_strides = vec![1, 4194304, 2]; // scattered
         let dst_strides = vec![1, 2, 4]; // contiguous
         let (fd, fs, fds) = fuse_dims_bilateral(&dims, &src_strides, &dst_strides);
-        assert_eq!(fd, vec![2, 2, 2]); // nothing fuses
-        assert_eq!(fs, vec![1, 4194304, 2]);
-        assert_eq!(fds, vec![1, 2, 4]);
+        assert_eq!(&fd[..], &[2, 2, 2]); // nothing fuses
+        assert_eq!(&fs[..], &[1, 4194304, 2]);
+        assert_eq!(&fds[..], &[1, 2, 4]);
     }
 
     #[test]

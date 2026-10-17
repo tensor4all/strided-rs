@@ -224,14 +224,14 @@ pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + crate::MaybeSendSync>(
     fill_contiguous(span, core::mem::MaybeUninit::new(value));
 }
 
-pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync>(
+pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
     strided_perm::copy_into_col_major(dest, src)
 }
 
-pub(crate) fn copy_permuted_serial<T: Copy + crate::MaybeSendSync>(
+pub(crate) fn copy_permuted_serial<T: Copy + crate::MaybeSendSync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
@@ -275,7 +275,7 @@ fn with_permutation_copy_scheduler<R>(operation: impl FnOnce() -> R) -> R {
 }
 
 #[cfg(feature = "parallel")]
-pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync>(
+pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {

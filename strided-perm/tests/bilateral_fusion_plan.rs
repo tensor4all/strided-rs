@@ -4,35 +4,26 @@ fn plan(dims: &[usize], src_strides: &[isize], dst_strides: &[isize]) -> Bilater
     plan_bilateral_fusion(dims, src_strides, dst_strides).unwrap()
 }
 
+/// Build the inline-vector expected value for a fusion plan.
+fn fusion(dims: &[usize], src_strides: &[isize], dst_strides: &[isize]) -> BilateralFusionPlan {
+    BilateralFusionPlan {
+        dims: dims.iter().copied().collect(),
+        src_strides: src_strides.iter().copied().collect(),
+        dst_strides: dst_strides.iter().copied().collect(),
+    }
+}
+
 #[test]
 fn empty_metadata_stays_rank_zero() {
-    assert_eq!(
-        plan(&[], &[], &[]),
-        BilateralFusionPlan {
-            dims: vec![],
-            src_strides: vec![],
-            dst_strides: vec![],
-        }
-    );
+    assert_eq!(plan(&[], &[], &[]), fusion(&[], &[], &[]));
 }
 
 #[test]
 fn size_one_axes_are_removed_including_scalar_like_shapes() {
-    assert_eq!(
-        plan(&[1, 1], &[7, -3], &[9, 4]),
-        BilateralFusionPlan {
-            dims: vec![],
-            src_strides: vec![],
-            dst_strides: vec![],
-        }
-    );
+    assert_eq!(plan(&[1, 1], &[7, -3], &[9, 4]), fusion(&[], &[], &[]));
     assert_eq!(
         plan(&[1, 5, 1], &[100, 1, -20], &[80, 1, 9]),
-        BilateralFusionPlan {
-            dims: vec![5],
-            src_strides: vec![1],
-            dst_strides: vec![1],
-        }
+        fusion(&[5], &[1], &[1])
     );
 }
 
@@ -40,11 +31,7 @@ fn size_one_axes_are_removed_including_scalar_like_shapes() {
 fn identity_layout_collapses_to_one_axis() {
     assert_eq!(
         plan(&[2, 3, 4], &[1, 2, 6], &[1, 2, 6]),
-        BilateralFusionPlan {
-            dims: vec![24],
-            src_strides: vec![1],
-            dst_strides: vec![1],
-        }
+        fusion(&[24], &[1], &[1])
     );
 }
 
@@ -52,19 +39,11 @@ fn identity_layout_collapses_to_one_axis() {
 fn only_bilaterally_contiguous_axes_fuse() {
     assert_eq!(
         plan(&[2, 3, 4], &[1, 2, 100], &[1, 2, 6]),
-        BilateralFusionPlan {
-            dims: vec![6, 4],
-            src_strides: vec![1, 100],
-            dst_strides: vec![1, 6],
-        }
+        fusion(&[6, 4], &[1, 100], &[1, 6])
     );
     assert_eq!(
         plan(&[2, 3, 4], &[1, 10, 40], &[1, 2, 6]),
-        BilateralFusionPlan {
-            dims: vec![2, 3, 4],
-            src_strides: vec![1, 10, 40],
-            dst_strides: vec![1, 2, 6],
-        }
+        fusion(&[2, 3, 4], &[1, 10, 40], &[1, 2, 6])
     );
 }
 
@@ -72,24 +51,13 @@ fn only_bilaterally_contiguous_axes_fuse() {
 fn two_dimensional_transpose_does_not_fuse() {
     assert_eq!(
         plan(&[3, 2], &[2, 1], &[1, 3]),
-        BilateralFusionPlan {
-            dims: vec![3, 2],
-            src_strides: vec![2, 1],
-            dst_strides: vec![1, 3],
-        }
+        fusion(&[3, 2], &[2, 1], &[1, 3])
     );
 }
 
 #[test]
 fn negative_contiguous_strides_can_fuse() {
-    assert_eq!(
-        plan(&[2, 3], &[-1, -2], &[1, 2]),
-        BilateralFusionPlan {
-            dims: vec![6],
-            src_strides: vec![-1],
-            dst_strides: vec![1],
-        }
-    );
+    assert_eq!(plan(&[2, 3], &[-1, -2], &[1, 2]), fusion(&[6], &[-1], &[1]));
 }
 
 #[test]
@@ -102,11 +70,7 @@ fn rank_24_contiguous_tensor_collapses_to_one_axis() {
     }
     assert_eq!(
         plan(&dims, &strides, &strides),
-        BilateralFusionPlan {
-            dims: vec![dims.iter().product()],
-            src_strides: vec![1],
-            dst_strides: vec![1],
-        }
+        fusion(&[dims.iter().product()], &[1], &[1])
     );
 }
 

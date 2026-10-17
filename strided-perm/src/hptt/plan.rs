@@ -5,22 +5,31 @@
 
 use crate::fuse::{plan_bilateral_fusion, FusionPlanError};
 use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
+use strided_view::INLINE_RANK;
+use tinyvec::TinyVec;
 
-/// A node in the recursive loop structure.
+/// Fused axis extents, inline up to [`INLINE_RANK`].
+pub(crate) type PlanDimVec = TinyVec<[usize; INLINE_RANK]>;
+/// Fused strides, inline up to [`INLINE_RANK`].
+pub(crate) type PlanStrideVec = TinyVec<[isize; INLINE_RANK]>;
+
+/// One loop level of the flattened HPTT loop nest.
 ///
-/// Mirrors HPTT's ComputeNode linked list. Each node represents one
-/// loop level in the execution nest.
-#[derive(Debug, Clone)]
-pub(crate) struct ComputeNode {
+/// This replaces the previous `Box<ComputeNode>` linked list so a plan keeps
+/// its loop structure inline up to [`INLINE_RANK`] levels with no per-node
+/// allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct LoopLevel {
     /// End index for this loop (loop runs 0..end).
     pub(crate) end: usize,
     /// Source stride for this dimension.
     pub(crate) lda: isize,
     /// Destination stride for this dimension.
     pub(crate) ldb: isize,
-    /// Next node in the chain (None = leaf → calls macro_kernel or memcpy).
-    pub(crate) next: Option<Box<ComputeNode>>,
 }
+
+/// Flattened loop nest, outermost first; empty means all work is at the leaf.
+pub(crate) type LoopLevels = TinyVec<[LoopLevel; INLINE_RANK]>;
 
 /// Execution mode determined at plan time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,12 +53,25 @@ pub(crate) enum ExecMode {
 }
 
 /// One virtual flattened tile group.
+///
+/// The offset tables are products of extents, not rank, so they are held in a
+/// [`TinyVec`] with [`GROUP_OFFSETS_INLINE`] inline entries and spill to the
+/// heap above that bound. A rank `<= INLINE_RANK` plan therefore stays
+/// allocation-free while its grouped tiles fit the inline bound.
 #[derive(Debug, Clone)]
 pub(crate) struct OffsetGroup {
-    pub(crate) src_offsets: Vec<isize>,
-    pub(crate) dst_offsets: Vec<isize>,
+    pub(crate) src_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]>,
+    pub(crate) dst_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]>,
     pub(crate) len: usize,
 }
+
+/// Inline capacity of a grouped-tile offset table.
+///
+/// The tables are sized by the product of a tile's extents, so they are not
+/// bounded by rank. This is the inline bound only: a larger grouped tile
+/// spills its tables to the heap (P1/P4 allow allocation above the bound), it
+/// does not change which tiles the planner selects.
+pub(crate) const GROUP_OFFSETS_INLINE: usize = 64;
 
 /// Offset-table tile plan for high-rank scattered permutations.
 #[derive(Debug, Clone)]
@@ -62,13 +84,13 @@ pub(crate) struct GroupedTilePlan {
 #[derive(Debug)]
 pub(crate) struct PermutePlan {
     /// Fused dimensions (after bilateral fusion).
-    pub(crate) fused_dims: Vec<usize>,
+    pub(crate) fused_dims: PlanDimVec,
     /// Fused source strides.
-    pub(crate) src_strides: Vec<isize>,
+    pub(crate) src_strides: PlanStrideVec,
     /// Fused destination strides.
-    pub(crate) dst_strides: Vec<isize>,
-    /// Root of the recursive loop structure (None for Scalar mode).
-    pub(crate) root: Option<ComputeNode>,
+    pub(crate) dst_strides: PlanStrideVec,
+    /// Flattened loop nest, outermost first (empty for Scalar / rootless).
+    pub(crate) levels: LoopLevels,
     /// Execution mode.
     pub(crate) mode: ExecMode,
     /// Source stride along dim_B — the "lda" for macro_kernel.
@@ -111,7 +133,7 @@ pub(crate) fn build_permute_plan(
             fused_dims,
             src_strides: fused_src,
             dst_strides: fused_dst,
-            root: None,
+            levels: LoopLevels::new(),
             mode: ExecMode::Scalar,
             lda_inner: 0,
             ldb_inner: 0,
@@ -135,13 +157,13 @@ pub(crate) fn build_permute_plan(
         let mode = ExecMode::ConstStride1 { inner_dim };
 
         let loop_order = compute_loop_order_const(&fused_dims, &fused_src, &fused_dst, inner_dim);
-        let root = build_compute_nodes(&fused_dims, &fused_src, &fused_dst, &loop_order);
+        let levels = build_loop_levels(&fused_dims, &fused_src, &fused_dst, &loop_order);
 
         Ok(PermutePlan {
             fused_dims,
             src_strides: fused_src.clone(),
             dst_strides: fused_dst.clone(),
-            root,
+            levels,
             mode,
             lda_inner: fused_src[inner_dim],
             ldb_inner: fused_dst[inner_dim],
@@ -164,7 +186,7 @@ pub(crate) fn build_permute_plan(
             // so `block * 2` keeps the inner run at several cache lines without
             // enlarging the outer step so far that it defeats the tile's locality.
             let grouped_target = block.saturating_mul(2);
-            if let Some((root, grouped_tile)) = try_build_grouped_tile_plan(
+            if let Some((levels, grouped_tile)) = try_build_grouped_tile_plan(
                 &fused_dims,
                 &fused_src,
                 &fused_dst,
@@ -175,7 +197,7 @@ pub(crate) fn build_permute_plan(
                     fused_dims,
                     src_strides: fused_src,
                     dst_strides: fused_dst,
-                    root,
+                    levels,
                     mode: ExecMode::GroupedTranspose,
                     lda_inner: 0,
                     ldb_inner: 0,
@@ -194,13 +216,13 @@ pub(crate) fn build_permute_plan(
 
         let loop_order =
             compute_loop_order_transpose(&fused_dims, &fused_src, &fused_dst, dim_a, dim_b);
-        let root = build_compute_nodes(&fused_dims, &fused_src, &fused_dst, &loop_order);
+        let levels = build_loop_levels(&fused_dims, &fused_src, &fused_dst, &loop_order);
 
         Ok(PermutePlan {
             fused_dims,
             src_strides: fused_src,
             dst_strides: fused_dst,
-            root,
+            levels,
             mode,
             lda_inner,
             ldb_inner,
@@ -241,7 +263,7 @@ fn try_build_grouped_tile_plan(
     dst_strides: &[isize],
     target: usize,
     legacy_area: usize,
-) -> Option<(Option<ComputeNode>, GroupedTilePlan)> {
+) -> Option<(LoopLevels, GroupedTilePlan)> {
     let group_a = select_contiguous_group(dims, src_strides, &[], target)?;
     let group_a_len = group_len(dims, &group_a);
     if group_a_len < 4 {
@@ -255,51 +277,71 @@ fn try_build_grouped_tile_plan(
         return None;
     }
 
-    let mut consumed = vec![false; dims.len()];
+    let mut consumed: TinyVec<[bool; INLINE_RANK]> = TinyVec::with_capacity(dims.len());
+    for _ in 0..dims.len() {
+        consumed.push(false);
+    }
     for &d in group_a.iter().chain(group_b.iter()) {
         consumed[d] = true;
     }
 
-    let mut outer: Vec<usize> = (0..dims.len())
-        .filter(|&d| !consumed[d] && dims[d] > 1)
-        .collect();
+    let mut outer: PlanDimVec = TinyVec::with_capacity(dims.len());
+    for d in 0..dims.len() {
+        if !consumed[d] && dims[d] > 1 {
+            outer.push(d);
+        }
+    }
     outer.sort_by(|&a, &b| {
         let cost_a = src_strides[a].unsigned_abs() + dst_strides[a].unsigned_abs();
         let cost_b = src_strides[b].unsigned_abs() + dst_strides[b].unsigned_abs();
         cost_b.cmp(&cost_a)
     });
 
-    let root = build_compute_nodes(dims, src_strides, dst_strides, &outer);
+    let levels = build_loop_levels(dims, src_strides, dst_strides, &outer);
     let grouped_tile = GroupedTilePlan {
         group_a: build_offset_group(dims, src_strides, dst_strides, &group_a),
         group_b: build_offset_group(dims, src_strides, dst_strides, &group_b),
     };
-    Some((root, grouped_tile))
+    Some((levels, grouped_tile))
 }
 
+/// Select the longest contiguous source or destination group within the
+/// bounded cache-tile growth rule.
+///
+/// The group size is driven by `target` and the bounded-multiple growth rule,
+/// not by the offset-table capacity: a group larger than
+/// [`GROUP_OFFSETS_INLINE`] still builds, and `build_offset_group` lets its
+/// table spill to the heap.
 fn select_contiguous_group(
     dims: &[usize],
     strides: &[isize],
     excluded: &[usize],
     target: usize,
-) -> Option<Vec<usize>> {
-    let mut is_excluded = vec![false; dims.len()];
+) -> Option<PlanDimVec> {
+    let mut is_excluded: TinyVec<[bool; INLINE_RANK]> = TinyVec::with_capacity(dims.len());
+    for _ in 0..dims.len() {
+        is_excluded.push(false);
+    }
     for &d in excluded {
         is_excluded[d] = true;
     }
 
-    let mut order: Vec<usize> = (0..dims.len())
-        .filter(|&d| dims[d] > 1 && !is_excluded[d] && strides[d] > 0)
-        .collect();
+    let mut order: PlanDimVec = TinyVec::with_capacity(dims.len());
+    for d in 0..dims.len() {
+        if dims[d] > 1 && !is_excluded[d] && strides[d] > 0 {
+            order.push(d);
+        }
+    }
     order.sort_by_key(|&d| strides[d].unsigned_abs());
 
-    let mut best = Vec::new();
+    let mut best = PlanDimVec::with_capacity(dims.len());
     let mut best_len = 0usize;
 
     for start in 0..order.len() {
         let first = order[start];
         let base = strides[first];
-        let mut group = vec![first];
+        let mut group = PlanDimVec::with_capacity(order.len());
+        group.push(first);
         let mut len = dims[first];
         let mut expected = base.saturating_mul(len as isize);
 
@@ -355,8 +397,10 @@ fn build_offset_group(
     group: &[usize],
 ) -> OffsetGroup {
     let len = group_len(dims, group);
-    let mut src_offsets = Vec::with_capacity(len);
-    let mut dst_offsets = Vec::with_capacity(len);
+    // Reserve the exact table size so the heap spill is a single allocation
+    // instead of a geometric regrowth above the inline bound.
+    let mut src_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]> = TinyVec::with_capacity(len);
+    let mut dst_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]> = TinyVec::with_capacity(len);
 
     for flat in 0..len {
         let mut rem = flat;
@@ -389,10 +433,13 @@ fn compute_loop_order_transpose(
     dst_strides: &[isize],
     dim_a: usize,
     dim_b: usize,
-) -> Vec<usize> {
-    let mut loop_dims: Vec<usize> = (0..dims.len())
-        .filter(|&d| d != dim_a && d != dim_b && dims[d] > 1)
-        .collect();
+) -> PlanDimVec {
+    let mut loop_dims: PlanDimVec = TinyVec::with_capacity(dims.len());
+    for d in 0..dims.len() {
+        if d != dim_a && d != dim_b && dims[d] > 1 {
+            loop_dims.push(d);
+        }
+    }
     loop_dims.sort_by(|&a, &b| {
         let cost_a = src_strides[a].unsigned_abs() + dst_strides[a].unsigned_abs();
         let cost_b = src_strides[b].unsigned_abs() + dst_strides[b].unsigned_abs();
@@ -414,10 +461,13 @@ fn compute_loop_order_const(
     _src_strides: &[isize],
     dst_strides: &[isize],
     inner_dim: usize,
-) -> Vec<usize> {
-    let mut loop_dims: Vec<usize> = (0..dims.len())
-        .filter(|&d| d != inner_dim && dims[d] > 1)
-        .collect();
+) -> PlanDimVec {
+    let mut loop_dims: PlanDimVec = TinyVec::with_capacity(dims.len());
+    for d in 0..dims.len() {
+        if d != inner_dim && dims[d] > 1 {
+            loop_dims.push(d);
+        }
+    }
     loop_dims.sort_by(|&a, &b| {
         dst_strides[b]
             .unsigned_abs()
@@ -426,31 +476,26 @@ fn compute_loop_order_const(
     loop_dims
 }
 
-/// Build a linked-list ComputeNode chain from loop_order.
+/// Flatten a loop order into an inline array of loop levels, outermost first.
 ///
-/// All nodes have inc=1 (the two stride-1 dims are not in the chain;
-/// they are handled by macro_kernel or memcpy at the leaf).
-/// Returns None if loop_order is empty (all work done at the leaf).
-fn build_compute_nodes(
+/// All levels iterate a single dimension. The two stride-1 dims are not in
+/// the chain; they are handled by macro_kernel or memcpy at the leaf. An
+/// empty result means all work is done at the leaf.
+fn build_loop_levels(
     dims: &[usize],
     src_strides: &[isize],
     dst_strides: &[isize],
     loop_order: &[usize],
-) -> Option<ComputeNode> {
-    let mut current: Option<ComputeNode> = None;
-
-    // Build from innermost (last in loop_order) to outermost (first)
-    for &d in loop_order.iter().rev() {
-        let node = ComputeNode {
+) -> LoopLevels {
+    let mut levels: LoopLevels = TinyVec::with_capacity(loop_order.len());
+    for &d in loop_order {
+        levels.push(LoopLevel {
             end: dims[d],
             lda: src_strides[d],
             ldb: dst_strides[d],
-            next: current.map(Box::new),
-        };
-        current = Some(node);
+        });
     }
-
-    current
+    levels
 }
 
 #[cfg(test)]
@@ -473,7 +518,7 @@ mod tests {
     fn test_build_plan_identity() {
         // Identity: src and dst both col-major → fuses to single dim → ConstStride1
         let plan = build_permute_plan(&[2, 3, 4], &[1, 2, 6], &[1, 2, 6], 8).unwrap();
-        assert_eq!(plan.fused_dims, vec![24]);
+        assert_eq!(&plan.fused_dims[..], &[24]);
         assert!(matches!(plan.mode, ExecMode::ConstStride1 { .. }));
     }
 
@@ -481,7 +526,7 @@ mod tests {
     fn test_build_plan_transpose_2d() {
         // 2D transpose: src [1, 4], dst [5, 1]
         let plan = build_permute_plan(&[4, 5], &[1, 4], &[5, 1], 8).unwrap();
-        assert_eq!(plan.fused_dims, vec![4, 5]);
+        assert_eq!(&plan.fused_dims[..], &[4, 5]);
         match plan.mode {
             ExecMode::Transpose { dim_a, dim_b } => {
                 assert_eq!(dim_a, 0); // src stride-1
@@ -493,7 +538,7 @@ mod tests {
         assert_eq!(plan.lda_inner, 4); // src stride along dim_b
         assert_eq!(plan.ldb_inner, 5); // dst stride along dim_a
                                        // No loop nodes (only 2 dims, both consumed by macro_kernel)
-        assert!(plan.root.is_none());
+        assert!(plan.levels.is_empty());
     }
 
     #[test]
@@ -502,7 +547,7 @@ mod tests {
         // Bilateral fusion: dims 1-2 fuse (src: 2*1=2 == strides[2], dst: 2*4=8 == strides[2])
         // After fusion: dims [4, 6], src [6, 1], dst [1, 4]
         let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8).unwrap();
-        assert_eq!(plan.fused_dims, vec![4, 6]);
+        assert_eq!(&plan.fused_dims[..], &[4, 6]);
         match plan.mode {
             ExecMode::Transpose { dim_a, dim_b } => {
                 // dim_a: min |src_stride| → dim 1 (stride 1)
@@ -513,7 +558,7 @@ mod tests {
             _ => panic!("expected Transpose mode"),
         }
         // Only 2 fused dims, both consumed by macro_kernel → no outer loops
-        assert!(plan.root.is_none());
+        assert!(plan.levels.is_empty());
     }
 
     #[test]
@@ -557,6 +602,25 @@ mod tests {
     }
 
     #[test]
+    fn test_build_plan_rank8_scattered_uses_inline_grouped_tile() {
+        // The rank-24 grouped case capped at the inline rank. Both offset
+        // tables must fit the explicit grouped bound so `copy_into` allocates
+        // nothing at rank 8.
+        let dims = vec![2usize; 8];
+        let src_strides = [16isize, 1024, 8388608, 4096, 1048576, 1, 8, 131072];
+        let dst_strides = [1isize, 2, 4, 8, 16, 32, 64, 128];
+
+        let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8).unwrap();
+
+        assert!(matches!(plan.mode, ExecMode::GroupedTranspose));
+        let grouped = plan.grouped_tile.as_ref().expect("grouped tile plan");
+        assert!(grouped.group_a.len <= GROUP_OFFSETS_INLINE);
+        assert!(grouped.group_b.len <= GROUP_OFFSETS_INLINE);
+        assert!(grouped.group_a.len >= 4 && grouped.group_b.len >= 4);
+        assert!(!plan.levels.is_empty());
+    }
+
+    #[test]
     fn test_build_plan_large_3d_transpose_uses_legacy_tile() {
         let dims = vec![256usize, 256, 256];
         let src_strides = vec![256isize, 1, 65536];
@@ -572,7 +636,7 @@ mod tests {
     fn test_build_plan_rank0() {
         let plan = build_permute_plan(&[], &[], &[], 8).unwrap();
         assert!(matches!(plan.mode, ExecMode::Scalar));
-        assert!(plan.root.is_none());
+        assert!(plan.levels.is_empty());
     }
 
     #[test]
@@ -585,22 +649,21 @@ mod tests {
         // Remaining: dims 2 and 3
         // cost[2] = 100 + 7 = 107, cost[3] = 300 + 21 = 321
         // Descending: [3, 2]
-        assert_eq!(order, vec![3, 2]);
+        assert_eq!(&order[..], &[3, 2]);
     }
 
     #[test]
-    fn test_build_compute_nodes_chain() {
+    fn test_build_loop_levels_chain() {
         let dims = [10, 5, 3];
         let src_s = [1isize, 10, 50];
         let dst_s = [15isize, 1, 5];
         let loop_order = vec![2]; // only dim 2 in the loop
 
-        let root = build_compute_nodes(&dims, &src_s, &dst_s, &loop_order);
-        assert!(root.is_some());
-        let root = root.unwrap();
-        assert_eq!(root.end, 3);
-        assert_eq!(root.lda, 50);
-        assert_eq!(root.ldb, 5);
-        assert!(root.next.is_none());
+        let levels = build_loop_levels(&dims, &src_s, &dst_s, &loop_order);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].end, 3);
+        assert_eq!(levels[0].lda, 50);
+        assert_eq!(levels[0].ldb, 5);
+        assert!(build_loop_levels(&dims, &src_s, &dst_s, &[]).is_empty());
     }
 }

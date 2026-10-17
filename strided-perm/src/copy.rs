@@ -6,6 +6,16 @@ use crate::hptt::execute_permute_blocked_par;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
 
+/// Accept every injective destination the exact check can settle, using the
+/// allocation-free validator first. The analysis is owned by
+/// [`strided_view::injectivity`]; this only states the "keep accepted layouts"
+/// policy of the permutation entries.
+#[inline]
+fn destination_is_injective(dims: &[usize], strides: &[isize]) -> bool {
+    strided_view::is_injective_layout_without_alloc(dims, strides)
+        || strided_view::is_injective_layout(dims, strides)
+}
+
 /// Map a permutation planning failure onto the shared view error vocabulary.
 ///
 /// Rank and shape are validated before planning, so a length mismatch cannot
@@ -73,94 +83,7 @@ fn is_both_contiguous(dims: &[usize], dst_strides: &[isize], src_strides: &[isiz
 ///
 /// This is a simple copy without ElementOp support. For copies with
 /// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
-pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()> {
-    let dst_dims = dest.dims();
-    let src_dims = src.dims();
-    if dst_dims.len() != src_dims.len() {
-        return Err(StridedError::RankMismatch(dst_dims.len(), src_dims.len()));
-    }
-    if dst_dims != src_dims {
-        return Err(StridedError::ShapeMismatch(
-            dst_dims.to_vec(),
-            src_dims.to_vec(),
-        ));
-    }
-    // A zero-sized view has nothing to copy. It validates without its other
-    // extents or strides forming an in-range product, so neither the
-    // contiguous fast path nor the permutation planner may see it.
-    if dst_dims.contains(&0) {
-        return Ok(());
-    }
-
-    let dst_ptr = dest.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_strides = dest.strides();
-    let src_strides = src.strides();
-
-    // Fast path: both contiguous
-    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
-        let len = total_len(dst_dims);
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
-        return Ok(());
-    }
-
-    // HPTT-inspired blocked permutation
-    let elem_size = std::mem::size_of::<T>();
-    let plan =
-        build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
-    unsafe {
-        execute_permute_blocked(src_ptr, dst_ptr, &plan);
-    }
-    Ok(())
-}
-
-/// Copy elements to a col-major destination.
-///
-/// This now delegates to the same HPTT-inspired blocked permutation as
-/// `copy_into`. The HPTT planner automatically handles the col-major
-/// destination case optimally.
-pub fn copy_into_col_major<T: Copy>(
-    dst: &mut StridedViewMut<T>,
-    src: &StridedView<T>,
-) -> Result<()> {
-    copy_into(dst, src)
-}
-
-/// Conservative sufficient proof that distinct destination elements are
-/// distinct offsets.
-///
-/// Axes with extent > 1 are visited in ascending stride. An axis is separated
-/// when its positive stride lands strictly past the offset span already covered
-/// by the smaller-stride axes, so the two offset sets cannot meet. A negative,
-/// zero, or interleaved stride is left unresolved: the parallel entry then
-/// keeps the serial engine rather than let two workers write one offset. A
-/// layout that fails this test can still be injective; only the parallel fast
-/// path is withheld.
-fn destination_offsets_are_separated(dims: &[usize], strides: &[isize]) -> bool {
-    let mut axes: Vec<(isize, usize)> = dims
-        .iter()
-        .copied()
-        .zip(strides.iter().copied())
-        .filter(|&(dim, _)| dim > 1)
-        .map(|(dim, stride)| (stride, dim))
-        .collect();
-    axes.sort_by_key(|&(stride, _)| stride.unsigned_abs());
-    let mut span: u128 = 0;
-    for (stride, dim) in axes {
-        if stride <= 0 || stride as u128 <= span {
-            return false;
-        }
-        span = span.saturating_add((dim as u128 - 1).saturating_mul(stride as u128));
-    }
-    true
-}
-
-/// Copy elements from source to destination with Rayon parallelism.
-///
-/// Parallelizes the outermost block loop of the HPTT-inspired permutation.
-/// Falls back to single-threaded for small tensors.
-#[cfg(feature = "parallel")]
-pub fn copy_into_par<T: Copy + Send + Sync>(
+pub fn copy_into<T: Copy + 'static>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
@@ -187,23 +110,107 @@ pub fn copy_into_par<T: Copy + Send + Sync>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if !destination_offsets_are_separated(dst_dims, dst_strides) {
-        // Each tile is written by one worker; an unresolved destination layout
-        // could map two tiles onto one offset, which is a data race under
-        // parallel execution. Keep the serial engine for that case.
-        return copy_into(dest, src);
-    }
-
-    // Fast path: both contiguous (memcpy is already bandwidth-limited)
+    // Fast path: both contiguous. A contiguous layout is injective by
+    // construction, so it skips the validation below.
     if is_both_contiguous(dst_dims, dst_strides, src_strides) {
         let len = total_len(dst_dims);
         unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
         return Ok(());
     }
 
+    // HPTT-inspired blocked permutation. Planning runs before the injectivity
+    // check so an unrepresentable layout keeps reporting `OffsetOverflow`
+    // (issue #263) even when its destination is also non-injective; planning
+    // only builds metadata and writes nothing.
     let elem_size = std::mem::size_of::<T>();
     let plan =
         build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
+    // A non-injective destination maps distinct logical elements onto one
+    // offset, so the unsafe write loop would produce overlapping writes (and a
+    // data race under `parallel`). This matches the sibling output-writing
+    // APIs (issue #281).
+    if !destination_is_injective(dst_dims, dst_strides) {
+        return Err(StridedError::NonInjectiveOutputLayout);
+    }
+    unsafe {
+        execute_permute_blocked(src_ptr, dst_ptr, &plan);
+    }
+    Ok(())
+}
+
+/// Copy elements to a col-major destination.
+///
+/// This now delegates to the same HPTT-inspired blocked permutation as
+/// `copy_into`. The HPTT planner automatically handles the col-major
+/// destination case optimally.
+pub fn copy_into_col_major<T: Copy + 'static>(
+    dst: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    copy_into(dst, src)
+}
+
+/// Copy elements from source to destination with Rayon parallelism.
+///
+/// Parallelizes the outermost block loop of the HPTT-inspired permutation.
+/// Falls back to single-threaded for small tensors.
+#[cfg(feature = "parallel")]
+pub fn copy_into_par<T: Copy + Send + Sync + 'static>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    let dst_dims = dest.dims();
+    let src_dims = src.dims();
+    if dst_dims.len() != src_dims.len() {
+        return Err(StridedError::RankMismatch(dst_dims.len(), src_dims.len()));
+    }
+    if dst_dims != src_dims {
+        return Err(StridedError::ShapeMismatch(
+            dst_dims.to_vec(),
+            src_dims.to_vec(),
+        ));
+    }
+    // A zero-sized view has nothing to copy. It validates without its other
+    // extents or strides forming an in-range product, so neither the
+    // contiguous fast path nor the permutation planner may see it.
+    if dst_dims.contains(&0) {
+        return Ok(());
+    }
+
+    let dst_ptr = dest.as_mut_ptr();
+    let src_ptr = src.ptr();
+    let dst_strides = dest.strides();
+    let src_strides = src.strides();
+
+    // Fast path: both contiguous (memcpy is already bandwidth-limited, and a
+    // contiguous layout is injective by construction).
+    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
+        let len = total_len(dst_dims);
+        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
+        return Ok(());
+    }
+
+    // Planning runs before the injectivity check so an unrepresentable layout
+    // keeps reporting `OffsetOverflow` (issue #263); planning writes nothing.
+    let elem_size = std::mem::size_of::<T>();
+    let plan =
+        build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
+    // Reject overlapping destination layouts before any unsafe write, serial
+    // or parallel (issue #281).
+    if !destination_is_injective(dst_dims, dst_strides) {
+        return Err(StridedError::NonInjectiveOutputLayout);
+    }
+
+    if !strided_view::axes_are_separated(dst_dims, dst_strides) {
+        // Each tile is written by one worker; an unresolved destination layout
+        // could map two tiles onto one offset, which is a data race under
+        // parallel execution. Keep the serial engine for that case.
+        unsafe {
+            execute_permute_blocked(src_ptr, dst_ptr, &plan);
+        }
+        return Ok(());
+    }
+
     unsafe {
         execute_permute_blocked_par(src_ptr, dst_ptr, &plan);
     }
@@ -212,7 +219,7 @@ pub fn copy_into_par<T: Copy + Send + Sync>(
 
 /// Copy elements to a col-major destination with Rayon parallelism.
 #[cfg(feature = "parallel")]
-pub fn copy_into_col_major_par<T: Copy + Send + Sync>(
+pub fn copy_into_col_major_par<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
@@ -412,12 +419,12 @@ mod tests {
 
     #[test]
     fn destination_separation_rejects_overlapping_strides() {
-        assert!(destination_offsets_are_separated(&[3, 16384], &[1, 3]));
+        assert!(strided_view::axes_are_separated(&[3, 16384], &[1, 3]));
         // The first axis' offsets (stride 2) interleave the second axis' (stride
         // 1), so the parallel entry must keep the serial engine.
-        assert!(!destination_offsets_are_separated(&[3, 16384], &[2, 1]));
-        assert!(!destination_offsets_are_separated(&[4], &[-1]));
-        assert!(destination_offsets_are_separated(&[1, 1], &[0, 1]));
+        assert!(!strided_view::axes_are_separated(&[3, 16384], &[2, 1]));
+        assert!(!strided_view::axes_are_separated(&[4], &[-1]));
+        assert!(strided_view::axes_are_separated(&[1, 1], &[0, 1]));
     }
 
     #[cfg(feature = "parallel")]
