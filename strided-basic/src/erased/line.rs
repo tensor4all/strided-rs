@@ -38,7 +38,7 @@ pub(super) struct LineLayout {
     /// Destination stride between adjacent lines of a panel.
     pub(super) dest_lane_stride: isize,
     /// Compressed outer axes; in panel mode the first one is the panel axis.
-    outer_axes: Vec<ReduceOuterAxis>,
+    outer_axes: crate::inline::InlineVec<ReduceOuterAxis>,
     /// Number of units (cursor positions).
     units: usize,
     /// Extent of the panel axis, when panel mode is selected.
@@ -75,7 +75,7 @@ impl LineLayout {
             .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
             .ok_or(StridedError::OffsetOverflow)?;
 
-        let mut outer: Vec<(usize, isize, isize)> = (0..rank)
+        let mut outer: crate::inline::InlineVec<(usize, isize, isize)> = (0..rank)
             .filter(|&source_axis| source_axis != axis)
             .zip(dest_outer_strides)
             .map(|(source_axis, &dest_step)| {
@@ -134,7 +134,7 @@ impl LineLayout {
                     dest_reset: checked_reduce_reset(extent, dest_step)?,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<crate::inline::InlineVec<_>>>()?;
         let dest_lane_stride = match panel_extent {
             Some(_) => outer[0].2,
             None => 0,
@@ -143,7 +143,8 @@ impl LineLayout {
         let outer_axes = match panel_extent {
             Some(_) => {
                 let mut axes = axes.into_iter();
-                let mut fused = vec![axes.next().expect("panel axis exists")];
+                let mut fused = crate::inline::InlineVec::new();
+                fused.push(axes.next().expect("panel axis exists"));
                 fused.extend(compress_reduce_outer_axes(axes.collect())?);
                 fused
             }

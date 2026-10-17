@@ -340,17 +340,17 @@ pub struct ErasedReducePlan {
 #[derive(Clone, Debug)]
 enum ReduceLayout {
     Full {
-        dims: Vec<usize>,
-        src_strides: Vec<isize>,
+        dims: crate::inline::InlineVec<usize>,
+        src_strides: crate::inline::InlineVec<isize>,
         traversal: FullTraversal,
     },
     Axes {
-        src_dims: Vec<usize>,
-        src_strides: Vec<isize>,
-        dest_dims: Vec<usize>,
-        dest_strides: Vec<isize>,
-        outer_axes: Vec<ReduceOuterAxis>,
-        inner_axes: Vec<ReduceInnerAxis>,
+        src_dims: crate::inline::InlineVec<usize>,
+        src_strides: crate::inline::InlineVec<isize>,
+        dest_dims: crate::inline::InlineVec<usize>,
+        dest_strides: crate::inline::InlineVec<isize>,
+        outer_axes: crate::inline::InlineVec<ReduceOuterAxis>,
+        inner_axes: crate::inline::InlineVec<ReduceInnerAxis>,
         dest_total: usize,
         reduce_total: usize,
         /// Set when every source axis is reduced; the plan then runs the
@@ -359,7 +359,7 @@ enum ReduceLayout {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct ReduceOuterAxis {
     extent: usize,
     source_step: isize,
@@ -367,7 +367,7 @@ struct ReduceOuterAxis {
     dest_step: isize,
     dest_reset: isize,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct ReduceInnerAxis {
     extent: usize,
     source_step: isize,
@@ -421,8 +421,8 @@ impl ErasedReducePlan {
             dtype,
             op,
             layout: ReduceLayout::Full {
-                dims: dims.to_vec(),
-                src_strides: src_strides.to_vec(),
+                dims: dims.into(),
+                src_strides: src_strides.into(),
                 traversal,
             },
         })
@@ -456,21 +456,22 @@ impl ErasedReducePlan {
         }
         validate_unique_axes(axes, src_dims.len())?;
 
-        let kept_axes: Vec<usize> = (0..src_dims.len())
+        let kept_axes: crate::inline::InlineVec<usize> = (0..src_dims.len())
             .filter(|axis| !axes.contains(axis))
             .collect();
-        let expected_dest_dims: Vec<usize> = kept_axes.iter().map(|&axis| src_dims[axis]).collect();
+        let expected_dest_dims: crate::inline::InlineVec<usize> =
+            kept_axes.iter().map(|&axis| src_dims[axis]).collect();
         if expected_dest_dims.is_empty() {
             if dest_total != 1 {
                 return Err(StridedError::ShapeMismatch(
                     dest_dims.to_vec(),
-                    expected_dest_dims,
+                    expected_dest_dims.to_vec(),
                 ));
             }
         } else if dest_dims != expected_dest_dims.as_slice() {
             return Err(StridedError::ShapeMismatch(
                 dest_dims.to_vec(),
-                expected_dest_dims,
+                expected_dest_dims.to_vec(),
             ));
         }
 
@@ -492,7 +493,7 @@ impl ErasedReducePlan {
                         dest_reset: checked_reduce_reset(extent, dest_strides[dest_axis])?,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<crate::inline::InlineVec<_>>>()?,
         )?;
         let inner_axes = compress_reduce_inner_axes(
             axes.iter()
@@ -504,7 +505,7 @@ impl ErasedReducePlan {
                         source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<crate::inline::InlineVec<_>>>()?,
         )?;
         let full = if kept_axes.is_empty() {
             Some(FullTraversal::compile(src_dims, src_strides)?)
@@ -515,10 +516,10 @@ impl ErasedReducePlan {
             dtype,
             op,
             layout: ReduceLayout::Axes {
-                src_dims: src_dims.to_vec(),
-                src_strides: src_strides.to_vec(),
-                dest_dims: dest_dims.to_vec(),
-                dest_strides: dest_strides.to_vec(),
+                src_dims: src_dims.into(),
+                src_strides: src_strides.into(),
+                dest_dims: dest_dims.into(),
+                dest_strides: dest_strides.into(),
                 outer_axes,
                 inner_axes,
                 dest_total,
@@ -779,23 +780,34 @@ where
         plan.check_input_layout(position, &input_ref)?;
         plan.segment_offset(position, dest_offset)?;
     }
-    if plan.prefers_whole_plan() {
-        let input_refs = inputs
-            .iter()
-            .map(|input| {
-                let input_data = input.data_as::<T>()?;
-                Ok(unsafe {
-                    RawStridedRef::new_unchecked(
-                        input_data,
-                        input.dims(),
-                        input.strides(),
-                        input.offset(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Splits the concatenated index space across and within segments.
-        return plan.execute(&mut dest_ref, &input_refs);
+    if plan.prefers_whole_plan() && !inputs.is_empty() && inputs.len() <= crate::inline::OPERAND_CAP
+    {
+        // Build the typed descriptors on the stack: `RawStridedRef` is `Copy`,
+        // so this stays allocation-free within the operand bound. The
+        // whole-plan entry then splits the concatenated space and the typed
+        // `try_execute_parallel` reads each segment straight from the plan.
+        let first_data = inputs[0].data_as::<T>()?;
+        let first = unsafe {
+            RawStridedRef::new_unchecked(
+                first_data,
+                inputs[0].dims(),
+                inputs[0].strides(),
+                inputs[0].offset(),
+            )
+        };
+        let mut input_refs = [first; crate::inline::OPERAND_CAP];
+        for (slot, input) in input_refs.iter_mut().zip(inputs) {
+            let input_data = input.data_as::<T>()?;
+            *slot = unsafe {
+                RawStridedRef::new_unchecked(
+                    input_data,
+                    input.dims(),
+                    input.strides(),
+                    input.offset(),
+                )
+            };
+        }
+        return plan.execute(&mut dest_ref, &input_refs[..inputs.len()]);
     }
     for (position, input) in inputs.iter().enumerate() {
         let input_data = input.data_as::<T>()?;
@@ -833,28 +845,37 @@ where
         plan.check_input_layout(position, &input_ref)?;
         plan.segment_offset(position, dest_offset)?;
     }
-    if plan.prefers_whole_plan() {
-        let inputs = inputs
-            .iter()
+    if plan.prefers_whole_plan() && !inputs.is_empty() && inputs.len() <= crate::inline::OPERAND_CAP
+    {
+        // SAFETY: input/output overlap was rejected before forming references.
+        let first_erased = unsafe { inputs[0].try_as_ref_after_no_overlap() }?;
+        let mut erased_refs = [first_erased; crate::inline::OPERAND_CAP];
+        for (slot, input) in erased_refs.iter_mut().zip(inputs) {
             // SAFETY: input/output overlap was rejected before forming references.
-            .map(|input| unsafe { input.try_as_ref_after_no_overlap() })
-            .collect::<Result<Vec<_>>>()?;
-        let input_refs = inputs
-            .iter()
-            .map(|input| {
-                let input_data = input.data_as::<T>()?;
-                Ok(unsafe {
-                    RawStridedRef::new_unchecked(
-                        input_data,
-                        input.dims(),
-                        input.strides(),
-                        input.offset(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Splits the concatenated index space across and within segments.
-        return plan.execute_uninit(&mut dest_ref, &input_refs);
+            *slot = unsafe { input.try_as_ref_after_no_overlap() }?;
+        }
+        let first_data = erased_refs[0].data_as::<T>()?;
+        let first = unsafe {
+            RawStridedRef::new_unchecked(
+                first_data,
+                erased_refs[0].dims(),
+                erased_refs[0].strides(),
+                erased_refs[0].offset(),
+            )
+        };
+        let mut input_refs = [first; crate::inline::OPERAND_CAP];
+        for (slot, erased) in input_refs.iter_mut().zip(&erased_refs) {
+            let input_data = erased.data_as::<T>()?;
+            *slot = unsafe {
+                RawStridedRef::new_unchecked(
+                    input_data,
+                    erased.dims(),
+                    erased.strides(),
+                    erased.offset(),
+                )
+            };
+        }
+        return plan.execute_uninit(&mut dest_ref, &input_refs[..inputs.len()]);
     }
     for (position, input) in inputs.iter().enumerate() {
         // SAFETY: input/output overlap was rejected before forming references.
@@ -866,6 +887,103 @@ where
         plan.execute_segment_uninit(position, &mut dest_ref, &input_ref)?;
     }
     Ok(())
+}
+
+/// Runtime unary operation applied to the source of an [`ErasedUpdatePlan`].
+///
+/// The real dtypes have only [`Self::Identity`]; the complex dtypes also have
+/// [`Self::Conj`], matching the `ElementOp` choices a beta accumulator uses.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateOp {
+    /// `op(x) = x`.
+    Identity,
+    /// `op(x) = conj(x)`.
+    Conj,
+}
+
+/// Dtype-erased wrapper around [`UpdatePlan`].
+///
+/// The layout traversal is compiled once and stored without a scalar type;
+/// each [`execute`](Self::execute) names the concrete scalar type, resolves the
+/// runtime element op once per call, and then replays monomorphized loops.
+#[derive(Clone, Debug)]
+pub struct ErasedUpdatePlan {
+    dtype: KernelDType,
+    plan: UpdatePlan,
+}
+
+impl ErasedUpdatePlan {
+    /// Compile an update plan for one dtype and layout pair.
+    pub fn compile(
+        dtype: KernelDType,
+        dims: &[usize],
+        dst_strides: &[isize],
+        src_strides: &[isize],
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: UpdatePlan::compile(dims, dst_strides, src_strides)?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    /// The compiled typed traversal.
+    #[inline]
+    pub fn plan(&self) -> &UpdatePlan {
+        &self.plan
+    }
+
+    /// `dest = alpha * op(src) + beta * dest` into an erased destination.
+    ///
+    /// `alpha`, `beta`, and `op` are resolved once per call; the layout check
+    /// and replay are the same allocation-free [`UpdatePlan`] path.
+    pub fn execute<T>(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedMut<'_>,
+        src: &ErasedRawStridedRef<'_>,
+        alpha: T,
+        beta: T,
+        op: UpdateOp,
+    ) -> Result<()>
+    where
+        T: Copy
+            + crate::MaybeSendSync
+            + KernelStorageElement
+            + core::ops::Add<Output = T>
+            + core::ops::Mul<Output = T>
+            + ElementOpApply,
+    {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        let source_data = src.data_as::<T>()?;
+        let dest_dims = dest.dims();
+        let dest_strides = dest.strides();
+        let dest_offset = dest.offset();
+        ctx.run(|| {
+            let dest_data = dest.data_as_mut::<T>()?;
+            let source = unsafe {
+                RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+            };
+            let mut dest_ref = unsafe {
+                RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
+            };
+            match op {
+                UpdateOp::Identity => self
+                    .plan
+                    .execute(&mut dest_ref, &source, alpha, beta, |x| x),
+                UpdateOp::Conj => self
+                    .plan
+                    .execute(&mut dest_ref, &source, alpha, beta, |x| x.conj()),
+            }
+        })
+    }
 }
 
 /// Whether a reduction context runs on the caller thread without entering
@@ -1388,7 +1506,15 @@ impl_complex_erased_reduce_scalar!(Complex32, Complex64);
 impl_wrapping_erased_reduce_scalar!(i32, i64);
 
 fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
-    let mut seen = vec![false; rank];
+    // Inline for the rank bound (P4); above it the spill may allocate.
+    let mut inline = [false; strided_view::INLINE_RANK];
+    let mut spill: Vec<bool> = Vec::new();
+    let seen: &mut [bool] = if rank <= strided_view::INLINE_RANK {
+        &mut inline[..rank]
+    } else {
+        spill.resize(rank, false);
+        &mut spill
+    };
     for &axis in axes {
         if axis >= rank {
             return Err(StridedError::InvalidAxis { axis, rank });
@@ -1522,8 +1648,11 @@ fn check_reduce_layout_offset_arithmetic(dims: &[usize], strides: &[isize]) -> R
     let _ = (min_offset, max_offset);
     Ok(())
 }
-fn compress_reduce_outer_axes(axes: Vec<ReduceOuterAxis>) -> Result<Vec<ReduceOuterAxis>> {
-    let mut compressed: Vec<ReduceOuterAxis> = Vec::with_capacity(axes.len());
+fn compress_reduce_outer_axes(
+    axes: crate::inline::InlineVec<ReduceOuterAxis>,
+) -> Result<crate::inline::InlineVec<ReduceOuterAxis>> {
+    let mut compressed: crate::inline::InlineVec<ReduceOuterAxis> =
+        crate::inline::InlineVec::with_capacity(axes.len());
     for axis in axes {
         if let Some(previous) = compressed.last_mut() {
             let previous_extent =
@@ -1551,8 +1680,11 @@ fn compress_reduce_outer_axes(axes: Vec<ReduceOuterAxis>) -> Result<Vec<ReduceOu
     }
     Ok(compressed)
 }
-fn compress_reduce_inner_axes(axes: Vec<ReduceInnerAxis>) -> Result<Vec<ReduceInnerAxis>> {
-    let mut compressed: Vec<ReduceInnerAxis> = Vec::with_capacity(axes.len());
+fn compress_reduce_inner_axes(
+    axes: crate::inline::InlineVec<ReduceInnerAxis>,
+) -> Result<crate::inline::InlineVec<ReduceInnerAxis>> {
+    let mut compressed: crate::inline::InlineVec<ReduceInnerAxis> =
+        crate::inline::InlineVec::with_capacity(axes.len());
     for axis in axes {
         if let Some(previous) = compressed.last_mut() {
             let previous_extent =

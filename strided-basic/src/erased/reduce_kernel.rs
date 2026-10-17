@@ -52,6 +52,56 @@ fn axis_output_block_len<T>() -> usize {
     (AXIS_OUTPUT_BLOCK_BYTES / core::mem::size_of::<T>().max(1)).max(AXIS_OUTPUT_BLOCK_MIN_LEN)
 }
 
+/// Runs `f` with a per-thread reused accumulator block of `len` elements.
+///
+/// The block kernel needs `axis_output_block_len::<T>()` accumulators (up to
+/// `AXIS_OUTPUT_BLOCK_BYTES / size_of::<T>()`, several thousand), so an inline
+/// stack buffer is too large. The buffer is grown once per worker thread and
+/// reused by every later call on that thread, so a steady-state axis reduction
+/// allocates nothing (#306 item 5).
+///
+/// `init` fills every slot before `f` sees the slice; `Acc` is `Copy`, so the
+/// buffer needs no drop.
+fn with_axis_block_scratch<Acc: Copy, R>(
+    len: usize,
+    init: Acc,
+    f: impl FnOnce(&mut [Acc]) -> R,
+) -> R {
+    use std::cell::RefCell;
+    debug_assert!(core::mem::align_of::<Acc>() <= core::mem::align_of::<u128>());
+    thread_local! {
+        static SCRATCH: RefCell<Vec<core::mem::MaybeUninit<u128>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|cell| {
+        let mut buffer = cell.borrow_mut();
+        let bytes = len
+            .checked_mul(core::mem::size_of::<Acc>())
+            .unwrap_or(usize::MAX);
+        let words = bytes.div_ceil(core::mem::size_of::<u128>());
+        if buffer.len() < words {
+            buffer.resize(words, core::mem::MaybeUninit::uninit());
+        }
+        // SAFETY: no element is read before `init` is written into it
+        // (references to `MaybeUninit` carry no validity requirement), the
+        // `u128` buffer is aligned for `Acc`, and the allocation covers
+        // `len * size_of::<Acc>()` bytes.
+        let uninit = unsafe {
+            core::slice::from_raw_parts_mut(
+                buffer.as_mut_ptr().cast::<core::mem::MaybeUninit<Acc>>(),
+                len,
+            )
+        };
+        for slot in uninit.iter_mut() {
+            slot.write(init);
+        }
+        // SAFETY: every slot was initialized just above.
+        let acc =
+            unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<Acc>(), len) };
+        f(acc)
+    })
+}
+
 /// One reduction operation, fixed at compile time.
 pub(super) trait ReduceKernel<T: ErasedReduceScalar>: 'static {
     /// Accumulator carried through the range kernels.
@@ -929,7 +979,7 @@ pub(super) struct FullTraversal {
     total: usize,
     run_len: usize,
     run_stride: isize,
-    run_axes: Vec<ReduceOuterAxis>,
+    run_axes: crate::inline::InlineVec<ReduceOuterAxis>,
 }
 
 impl FullTraversal {
@@ -946,10 +996,10 @@ impl FullTraversal {
                 total,
                 run_len: 0,
                 run_stride: 1,
-                run_axes: Vec::new(),
+                run_axes: crate::inline::InlineVec::new(),
             });
         }
-        let mut axes: Vec<(usize, isize)> = dims
+        let mut axes: crate::inline::InlineVec<(usize, isize)> = dims
             .iter()
             .copied()
             .zip(strides.iter().copied())
@@ -973,7 +1023,7 @@ impl FullTraversal {
                         dest_reset: 0,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<crate::inline::InlineVec<_>>>()?,
         )?;
         if fused.is_empty() {
             return Ok(Self {
@@ -1252,96 +1302,100 @@ where
             let block_axis = parts.outer_axes[0];
             let mut inner = ReduceInnerCursor::new(0, parts.inner_axes);
             let block = axis_output_block_len::<T>().min(range.len());
-            let mut acc = vec![K::identity(); block];
-            let mut output = range.start;
-            while output < range.end {
-                // A block stays inside one run of the leading kept axis and
-                // inside the worker range.
-                let block_room = block_axis.extent - outer.leading_coord();
-                let len = block_room.min(range.end - output).min(block);
-                let acc = &mut acc[..len];
-                acc.fill(K::identity());
-                inner.reset(outer.source_offset);
-                let mut offsets = [0isize; AXIS_OUTPUT_BLOCK_STEPS];
-                let mut value_index = 0;
-                // Fold several reduced steps per pass; each slot still
-                // combines its values in reduced order.
-                while value_index + AXIS_OUTPUT_BLOCK_STEPS <= reduce_total {
-                    for offset in &mut offsets {
-                        *offset = inner.source_offset;
+            // Per-thread reused accumulator block: the first call on a worker
+            // sizes it, later calls never allocate.
+            with_axis_block_scratch::<K::Acc, _>(block, K::identity(), |acc| -> Result<()> {
+                let mut output = range.start;
+                while output < range.end {
+                    // A block stays inside one run of the leading kept axis and
+                    // inside the worker range.
+                    let block_room = block_axis.extent - outer.leading_coord();
+                    let len = block_room.min(range.end - output).min(block);
+                    let acc = &mut acc[..len];
+                    acc.fill(K::identity());
+                    inner.reset(outer.source_offset);
+                    let mut offsets = [0isize; AXIS_OUTPUT_BLOCK_STEPS];
+                    let mut value_index = 0;
+                    // Fold several reduced steps per pass; each slot still
+                    // combines its values in reduced order.
+                    while value_index + AXIS_OUTPUT_BLOCK_STEPS <= reduce_total {
+                        for offset in &mut offsets {
+                            *offset = inner.source_offset;
+                            value_index += 1;
+                            if value_index < reduce_total {
+                                inner.advance();
+                            }
+                        }
+                        // SAFETY: the `len` adjacent outputs of this block read
+                        // `len` reachable unit-stride source elements along the
+                        // leading kept axis at every reduced position.
+                        let [v0, v1, v2, v3] = offsets.map(|offset| unsafe {
+                            core::slice::from_raw_parts(source.offset(offset), len)
+                        });
+                        K::combine_block(acc, v0);
+                        K::combine_block(acc, v1);
+                        K::combine_block(acc, v2);
+                        K::combine_block(acc, v3);
+                    }
+                    while value_index < reduce_total {
+                        // SAFETY: as above, for one reduced position.
+                        let values = unsafe {
+                            core::slice::from_raw_parts(source.offset(inner.source_offset), len)
+                        };
+                        K::combine_block(acc, values);
                         value_index += 1;
                         if value_index < reduce_total {
                             inner.advance();
                         }
                     }
-                    // SAFETY: the `len` adjacent outputs of this block read
-                    // `len` reachable unit-stride source elements along the
-                    // leading kept axis at every reduced position.
-                    let [v0, v1, v2, v3] = offsets.map(|offset| unsafe {
-                        core::slice::from_raw_parts(source.offset(offset), len)
-                    });
-                    K::combine_block(acc, v0);
-                    K::combine_block(acc, v1);
-                    K::combine_block(acc, v2);
-                    K::combine_block(acc, v3);
-                }
-                while value_index < reduce_total {
-                    // SAFETY: as above, for one reduced position.
-                    let values = unsafe {
-                        core::slice::from_raw_parts(source.offset(inner.source_offset), len)
-                    };
-                    K::combine_block(acc, values);
-                    value_index += 1;
-                    if value_index < reduce_total {
-                        inner.advance();
-                    }
-                }
-                let block_needs_fallback = acc.iter().any(K::needs_ordered_fallback);
-                if block_axis.dest_step == 1 && K::SCALAR_ACC && !block_needs_fallback {
-                    // SAFETY: with `SCALAR_ACC` the accumulator is
-                    // layout-identical to `T`, and the block outputs are
-                    // `len` reachable unit-stride destination elements,
-                    // disjoint from the source.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            acc.as_ptr() as *const T,
-                            dest.offset(outer.dest_offset),
-                            len,
-                        )
-                    };
-                } else {
-                    for (index, &value) in acc.iter().enumerate() {
-                        let offset = outer.dest_offset + index as isize * block_axis.dest_step;
-                        let output_value = if K::needs_ordered_fallback(&value) {
-                            // SAFETY: adjacent outputs of this block start a
-                            // reachable reduced run one kept-axis step apart.
-                            let source_offset = block_output_source_offset(
-                                outer.source_offset,
-                                block_axis.source_step,
-                                index,
-                            )?;
-                            unsafe {
-                                fallback_axes_output::<T, K>(
-                                    source,
-                                    parts.inner_axes,
-                                    source_offset,
-                                    reduce_total,
-                                )
-                            }
-                        } else {
-                            K::finish(value)
+                    let block_needs_fallback = acc.iter().any(K::needs_ordered_fallback);
+                    if block_axis.dest_step == 1 && K::SCALAR_ACC && !block_needs_fallback {
+                        // SAFETY: with `SCALAR_ACC` the accumulator is
+                        // layout-identical to `T`, and the block outputs are
+                        // `len` reachable unit-stride destination elements,
+                        // disjoint from the source.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                acc.as_ptr() as *const T,
+                                dest.offset(outer.dest_offset),
+                                len,
+                            )
                         };
-                        // SAFETY: the block outputs are reachable destination offsets.
-                        unsafe { dest.offset(offset).write(output_value) };
+                    } else {
+                        for (index, &value) in acc.iter().enumerate() {
+                            let offset = outer.dest_offset + index as isize * block_axis.dest_step;
+                            let output_value = if K::needs_ordered_fallback(&value) {
+                                // SAFETY: adjacent outputs of this block start a
+                                // reachable reduced run one kept-axis step apart.
+                                let source_offset = block_output_source_offset(
+                                    outer.source_offset,
+                                    block_axis.source_step,
+                                    index,
+                                )?;
+                                unsafe {
+                                    fallback_axes_output::<T, K>(
+                                        source,
+                                        parts.inner_axes,
+                                        source_offset,
+                                        reduce_total,
+                                    )
+                                }
+                            } else {
+                                K::finish(value)
+                            };
+                            // SAFETY: the block outputs are reachable destination offsets.
+                            unsafe { dest.offset(offset).write(output_value) };
+                        }
+                    }
+                    for _ in 0..len {
+                        output += 1;
+                        if output < range.end {
+                            outer.advance();
+                        }
                     }
                 }
-                for _ in 0..len {
-                    output += 1;
-                    if output < range.end {
-                        outer.advance();
-                    }
-                }
-            }
+                Ok(())
+            })?;
         }
         AxesStrategy::Sequential => {
             let mut inner = ReduceInnerCursor::new(0, parts.inner_axes);

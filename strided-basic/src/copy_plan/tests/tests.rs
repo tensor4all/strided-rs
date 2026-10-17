@@ -261,3 +261,51 @@ fn identity_layout_uses_single_fused_axis() {
     assert_eq!(fused.rank, 1);
     assert_eq!(fused.dims[0], 24);
 }
+
+#[test]
+fn update_plan_computes_alpha_f_plus_beta_self_on_permuted_layout() {
+    // 2x3 source, destination transposed, src strides make the source
+    // non-contiguous so the update replays through the fused pair traversal.
+    let dims = [2usize, 3];
+    let dst_strides = [1isize, 2]; // column-major 2x3
+    let src_strides = [3isize, 1]; // row-major window
+    let plan = UpdatePlan::compile(&dims, &dst_strides, &src_strides).unwrap();
+
+    let src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let initial = [10.0f64, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let mut dst = initial;
+    let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+    // dst = 2 * (src + 1) + 3 * dst
+    plan.execute(&mut dest, &source, 2.0, 3.0, |x| x + 1.0)
+        .unwrap();
+
+    // Logical (i, j): src offset i*3 + j, dst offset i + j*2. Every logical
+    // destination is written exactly once, so the expected value uses the
+    // pre-update destination.
+    for i in 0..2 {
+        for j in 0..3 {
+            let s = src[i * 3 + j];
+            let expected = 2.0 * (s + 1.0) + 3.0 * initial[i + j * 2];
+            assert_eq!(dst[i + j * 2], expected, "({i},{j})");
+        }
+    }
+}
+
+#[test]
+fn update_plan_rejects_non_injective_destination_and_layout_drift() {
+    let dims = [2usize, 2];
+    let src_strides = [1isize, 2];
+    let err = UpdatePlan::compile(&dims, &[1, 0], &src_strides).unwrap_err();
+    assert!(matches!(err, StridedError::NonInjectiveOutputLayout));
+
+    let plan = UpdatePlan::compile(&dims, &[1, 2], &src_strides).unwrap();
+    let src = [1.0f64, 2.0, 3.0, 4.0];
+    let mut dst = [0.0f64; 4];
+    let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &[2, 1], 0).unwrap();
+    let err = plan
+        .execute(&mut dest, &source, 1.0, 1.0, |x| x)
+        .unwrap_err();
+    assert!(matches!(err, StridedError::PlanLayoutMismatch));
+}

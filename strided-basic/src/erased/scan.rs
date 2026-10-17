@@ -167,9 +167,9 @@ pub struct ErasedScanPlan {
     dtype: KernelDType,
     op: ScanOp,
     options: ScanOptions,
-    dims: Vec<usize>,
-    src_strides: Vec<isize>,
-    dest_strides: Vec<isize>,
+    dims: crate::inline::InlineVec<usize>,
+    src_strides: crate::inline::InlineVec<isize>,
+    dest_strides: crate::inline::InlineVec<isize>,
     layout: LineLayout,
 }
 
@@ -225,7 +225,7 @@ impl ErasedScanPlan {
         if !crate::layout_check::is_injective_layout(dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
-        let dest_outer: Vec<isize> = (0..dims.len())
+        let dest_outer: crate::inline::InlineVec<isize> = (0..dims.len())
             .filter(|&a| a != axis)
             .map(|a| dest_strides[a])
             .collect();
@@ -241,9 +241,9 @@ impl ErasedScanPlan {
             dtype,
             op,
             options,
-            dims: dims.to_vec(),
-            src_strides: src_strides.to_vec(),
-            dest_strides: dest_strides.to_vec(),
+            dims: dims.into(),
+            src_strides: src_strides.into(),
+            dest_strides: dest_strides.into(),
             layout,
         })
     }

@@ -396,7 +396,268 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
 
     run_composites(&pool);
     check_reduce_axis(&pool);
+    check_plans(&pool);
     record_rank9_spill(&pool);
+}
+
+/// Compiled plans must not allocate on compile or execute within the inline
+/// rank/operand bounds (P4), so downstream code that compiles per call and
+/// executes per accumulate does not touch the heap.
+fn check_plans(pool: &rayon::ThreadPool) {
+    use strided_basic::{
+        ConcatenatePlan, ErasedConcatenatePlan, ErasedRawStridedMut, ErasedRawStridedRef,
+        ErasedReducePlan, ErasedUpdatePlan, ExecContext, KernelDType, RawStridedMut, RawStridedRef,
+        ReduceOp, UpdateOp, UpdatePlan,
+    };
+    for rank in 1..=8usize {
+        let dims = vec![2usize; rank];
+        let strides = col_major_strides(&dims).into_vec();
+        let len = total(&dims);
+        let src: Vec<f64> = (0..len).map(|v| v as f64 + 1.0).collect();
+        let mut dst = vec![0.0f64; len];
+
+        // UpdatePlan: compile and execute allocation-free.
+        let plan = with_execution_policy(ExecutionPolicy::Sequential, || {
+            UpdatePlan::compile(&dims, &strides, &strides).unwrap()
+        });
+        {
+            let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+            let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x)
+                .unwrap();
+        }
+        let update_compile = count_thread_allocations(|| {
+            let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            update_compile, 0,
+            "UpdatePlan::compile rank {rank} allocated {update_compile}"
+        );
+        let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+        let update_execute = count_thread_allocations(|| {
+            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x)
+                .unwrap();
+        });
+        assert_eq!(
+            update_execute, 0,
+            "UpdatePlan::execute rank {rank} allocated {update_execute}"
+        );
+
+        // Erased update plan: same traversal behind a dtype-erased boundary.
+        let erased_update =
+            ErasedUpdatePlan::compile(KernelDType::F64, &dims, &strides, &strides).unwrap();
+        {
+            let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let mut erased_dst = vec![0.0f64; len];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dims, &strides, 0).unwrap();
+            erased_update
+                .execute(
+                    &ExecContext::serial(),
+                    &mut dest,
+                    &source,
+                    2.0,
+                    3.0,
+                    UpdateOp::Identity,
+                )
+                .unwrap();
+        }
+        let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut erased_dst = vec![0.0f64; len];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dims, &strides, 0).unwrap();
+        let erased_update_execute = count_thread_allocations(|| {
+            erased_update
+                .execute(
+                    &ExecContext::serial(),
+                    &mut dest,
+                    &source,
+                    2.0,
+                    3.0,
+                    UpdateOp::Identity,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            erased_update_execute, 0,
+            "ErasedUpdatePlan::execute rank {rank} allocated {erased_update_execute}"
+        );
+
+        // ConcatenatePlan with two inputs: compile and execute allocation-free.
+        let mut dest_dims = dims.clone();
+        dest_dims[0] *= 2;
+        let dest_strides = col_major_strides(&dest_dims).into_vec();
+        let dest_len = total(&dest_dims);
+        let mut concat_dst = vec![0.0f64; dest_len];
+        let concat_compile = count_thread_allocations(|| {
+            let plan = ConcatenatePlan::compile(
+                &[&dims, &dims],
+                &[&strides, &strides],
+                &dest_dims,
+                &dest_strides,
+                0,
+            )
+            .unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            concat_compile, 0,
+            "ConcatenatePlan::compile rank {rank} allocated {concat_compile}"
+        );
+        let concat_plan = ConcatenatePlan::compile(
+            &[&dims, &dims],
+            &[&strides, &strides],
+            &dest_dims,
+            &dest_strides,
+            0,
+        )
+        .unwrap();
+        {
+            let a = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+            let b = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+            let mut dest =
+                RawStridedMut::new(&mut concat_dst, &dest_dims, &dest_strides, 0).unwrap();
+            concat_plan.execute(&mut dest, &[a, b]).unwrap();
+        }
+        let a = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let b = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let mut dest = RawStridedMut::new(&mut concat_dst, &dest_dims, &dest_strides, 0).unwrap();
+        let concat_execute = count_thread_allocations(|| {
+            concat_plan.execute(&mut dest, &[a, b]).unwrap();
+        });
+        assert_eq!(
+            concat_execute, 0,
+            "ConcatenatePlan::execute rank {rank} allocated {concat_execute}"
+        );
+
+        // Erased concatenate execute (typed scalar, erased dtype tag).
+        let erased_plan = ErasedConcatenatePlan::compile(
+            KernelDType::F64,
+            &[&dims, &dims],
+            &[&strides, &strides],
+            &dest_dims,
+            &dest_strides,
+            0,
+        )
+        .unwrap();
+        let mut erased_dst = vec![0.0f64; dest_len];
+        {
+            let a = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let b = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dest_dims, &dest_strides, 0)
+                    .unwrap();
+            erased_plan
+                .execute(&strided_basic::ExecContext::serial(), &mut dest, &[a, b])
+                .unwrap();
+        }
+        let a = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let b = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        let erased_concat_execute = count_thread_allocations(|| {
+            erased_plan
+                .execute(&strided_basic::ExecContext::serial(), &mut dest, &[a, b])
+                .unwrap();
+        });
+        assert_eq!(
+            erased_concat_execute, 0,
+            "ErasedConcatenatePlan::execute rank {rank} allocated {erased_concat_execute}"
+        );
+
+        // Erased reduction compile (full and one axis) allocation-free.
+        let full_compile = count_thread_allocations(|| {
+            let plan = ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides)
+                .unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            full_compile, 0,
+            "ErasedReducePlan::compile rank {rank} allocated {full_compile}"
+        );
+        let reduced_dims: Vec<usize> = dims[1..].to_vec();
+        let reduced_strides = col_major_strides(&reduced_dims).into_vec();
+        let axes_compile = count_thread_allocations(|| {
+            let plan = ErasedReducePlan::compile_axes(
+                KernelDType::F64,
+                ReduceOp::Sum,
+                &dims,
+                &strides,
+                &reduced_dims,
+                &reduced_strides,
+                &[0],
+            )
+            .unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            axes_compile, 0,
+            "ErasedReducePlan::compile_axes rank {rank} allocated {axes_compile}"
+        );
+    }
+
+    // Axis-reduction execute for each kernel strategy, allocation-free. The
+    // `OutputBlocks` path exercises the per-thread reusable accumulator scratch.
+    let dims = [16usize, 4];
+    let strides = col_major_strides(&dims).into_vec();
+    let src: Vec<f64> = (0..64).map(|v| v as f64).collect();
+    for reduced_dims in [vec![4usize], vec![16usize]] {
+        let reduce_axis = if reduced_dims[0] == 4 { 0 } else { 1 };
+        let reduced_strides = col_major_strides(&reduced_dims).into_vec();
+        let plan = ErasedReducePlan::compile_axes(
+            KernelDType::F64,
+            ReduceOp::Sum,
+            &dims,
+            &strides,
+            &reduced_dims,
+            &reduced_strides,
+            &[reduce_axis],
+        )
+        .unwrap();
+        let mut out = vec![0.0f64; reduced_dims.iter().product::<usize>()];
+        {
+            let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut out, &reduced_dims, &reduced_strides, 0)
+                    .unwrap();
+            plan.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
+                .unwrap();
+        }
+        let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut out, &reduced_dims, &reduced_strides, 0)
+                .unwrap();
+        let execute = count_thread_allocations(|| {
+            plan.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
+                .unwrap();
+        });
+        assert_eq!(
+            execute, 0,
+            "ErasedReducePlan::execute {reduced_dims:?} allocated {execute}"
+        );
+    }
+    let full = ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides).unwrap();
+    let mut scalar = [0.0f64; 1];
+    {
+        let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut dest = ErasedRawStridedMut::from_slice_mut(&mut scalar, &[1], &[1], 0).unwrap();
+        full.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
+            .unwrap();
+    }
+    let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut scalar, &[1], &[1], 0).unwrap();
+    let full_execute = count_thread_allocations(|| {
+        full.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
+            .unwrap();
+    });
+    assert_eq!(
+        full_execute, 0,
+        "ErasedReducePlan full execute allocated {full_execute}"
+    );
+    let _ = pool;
 }
 
 /// `reduce_axis_into` must be allocation-free; the array-returning

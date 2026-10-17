@@ -188,7 +188,7 @@ where
 /// plan.execute(&mut dst_mut, &src_ref).unwrap();
 /// assert_eq!(dst, [0.0, 10.0, 1.0, 11.0, 2.0, 12.0]);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CopyPlan {
     dims: AxisVec<usize>,
     dst_strides: AxisVec<isize>,
@@ -266,14 +266,7 @@ impl CopyPlan {
         dest: &RawStridedMut<'_, D>,
         src: &RawStridedRef<'_, S>,
     ) -> Result<()> {
-        if dest.dims() != &self.dims[..]
-            || src.dims() != &self.dims[..]
-            || dest.strides() != &self.dst_strides[..]
-            || src.strides() != &self.src_strides[..]
-        {
-            return Err(StridedError::PlanLayoutMismatch);
-        }
-        Ok(())
+        check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)
     }
 
     /// `dest = src` into a potentially uninitialized destination.
@@ -361,6 +354,133 @@ impl CopyPlan {
             &self.fused,
             |dst, value| *dst = value,
             |value: T| value.conj(),
+        );
+        Ok(())
+    }
+}
+
+/// Verify that a pair of raw views carries exactly a compiled layout.
+///
+/// Shared by [`CopyPlan`] and [`UpdatePlan`], whose `compile` methods prove the
+/// layout facts once. Buffer bounds against that layout were already proven by
+/// [`RawStridedRef::new`]/[`RawStridedMut::new`] (or asserted by the caller of
+/// the `new_unchecked` constructors), so layout equality is the complete
+/// per-call precondition for the pointer-based fused replay.
+fn check_layout_pair<D, S>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    dest: &RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+) -> Result<()> {
+    if dest.dims() != dims
+        || src.dims() != dims
+        || dest.strides() != dst_strides
+        || src.strides() != src_strides
+    {
+        return Err(StridedError::PlanLayoutMismatch);
+    }
+    Ok(())
+}
+
+/// A compiled read-modify-write traversal for one `(dims, dst_strides,
+/// src_strides)` layout pair.
+///
+/// [`execute`](Self::execute) computes `dest = alpha * f(src) + beta * dest` by
+/// replaying the same fused pair traversal as [`CopyPlan`]: `compile` proves
+/// the layout facts once (rank agreement, extent overflow, destination
+/// injectivity) and each call only re-checks that the supplied views carry the
+/// compiled layout before running monomorphized loops. Execute is
+/// allocation-free for fused ranks at most
+/// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT), and the injective
+/// destination makes a large replay parallel-safe exactly as in [`CopyPlan`].
+///
+/// Overlapping `src`/`dest` memory is not supported, matching the rest of the
+/// crate.
+///
+/// # Example
+///
+/// ```rust
+/// use strided_basic::{RawStridedMut, RawStridedRef, UpdatePlan};
+///
+/// let dims = [2usize, 2];
+/// let dst_strides = [1isize, 2];
+/// let src_strides = [1isize, 2];
+/// let plan = UpdatePlan::compile(&dims, &dst_strides, &src_strides).unwrap();
+///
+/// let src = [1.0f64, 2.0, 3.0, 4.0];
+/// let mut dst = [10.0f64, 20.0, 30.0, 40.0];
+/// let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+/// let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+/// // dst = 2 * src + 3 * dst
+/// plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x).unwrap();
+/// assert_eq!(dst, [32.0, 64.0, 96.0, 128.0]);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct UpdatePlan {
+    dims: AxisVec<usize>,
+    dst_strides: AxisVec<isize>,
+    src_strides: AxisVec<isize>,
+    fused: PairTraversal,
+}
+
+impl UpdatePlan {
+    /// Compile an update plan for the given layout pair.
+    ///
+    /// Performs the same layout validation as [`CopyPlan::compile`]:
+    ///
+    /// - `dims`, `dst_strides`, and `src_strides` must have equal length
+    ///   ([`StridedError::StrideLengthMismatch`]);
+    /// - the total element count must not overflow `usize`
+    ///   ([`StridedError::OffsetOverflow`]);
+    /// - the destination layout must be injective
+    ///   ([`StridedError::NonInjectiveOutputLayout`]), so two logical indices
+    ///   never name one slot and a parallel replay writes each slot once.
+    pub fn compile(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> Result<Self> {
+        if dims.len() != dst_strides.len() || dims.len() != src_strides.len() {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        crate::kernel::total_len(dims)?;
+        if !crate::layout_check::is_injective_layout(dims, dst_strides) {
+            return Err(StridedError::NonInjectiveOutputLayout);
+        }
+        Ok(Self {
+            dims: dims.into(),
+            dst_strides: dst_strides.into(),
+            src_strides: src_strides.into(),
+            fused: fuse_pair_traversal(dims, dst_strides, src_strides),
+        })
+    }
+
+    /// `dest = alpha * f(src) + beta * dest`.
+    ///
+    /// `f` is applied to the source element before scaling; the old destination
+    /// element is read through the destination layout. Allocation-free for fused
+    /// ranks at most [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    ///
+    /// # Errors
+    ///
+    /// [`StridedError::PlanLayoutMismatch`] when the supplied views do not
+    /// carry the compiled layout, before any write.
+    pub fn execute<T, F>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        src: &RawStridedRef<'_, T>,
+        alpha: T,
+        beta: T,
+        f: F,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync + Add<Output = T> + Mul<Output = T>,
+        F: Fn(T) -> T + MaybeSendSync,
+    {
+        check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
+        replay_fused(
+            dest,
+            src,
+            &self.fused,
+            |dst, value| *dst = alpha * value + beta * *dst,
+            f,
         );
         Ok(())
     }

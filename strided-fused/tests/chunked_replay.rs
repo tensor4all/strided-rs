@@ -524,9 +524,7 @@ fn run_rank1<T: FusedScalar>(
     let dims = [len];
     let views: Vec<StridedView<'_, T>> = operands
         .iter()
-        .map(|(data, stride)| {
-            StridedView::new(data, &dims, &[*stride], 0).unwrap()
-        })
+        .map(|(data, stride)| StridedView::new(data, &dims, &[*stride], 0).unwrap())
         .collect();
     let seed = operands[0].0[0];
     let mut outputs: Vec<Vec<T>> = dest_strides
@@ -734,8 +732,7 @@ fn chunked_replay_handles_rank3_inner_broadcast() {
             },
         ],
     };
-    let views =
-        [StridedView::new(&plane, &dims, &[0isize, 1, b as isize], 0).unwrap()];
+    let views = [StridedView::new(&plane, &dims, &[0isize, 1, b as isize], 0).unwrap()];
     let mut output = vec![0.0f64; a * b * c];
     {
         let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
