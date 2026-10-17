@@ -597,6 +597,12 @@ impl GatherPlan {
             index_component_offsets.push(checked_offset_add(0, vector_stride, component)?);
         }
 
+        let index_operand_strides: AxisVec<isize> = spec
+            .start_index_map
+            .iter()
+            .map(|&axis| operand_strides[axis])
+            .collect();
+
         Ok(Self {
             operand_dims: operand_dims.into(),
             operand_strides: operand_strides.into(),
@@ -604,15 +610,11 @@ impl GatherPlan {
             index_strides: index_strides.into(),
             dest_dims: dest_dims.into(),
             dest_strides: dest_strides.into(),
-            spec: spec.clone(),
+            spec,
             replay: GatherReplay {
                 axes: replay_axes,
                 index_component_offsets,
-                index_operand_strides: spec
-                    .start_index_map
-                    .iter()
-                    .map(|&axis| operand_strides[axis])
-                    .collect(),
+                index_operand_strides,
             },
             total,
         })
@@ -2053,7 +2055,10 @@ impl ScatterPlan {
 }
 
 fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
-    let mut seen = vec![false; rank];
+    // Inline boolean metadata: rank <= INLINE_RANK validation allocates
+    // nothing, and it spills above the inline bound.
+    let mut seen: InlineVec<bool> = InlineVec::new();
+    seen.resize(rank, false);
     for &axis in axes {
         if axis >= rank {
             return Err(StridedError::InvalidAxis { axis, rank });

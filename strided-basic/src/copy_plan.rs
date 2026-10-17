@@ -416,7 +416,7 @@ fn check_layout_pair<D, S>(
 /// plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x).unwrap();
 /// assert_eq!(dst, [32.0, 64.0, 96.0, 128.0]);
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct UpdatePlan {
     dims: AxisVec<usize>,
     dst_strides: AxisVec<isize>,

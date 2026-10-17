@@ -7,18 +7,20 @@
 //!
 //! The common case is validated without allocating: axes are reduced in
 //! ascending `|stride|` order and only the interleaved block of small-stride
-//! axes is compared pairwise. A block larger than the pairwise budget cannot
-//! be settled pairwise, so it spills to the exact (allocating) enumeration.
-//! Both checks conservatively reject metadata whose spans do not fit the
-//! analysis, which keeps the entry points panic-free.
+//! axes is compared pairwise. A two-axis block is settled exactly by a gcd
+//! argument regardless of size. A larger block above the pairwise budget
+//! cannot be settled without enumeration, so it spills to the exact
+//! (allocating) check. All three paths conservatively reject metadata whose
+//! spans do not fit the analysis, which keeps the entry points panic-free.
 
 /// Decide whether distinct logical positions map to distinct offsets.
 ///
-/// Runs the allocation-free pairwise check first and falls back to the exact
-/// enumeration only when the interleaved block exceeds the pairwise budget.
-/// This accepts every injective layout the exact check can settle, including
-/// the interleaved `[3, 1500]` / `[2000, 3]` case, without allocating for the
-/// common separated or small-block layouts.
+/// Runs the allocation-free proof first (separated axes, the two-axis gcd
+/// argument, then the pairwise budget) and falls back to the exact enumeration
+/// only when the interleaved block exceeds the pairwise budget. This accepts
+/// every injective layout the exact check can settle, including the
+/// interleaved `[3, 1500]` / `[2000, 3]` case, without allocating for the
+/// common separated, small-block, or two-axis layouts.
 ///
 /// # Examples
 ///
@@ -35,8 +37,9 @@ pub fn is_injective_layout(dims: &[usize], strides: &[isize]) -> bool {
 
 /// Allocation-free injectivity check.
 ///
-/// Exact for interleaved blocks of at most `PAIRWISE_BLOCK_BUDGET` logical
-/// elements; larger blocks are conservatively rejected (callers that must keep
+/// Exact for a two-axis interleaved block (any size) and for interleaved
+/// blocks of at most `PAIRWISE_BLOCK_BUDGET` logical elements; larger blocks
+/// with three or more axes are conservatively rejected (callers that must keep
 /// every injective layout use [`is_injective_layout`] instead, which spills to
 /// the exact enumeration). Exposed for the kernel adapters that validate a
 /// destination on a per-call path.
@@ -52,31 +55,17 @@ pub fn is_injective_layout_without_alloc(dims: &[usize], strides: &[isize]) -> b
         None => false,
         Some(None) => true,
         Some(Some(block)) => {
-            block.may_be_injective()
-                && block.total <= PAIRWISE_BLOCK_BUDGET as u128
+            if !block.may_be_injective() {
+                // Pigeonhole: more elements than reachable offsets always alias.
+                return false;
+            }
+            if let Some(injective) = two_axis_block_is_injective(dims, strides, &block) {
+                return injective;
+            }
+            block.total <= PAIRWISE_BLOCK_BUDGET as u128
                 && block_offsets_unique_pairwise(dims, strides, &block)
         }
     }
-}
-
-/// Conservative, allocation-free proof that every non-singleton axis is
-/// separated from the offset span of the smaller-stride axes.
-///
-/// A layout whose axes interleave is rejected even when it is injective, so a
-/// parallel engine that splits the outermost loop can never let two workers
-/// write one offset. Exposed for `strided-perm`'s parallel entry.
-#[doc(hidden)]
-pub fn axes_are_separated(dims: &[usize], strides: &[isize]) -> bool {
-    // Negative and zero strides on a non-singleton axis are left unresolved:
-    // the conservative proof only reasons about positive, non-collapsed axes.
-    if dims
-        .iter()
-        .zip(strides.iter())
-        .any(|(&dim, &stride)| dim > 1 && stride <= 0)
-    {
-        return false;
-    }
-    matches!(interleaved_block(dims, strides), Some(None))
 }
 
 /// Exact injectivity check used when the pairwise budget is exceeded.
@@ -91,9 +80,14 @@ fn is_injective_layout_exact(dims: &[usize], strides: &[isize]) -> bool {
         None => false,
         Some(None) => true,
         Some(Some(block)) => {
-            block.may_be_injective()
-                && block.total <= EXACT_BLOCK_BUDGET as u128
-                && block_offsets_unique(dims, strides, &block)
+            if !block.may_be_injective() {
+                // Pigeonhole: more elements than reachable offsets always alias.
+                return false;
+            }
+            if let Some(injective) = two_axis_block_is_injective(dims, strides, &block) {
+                return injective;
+            }
+            block.total <= EXACT_BLOCK_BUDGET as u128 && block_offsets_unique(dims, strides, &block)
         }
     }
 }
@@ -132,6 +126,67 @@ impl InterleavedBlock {
     fn may_be_injective(&self) -> bool {
         self.total <= self.span + 1
     }
+}
+
+/// Exact, allocation-free injectivity decision for a two-axis interleaved
+/// block.
+///
+/// For strides `s1 <= s2` and extents `d1`, `d2`, the sums `i*s1 + j*s2` are
+/// all distinct iff `s2/g >= d1` or `s1/g >= d2`, where `g = gcd(s1, s2)`: a
+/// non-zero `a*s1 + b*s2 = 0` must have `|a| >= s2/g` and `|b| >= s1/g`, so a
+/// collision exists exactly when both bounds fit inside the extents. The
+/// result is exact, so it is decidable without enumeration even for a block
+/// far above the enumeration budget. Returns `None` when the block does not
+/// hold exactly two axes.
+fn two_axis_block_is_injective(
+    dims: &[usize],
+    strides: &[isize],
+    block: &InterleavedBlock,
+) -> Option<bool> {
+    let mut axes = [(0usize, 0usize); 2]; // (extent, |stride|)
+    let mut count = 0;
+    for (axis, (&dim, &stride)) in dims.iter().zip(strides.iter()).enumerate() {
+        if !block.contains(axis, dim, stride) {
+            continue;
+        }
+        if count == 2 {
+            return None;
+        }
+        axes[count] = (dim, stride.unsigned_abs());
+        count += 1;
+    }
+    if count != 2 {
+        return None;
+    }
+    // Order by stride so the pairing of the gcd bounds matches the proof.
+    let (extent_lo, stride_lo, extent_hi, stride_hi) = if axes[0].1 <= axes[1].1 {
+        (
+            axes[0].0 as u128,
+            axes[0].1 as u128,
+            axes[1].0 as u128,
+            axes[1].1 as u128,
+        )
+    } else {
+        (
+            axes[1].0 as u128,
+            axes[1].1 as u128,
+            axes[0].0 as u128,
+            axes[0].1 as u128,
+        )
+    };
+    let g = gcd(stride_lo, stride_hi);
+    debug_assert!(g > 0, "stride zero on a non-singleton axis was rejected");
+    Some(stride_hi / g >= extent_lo || stride_lo / g >= extent_hi)
+}
+
+/// Greatest common divisor of two non-negative integers.
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
 }
 
 /// Find the interleaved block of a layout.
@@ -336,22 +391,37 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_injective_layout_needs_the_exact_spill_path() {
-        // The allocation-free pairwise budget is 4096; this block has 4500
-        // elements, so the first pass rejects it and the exact path accepts.
-        assert!(is_injective_layout(&[3, 1500], &[2000, 3]));
-        assert!(is_injective_layout_without_alloc(&[3, 1500], &[2000, 3]) == false);
+    fn three_axis_interleaved_injective_layout_needs_the_exact_spill_path() {
+        // Three-axis interleaved block above the pairwise budget; no two-axis
+        // proof applies, so only the allocating exact enumeration accepts it.
+        assert!(is_injective_layout_without_alloc(&[2, 2, 2000], &[4, 5, 6]) == false);
+        assert!(is_injective_layout(&[2, 2, 2000], &[4, 5, 6]));
+        // The two-axis gcd proof now settles the old 4500-element case
+        // allocation-free.
+        assert!(is_injective_layout_without_alloc(&[3, 1500], &[2000, 3]));
         assert!(is_injective_layout(&[1500, 3], &[3, 2000]));
         assert!(!is_injective_layout(&[3, 1500], &[2000, 2]));
     }
 
     #[test]
-    fn separated_axes_gate_matches_the_conservative_parallel_rule() {
-        assert!(axes_are_separated(&[3, 16384], &[1, 3]));
-        assert!(!axes_are_separated(&[3, 16384], &[2, 1]));
-        assert!(!axes_are_separated(&[4], &[-1]));
-        assert!(!axes_are_separated(&[4], &[0]));
-        assert!(axes_are_separated(&[1, 1], &[0, 1]));
+    fn large_two_axis_injective_layout_is_decided_without_enumeration() {
+        // Post-review regression: 6_000_001 = 1 (mod 3), so the rows stay
+        // distinct. The block has 18M elements, above the exact enumeration
+        // budget, and must be settled by the allocation-free gcd proof instead
+        // of being rejected as overlapping.
+        assert!(is_injective_layout(&[3, 6_000_000], &[6_000_001, 3]));
+        assert!(is_injective_layout_without_alloc(
+            &[3, 6_000_000],
+            &[6_000_001, 3]
+        ));
+        // The gcd proof is exact: with a stride-3 axis of extent 6M and a
+        // 6_000_003 axis of extent 3, `2000001 * 3 == 6000003`, so the layout
+        // aliases and is rejected without enumeration.
+        assert!(!is_injective_layout(&[3, 6_000_000], &[6_000_003, 3]));
+        assert!(!is_injective_layout_without_alloc(
+            &[3, 6_000_000],
+            &[6_000_003, 3]
+        ));
     }
 
     #[test]

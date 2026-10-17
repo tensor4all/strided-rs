@@ -90,7 +90,7 @@ pub use element_op::{
 // ============================================================================
 pub use injectivity::is_injective_layout;
 #[doc(hidden)]
-pub use injectivity::{axes_are_separated, is_injective_layout_without_alloc};
+pub use injectivity::is_injective_layout_without_alloc;
 
 // ============================================================================
 // View-based types

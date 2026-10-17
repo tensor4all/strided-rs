@@ -11,11 +11,11 @@
 //! grouped cases whose tables spill.
 //!
 //! This lives in its own integration-test binary because it installs a
-//! counting global allocator. Every counting window reads the calling thread's
-//! counter: the serial windows run on the test thread, and each parallel
-//! window runs inside a dedicated 2-worker pool and reads the worker thread's
-//! counter (the plan is built there). A process-global counter was flaky
-//! because an unrelated thread can allocate inside a short window.
+//! counting global allocator. Serial windows read the calling thread's counter
+//! (the plan is built there). Parallel windows read a process-wide counter so
+//! allocations made on stolen Rayon tasks are counted on every worker, not
+//! only the initiating one. The whole matrix runs in one test so no other test
+//! in this binary can allocate concurrently with a process-wide window.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -29,11 +29,16 @@ use strided_view::{StridedArray, StridedViewMut, INLINE_RANK};
 
 struct CountingAllocator;
 
+#[cfg(feature = "parallel")]
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn record_allocation() {
+    #[cfg(feature = "parallel")]
+    ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
     // `try_with` fails only during thread teardown, when nothing is counted.
     let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
 }
@@ -58,28 +63,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 /// Allocations made by the calling thread while `run` executes.
-fn count_allocations(run: impl FnOnce()) -> usize {
+fn count_thread_allocations(run: impl FnOnce()) -> usize {
     let before = THREAD_ALLOCATIONS.with(Cell::get);
     run();
     THREAD_ALLOCATIONS.with(Cell::get) - before
 }
 
-/// Allocations made by the pool worker thread that `run` executes on.
+/// Allocations made by every thread while `run` executes.
 ///
-/// `run` is handed to the pool, so the plan build inside `copy_into_par` is
-/// counted on the worker, not on the test thread.
+/// Parallel windows use this so allocations in stolen Rayon tasks are counted.
 #[cfg(feature = "parallel")]
-fn count_worker_allocations(pool: &rayon::ThreadPool, run: impl FnOnce() + Send) -> usize {
-    let result = AtomicUsize::new(0);
-    pool.install(|| {
-        let before = THREAD_ALLOCATIONS.with(Cell::get);
-        run();
-        result.store(
-            THREAD_ALLOCATIONS.with(Cell::get) - before,
-            Ordering::SeqCst,
-        );
-    });
-    result.load(Ordering::SeqCst)
+fn count_process_allocations(run: impl FnOnce()) -> usize {
+    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    run();
+    ALLOCATIONS.load(Ordering::SeqCst) - before
 }
 
 fn col_major_strides(dims: &[usize]) -> Vec<isize> {
@@ -125,11 +122,10 @@ fn serial_allocations(dims: &[usize], src_strides: &[isize], dst_strides: &[isiz
     let mut dst_data = vec![0.0f64; max_offset(dims, dst_strides) as usize + 1];
     let mut dst = StridedViewMut::new(&mut dst_data, dims, dst_strides, 0).unwrap();
     let src_view = src.view();
-    count_allocations(|| copy_into(&mut dst, &src_view).unwrap())
+    count_thread_allocations(|| copy_into(&mut dst, &src_view).unwrap())
 }
 
-#[test]
-fn copy_into_is_allocation_free_up_to_inline_rank() {
+fn check_serial_contract() {
     for rank in 1..=INLINE_RANK {
         // Extent-2 layouts keep every grouped table within the inline bound,
         // so the whole plan is allocation-free.
@@ -182,19 +178,12 @@ fn copy_into_is_allocation_free_up_to_inline_rank() {
         serial_allocations(&dims9, &strides9, &col_major_strides(&dims9)) > 0,
         "rank 9 must spill"
     );
-}
 
-/// A grouped tile whose offset table is larger than the inline bound spills
-/// that table to the heap. The tile algorithm is unchanged: the long
-/// source-contiguous group is still selected, it just needs a heap table.
-#[test]
-fn grouped_offset_tables_spill_above_the_inline_bound() {
+    // A grouped tile whose offset table is larger than the inline bound spills
+    // that table to the heap. The tile algorithm is unchanged: the long
+    // source-contiguous group is still selected, it just needs a heap table.
     // Source group along the 100-element first axis (100 > 64 inline), while
-    // the destination keeps a 32-element contiguous group. `dim_a = 0`,
-    // `dim_b = 1`, `legacy_area = 200 < 256`, so the grouped path is chosen.
-    // The source strides are deliberately non-doubling so bilateral fusion
-    // does not collapse the group_b axes into `dim_b` and enlarge
-    // `legacy_area` past the grouped threshold.
+    // the destination keeps a 32-element contiguous group.
     let dims = [100usize, 2, 2, 2, 2, 2, 2, 2];
     let src_strides = [1isize, 101, 1000, 1001, 1002, 1003, 1004, 1005];
     let dst_strides = [128isize, 1, 2, 4, 8, 16, 32, 64];
@@ -220,9 +209,10 @@ fn grouped_offset_tables_spill_above_the_inline_bound() {
     println!("spill case [2,3,..,9] swapped allocations = {allocations}");
 }
 
+/// Parallel windows. The process-wide counter sees every worker, so a
+/// per-call allocation on a stolen task fails the assertion.
 #[cfg(feature = "parallel")]
-#[test]
-fn copy_into_par_is_allocation_free_in_a_two_worker_pool() {
+fn check_parallel_contract() {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
         .build()
@@ -246,9 +236,12 @@ fn copy_into_par_is_allocation_free_in_a_two_worker_pool() {
             let mut dst_data = vec![0.0f64; max_offset(&dims, &dst_strides) as usize + 1];
             let mut dst = StridedViewMut::new(&mut dst_data, &dims, &dst_strides, 0).unwrap();
             let src_view = src.view();
+            // Warm up outside the counted window.
             pool.install(|| copy_into_par(&mut dst, &src_view).unwrap());
-            let allocations = count_worker_allocations(&pool, || {
-                copy_into_par(&mut dst, &src_view).unwrap();
+            let allocations = pool.install(|| {
+                count_process_allocations(|| {
+                    copy_into_par(&mut dst, &src_view).unwrap();
+                })
             });
             assert_eq!(allocations, 0, "parallel {label} rank {rank}");
         }
@@ -268,12 +261,14 @@ fn copy_into_par_is_allocation_free_in_a_two_worker_pool() {
     for _ in 0..4 {
         pool.install(|| copy_into_par(&mut dst, &src_view).unwrap());
     }
-    let allocations = count_worker_allocations(&pool, || {
-        copy_into_par(&mut dst, &src_view).unwrap();
+    let allocations = pool.install(|| {
+        count_process_allocations(|| {
+            copy_into_par(&mut dst, &src_view).unwrap();
+        })
     });
     assert_eq!(
         allocations, 0,
-        "parallel copy at rank 3 must not allocate in a 2-worker pool"
+        "parallel copy at rank 3 must not allocate on any worker"
     );
 
     // The rank-8 grouped layout also stays allocation-free in the pool.
@@ -284,11 +279,20 @@ fn copy_into_par_is_allocation_free_in_a_two_worker_pool() {
     let mut dst8 = StridedViewMut::new(&mut dst8_data, &dims8, &dst8_strides, 0).unwrap();
     let src8_view = src8.view();
     pool.install(|| copy_into_par(&mut dst8, &src8_view).unwrap());
-    let allocations = count_worker_allocations(&pool, || {
-        copy_into_par(&mut dst8, &src8_view).unwrap();
+    let allocations = pool.install(|| {
+        count_process_allocations(|| {
+            copy_into_par(&mut dst8, &src8_view).unwrap();
+        })
     });
     assert_eq!(
         allocations, 0,
-        "parallel grouped rank-8 copy must not allocate in a 2-worker pool"
+        "parallel grouped rank-8 copy must not allocate on any worker"
     );
+}
+
+#[test]
+fn copy_entries_are_allocation_free_within_the_contract() {
+    check_serial_contract();
+    #[cfg(feature = "parallel")]
+    check_parallel_contract();
 }

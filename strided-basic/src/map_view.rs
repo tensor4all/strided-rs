@@ -42,7 +42,7 @@ const TRANSPOSED_SCALAR_TILE_MAX_INNER_ROW_ASPECT: usize = 8;
 /// This marker is not bound to a destination. It does not authorize unchecked
 /// replay with a different geometry; callers of the unsafe execution entries
 /// must establish that association themselves.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ValidatedDestinationLayout(());
 
 /// Validate destination injectivity and return the replay marker.

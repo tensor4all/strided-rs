@@ -10,8 +10,9 @@
 //!
 //! Run with `OVERHEAD_GATE=1` to make a failed gate exit non-zero; without it
 //! the table is printed and the process succeeds. The gate is deliberately
-//! forgiving: it fails only when all [`ATTEMPTS`] attempts exceed the
-//! threshold, and the per-round timing is the minimum of [`ROUNDS`] rounds.
+//! forgiving: it fails only when all [`support::ATTEMPTS`] attempts exceed the
+//! threshold, and the per-round timing is the minimum of [`support::ROUNDS`]
+//! rounds.
 //!
 //! Rows (see `#306`):
 //! - S1: erased fused `execute` under `ExecContext::serial()` vs
@@ -25,12 +26,7 @@
 //! OVERHEAD_GATE=1 cargo bench --profile release -p strided-fused --bench overhead_smoke
 //! ```
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::fs::OpenOptions;
 use std::hint::black_box;
-use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use strided_basic::{
     zip_map2_into, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType, StridedView,
@@ -38,130 +34,16 @@ use strided_basic::{
 };
 use strided_fused::{fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 
-struct CountingAllocator;
-
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
-    }
-}
+#[path = "../../strided-basic/benches/support/mod.rs"]
+mod support;
 
 #[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
+static GLOBAL: support::CountingAllocator = support::CountingAllocator;
 
-const ROUNDS: usize = 5;
-const ATTEMPTS: usize = 3;
-const ALLOC_ITERS: usize = 64;
+use support::{measure_case, print_table, CaseResult};
+
 const SIDE: usize = 8;
 const LEN: usize = SIDE * SIDE * SIDE;
-
-fn time_once(iterations: usize, body: &mut impl FnMut()) -> f64 {
-    let start = Instant::now();
-    for _ in 0..iterations {
-        body();
-    }
-    start.elapsed().as_secs_f64() * 1e9 / iterations as f64
-}
-
-fn allocations_per_op(body: &mut impl FnMut()) -> f64 {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..ALLOC_ITERS {
-        body();
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
-    (after - before) as f64 / ALLOC_ITERS as f64
-}
-
-struct CaseResult {
-    id: &'static str,
-    description: &'static str,
-    a_ns: f64,
-    b_ns: f64,
-    ratio: f64,
-    a_allocs: f64,
-    b_allocs: f64,
-    threshold: Option<f64>,
-    attempts_exceeded: usize,
-}
-
-impl CaseResult {
-    fn failed(&self) -> bool {
-        match self.threshold {
-            Some(_) => {
-                self.attempts_exceeded == ATTEMPTS || self.a_allocs > 0.0 || self.b_allocs > 0.0
-            }
-            None => false,
-        }
-    }
-}
-
-fn measure_case(
-    id: &'static str,
-    description: &'static str,
-    iterations: usize,
-    threshold: Option<f64>,
-    mut path_a: impl FnMut(),
-    mut path_b: impl FnMut(),
-) -> CaseResult {
-    path_a();
-    path_b();
-
-    let mut best_ratio = f64::INFINITY;
-    let mut reported_a = 0.0;
-    let mut reported_b = 0.0;
-    let mut max_a_allocs: f64 = 0.0;
-    let mut max_b_allocs: f64 = 0.0;
-    let mut attempts_exceeded = 0;
-    for _ in 0..ATTEMPTS {
-        // Interleave the two paths round by round so a frequency or thermal
-        // drift cannot land entirely on one side of the ratio.
-        let mut a_ns = f64::INFINITY;
-        let mut b_ns = f64::INFINITY;
-        for _ in 0..ROUNDS {
-            a_ns = a_ns.min(time_once(iterations, &mut path_a));
-            b_ns = b_ns.min(time_once(iterations, &mut path_b));
-        }
-        let ratio = a_ns / b_ns;
-        let a_allocs = allocations_per_op(&mut path_a);
-        let b_allocs = allocations_per_op(&mut path_b);
-        max_a_allocs = max_a_allocs.max(a_allocs);
-        max_b_allocs = max_b_allocs.max(b_allocs);
-        if let Some(threshold) = threshold {
-            if ratio > threshold {
-                attempts_exceeded += 1;
-            }
-        }
-        if ratio < best_ratio {
-            best_ratio = ratio;
-            reported_a = a_ns;
-            reported_b = b_ns;
-        }
-    }
-
-    CaseResult {
-        id,
-        description,
-        a_ns: reported_a,
-        b_ns: reported_b,
-        ratio: best_ratio,
-        a_allocs: max_a_allocs,
-        b_allocs: max_b_allocs,
-        threshold,
-        attempts_exceeded,
-    }
-}
 
 fn two_op_dag() -> FusedPlan {
     FusedPlan::new(
@@ -321,40 +203,6 @@ fn s5_case() -> CaseResult {
     )
 }
 
-fn print_table(cases: &[CaseResult]) {
-    let mut table = String::new();
-    table
-        .push_str("| id | case | A ns/op | B ns/op | ratio | A allocs/op | B allocs/op | gate |\n");
-    table
-        .push_str("|----|------|--------:|--------:|------:|------------:|------------:|------|\n");
-    for case in cases {
-        let gate = match case.threshold {
-            Some(threshold) if case.failed() => format!("FAIL (>{threshold})"),
-            Some(threshold) => format!("<= {threshold}"),
-            None => "report".to_string(),
-        };
-        table.push_str(&format!(
-            "| {} | {} | {:.1} | {:.1} | {:.3} | {:.2} | {:.2} | {} |\n",
-            case.id,
-            case.description,
-            case.a_ns,
-            case.b_ns,
-            case.ratio,
-            case.a_allocs,
-            case.b_allocs,
-            gate,
-        ));
-    }
-    print!("{table}");
-    let _ = std::io::stdout().flush();
-    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = file.write_all(b"\n### strided-fused overhead smoke\n\n");
-            let _ = file.write_all(table.as_bytes());
-        }
-    }
-}
-
 fn run_cases() -> Vec<CaseResult> {
     vec![s1_case(), s2_case(), s5_case()]
 }
@@ -380,11 +228,6 @@ fn main() {
     #[cfg(not(feature = "parallel"))]
     let cases = run_cases();
 
-    print_table(&cases);
-
-    let failed = cases.iter().any(CaseResult::failed);
-    if failed && std::env::var_os("OVERHEAD_GATE").is_some() {
-        eprintln!("overhead smoke gate failed (see table above)");
-        std::process::exit(1);
-    }
+    print_table(&cases, "### strided-fused overhead smoke");
+    support::exit_if_failed(&cases);
 }

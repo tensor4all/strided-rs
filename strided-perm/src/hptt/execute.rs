@@ -270,8 +270,10 @@ unsafe fn grouped_recursive<T: Copy>(
         } else {
             grouped_recursive(s, d, rest, grouped);
         }
-        s = s.offset(node.lda);
-        d = d.offset(node.ldb);
+        // The advance after the last iteration may leave the allocation; the
+        // cursor is never dereferenced there, so it must not use `offset`.
+        s = s.wrapping_offset(node.lda);
+        d = d.wrapping_offset(node.ldb);
     }
 }
 
@@ -279,12 +281,18 @@ unsafe fn grouped_recursive<T: Copy>(
 unsafe fn grouped_tile_copy<T: Copy>(src: *const T, dst: *mut T, grouped: &GroupedTilePlan) {
     let group_a = &grouped.group_a;
     let group_b = &grouped.group_b;
+    // Borrow the offset tables once; indexing the `TinyVec` per access would
+    // pay its inline/heap match in the element-count loop.
+    let a_src = group_a.src_offsets.as_slice();
+    let a_dst = group_a.dst_offsets.as_slice();
+    let b_src = group_b.src_offsets.as_slice();
+    let b_dst = group_b.dst_offsets.as_slice();
 
     for a in 0..group_a.len {
-        let src_a = src.offset(group_a.src_offsets[a]);
-        let dst_a = dst.offset(group_a.dst_offsets[a]);
+        let src_a = src.offset(a_src[a]);
+        let dst_a = dst.offset(a_dst[a]);
         for b in 0..group_b.len {
-            *dst_a.offset(group_b.dst_offsets[b]) = *src_a.offset(group_b.src_offsets[b]);
+            *dst_a.offset(b_dst[b]) = *src_a.offset(b_src[b]);
         }
     }
 }
@@ -318,8 +326,10 @@ unsafe fn transpose_recursive<T: Copy + 'static>(
         } else {
             transpose_recursive(s, d, rest, size_a, size_b, lda, ldb, block);
         }
-        s = s.offset(node.lda);
-        d = d.offset(node.ldb);
+        // Last-iteration advance may leave the allocation; see
+        // `grouped_recursive`.
+        s = s.wrapping_offset(node.lda);
+        d = d.wrapping_offset(node.ldb);
     }
 }
 
@@ -646,8 +656,10 @@ unsafe fn const_stride1_recursive<T: Copy>(
         } else {
             const_stride1_recursive(s, d, rest, count, src_stride, dst_stride);
         }
-        s = s.offset(node.lda);
-        d = d.offset(node.ldb);
+        // Last-iteration advance may leave the allocation; see
+        // `grouped_recursive`.
+        s = s.wrapping_offset(node.lda);
+        d = d.wrapping_offset(node.ldb);
     }
 }
 
@@ -665,6 +677,22 @@ mod tests {
             execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
         }
         assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn terminal_cursor_advance_may_leave_the_allocation() {
+        // dims [2, 2] with source strides [1, 3] over a 5-element buffer: the
+        // outer loop's terminal advance reaches offset 6 after its last copy,
+        // past the allocation. That cursor is never read, so the advance must
+        // wrap; Miri flags the pre-fix `offset`.
+        let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
+        let mut dst = vec![0.0f64; 4];
+        let plan = build_permute_plan(&[2, 2], &[1, 3], &[1, 2], 8).unwrap();
+        unsafe {
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+        }
+        // dst(i, j) = src(i + 3j) in col-major dst: [1, 2, 4, 5].
+        assert_eq!(dst, vec![1.0, 2.0, 4.0, 5.0]);
     }
 
     #[test]

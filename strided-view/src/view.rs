@@ -573,17 +573,18 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
                 .checked_add(strides[hi])
                 .ok_or(StridedError::OffsetOverflow)?;
             dims[lo] = dims[lo].min(dims[hi]);
-            axes_to_remove.push(hi);
-        }
-
-        axes_to_remove.sort_unstable();
-        let mut unique_axes: tinyvec::TinyVec<[usize; INLINE_RANK]> = tinyvec::TinyVec::new();
-        for &axis in axes_to_remove.iter() {
-            if unique_axes.last() != Some(&axis) {
-                unique_axes.push(axis);
+            // Insert each removal axis once. Pairs may share an axis, so a
+            // duplicate would otherwise grow the list past the rank bound and
+            // spill the inline vector for an otherwise in-bounds view.
+            if !axes_to_remove.contains(&hi) {
+                axes_to_remove.push(hi);
             }
         }
-        for &ax in unique_axes.iter().rev() {
+
+        // Remove in descending order so the lower indices stay valid. The list
+        // is already unique, so no deduplication pass is needed.
+        axes_to_remove.sort_unstable();
+        for &ax in axes_to_remove.iter().rev() {
             dims.remove(ax);
             strides.remove(ax);
         }
@@ -1030,8 +1031,11 @@ impl<T: Clone + Default> StridedArray<T> {
         let mut data = Vec::with_capacity(total);
         let mut idx: AxisVec = AxisVec::new();
         idx.resize(rank, 0usize);
+        // Borrow the cursor once; indexing the `TinyVec` per access would pay
+        // its inline/heap match in the element-count loop.
+        let idx: &mut [usize] = &mut idx[..];
         for _ in 0..total {
-            data.push(f(&idx));
+            data.push(f(idx));
             for d in 0..rank {
                 idx[d] += 1;
                 if idx[d] < dims[d] {
@@ -1057,8 +1061,10 @@ impl<T: Clone + Default> StridedArray<T> {
         let mut data = Vec::with_capacity(total);
         let mut idx: AxisVec = AxisVec::new();
         idx.resize(rank, 0usize);
+        // Borrow the cursor once; see `from_fn_col_major`.
+        let idx: &mut [usize] = &mut idx[..];
         for _ in 0..total {
-            data.push(f(&idx));
+            data.push(f(idx));
             for d in (0..rank).rev() {
                 idx[d] += 1;
                 if idx[d] < dims[d] {

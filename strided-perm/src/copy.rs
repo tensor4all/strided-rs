@@ -6,16 +6,6 @@ use crate::hptt::execute_permute_blocked_par;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
 
-/// Accept every injective destination the exact check can settle, using the
-/// allocation-free validator first. The analysis is owned by
-/// [`strided_view::injectivity`]; this only states the "keep accepted layouts"
-/// policy of the permutation entries.
-#[inline]
-fn destination_is_injective(dims: &[usize], strides: &[isize]) -> bool {
-    strided_view::is_injective_layout_without_alloc(dims, strides)
-        || strided_view::is_injective_layout(dims, strides)
-}
-
 /// Map a permutation planning failure onto the shared view error vocabulary.
 ///
 /// Rank and shape are validated before planning, so a length mismatch cannot
@@ -129,7 +119,7 @@ pub fn copy_into<T: Copy + 'static>(
     // offset, so the unsafe write loop would produce overlapping writes (and a
     // data race under `parallel`). This matches the sibling output-writing
     // APIs (issue #281).
-    if !destination_is_injective(dst_dims, dst_strides) {
+    if !strided_view::is_injective_layout(dst_dims, dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
     unsafe {
@@ -196,19 +186,11 @@ pub fn copy_into_par<T: Copy + Send + Sync + 'static>(
     let plan =
         build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
     // Reject overlapping destination layouts before any unsafe write, serial
-    // or parallel (issue #281).
-    if !destination_is_injective(dst_dims, dst_strides) {
+    // or parallel (issue #281). The check is global over the destination, so
+    // two worker partitions (disjoint logical positions) can never write one
+    // offset; no extra per-partition separation proof is needed.
+    if !strided_view::is_injective_layout(dst_dims, dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
-    }
-
-    if !strided_view::axes_are_separated(dst_dims, dst_strides) {
-        // Each tile is written by one worker; an unresolved destination layout
-        // could map two tiles onto one offset, which is a data race under
-        // parallel execution. Keep the serial engine for that case.
-        unsafe {
-            execute_permute_blocked(src_ptr, dst_ptr, &plan);
-        }
-        return Ok(());
     }
 
     unsafe {
@@ -415,16 +397,6 @@ mod tests {
     #[test]
     fn test_try_fuse_group_non_contiguous() {
         assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
-    }
-
-    #[test]
-    fn destination_separation_rejects_overlapping_strides() {
-        assert!(strided_view::axes_are_separated(&[3, 16384], &[1, 3]));
-        // The first axis' offsets (stride 2) interleave the second axis' (stride
-        // 1), so the parallel entry must keep the serial engine.
-        assert!(!strided_view::axes_are_separated(&[3, 16384], &[2, 1]));
-        assert!(!strided_view::axes_are_separated(&[4], &[-1]));
-        assert!(strided_view::axes_are_separated(&[1, 1], &[0, 1]));
     }
 
     #[cfg(feature = "parallel")]

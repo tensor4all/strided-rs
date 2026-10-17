@@ -143,6 +143,25 @@ fn clone_conj_and_derived_views_allocate_nothing_up_to_inline_rank() {
 }
 
 #[test]
+fn diagonal_view_with_repeated_pairs_allocates_nothing() {
+    // Nine copies of the same removal axis must not grow the axis list past
+    // the inline bound: insertion is unique, so a rank-2 view still allocates
+    // nothing even though the pair list is longer than INLINE_RANK. The layout
+    // is the review's reproducer (dims [2, 2], strides [0, 0]).
+    let dims = [2usize, 2];
+    let strides = [0isize, 0];
+    let data = [0.0f64; 1];
+    let view = StridedView::<f64>::new(&data, &dims, &strides, 0).unwrap();
+    let pairs = [(0usize, 1usize); INLINE_RANK + 1];
+    let allocations = count_allocations(|| {
+        let diagonal = view.diagonal_view(&pairs).unwrap();
+        assert_eq!(diagonal.dims(), &[2]);
+        black_box(diagonal.dims().len());
+    });
+    assert_eq!(allocations, 0, "duplicate diagonal pairs allocated");
+}
+
+#[test]
 fn mutable_permute_and_reborrow_allocate_nothing_up_to_inline_rank() {
     for rank in 1..=INLINE_RANK {
         let (dims, strides, data) = contiguous_case(rank);

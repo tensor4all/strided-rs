@@ -396,8 +396,86 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
 
     run_composites(&pool);
     check_reduce_axis(&pool);
+    check_parallel_threshold(&pool);
+    check_full_reduction(&pool);
     check_plans(&pool);
     record_rank9_spill(&pool);
+}
+
+/// Tensor-sized cases above the 32768-element threading threshold, so the
+/// two-worker counting windows exercise the real parallel branches rather than
+/// the serial fallback that the `large` shapes (1025..1152 elements) take.
+fn check_parallel_threshold(pool: &rayon::ThreadPool) {
+    let shapes: [&[usize]; 3] = [
+        &[33, 33, 33],
+        &[3, 3, 3, 3, 3, 3, 3, 21],
+        &[5, 4, 4, 4, 4, 4, 4, 2],
+    ];
+    for dims in shapes {
+        assert!(
+            total(dims) > 32_768,
+            "threshold case {dims:?} is not tensor-sized"
+        );
+        run_map_entries(dims, pool);
+    }
+}
+
+/// The recursive full-reduction fold (`reduce`, whose parallel path combines
+/// per-worker partials in a tree) must also be allocation-free on every worker
+/// for a non-contiguous source above the threading threshold.
+fn check_full_reduction(pool: &rayon::ThreadPool) {
+    use strided_basic::reduce;
+
+    let dims = [257usize, 128];
+    let strides = [1isize, 300];
+    assert!(
+        total(&dims) > 32_768,
+        "full-reduction case is not tensor-sized"
+    );
+    let len = required_len(&dims, &strides);
+    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    // A gapped stride keeps the source non-contiguous so the recursive
+    // partial-combination fold runs instead of the contiguous lane fold.
+    let source = sv(&src, &dims, &strides, 0).unwrap();
+
+    // Warm up under both execution modes outside the counted windows.
+    with_execution_policy(ExecutionPolicy::Sequential, || {
+        let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
+    });
+    pool.install(|| {
+        with_execution_policy(
+            ExecutionPolicy::Rayon {
+                max_threads: NonZeroUsize::new(2).unwrap(),
+            },
+            || {
+                let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
+            },
+        );
+    });
+
+    let serial = count_thread_allocations(|| {
+        with_execution_policy(ExecutionPolicy::Sequential, || {
+            let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
+        });
+    });
+    assert_eq!(serial, 0, "serial full reduction allocated {serial}");
+
+    let parallel = pool.install(|| {
+        count_allocations(|| {
+            with_execution_policy(
+                ExecutionPolicy::Rayon {
+                    max_threads: NonZeroUsize::new(2).unwrap(),
+                },
+                || {
+                    let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
+                },
+            );
+        })
+    });
+    assert_eq!(
+        parallel, 0,
+        "two-worker full reduction allocated {parallel}"
+    );
 }
 
 /// Compiled plans must not allocate on compile or execute within the inline

@@ -110,11 +110,20 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
         if buffer.len() < words {
             buffer.resize(words, MaybeUninit::uninit());
         }
+        // INITIALIZATION: initialize through `MaybeUninit` first, then form
+        // the live slice. Forming `&mut [T]` over uninitialized storage (even
+        // to fill it) violates `from_raw_parts_mut`'s validity requirement.
         // SAFETY: the `u128` buffer is aligned for `T` (the chunk path only
-        // reaches f32/f64), and `seed` initializes every `len` slot before the
-        // callback observes the slice.
-        let regs = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<T>(), len) };
-        regs.fill(seed);
+        // reaches f32/f64) and the allocation covers `len * size_of::<T>()`
+        // bytes.
+        let uninit = unsafe {
+            core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<MaybeUninit<T>>(), len)
+        };
+        for slot in uninit.iter_mut() {
+            slot.write(seed);
+        }
+        // SAFETY: every slot was initialized just above.
+        let regs = unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<T>(), len) };
         f(regs)
     })
 }
@@ -475,6 +484,28 @@ fn chunk_ternary<T: FusedScalar>(op: FusedOp, a: &[T], b: &[T], c: &[T], dst: &m
         *slot = super::eval_ternary(op, a[index], b[index], c[index]);
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fused::{FusedInst, FusedOp};
+
+    #[test]
+    fn register_file_is_seeded_before_the_live_slice_is_formed() {
+        // The per-thread buffer starts uninitialized; the seed must be written
+        // through `MaybeUninit` before `&mut [T]` is formed. Miri flags reading
+        // or referencing the uninitialized buffer otherwise.
+        let plan = FusedPlan::new(1, vec![2], vec![FusedInst::new(FusedOp::Negate, vec![0])]);
+        with_register_file::<f64, _>(&plan, Some(7.0), |regs| {
+            assert_eq!(regs.len(), register_file_len(&plan));
+            assert!(regs.iter().all(|&value| value == 7.0));
+        });
+        // A second call reuses the grown buffer and re-seeds it.
+        with_register_file::<f64, _>(&plan, Some(-3.5), |regs| {
+            assert!(regs.iter().all(|&value| value == -3.5));
+        });
+    }
+}
+
 /// Apply one analytic unary kernel over a chunk, or return `false` when `op`
 /// has no vector kernel for `T`.
 ///

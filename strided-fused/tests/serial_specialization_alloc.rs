@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use strided_basic::{
     ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    ExecContext, KernelDType,
+    ExecContext, KernelDType, StridedView, StridedViewMut,
 };
-use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
+use strided_fused::{fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 
 struct CountingAllocator;
 
@@ -27,12 +27,17 @@ static GLOBAL_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static THREAD_FREES: Cell<usize> = const { Cell::new(0) };
 }
 
 fn record_allocation() {
     GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
     // `try_with` fails only during thread teardown, when nothing is counted.
     let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+}
+
+fn record_deallocation() {
+    let _ = THREAD_FREES.try_with(|count| count.set(count.get() + 1));
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -42,6 +47,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        record_deallocation();
         System.dealloc(ptr, layout)
     }
 
@@ -58,6 +64,17 @@ fn count_allocations(run: impl FnOnce()) -> usize {
     let before = THREAD_ALLOCATIONS.with(Cell::get);
     run();
     THREAD_ALLOCATIONS.with(Cell::get) - before
+}
+
+/// Net live allocations (allocations minus frees) made by the calling thread
+/// while `run` executes. Used to catch a dropped-metadata leak.
+fn count_net_allocations(run: impl FnOnce()) -> isize {
+    let before_alloc = THREAD_ALLOCATIONS.with(Cell::get);
+    let before_free = THREAD_FREES.with(Cell::get);
+    run();
+    let after_alloc = THREAD_ALLOCATIONS.with(Cell::get);
+    let after_free = THREAD_FREES.with(Cell::get);
+    (after_alloc - before_alloc) as isize - (after_free - before_free) as isize
 }
 
 /// Allocations made by every thread while `run` executes.
@@ -307,6 +324,147 @@ fn two_worker_replay_does_not_allocate_above_threshold() {
         })
     });
     assert_eq!(allocated, 0, "two-worker replay allocated {allocated}");
+}
+
+/// A multi-output rank-9 replay builds each destination view on the stack,
+/// and above `INLINE_RANK` each owns boxed shape/stride metadata. The RAII
+/// guard must drop the initialized prefix, so a call leaves no live allocation
+/// behind on success (post-review leak regression).
+#[test]
+fn rank9_multi_output_replay_drops_destination_metadata() {
+    let dims = vec![2usize; 9];
+    let mut strides: Vec<isize> = Vec::with_capacity(9);
+    let mut stride = 1isize;
+    for &dim in &dims {
+        strides.push(stride);
+        stride *= dim as isize;
+    }
+    let len: usize = dims.iter().product();
+    let input: Vec<f64> = (0..len).map(|value| value as f64 + 1.0).collect();
+    let input_ref = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
+    let inputs = [input_ref];
+    let serial = ExecContext::serial();
+    let plan = ErasedFusedPlan::compile(
+        KernelDType::F64,
+        FusedPlan::new(
+            1,
+            vec![0, 1],
+            vec![FusedInst::new(FusedOp::Negate, vec![0])],
+        ),
+    )
+    .unwrap();
+
+    let mut pass_through = vec![0.0f64; len];
+    let mut negated = vec![0.0f64; len];
+    // Warm up so the destination views' first-touch and any one-time state
+    // stay outside the counted window.
+    {
+        let mut dests = [
+            ErasedRawStridedMut::from_slice_mut(&mut pass_through, &dims, &strides, 0).unwrap(),
+            ErasedRawStridedMut::from_slice_mut(&mut negated, &dims, &strides, 0).unwrap(),
+        ];
+        plan.execute_outputs(&serial, &mut dests, &inputs).unwrap();
+    }
+    let mut dests = [
+        ErasedRawStridedMut::from_slice_mut(&mut pass_through, &dims, &strides, 0).unwrap(),
+        ErasedRawStridedMut::from_slice_mut(&mut negated, &dims, &strides, 0).unwrap(),
+    ];
+    let live = count_net_allocations(|| {
+        plan.execute_outputs(&serial, &mut dests, &inputs).unwrap();
+    });
+    assert_eq!(
+        live, 0,
+        "rank-9 multi-output replay leaked {live} allocations"
+    );
+}
+
+/// `execute_outputs_uninit` with two destinations must keep its validation
+/// tokens inline within the five-stream bound (post-review regression); the
+/// old code allocated a token `Vec` for every multi-output call.
+#[test]
+fn serial_multi_output_uninit_replay_does_not_allocate() {
+    let side = 8usize;
+    let dims = [side, side, side];
+    let strides = [1isize, side as isize, (side * side) as isize];
+    let len = side * side * side;
+    let input: Vec<f64> = (0..len).map(|value| value as f64 + 1.0).collect();
+    let input_ref = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
+    let input_ptrs = [ErasedRawStridedPtr::from_ref(&input_ref)];
+    let serial = ExecContext::serial();
+    let plan = ErasedFusedPlan::compile(
+        KernelDType::F64,
+        FusedPlan::new(
+            1,
+            vec![0, 1],
+            vec![FusedInst::new(FusedOp::Negate, vec![0])],
+        ),
+    )
+    .unwrap();
+
+    let mut pass_through = vec![MaybeUninit::<f64>::uninit(); len];
+    let mut negated = vec![MaybeUninit::<f64>::uninit(); len];
+    {
+        let mut dests = [
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut pass_through, &dims, &strides, 0)
+                .unwrap(),
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut negated, &dims, &strides, 0).unwrap(),
+        ];
+        plan.execute_outputs_uninit(&serial, &mut dests, &input_ptrs)
+            .unwrap();
+    }
+    let mut dests = [
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut pass_through, &dims, &strides, 0)
+            .unwrap(),
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut negated, &dims, &strides, 0).unwrap(),
+    ];
+    let allocated = count_allocations(|| {
+        plan.execute_outputs_uninit(&serial, &mut dests, &input_ptrs)
+            .unwrap();
+    });
+    assert_eq!(
+        allocated, 0,
+        "multi-output uninit replay allocated {allocated}"
+    );
+}
+
+/// A rank-8 unspecialized typed replay is within the inline-metadata bound, so
+/// the per-call dimension vector must not spill (post-review regression).
+#[test]
+fn typed_rank_eight_unspecialized_replay_does_not_allocate() {
+    let dims = [2usize; 8];
+    let mut strides = Vec::with_capacity(8);
+    let mut stride = 1isize;
+    for &dim in &dims {
+        strides.push(stride);
+        stride *= dim as isize;
+    }
+    let len: usize = dims.iter().product();
+    let lhs: Vec<f64> = (0..len).map(|value| value as f64).collect();
+    let rhs: Vec<f64> = (0..len).map(|value| (value + 1) as f64).collect();
+    let lhs_view = StridedView::<f64>::new(&lhs, &dims, &strides, 0).unwrap();
+    let rhs_view = StridedView::<f64>::new(&rhs, &dims, &strides, 0).unwrap();
+    let inputs = [lhs_view.clone(), rhs_view.clone()];
+    // The input order keeps this plan off the static specialization, so it
+    // replays through the generic interpreter.
+    let plan = FusedPlan::new(
+        2,
+        vec![3],
+        vec![
+            FusedInst::new(FusedOp::Add, vec![1, 0]),
+            FusedInst::new(FusedOp::Multiply, vec![2, 0]),
+        ],
+    );
+    let mut out = vec![0.0f64; len];
+    let mut dest = StridedViewMut::<f64>::new(&mut out, &dims, &strides, 0).unwrap();
+    // Warm up outside the counted window.
+    fused_elementwise_into(std::slice::from_mut(&mut dest), &inputs, &plan).unwrap();
+    let allocated = count_allocations(|| {
+        fused_elementwise_into(std::slice::from_mut(&mut dest), &inputs, &plan).unwrap();
+    });
+    assert_eq!(
+        allocated, 0,
+        "rank-8 unspecialized replay allocated {allocated}"
+    );
 }
 
 /// `ErasedFusedPlan::compile` and `FusedPlan` construction stay allocation-free

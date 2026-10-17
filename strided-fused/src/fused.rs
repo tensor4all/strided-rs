@@ -18,22 +18,52 @@ use strided_basic::{with_execution_policy, ExecutionPolicy};
 
 mod chunk;
 
-/// Reborrow the initialized prefix of a stack buffer of destination views.
+/// RAII owner of the initialized prefix of a stack buffer of destination
+/// views.
 ///
 /// Used by the erased multi-output entry points so their stack-buffer cast stays
-/// out of the erased raw-boundary modules.
-///
-/// # Safety
-/// `storage[..len]` must be initialized and `len <= storage.len()`.
-pub(crate) unsafe fn initialized_views_mut<'a, 'b, T, const N: usize>(
-    storage: &'b mut [MaybeUninit<StridedViewMut<'a, T>>; N],
+/// out of the erased raw-boundary modules. Dropping the guard drops exactly the
+/// initialized prefix, so a rank above `INLINE_RANK` does not leak every
+/// destination's boxed metadata on success, error, or unwind.
+pub(crate) struct InitializedViewsMut<'a, T> {
+    storage: *mut MaybeUninit<StridedViewMut<'a, T>>,
     len: usize,
-) -> &'b mut [StridedViewMut<'a, T>] {
-    debug_assert!(len <= N);
-    // SAFETY: the caller guarantees the prefix is initialized, and
-    // `MaybeUninit<StridedViewMut>` has the same layout as `StridedViewMut`.
-    unsafe {
-        core::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<StridedViewMut<'a, T>>(), len)
+}
+
+impl<'a, T> InitializedViewsMut<'a, T> {
+    /// # Safety
+    /// `storage` must point to at least `OPERAND_CAP` writable slots that stay
+    /// valid until the guard is dropped.
+    pub(crate) unsafe fn new(storage: *mut MaybeUninit<StridedViewMut<'a, T>>) -> Self {
+        Self { storage, len: 0 }
+    }
+
+    /// Write the next initialized view into the prefix.
+    pub(crate) fn push(&mut self, view: StridedViewMut<'a, T>) {
+        debug_assert!(self.len < strided_basic::OPERAND_CAP);
+        // SAFETY: the caller reserved `OPERAND_CAP` slots and
+        // `len < OPERAND_CAP` holds.
+        unsafe { self.storage.add(self.len).write(MaybeUninit::new(view)) };
+        self.len += 1;
+    }
+
+    /// Borrow the initialized prefix.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [StridedViewMut<'a, T>] {
+        // SAFETY: every slot below `len` was initialized by `push`, and
+        // `MaybeUninit<StridedViewMut>` has the same layout as
+        // `StridedViewMut`.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.storage.cast::<StridedViewMut<'a, T>>(), self.len)
+        }
+    }
+}
+
+impl<T> Drop for InitializedViewsMut<'_, T> {
+    fn drop(&mut self) {
+        for index in 0..self.len {
+            // SAFETY: every slot in the prefix was initialized by `push`.
+            unsafe { (*self.storage.add(index)).assume_init_drop() };
+        }
     }
 }
 
@@ -1412,7 +1442,7 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         if dests[0].is_empty() {
             return Ok(());
         }
-        let dims: strided_basic::OperandVec<usize> = dests[0].dims().iter().copied().collect();
+        let dims: strided_basic::InlineVec<usize> = dests[0].dims().iter().copied().collect();
 
         let dst_ptrs: strided_basic::OperandVec<OperandPtr<T>> = dests
             .iter_mut()
@@ -1531,7 +1561,7 @@ fn interpret_fused_elementwise_into_serial<T: FusedScalar>(
     if dests[0].is_empty() {
         return Ok(());
     }
-    let dims: strided_basic::OperandVec<usize> = dests[0].dims().iter().copied().collect();
+    let dims: strided_basic::InlineVec<usize> = dests[0].dims().iter().copied().collect();
 
     let dst_ptrs: strided_basic::OperandVec<OperandPtr<T>> = dests
         .iter_mut()
@@ -1763,7 +1793,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
     plan: &FusedPlan,
     _serial: bool,
 ) -> Result<()> {
-    let dims: strided_basic::OperandVec<usize> = dests[0].dims().iter().copied().collect();
+    let dims: strided_basic::InlineVec<usize> = dests[0].dims().iter().copied().collect();
     let dst_ptrs: strided_basic::OperandVec<OperandPtr<MaybeUninit<T>>> = dests
         .iter_mut()
         .map(|dest| OperandPtr::new(dest.as_mut_ptr()))
@@ -1949,12 +1979,17 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
 /// `Abs`, `Maximum`, `Minimum`, `Clamp`, `Sqrt`, `Rsqrt`, `Pow`) keep the scalar
 /// `FusedScalar` methods and are bit-identical to the per-element replay.
 ///
-/// Real `Maximum`, `Minimum`, and `Clamp` use Rust `f32`/`f64` `max`/`min`
-/// semantics. Complex `Abs` returns the norm in the real component; complex
-/// `Maximum`, `Minimum`, and `Clamp` compare by squared norm. Signed integer
-/// `Add`, `Multiply`, `Negate`, and `Abs` use wrapping arithmetic. `bool`
-/// supports only copy-like identity plans and `Conj`; ambiguous arithmetic and
-/// transcendental op/dtype pairs are rejected before any destination is written.
+/// Real `Maximum`, `Minimum`, and `Clamp` share the NaN-propagating select and
+/// signed-zero contract of `strided_basic::nan_propagating_maximum` /
+/// `nan_propagating_minimum` (issue #315): a NaN in any operand makes the
+/// result NaN, and a tie keeps the left operand, so `maximum(-0.0, 0.0)` and
+/// `clamp` on equal bounds preserve the signed zero of the left/bound operand.
+/// Complex `Abs` returns the norm in the real component; complex `Maximum`,
+/// `Minimum`, and `Clamp` compare by squared norm. Signed integer `Add`,
+/// `Multiply`, `Negate`, and `Abs` use wrapping arithmetic. `bool` supports
+/// only copy-like identity plans and `Conj`; ambiguous arithmetic and
+/// transcendental op/dtype pairs are rejected before any destination is
+/// written.
 pub fn fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],

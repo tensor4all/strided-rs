@@ -444,6 +444,15 @@ where
     let axis_len = src_dims[axis];
     let axis_stride = src_strides[axis];
 
+    if axis_len == 0 {
+        // No source elements to fold: every output is `init`. Fill the
+        // destination directly rather than traversing the source, because an
+        // empty source view carries a dangling base pointer and `offset` on it
+        // is UB even when the fold reads zero elements.
+        fill_outputs_with(dest, &init);
+        return Ok(());
+    }
+
     if rank == 1 {
         // Full reduction into a single destination element.
         // SAFETY: the view proves `axis_len` readable elements along `axis`.
@@ -542,6 +551,52 @@ where
         };
     }
     Ok(())
+}
+
+/// Writes `value` into every logical destination element.
+///
+/// Used when the reduced axis is empty: the fold would read zero source
+/// elements, so the destination is exactly `init` everywhere and no source
+/// pointer may be formed. The odometer keeps the fill allocation-free within
+/// [`strided_view::INLINE_RANK`] and spills above it.
+fn fill_outputs_with<U: Clone>(dest: &mut StridedViewMut<U>, value: &U) {
+    let dims = dest.dims();
+    if dims.iter().any(|&dim| dim == 0) {
+        return;
+    }
+    let strides = dest.strides();
+    let rank = dims.len();
+    let total: usize = dims.iter().product();
+    let base = dest.as_mut_ptr();
+    if rank == 0 {
+        // SAFETY: a rank-0 destination is one writable element.
+        unsafe { *base = value.clone() };
+        return;
+    }
+    let mut coords_inline = [0usize; strided_view::INLINE_RANK];
+    let mut coords_heap: Vec<usize> = Vec::new();
+    let coords: &mut [usize] = if rank <= strided_view::INLINE_RANK {
+        &mut coords_inline[..rank]
+    } else {
+        coords_heap.resize(rank, 0);
+        &mut coords_heap[..]
+    };
+    let mut offset = 0isize;
+    for _ in 0..total {
+        // SAFETY: the destination is an injective view validated by the
+        // caller, and the cursor visits each logical element exactly once, so
+        // every written offset is in bounds.
+        unsafe { *base.offset(offset) = value.clone() };
+        for axis in 0..rank {
+            coords[axis] += 1;
+            offset += strides[axis];
+            if coords[axis] < dims[axis] {
+                break;
+            }
+            coords[axis] = 0;
+            offset -= dims[axis] as isize * strides[axis];
+        }
+    }
 }
 
 /// Shared inputs of [`reduce_axis_range_linear`] and

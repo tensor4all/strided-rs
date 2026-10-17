@@ -17,10 +17,10 @@ use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
     copy_scale_raw, erased_map_into, erased_zip_into, map_into, zip_map2_into, CopyPlan,
     ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
-    ErasedMapOp, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, ErasedReducePlan, ErasedReversePlan, ErasedScatterPlan,
-    ErasedSlicePlan, ErasedZipOp, ExecContext, Identity, KernelDType, RawStridedMut, RawStridedRef,
-    ReduceOp, ScatterSpec, StridedView, StridedViewMut,
+    ErasedGatherPlan, ErasedMapOp, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan, ErasedReversePlan,
+    ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, ExecContext, GatherSpec, Identity,
+    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
 };
 
 struct CountingAllocator;
@@ -772,6 +772,75 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         },
     )
     .unwrap();
+    // The compile itself must not allocate within the inline bound: the axis
+    // validators used to build a `Vec<bool>` per call (post-review regression).
+    let compile_spec = ScatterSpec {
+        update_window_dims: (1..8).collect(),
+        inserted_window_dims: vec![0],
+        scatter_dims_to_operand_dims: vec![0],
+        index_vector_dim: 1,
+    };
+    // Capture references (which are `Copy`) so only the owned spec moves.
+    let src_dims_ref = &src_dims;
+    let src_strides_ref = &src_strides;
+    let index_dims_ref = &window_index_dims;
+    let index_strides_ref = &window_index_strides;
+    let update_dims_ref = &window_update_dims;
+    let update_strides_ref = &window_update_strides;
+    let compile_allocations = count_allocations(move || {
+        let plan = ErasedScatterPlan::compile(
+            KernelDType::F64,
+            KernelDType::I64,
+            src_dims_ref,
+            src_strides_ref,
+            index_dims_ref,
+            index_strides_ref,
+            update_dims_ref,
+            update_strides_ref,
+            src_dims_ref,
+            src_strides_ref,
+            compile_spec,
+        )
+        .unwrap();
+        std::hint::black_box(plan);
+    });
+    assert_eq!(
+        compile_allocations, 0,
+        "rank-8 scatter compile must not allocate"
+    );
+    // `GatherPlan::compile` must move its owned spec rather than clone it.
+    let gather_operand_dims = [3usize, 4];
+    let gather_operand_strides = [1isize, 3];
+    let gather_index_dims = [2usize, 1];
+    let gather_index_strides = [1isize, 2];
+    let gather_dest_dims = [2usize, 3];
+    let gather_dest_strides = [1isize, 2];
+    let gather_spec = GatherSpec {
+        offset_dims: vec![1],
+        collapsed_slice_dims: vec![1],
+        start_index_map: vec![1],
+        index_vector_dim: 1,
+        slice_sizes: vec![3, 1],
+    };
+    let gather_compile_allocations = count_allocations(move || {
+        let plan = ErasedGatherPlan::compile(
+            KernelDType::F64,
+            KernelDType::I64,
+            &gather_operand_dims,
+            &gather_operand_strides,
+            &gather_index_dims,
+            &gather_index_strides,
+            &gather_dest_dims,
+            &gather_dest_strides,
+            gather_spec,
+        )
+        .unwrap();
+        std::hint::black_box(plan);
+    });
+    assert_eq!(
+        gather_compile_allocations, 0,
+        "gather compile must not clone its spec"
+    );
     let window_index = ErasedRawStridedRef::from_slice(
         &window_indices,
         &window_index_dims,
