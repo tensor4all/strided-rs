@@ -140,9 +140,6 @@ impl ErasedFusedPlan {
                 self.plan.outputs.len(),
             ));
         }
-        if dests.is_empty() {
-            return Err(StridedError::RankMismatch(0, 1));
-        }
         for dest in dests.iter() {
             check_dtype(self.dtype, dest.dtype())?;
         }
@@ -273,9 +270,6 @@ impl ErasedFusedPlan {
                 dests.len(),
                 self.plan.outputs.len(),
             ));
-        }
-        if dests.is_empty() {
-            return Err(StridedError::RankMismatch(0, 1));
         }
         for dest in dests.iter() {
             check_dtype(self.dtype, dest.dtype())?;

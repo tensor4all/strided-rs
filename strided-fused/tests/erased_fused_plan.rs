@@ -618,6 +618,87 @@ fn erased_fused_plan_executes_rank_zero_multiple_outputs() {
 }
 
 #[test]
+fn erased_fused_plan_executes_rank_zero_uninit_multiple_outputs() {
+    let dims: [usize; 0] = [];
+    let strides: [isize; 0] = [];
+    let input = [2.0f64];
+    let plan = ErasedFusedPlan::compile(
+        KernelDType::F64,
+        FusedPlan {
+            input_count: 1,
+            outputs: vec![0, 1, 2],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Negate,
+                    inputs: vec![0],
+                },
+                FusedInst {
+                    op: FusedOp::Negate,
+                    inputs: vec![1],
+                },
+            ],
+        },
+    )
+    .unwrap();
+    let input_ref = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
+    let pointers = [ErasedRawStridedPtr::from_ref(&input_ref)];
+    let mut pass_through = [MaybeUninit::<f64>::uninit(); 1];
+    let mut negated = [MaybeUninit::<f64>::uninit(); 1];
+    let mut twice = [MaybeUninit::<f64>::uninit(); 1];
+    {
+        let mut dests = [
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut pass_through, &dims, &strides, 0)
+                .unwrap(),
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut negated, &dims, &strides, 0).unwrap(),
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut twice, &dims, &strides, 0).unwrap(),
+        ];
+        plan.execute_outputs_uninit(&ExecContext::serial(), &mut dests, &pointers)
+            .unwrap();
+    }
+    // SAFETY: `execute_outputs_uninit` writes every reachable element.
+    assert_eq!(unsafe { pass_through[0].assume_init() }, 2.0);
+    // SAFETY: as above.
+    assert_eq!(unsafe { negated[0].assume_init() }, -2.0);
+    // SAFETY: as above.
+    assert_eq!(unsafe { twice[0].assume_init() }, 2.0);
+}
+
+#[test]
+fn erased_fused_plan_writes_a_repeated_output_id_to_every_destination() {
+    let dims = [3usize];
+    let unit = [1isize];
+    let input = [1.0f64, -2.0, 3.0];
+    let plan = ErasedFusedPlan::compile(
+        KernelDType::F64,
+        FusedPlan {
+            input_count: 1,
+            outputs: vec![0, 0, 1],
+            ops: vec![FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![0],
+            }],
+        },
+    )
+    .unwrap();
+    let inputs = [ErasedRawStridedRef::from_slice(&input, &dims, &unit, 0).unwrap()];
+    let mut first = [0.0f64; 3];
+    let mut second = [0.0f64; 3];
+    let mut negated = [0.0f64; 3];
+    {
+        let mut dests = [
+            ErasedRawStridedMut::from_slice_mut(&mut first, &dims, &unit, 0).unwrap(),
+            ErasedRawStridedMut::from_slice_mut(&mut second, &dims, &unit, 0).unwrap(),
+            ErasedRawStridedMut::from_slice_mut(&mut negated, &dims, &unit, 0).unwrap(),
+        ];
+        plan.execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+            .unwrap();
+    }
+    assert_eq!(first, input);
+    assert_eq!(second, input);
+    assert_eq!(negated, [-1.0, 2.0, -3.0]);
+}
+
+#[test]
 fn erased_fused_plan_rejects_destination_count_mismatch() {
     let dims = [2usize];
     let unit = [1isize];
@@ -675,12 +756,13 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
         ErasedRawStridedUninitMut::from_raw_parts(KernelDType::F64, base, byte_len, &dims, &unit, 0)
     }
     .unwrap();
-    let mut disjoint_storage = [MaybeUninit::<f64>::uninit(); 2];
-    let disjoint =
-        ErasedRawStridedUninitMut::from_uninit_slice(&mut disjoint_storage, &dims, &unit, 0)
-            .unwrap();
+    // The first destination is disjoint and pre-filled. The overlap in the
+    // second must be rejected before the first is written.
+    let mut first_storage = [MaybeUninit::new(7.5f64); 2];
+    let first =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut first_storage, &dims, &unit, 0).unwrap();
     let err = {
-        let mut dests = [overlapping, disjoint];
+        let mut dests = [first, overlapping];
         plan.execute_outputs_uninit(&ExecContext::serial(), &mut dests, &[input])
             .unwrap_err()
     };
@@ -688,5 +770,13 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
         err,
         StridedError::OverlappingInputOutput { input: 0 }
     ));
+    for (index, slot) in first_storage.iter().enumerate() {
+        // SAFETY: the sentinel slots were initialized before the call.
+        assert_eq!(
+            unsafe { slot.assume_init() },
+            7.5,
+            "first destination element {index} was written before validation failed"
+        );
+    }
     assert_eq!(storage, [1.0, 2.0, 3.0, 4.0]);
 }

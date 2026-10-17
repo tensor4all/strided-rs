@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use strided_basic::{
-    map_into_uninit_with_kernel, mul_into_uninit, with_execution_policy, ErasedRawStridedPtr,
-    ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext, ExecutionPolicy, KernelDType,
-    KernelStorageElement, MaybeSendSync, StridedView, StridedViewMut,
+    map_into_uninit_with_kernel, mul_into_uninit, with_execution_policy, zip_map2_into,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext,
+    ExecutionPolicy, KernelDType, KernelStorageElement, MaybeSendSync, StridedView, StridedViewMut,
 };
 use strided_fused::{
     fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan, FusedScalar,
@@ -244,9 +244,10 @@ fn ping_pong_tanh<T: BenchScalar>(
 }
 
 /// The per-instruction dispatch cost: the same instructions one at a time
-/// through the workspace's vector kernels. For [`Row::TwoOutput`] the consumer
-/// that predates multi-output plans compiled one plan per output, so the shared
-/// chain is replayed twice.
+/// through the workspace's vector kernels. For [`Row::TwoOutput`] the shared
+/// chain runs once; its buffer is both the first output and the input of the
+/// final `add(input0)` that produces the second output, and every op goes
+/// through a threaded kernel.
 #[allow(clippy::too_many_arguments)]
 fn per_instruction<T: BenchScalar>(
     row: Row,
@@ -256,9 +257,9 @@ fn per_instruction<T: BenchScalar>(
     b_strides: &[isize],
     dims: &[usize],
     len: usize,
-    buffers: &mut [Vec<MaybeUninit<T>>; 4],
+    buffers: &mut [Vec<MaybeUninit<T>>; 3],
 ) {
-    let [buffer0, buffer1, buffer2, buffer3] = buffers;
+    let [buffer0, buffer1, buffer2] = buffers;
     let a_view = StridedView::<T>::new(a_data, dims, a_strides, 0).unwrap();
     let b_view = StridedView::<T>::new(b_data, dims, b_strides, 0).unwrap();
     match row {
@@ -267,17 +268,15 @@ fn per_instruction<T: BenchScalar>(
             ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer0, buffer1)
         }
         Row::TwoOutput => {
-            // Plan for output 11: the shared chain.
+            // The shared chain runs once and ends in `buffer1`.
             ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer0, buffer1);
-            // Plan for output 12: the chain is recomputed, then `add(input0)`.
-            ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer2, buffer3);
-            // SAFETY: `buffer2` and `buffer3` are distinct; the raw read of one
-            // and the writes to the other do not overlap.
-            let src_data: &[T] =
-                unsafe { std::slice::from_raw_parts(buffer3.as_ptr().cast::<T>(), len) };
-            for index in 0..len {
-                buffer2[index].write(src_data[index] + a_data[index]);
-            }
+            // SAFETY: `buffer1` is read through a raw pointer while `buffer2`
+            // is written; they are distinct buffers.
+            let chain_data: &[T] =
+                unsafe { std::slice::from_raw_parts(buffer1.as_ptr().cast::<T>(), len) };
+            let chain = StridedView::<T>::new(chain_data, dims, b_strides, 0).unwrap();
+            let mut dest = StridedViewMut::new(buffer2, dims, b_strides, 0).unwrap();
+            zip_map2_into(&mut dest, &chain, &a_view, |x, y| MaybeUninit::new(x + y)).unwrap();
         }
     }
 }
@@ -367,7 +366,7 @@ fn bench_size<T: BenchScalar>(
         });
 
         // One instruction at a time over preallocated buffers.
-        let mut buffers: [Vec<MaybeUninit<T>>; 4] =
+        let mut buffers: [Vec<MaybeUninit<T>>; 3] =
             std::array::from_fn(|_| vec![MaybeUninit::uninit(); len]);
         group.bench_function("per_instruction_dispatch", |bencher| {
             bencher.iter(|| {
