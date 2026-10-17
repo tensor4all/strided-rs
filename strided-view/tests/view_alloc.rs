@@ -257,20 +257,21 @@ fn above_inline_rank_spills_gracefully() {
     let rank = INLINE_RANK + 1;
     let (dims, strides, data) = contiguous_case(rank);
 
-    // `new` copies both metadata vectors, and each spills at rank 9.
+    // `new` boxes `SpilledMeta` plus one slice per metadata vector, and each
+    // spills at rank 9.
     let allocations = count_allocations(|| {
         let view = StridedView::<f64>::new(&data, &dims, &strides, 0).unwrap();
         black_box(view.dims().len());
     });
-    assert_eq!(allocations, 2, "rank 9 new should spill two metadata vecs");
+    assert_eq!(allocations, 3, "rank 9 new should spill the boxed metadata");
 
     let view = StridedView::<f64>::new(&data, &dims, &strides, 0).unwrap();
     let allocations = count_allocations(|| {
         black_box(view.clone());
     });
     assert_eq!(
-        allocations, 2,
-        "rank 9 clone should spill two metadata vecs"
+        allocations, 3,
+        "rank 9 clone should spill the boxed metadata"
     );
 
     let perm: Vec<usize> = (0..rank).rev().collect();

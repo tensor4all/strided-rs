@@ -30,7 +30,8 @@ pub mod view;
 /// Maximum rank whose metadata is stored inline without a heap allocation.
 ///
 /// [`StridedView`], [`StridedViewMut`] and [`StridedArray`] keep up to this
-/// many dimensions and strides in a `SmallVec` on the stack. Derived views,
+/// many dimensions and strides inline in a fixed-size `Copy` buffer. Derived
+/// views,
 /// clones and array constructors are allocation-free at ranks 1 through
 /// `INLINE_RANK`; a higher rank spills to the heap gracefully (never an
 /// error).

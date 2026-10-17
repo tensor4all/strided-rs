@@ -7,18 +7,197 @@
 //! - [`StridedViewMut`]: Mutable dynamic-rank strided view (Identity op only)
 //! - [`StridedArray`]: Owned strided multidimensional array
 //!
-//! A view's shape and strides are inline `SmallVec`s with capacity
-//! [`crate::INLINE_RANK`]: every constructor, clone, and metadata transform
-//! allocates nothing up to that rank and spills gracefully above it. The view
-//! itself only borrows the element data.
+//! A view's shape and strides are a small inline-or-heap container with
+//! capacity [`crate::INLINE_RANK`]: every constructor, clone, and metadata
+//! transform allocates nothing up to that rank and spills gracefully above
+//! it. The view itself only borrows the element data.
+//!
+//! The container is deliberately not `smallvec::SmallVec`: the generic
+//! `SmallVec` clone/`from_slice` walks elements and does capacity
+//! bookkeeping, which dominates a metadata copy of a handful of words. See
+//! [`InlineVec`].
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
 
 use smallvec::SmallVec;
 
 use crate::element_op::{ComposableElementOp, ElementOp, ElementOpApply, Identity};
 use crate::{AxisVec, Result, StrideVec, StridedError, INLINE_RANK};
+
+/// Inline metadata for up to [`INLINE_RANK`] elements, stored as a `Copy`
+/// fixed array.
+///
+/// The buffer is `MaybeUninit` so only the live prefix is ever written; the
+/// value is nevertheless `Copy`, and its `Copy`/`Clone` is one fixed-size
+/// bitwise copy (the uninitialized tail is never read as `T`). An owning enum
+/// variant would add drop glue to every clone, and a runtime-length copy is
+/// lowered to a `memcpy` PLT call; this has neither.
+#[derive(Clone, Copy)]
+struct InlineVec<T: Copy> {
+    len: u8,
+    buf: [MaybeUninit<T>; INLINE_RANK],
+}
+
+impl<T: Copy> InlineVec<T> {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            len: 0,
+            buf: [MaybeUninit::uninit(); INLINE_RANK],
+        }
+    }
+
+    #[inline(always)]
+    fn from_slice(src: &[T]) -> Self {
+        debug_assert!(src.len() <= INLINE_RANK);
+        let n = src.len();
+        let mut buf = [MaybeUninit::<T>::uninit(); INLINE_RANK];
+        // Literal-count writes: a runtime-length loop or `copy_from_slice` is
+        // recognized by LLVM and lowered to a `memcpy` call, whose PLT
+        // overhead dominates these few words.
+        match n {
+            0 => {}
+            1 => {
+                buf[0].write(src[0]);
+            }
+            2 => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+            }
+            3 => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+                buf[2].write(src[2]);
+            }
+            4 => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+                buf[2].write(src[2]);
+                buf[3].write(src[3]);
+            }
+            5 => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+                buf[2].write(src[2]);
+                buf[3].write(src[3]);
+                buf[4].write(src[4]);
+            }
+            6 => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+                buf[2].write(src[2]);
+                buf[3].write(src[3]);
+                buf[4].write(src[4]);
+                buf[5].write(src[5]);
+            }
+            7 => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+                buf[2].write(src[2]);
+                buf[3].write(src[3]);
+                buf[4].write(src[4]);
+                buf[5].write(src[5]);
+                buf[6].write(src[6]);
+            }
+            _ => {
+                buf[0].write(src[0]);
+                buf[1].write(src[1]);
+                buf[2].write(src[2]);
+                buf[3].write(src[3]);
+                buf[4].write(src[4]);
+                buf[5].write(src[5]);
+                buf[6].write(src[6]);
+                buf[7].write(src[7]);
+            }
+        }
+        Self { len: n as u8, buf }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: the first `len` elements are initialized by `from_slice`,
+        // and the `Copy`/`Clone` of the container preserves those bytes.
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const T, self.len as usize) }
+    }
+}
+
+impl<T: Copy + std::fmt::Debug> std::fmt::Debug for InlineVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+/// Heap-owned metadata used only above [`INLINE_RANK`].
+#[derive(Clone, Debug)]
+struct SpilledMeta {
+    dims: Box<[usize]>,
+    strides: Box<[isize]>,
+}
+
+/// Shape and strides of a view or array.
+///
+/// Rank `<= INLINE_RANK` is stored inline in two [`InlineVec`]s and the
+/// `spilled` slot is `None`, so cloning the whole metadata is a fixed-size
+/// copy with one predictable `None` check. A higher rank keeps the inline
+/// buffers empty and boxes both vectors.
+#[derive(Debug)]
+struct ViewMeta {
+    inline_dims: InlineVec<usize>,
+    inline_strides: InlineVec<isize>,
+    spilled: Option<Box<SpilledMeta>>,
+}
+
+impl Clone for ViewMeta {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inline_dims: self.inline_dims,
+            inline_strides: self.inline_strides,
+            spilled: self.spilled.clone(),
+        }
+    }
+}
+
+impl ViewMeta {
+    #[inline(always)]
+    fn from_slices(dims: &[usize], strides: &[isize]) -> Self {
+        debug_assert_eq!(dims.len(), strides.len());
+        if dims.len() <= INLINE_RANK {
+            Self {
+                inline_dims: InlineVec::from_slice(dims),
+                inline_strides: InlineVec::from_slice(strides),
+                spilled: None,
+            }
+        } else {
+            Self {
+                inline_dims: InlineVec::new(),
+                inline_strides: InlineVec::new(),
+                spilled: Some(Box::new(SpilledMeta {
+                    dims: dims.into(),
+                    strides: strides.into(),
+                })),
+            }
+        }
+    }
+
+    #[inline]
+    fn dims(&self) -> &[usize] {
+        match &self.spilled {
+            Some(spilled) => &spilled.dims,
+            None => self.inline_dims.as_slice(),
+        }
+    }
+
+    #[inline]
+    fn strides(&self) -> &[isize] {
+        match &self.spilled {
+            Some(spilled) => &spilled.strides,
+            None => self.inline_strides.as_slice(),
+        }
+    }
+}
 
 #[inline]
 fn empty_layout(dims: &[usize]) -> bool {
@@ -40,6 +219,7 @@ fn empty_mut_ptr<T>() -> *mut T {
 // ============================================================================
 
 /// Validate that all accessed offsets stay within `[0, len)`.
+#[inline]
 pub(crate) fn validate_bounds(
     len: usize,
     dims: &[usize],
@@ -184,7 +364,7 @@ pub fn row_major_strides(dims: &[usize]) -> StrideVec {
 ///
 /// # Size
 ///
-/// The inline metadata makes the view 176 bytes on 64-bit targets for
+/// The inline metadata makes the view 184 bytes on 64-bit targets for
 /// `usize`/`isize` strides.
 ///
 /// # Auto traits
@@ -202,8 +382,7 @@ pub fn row_major_strides(dims: &[usize]) -> StrideVec {
 pub struct StridedView<'a, T, Op = Identity> {
     ptr: *const T,
     data: &'a [T],
-    dims: SmallVec<[usize; INLINE_RANK]>,
-    strides: SmallVec<[isize; INLINE_RANK]>,
+    meta: ViewMeta,
     offset: isize,
     _op: PhantomData<Op>,
 }
@@ -217,8 +396,7 @@ impl<T, Op> Clone for StridedView<'_, T, Op> {
         Self {
             ptr: self.ptr,
             data: self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            meta: self.meta.clone(),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -228,8 +406,8 @@ impl<T, Op> Clone for StridedView<'_, T, Op> {
 impl<T: std::fmt::Debug, Op> std::fmt::Debug for StridedView<'_, T, Op> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StridedView")
-            .field("dims", &self.dims)
-            .field("strides", &self.strides)
+            .field("dims", &self.meta.dims())
+            .field("strides", &self.meta.strides())
             .field("offset", &self.offset)
             .finish()
     }
@@ -252,16 +430,16 @@ fn base_ptr<T>(data: &[T], dims: &[usize], offset: isize) -> *const T {
 #[inline]
 fn from_meta<'a, T, Op>(
     data: &'a [T],
-    dims: AxisVec,
-    strides: StrideVec,
+    dims: &[usize],
+    strides: &[isize],
     offset: isize,
 ) -> StridedView<'a, T, Op> {
-    let ptr = base_ptr(data, &dims, offset);
+    let meta = ViewMeta::from_slices(dims, strides);
+    let ptr = base_ptr(data, meta.dims(), offset);
     StridedView {
         ptr,
         data,
-        dims,
-        strides,
+        meta,
         offset,
         _op: PhantomData,
     }
@@ -287,12 +465,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     #[inline]
     pub fn new(data: &'a [T], dims: &[usize], strides: &[isize], offset: isize) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
-        Ok(from_meta(
-            data,
-            SmallVec::from_slice(dims),
-            SmallVec::from_slice(strides),
-            offset,
-        ))
+        Ok(from_meta(data, dims, strides, offset))
     }
 
     /// Create a view without bounds checking, copying the caller's metadata.
@@ -316,24 +489,19 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         strides: &[isize],
         offset: isize,
     ) -> Self {
-        from_meta(
-            data,
-            SmallVec::from_slice(dims),
-            SmallVec::from_slice(strides),
-            offset,
-        )
+        from_meta(data, dims, strides, offset)
     }
 
     /// Returns the shape (dimension sizes) of this view.
     #[inline]
     pub fn dims(&self) -> &[usize] {
-        &self.dims
+        self.meta.dims()
     }
 
     /// Returns the strides (in units of `T`) for each dimension.
     #[inline]
     pub fn strides(&self) -> &[isize] {
-        &self.strides
+        self.meta.strides()
     }
 
     /// Returns the byte offset into the backing data.
@@ -345,19 +513,19 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Returns the number of dimensions (rank).
     #[inline]
     pub fn ndim(&self) -> usize {
-        self.dims.len()
+        self.dims().len()
     }
 
     /// Returns the total number of elements.
     #[inline]
     pub fn len(&self) -> usize {
-        self.dims.iter().product()
+        self.dims().iter().product()
     }
 
     /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dims.iter().any(|&d| d == 0)
+        self.dims().iter().any(|&d| d == 0)
     }
 
     /// Returns a reference to the backing data slice.
@@ -374,7 +542,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
 
     /// Permute dimensions.
     pub fn permute(&self, perm: &[usize]) -> Result<StridedView<'a, T, Op>> {
-        let rank = self.dims.len();
+        let rank = self.dims().len();
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
@@ -388,9 +556,9 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
             }
             seen[p] = true;
         }
-        let new_dims: AxisVec = perm.iter().map(|&p| self.dims[p]).collect();
-        let new_strides: StrideVec = perm.iter().map(|&p| self.strides[p]).collect();
-        Ok(from_meta(self.data, new_dims, new_strides, self.offset))
+        let new_dims: AxisVec = perm.iter().map(|&p| self.dims()[p]).collect();
+        let new_strides: StrideVec = perm.iter().map(|&p| self.strides()[p]).collect();
+        Ok(from_meta(self.data, &new_dims, &new_strides, self.offset))
     }
 
     /// Create a diagonal view by fusing repeated axis pairs via stride trick (zero-copy).
@@ -452,38 +620,33 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         // its own and is validated here instead (tensor4all/strided-rs#204).
         validate_bounds(self.data().len(), &dims, &strides, self.offset())?;
 
-        Ok(from_meta(self.data(), dims, strides, self.offset()))
+        Ok(from_meta(self.data(), &dims, &strides, self.offset()))
     }
 
     /// Broadcast this view to a target shape.
     ///
     /// Size-1 dimensions are expanded (stride set to 0) to match target.
     pub fn broadcast(&self, target_dims: &[usize]) -> Result<StridedView<'a, T, Op>> {
-        if self.dims.len() != target_dims.len() {
+        if self.dims().len() != target_dims.len() {
             return Err(StridedError::RankMismatch(
-                self.dims.len(),
+                self.dims().len(),
                 target_dims.len(),
             ));
         }
-        let mut new_strides = StrideVec::with_capacity(self.dims.len());
-        for i in 0..self.dims.len() {
-            if self.dims[i] == target_dims[i] {
-                new_strides.push(self.strides[i]);
-            } else if self.dims[i] == 1 {
+        let mut new_strides = StrideVec::with_capacity(self.dims().len());
+        for i in 0..self.dims().len() {
+            if self.dims()[i] == target_dims[i] {
+                new_strides.push(self.strides()[i]);
+            } else if self.dims()[i] == 1 {
                 new_strides.push(0);
             } else {
                 return Err(StridedError::ShapeMismatch(
-                    self.dims.to_vec(),
+                    self.dims().to_vec(),
                     target_dims.to_vec(),
                 ));
             }
         }
-        Ok(from_meta(
-            self.data,
-            SmallVec::from_slice(target_dims),
-            new_strides,
-            self.offset,
-        ))
+        Ok(from_meta(self.data, target_dims, &new_strides, self.offset))
     }
 }
 
@@ -493,13 +656,13 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     ///
     /// Julia equivalent: `Base.transpose(a::AbstractStridedView{<:Any, 2})`
     pub fn transpose_2d(&self) -> Result<StridedView<'a, T, Op::ComposeTranspose>> {
-        if self.dims.len() != 2 {
-            return Err(StridedError::RankMismatch(self.dims.len(), 2));
+        if self.dims().len() != 2 {
+            return Err(StridedError::RankMismatch(self.dims().len(), 2));
         }
         Ok(from_meta(
             self.data,
-            AxisVec::from_slice(&[self.dims[1], self.dims[0]]),
-            StrideVec::from_slice(&[self.strides[1], self.strides[0]]),
+            &[self.dims()[1], self.dims()[0]],
+            &[self.strides()[1], self.strides()[0]],
             self.offset,
         ))
     }
@@ -508,13 +671,13 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     ///
     /// Julia equivalent: `Base.adjoint(a::AbstractStridedView{<:Any, 2})`
     pub fn adjoint_2d(&self) -> Result<StridedView<'a, T, Op::ComposeAdjoint>> {
-        if self.dims.len() != 2 {
-            return Err(StridedError::RankMismatch(self.dims.len(), 2));
+        if self.dims().len() != 2 {
+            return Err(StridedError::RankMismatch(self.dims().len(), 2));
         }
         Ok(from_meta(
             self.data,
-            AxisVec::from_slice(&[self.dims[1], self.dims[0]]),
-            StrideVec::from_slice(&[self.strides[1], self.strides[0]]),
+            &[self.dims()[1], self.dims()[0]],
+            &[self.strides()[1], self.strides()[0]],
             self.offset,
         ))
     }
@@ -527,8 +690,7 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
         StridedView {
             ptr: self.ptr,
             data: self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            meta: self.meta.clone(),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -556,7 +718,7 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
     pub unsafe fn get_unchecked(&self, indices: &[usize]) -> T {
         let mut idx = 0isize;
         for (i, &index) in indices.iter().enumerate() {
-            idx += index as isize * self.strides[i];
+            idx += index as isize * self.strides()[i];
         }
         Op::apply(*self.ptr.offset(idx))
     }
@@ -573,8 +735,7 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
 pub struct StridedViewMut<'a, T> {
     ptr: *mut T,
     data: &'a mut [T],
-    dims: SmallVec<[usize; INLINE_RANK]>,
-    strides: SmallVec<[isize; INLINE_RANK]>,
+    meta: ViewMeta,
     offset: isize,
 }
 
@@ -583,8 +744,8 @@ unsafe impl<T: Send> Send for StridedViewMut<'_, T> {}
 impl<T: std::fmt::Debug> std::fmt::Debug for StridedViewMut<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StridedViewMut")
-            .field("dims", &self.dims)
-            .field("strides", &self.strides)
+            .field("dims", &self.meta.dims())
+            .field("strides", &self.meta.strides())
             .field("offset", &self.offset)
             .finish()
     }
@@ -593,8 +754,9 @@ impl<T: std::fmt::Debug> std::fmt::Debug for StridedViewMut<'_, T> {
 impl<'a, T> StridedViewMut<'a, T> {
     /// A view from already-validated metadata.
     #[inline]
-    fn from_meta(data: &'a mut [T], dims: AxisVec, strides: StrideVec, offset: isize) -> Self {
-        let ptr = if empty_layout(&dims) {
+    fn from_meta(data: &'a mut [T], dims: &[usize], strides: &[isize], offset: isize) -> Self {
+        let meta = ViewMeta::from_slices(dims, strides);
+        let ptr = if empty_layout(meta.dims()) {
             empty_mut_ptr()
         } else {
             unsafe { data.as_mut_ptr().offset(offset) }
@@ -602,8 +764,7 @@ impl<'a, T> StridedViewMut<'a, T> {
         Self {
             ptr,
             data,
-            dims,
-            strides,
+            meta,
             offset,
         }
     }
@@ -631,12 +792,7 @@ impl<'a, T> StridedViewMut<'a, T> {
         offset: isize,
     ) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
-        Ok(Self::from_meta(
-            data,
-            SmallVec::from_slice(dims),
-            SmallVec::from_slice(strides),
-            offset,
-        ))
+        Ok(Self::from_meta(data, dims, strides, offset))
     }
 
     /// Create without bounds checking, copying the caller's metadata.
@@ -660,24 +816,19 @@ impl<'a, T> StridedViewMut<'a, T> {
         strides: &[isize],
         offset: isize,
     ) -> Self {
-        Self::from_meta(
-            data,
-            SmallVec::from_slice(dims),
-            SmallVec::from_slice(strides),
-            offset,
-        )
+        Self::from_meta(data, dims, strides, offset)
     }
 
     /// Returns the shape (dimension sizes) of this view.
     #[inline]
     pub fn dims(&self) -> &[usize] {
-        &self.dims
+        self.meta.dims()
     }
 
     /// Returns the strides (in units of `T`) for each dimension.
     #[inline]
     pub fn strides(&self) -> &[isize] {
-        &self.strides
+        self.meta.strides()
     }
 
     /// Returns the byte offset into the backing data.
@@ -689,19 +840,19 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// Returns the number of dimensions (rank).
     #[inline]
     pub fn ndim(&self) -> usize {
-        self.dims.len()
+        self.dims().len()
     }
 
     /// Returns the total number of elements.
     #[inline]
     pub fn len(&self) -> usize {
-        self.dims.iter().product()
+        self.dims().iter().product()
     }
 
     /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dims.iter().any(|&d| d == 0)
+        self.dims().iter().any(|&d| d == 0)
     }
 
     /// Raw const pointer to element at the view's base offset.
@@ -733,7 +884,7 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// Returns a new mutable view with reordered dimensions and strides.
     /// Takes `self` by value to prevent aliasing of mutable views.
     pub fn permute(self, perm: &[usize]) -> Result<StridedViewMut<'a, T>> {
-        let rank = self.dims.len();
+        let rank = self.dims().len();
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
@@ -747,12 +898,12 @@ impl<'a, T> StridedViewMut<'a, T> {
             }
             seen[p] = true;
         }
-        let new_dims: AxisVec = perm.iter().map(|&p| self.dims[p]).collect();
-        let new_strides: StrideVec = perm.iter().map(|&p| self.strides[p]).collect();
+        let new_dims: AxisVec = perm.iter().map(|&p| self.dims()[p]).collect();
+        let new_strides: StrideVec = perm.iter().map(|&p| self.strides()[p]).collect();
         Ok(Self::from_meta(
             self.data,
-            new_dims,
-            new_strides,
+            &new_dims,
+            &new_strides,
             self.offset,
         ))
     }
@@ -778,8 +929,7 @@ impl<'a, T> StridedViewMut<'a, T> {
         StridedView {
             ptr: self.ptr as *const T,
             data: unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.data.len()) },
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            meta: self.meta.clone(),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -821,16 +971,15 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
 /// Supports both column-major (Julia default) and row-major (C default) layouts.
 pub struct StridedArray<T> {
     data: Vec<T>,
-    dims: SmallVec<[usize; INLINE_RANK]>,
-    strides: SmallVec<[isize; INLINE_RANK]>,
+    meta: ViewMeta,
     offset: isize,
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for StridedArray<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StridedArray")
-            .field("dims", &self.dims)
-            .field("strides", &self.strides)
+            .field("dims", &self.meta.dims())
+            .field("strides", &self.meta.strides())
             .field("offset", &self.offset)
             .finish()
     }
@@ -840,8 +989,7 @@ impl<T: Clone> Clone for StridedArray<T> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            meta: self.meta.clone(),
             offset: self.offset,
         }
     }
@@ -868,8 +1016,7 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -894,8 +1041,7 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = row_major_strides(dims);
         Self {
             data,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -921,8 +1067,7 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -948,8 +1093,7 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -966,8 +1110,7 @@ impl<T> StridedArray<T> {
         validate_bounds(data.len(), dims, strides, offset)?;
         Ok(Self {
             data,
-            dims: SmallVec::from_slice(dims),
-            strides: SmallVec::from_slice(strides),
+            meta: ViewMeta::from_slices(dims, strides),
             offset,
         })
     }
@@ -975,31 +1118,31 @@ impl<T> StridedArray<T> {
     /// Returns the shape (dimension sizes) of this array.
     #[inline]
     pub fn dims(&self) -> &[usize] {
-        &self.dims
+        self.meta.dims()
     }
 
     /// Returns the strides (in units of `T`) for each dimension.
     #[inline]
     pub fn strides(&self) -> &[isize] {
-        &self.strides
+        self.meta.strides()
     }
 
     /// Returns the number of dimensions (rank).
     #[inline]
     pub fn ndim(&self) -> usize {
-        self.dims.len()
+        self.dims().len()
     }
 
     /// Returns the total number of elements.
     #[inline]
     pub fn len(&self) -> usize {
-        self.dims.iter().product()
+        self.dims().iter().product()
     }
 
     /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dims.iter().any(|&d| d == 0)
+        self.dims().iter().any(|&d| d == 0)
     }
 
     /// Returns a reference to the backing data slice.
@@ -1025,8 +1168,7 @@ impl<T> StridedArray<T> {
         StridedView {
             ptr,
             data: &self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            meta: self.meta.clone(),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -1043,8 +1185,7 @@ impl<T> StridedArray<T> {
         StridedViewMut {
             ptr,
             data: &mut self.data,
-            dims: self.dims.clone(),
-            strides: self.strides.clone(),
+            meta: self.meta.clone(),
             offset: self.offset,
         }
     }
@@ -1054,7 +1195,7 @@ impl<T> StridedArray<T> {
     /// Returns a new array with reordered dims and strides.
     /// The underlying data buffer is not touched.
     pub fn permuted(self, perm: &[usize]) -> Result<Self> {
-        let rank = self.dims.len();
+        let rank = self.dims().len();
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
@@ -1068,12 +1209,11 @@ impl<T> StridedArray<T> {
             }
             seen[p] = true;
         }
-        let new_dims: AxisVec = perm.iter().map(|&p| self.dims[p]).collect();
-        let new_strides: StrideVec = perm.iter().map(|&p| self.strides[p]).collect();
+        let new_dims: AxisVec = perm.iter().map(|&p| self.dims()[p]).collect();
+        let new_strides: StrideVec = perm.iter().map(|&p| self.strides()[p]).collect();
         Ok(Self {
             data: self.data,
-            dims: new_dims,
-            strides: new_strides,
+            meta: ViewMeta::from_slices(&new_dims, &new_strides),
             offset: self.offset,
         })
     }
@@ -1113,8 +1253,7 @@ impl<T: Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data: buf,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -1132,8 +1271,7 @@ impl<T: Copy> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -1151,8 +1289,7 @@ impl<T: Copy> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data: buf,
-            dims: SmallVec::from_slice(dims),
-            strides,
+            meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         }
     }
@@ -1176,7 +1313,7 @@ impl<T: Copy> StridedArray<T> {
     /// Panics if `indices.len()` is not the array's rank, an index is out of
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn set(&mut self, indices: &[usize], value: T) {
-        let offset = indexed_offset(&self.dims, &self.strides, indices, self.offset);
+        let offset = indexed_offset(self.dims(), self.strides(), indices, self.offset);
         self.data[offset as usize] = value;
     }
 }
@@ -1185,14 +1322,14 @@ impl<T: Copy> Index<&[usize]> for StridedArray<T> {
     type Output = T;
 
     fn index(&self, indices: &[usize]) -> &T {
-        let offset = indexed_offset(&self.dims, &self.strides, indices, self.offset);
+        let offset = indexed_offset(self.dims(), self.strides(), indices, self.offset);
         &self.data[offset as usize]
     }
 }
 
 impl<T: Copy> IndexMut<&[usize]> for StridedArray<T> {
     fn index_mut(&mut self, indices: &[usize]) -> &mut T {
-        let offset = indexed_offset(&self.dims, &self.strides, indices, self.offset);
+        let offset = indexed_offset(self.dims(), self.strides(), indices, self.offset);
         &mut self.data[offset as usize]
     }
 }
