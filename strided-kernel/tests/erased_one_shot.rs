@@ -1,9 +1,11 @@
 use num_complex::{Complex32, Complex64};
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
-    erased_map_into, erased_zip_into, ErasedMapOp, ErasedRawStridedMut, ErasedRawStridedPtr,
-    ErasedRawStridedRef, ErasedZipOp, ExecContext, KernelDType, StridedError,
+    erased_clamp_into_uninit, erased_map_into, erased_zip_into, ErasedMapOp, ErasedRawStridedMut,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, ExecContext,
+    KernelDType, StridedError,
 };
 
 fn single_op_plan(input_count: usize, op: FusedOp) -> FusedPlan {
@@ -101,6 +103,185 @@ fn assert_binary_matches_plan<T>(
     }
 
     assert_eq!(one_shot, planned);
+}
+
+/// Bitwise `u64` key so the differential checks can compare NaN payloads and
+/// signed zeros, where `PartialEq` would hide or conflate the result.
+trait BitKey: Copy {
+    fn bit_key(self) -> u64;
+}
+
+impl BitKey for f32 {
+    fn bit_key(self) -> u64 {
+        self.to_bits() as u64
+    }
+}
+
+impl BitKey for f64 {
+    fn bit_key(self) -> u64 {
+        self.to_bits()
+    }
+}
+
+fn bit_keys<T: BitKey>(values: &[T]) -> Vec<u64> {
+    values.iter().map(|value| value.bit_key()).collect()
+}
+
+/// Differential check of the fused `Maximum`/`Minimum` against the ordinary
+/// erased binary kernel for every f32/f64 edge value (NaN in either operand
+/// and signed-zero ties).
+fn assert_binary_bits_match<T: BitKey + Copy + strided_kernel::KernelStorageElement>(
+    dtype: KernelDType,
+    lhs: &[T],
+    rhs: &[T],
+    one_shot_op: ErasedZipOp,
+    plan_op: FusedOp,
+) {
+    let dims = [lhs.len()];
+    let strides = [1isize];
+    let mut one_shot = lhs.to_vec();
+    let mut planned = lhs.to_vec();
+
+    {
+        let lhs = ErasedRawStridedRef::from_slice(lhs, &dims, &strides, 0).unwrap();
+        let rhs = ErasedRawStridedRef::from_slice(rhs, &dims, &strides, 0).unwrap();
+        let mut output =
+            ErasedRawStridedMut::from_slice_mut(&mut one_shot, &dims, &strides, 0).unwrap();
+        erased_zip_into(
+            dtype,
+            one_shot_op,
+            &ExecContext::serial(),
+            &mut output,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs),
+        )
+        .unwrap();
+    }
+
+    {
+        let lhs = ErasedRawStridedRef::from_slice(lhs, &dims, &strides, 0).unwrap();
+        let rhs = ErasedRawStridedRef::from_slice(rhs, &dims, &strides, 0).unwrap();
+        let mut output =
+            ErasedRawStridedMut::from_slice_mut(&mut planned, &dims, &strides, 0).unwrap();
+        ErasedFusedPlan::compile(dtype, single_op_plan(2, plan_op))
+            .unwrap()
+            .execute(&ExecContext::serial(), &mut output, &[lhs, rhs])
+            .unwrap();
+    }
+
+    assert_eq!(bit_keys(&one_shot), bit_keys(&planned));
+}
+
+/// Differential check of the fused `Clamp` against the ordinary erased clamp.
+fn assert_clamp_bits_match<T: BitKey + Copy + strided_kernel::KernelStorageElement>(
+    dtype: KernelDType,
+    x: &[T],
+    lo: &[T],
+    hi: &[T],
+) {
+    let dims = [x.len()];
+    let strides = [1isize];
+    let init = |values: Vec<MaybeUninit<T>>| -> Vec<T> {
+        values
+            .into_iter()
+            .map(|value| unsafe { value.assume_init() })
+            .collect()
+    };
+
+    let mut ordinary_storage = vec![MaybeUninit::<T>::uninit(); x.len()];
+    {
+        let x = ErasedRawStridedRef::from_slice(x, &dims, &strides, 0).unwrap();
+        let lo = ErasedRawStridedRef::from_slice(lo, &dims, &strides, 0).unwrap();
+        let hi = ErasedRawStridedRef::from_slice(hi, &dims, &strides, 0).unwrap();
+        let mut dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut ordinary_storage, &dims, &strides, 0)
+                .unwrap();
+        erased_clamp_into_uninit(
+            dtype,
+            &ExecContext::serial(),
+            &mut dest,
+            &ErasedRawStridedPtr::from_ref(&x),
+            &ErasedRawStridedPtr::from_ref(&lo),
+            &ErasedRawStridedPtr::from_ref(&hi),
+        )
+        .unwrap();
+    }
+
+    let mut planned_storage = vec![MaybeUninit::<T>::uninit(); x.len()];
+    {
+        let x = ErasedRawStridedRef::from_slice(x, &dims, &strides, 0).unwrap();
+        let lo = ErasedRawStridedRef::from_slice(lo, &dims, &strides, 0).unwrap();
+        let hi = ErasedRawStridedRef::from_slice(hi, &dims, &strides, 0).unwrap();
+        let mut dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut planned_storage, &dims, &strides, 0)
+                .unwrap();
+        ErasedFusedPlan::compile(dtype, single_op_plan(3, FusedOp::Clamp))
+            .unwrap()
+            .execute_uninit(
+                &ExecContext::serial(),
+                &mut dest,
+                &[
+                    ErasedRawStridedPtr::from_ref(&x),
+                    ErasedRawStridedPtr::from_ref(&lo),
+                    ErasedRawStridedPtr::from_ref(&hi),
+                ],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        bit_keys(&init(ordinary_storage)),
+        bit_keys(&init(planned_storage))
+    );
+}
+
+#[test]
+fn fused_maximum_minimum_and_clamp_agree_with_the_ordinary_kernels_on_nan() {
+    let f64_lhs = [f64::NAN, 3.0, f64::NAN, 0.0, -0.0, f64::INFINITY];
+    let f64_rhs = [3.0, f64::NAN, f64::NAN, -0.0, 0.0, f64::NEG_INFINITY];
+    assert_binary_bits_match(
+        KernelDType::F64,
+        &f64_lhs,
+        &f64_rhs,
+        ErasedZipOp::Maximum,
+        FusedOp::Maximum,
+    );
+    assert_binary_bits_match(
+        KernelDType::F64,
+        &f64_lhs,
+        &f64_rhs,
+        ErasedZipOp::Minimum,
+        FusedOp::Minimum,
+    );
+    assert_clamp_bits_match(
+        KernelDType::F64,
+        &[1.0, 2.0, 3.0, f64::NAN, 0.5, 2.0, -0.0],
+        &[0.0, 4.0, f64::NAN, 0.0, f64::NAN, 0.0, 0.0],
+        &[3.0, 1.0, 2.0, 1.0, 1.0, f64::NAN, 1.0],
+    );
+
+    let f32_lhs = [f32::NAN, 3.0, f32::NAN, 0.0, -0.0];
+    let f32_rhs = [3.0, f32::NAN, f32::NAN, -0.0, 0.0];
+    assert_binary_bits_match(
+        KernelDType::F32,
+        &f32_lhs,
+        &f32_rhs,
+        ErasedZipOp::Maximum,
+        FusedOp::Maximum,
+    );
+    assert_binary_bits_match(
+        KernelDType::F32,
+        &f32_lhs,
+        &f32_rhs,
+        ErasedZipOp::Minimum,
+        FusedOp::Minimum,
+    );
+    assert_clamp_bits_match(
+        KernelDType::F32,
+        &[1.0, 2.0, 3.0, f32::NAN],
+        &[0.0, 4.0, f32::NAN, 0.0],
+        &[3.0, 1.0, 2.0, 1.0],
+    );
 }
 
 #[test]

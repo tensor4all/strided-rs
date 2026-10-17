@@ -301,17 +301,22 @@ macro_rules! impl_real_fused_scalar {
 
             #[inline(always)]
             fn fused_maximum(self, rhs: Self) -> Self {
-                self.max(rhs)
+                // Same select as the ordinary binary kernel; see
+                // `strided_basic::nan_propagating_maximum`.
+                strided_basic::nan_propagating_maximum(self, rhs)
             }
 
             #[inline(always)]
             fn fused_minimum(self, rhs: Self) -> Self {
-                self.min(rhs)
+                strided_basic::nan_propagating_minimum(self, rhs)
             }
 
             #[inline(always)]
             fn fused_clamp(self, min: Self, max: Self) -> Self {
-                self.fused_maximum(min).fused_minimum(max)
+                // `minimum(hi, maximum(lo, x))`, the ordinary clamp
+                // composition; the argument order keeps signed-zero ties on
+                // the bounds and propagates NaN from any operand.
+                max.fused_minimum(min.fused_maximum(self))
             }
 
             #[inline(always)]

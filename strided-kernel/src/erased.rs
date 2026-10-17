@@ -1549,26 +1549,10 @@ macro_rules! impl_real_one_shot_scalar {
                     ErasedZipOp::Multiply => lhs * rhs,
                     ErasedZipOp::Divide => lhs / rhs,
                     ErasedZipOp::Remainder => lhs % rhs,
-                    // Both arms are written as selects (non short circuit `|`)
-                    // so the element loop vectorizes. The result is unchanged:
-                    // any NaN operand gives the canonical NaN, otherwise ties
-                    // such as `+0.0` against `-0.0` return `lhs`.
-                    ErasedZipOp::Maximum => {
-                        let picked = if lhs >= rhs { lhs } else { rhs };
-                        if lhs.is_nan() | rhs.is_nan() {
-                            <$ty>::NAN
-                        } else {
-                            picked
-                        }
-                    }
-                    ErasedZipOp::Minimum => {
-                        let picked = if lhs <= rhs { lhs } else { rhs };
-                        if lhs.is_nan() | rhs.is_nan() {
-                            <$ty>::NAN
-                        } else {
-                            picked
-                        }
-                    }
+                    // Shared NaN-propagating selects, so the fused path
+                    // cannot drift from the ordinary binary kernel.
+                    ErasedZipOp::Maximum => strided_basic::nan_propagating_maximum(lhs, rhs),
+                    ErasedZipOp::Minimum => strided_basic::nan_propagating_minimum(lhs, rhs),
                 }
             }
 
