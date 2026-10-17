@@ -9,10 +9,7 @@ use core::mem::MaybeUninit;
 
 use crate::{CopyPlan, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
 
-#[cfg(feature = "parallel")]
-type AxisVec<T> = smallvec::SmallVec<[T; crate::RAW_FUSED_RANK_LIMIT]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+type AxisVec<T> = crate::inline::InlineVec<T>;
 
 /// A compiled static-slice traversal.
 ///
@@ -290,7 +287,7 @@ impl PadPlan {
 
         let operand_total = checked_total_len(operand_dims)?;
         let dest_total = checked_total_len(dest_dims)?;
-        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
 
@@ -1219,7 +1216,7 @@ impl ConcatenatePlan {
             return Err(StridedError::InvalidAxis { axis, rank });
         }
         checked_total_len(dest_dims)?;
-        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
 

@@ -73,6 +73,7 @@ mod exec_context;
 pub mod execution;
 mod execution_policy;
 mod fuse;
+mod inline;
 mod kernel;
 mod layout_check;
 mod map_view;
@@ -93,6 +94,7 @@ pub use erased::{
 };
 pub use exec_context::ExecContext;
 pub use execution_policy::{with_execution_policy, ExecutionPolicy};
+pub use inline::{InlineVec, OperandVec, OPERAND_CAP};
 pub use map_view::{
     broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
     map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
@@ -106,7 +108,7 @@ pub use ops_view::{
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,
 };
-pub use reduce_view::{reduce, reduce_axis};
+pub use reduce_view::{reduce, reduce_axis, reduce_axis_into};
 pub use simd::MaybeSimdOps;
 pub use strided_view::view;
 pub use strided_view::*;

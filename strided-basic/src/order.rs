@@ -4,6 +4,7 @@
 //! an index_order + importance bit-packing algorithm.
 
 use crate::fuse::{compute_importance, sort_by_importance};
+use crate::inline::{InlineVec, OperandVec};
 use strided_view::auxiliary::index_order;
 
 /// Compute the optimal iteration order for dimensions.
@@ -29,10 +30,10 @@ pub(crate) fn compute_order(
     dims: &[usize],
     strides_list: &[&[isize]],
     dest_index: Option<usize>,
-) -> Vec<usize> {
+) -> InlineVec<usize> {
     let rank = dims.len();
     if rank == 0 {
-        return Vec::new();
+        return InlineVec::new();
     }
 
     if strides_list.is_empty() {
@@ -40,19 +41,19 @@ pub(crate) fn compute_order(
     }
 
     // Compute index_order for each stride array
-    let mut index_orders: Vec<Vec<usize>> = Vec::with_capacity(strides_list.len());
+    let mut index_orders: OperandVec<InlineVec<usize>> = OperandVec::new();
     for strides in strides_list {
-        index_orders.push(index_order(strides).into_vec());
+        index_orders.push(index_order(strides));
     }
 
     // Reorder so destination array is first (gets strong store-locality weight)
-    let reordered_strides: Vec<&[isize]>;
-    let reordered_orders: Vec<Vec<usize>>;
+    let reordered_strides: OperandVec<&[isize]>;
+    let reordered_orders: OperandVec<InlineVec<usize>>;
 
     if let Some(dest_idx) = dest_index {
         if dest_idx < strides_list.len() && dest_idx != 0 {
             // Move destination to front
-            let mut strides_vec: Vec<&[isize]> = strides_list.to_vec();
+            let mut strides_vec: OperandVec<&[isize]> = strides_list.iter().copied().collect();
             let mut orders_vec = index_orders;
 
             let dest_strides = strides_vec.remove(dest_idx);
@@ -64,11 +65,11 @@ pub(crate) fn compute_order(
             reordered_strides = strides_vec;
             reordered_orders = orders_vec;
         } else {
-            reordered_strides = strides_list.to_vec();
+            reordered_strides = strides_list.iter().copied().collect();
             reordered_orders = index_orders;
         }
     } else {
-        reordered_strides = strides_list.to_vec();
+        reordered_strides = strides_list.iter().copied().collect();
         reordered_orders = index_orders;
     }
 

@@ -7,16 +7,17 @@ use crate::kernel::{
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
-use crate::view::{col_major_strides, StridedArray, StridedView};
+use crate::view::{col_major_strides, StridedArray, StridedView, StridedViewMut};
 use crate::{Result, StridedError};
 use std::ops::Range;
 use strided_view::ElementOp;
 
 #[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
+use crate::inline::InlineVec;
 #[cfg(feature = "parallel")]
 use crate::threading::{
-    for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
+    for_each_inner_block_with_offsets, mapreduce_threaded_fold, SendPtr, MINTHREADLENGTH,
 };
 
 /// Number of independent accumulators of [`fold_contiguous`].
@@ -201,80 +202,54 @@ where
         let total = total_len(&fused_dims)?;
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
-            // False sharing avoidance: space output slots by cache line size
-            let spacing = (64 / std::mem::size_of::<U>()).max(1);
-            let mut threadedout = vec![init.clone(); spacing * nthreads];
-            let threadedout_ptr = SendPtr(threadedout.as_mut_ptr());
             let src_send = SendPtr(src_ptr as *mut T);
-
             let costs = compute_costs(&ordered_strides);
-
-            // For complete reduction, strides_list has 2 entries:
-            // [0] = threadedout (stride 0 everywhere — broadcasting), [1] = src
-            // The spacing/taskindex mechanism addresses output slots.
-            let ndim = fused_dims.len();
-            let mut threaded_strides = Vec::with_capacity(ordered_strides.len() + 1);
-            threaded_strides.push(vec![0isize; ndim]); // threadedout: stride 0 (broadcast)
-            for s in &ordered_strides {
-                threaded_strides.push(s.clone());
-            }
-            let initial_offsets = vec![0isize; threaded_strides.len()];
-
-            // Mask costs for threadedout stride=0 dims (all dims, since it's fully broadcast)
-            // This means: do NOT split on dims where output stride is 0 — but for complete
-            // reduction, ALL output strides are 0, so costs would all be masked to 0.
-            // Julia handles this with the spacing mechanism: each task writes to its own slot.
-            // We keep costs unmasked so splitting still works.
-
-            mapreduce_threaded(
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                ordered_strides.iter().map(|_| 0isize).collect();
+            let map_fn_ref = &map_fn;
+            let reduce_fn_ref = &reduce_fn;
+            let init_ref = &init;
+            // The reduction tree combines each split's partial result, so no
+            // worker-count-sized output-slot vector is needed (#306 scope).
+            let result = mapreduce_threaded_fold(
                 &fused_dims,
                 &plan.block,
-                &threaded_strides,
+                &ordered_strides,
                 &initial_offsets,
                 &costs,
                 nthreads,
-                spacing as isize,
-                1,
                 &|dims, blocks, strides_list, offsets| {
-                    // offsets[0] = spacing * (taskindex - 1) for threadedout
-                    // offsets[1] = offset into src
-                    let out_offset = offsets[0] as usize;
-                    let src_offsets = &offsets[1..];
-
+                    let mut acc = init_ref.clone();
                     for_each_inner_block_with_offsets(
                         dims,
                         blocks,
-                        &strides_list[1..],
-                        src_offsets,
+                        strides_list,
+                        offsets,
                         |offsets, len, strides| {
                             let mut ptr = unsafe { src_send.as_const().offset(offsets[0]) };
                             let stride = strides[0];
-                            let slot = unsafe { &mut *threadedout_ptr.as_ptr().add(out_offset) };
                             for _ in 0..len {
                                 let val = Op::apply(unsafe { *ptr });
-                                let mapped = map_fn(val);
-                                *slot = reduce_fn(slot.clone(), mapped);
+                                let mapped = map_fn_ref(val);
+                                acc = reduce_fn_ref(acc.clone(), mapped);
                                 unsafe {
                                     ptr = ptr.offset(stride);
                                 }
                             }
                             Ok(())
                         },
-                    )
+                    )?;
+                    Ok(acc)
                 },
+                &|a, b| reduce_fn_ref(a, b),
             )?;
-
-            // Merge thread-local results
-            let mut result = init;
-            for i in 0..nthreads {
-                result = reduce_fn(result, threadedout[i * spacing].clone());
-            }
             return Ok(result);
         }
     }
 
     let mut acc = init;
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -298,7 +273,10 @@ where
     Ok(acc)
 }
 
-/// Reduce along a single axis, returning a new StridedArray.
+/// Reduce along a single axis, returning a new `StridedArray`.
+///
+/// This allocates a column-major output and delegates to
+/// [`reduce_axis_into`].
 ///
 /// Every output folds `init` once and then its reduced elements. When the
 /// reduced axis has unit stride those elements are folded with the lane
@@ -325,48 +303,166 @@ where
     if axis >= rank {
         return Err(StridedError::InvalidAxis { axis, rank });
     }
+    // Reject an element count beyond `usize` before allocating the output.
+    total_len(src.dims())?;
+    let out_dims: InlineVec<usize> = src
+        .dims()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != axis)
+        .map(|(_, &d)| d)
+        .collect();
+    // A full reduction keeps the historical rank-1 shape-[1] output; the
+    // `_into` form accepts any single-element destination for that case.
+    let (out_dims, out_strides) = if out_dims.is_empty() {
+        let mut dims = InlineVec::new();
+        dims.push(1usize);
+        let strides = col_major_strides(&dims);
+        (dims, strides)
+    } else {
+        let strides = col_major_strides(&out_dims);
+        (out_dims, strides)
+    };
+    let total_out = total_len(&out_dims)?;
+    let mut out =
+        StridedArray::<U>::from_parts(vec![init.clone(); total_out], &out_dims, &out_strides, 0)?;
+    {
+        let mut dest = out.view_mut();
+        reduce_axis_into(&mut dest, src, axis, map_fn, reduce_fn, init)?;
+    }
+    Ok(out)
+}
+
+/// Reduce along a single axis into caller-owned storage.
+///
+/// `dest` must have the source's shape with `axis` removed, or any
+/// single-element destination for a full reduction, and an injective layout.
+/// Every destination element is written: an empty reduced axis fills each
+/// output with `init`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::InvalidAxis`] for `axis >= src.ndim()`,
+/// [`StridedError::RankMismatch`] / [`StridedError::ShapeMismatch`] for a
+/// destination shape that is not the reduced source shape,
+/// [`StridedError::NonInjectiveOutputLayout`] for an overlapping destination,
+/// and [`StridedError::OffsetOverflow`] for unrepresentable sizes.
+///
+/// # Examples
+///
+/// ```
+/// use strided_basic::{reduce_axis_into, StridedArray};
+/// # let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |i| (i[0] + 2 * i[1]) as f64);
+/// let mut out = StridedArray::<f64>::col_major(&[3]);
+/// reduce_axis_into(&mut out.view_mut(), &src.view(), 0, |x| x, |a, b| a + b, 0.0).unwrap();
+/// assert_eq!(out.get(&[0]), 1.0);
+/// ```
+// ponytail: the array-returning wrapper regressed against the pre-0.6
+// `reduce_axis` (contiguous 1T, shared EPYC host load ~5-6, 2026-10-17):
+// 4x4x4 191 -> 322 ns, 32x32x32 7150 -> 8423 ns. The allocation-free planner
+// and the `_into` split are the only structural changes; the inline cursor and
+// `kept` metadata are candidates. Re-profile before B4.
+pub fn reduce_axis_into<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+    dest: &mut StridedViewMut<U>,
+    src: &StridedView<T, Op>,
+    axis: usize,
+    map_fn: M,
+    reduce_fn: R,
+    init: U,
+) -> Result<()>
+where
+    M: Fn(T) -> U + MaybeSync,
+    R: Fn(U, U) -> U + MaybeSync,
+    U: Clone + MaybeSendSync,
+{
+    let rank = src.ndim();
+    if axis >= rank {
+        return Err(StridedError::InvalidAxis { axis, rank });
+    }
 
     let src_dims = src.dims();
     let src_strides = src.strides();
     let src_ptr = src.ptr();
     // Reject an element count beyond usize (a huge stride-0 broadcast) up
-    // front instead of allocating and looping over it.
+    // front instead of looping over it.
     total_len(src_dims)?;
+
+    let expected: InlineVec<usize> = src_dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != axis)
+        .map(|(_, &d)| d)
+        .collect();
+    let dest_len = total_len(dest.dims())?;
+    if expected.is_empty() {
+        if dest_len != 1 {
+            return Err(StridedError::ShapeMismatch(vec![dest_len], vec![1]));
+        }
+    } else {
+        if dest.ndim() != expected.len() {
+            return Err(StridedError::RankMismatch(dest.ndim(), expected.len()));
+        }
+        if dest.dims() != expected.as_slice() {
+            return Err(StridedError::ShapeMismatch(
+                dest.dims().to_vec(),
+                expected.to_vec(),
+            ));
+        }
+    }
+    if !crate::layout_check::is_injective_layout_inline(dest.dims(), dest.strides()) {
+        return Err(StridedError::NonInjectiveOutputLayout);
+    }
 
     let axis_len = src_dims[axis];
     let axis_stride = src_strides[axis];
 
-    let kept: Vec<(usize, isize)> = src_dims
-        .iter()
-        .zip(src_strides)
-        .enumerate()
-        .filter(|(i, _)| *i != axis)
-        .map(|(_, (&d, &s))| (d, s))
-        .collect();
-    let out_dims: Vec<usize> = kept.iter().map(|&(d, _)| d).collect();
-
-    if out_dims.is_empty() {
+    // Full reduction into a single destination element.
+    if expected.is_empty() {
         // SAFETY: the view proves `axis_len` readable elements along `axis`.
         let acc = unsafe {
             fold_run::<T, Op, M, R, U>(src_ptr, axis_stride, axis_len, init, &map_fn, &reduce_fn)
         };
-        let strides = col_major_strides(&[1]);
-        return StridedArray::from_parts(vec![acc], &[1], &strides, 0);
+        unsafe { *dest.as_mut_ptr() = acc };
+        return Ok(());
     }
 
-    let total_out = total_len(&out_dims)?;
-    let out_strides = col_major_strides(&out_dims);
-    let mut out =
-        StridedArray::from_parts(vec![init.clone(); total_out], &out_dims, &out_strides, 0)?;
-    if total_out == 0 || axis_len == 0 {
-        return Ok(out);
+    if dest_len == 0 {
+        return Ok(());
     }
-    let out_ptr = out.view_mut().as_mut_ptr();
 
+    let mut kept: InlineVec<(usize, isize)> = InlineVec::new();
+    let mut dest_strides: InlineVec<isize> = InlineVec::new();
+    {
+        let mut d = 0usize;
+        for i in 0..rank {
+            if i == axis {
+                continue;
+            }
+            kept.push((src_dims[i], src_strides[i]));
+            dest_strides.push(dest.strides()[d]);
+            d += 1;
+        }
+    }
+    // A column-major destination is the common case (the array-returning
+    // wrapper always allocates one). Its destination offset equals the linear
+    // output index, so the per-output destination bookkeeping can be skipped.
+    let dest_linear = {
+        let mut prefix = 1usize;
+        kept.iter()
+            .zip(dest_strides.iter())
+            .all(|(&(dim, _), &dest_stride)| {
+                let linear = dest_stride == prefix as isize;
+                prefix = prefix.saturating_mul(dim);
+                linear
+            })
+    };
+    let out_ptr = dest.as_mut_ptr();
     let parts = AxisParts {
         kept: &kept,
+        dest_strides: &dest_strides,
         axis_len,
         axis_stride,
+        dest_linear,
         map_fn: &map_fn,
         reduce_fn: &reduce_fn,
         init: &init,
@@ -374,16 +470,16 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        let work = total_out.saturating_mul(axis_len);
-        let nthreads = crate::threading::parallel_threads_for_len(work).min(total_out);
+        let work = dest_len.saturating_mul(axis_len);
+        let nthreads = crate::threading::parallel_threads_for_len(work).min(dest_len);
         if nthreads > 1 {
             let src_send = SendPtr(src_ptr as *mut T);
             let out_send = SendPtr(out_ptr);
             let parts = &parts;
-            crate::threading::parallel_for_each(0..total_out, nthreads, &|range| {
-                // SAFETY: worker ranges are disjoint output ranges of the
-                // freshly allocated column-major output, and the view proves
-                // every source offset reachable from its kept coordinates.
+            crate::threading::parallel_for_each(0..dest_len, nthreads, &|range| {
+                // SAFETY: worker ranges are disjoint, the destination is
+                // injective, and the view proves every source offset reachable
+                // from its kept coordinates.
                 unsafe {
                     reduce_axis_range::<T, Op, M, R, U>(
                         src_send.as_const(),
@@ -393,34 +489,78 @@ where
                     )
                 }
             });
-            return Ok(out);
+            return Ok(());
         }
     }
 
     // SAFETY: as for the parallel ranges, with one range covering all outputs.
-    unsafe { reduce_axis_range::<T, Op, M, R, U>(src_ptr, out_ptr, 0..total_out, &parts) };
-    Ok(out)
+    unsafe { reduce_axis_range::<T, Op, M, R, U>(src_ptr, out_ptr, 0..dest_len, &parts) };
+    Ok(())
 }
 
 /// Shared inputs of [`reduce_axis_range`].
 struct AxisParts<'a, M, R, U> {
     /// `(extent, source stride)` of every kept axis, in output order.
     kept: &'a [(usize, isize)],
+    /// Destination stride of every kept axis, in the same order.
+    dest_strides: &'a [isize],
     axis_len: usize,
     axis_stride: isize,
+    /// Whether the destination is the column-major output, so its offset is the
+    /// linear output index and no destination cursor is needed.
+    dest_linear: bool,
     map_fn: &'a M,
     reduce_fn: &'a R,
     init: &'a U,
 }
 
-/// Computes outputs `range` (column-major output indices) of [`reduce_axis`].
+/// Computes outputs `range` (column-major logical output indices) of
+/// [`reduce_axis_into`].
 ///
 /// # Safety
-/// `out` must be the column-major output of `parts.kept` extents, `range` a
-/// subrange of it that no other thread writes, and every source offset
-/// reachable from a kept coordinate plus `k * parts.axis_stride` for
-/// `k < parts.axis_len` must be a readable element of `src`.
+/// `out` must be a destination of `parts.kept` extents with injective layout,
+/// `range` a subrange of its logical output indices that no other thread
+/// writes, and every source offset reachable from a kept coordinate plus
+/// `k * parts.axis_stride` for `k < parts.axis_len` must be a readable element
+/// of `src`.
+/// Computes outputs `range` of [`reduce_axis_into`], dispatching on the
+/// destination layout so the common column-major case runs the same cursor as
+/// the array-returning wrapper used before this was split (#306 performance).
+///
+/// # Safety
+/// As [`reduce_axis_range_linear`] / [`reduce_axis_range_strided`].
 unsafe fn reduce_axis_range<T, Op, M, R, U>(
+    src: *const T,
+    out: *mut U,
+    range: Range<usize>,
+    parts: &AxisParts<'_, M, R, U>,
+) where
+    T: Copy,
+    Op: ElementOp<T>,
+    M: Fn(T) -> U,
+    R: Fn(U, U) -> U,
+    U: Clone,
+{
+    if parts.dest_linear {
+        // SAFETY: forwarded caller contract; a linear destination is a valid
+        // destination for the kept extents.
+        unsafe { reduce_axis_range_linear::<T, Op, M, R, U>(src, out, range, parts) }
+    } else {
+        // SAFETY: forwarded caller contract.
+        unsafe { reduce_axis_range_strided::<T, Op, M, R, U>(src, out, range, parts) }
+    }
+}
+
+/// Column-major destination cursor: the destination offset is the linear output
+/// index, so no destination stride bookkeeping is needed.
+///
+/// # Safety
+/// `out` must be a column-major destination of `parts.kept` extents, `range` a
+/// subrange of its logical output indices that no other thread writes, and
+/// every source offset reachable from a kept coordinate plus
+/// `k * parts.axis_stride` for `k < parts.axis_len` must be a readable element
+/// of `src`.
+unsafe fn reduce_axis_range_linear<T, Op, M, R, U>(
     src: *const T,
     out: *mut U,
     range: Range<usize>,
@@ -437,8 +577,9 @@ unsafe fn reduce_axis_range<T, Op, M, R, U>(
     let sweep = lead_stride == 1 && lead_extent >= AXIS_SWEEP_MIN_LEN && parts.axis_len > 1;
     let block = (AXIS_SWEEP_BLOCK_BYTES / std::mem::size_of::<U>().max(1)).max(AXIS_SWEEP_MIN_LEN);
 
-    // Decode the first output once, then advance incrementally.
-    let mut coords = vec![0usize; kept.len()];
+    // Decode the first output once, then advance incrementally. `coords` is
+    // inline at rank <= INLINE_RANK.
+    let mut coords: InlineVec<usize> = (0..kept.len()).map(|_| 0usize).collect();
     let mut rest = range.start;
     let mut src_off = 0isize;
     for (coord, &(extent, stride)) in coords.iter_mut().zip(kept) {
@@ -455,8 +596,9 @@ unsafe fn reduce_axis_range<T, Op, M, R, U>(
             1
         };
         if sweep {
-            // SAFETY: the `len` outputs are inside the caller's range and
-            // their unit-stride source columns are readable.
+            // SAFETY: the `len` outputs are inside the caller's range, their
+            // unit-stride destination elements are contiguous, and their
+            // unit-stride source columns are readable.
             unsafe { sweep_block::<T, Op, M, R, U>(src, src_off, out.add(output), len, parts) };
         } else {
             // SAFETY: one reachable output and its reduced run.
@@ -487,6 +629,97 @@ unsafe fn reduce_axis_range<T, Op, M, R, U>(
             axis += 1;
             coords[axis] += 1;
             src_off += kept[axis].1;
+        }
+    }
+}
+
+/// General strided destination cursor, tracking a destination offset next to
+/// the source offset.
+///
+/// # Safety
+/// `out` must be a destination of `parts.kept` extents with injective layout,
+/// `range` a subrange of its logical output indices that no other thread
+/// writes, and every source offset reachable from a kept coordinate plus
+/// `k * parts.axis_stride` for `k < parts.axis_len` must be a readable element
+/// of `src`.
+unsafe fn reduce_axis_range_strided<T, Op, M, R, U>(
+    src: *const T,
+    out: *mut U,
+    range: Range<usize>,
+    parts: &AxisParts<'_, M, R, U>,
+) where
+    T: Copy,
+    Op: ElementOp<T>,
+    M: Fn(T) -> U,
+    R: Fn(U, U) -> U,
+    U: Clone,
+{
+    let kept = parts.kept;
+    let dest_strides = parts.dest_strides;
+    let (lead_extent, lead_stride) = kept[0];
+    let lead_dest_stride = dest_strides[0];
+    let sweep = lead_stride == 1
+        && lead_dest_stride == 1
+        && lead_extent >= AXIS_SWEEP_MIN_LEN
+        && parts.axis_len > 1;
+    let block = (AXIS_SWEEP_BLOCK_BYTES / std::mem::size_of::<U>().max(1)).max(AXIS_SWEEP_MIN_LEN);
+
+    let mut coords: InlineVec<usize> = (0..kept.len()).map(|_| 0usize).collect();
+    let mut rest = range.start;
+    let mut src_off = 0isize;
+    let mut dest_off = 0isize;
+    for (coord, (&(extent, stride), &dest_stride)) in
+        coords.iter_mut().zip(kept.iter().zip(dest_strides))
+    {
+        *coord = rest % extent;
+        rest /= extent;
+        src_off += *coord as isize * stride;
+        dest_off += *coord as isize * dest_stride;
+    }
+
+    let mut output = range.start;
+    while output < range.end {
+        let len = if sweep {
+            (lead_extent - coords[0]).min(range.end - output).min(block)
+        } else {
+            1
+        };
+        if sweep {
+            // SAFETY: as for the linear cursor; `lead_dest_stride == 1` makes
+            // the `len` destinations contiguous.
+            unsafe {
+                sweep_block::<T, Op, M, R, U>(src, src_off, out.offset(dest_off), len, parts)
+            };
+        } else {
+            // SAFETY: one reachable output and its reduced run.
+            unsafe {
+                let acc = fold_run::<T, Op, M, R, U>(
+                    src.offset(src_off),
+                    parts.axis_stride,
+                    parts.axis_len,
+                    parts.init.clone(),
+                    parts.map_fn,
+                    parts.reduce_fn,
+                );
+                *out.offset(dest_off) = acc;
+            }
+        }
+        output += len;
+        if output >= range.end {
+            break;
+        }
+        coords[0] += len;
+        src_off += len as isize * lead_stride;
+        dest_off += len as isize * lead_dest_stride;
+        let mut axis = 0;
+        while coords[axis] == kept[axis].0 {
+            src_off -= kept[axis].0 as isize * kept[axis].1;
+            dest_off -= kept[axis].0 as isize * dest_strides[axis];
+            coords[axis] = 0;
+            axis += 1;
+            coords[axis] += 1;
+            src_off += kept[axis].1;
+            dest_off += dest_strides[axis];
         }
     }
 }

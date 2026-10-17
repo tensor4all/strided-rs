@@ -4,6 +4,7 @@
 //! `_mapreduce_kernel!` pattern for cache-optimized strided array operations.
 
 use crate::fuse::{compress_dims, fuse_dims};
+use crate::inline::{InlineVec, OperandVec};
 use crate::{block, order, Result, StridedError};
 
 /// Maximum total elements for the small tensor fast path.
@@ -15,8 +16,8 @@ pub const SMALL_TENSOR_THRESHOLD: usize = 1024;
 #[derive(Debug)]
 pub struct KernelPlan {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) order: Vec<usize>, // outer -> inner
-    pub block: Vec<usize>,
+    pub(crate) order: InlineVec<usize>, // outer -> inner
+    pub block: InlineVec<usize>,
 }
 
 /// Build an execution plan for strided iteration (used only in tests).
@@ -53,29 +54,29 @@ pub(crate) fn build_plan_fused(
     strides_list: &[&[isize]],
     dest_index: Option<usize>,
     elem_size: usize,
-) -> (Vec<usize>, Vec<Vec<isize>>, KernelPlan) {
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // 1. Compute optimal iteration order on original dims
     let order = order::compute_order(dims, strides_list, dest_index);
 
     // 2. Reorder dims and strides
-    let ordered_dims: Vec<usize> = order.iter().map(|&d| dims[d]).collect();
-    let ordered_strides: Vec<Vec<isize>> = strides_list
+    let ordered_dims: InlineVec<usize> = order.iter().map(|&d| dims[d]).collect();
+    let ordered_strides: OperandVec<InlineVec<isize>> = strides_list
         .iter()
         .map(|strides| order.iter().map(|&d| strides[d]).collect())
         .collect();
-    let ordered_strides_refs: Vec<&[isize]> =
+    let ordered_strides_refs: OperandVec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     // 3. Fuse contiguous dimensions in ordered space
     let fused_dims = fuse_dims(&ordered_dims, &ordered_strides_refs);
 
     // 4. Compress: remove size-1 dimensions to reduce loop depth
-    let (compressed_dims, compressed_strides) = compress_dims(&fused_dims, &ordered_strides);
-    let compressed_strides_refs: Vec<&[isize]> =
+    let (compressed_dims, compressed_strides) = compress_dims(&fused_dims, &ordered_strides_refs);
+    let compressed_strides_refs: OperandVec<&[isize]> =
         compressed_strides.iter().map(|s| s.as_slice()).collect();
 
     // 5. Compute blocks with identity ordering (already ordered)
-    let identity: Vec<usize> = (0..compressed_dims.len()).collect();
+    let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
     let block = block::compute_block_sizes(
         &compressed_dims,
         &identity,
@@ -104,16 +105,14 @@ pub(crate) fn build_plan_fused(
 pub(crate) fn build_plan_fused_small(
     dims: &[usize],
     strides_list: &[&[isize]],
-) -> (Vec<usize>, Vec<Vec<isize>>, KernelPlan) {
-    let strides_owned: Vec<Vec<isize>> = strides_list.iter().map(|s| s.to_vec()).collect();
-
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // Single fuse + compress pass (no ordering needed)
     let fused = fuse_dims(dims, strides_list);
-    let (fused_dims, fused_strides) = compress_dims(&fused, &strides_owned);
+    let (fused_dims, fused_strides) = compress_dims(&fused, strides_list);
 
     // Block = full dimension (no tiling)
     let block = fused_dims.clone();
-    let identity: Vec<usize> = (0..fused_dims.len()).collect();
+    let identity: InlineVec<usize> = (0..fused_dims.len()).collect();
 
     (
         fused_dims,
@@ -147,87 +146,87 @@ where
 {
     let rank = dims.len();
     if rank == 0 {
-        let offsets = vec![0isize; strides_list.len()];
+        let offsets: OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
         return f(&offsets, 1, &[]);
     }
 
     // Reorder dimensions and strides according to plan
-    let ordered_dims: Vec<usize> = plan.order.iter().map(|&d| dims[d]).collect();
-    let ordered_blocks: Vec<usize> = plan.block.clone();
+    let ordered_dims: InlineVec<usize> = plan.order.iter().map(|&d| dims[d]).collect();
+    let ordered_blocks: InlineVec<usize> = plan.block.clone();
 
     // Build stride vectors for each array, ordered by plan
-    let num_arrays = strides_list.len();
-    let mut ordered_strides: Vec<Vec<isize>> = Vec::with_capacity(num_arrays);
+    let mut ordered_strides: OperandVec<InlineVec<isize>> = OperandVec::new();
     for strides in strides_list {
-        let s: Vec<isize> = plan.order.iter().map(|&d| strides[d]).collect();
-        ordered_strides.push(s);
+        ordered_strides.push(plan.order.iter().map(|&d| strides[d]).collect());
     }
+    let ordered_strides_refs: OperandVec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
 
     // Initial offsets (all zero)
-    let mut offsets = vec![0isize; num_arrays];
+    let mut offsets: OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
 
     // Call the specialized kernel based on rank
     match rank {
         1 => kernel_1d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         2 => kernel_2d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         3 => kernel_3d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         4 => kernel_4d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         5 => kernel_5d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         6 => kernel_6d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         7 => kernel_7d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         8 => kernel_8d_inner(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
         _ => kernel_nd_inner_iterative(
             &ordered_dims,
             &ordered_blocks,
-            &ordered_strides,
+            &ordered_strides_refs,
             &mut offsets,
             &mut f,
         ),
@@ -353,7 +352,7 @@ macro_rules! make_kernel {
         fn $name<F>(
             dims: &[usize],
             blocks: &[usize],
-            strides: &[Vec<isize>],
+            strides: &[&[isize]],
             offsets: &mut [isize],
             f: &mut F,
         ) -> Result<()>
@@ -362,7 +361,7 @@ macro_rules! make_kernel {
         {
             let d0 = dims[0];
             let b0 = blocks[0].max(1).min(d0);
-            let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
+            let inner_strides: OperandVec<isize> = strides.iter().map(|s| s[0]).collect();
 
             let mut j0 = 0usize;
             let mut advanced = 0usize;
@@ -393,14 +392,14 @@ macro_rules! make_kernel {
         fn $name<F>(
             dims: &[usize],
             blocks: &[usize],
-            strides: &[Vec<isize>],
+            strides: &[&[isize]],
             offsets: &mut [isize],
             f: &mut F,
         ) -> Result<()>
         where
             F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
         {
-            let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
+            let inner_strides: OperandVec<isize> = strides.iter().map(|s| s[0]).collect();
             let mut blens = [0usize; $rank];
             block_loop!(dims, blocks, strides, offsets, f, blens, inner_strides;
                 elem=[$($el),+]; $($blk),+; top=$top);
@@ -468,7 +467,7 @@ make_kernel!(
 fn kernel_nd_inner_iterative<F>(
     dims: &[usize],
     blocks: &[usize],
-    strides: &[Vec<isize>],
+    strides: &[&[isize]],
     offsets: &mut [isize],
     f: &mut F,
 ) -> Result<()>
@@ -480,10 +479,10 @@ where
 
     let d0 = dims[0];
     let b0 = blocks[0].max(1).min(d0);
-    let inner_strides: Vec<isize> = strides.iter().map(|s| s[0]).collect();
+    let inner_strides: OperandVec<isize> = strides.iter().map(|s| s[0]).collect();
 
     // Current position for each outer level (1..rank-1). Level 0 uses block loop.
-    let mut idx = vec![0usize; rank];
+    let mut idx: Vec<usize> = vec![0usize; rank];
 
     // As in the rank-specialized kernels, offsets advance only when another
     // position follows and each level rewinds from its last position, so they
@@ -554,17 +553,18 @@ where
 /// generic would duplicate it for every operation, dtype and element-op
 /// combination of every downstream crate.
 #[inline]
-pub(crate) fn for_each_inner_block_preordered<F>(
+pub(crate) fn for_each_inner_block_preordered<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
-    strides: &[Vec<isize>],
+    strides: &[S],
     initial_offsets: &[isize],
     mut f: F,
 ) -> Result<()>
 where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
-    preordered_dyn(dims, blocks, strides, initial_offsets, &mut f)
+    let refs: OperandVec<&[isize]> = strides.iter().map(|s| s.as_ref()).collect();
+    preordered_dyn(dims, blocks, &refs, initial_offsets, &mut f)
 }
 
 type BlockFn<'a> = &'a mut dyn FnMut(&[isize], usize, &[isize]) -> Result<()>;
@@ -573,7 +573,7 @@ type BlockFn<'a> = &'a mut dyn FnMut(&[isize], usize, &[isize]) -> Result<()>;
 fn preordered_dyn(
     dims: &[usize],
     blocks: &[usize],
-    strides: &[Vec<isize>],
+    strides: &[&[isize]],
     initial_offsets: &[isize],
     mut f: BlockFn<'_>,
 ) -> Result<()> {
@@ -583,7 +583,7 @@ fn preordered_dyn(
     }
 
     // Start from initial_offsets (kernel functions reset to starting values at end)
-    let mut offsets = initial_offsets.to_vec();
+    let mut offsets: OperandVec<isize> = initial_offsets.iter().copied().collect();
 
     match rank {
         1 => kernel_1d_inner(dims, blocks, strides, &mut offsets, &mut f),

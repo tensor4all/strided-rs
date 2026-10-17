@@ -222,7 +222,7 @@ impl ErasedScanPlan {
         checked_total_len(dims)?;
         check_reduce_layout_offset_arithmetic(dims, src_strides)?;
         check_reduce_layout_offset_arithmetic(dims, dest_strides)?;
-        if !crate::layout_check::is_injective_layout(dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         let dest_outer: Vec<isize> = (0..dims.len())

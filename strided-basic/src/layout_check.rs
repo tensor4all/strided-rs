@@ -79,6 +79,18 @@ pub(crate) const EXACT_BLOCK_BUDGET: usize = 1 << 24;
 /// toward the budget.
 pub(crate) const PAIRWISE_BLOCK_BUDGET: usize = 4096;
 
+/// Injective-layout check used on the hot validation paths.
+///
+/// Tries the allocation-free pairwise check first, so a successful validation
+/// at small rank and block size allocates nothing (#306 P1). A layout the
+/// pairwise budget conservatively rejects -- a large interleaved block or a
+/// small non-injective one -- falls back to the exact [`is_injective_layout`]
+/// check so every layout accepted before is still accepted. The fallback may
+/// allocate, which is an error path (P7) or above the inline rank budget.
+pub(crate) fn is_injective_layout_inline(dims: &[usize], strides: &[isize]) -> bool {
+    is_injective_layout_without_alloc(dims, strides) || is_injective_layout(dims, strides)
+}
+
 /// The smallest-stride axes that must be checked by enumeration.
 ///
 /// Contains every non-singleton axis whose `(|stride|, axis)` key is at most

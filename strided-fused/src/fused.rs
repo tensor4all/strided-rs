@@ -1179,7 +1179,7 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
             let operands = dst_ptrs.len() + input_ptrs.len();
             let run_partition = |dims: &[usize],
                                  blocks: &[usize],
-                                 strides_list: &[Vec<isize>],
+                                 strides_list: &[&[isize]],
                                  offsets: &[isize]|
              -> Result<()> {
                 let dst_ptrs: Vec<*mut T> = dst_send.iter().map(|ptr| ptr.as_ptr()).collect();
@@ -1395,7 +1395,7 @@ pub(crate) fn fused_elementwise_into_uninit<T: FusedScalar>(
             let operands = 1 + input_ptrs.len();
             let run_partition = |dims: &[usize],
                                  blocks: &[usize],
-                                 strides_list: &[Vec<isize>],
+                                 strides_list: &[&[isize]],
                                  offsets: &[isize]|
              -> Result<()> {
                 let input_ptrs: Vec<*const T> =

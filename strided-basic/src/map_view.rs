@@ -22,13 +22,8 @@ use strided_view::{ElementOp, Identity};
 use crate::fuse::compute_costs;
 #[cfg(feature = "parallel")]
 use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH};
-#[cfg(feature = "parallel")]
-use smallvec::SmallVec;
 
-#[cfg(feature = "parallel")]
-type AxisVec<T> = SmallVec<[T; 8]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+type AxisVec<T> = crate::inline::InlineVec<T>;
 
 const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
 
@@ -55,7 +50,7 @@ fn validate_destination_layout(
     dims: &[usize],
     strides: &[isize],
 ) -> Result<ValidatedDestinationLayout> {
-    if crate::layout_check::is_injective_layout(dims, strides) {
+    if crate::layout_check::is_injective_layout_inline(dims, strides) {
         Ok(ValidatedDestinationLayout(()))
     } else {
         Err(StridedError::NonInjectiveOutputLayout)
@@ -1392,7 +1387,8 @@ fn map_parts_into_validated<
             let src_send = SendPtr(src_ptr as *mut A);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1424,7 +1420,8 @@ fn map_parts_into_validated<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -1729,7 +1726,8 @@ fn zip_map2_parts_into_validated<
             let b_send = SendPtr(b_ptr as *mut B);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1762,7 +1760,8 @@ fn zip_map2_parts_into_validated<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -1848,7 +1847,8 @@ fn mul_identity_into_raw<
             let b_send = SendPtr(b_ptr as *mut B);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -1881,7 +1881,8 @@ fn mul_identity_into_raw<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -2244,7 +2245,8 @@ pub(crate) fn zip_map3_into_validated<
             let c_send = SendPtr(c_ptr as *mut C);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -2279,7 +2281,8 @@ pub(crate) fn zip_map3_into_validated<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -2424,7 +2427,8 @@ pub(crate) fn zip_map4_into_validated<
             let e_send = SendPtr(e_ptr as *mut E);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -2460,7 +2464,8 @@ pub(crate) fn zip_map4_into_validated<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,

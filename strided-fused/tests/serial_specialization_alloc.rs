@@ -160,20 +160,22 @@ fn serial_replay_of_contiguous_operands_does_not_allocate() {
     }
 }
 
-/// A permuted operand still pays the strided-basic planner metadata that the
-/// specialized kernel builds per call (tensor4all/strided-rs#306), but no
-/// per-inner-block register vector: the interpreter allocated 82 and 1069
-/// times at these sizes.
+/// A permuted operand still pays at most one wrapper allocation around the
+/// inline planner (the interpreter register file that B4/
+/// tensor4all/strided-rs#306 removes); before the inline planner this was 16
+/// (8^3) and 43 (32^3), and the per-inner-block interpreter allocated 82 and
+/// 1069 times. Debug builds can keep one lazy allocation that release drops, so
+/// the guard is a small upper bound rather than an exact count.
 #[test]
 fn serial_replay_of_permuted_operands_allocates_like_the_typed_kernel() {
-    assert_eq!(
-        counted_allocations(8, true),
-        [[16, 16], [16, 16]],
-        "serial permuted replay must not regress to per-block interpreter allocation"
-    );
-    assert_eq!(
-        counted_allocations(32, true),
-        [[43, 43], [43, 43]],
-        "serial permuted replay must not regress to per-block interpreter allocation"
-    );
+    for counts in [counted_allocations(8, true), counted_allocations(32, true)] {
+        for row in counts {
+            for allocated in row {
+                assert!(
+                    allocated <= 1,
+                    "serial permuted replay regressed to {allocated} allocations"
+                );
+            }
+        }
+    }
 }

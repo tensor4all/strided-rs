@@ -1,8 +1,8 @@
 //! High-level operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, same_contiguous_layout,
-    sequential_contiguous_layout, total_len,
+    build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
+    same_contiguous_layout, sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
 use crate::map_view::{map_into, zip_map2_into};
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
@@ -271,7 +271,7 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     src: &StridedView<T>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
-    if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
+    if !crate::layout_check::is_injective_layout_inline(dest.dims(), dest.strides()) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
     if src.is_empty() {
@@ -358,8 +358,12 @@ pub fn add<
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
     let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    let total = total_len(dst_dims)?;
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -370,7 +374,8 @@ pub fn add<
             let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -404,7 +409,8 @@ pub fn add<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -459,8 +465,12 @@ pub fn mul<
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
     let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    let total = total_len(dst_dims)?;
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -471,7 +481,8 @@ pub fn mul<
             let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -505,7 +516,8 @@ pub fn mul<
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -563,8 +575,12 @@ where
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
     let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    let total = total_len(dst_dims)?;
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -575,7 +591,8 @@ where
             let src_send = SendPtr(src_ptr as *mut S);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -610,7 +627,8 @@ where
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -676,8 +694,12 @@ where
         .max(std::mem::size_of::<A>())
         .max(std::mem::size_of::<B>());
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size);
+    let total = total_len(dst_dims)?;
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dst_dims, &strides_list)
+    } else {
+        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
+    };
 
     #[cfg(feature = "parallel")]
     {
@@ -689,7 +711,8 @@ where
             let b_send = SendPtr(b_ptr as *mut B);
 
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -725,7 +748,8 @@ where
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,
@@ -846,11 +870,16 @@ where
         .max(std::mem::size_of::<B>())
         .max(std::mem::size_of::<R>());
 
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(a_dims, &strides_list, None, elem_size);
+    let total = total_len(a_dims)?;
+    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(a_dims, &strides_list)
+    } else {
+        build_plan_fused(a_dims, &strides_list, None, elem_size)
+    };
 
     let mut acc = R::zero();
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,

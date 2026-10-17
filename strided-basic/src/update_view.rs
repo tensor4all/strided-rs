@@ -20,9 +20,9 @@
 
 use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
-    total_len, SMALL_TENSOR_THRESHOLD,
+    sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::layout_check::is_injective_layout;
+use crate::layout_check::is_injective_layout_inline;
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -60,7 +60,7 @@ impl<T> Raw<T> {
 }
 
 fn validate_destination(dims: &[usize], strides: &[isize]) -> Result<()> {
-    if is_injective_layout(dims, strides) {
+    if is_injective_layout_inline(dims, strides) {
         Ok(())
     } else {
         Err(StridedError::NonInjectiveOutputLayout)
@@ -88,9 +88,19 @@ fn run_update(
     if total == 0 {
         return Ok(());
     }
+    // Contiguous fast path: every operand is a flat run in the same order, so
+    // one unit-stride block replaces planning and blocking. The sequential
+    // guard keeps the parallel branch reachable for large tensors (see
+    // `use_sequential_fast_path`).
+    if sequential_contiguous_layout(dims, strides_list)?.is_some() {
+        let zeros: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
+        let ones: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 1isize).collect();
+        body(&zeros, total, &ones);
+        return Ok(());
+    }
     // One element (rank 0, or every extent one): a single length-1 block.
     if dims.iter().all(|&d| d == 1) {
-        let zeros = vec![0isize; strides_list.len()];
+        let zeros: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
         body(&zeros, 1, &zeros);
         return Ok(());
     }
@@ -107,7 +117,8 @@ fn run_update(
         let nthreads = crate::execution_policy::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
             let costs = compute_costs(&ordered_strides);
-            let initial_offsets = vec![0isize; strides_list.len()];
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                strides_list.iter().map(|_| 0isize).collect();
             return mapreduce_threaded(
                 &fused_dims,
                 &plan.block,
@@ -133,7 +144,8 @@ fn run_update(
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     for_each_inner_block_preordered(
         &fused_dims,
         &plan.block,

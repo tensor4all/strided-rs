@@ -3,6 +3,8 @@
 //! This module implements the core dimension fusion algorithm that merges
 //! contiguous dimensions to reduce iteration complexity.
 
+use crate::inline::{InlineVec, OperandVec};
+
 /// Fuse contiguous dimensions across multiple arrays.
 ///
 /// This function fuses subsequent dimensions that are contiguous in memory
@@ -36,13 +38,13 @@
 ///     return dims
 /// end
 /// ```
-pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
+pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> InlineVec<usize> {
     let n = dims.len();
     if n <= 1 || all_strides.is_empty() {
-        return dims.to_vec();
+        return dims.iter().copied().collect();
     }
 
-    let mut result = dims.to_vec();
+    let mut result: InlineVec<usize> = dims.iter().copied().collect();
 
     // Work from the end towards the beginning (Julia: for i in length(dims):-1:2)
     for i in (1..n).rev() {
@@ -89,22 +91,42 @@ pub fn fuse_dims(dims: &[usize], all_strides: &[&[isize]]) -> Vec<usize> {
 ///
 /// If ALL dimensions are 1 (scalar-like), a single dimension of size 1
 /// is preserved so the kernel has something to iterate over.
-pub fn compress_dims(dims: &[usize], all_strides: &[Vec<isize>]) -> (Vec<usize>, Vec<Vec<isize>>) {
-    let kept: Vec<usize> = (0..dims.len()).filter(|&i| dims[i] != 1).collect();
+///
+/// Both the returned dimensions and the per-operand stride lists are inline
+/// collections: rank `<= INLINE_RANK` with at most [`crate::inline::OPERAND_CAP`]
+/// operands does not allocate (#306 P1).
+pub fn compress_dims<S: AsRef<[isize]>>(
+    dims: &[usize],
+    all_strides: &[S],
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>) {
+    let kept: InlineVec<usize> = (0..dims.len()).filter(|&i| dims[i] != 1).collect();
 
     if kept.is_empty() {
         // All dims are 1 (or empty). Preserve a single trivial dimension.
         if dims.is_empty() {
-            return (vec![], all_strides.to_vec());
+            let strides = all_strides
+                .iter()
+                .map(|s| s.as_ref().iter().copied().collect())
+                .collect();
+            return (InlineVec::new(), strides);
         }
-        let new_strides = all_strides.iter().map(|s| vec![s[0]]).collect();
-        return (vec![1], new_strides);
+        let new_strides = all_strides
+            .iter()
+            .map(|s| {
+                let mut v = InlineVec::new();
+                v.push(s.as_ref()[0]);
+                v
+            })
+            .collect();
+        let mut dims_out = InlineVec::new();
+        dims_out.push(1);
+        return (dims_out, new_strides);
     }
 
-    let new_dims: Vec<usize> = kept.iter().map(|&i| dims[i]).collect();
-    let new_strides: Vec<Vec<isize>> = all_strides
+    let new_dims: InlineVec<usize> = kept.iter().map(|&i| dims[i]).collect();
+    let new_strides: OperandVec<InlineVec<isize>> = all_strides
         .iter()
-        .map(|s| kept.iter().map(|&i| s[i]).collect())
+        .map(|s| kept.iter().map(|&i| s.as_ref()[i]).collect())
         .collect();
 
     (new_dims, new_strides)
@@ -124,22 +146,22 @@ pub fn compress_dims(dims: &[usize], all_strides: &[Vec<isize>]) -> (Vec<usize>,
 ///
 /// # Returns
 /// Importance scores for each dimension
-pub fn compute_importance(
+pub fn compute_importance<I: AsRef<[usize]>>(
     dims: &[usize],
     all_strides: &[&[isize]],
-    index_orders: &[Vec<usize>],
-) -> Vec<u64> {
+    index_orders: &[I],
+) -> InlineVec<u64> {
     let n = dims.len();
     let m = all_strides.len();
 
     if n == 0 || m == 0 {
-        return vec![];
+        return InlineVec::new();
     }
 
     // g = ceil(log2(M + 2)) = number of bits needed to encode array count
     let g = (64 - (m as u64 + 1).leading_zeros()) as u64;
 
-    let mut importance = vec![0u64; n];
+    let mut importance: InlineVec<u64> = (0..n).map(|_| 0u64).collect();
 
     let output_weight = 1u64 << (g + 1);
 
@@ -149,7 +171,7 @@ pub fn compute_importance(
     // break a contiguous output group.
     for i in 0..n {
         if all_strides[0][i] != 0 {
-            let shift = g * (n - index_orders[0][i]) as u64;
+            let shift = g * (n - index_orders[0].as_ref()[i]) as u64;
             importance[i] = output_weight * (1u64 << shift);
         }
     }
@@ -159,7 +181,7 @@ pub fn compute_importance(
     for k in 1..m {
         for i in 0..n {
             if all_strides[k][i] != 0 {
-                let shift = g * (n - index_orders[k][i]) as u64;
+                let shift = g * (n - index_orders[k].as_ref()[i]) as u64;
                 importance[i] += 1u64 << shift;
             }
         }
@@ -178,8 +200,8 @@ pub fn compute_importance(
 /// Get the permutation that sorts by importance (descending).
 ///
 /// Returns indices that would sort the importance array in descending order.
-pub fn sort_by_importance(importance: &[u64]) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..importance.len()).collect();
+pub fn sort_by_importance(importance: &[u64]) -> InlineVec<usize> {
+    let mut indices: InlineVec<usize> = (0..importance.len()).collect();
     indices.sort_by(|&a, &b| importance[b].cmp(&importance[a]));
     indices
 }
@@ -187,13 +209,13 @@ pub fn sort_by_importance(importance: &[u64]) -> Vec<usize> {
 /// Compute the minimum stride cost for each dimension.
 ///
 /// Julia: `costs = map(a -> ifelse(iszero(a), 1, a << 1), map(min, strides...))`
-pub(crate) fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
+pub(crate) fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<isize> {
     if all_strides.is_empty() {
-        return vec![];
+        return InlineVec::new();
     }
 
     let n = all_strides[0].as_ref().len();
-    let mut costs = vec![isize::MAX; n];
+    let mut costs: InlineVec<isize> = (0..n).map(|_| isize::MAX).collect();
 
     for strides in all_strides {
         let strides = strides.as_ref();

@@ -8,15 +8,13 @@
 use core::{mem::MaybeUninit, ops::Add};
 
 use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
+use crate::inline::InlineVec;
 use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
 use crate::{
     MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
 };
 
-#[cfg(feature = "parallel")]
-type AxisVec<T> = smallvec::SmallVec<[T; RAW_FUSED_RANK_LIMIT]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+type AxisVec<T> = InlineVec<T>;
 
 /// Gather configuration shared by generic and erased replay.
 ///
@@ -71,7 +69,7 @@ pub struct GatherPlan {
     total: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct GatherReplayAxis {
     dest_step: isize,
     dest_reset: isize,
@@ -95,7 +93,7 @@ struct GatherReplayState {
     index_batch_offset: isize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct WindowReplayAxis {
     source_step: isize,
     source_reset: isize,
@@ -476,7 +474,7 @@ impl GatherPlan {
         validate_layout_span(operand_dims, operand_strides)?;
         validate_layout_span(index_dims, index_strides)?;
         validate_layout_span(dest_dims, dest_strides)?;
-        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
 
@@ -1021,7 +1019,7 @@ impl DynamicSlicePlan {
                 slice_sizes.to_vec(),
             ));
         }
-        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, slice_sizes)?;
@@ -1357,7 +1355,7 @@ impl DynamicUpdateSlicePlan {
                 operand_dims.to_vec(),
             ));
         }
-        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, update_dims)?;
@@ -1688,7 +1686,7 @@ impl ScatterPlan {
                 operand_dims.to_vec(),
             ));
         }
-        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
 

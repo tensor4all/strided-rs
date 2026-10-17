@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn test_compute_order_handles_empty_inputs_and_destination_reordering() {
     let dims = [2usize, 3];
-    assert_eq!(compute_order(&dims, &[], None), vec![0, 1]);
+    assert_eq!(compute_order(&dims, &[], None).as_slice(), vec![0, 1]);
 
     let first = [1isize, 2];
     let second = [2isize, 1];
@@ -13,7 +13,7 @@ fn test_compute_order_handles_empty_inputs_and_destination_reordering() {
         assert_eq!(order.len(), dims.len());
         let mut sorted = order.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, vec![0, 1]);
+        assert_eq!(sorted.as_slice(), vec![0, 1]);
     }
 }
 
@@ -106,7 +106,7 @@ fn test_compute_order_with_zero_stride_broadcast() {
 
     let order = compute_order(&dims, &strides_list, Some(0));
 
-    assert_eq!(order, vec![1, 2, 0]);
+    assert_eq!(order.as_slice(), vec![1, 2, 0]);
 }
 
 #[test]

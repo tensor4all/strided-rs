@@ -21,15 +21,12 @@ use crate::raw_ops::{
 };
 use crate::{ElementOpApply, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
 
-// Same pattern as map_view.rs / outer_product.rs: stack storage when the
-// parallel feature pulls in smallvec, plain Vec otherwise. Only `compile`
-// touches these; `execute*` never allocates for them. (A spilled fused layout
-// needs one cursor allocation per replayed range, so a parallel `execute*` can
-// allocate once per worker range.)
-#[cfg(feature = "parallel")]
-type AxisVec<T> = smallvec::SmallVec<[T; crate::RAW_FUSED_RANK_LIMIT]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+// Same pattern as map_view.rs / outer_product.rs: inline storage in both
+// feature configurations. Only `compile` touches these; `execute*` never
+// allocates for them. (A spilled fused layout needs one cursor allocation per
+// replayed range, so an `execute*` can allocate once per worker range above the
+// inline rank bound.)
+type AxisVec<T> = crate::inline::InlineVec<T>;
 
 pub(crate) trait OverwriteWriter<T> {
     fn dims(&self) -> &[usize];
@@ -248,7 +245,7 @@ impl CopyPlan {
         // A zero-sized layout has zero elements even when its other extents
         // overflow; only a nonempty overflowing count is rejected.
         crate::kernel::total_len(dims)?;
-        if !crate::layout_check::is_injective_layout(dims, dst_strides) {
+        if !crate::layout_check::is_injective_layout_inline(dims, dst_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         Ok(Self {
