@@ -1069,32 +1069,78 @@ where
 
     match kind {
         StaticFusedKind::Unary(op, a) => {
-            // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
-            unsafe {
-                map_into_validated(dest, &inputs[a], |x| O::write(eval_unary(op, x)), validated)
-            }?
+            // Dispatch on the op once, outside the element loop, so the
+            // specialization is monomorphized per `FusedOp` and vectorizes
+            // (tensor4all/strided-rs#305 item 2).
+            macro_rules! unary {
+                ($apply:expr) => {{
+                    // SAFETY: matching shapes and this destination layout were
+                    // validated before specialization/replay.
+                    unsafe {
+                        map_into_validated(dest, &inputs[a], |x| O::write($apply(x)), validated)
+                    }?
+                }};
+            }
+            match op {
+                FusedOp::Negate => unary!(|x: T| x.fused_negate()),
+                FusedOp::Conj => unary!(|x: T| x.fused_conj()),
+                FusedOp::Abs => unary!(|x: T| x.fused_abs()),
+                FusedOp::Exp => unary!(|x: T| x.fused_exp()),
+                FusedOp::Log => unary!(|x: T| x.fused_log()),
+                FusedOp::Sin => unary!(|x: T| x.fused_sin()),
+                FusedOp::Cos => unary!(|x: T| x.fused_cos()),
+                FusedOp::Tanh => unary!(|x: T| x.fused_tanh()),
+                FusedOp::Sqrt => unary!(|x: T| x.fused_sqrt()),
+                FusedOp::Rsqrt => unary!(|x: T| x.fused_rsqrt()),
+                FusedOp::Expm1 => unary!(|x: T| x.fused_expm1()),
+                FusedOp::Log1p => unary!(|x: T| x.fused_log1p()),
+                _ => unreachable!("not a unary fused op: {op:?}"),
+            }
         }
-        // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
-        StaticFusedKind::Binary(op, a, b) => unsafe {
-            zip_map2_into_validated(
-                dest,
-                &inputs[a],
-                &inputs[b],
-                |x, y| O::write(eval_binary(op, x, y)),
-                validated,
-            )
-        }?,
-        // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
-        StaticFusedKind::Ternary(op, a, b, c) => unsafe {
-            zip_map3_into_validated(
-                dest,
-                &inputs[a],
-                &inputs[b],
-                &inputs[c],
-                |x, y, z| O::write(eval_ternary(op, x, y, z)),
-                validated,
-            )
-        }?,
+        StaticFusedKind::Binary(op, a, b) => {
+            // As above: one monomorphized kernel per `FusedOp`.
+            macro_rules! binary {
+                ($apply:expr) => {{
+                    // SAFETY: matching shapes and this destination layout were
+                    // validated before specialization/replay.
+                    unsafe {
+                        zip_map2_into_validated(
+                            dest,
+                            &inputs[a],
+                            &inputs[b],
+                            |x, y| O::write($apply(x, y)),
+                            validated,
+                        )
+                    }?
+                }};
+            }
+            match op {
+                FusedOp::Add => binary!(|x: T, y: T| x.fused_add(y)),
+                FusedOp::Multiply => binary!(|x: T, y: T| x.fused_multiply(y)),
+                FusedOp::Divide => binary!(|x: T, y: T| x.fused_divide(y)),
+                FusedOp::Maximum => binary!(|x: T, y: T| x.fused_maximum(y)),
+                FusedOp::Minimum => binary!(|x: T, y: T| x.fused_minimum(y)),
+                FusedOp::Pow => binary!(|x: T, y: T| x.fused_pow(y)),
+                _ => unreachable!("not a binary fused op: {op:?}"),
+            }
+        }
+        StaticFusedKind::Ternary(op, a, b, c) => match op {
+            FusedOp::Clamp => {
+                // SAFETY: matching shapes and this destination layout were
+                // validated before specialization/replay.
+                unsafe {
+                    zip_map3_into_validated(
+                        dest,
+                        &inputs[a],
+                        &inputs[b],
+                        &inputs[c],
+                        |x, y, z| O::write(x.fused_clamp(y, z)),
+                        validated,
+                    )
+                }?
+            }
+            _ => unreachable!("not a ternary fused op: {op:?}"),
+        },
         // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
         StaticFusedKind::AddMulLeft => unsafe {
             zip_map2_into_validated(
