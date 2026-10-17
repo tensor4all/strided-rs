@@ -3,7 +3,8 @@
 #[cfg(feature = "parallel")]
 use crate::kernel::same_contiguous_layout;
 use crate::kernel::{
-    build_plan_fused, for_each_inner_block_preordered, sequential_contiguous_layout, total_len,
+    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered,
+    sequential_contiguous_layout, total_len,
 };
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
@@ -110,14 +111,32 @@ where
 ///
 /// # Evaluation order
 ///
-/// `reduce_fn` must be associative and commutative, and `init` must be an
-/// identity of `reduce_fn` whenever the reduction runs on several threads.
-/// A contiguous source is folded with sixteen independent lanes (see the
-/// crate source for the exact lane assignment), non-contiguous sources are
-/// traversed in a cache-friendly loop order, and parallel execution folds
-/// chunks independently and combines them in chunk order. Floating point
-/// results can therefore differ from a strict left to right fold in the last
-/// bits; for a fixed shape, layout and thread count the result is repeatable.
+/// The result is independent of the ambient pool width when the call runs
+/// under the sequential policy — [`ExecContext::serial`](crate::ExecContext::serial)
+/// or [`with_execution_policy`](crate::with_execution_policy) with
+/// [`ExecutionPolicy::Sequential`](crate::ExecutionPolicy::Sequential): only
+/// serial branches run, and their fold order is fixed by the source layout.
+/// Under a parallel policy the fold is split over the effective thread count,
+/// so the result is repeatable for a fixed shape, layout and thread count but
+/// can differ between thread counts.
+///
+/// In neither case is this a strict left to right fold: a contiguous source is
+/// folded with sixteen independent lanes (see the crate source for the exact
+/// lane assignment), non-contiguous sources are traversed in a cache-friendly
+/// loop order, and parallel execution folds per-worker chunks independently
+/// and combines them in a tree. Floating point results can therefore differ
+/// from a sequential left to right sum in the last bits, and no bitwise
+/// equality across machines or target features is guaranteed.
+///
+/// Because of that, `reduce_fn` must be associative and commutative, and
+/// `init` must be an identity of `reduce_fn` whenever the reduction can run on
+/// several threads.
+///
+/// # Allocation
+///
+/// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
+/// the traversal plan are stored inline, so a call performs no heap
+/// allocation. Above that bound the planner may spill to the heap.
 ///
 /// Because `map_fn` and `reduce_fn` are opaque closures this entry cannot
 /// select the dtype-specific SIMD kernels of [`crate::ErasedReducePlan`];
@@ -266,6 +285,354 @@ where
                     ptr = ptr.offset(stride);
                 }
             }
+            Ok(())
+        },
+    )?;
+
+    Ok(acc)
+}
+
+/// Folds a contiguous run of two operands with [`FOLD_LANES`] independent
+/// accumulators.
+///
+/// Same lane scheme as [`fold_contiguous`]: lane `i` starts from the pair at
+/// index `i` and folds the pairs at `i + FOLD_LANES`, `i + 2 * FOLD_LANES`,
+/// ... in order, the remainder goes to the first lanes, and `init` is combined
+/// once before the lanes are combined left to right.
+#[inline(always)]
+fn fold_contiguous2<A, B, OpA, OpB, M, R, U>(
+    a: &[A],
+    b: &[B],
+    init: U,
+    map_fn: &M,
+    reduce_fn: &R,
+) -> U
+where
+    A: Copy,
+    B: Copy,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    M: Fn(A, B) -> U,
+    R: Fn(U, U) -> U,
+    U: Clone,
+{
+    debug_assert_eq!(a.len(), b.len());
+    if a.len() < 2 * FOLD_LANES {
+        let mut acc = init;
+        for (&value_a, &value_b) in a.iter().zip(b) {
+            acc = reduce_fn(acc, map_fn(OpA::apply(value_a), OpB::apply(value_b)));
+        }
+        return acc;
+    }
+    let (head_a, rest_a) = a.split_at(FOLD_LANES);
+    let (head_b, rest_b) = b.split_at(FOLD_LANES);
+    let mut lanes: [U; FOLD_LANES] =
+        core::array::from_fn(|lane| map_fn(OpA::apply(head_a[lane]), OpB::apply(head_b[lane])));
+    let mut chunks_a = rest_a.chunks_exact(FOLD_LANES);
+    let mut chunks_b = rest_b.chunks_exact(FOLD_LANES);
+    for (chunk_a, chunk_b) in chunks_a.by_ref().zip(chunks_b.by_ref()) {
+        for ((lane, &value_a), &value_b) in lanes.iter_mut().zip(chunk_a).zip(chunk_b) {
+            *lane = reduce_fn(
+                lane.clone(),
+                map_fn(OpA::apply(value_a), OpB::apply(value_b)),
+            );
+        }
+    }
+    for ((lane, &value_a), &value_b) in lanes
+        .iter_mut()
+        .zip(chunks_a.remainder())
+        .zip(chunks_b.remainder())
+    {
+        *lane = reduce_fn(
+            lane.clone(),
+            map_fn(OpA::apply(value_a), OpB::apply(value_b)),
+        );
+    }
+    lanes.into_iter().fold(init, reduce_fn)
+}
+
+/// Folds `len` operand pairs starting at `a_ptr`/`b_ptr` with the given
+/// strides.
+///
+/// # Safety
+/// `a_ptr.offset(i * a_stride)` and `b_ptr.offset(i * b_stride)` must be
+/// readable elements for every `i < len`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_run2<A, B, OpA, OpB, M, R, U>(
+    a_ptr: *const A,
+    a_stride: isize,
+    b_ptr: *const B,
+    b_stride: isize,
+    len: usize,
+    init: &U,
+    map_fn: &M,
+    reduce_fn: &R,
+) -> U
+where
+    A: Copy,
+    B: Copy,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    M: Fn(A, B) -> U,
+    R: Fn(U, U) -> U,
+    U: Clone,
+{
+    if a_stride == 1 && b_stride == 1 {
+        // SAFETY: the caller proves `len` readable unit-stride elements of
+        // both operands.
+        let a = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+        let b = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+        return fold_contiguous2::<A, B, OpA, OpB, M, R, U>(a, b, init.clone(), map_fn, reduce_fn);
+    }
+    let mut acc = init.clone();
+    let mut cursor_a = a_ptr;
+    let mut cursor_b = b_ptr;
+    for index in 0..len {
+        // SAFETY: the caller proves every pair of the run is readable.
+        let mapped = map_fn(
+            OpA::apply(unsafe { *cursor_a }),
+            OpB::apply(unsafe { *cursor_b }),
+        );
+        acc = reduce_fn(acc, mapped);
+        if index + 1 < len {
+            cursor_a = cursor_a.wrapping_offset(a_stride);
+            cursor_b = cursor_b.wrapping_offset(b_stride);
+        }
+    }
+    acc
+}
+
+/// Two-input mapped reduction: `reduce(init, op, map.(a[i], b[i]))`.
+///
+/// This is the two-operand sibling of [`reduce`]. It exists so that the
+/// accumulator type `U` is chosen by the caller instead of being tied to the
+/// operand types by `Mul`, which is what makes a widening accumulation
+/// possible — for example an `f32` dot accumulated in `f64`:
+///
+/// ```
+/// use strided_basic::{zip_reduce, StridedArray};
+///
+/// let a = StridedArray::<f32>::from_fn_col_major(&[2, 3], |i| (1 + i[0] + 2 * i[1]) as f32);
+/// let b = StridedArray::<f32>::from_fn_col_major(&[2, 3], |i| (1 + i[0]) as f32 * 0.5);
+/// let dot: f64 = zip_reduce(
+///     &a.view(),
+///     &b.view(),
+///     |x: f32, y: f32| x as f64 * y as f64,
+///     |x, y| x + y,
+///     0.0,
+/// )
+/// .unwrap();
+/// assert_eq!(dot, 16.5);
+/// ```
+///
+/// Both operands must have the same shape. Each operand's [`ElementOp`] is
+/// applied before `map_fn`, so conjugation and transposition flags are honoured
+/// without materializing a conjugated copy. Permuted, gapped, negative and
+/// stride-0 (broadcast) operands are supported: the traversal is the fused
+/// plan of [`reduce`], extended to two stride lists.
+///
+/// # Evaluation order
+///
+/// The result is independent of the ambient pool width when the call runs
+/// under the sequential policy — [`ExecContext::serial`](crate::ExecContext::serial)
+/// or [`with_execution_policy`](crate::with_execution_policy) with
+/// [`ExecutionPolicy::Sequential`](crate::ExecutionPolicy::Sequential): only
+/// serial branches run, and their fold order is fixed by the operand layouts.
+/// Under a parallel policy the fold is split over the effective thread count,
+/// so the result is repeatable for a fixed shape, layout and thread count but
+/// can differ between thread counts.
+///
+/// In neither case is this a strict left to right fold: a contiguous operand
+/// pair is folded with the same sixteen independent lanes as [`reduce`], the
+/// general plan is traversed in a cache-friendly loop order, and parallel
+/// execution folds per-worker chunks independently and combines them in a
+/// tree. Floating point results can therefore differ from a sequential left to
+/// right sum in the last bits, and no bitwise equality across machines or
+/// target features is guaranteed.
+///
+/// Because of that, `reduce_fn` must be associative and commutative, and
+/// `init` must be an identity of `reduce_fn` whenever the reduction can run on
+/// several threads.
+///
+/// # Allocation
+///
+/// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
+/// the two-operand traversal plan are stored inline, so a call performs no heap
+/// allocation. Above that bound the planner may spill to the heap.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] / [`StridedError::ShapeMismatch`] when
+/// the operand shapes differ, and [`StridedError::OffsetOverflow`] for
+/// unrepresentable element counts.
+pub fn zip_reduce<A, B, OpA, OpB, M, R, U>(
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    map_fn: M,
+    reduce_fn: R,
+    init: U,
+) -> Result<U>
+where
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    M: Fn(A, B) -> U + MaybeSync,
+    R: Fn(U, U) -> U + MaybeSync,
+    U: Clone + MaybeSendSync,
+{
+    zip_reduce_impl(a, b, map_fn, reduce_fn, init)
+}
+
+fn zip_reduce_impl<A, B, OpA, OpB, M, R, U>(
+    a: &StridedView<A, OpA>,
+    b: &StridedView<B, OpB>,
+    map_fn: M,
+    reduce_fn: R,
+    init: U,
+) -> Result<U>
+where
+    A: Copy + MaybeSendSync,
+    B: Copy + MaybeSendSync,
+    OpA: ElementOp<A>,
+    OpB: ElementOp<B>,
+    M: Fn(A, B) -> U + MaybeSync,
+    R: Fn(U, U) -> U + MaybeSync,
+    U: Clone + MaybeSendSync,
+{
+    ensure_same_shape(a.dims(), b.dims())?;
+
+    let a_ptr = a.ptr();
+    let b_ptr = b.ptr();
+    let dims = a.dims();
+    let a_strides = a.strides();
+    let b_strides = b.strides();
+
+    if sequential_contiguous_layout(dims, &[a_strides, b_strides])?.is_some() {
+        let len = total_len(dims)?;
+        return Ok(simd::dispatch_if_large(len, || {
+            // SAFETY: both operands prove `len` readable elements.
+            let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
+            let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
+            fold_contiguous2::<A, B, OpA, OpB, M, R, U>(sa, sb, init, &map_fn, &reduce_fn)
+        }));
+    }
+
+    // Parallel contiguous fast path: split into scheduler chunks so each chunk
+    // folds two contiguous slices, matching the serial contiguous kernel.
+    #[cfg(feature = "parallel")]
+    {
+        let total = total_len(dims)?;
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH
+            && nthreads > 1
+            && same_contiguous_layout(dims, &[a_strides, b_strides]).is_some()
+        {
+            // SAFETY: both operands prove `total` readable elements.
+            let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };
+            let sb = unsafe { std::slice::from_raw_parts(b_ptr, total) };
+            let result = crate::threading::parallel_map_reduce(
+                0..total,
+                nthreads,
+                &|range| {
+                    fold_contiguous2::<A, B, OpA, OpB, M, R, U>(
+                        &sa[range.clone()],
+                        &sb[range],
+                        init.clone(),
+                        &map_fn,
+                        &reduce_fn,
+                    )
+                },
+                &|left, right| reduce_fn(left, right),
+            );
+            return Ok(result);
+        }
+    }
+
+    let strides_list: [&[isize]; 2] = [a_strides, b_strides];
+    let elem_size = std::mem::size_of::<A>().max(std::mem::size_of::<B>());
+    let (fused_dims, ordered_strides, plan) =
+        build_plan_fused(dims, &strides_list, None, elem_size);
+
+    #[cfg(feature = "parallel")]
+    {
+        let total = total_len(&fused_dims)?;
+        let nthreads = crate::execution_policy::rayon_threads();
+        if total > MINTHREADLENGTH && nthreads > 1 {
+            let a_send = SendPtr(a_ptr as *mut A);
+            let b_send = SendPtr(b_ptr as *mut B);
+            let costs = compute_costs(&ordered_strides);
+            let initial_offsets: crate::inline::OperandVec<isize> =
+                ordered_strides.iter().map(|_| 0isize).collect();
+            let map_fn_ref = &map_fn;
+            let reduce_fn_ref = &reduce_fn;
+            let init_ref = &init;
+            // The reduction tree combines each split's partial result, so no
+            // worker-count-sized output-slot vector is needed (#306 scope).
+            let result = mapreduce_threaded_fold(
+                &fused_dims,
+                &plan.block,
+                &ordered_strides,
+                &initial_offsets,
+                &costs,
+                nthreads,
+                &|dims, blocks, strides_list, offsets| {
+                    let mut acc = init_ref.clone();
+                    for_each_inner_block_with_offsets(
+                        dims,
+                        blocks,
+                        strides_list,
+                        offsets,
+                        |offsets, len, strides| {
+                            // SAFETY: the plan proves every pair of this block
+                            // is a readable element of both operands.
+                            acc = unsafe {
+                                fold_run2::<A, B, OpA, OpB, M, R, U>(
+                                    a_send.as_const().offset(offsets[0]),
+                                    strides[0],
+                                    b_send.as_const().offset(offsets[1]),
+                                    strides[1],
+                                    len,
+                                    &acc,
+                                    map_fn_ref,
+                                    reduce_fn_ref,
+                                )
+                            };
+                            Ok(())
+                        },
+                    )?;
+                    Ok(acc)
+                },
+                &|left, right| reduce_fn_ref(left, right),
+            )?;
+            return Ok(result);
+        }
+    }
+
+    let mut acc = init;
+    let initial_offsets: crate::inline::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
+    for_each_inner_block_preordered(
+        &fused_dims,
+        &plan.block,
+        &ordered_strides,
+        &initial_offsets,
+        |offsets, len, strides| {
+            // SAFETY: the plan proves every pair of this block is a readable
+            // element of both operands.
+            acc = unsafe {
+                fold_run2::<A, B, OpA, OpB, M, R, U>(
+                    a_ptr.offset(offsets[0]),
+                    strides[0],
+                    b_ptr.offset(offsets[1]),
+                    strides[1],
+                    len,
+                    &acc,
+                    &map_fn,
+                    &reduce_fn,
+                )
+            };
             Ok(())
         },
     )?;
