@@ -978,6 +978,9 @@ impl ErasedUpdatePlan {
             + KernelStorageElement
             + core::ops::Add<Output = T>
             + core::ops::Mul<Output = T>
+            + Zero
+            + One
+            + PartialEq
             + ElementOpApply,
     {
         check_dtype(self.dtype, dest.dtype())?;
@@ -1001,6 +1004,90 @@ impl ErasedUpdatePlan {
                 UpdateOp::Conj => self
                     .plan
                     .execute(&mut dest_ref, &source, alpha, beta, |x| x.conj()),
+            }
+        })
+    }
+
+    /// `dest = alpha * op(src)` into an uninitialized erased destination.
+    ///
+    /// This is [`execute`](Self::execute) with `beta = 0`: the destination is
+    /// never read, so a NaN-filled or uninitialized output cannot contaminate
+    /// the result. On success every reachable destination element is written;
+    /// validation errors are returned before any write. A panic during
+    /// execution may leave a partially initialized `MaybeUninit` destination,
+    /// which is still safely droppable; no readable value is promised for
+    /// unwritten reachable slots.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::mem::MaybeUninit;
+    /// use strided_basic::{
+    ///     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedUpdatePlan,
+    ///     ExecContext, KernelDType, UpdateOp,
+    /// };
+    ///
+    /// let plan = ErasedUpdatePlan::compile(KernelDType::F64, &[2], &[1], &[1]).unwrap();
+    /// let src_data = [1.0_f64, 2.0];
+    /// let mut dst_data = [MaybeUninit::<f64>::uninit(); 2];
+    /// let src = ErasedRawStridedRef::from_slice(&src_data, &[2], &[1], 0).unwrap();
+    /// let src_ptr = ErasedRawStridedPtr::from_ref(&src);
+    /// let mut dst =
+    ///     ErasedRawStridedUninitMut::from_uninit_slice(&mut dst_data, &[2], &[1], 0).unwrap();
+    /// // dst = 2 * src
+    /// plan.execute_uninit(&ExecContext::serial(), &mut dst, &src_ptr, 2.0, UpdateOp::Identity)
+    ///     .unwrap();
+    /// let values: Vec<f64> = dst_data.iter().map(|v| unsafe { v.assume_init() }).collect();
+    /// assert_eq!(values, [2.0, 4.0]);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `DTypeMismatch` or `PlanLayoutMismatch` when a descriptor does
+    /// not match the plan, and `OverlappingInputOutput` when the source
+    /// overlaps the destination allocation, all before any destination write.
+    pub fn execute_uninit<T>(
+        &self,
+        ctx: &ExecContext,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        src: &ErasedRawStridedPtr<'_>,
+        alpha: T,
+        op: UpdateOp,
+    ) -> Result<()>
+    where
+        T: Copy
+            + crate::MaybeSendSync
+            + KernelStorageElement
+            + core::ops::Mul<Output = T>
+            + One
+            + PartialEq
+            + ElementOpApply,
+    {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        validate_uninit_no_overlap(dest, src, 0)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let src = unsafe { src.try_as_ref_after_no_overlap() }?;
+        let source_data = src.data_as::<T>()?;
+        let dest_dims = dest.dims();
+        let dest_strides = dest.strides();
+        let dest_offset = dest.offset();
+        ctx.run(|| {
+            let dest_data = dest.data_as_uninit_mut::<T>()?;
+            let source = unsafe {
+                RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+            };
+            let mut dest_ref = unsafe {
+                RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
+            };
+            match op {
+                UpdateOp::Identity => {
+                    self.plan
+                        .execute_uninit(&mut dest_ref, &source, alpha, |x| x)
+                }
+                UpdateOp::Conj => self
+                    .plan
+                    .execute_uninit(&mut dest_ref, &source, alpha, |x| x.conj()),
             }
         })
     }

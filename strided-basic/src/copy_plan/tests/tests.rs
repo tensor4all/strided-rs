@@ -309,3 +309,287 @@ fn update_plan_rejects_non_injective_destination_and_layout_drift() {
         .unwrap_err();
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
 }
+
+/// Independent reference for the write-only update `dst = alpha * src` over a
+/// logical layout, used to check that `beta = 0` never reads the destination.
+fn reference_scale<T>(
+    dst: &mut [T],
+    src: &[T],
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    alpha: T,
+) where
+    T: Copy + Mul<Output = T>,
+{
+    let total: usize = dims.iter().product();
+    for linear in 0..total {
+        let mut rest = linear;
+        let mut d = 0isize;
+        let mut s = 0isize;
+        for axis in 0..dims.len() {
+            let coord = (rest % dims[axis]) as isize;
+            rest /= dims[axis];
+            d += coord * dst_strides[axis];
+            s += coord * src_strides[axis];
+        }
+        dst[d as usize] = alpha * src[s as usize];
+    }
+}
+
+/// Poison a destination with `poison`, run `dest = alpha * f(src) + beta * dest`
+/// and assert the result equals `alpha * f(src)` for a beta that is zero.
+fn assert_update_beta_zero_case<T>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    src: &[T],
+    poison: T,
+    alpha: T,
+    beta: T,
+) where
+    T: Copy
+        + PartialEq
+        + core::fmt::Debug
+        + MaybeSendSync
+        + Add<Output = T>
+        + Mul<Output = T>
+        + num_traits::Zero
+        + num_traits::One,
+{
+    let len: usize = dims.iter().product();
+    let plan = UpdatePlan::compile(dims, dst_strides, src_strides).unwrap();
+    let mut dst = vec![poison; len];
+    {
+        let source = RawStridedRef::new(src, dims, src_strides, 0).unwrap();
+        let mut dest = RawStridedMut::new(&mut dst, dims, dst_strides, 0).unwrap();
+        plan.execute(&mut dest, &source, alpha, beta, |x| x)
+            .unwrap();
+    }
+    let mut expected = vec![poison; len];
+    reference_scale(&mut expected, src, dims, dst_strides, src_strides, alpha);
+    assert_eq!(dst, expected);
+}
+
+/// Poisoned `MaybeUninit` destination: `execute_uninit` must write every
+/// reachable slot exactly as the write-only reference does, leaving holes as
+/// they were.
+fn assert_execute_uninit_case<T>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    src: &[T],
+    poison: T,
+    alpha: T,
+) where
+    T: Copy
+        + PartialEq
+        + core::fmt::Debug
+        + MaybeSendSync
+        + Add<Output = T>
+        + Mul<Output = T>
+        + num_traits::Zero
+        + num_traits::One,
+{
+    let len: usize = dims.iter().product();
+    let plan = UpdatePlan::compile(dims, dst_strides, src_strides).unwrap();
+    let mut storage = vec![MaybeUninit::new(poison); len];
+    {
+        let source = RawStridedRef::new(src, dims, src_strides, 0).unwrap();
+        let mut dest = RawStridedMut::new(&mut storage, dims, dst_strides, 0).unwrap();
+        plan.execute_uninit(&mut dest, &source, alpha, |x| x)
+            .unwrap();
+    }
+    let mut expected = vec![poison; len];
+    reference_scale(&mut expected, src, dims, dst_strides, src_strides, alpha);
+    for (got, want) in storage.iter().zip(&expected) {
+        // SAFETY: every slot was initialized with `poison` above, so even a
+        // hole stays a valid readable value.
+        assert_eq!(unsafe { got.assume_init() }, *want);
+    }
+}
+
+#[test]
+fn update_plan_beta_zero_never_reads_nan_destination() {
+    let dims = [2usize, 3];
+    let contiguous = [3isize, 1];
+    let src_permuted = [3isize, 1];
+    let dst_permuted = [1isize, 2];
+
+    let f64_src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert_update_beta_zero_case(
+        &dims,
+        &contiguous,
+        &contiguous,
+        &f64_src,
+        f64::NAN,
+        2.0,
+        0.0,
+    );
+    assert_update_beta_zero_case(
+        &dims,
+        &dst_permuted,
+        &src_permuted,
+        &f64_src,
+        f64::NAN,
+        2.0,
+        0.0,
+    );
+    // alpha == 1 takes the exact write-only copy branch.
+    assert_update_beta_zero_case(
+        &dims,
+        &dst_permuted,
+        &src_permuted,
+        &f64_src,
+        f64::NAN,
+        1.0,
+        0.0,
+    );
+
+    let f32_src = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert_update_beta_zero_case(
+        &dims,
+        &contiguous,
+        &contiguous,
+        &f32_src,
+        f32::NAN,
+        2.0,
+        0.0,
+    );
+    assert_update_beta_zero_case(
+        &dims,
+        &dst_permuted,
+        &src_permuted,
+        &f32_src,
+        f32::NAN,
+        1.0,
+        0.0,
+    );
+
+    let c64_src: Vec<Complex64> = (0..6)
+        .map(|value| Complex64::new(value as f64, -(value as f64)))
+        .collect();
+    let c64_nan = Complex64::new(f64::NAN, f64::NAN);
+    assert_update_beta_zero_case(
+        &dims,
+        &contiguous,
+        &contiguous,
+        &c64_src,
+        c64_nan,
+        Complex64::new(2.0, 0.0),
+        Complex64::new(0.0, 0.0),
+    );
+    assert_update_beta_zero_case(
+        &dims,
+        &dst_permuted,
+        &src_permuted,
+        &c64_src,
+        c64_nan,
+        Complex64::new(1.0, 0.0),
+        Complex64::new(0.0, 0.0),
+    );
+}
+
+#[test]
+fn update_plan_negative_zero_beta_is_write_only() {
+    // `-0.0 == 0.0`, so beta = -0.0 must also skip the destination read.
+    let dims = [2usize, 3];
+    let src_strides = [3isize, 1];
+    let dst_strides = [1isize, 2];
+    let src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert_update_beta_zero_case(&dims, &dst_strides, &src_strides, &src, f64::NAN, 3.0, -0.0);
+}
+
+#[test]
+fn update_plan_beta_nonzero_reads_destination() {
+    let dims = [2usize, 2];
+    let strides = [1isize, 2];
+    let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+    let src = [1.0f64, 2.0, 3.0, 4.0];
+    let initial = [10.0f64, 20.0, 30.0, 40.0];
+    let mut dst = initial;
+    let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+    plan.execute(&mut dest, &source, 2.0, 0.5, |x| x + 1.0)
+        .unwrap();
+    for index in 0..4 {
+        assert_eq!(dst[index], 2.0 * (src[index] + 1.0) + 0.5 * initial[index]);
+    }
+}
+
+#[test]
+fn update_plan_nan_beta_reads_destination() {
+    // NaN is not zero, so the destination read path stays active.
+    let dims = [2usize];
+    let strides = [1isize];
+    let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+    let src = [1.0f64, 2.0];
+    let mut dst = [3.0f64, 4.0];
+    let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+    plan.execute(&mut dest, &source, 1.0, f64::NAN, |x| x)
+        .unwrap();
+    assert!(dst.iter().all(|value| value.is_nan()));
+}
+
+#[test]
+fn update_plan_execute_uninit_initializes_every_reachable_slot() {
+    let dims = [2usize, 3];
+    let contiguous = [3isize, 1];
+    let src_permuted = [3isize, 1];
+    let dst_permuted = [1isize, 2];
+
+    let f64_src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert_execute_uninit_case(&dims, &contiguous, &contiguous, &f64_src, f64::NAN, 2.0);
+    assert_execute_uninit_case(&dims, &contiguous, &contiguous, &f64_src, f64::NAN, 1.0);
+    assert_execute_uninit_case(&dims, &dst_permuted, &src_permuted, &f64_src, f64::NAN, 2.0);
+
+    let f32_src = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert_execute_uninit_case(&dims, &contiguous, &contiguous, &f32_src, f32::NAN, 2.0);
+    assert_execute_uninit_case(&dims, &dst_permuted, &src_permuted, &f32_src, f32::NAN, 1.0);
+
+    let c64_src: Vec<Complex64> = (0..6)
+        .map(|value| Complex64::new(value as f64, -(value as f64)))
+        .collect();
+    let c64_nan = Complex64::new(f64::NAN, f64::NAN);
+    assert_execute_uninit_case(
+        &dims,
+        &contiguous,
+        &contiguous,
+        &c64_src,
+        c64_nan,
+        Complex64::new(2.0, 0.0),
+    );
+    assert_execute_uninit_case(
+        &dims,
+        &dst_permuted,
+        &src_permuted,
+        &c64_src,
+        c64_nan,
+        Complex64::new(1.0, 0.0),
+    );
+}
+
+#[test]
+fn update_plan_execute_uninit_leaves_gapped_holes_untouched() {
+    // Rank-1 destination with stride 2 reaches offsets 0 and 2; the holes at 1
+    // and 3 keep their poison and must not be written.
+    let dims = [2usize];
+    let dst_strides = [2isize];
+    let src_strides = [1isize];
+    let src = [7.0f64, 8.0];
+    let plan = UpdatePlan::compile(&dims, &dst_strides, &src_strides).unwrap();
+    let mut storage = vec![MaybeUninit::new(f64::NAN); 4];
+    {
+        let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+        let mut dest = RawStridedMut::new(&mut storage, &dims, &dst_strides, 0).unwrap();
+        plan.execute_uninit(&mut dest, &source, 1.0, |x| x).unwrap();
+    }
+    // SAFETY: every slot was initialized with NaN before the call.
+    unsafe {
+        assert_eq!(storage[0].assume_init(), 7.0);
+        assert!(storage[1].assume_init().is_nan());
+        assert_eq!(storage[2].assume_init(), 8.0);
+        assert!(storage[3].assume_init().is_nan());
+    }
+}
