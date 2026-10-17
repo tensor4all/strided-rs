@@ -46,14 +46,26 @@ Representative run (this machine):
 | id | ratio | gate | allocs/op |
 |---|---|---|---|
 | S1 serial vs 1-thread parallel fused two-op DAG, 8^3 | 0.99 | <= 1.5 | 0 |
-| S2 fused single add vs `zip_map2_into`, 8^3 | 1.43 to 1.48 | <= 1.5 | 0 |
-| S3a `map_into` vs compiled `ErasedUpdatePlan`, n=16 | 1.06 | <= 2 | 0 |
-| S3b `map_into` vs compiled `ErasedUpdatePlan`, 4^3 | 1.62 | <= 2 | 0 |
+| S2 fused single add vs `zip_map2_into`, 8^3 | 1.04 to 1.18 | <= 1.5 | 0 |
+| S3a `map_into` vs compiled typed `UpdatePlan`, n=16 | 1.54 | <= 2.0 | 0 |
+| S3b `map_into` vs compiled typed `UpdatePlan`, 4^3 | 2.24 | <= 3.0 | 0 |
+| S3c `map_into` vs compiled `ErasedUpdatePlan`, n=16 | 0.92 | report | 0 |
+| S3d `map_into` vs compiled `ErasedUpdatePlan`, 4^3 | 1.49 | report | 0 |
 | S4 permuted vs contiguous `copy_into`, 8^3 / 32^3 | 0.78 / 15.3 | report | 0 |
 | S5 unspecialized vs specialized add*mul, 8^3 | 7.6 to 8.1 | report | 0 |
 
-S2 was 6.5 before the item-2 fix (the per-element `eval_binary` dispatch) and is
-1.4 to 1.5 after it; at 16^3 it is 1.12, so the residual is the fused per-call
-validation, not the kernel. S3 uses the compiled erased update plan because that
-is the plan a downstream runtime compiles and executes per call (P4); against
-the typed `UpdatePlan` the 4^3 row is about 2.2 and the threshold would not hold.
+S2 was 6.5 before the item-2 fix (the per-element `eval_binary` dispatch) and
+1.4 to 1.5 after it, because `fused_elementwise_into` validated the destination
+injectivity a second time inside `try_static_specialization`. Threading the
+`ValidatedDestinationLayout` marker out of `validate_shapes` into the
+specialization removed the duplicate check (`strided-basic` now exposes
+`validate_destination_layout` returning the marker); S2 is 1.04 to 1.18 and the
+fused single add matches `zip_map2_into` (about 158 ns against 147 ns at
+8x8x8).
+
+S3 measures the P4 per-call-planning residual of typed `map_into`: it is about
+1.5x a compiled typed `UpdatePlan` at n=16 and about 2.2x at 4x4x4, which is
+the gap the gate exists to watch. Because #306 says the first thresholds are
+loose and tightened after about 20 CI runs, S3a/S3b start at 2.0 and 3.0 (the
+measured value times about 1.3). The `ErasedUpdatePlan` a downstream runtime
+actually replays is reported as S3c/S3d, separately from the typed gate.
