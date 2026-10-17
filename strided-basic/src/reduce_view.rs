@@ -409,7 +409,7 @@ where
             ));
         }
     }
-    if !crate::layout_check::is_injective_layout_inline(dest.dims(), dest.strides()) {
+    if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
 

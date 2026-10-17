@@ -6,7 +6,7 @@
 use crate::hptt::macro_kernel::{
     const_stride1_copy, macro_kernel_f32, macro_kernel_f64, macro_kernel_fallback,
 };
-use crate::hptt::plan::{ComputeNode, ExecMode, GroupedTilePlan, PermutePlan};
+use crate::hptt::plan::{ExecMode, GroupedTilePlan, LoopLevel, PermutePlan};
 
 #[cfg(feature = "parallel")]
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -15,13 +15,48 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 #[cfg(feature = "parallel")]
 const MINTHREADLENGTH: usize = 1 << 15; // 32768
 
+/// The native float width `T` may be reinterpreted as, or `None` for the
+/// generic fallback.
+///
+/// INVARIANT: the permutation micro-kernels read and write the buffer as
+/// `f64`/`f32`. Reinterpreting by `size_of::<T>()` alone is unsound for an
+/// arbitrary `Copy` type with a weaker alignment (for example
+/// `num_complex::Complex32`, size 8 / align 4, or `[u16; 4]`, size 8 / align
+/// 2): a `Vec` of those is only guaranteed their own alignment, so the float
+/// access can be misaligned. Restrict the reinterpretation to the exact
+/// primitive types whose alignment matches the float width (#289); every
+/// other type takes the generic element-wise path.
+#[inline]
+fn native_float_kind<T: 'static>() -> Option<usize> {
+    let id = std::any::TypeId::of::<T>();
+    if (id == std::any::TypeId::of::<f64>()
+        || id == std::any::TypeId::of::<i64>()
+        || id == std::any::TypeId::of::<u64>())
+        && std::mem::align_of::<T>() >= 8
+    {
+        Some(8)
+    } else if (id == std::any::TypeId::of::<f32>()
+        || id == std::any::TypeId::of::<i32>()
+        || id == std::any::TypeId::of::<u32>())
+        && std::mem::align_of::<T>() >= 4
+    {
+        Some(4)
+    } else {
+        None
+    }
+}
+
 /// Execute the permutation plan (single-threaded).
 ///
 /// # Safety
 /// - `src` must be valid for reads at all offsets determined by dims/src_strides
 /// - `dst` must be valid for writes at all offsets determined by dims/dst_strides
 /// - src and dst must not overlap
-pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan: &PermutePlan) {
+pub unsafe fn execute_permute_blocked<T: Copy + 'static>(
+    src: *const T,
+    dst: *mut T,
+    plan: &PermutePlan,
+) {
     match plan.mode {
         ExecMode::Scalar => {
             *dst = *src;
@@ -30,13 +65,10 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
             let count = plan.fused_dims[inner_dim];
             let src_stride = plan.src_strides[inner_dim];
             let dst_stride = plan.dst_strides[inner_dim];
-            match &plan.root {
-                Some(root) => {
-                    const_stride1_recursive(src, dst, root, count, src_stride, dst_stride);
-                }
-                None => {
-                    const_stride1_copy(src, dst, count, src_stride, dst_stride);
-                }
+            if plan.levels.is_empty() {
+                const_stride1_copy(src, dst, count, src_stride, dst_stride);
+            } else {
+                const_stride1_recursive(src, dst, &plan.levels, count, src_stride, dst_stride);
             }
         }
         ExecMode::GroupedTranspose => {
@@ -44,13 +76,10 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
                 .grouped_tile
                 .as_ref()
                 .expect("grouped transpose mode requires grouped tile plan");
-            match &plan.root {
-                Some(root) => {
-                    grouped_recursive(src, dst, root, grouped);
-                }
-                None => {
-                    grouped_tile_copy(src, dst, grouped);
-                }
+            if plan.levels.is_empty() {
+                grouped_tile_copy(src, dst, grouped);
+            } else {
+                grouped_recursive(src, dst, &plan.levels, grouped);
             }
         }
         ExecMode::Transpose { dim_a, dim_b } => {
@@ -59,16 +88,12 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
             let lda = plan.lda_inner;
             let ldb = plan.ldb_inner;
             let block = plan.block;
-            let elem_size = std::mem::size_of::<T>();
 
-            match &plan.root {
-                Some(root) => {
-                    transpose_recursive(src, dst, root, size_a, size_b, lda, ldb, block, elem_size);
-                }
-                None => {
-                    // No outer loops — just the 2D blocked transpose
-                    dispatch_blocked_2d(src, dst, size_a, size_b, lda, ldb, block, elem_size);
-                }
+            if plan.levels.is_empty() {
+                // No outer loops — just the 2D blocked transpose
+                dispatch_blocked_2d(src, dst, size_a, size_b, lda, ldb, block);
+            } else {
+                transpose_recursive(src, dst, &plan.levels, size_a, size_b, lda, ldb, block);
             }
         }
     }
@@ -76,13 +101,13 @@ pub unsafe fn execute_permute_blocked<T: Copy>(src: *const T, dst: *mut T, plan:
 
 /// Execute the permutation plan with Rayon parallelism.
 ///
-/// Parallelizes over the outermost ComputeNode's dimension.
+/// Parallelizes over the outermost loop level.
 /// Falls back to single-threaded for small tensors.
 ///
 /// # Safety
 /// Same requirements as `execute_permute_blocked`.
 #[cfg(feature = "parallel")]
-pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
+pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
     src: *const T,
     dst: *mut T,
     plan: &PermutePlan,
@@ -94,56 +119,53 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
         return;
     }
 
-    let root = match &plan.root {
-        Some(r) => r,
-        None => {
-            match plan.mode {
-                ExecMode::Transpose { dim_a, dim_b } => {
-                    dispatch_blocked_2d_par(
-                        src,
-                        dst,
-                        plan.fused_dims[dim_a],
-                        plan.fused_dims[dim_b],
-                        plan.lda_inner,
-                        plan.ldb_inner,
-                        plan.block,
-                        std::mem::size_of::<T>(),
-                    );
-                }
-                ExecMode::ConstStride1 { inner_dim } => {
-                    // One strided stream with no enclosing loop: split its
-                    // elements across workers instead of running it on one.
-                    let count = plan.fused_dims[inner_dim];
-                    let src_stride = plan.src_strides[inner_dim];
-                    let dst_stride = plan.dst_strides[inner_dim];
-                    let nthreads = rayon::current_num_threads().max(1);
-                    let chunk = count.div_ceil(nthreads).max(1);
-                    let src_addr = src as usize;
-                    let dst_addr = dst as usize;
-                    let chunks = count.div_ceil(chunk).max(1);
-                    (0..chunks).into_par_iter().for_each(|c| {
-                        let start = c * chunk;
-                        if start >= count {
-                            return;
-                        }
-                        let len = chunk.min(count - start);
-                        let s = (src_addr as isize
-                            + start as isize * src_stride * (std::mem::size_of::<T>() as isize))
-                            as *const T;
-                        let d = (dst_addr as isize
-                            + start as isize * dst_stride * (std::mem::size_of::<T>() as isize))
-                            as *mut T;
-                        unsafe { const_stride1_copy(s, d, len, src_stride, dst_stride) };
-                    });
-                }
-                _ => {
-                    execute_permute_blocked(src, dst, plan);
-                }
+    if plan.levels.is_empty() {
+        match plan.mode {
+            ExecMode::Transpose { dim_a, dim_b } => {
+                dispatch_blocked_2d_par(
+                    src,
+                    dst,
+                    plan.fused_dims[dim_a],
+                    plan.fused_dims[dim_b],
+                    plan.lda_inner,
+                    plan.ldb_inner,
+                    plan.block,
+                );
             }
-            return;
+            ExecMode::ConstStride1 { inner_dim } => {
+                // One strided stream with no enclosing loop: split its
+                // elements across workers instead of running it on one.
+                let count = plan.fused_dims[inner_dim];
+                let src_stride = plan.src_strides[inner_dim];
+                let dst_stride = plan.dst_strides[inner_dim];
+                let nthreads = rayon::current_num_threads().max(1);
+                let chunk = count.div_ceil(nthreads).max(1);
+                let src_addr = src as usize;
+                let dst_addr = dst as usize;
+                let chunks = count.div_ceil(chunk).max(1);
+                (0..chunks).into_par_iter().for_each(|c| {
+                    let start = c * chunk;
+                    if start >= count {
+                        return;
+                    }
+                    let len = chunk.min(count - start);
+                    let s = (src_addr as isize
+                        + start as isize * src_stride * (std::mem::size_of::<T>() as isize))
+                        as *const T;
+                    let d = (dst_addr as isize
+                        + start as isize * dst_stride * (std::mem::size_of::<T>() as isize))
+                        as *mut T;
+                    unsafe { const_stride1_copy(s, d, len, src_stride, dst_stride) };
+                });
+            }
+            _ => {
+                execute_permute_blocked(src, dst, plan);
+            }
         }
-    };
+        return;
+    }
 
+    let root = &plan.levels[0];
     let outer_dim = root.end;
     if outer_dim <= 1 {
         execute_permute_blocked(src, dst, plan);
@@ -155,7 +177,7 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
     let lda_root = root.lda;
     let ldb_root = root.ldb;
     let elem_size = std::mem::size_of::<T>();
-    let inner = root.next.clone();
+    let inner: &[LoopLevel] = &plan.levels[1..];
 
     match plan.mode {
         ExecMode::Transpose { dim_a, dim_b } => {
@@ -172,15 +194,10 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
                     (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
-                    match &inner {
-                        Some(next) => {
-                            transpose_recursive(
-                                s, d, next, size_a, size_b, lda, ldb, block, elem_size,
-                            );
-                        }
-                        None => {
-                            dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block, elem_size);
-                        }
+                    if inner.is_empty() {
+                        dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
+                    } else {
+                        transpose_recursive(s, d, inner, size_a, size_b, lda, ldb, block);
                     }
                 }
             });
@@ -197,13 +214,10 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
                     (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
-                    match &inner {
-                        Some(next) => {
-                            const_stride1_recursive(s, d, next, count, src_stride, dst_stride);
-                        }
-                        None => {
-                            const_stride1_copy(s, d, count, src_stride, dst_stride);
-                        }
+                    if inner.is_empty() {
+                        const_stride1_copy(s, d, count, src_stride, dst_stride);
+                    } else {
+                        const_stride1_recursive(s, d, inner, count, src_stride, dst_stride);
                     }
                 }
             });
@@ -221,13 +235,10 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
                     (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
 
                 unsafe {
-                    match &inner {
-                        Some(next) => {
-                            grouped_recursive(s, d, next, grouped);
-                        }
-                        None => {
-                            grouped_tile_copy(s, d, grouped);
-                        }
+                    if inner.is_empty() {
+                        grouped_tile_copy(s, d, grouped);
+                    } else {
+                        grouped_recursive(s, d, inner, grouped);
                     }
                 }
             });
@@ -245,32 +256,22 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync>(
 unsafe fn grouped_recursive<T: Copy>(
     src: *const T,
     dst: *mut T,
-    node: &ComputeNode,
+    levels: &[LoopLevel],
     grouped: &GroupedTilePlan,
 ) {
-    let end = node.end;
-    let node_lda = node.lda;
-    let node_ldb = node.ldb;
-
-    match &node.next {
-        Some(next) => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                grouped_recursive(s, d, next, grouped);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
+    let (node, rest) = levels
+        .split_first()
+        .expect("grouped_recursive requires a loop level");
+    let mut s = src;
+    let mut d = dst;
+    for _ in 0..node.end {
+        if rest.is_empty() {
+            grouped_tile_copy(s, d, grouped);
+        } else {
+            grouped_recursive(s, d, rest, grouped);
         }
-        None => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                grouped_tile_copy(s, d, grouped);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
-        }
+        s = s.offset(node.lda);
+        d = d.offset(node.ldb);
     }
 }
 
@@ -294,51 +295,41 @@ unsafe fn grouped_tile_copy<T: Copy>(src: *const T, dst: *mut T, grouped: &Group
 
 /// Recursive loop nest for Transpose mode.
 ///
-/// Mirrors HPTT's `transpose_int`. Each ComputeNode iterates its dimension
+/// Mirrors HPTT's `transpose_int`. Each [`LoopLevel`] iterates its dimension
 /// with inc=1. At the leaf, runs the 2D blocked transpose over dim_A × dim_B.
-unsafe fn transpose_recursive<T: Copy>(
+unsafe fn transpose_recursive<T: Copy + 'static>(
     src: *const T,
     dst: *mut T,
-    node: &ComputeNode,
+    levels: &[LoopLevel],
     size_a: usize,
     size_b: usize,
     lda: isize,
     ldb: isize,
     block: usize,
-    elem_size: usize,
 ) {
-    let end = node.end;
-    let node_lda = node.lda;
-    let node_ldb = node.ldb;
-
-    match &node.next {
-        Some(next) => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                transpose_recursive(s, d, next, size_a, size_b, lda, ldb, block, elem_size);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
+    let (node, rest) = levels
+        .split_first()
+        .expect("transpose_recursive requires a loop level");
+    let mut s = src;
+    let mut d = dst;
+    for _ in 0..node.end {
+        if rest.is_empty() {
+            dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
+        } else {
+            transpose_recursive(s, d, rest, size_a, size_b, lda, ldb, block);
         }
-        None => {
-            // Leaf: iterate this dim, calling blocked 2D transpose at each position
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block, elem_size);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
-        }
+        s = s.offset(node.lda);
+        d = d.offset(node.ldb);
     }
 }
 
 /// 2D blocked transpose over dim_A × dim_B.
 ///
-/// Tiles both dimensions by BLOCK and calls the appropriate macro_kernel.
+/// The native-float micro-kernel is used only for the exact 4/8-byte types the
+/// guard in [`native_float_kind`] allows; every other `T` goes through the
+/// generic element-wise path.
 #[inline]
-unsafe fn dispatch_blocked_2d<T: Copy>(
+unsafe fn dispatch_blocked_2d<T: Copy + 'static>(
     src: *const T,
     dst: *mut T,
     size_a: usize,
@@ -346,10 +337,9 @@ unsafe fn dispatch_blocked_2d<T: Copy>(
     lda: isize,
     ldb: isize,
     block: usize,
-    elem_size: usize,
 ) {
-    match elem_size {
-        8 => blocked_transpose_2d_f64(
+    match native_float_kind::<T>() {
+        Some(8) => blocked_transpose_2d_f64(
             src as *const f64,
             dst as *mut f64,
             size_a,
@@ -358,7 +348,7 @@ unsafe fn dispatch_blocked_2d<T: Copy>(
             ldb,
             block,
         ),
-        4 => blocked_transpose_2d_f32(
+        Some(4) => blocked_transpose_2d_f32(
             src as *const f32,
             dst as *mut f32,
             size_a,
@@ -474,7 +464,7 @@ fn transpose_tile_rows(size: usize, block: usize) -> usize {
 
 #[cfg(feature = "parallel")]
 #[inline]
-unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync>(
+unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     src: *const T,
     dst: *mut T,
     size_a: usize,
@@ -482,10 +472,9 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync>(
     lda: isize,
     ldb: isize,
     block: usize,
-    elem_size: usize,
 ) {
-    match elem_size {
-        8 => parallel_blocked_transpose_2d_f64(
+    match native_float_kind::<T>() {
+        Some(8) => parallel_blocked_transpose_2d_f64(
             src as *const f64,
             dst as *mut f64,
             size_a,
@@ -494,7 +483,7 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync>(
             ldb,
             block,
         ),
-        4 => parallel_blocked_transpose_2d_f32(
+        Some(4) => parallel_blocked_transpose_2d_f32(
             src as *const f32,
             dst as *mut f32,
             size_a,
@@ -636,39 +625,29 @@ unsafe fn parallel_blocked_transpose_2d_fallback<T: Copy + Send + Sync>(
 
 /// Recursive loop nest for ConstStride1 mode.
 ///
-/// Mirrors HPTT's `transpose_int_constStride1`. Each ComputeNode iterates
+/// Mirrors HPTT's `transpose_int_constStride1`. Each [`LoopLevel`] iterates
 /// its dimension. At the leaf, calls `const_stride1_copy` for the inner dim.
 unsafe fn const_stride1_recursive<T: Copy>(
     src: *const T,
     dst: *mut T,
-    node: &ComputeNode,
+    levels: &[LoopLevel],
     count: usize,
     src_stride: isize,
     dst_stride: isize,
 ) {
-    let end = node.end;
-    let node_lda = node.lda;
-    let node_ldb = node.ldb;
-
-    match &node.next {
-        Some(next) => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                const_stride1_recursive(s, d, next, count, src_stride, dst_stride);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
+    let (node, rest) = levels
+        .split_first()
+        .expect("const_stride1_recursive requires a loop level");
+    let mut s = src;
+    let mut d = dst;
+    for _ in 0..node.end {
+        if rest.is_empty() {
+            const_stride1_copy(s, d, count, src_stride, dst_stride);
+        } else {
+            const_stride1_recursive(s, d, rest, count, src_stride, dst_stride);
         }
-        None => {
-            let mut s = src;
-            let mut d = dst;
-            for _ in 0..end {
-                const_stride1_copy(s, d, count, src_stride, dst_stride);
-                s = s.offset(node_lda);
-                d = d.offset(node_ldb);
-            }
-        }
+        s = s.offset(node.lda);
+        d = d.offset(node.ldb);
     }
 }
 
@@ -803,6 +782,38 @@ mod tests {
         assert_eq!(dst[0], 42.0);
     }
 
+    #[test]
+    fn native_float_kind_rejects_weakly_aligned_same_size_types() {
+        // Exact primitives keep the fast path.
+        assert_eq!(native_float_kind::<f64>(), Some(8));
+        assert_eq!(native_float_kind::<i64>(), Some(8));
+        assert_eq!(native_float_kind::<u64>(), Some(8));
+        assert_eq!(native_float_kind::<f32>(), Some(4));
+        assert_eq!(native_float_kind::<i32>(), Some(4));
+        assert_eq!(native_float_kind::<u32>(), Some(4));
+        // Size-only matches must not qualify: complex/array/packed structs.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct EightAlign4([u32; 2]);
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct EightAlign2([u16; 4]);
+        #[repr(C, packed)]
+        #[derive(Clone, Copy)]
+        struct EightAlign1([u8; 8]);
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FourAlign1([u8; 4]);
+        assert_eq!(std::mem::size_of::<EightAlign4>(), 8);
+        assert_eq!(native_float_kind::<EightAlign4>(), None);
+        assert_eq!(std::mem::size_of::<EightAlign2>(), 8);
+        assert_eq!(native_float_kind::<EightAlign2>(), None);
+        assert_eq!(std::mem::size_of::<EightAlign1>(), 8);
+        assert_eq!(native_float_kind::<EightAlign1>(), None);
+        assert_eq!(std::mem::size_of::<FourAlign1>(), 4);
+        assert_eq!(native_float_kind::<FourAlign1>(), None);
+    }
+
     #[cfg(feature = "parallel")]
     #[test]
     fn test_execute_par_transpose_2d() {
@@ -848,7 +859,7 @@ mod tests {
     fn test_transpose_tile_rows_cover_rootless_3d_transpose() {
         let n = 256;
         let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8).unwrap();
-        assert!(plan.root.is_none());
+        assert!(plan.levels.is_empty());
 
         let ExecMode::Transpose { dim_a, dim_b } = plan.mode else {
             panic!("expected transpose mode");

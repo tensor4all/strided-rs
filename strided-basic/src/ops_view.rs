@@ -271,7 +271,7 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     src: &StridedView<T>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
-    if !crate::layout_check::is_injective_layout_inline(dest.dims(), dest.strides()) {
+    if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
     if src.is_empty() {
@@ -317,7 +317,7 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
 ///
 /// Delegates to the centralized permutation-copy dispatch for the actual work.
-pub fn copy_into_col_major<T: Copy + MaybeSendSync>(
+pub fn copy_into_col_major<T: Copy + MaybeSendSync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {

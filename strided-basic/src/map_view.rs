@@ -50,7 +50,7 @@ fn validate_destination_layout(
     dims: &[usize],
     strides: &[isize],
 ) -> Result<ValidatedDestinationLayout> {
-    if crate::layout_check::is_injective_layout_inline(dims, strides) {
+    if crate::layout_check::is_injective_layout(dims, strides) {
         Ok(ValidatedDestinationLayout(()))
     } else {
         Err(StridedError::NonInjectiveOutputLayout)

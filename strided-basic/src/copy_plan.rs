@@ -245,7 +245,7 @@ impl CopyPlan {
         // A zero-sized layout has zero elements even when its other extents
         // overflow; only a nonempty overflowing count is rejected.
         crate::kernel::total_len(dims)?;
-        if !crate::layout_check::is_injective_layout_inline(dims, dst_strides) {
+        if !crate::layout_check::is_injective_layout(dims, dst_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         Ok(Self {

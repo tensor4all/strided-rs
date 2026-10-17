@@ -302,7 +302,7 @@ impl ErasedNormPlan {
         for stride in [spec.weight_stride, spec.bias_stride].into_iter().flatten() {
             check_reduce_layout_offset_arithmetic(&dims[axis..=axis], &[stride])?;
         }
-        if !crate::layout_check::is_injective_layout_inline(dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout(dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         let dest_outer: Vec<isize> = (0..dims.len())

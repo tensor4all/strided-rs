@@ -474,7 +474,7 @@ impl GatherPlan {
         validate_layout_span(operand_dims, operand_strides)?;
         validate_layout_span(index_dims, index_strides)?;
         validate_layout_span(dest_dims, dest_strides)?;
-        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
 
@@ -1019,7 +1019,7 @@ impl DynamicSlicePlan {
                 slice_sizes.to_vec(),
             ));
         }
-        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, slice_sizes)?;
@@ -1355,7 +1355,7 @@ impl DynamicUpdateSlicePlan {
                 operand_dims.to_vec(),
             ));
         }
-        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, update_dims)?;
@@ -1686,7 +1686,7 @@ impl ScatterPlan {
                 operand_dims.to_vec(),
             ));
         }
-        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
 

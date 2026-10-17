@@ -190,7 +190,7 @@ impl ErasedArgReducePlan {
         checked_total_len(src_dims)?;
         check_reduce_layout_offset_arithmetic(src_dims, src_strides)?;
         check_reduce_layout_offset_arithmetic(dest_dims, dest_strides)?;
-        if !crate::layout_check::is_injective_layout_inline(dest_dims, dest_strides) {
+        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         let layout = LineLayout::compile(src_dims, src_strides, dest_strides, 0, axis, false)?;

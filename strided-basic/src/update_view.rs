@@ -22,7 +22,7 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::layout_check::is_injective_layout_inline;
+use crate::layout_check::is_injective_layout;
 use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -60,7 +60,7 @@ impl<T> Raw<T> {
 }
 
 fn validate_destination(dims: &[usize], strides: &[isize]) -> Result<()> {
-    if is_injective_layout_inline(dims, strides) {
+    if is_injective_layout(dims, strides) {
         Ok(())
     } else {
         Err(StridedError::NonInjectiveOutputLayout)
