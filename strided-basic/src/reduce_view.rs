@@ -741,7 +741,18 @@ unsafe fn reduce_axis_range_strided<T, Op, M, R, U>(
         && parts.axis_len > 1;
     let block = (AXIS_SWEEP_BLOCK_BYTES / std::mem::size_of::<U>().max(1)).max(AXIS_SWEEP_MIN_LEN);
 
-    let mut coords: InlineVec<usize> = (0..kept.len()).map(|_| 0usize).collect();
+    // Same fixed-array-plus-spill cursor as `reduce_axis_range_linear`: the
+    // `TinyVec` enum match is not paid per output access in the hot loop and
+    // only ranks above `INLINE_RANK` allocate (#306 P1).
+    let coords_len = kept.len();
+    let mut coords_inline = [0usize; strided_view::INLINE_RANK];
+    let mut coords_heap: Vec<usize> = Vec::new();
+    let coords: &mut [usize] = if coords_len <= strided_view::INLINE_RANK {
+        &mut coords_inline[..coords_len]
+    } else {
+        coords_heap.resize(coords_len, 0);
+        &mut coords_heap[..]
+    };
     let mut rest = range.start;
     let mut src_off = 0isize;
     let mut dest_off = 0isize;
