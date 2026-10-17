@@ -70,6 +70,29 @@ impl<T> SendPtr<T> {
 #[cfg(feature = "parallel")]
 pub const MINTHREADLENGTH: usize = 1 << 15;
 
+/// Block sizes handed to the parallel splitter.
+///
+/// [`ThreadedMapReduce::run`] declines to split a dimension that fits in one
+/// cache block (`dims[i] <= blocks[i].min(1024)`), so a region whose block
+/// covers a small whole tensor (for example `1024x64` with `block == dims`)
+/// never opens even at four threads. Halving such a block lets the splitter
+/// open; the leaf merely walks two tiles instead of one. Dimensions that
+/// already exceed the guard are left unchanged so other shapes keep their
+/// tiles.
+#[cfg(feature = "parallel")]
+fn scheduler_blocks(dims: &[usize], blocks: &[usize]) -> SVec<usize> {
+    dims.iter()
+        .zip(blocks)
+        .map(|(&dim, &block)| {
+            if dim > 1 && dim <= block.min(1024) {
+                (dim / 2).max(1)
+            } else {
+                block
+            }
+        })
+        .collect()
+}
+
 #[cfg(feature = "parallel")]
 pub fn parallel_threads_for_len(len: usize) -> usize {
     if len <= MINTHREADLENGTH {
@@ -397,8 +420,12 @@ fn mapreduce_threaded_dyn(
     taskindex: usize,
     f: LeafFn<'_>,
 ) -> Result<()> {
+    // Normalize before the splitter: the guard below uses these tile sizes, so
+    // a block that covers its whole dimension would otherwise suppress the
+    // split. The shared layer applies this for every map, zip and fused caller.
+    let blocks = scheduler_blocks(dims, blocks);
     ThreadedMapReduce {
-        blocks,
+        blocks: &blocks,
         strides_list,
         costs,
         spacing,

@@ -1162,29 +1162,6 @@ fn inner_stride(strides: &[isize], index: usize) -> isize {
     strides.get(index).copied().unwrap_or(0)
 }
 
-/// Block sizes handed to the parallel splitter.
-///
-/// `ThreadedMapReduce::run` declines to split a dimension that fits in one
-/// cache block (`dims[i] <= blocks[i].min(1024)`), so a fused plan whose block
-/// covers a small whole tensor (for example `1024x64` with `block == dims`)
-/// never opens even at four threads. Halving such a block lets the splitter
-/// open; the leaf merely walks two tiles instead of one. Dimensions that
-/// already exceed the guard are left unchanged so other shapes keep their
-/// tiles.
-#[cfg(feature = "parallel")]
-fn scheduler_blocks(dims: &[usize], blocks: &[usize]) -> Vec<usize> {
-    dims.iter()
-        .zip(blocks)
-        .map(|(&dim, &block)| {
-            if dim > 1 && dim <= block.min(1024) {
-                (dim / 2).max(1)
-            } else {
-                block
-            }
-        })
-        .collect()
-}
-
 fn interpret_fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],
@@ -1274,11 +1251,10 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                 }
             };
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-            let blocks = scheduler_blocks(&fused_dims, &kernel_plan.block);
             return unsafe {
                 mapreduce_threaded(
                     &fused_dims,
-                    &blocks,
+                    &kernel_plan.block,
                     &ordered_strides,
                     &initial_offsets,
                     &costs,
@@ -1556,11 +1532,10 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                 }
             };
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-            let blocks = scheduler_blocks(&fused_dims, &kernel_plan.block);
             return unsafe {
                 mapreduce_threaded(
                     &fused_dims,
-                    &blocks,
+                    &kernel_plan.block,
                     &ordered_strides,
                     &initial_offsets,
                     &costs,
