@@ -15,6 +15,8 @@ use core::{
     ops::{Add, Mul},
 };
 
+use num_traits::{One, Zero};
+
 use crate::raw_ops::{
     apply_fused_range, apply_spilled_range, fuse_pair_traversal, fused_total, FusedAxis,
     FusedPairLayout, PairTraversal,
@@ -454,9 +456,13 @@ impl UpdatePlan {
 
     /// `dest = alpha * f(src) + beta * dest`.
     ///
-    /// `f` is applied to the source element before scaling; the old destination
-    /// element is read through the destination layout. Allocation-free for fused
-    /// ranks at most [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    /// `f` is applied to the source element before scaling. When `beta` is
+    /// zero (`-0.0` included; `NaN` is not zero) the replay is write-only: the
+    /// old destination element is never read, so a NaN-filled or uninitialized
+    /// destination cannot contaminate the result, matching BLAS `beta = 0`
+    /// semantics. Otherwise the old destination element is read through the
+    /// destination layout. Allocation-free for fused ranks at most
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
     ///
     /// # Errors
     ///
@@ -471,17 +477,95 @@ impl UpdatePlan {
         f: F,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync + Add<Output = T> + Mul<Output = T>,
+        T: Copy + MaybeSendSync + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
         F: Fn(T) -> T + MaybeSendSync,
     {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
-        replay_fused(
-            dest,
-            src,
-            &self.fused,
-            |dst, value| *dst = alpha * value + beta * *dst,
-            f,
-        );
+        if beta.is_zero() {
+            // Write-only: never form a read of the old destination.
+            if alpha.is_one() {
+                replay_fused(dest, src, &self.fused, |dst, value| *dst = value, f);
+            } else {
+                replay_fused(dest, src, &self.fused, |dst, value| *dst = alpha * value, f);
+            }
+        } else {
+            replay_fused(
+                dest,
+                src,
+                &self.fused,
+                |dst, value| *dst = alpha * value + beta * *dst,
+                f,
+            );
+        }
+        Ok(())
+    }
+
+    /// `dest = alpha * f(src)` into a potentially uninitialized destination.
+    ///
+    /// This is [`execute`](Self::execute) with `beta = 0`: the destination is
+    /// never read. On success every reachable logical destination element is
+    /// initialized; non-reachable holes in the backing allocation are not
+    /// written. Allocation-free for fused ranks at most
+    /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    ///
+    /// # Errors
+    ///
+    /// [`StridedError::PlanLayoutMismatch`] when the supplied views do not
+    /// carry the compiled layout, before any write.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use core::mem::MaybeUninit;
+    /// use strided_basic::{RawStridedMut, RawStridedRef, UpdatePlan};
+    ///
+    /// let dims = [2usize, 2];
+    /// let strides = [1isize, 2];
+    /// let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+    /// let src = [1.0f64, 2.0, 3.0, 4.0];
+    /// let mut storage = [MaybeUninit::<f64>::uninit(); 4];
+    /// let mut dst = RawStridedMut::new(&mut storage, &dims, &strides, 0).unwrap();
+    /// let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    /// // dst = 2 * src
+    /// plan.execute_uninit(&mut dst, &source, 2.0, |x| x).unwrap();
+    /// drop(dst);
+    /// // SAFETY: every reachable destination slot was initialized above.
+    /// let values: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+    /// assert_eq!(values, [2.0, 4.0, 6.0, 8.0]);
+    /// ```
+    pub fn execute_uninit<T, F>(
+        &self,
+        dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+        src: &RawStridedRef<'_, T>,
+        alpha: T,
+        f: F,
+    ) -> Result<()>
+    where
+        T: Copy + MaybeSendSync + Mul<Output = T> + One + PartialEq,
+        F: Fn(T) -> T + MaybeSendSync,
+    {
+        check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
+        if alpha.is_one() {
+            replay_fused(
+                dest,
+                src,
+                &self.fused,
+                |dst, value| {
+                    dst.write(value);
+                },
+                f,
+            );
+        } else {
+            replay_fused(
+                dest,
+                src,
+                &self.fused,
+                |dst, value| {
+                    dst.write(alpha * value);
+                },
+                f,
+            );
+        }
         Ok(())
     }
 }

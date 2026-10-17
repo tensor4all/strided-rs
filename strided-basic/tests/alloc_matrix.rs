@@ -483,9 +483,9 @@ fn check_full_reduction(pool: &rayon::ThreadPool) {
 /// executes per accumulate does not touch the heap.
 fn check_plans(pool: &rayon::ThreadPool) {
     use strided_basic::{
-        ConcatenatePlan, ErasedConcatenatePlan, ErasedRawStridedMut, ErasedRawStridedRef,
-        ErasedReducePlan, ErasedUpdatePlan, ExecContext, KernelDType, RawStridedMut, RawStridedRef,
-        ReduceOp, UpdateOp, UpdatePlan,
+        ConcatenatePlan, ErasedConcatenatePlan, ErasedRawStridedMut, ErasedRawStridedPtr,
+        ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan, ErasedUpdatePlan,
+        ExecContext, KernelDType, RawStridedMut, RawStridedRef, ReduceOp, UpdateOp, UpdatePlan,
     };
     for rank in 1..=8usize {
         let dims = vec![2usize; rank];
@@ -521,6 +521,20 @@ fn check_plans(pool: &rayon::ThreadPool) {
         assert_eq!(
             update_execute, 0,
             "UpdatePlan::execute rank {rank} allocated {update_execute}"
+        );
+
+        // Write-only uninitialized destination: same allocation-free replay.
+        let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); len];
+        let mut uninit_mut = RawStridedMut::new(&mut uninit_dst, &dims, &strides, 0).unwrap();
+        plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x)
+            .unwrap();
+        let update_uninit = count_thread_allocations(|| {
+            plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x)
+                .unwrap();
+        });
+        assert_eq!(
+            update_uninit, 0,
+            "UpdatePlan::execute_uninit rank {rank} allocated {update_uninit}"
         );
 
         // Erased update plan: same traversal behind a dtype-erased boundary.
@@ -561,6 +575,37 @@ fn check_plans(pool: &rayon::ThreadPool) {
         assert_eq!(
             erased_update_execute, 0,
             "ErasedUpdatePlan::execute rank {rank} allocated {erased_update_execute}"
+        );
+
+        // Erased write-only uninitialized destination.
+        let mut erased_uninit = vec![MaybeUninit::<f64>::uninit(); len];
+        let mut uninit_dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut erased_uninit, &dims, &strides, 0)
+                .unwrap();
+        let source_ptr = ErasedRawStridedPtr::from_ref(&source);
+        erased_update
+            .execute_uninit(
+                &ExecContext::serial(),
+                &mut uninit_dest,
+                &source_ptr,
+                1.0,
+                UpdateOp::Identity,
+            )
+            .unwrap();
+        let erased_update_uninit = count_thread_allocations(|| {
+            erased_update
+                .execute_uninit(
+                    &ExecContext::serial(),
+                    &mut uninit_dest,
+                    &source_ptr,
+                    1.0,
+                    UpdateOp::Identity,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            erased_update_uninit, 0,
+            "ErasedUpdatePlan::execute_uninit rank {rank} allocated {erased_update_uninit}"
         );
 
         // ConcatenatePlan with two inputs: compile and execute allocation-free.

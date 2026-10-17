@@ -198,3 +198,46 @@ fn copy_plan_conj_parallel_matches_serial() {
     assert_eq!(serial, parallel);
     assert_eq!(serial[1], src[187].conj());
 }
+
+#[test]
+fn update_plan_beta_zero_parallel_ignores_nan_destination() {
+    // Above the threading threshold so both the serial and the multi-worker
+    // replay run; the NaN poison would surface as NaN on any destination read.
+    let dims = [40_001usize];
+    let strides = [1isize];
+    let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+    let src: Vec<f64> = (0..40_001).map(|value| value as f64).collect();
+    let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    let (serial, parallel) = run_serial_and_parallel(|| {
+        let mut dst = vec![f64::NAN; 40_001];
+        let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+        plan.execute(&mut dest, &source, 2.0, 0.0, |x| x).unwrap();
+        dst
+    });
+    let expected: Vec<f64> = (0..40_001).map(|value| 2.0 * value as f64).collect();
+    assert_eq!(serial, expected);
+    assert_eq!(parallel, expected);
+    assert!(parallel.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn update_plan_execute_uninit_parallel_initializes_every_slot() {
+    let dims = [40_009usize];
+    let plan = UpdatePlan::compile(&dims, &[1], &[-1]).unwrap();
+    let src: Vec<i64> = (0..40_009).collect();
+    let source = RawStridedRef::new(&src, &dims, &[-1], 40_008).unwrap();
+    let (serial, parallel) = run_serial_and_parallel(|| {
+        let mut storage = vec![MaybeUninit::<i64>::uninit(); 40_009];
+        let mut dest = RawStridedMut::new(&mut storage, &dims, &[1], 0).unwrap();
+        plan.execute_uninit(&mut dest, &source, 1, |x| x).unwrap();
+        // SAFETY: the dense unit-stride destination reaches every slot and a
+        // successful `execute_uninit` initializes every reachable slot.
+        storage
+            .iter()
+            .map(|value| unsafe { value.assume_init() })
+            .collect::<Vec<_>>()
+    });
+    let expected: Vec<i64> = (0..40_009).rev().collect();
+    assert_eq!(serial, expected);
+    assert_eq!(parallel, expected);
+}
