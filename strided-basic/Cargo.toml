@@ -55,3 +55,7 @@ required-features = ["parallel"]
 name = "broadcast_zip"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "overhead_smoke"
+harness = false

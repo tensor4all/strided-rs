@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "fused_chunked_replay"
 harness = false
+
+[[bench]]
+name = "overhead_smoke"
+harness = false
