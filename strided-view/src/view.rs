@@ -7,17 +7,18 @@
 //! - [`StridedViewMut`]: Mutable dynamic-rank strided view (Identity op only)
 //! - [`StridedArray`]: Owned strided multidimensional array
 //!
-//! A view's shape and strides are `Cow<'a, [_]>`: [`StridedView::new`] borrows
-//! the caller's layout and allocates nothing, while [`StridedView::new_owned`]
-//! (and every derived view, such as [`StridedView::permute`]) owns the layout it
-//! computed. Neither touches a reference count.
+//! A view's shape and strides are inline `SmallVec`s with capacity
+//! [`crate::INLINE_RANK`]: every constructor, clone, and metadata transform
+//! allocates nothing up to that rank and spills gracefully above it. The view
+//! itself only borrows the element data.
 
-use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
+use smallvec::SmallVec;
+
 use crate::element_op::{ComposableElementOp, ElementOp, ElementOpApply, Identity};
-use crate::{Result, StridedError};
+use crate::{AxisVec, Result, StrideVec, StridedError, INLINE_RANK};
 
 #[inline]
 fn empty_layout(dims: &[usize]) -> bool {
@@ -112,12 +113,25 @@ fn indexed_offset(dims: &[usize], strides: &[isize], indices: &[usize], base: is
 }
 
 /// Compute column-major strides (Julia default: first index varies fastest).
-pub fn col_major_strides(dims: &[usize]) -> Vec<isize> {
+///
+/// Returns an inline [`StrideVec`]: the result does not allocate at rank
+/// `<= INLINE_RANK` and spills above it.
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::col_major_strides;
+///
+/// // Julia default: first index varies fastest.
+/// assert_eq!(col_major_strides(&[2, 3]).as_slice(), &[1, 2]);
+/// ```
+#[inline]
+pub fn col_major_strides(dims: &[usize]) -> StrideVec {
     let rank = dims.len();
     if rank == 0 {
-        return vec![];
+        return StrideVec::new();
     }
-    let mut strides = vec![1isize; rank];
+    let mut strides = StrideVec::from_elem(1isize, rank);
     for i in 1..rank {
         strides[i] = strides[i - 1] * dims[i - 1] as isize;
     }
@@ -125,12 +139,25 @@ pub fn col_major_strides(dims: &[usize]) -> Vec<isize> {
 }
 
 /// Compute row-major strides (C default: last index varies fastest).
-pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
+///
+/// Returns an inline [`StrideVec`]: the result does not allocate at rank
+/// `<= INLINE_RANK` and spills above it.
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::row_major_strides;
+///
+/// // C default: last index varies fastest.
+/// assert_eq!(row_major_strides(&[2, 3]).as_slice(), &[3, 1]);
+/// ```
+#[inline]
+pub fn row_major_strides(dims: &[usize]) -> StrideVec {
     let rank = dims.len();
     if rank == 0 {
-        return vec![];
+        return StrideVec::new();
     }
-    let mut strides = vec![1isize; rank];
+    let mut strides = StrideVec::from_elem(1isize, rank);
     for i in (0..rank - 1).rev() {
         strides[i] = strides[i + 1] * dims[i + 1] as isize;
     }
@@ -144,15 +171,21 @@ pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
 /// Dynamic-rank immutable strided view with lazy element operations.
 ///
 /// This is the Julia-equivalent `StridedView` type with:
-/// - Dynamic rank, with metadata borrowed ([`StridedView::new`], no allocation)
-///   or owned ([`StridedView::new_owned`], for computed metadata)
+/// - Dynamic rank, with metadata stored inline for up to [`INLINE_RANK`]
+///   dimensions ([`StridedView::new`] copies the caller's layout, so the view
+///   borrows only the element data)
 /// - Lazy element operations via the `Op` type parameter
 /// - Zero-copy transformations (permute, transpose, adjoint, conj)
 ///
 /// # Type Parameters
-/// - `'a`: Lifetime of the underlying data and of borrowed metadata
+/// - `'a`: Lifetime of the underlying data
 /// - `T`: Element type
 /// - `Op`: Element operation applied lazily on access (default: `Identity`)
+///
+/// # Size
+///
+/// The inline metadata makes the view 176 bytes on 64-bit targets for
+/// `usize`/`isize` strides.
 ///
 /// # Auto traits
 ///
@@ -169,8 +202,8 @@ pub fn row_major_strides(dims: &[usize]) -> Vec<isize> {
 pub struct StridedView<'a, T, Op = Identity> {
     ptr: *const T,
     data: &'a [T],
-    dims: Cow<'a, [usize]>,
-    strides: Cow<'a, [isize]>,
+    dims: SmallVec<[usize; INLINE_RANK]>,
+    strides: SmallVec<[isize; INLINE_RANK]>,
     offset: isize,
     _op: PhantomData<Op>,
 }
@@ -179,6 +212,7 @@ unsafe impl<T: Sync, Op: Send> Send for StridedView<'_, T, Op> {}
 unsafe impl<T: Sync, Op: Sync> Sync for StridedView<'_, T, Op> {}
 
 impl<T, Op> Clone for StridedView<'_, T, Op> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             ptr: self.ptr,
@@ -218,12 +252,13 @@ fn base_ptr<T>(data: &[T], dims: &[usize], offset: isize) -> *const T {
 #[inline]
 fn from_meta<'a, T, Op>(
     data: &'a [T],
-    dims: Cow<'a, [usize]>,
-    strides: Cow<'a, [isize]>,
+    dims: AxisVec,
+    strides: StrideVec,
     offset: isize,
 ) -> StridedView<'a, T, Op> {
+    let ptr = base_ptr(data, &dims, offset);
     StridedView {
-        ptr: base_ptr(data, &dims, offset),
+        ptr,
         data,
         dims,
         strides,
@@ -233,68 +268,60 @@ fn from_meta<'a, T, Op>(
 }
 
 impl<'a, T, Op> StridedView<'a, T, Op> {
-    /// Create an immutable strided view that borrows the caller's metadata.
+    /// Create an immutable strided view, copying the caller's metadata inline.
     ///
-    /// This is the allocation-free constructor: `dims` and `strides` must
-    /// outlive the view, which every caller that keeps its layouts does.
-    pub fn new(
-        data: &'a [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
-        offset: isize,
-    ) -> Result<Self> {
+    /// The layout is copied into the view's inline storage, so it does not
+    /// need to outlive the view and no heap allocation happens at rank
+    /// `<= INLINE_RANK`. The view's lifetime is tied to `data` only.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedView;
+    ///
+    /// let data = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    /// let view = StridedView::<f64>::new(&data, &[2, 3], &[1, 2], 0).unwrap();
+    /// assert_eq!(view.dims(), &[2, 3]);
+    /// assert_eq!(view.get(&[1, 2]), 6.0);
+    /// ```
+    #[inline]
+    pub fn new(data: &'a [T], dims: &[usize], strides: &[isize], offset: isize) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
         Ok(from_meta(
             data,
-            Cow::Borrowed(dims),
-            Cow::Borrowed(strides),
+            SmallVec::from_slice(dims),
+            SmallVec::from_slice(strides),
             offset,
         ))
     }
 
-    /// Create an immutable strided view that owns computed metadata.
-    ///
-    /// For a caller that computes `dims`/`strides` next to the view, as a
-    /// helper returning a view must. Prefer [`StridedView::new`] otherwise.
-    pub fn new_owned(
-        data: &'a [T],
-        dims: Vec<usize>,
-        strides: Vec<isize>,
-        offset: isize,
-    ) -> Result<Self> {
-        validate_bounds(data.len(), &dims, &strides, offset)?;
-        Ok(from_meta(
-            data,
-            Cow::Owned(dims),
-            Cow::Owned(strides),
-            offset,
-        ))
-    }
-
-    /// Create a view without bounds checking, borrowing the caller's metadata.
+    /// Create a view without bounds checking, copying the caller's metadata.
     ///
     /// # Safety
     /// The caller must ensure all index combinations stay within bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedView;
+    ///
+    /// let data = [1.0f64, 2.0, 3.0, 4.0];
+    /// let view = unsafe { StridedView::<f64>::new_unchecked(&data, &[2, 2], &[1, 2], 0) };
+    /// assert_eq!(view.ndim(), 2);
+    /// ```
+    #[inline]
     pub unsafe fn new_unchecked(
         data: &'a [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
+        dims: &[usize],
+        strides: &[isize],
         offset: isize,
     ) -> Self {
-        from_meta(data, Cow::Borrowed(dims), Cow::Borrowed(strides), offset)
-    }
-
-    /// Create a view without bounds checking, owning the metadata.
-    ///
-    /// # Safety
-    /// As [`StridedView::new_unchecked`].
-    pub unsafe fn new_owned_unchecked(
-        data: &'a [T],
-        dims: Vec<usize>,
-        strides: Vec<isize>,
-        offset: isize,
-    ) -> Self {
-        from_meta(data, Cow::Owned(dims), Cow::Owned(strides), offset)
+        from_meta(
+            data,
+            SmallVec::from_slice(dims),
+            SmallVec::from_slice(strides),
+            offset,
+        )
     }
 
     /// Returns the shape (dimension sizes) of this view.
@@ -351,7 +378,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
-        let mut seen = vec![false; rank];
+        let mut seen: SmallVec<[bool; INLINE_RANK]> = SmallVec::from_elem(false, rank);
         for &p in perm {
             if p >= rank {
                 return Err(StridedError::InvalidAxis { axis: p, rank });
@@ -361,14 +388,9 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
             }
             seen[p] = true;
         }
-        let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
-        let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
-        Ok(from_meta(
-            self.data,
-            Cow::Owned(new_dims),
-            Cow::Owned(new_strides),
-            self.offset,
-        ))
+        let new_dims: AxisVec = perm.iter().map(|&p| self.dims[p]).collect();
+        let new_strides: StrideVec = perm.iter().map(|&p| self.strides[p]).collect();
+        Ok(from_meta(self.data, new_dims, new_strides, self.offset))
     }
 
     /// Create a diagonal view by fusing repeated axis pairs via stride trick (zero-copy).
@@ -393,10 +415,10 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// `A[i,i,j]` shape=`[n,n,m]` strides=`[s0,s1,s2]` -> shape=`[n,m]` strides=`[s0+s1, s2]`
     pub fn diagonal_view(&self, axis_pairs: &[(usize, usize)]) -> Result<StridedView<'a, T, Op>> {
         let ndim = self.ndim();
-        let mut dims: Vec<usize> = self.dims().to_vec();
-        let mut strides: Vec<isize> = self.strides().to_vec();
+        let mut dims: AxisVec = SmallVec::from_slice(self.dims());
+        let mut strides: StrideVec = SmallVec::from_slice(self.strides());
 
-        let mut axes_to_remove = Vec::new();
+        let mut axes_to_remove: SmallVec<[usize; INLINE_RANK]> = SmallVec::new();
         for &(a, b) in axis_pairs {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             if hi >= ndim {
@@ -430,12 +452,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         // its own and is validated here instead (tensor4all/strided-rs#204).
         validate_bounds(self.data().len(), &dims, &strides, self.offset())?;
 
-        Ok(from_meta(
-            self.data(),
-            Cow::Owned(dims),
-            Cow::Owned(strides),
-            self.offset(),
-        ))
+        Ok(from_meta(self.data(), dims, strides, self.offset()))
     }
 
     /// Broadcast this view to a target shape.
@@ -448,7 +465,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
                 target_dims.len(),
             ));
         }
-        let mut new_strides = Vec::with_capacity(self.dims.len());
+        let mut new_strides = StrideVec::with_capacity(self.dims.len());
         for i in 0..self.dims.len() {
             if self.dims[i] == target_dims[i] {
                 new_strides.push(self.strides[i]);
@@ -463,8 +480,8 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         }
         Ok(from_meta(
             self.data,
-            Cow::Owned(target_dims.to_vec()),
-            Cow::Owned(new_strides),
+            SmallVec::from_slice(target_dims),
+            new_strides,
             self.offset,
         ))
     }
@@ -481,8 +498,8 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
         }
         Ok(from_meta(
             self.data,
-            Cow::Owned(vec![self.dims[1], self.dims[0]]),
-            Cow::Owned(vec![self.strides[1], self.strides[0]]),
+            AxisVec::from_slice(&[self.dims[1], self.dims[0]]),
+            StrideVec::from_slice(&[self.strides[1], self.strides[0]]),
             self.offset,
         ))
     }
@@ -496,8 +513,8 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
         }
         Ok(from_meta(
             self.data,
-            Cow::Owned(vec![self.dims[1], self.dims[0]]),
-            Cow::Owned(vec![self.strides[1], self.strides[0]]),
+            AxisVec::from_slice(&[self.dims[1], self.dims[0]]),
+            StrideVec::from_slice(&[self.strides[1], self.strides[0]]),
             self.offset,
         ))
     }
@@ -505,6 +522,7 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     /// Complex conjugate (compose Conj without changing dims/strides).
     ///
     /// Julia equivalent: `Base.conj(a::AbstractStridedView)`
+    #[inline]
     pub fn conj(&self) -> StridedView<'a, T, Op::ComposeConj> {
         StridedView {
             ptr: self.ptr,
@@ -555,8 +573,8 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
 pub struct StridedViewMut<'a, T> {
     ptr: *mut T,
     data: &'a mut [T],
-    dims: Cow<'a, [usize]>,
-    strides: Cow<'a, [isize]>,
+    dims: SmallVec<[usize; INLINE_RANK]>,
+    strides: SmallVec<[isize; INLINE_RANK]>,
     offset: isize,
 }
 
@@ -575,12 +593,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for StridedViewMut<'_, T> {
 impl<'a, T> StridedViewMut<'a, T> {
     /// A view from already-validated metadata.
     #[inline]
-    fn from_meta(
-        data: &'a mut [T],
-        dims: Cow<'a, [usize]>,
-        strides: Cow<'a, [isize]>,
-        offset: isize,
-    ) -> Self {
+    fn from_meta(data: &'a mut [T], dims: AxisVec, strides: StrideVec, offset: isize) -> Self {
         let ptr = if empty_layout(&dims) {
             empty_mut_ptr()
         } else {
@@ -595,33 +608,64 @@ impl<'a, T> StridedViewMut<'a, T> {
         }
     }
 
-    /// Create a mutable view that borrows the caller's metadata: no allocation.
+    /// Create a mutable view, copying the caller's metadata inline.
+    ///
+    /// The layout is copied, so it does not need to outlive the view and no
+    /// heap allocation happens at rank `<= INLINE_RANK`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedViewMut;
+    ///
+    /// let mut data = [0.0f64; 4];
+    /// let mut view = StridedViewMut::<f64>::new(&mut data, &[2, 2], &[1, 2], 0).unwrap();
+    /// view.set(&[1, 1], 5.0);
+    /// assert_eq!(data[3], 5.0);
+    /// ```
+    #[inline]
     pub fn new(
         data: &'a mut [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
+        dims: &[usize],
+        strides: &[isize],
         offset: isize,
     ) -> Result<Self> {
         validate_bounds(data.len(), dims, strides, offset)?;
         Ok(Self::from_meta(
             data,
-            Cow::Borrowed(dims),
-            Cow::Borrowed(strides),
+            SmallVec::from_slice(dims),
+            SmallVec::from_slice(strides),
             offset,
         ))
     }
 
-    /// Create without bounds checking, borrowing the caller's metadata.
+    /// Create without bounds checking, copying the caller's metadata.
     ///
     /// # Safety
     /// Caller must ensure all index combinations stay within bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedViewMut;
+    ///
+    /// let mut data = [0.0f64; 4];
+    /// let view = unsafe { StridedViewMut::<f64>::new_unchecked(&mut data, &[2, 2], &[1, 2], 0) };
+    /// assert_eq!(view.ndim(), 2);
+    /// ```
+    #[inline]
     pub unsafe fn new_unchecked(
         data: &'a mut [T],
-        dims: &'a [usize],
-        strides: &'a [isize],
+        dims: &[usize],
+        strides: &[isize],
         offset: isize,
     ) -> Self {
-        Self::from_meta(data, Cow::Borrowed(dims), Cow::Borrowed(strides), offset)
+        Self::from_meta(
+            data,
+            SmallVec::from_slice(dims),
+            SmallVec::from_slice(strides),
+            offset,
+        )
     }
 
     /// Returns the shape (dimension sizes) of this view.
@@ -693,7 +737,7 @@ impl<'a, T> StridedViewMut<'a, T> {
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
-        let mut seen = vec![false; rank];
+        let mut seen: SmallVec<[bool; INLINE_RANK]> = SmallVec::from_elem(false, rank);
         for &p in perm {
             if p >= rank {
                 return Err(StridedError::InvalidAxis { axis: p, rank });
@@ -703,26 +747,39 @@ impl<'a, T> StridedViewMut<'a, T> {
             }
             seen[p] = true;
         }
-        let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
-        let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
+        let new_dims: AxisVec = perm.iter().map(|&p| self.dims[p]).collect();
+        let new_strides: StrideVec = perm.iter().map(|&p| self.strides[p]).collect();
         Ok(Self::from_meta(
             self.data,
-            Cow::Owned(new_dims),
-            Cow::Owned(new_strides),
+            new_dims,
+            new_strides,
             self.offset,
         ))
     }
 
     /// Reborrow as an immutable view.
     ///
-    /// The reborrow shares this view's metadata by borrowing it, so it allocates
-    /// nothing even when the metadata is owned.
+    /// The reborrow copies this view's metadata into the immutable view's
+    /// inline storage, which allocates nothing up to [`INLINE_RANK`] and
+    /// spills above it (the mutable owner always keeps its own copy).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedViewMut;
+    ///
+    /// let mut data = [1.0f64, 2.0, 3.0];
+    /// let view = StridedViewMut::<f64>::new(&mut data, &[3], &[1], 0).unwrap();
+    /// let read = view.as_view();
+    /// assert_eq!(read.get(&[2]), 3.0);
+    /// ```
+    #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
         StridedView {
             ptr: self.ptr as *const T,
             data: unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.data.len()) },
-            dims: Cow::Borrowed(self.dims.as_ref()),
-            strides: Cow::Borrowed(self.strides.as_ref()),
+            dims: self.dims.clone(),
+            strides: self.strides.clone(),
             offset: self.offset,
             _op: PhantomData,
         }
@@ -764,8 +821,8 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
 /// Supports both column-major (Julia default) and row-major (C default) layouts.
 pub struct StridedArray<T> {
     data: Vec<T>,
-    dims: Vec<usize>,
-    strides: Vec<isize>,
+    dims: SmallVec<[usize; INLINE_RANK]>,
+    strides: SmallVec<[isize; INLINE_RANK]>,
     offset: isize,
 }
 
@@ -792,26 +849,52 @@ impl<T: Clone> Clone for StridedArray<T> {
 
 impl<T: Clone + Default> StridedArray<T> {
     /// Create a column-major (Julia default) tensor filled with Default values.
+    ///
+    /// The shape and strides are stored inline, so a rank `<= INLINE_RANK`
+    /// tensor allocates only its element buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedArray;
+    ///
+    /// let a = StridedArray::<f64>::col_major(&[2, 3]);
+    /// assert_eq!(a.dims(), &[2, 3]);
+    /// assert_eq!(a.strides(), &[1, 2]);
+    /// ```
     pub fn col_major(dims: &[usize]) -> Self {
         let total: usize = dims.iter().product();
         let data = vec![T::default(); total];
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
     }
 
     /// Create a row-major (C default) tensor filled with Default values.
+    ///
+    /// The shape and strides are stored inline, so a rank `<= INLINE_RANK`
+    /// tensor allocates only its element buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::StridedArray;
+    ///
+    /// let a = StridedArray::<f64>::row_major(&[2, 3]);
+    /// assert_eq!(a.dims(), &[2, 3]);
+    /// assert_eq!(a.strides(), &[3, 1]);
+    /// ```
     pub fn row_major(dims: &[usize]) -> Self {
         let total: usize = dims.iter().product();
         let data = vec![T::default(); total];
         let strides = row_major_strides(dims);
         Self {
             data,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
@@ -825,7 +908,7 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         let rank = dims.len();
         let mut data = Vec::with_capacity(total);
-        let mut idx = vec![0usize; rank];
+        let mut idx: AxisVec = SmallVec::from_elem(0usize, rank);
         for _ in 0..total {
             data.push(f(&idx));
             for d in 0..rank {
@@ -838,7 +921,7 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
@@ -852,7 +935,7 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = row_major_strides(dims);
         let rank = dims.len();
         let mut data = Vec::with_capacity(total);
-        let mut idx = vec![0usize; rank];
+        let mut idx: AxisVec = SmallVec::from_elem(0usize, rank);
         for _ in 0..total {
             data.push(f(&idx));
             for d in (0..rank).rev() {
@@ -865,7 +948,7 @@ impl<T: Clone + Default> StridedArray<T> {
         }
         Self {
             data,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
@@ -883,8 +966,8 @@ impl<T> StridedArray<T> {
         validate_bounds(data.len(), dims, strides, offset)?;
         Ok(Self {
             data,
-            dims: dims.to_vec(),
-            strides: strides.to_vec(),
+            dims: SmallVec::from_slice(dims),
+            strides: SmallVec::from_slice(strides),
             offset,
         })
     }
@@ -932,6 +1015,7 @@ impl<T> StridedArray<T> {
     }
 
     /// Create an immutable view over this tensor.
+    #[inline]
     pub fn view(&self) -> StridedView<'_, T> {
         let ptr = if self.is_empty() {
             empty_const_ptr()
@@ -941,14 +1025,15 @@ impl<T> StridedArray<T> {
         StridedView {
             ptr,
             data: &self.data,
-            dims: Cow::Borrowed(&self.dims),
-            strides: Cow::Borrowed(&self.strides),
+            dims: self.dims.clone(),
+            strides: self.strides.clone(),
             offset: self.offset,
             _op: PhantomData,
         }
     }
 
     /// Create a mutable view over this tensor.
+    #[inline]
     pub fn view_mut(&mut self) -> StridedViewMut<'_, T> {
         let ptr = if self.is_empty() {
             empty_mut_ptr()
@@ -958,8 +1043,8 @@ impl<T> StridedArray<T> {
         StridedViewMut {
             ptr,
             data: &mut self.data,
-            dims: Cow::Borrowed(&self.dims),
-            strides: Cow::Borrowed(&self.strides),
+            dims: self.dims.clone(),
+            strides: self.strides.clone(),
             offset: self.offset,
         }
     }
@@ -973,7 +1058,7 @@ impl<T> StridedArray<T> {
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
-        let mut seen = vec![false; rank];
+        let mut seen: SmallVec<[bool; INLINE_RANK]> = SmallVec::from_elem(false, rank);
         for &p in perm {
             if p >= rank {
                 return Err(StridedError::InvalidAxis { axis: p, rank });
@@ -983,8 +1068,8 @@ impl<T> StridedArray<T> {
             }
             seen[p] = true;
         }
-        let new_dims: Vec<usize> = perm.iter().map(|&p| self.dims[p]).collect();
-        let new_strides: Vec<isize> = perm.iter().map(|&p| self.strides[p]).collect();
+        let new_dims: AxisVec = perm.iter().map(|&p| self.dims[p]).collect();
+        let new_strides: StrideVec = perm.iter().map(|&p| self.strides[p]).collect();
         Ok(Self {
             data: self.data,
             dims: new_dims,
@@ -1028,7 +1113,7 @@ impl<T: Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data: buf,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
@@ -1047,7 +1132,7 @@ impl<T: Copy> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
@@ -1066,7 +1151,7 @@ impl<T: Copy> StridedArray<T> {
         let strides = col_major_strides(dims);
         Self {
             data: buf,
-            dims: dims.to_vec(),
+            dims: SmallVec::from_slice(dims),
             strides,
             offset: 0,
         }
@@ -1147,14 +1232,14 @@ mod tests {
 
     #[test]
     fn test_col_major_strides() {
-        assert_eq!(col_major_strides(&[3, 4]), vec![1, 3]);
-        assert_eq!(col_major_strides(&[2, 3, 4]), vec![1, 2, 6]);
+        assert_eq!(col_major_strides(&[3, 4]).as_slice(), &[1, 3]);
+        assert_eq!(col_major_strides(&[2, 3, 4]).as_slice(), &[1, 2, 6]);
     }
 
     #[test]
     fn test_row_major_strides() {
-        assert_eq!(row_major_strides(&[3, 4]), vec![4, 1]);
-        assert_eq!(row_major_strides(&[2, 3, 4]), vec![12, 4, 1]);
+        assert_eq!(row_major_strides(&[3, 4]).as_slice(), &[4, 1]);
+        assert_eq!(row_major_strides(&[2, 3, 4]).as_slice(), &[12, 4, 1]);
     }
 
     #[test]

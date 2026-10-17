@@ -24,6 +24,59 @@ mod raw;
 pub mod view;
 
 // ============================================================================
+// Inline metadata capacity
+// ============================================================================
+
+/// Maximum rank whose metadata is stored inline without a heap allocation.
+///
+/// [`StridedView`], [`StridedViewMut`] and [`StridedArray`] keep up to this
+/// many dimensions and strides in a `SmallVec` on the stack. Derived views,
+/// clones and array constructors are allocation-free at ranks 1 through
+/// `INLINE_RANK`; a higher rank spills to the heap gracefully (never an
+/// error).
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::{StridedView, INLINE_RANK};
+///
+/// assert_eq!(INLINE_RANK, 8);
+/// let data = [0.0f64; 8];
+/// let view = StridedView::<f64>::new(&data, &[2, 2, 2], &[1, 2, 4], 0).unwrap();
+/// assert_eq!(view.ndim(), 3);
+/// ```
+pub const INLINE_RANK: usize = 8;
+
+/// Stride metadata with inline storage for up to [`INLINE_RANK`] dimensions.
+///
+/// Returned by [`view::col_major_strides`] and [`view::row_major_strides`],
+/// so a computed layout at rank `<= INLINE_RANK` does not allocate.
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::StrideVec;
+///
+/// let strides: StrideVec = [1isize, 2, 4].into_iter().collect();
+/// assert_eq!(&strides[..], &[1, 2, 4]);
+/// ```
+pub type StrideVec = smallvec::SmallVec<[isize; INLINE_RANK]>;
+
+/// Axis metadata with inline storage for up to [`INLINE_RANK`] dimensions.
+///
+/// Returned by [`auxiliary::index_order`].
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::AxisVec;
+///
+/// let axes: AxisVec = [3usize, 1, 2].into_iter().collect();
+/// assert_eq!(&axes[..], &[3, 1, 2]);
+/// ```
+pub type AxisVec = smallvec::SmallVec<[usize; INLINE_RANK]>;
+
+// ============================================================================
 // Element operations
 // ============================================================================
 pub use element_op::{

@@ -48,7 +48,10 @@ pub(crate) fn compute_block_sizes(
         .collect();
 
     // Compute stride orders (in iteration order)
-    let stride_orders: Vec<Vec<usize>> = byte_strides.iter().map(|bs| index_order(bs)).collect();
+    let stride_orders: Vec<Vec<usize>> = byte_strides
+        .iter()
+        .map(|bs| index_order(bs).into_vec())
+        .collect();
 
     // Reorder strides for cost computation
     let reordered_strides: Vec<Vec<isize>> = strides_list

@@ -70,7 +70,7 @@ fn test_compute_importance_2_arrays() {
 
     let order1 = index_order(&strides1);
     let order2 = index_order(&strides2);
-    let index_orders = vec![order1, order2];
+    let index_orders = vec![order1.into_vec(), order2.into_vec()];
 
     let importance = compute_importance(&dims, &all_strides, &index_orders);
 
@@ -108,9 +108,9 @@ fn test_compute_importance_with_zero_stride() {
     let order1 = index_order(&strides1);
     // For stride 0: order = 1 (zero strides always get 1)
     // For stride 1: order = 1 (no non-zero stride < 1)
-    assert_eq!(order1, vec![1, 1]);
+    assert_eq!(order1.as_slice(), &[1, 1]);
 
-    let index_orders = vec![order1];
+    let index_orders = vec![order1.into_vec()];
     let importance = compute_importance(&dims, &all_strides, &index_orders);
 
     assert_eq!(importance[0], 0);
@@ -125,7 +125,7 @@ fn test_compute_importance_size_one_dim() {
     let all_strides: Vec<&[isize]> = vec![&strides1];
 
     let order1 = index_order(&strides1);
-    let index_orders = vec![order1];
+    let index_orders = vec![order1.into_vec()];
     let importance = compute_importance(&dims, &all_strides, &index_orders);
 
     // Dimension 1 has size 1 -> importance = 0
@@ -146,7 +146,7 @@ fn test_compute_importance_output_weight() {
 
     let order_out = index_order(&out_strides); // [1, 2]
     let order_in = index_order(&in_strides); // [2, 1]
-    let index_orders = vec![order_out, order_in];
+    let index_orders = vec![order_out.into_vec(), order_in.into_vec()];
 
     let importance = compute_importance(&dims, &all_strides, &index_orders);
 

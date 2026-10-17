@@ -26,7 +26,7 @@ pub fn compute_order(
     // Compute index_order for each stride array
     let mut index_orders: Vec<Vec<usize>> = Vec::with_capacity(strides_list.len());
     for strides in strides_list {
-        index_orders.push(index_order(strides));
+        index_orders.push(index_order(strides).into_vec());
     }
 
     // Reorder so destination array is first (gets 2x weight)

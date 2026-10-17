@@ -79,9 +79,7 @@ fn replay<T: FusedScalar>(plan: &FusedPlan, len: usize, operands: &[(&[T], isize
     let dims = [len];
     let views: Vec<StridedView<'_, T>> = operands
         .iter()
-        .map(|(data, stride)| {
-            StridedView::new_owned(data, dims.to_vec(), vec![*stride], 0).unwrap()
-        })
+        .map(|(data, stride)| StridedView::new(data, &dims, &[*stride], 0).unwrap())
         .collect();
     let mut output = vec![operands[0].0[0]; len];
     {
@@ -355,9 +353,7 @@ fn replay_multi<T: FusedScalar>(
     let dims = [len];
     let views: Vec<StridedView<'_, T>> = operands
         .iter()
-        .map(|(data, stride)| {
-            StridedView::new_owned(data, dims.to_vec(), vec![*stride], 0).unwrap()
-        })
+        .map(|(data, stride)| StridedView::new(data, &dims, &[*stride], 0).unwrap())
         .collect();
     let mut outputs: Vec<Vec<T>> = (0..plan.outputs.len())
         .map(|_| vec![operands[0].0[0]; len])
@@ -440,8 +436,8 @@ fn chunked_replay_handles_several_blocks_with_different_bases() {
         let mut output = vec![0.0f64; cols * row_gap];
         {
             let inputs = [
-                StridedView::new_owned(lhs, dims.to_vec(), strides.to_vec(), 0).unwrap(),
-                StridedView::new_owned(rhs, dims.to_vec(), strides.to_vec(), 0).unwrap(),
+                StridedView::new(lhs, &dims, &strides, 0).unwrap(),
+                StridedView::new(rhs, &dims, &strides, 0).unwrap(),
             ];
             let mut dest = StridedViewMut::new(&mut output, &dims, &gapped_strides, 0).unwrap();
             fused_elementwise_into(&mut [dest], &inputs, &plan).unwrap();

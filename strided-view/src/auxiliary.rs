@@ -5,6 +5,18 @@
 /// Returns a vector where `result[i]` is the rank of `strides[i]` among all non-zero strides.
 /// Zero strides have order 1.
 ///
+/// Returns an inline [`crate::AxisVec`]: the result does not allocate at rank
+/// `<=` [`crate::INLINE_RANK`] and spills above it.
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::auxiliary::index_order;
+///
+/// let order = index_order(&[4, 1, 2]);
+/// assert_eq!(order.as_slice(), &[3, 1, 2]);
+/// ```
+///
 /// # Julia equivalent
 /// ```julia
 /// function indexorder(strides::NTuple{N,Int}) where {N}
@@ -21,9 +33,9 @@
 ///     end
 /// end
 /// ```
-pub fn index_order(strides: &[isize]) -> Vec<usize> {
+pub fn index_order(strides: &[isize]) -> crate::AxisVec {
     let n = strides.len();
-    let mut result = vec![1usize; n];
+    let mut result = crate::AxisVec::from_elem(1usize, n);
 
     for i in 0..n {
         let si = strides[i].unsigned_abs();
@@ -51,31 +63,31 @@ mod tests {
     fn test_index_order() {
         // strides [4, 1, 2]: order is [3, 1, 2] (4 is largest, 1 is smallest, 2 is middle)
         let order = index_order(&[4, 1, 2]);
-        assert_eq!(order, vec![3, 1, 2]);
+        assert_eq!(order.as_slice(), &[3, 1, 2]);
     }
 
     #[test]
     fn test_index_order_with_zero() {
         // Zero strides have order 1
         let order = index_order(&[4, 0, 2]);
-        assert_eq!(order, vec![2, 1, 1]);
+        assert_eq!(order.as_slice(), &[2, 1, 1]);
     }
 
     #[test]
     fn test_index_order_negative_strides() {
         let order = index_order(&[-4, 1, -2]);
-        assert_eq!(order, vec![3, 1, 2]);
+        assert_eq!(order.as_slice(), &[3, 1, 2]);
     }
 
     #[test]
     fn test_index_order_tied_strides() {
         let order = index_order(&[2, 2, 1]);
-        assert_eq!(order, vec![2, 2, 1]);
+        assert_eq!(order.as_slice(), &[2, 2, 1]);
     }
 
     #[test]
     fn test_index_order_all_same() {
         let order = index_order(&[3, 3, 3]);
-        assert_eq!(order, vec![1, 1, 1]);
+        assert_eq!(order.as_slice(), &[1, 1, 1]);
     }
 }
