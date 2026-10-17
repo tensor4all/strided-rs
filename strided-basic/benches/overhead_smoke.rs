@@ -17,8 +17,10 @@
 //! - S3a/S3b: `map_into` replanning per call vs a compiled typed `UpdatePlan`
 //!   (`alpha = 1`, `beta = 0`, identity), `n = 16` and `4x4x4` (pinned to
 //!   sequential execution). These guard P4 per-call planning. The thresholds
-//!   are deliberately loose for the first CI runs (measured at ~1.5 and ~2.2
-//!   on the reference machine, so 2.0 and 3.0).
+//!   are deliberately loose for the first CI runs and set from the slowest
+//!   machine seen: ~1.5 / ~2.2 on the reference EPYC host, and 1.87 / 3.15 on
+//!   the GitHub-hosted runner after #317 made the beta == 0 compiled baseline
+//!   write-only (faster), so 2.5 and 4.0. Tighten from CI history.
 //! - S3c/S3d: the same `map_into` path vs the compiled `ErasedUpdatePlan` a
 //!   downstream runtime replays; reported only, because the erased boundary
 //!   adds its own overhead.
@@ -177,13 +179,13 @@ fn main() {
     let cases = with_execution_policy(ExecutionPolicy::Sequential, || {
         vec![
             // Gated against the typed compiled plan (P4 per-call planning).
-            s3_case(&[16], "S3a", 20_000, S3Baseline::TypedUpdatePlan, Some(2.0)),
+            s3_case(&[16], "S3a", 20_000, S3Baseline::TypedUpdatePlan, Some(2.5)),
             s3_case(
                 &[4, 4, 4],
                 "S3b",
                 10_000,
                 S3Baseline::TypedUpdatePlan,
-                Some(3.0),
+                Some(4.0),
             ),
             // The erased compiled plan downstream actually replays: report
             // only, because the erased boundary adds its own overhead.

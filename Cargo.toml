@@ -10,23 +10,19 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/strided-rs"
 
 [workspace.dependencies]
-strided-basic = { version = "0.5.4", path = "strided-basic", default-features = false }
-strided-fused = { version = "0.5.2", path = "strided-fused", default-features = false }
-strided-traits = { version = "0.5.0", path = "strided-traits" }
-# Requirement stays 0.5.0 although strided-view is at 0.5.1: the published
-# providers (tcontract, cpueinsum, cpueinsum-blas, tlinalg) pin strided-view
-# =0.5.0, and no dependent needs a 0.5.1 item, so a 0.5.1 floor would force a
-# provider re-release for nothing. See the 2026-10-17 release note.
-strided-view = { version = "0.5.0", path = "strided-view" }
-strided-perm = { version = "0.5.0", path = "strided-perm" }
-strided-kernel = { version = "0.5.0", path = "strided-kernel" }
+strided-basic = { version = "0.6.0", path = "strided-basic", default-features = false }
+strided-fused = { version = "0.6.0", path = "strided-fused", default-features = false }
+strided-traits = { version = "0.6.0", path = "strided-traits" }
+strided-view = { version = "0.6.0", path = "strided-view" }
+strided-perm = { version = "0.6.0", path = "strided-perm" }
+strided-kernel = { version = "0.6.0", path = "strided-kernel" }
 
 approx = "0.5"
 criterion = "0.5"
