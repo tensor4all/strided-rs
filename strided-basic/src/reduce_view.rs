@@ -328,7 +328,8 @@ where
         StridedArray::<U>::from_parts(vec![init.clone(); total_out], &out_dims, &out_strides, 0)?;
     {
         let mut dest = out.view_mut();
-        reduce_axis_into(&mut dest, src, axis, map_fn, reduce_fn, init)?;
+        // The fresh column-major destination needs no validation.
+        reduce_axis_into_impl(&mut dest, src, axis, map_fn, reduce_fn, init)?;
     }
     Ok(out)
 }
@@ -357,11 +358,10 @@ where
 /// reduce_axis_into(&mut out.view_mut(), &src.view(), 0, |x| x, |a, b| a + b, 0.0).unwrap();
 /// assert_eq!(out.get(&[0]), 1.0);
 /// ```
-// ponytail: the array-returning wrapper regressed against the pre-0.6
-// `reduce_axis` (contiguous 1T, shared EPYC host load ~5-6, 2026-10-17):
-// 4x4x4 191 -> 322 ns, 32x32x32 7150 -> 8423 ns. The allocation-free planner
-// and the `_into` split are the only structural changes; the inline cursor and
-// `kept` metadata are candidates. Re-profile before B4.
+///
+/// Validation runs here; [`reduce_axis_into_impl`] is the shared kernel. The
+/// array-returning wrapper owns a fresh column-major destination and calls the
+/// kernel directly, so the common path does not re-validate.
 pub fn reduce_axis_into<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     dest: &mut StridedViewMut<U>,
     src: &StridedView<T, Op>,
@@ -379,45 +379,73 @@ where
     if axis >= rank {
         return Err(StridedError::InvalidAxis { axis, rank });
     }
-
     let src_dims = src.dims();
-    let src_strides = src.strides();
-    let src_ptr = src.ptr();
     // Reject an element count beyond usize (a huge stride-0 broadcast) up
     // front instead of looping over it.
     total_len(src_dims)?;
-
-    let expected: InlineVec<usize> = src_dims
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != axis)
-        .map(|(_, &d)| d)
-        .collect();
+    let kept_len = rank - 1;
     let dest_len = total_len(dest.dims())?;
-    if expected.is_empty() {
+    if kept_len == 0 {
         if dest_len != 1 {
             return Err(StridedError::ShapeMismatch(vec![dest_len], vec![1]));
         }
     } else {
-        if dest.ndim() != expected.len() {
-            return Err(StridedError::RankMismatch(dest.ndim(), expected.len()));
+        if dest.ndim() != kept_len {
+            return Err(StridedError::RankMismatch(dest.ndim(), kept_len));
         }
-        if dest.dims() != expected.as_slice() {
-            return Err(StridedError::ShapeMismatch(
-                dest.dims().to_vec(),
-                expected.to_vec(),
-            ));
+        let dest_dims = dest.dims();
+        let mut d = 0usize;
+        for (i, &src_dim) in src_dims.iter().enumerate() {
+            if i == axis {
+                continue;
+            }
+            if src_dim != dest_dims[d] {
+                let expected: Vec<usize> = src_dims
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != axis)
+                    .map(|(_, &d)| d)
+                    .collect();
+                return Err(StridedError::ShapeMismatch(dest_dims.to_vec(), expected));
+            }
+            d += 1;
+        }
+        if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
+            return Err(StridedError::NonInjectiveOutputLayout);
         }
     }
-    if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
-        return Err(StridedError::NonInjectiveOutputLayout);
-    }
+    reduce_axis_into_impl(dest, src, axis, map_fn, reduce_fn, init)
+}
 
+/// Shared kernel of [`reduce_axis_into`] and [`reduce_axis`].
+///
+/// Assumes the destination has the reduced source shape (or one element for a
+/// full reduction) and an injective layout; the public entry validates that,
+/// while the array-returning wrapper owns a freshly allocated column-major
+/// destination and can skip the re-validation.
+fn reduce_axis_into_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+    dest: &mut StridedViewMut<U>,
+    src: &StridedView<T, Op>,
+    axis: usize,
+    map_fn: M,
+    reduce_fn: R,
+    init: U,
+) -> Result<()>
+where
+    M: Fn(T) -> U + MaybeSync,
+    R: Fn(U, U) -> U + MaybeSync,
+    U: Clone + MaybeSendSync,
+{
+    let rank = src.ndim();
+    let src_dims = src.dims();
+    let src_strides = src.strides();
+    let src_ptr = src.ptr();
+    let dest_len = total_len(dest.dims())?;
     let axis_len = src_dims[axis];
     let axis_stride = src_strides[axis];
 
-    // Full reduction into a single destination element.
-    if expected.is_empty() {
+    if rank == 1 {
+        // Full reduction into a single destination element.
         // SAFETY: the view proves `axis_len` readable elements along `axis`.
         let acc = unsafe {
             fold_run::<T, Op, M, R, U>(src_ptr, axis_stride, axis_len, init, &map_fn, &reduce_fn)
@@ -425,36 +453,33 @@ where
         unsafe { *dest.as_mut_ptr() = acc };
         return Ok(());
     }
-
     if dest_len == 0 {
         return Ok(());
     }
 
+    // Build the kept-axis metadata in one pass. A column-major destination is
+    // the common case (the array-returning wrapper always allocates one); its
+    // offset equals the linear output index, so its stride list is only
+    // materialized for a strided destination.
+    let dest_stride_view = dest.strides();
     let mut kept: InlineVec<(usize, isize)> = InlineVec::new();
-    let mut dest_strides: InlineVec<isize> = InlineVec::new();
-    {
-        let mut d = 0usize;
-        for i in 0..rank {
-            if i == axis {
-                continue;
-            }
-            kept.push((src_dims[i], src_strides[i]));
-            dest_strides.push(dest.strides()[d]);
-            d += 1;
+    let mut dest_linear = true;
+    let mut prefix = 1usize;
+    for (i, (&dim, &src_stride)) in src_dims.iter().zip(src_strides).enumerate() {
+        if i == axis {
+            continue;
         }
+        let d = kept.len();
+        kept.push((dim, src_stride));
+        if dest_linear && dest_stride_view[d] != prefix as isize {
+            dest_linear = false;
+        }
+        prefix = prefix.saturating_mul(dim);
     }
-    // A column-major destination is the common case (the array-returning
-    // wrapper always allocates one). Its destination offset equals the linear
-    // output index, so the per-output destination bookkeeping can be skipped.
-    let dest_linear = {
-        let mut prefix = 1usize;
-        kept.iter()
-            .zip(dest_strides.iter())
-            .all(|(&(dim, _), &dest_stride)| {
-                let linear = dest_stride == prefix as isize;
-                prefix = prefix.saturating_mul(dim);
-                linear
-            })
+    let dest_strides: InlineVec<isize> = if dest_linear {
+        InlineVec::new()
+    } else {
+        dest_stride_view.iter().copied().collect()
     };
     let out_ptr = dest.as_mut_ptr();
     let parts = AxisParts {
@@ -462,7 +487,6 @@ where
         dest_strides: &dest_strides,
         axis_len,
         axis_stride,
-        dest_linear,
         map_fn: &map_fn,
         reduce_fn: &reduce_fn,
         init: &init,
@@ -476,29 +500,52 @@ where
             let src_send = SendPtr(src_ptr as *mut T);
             let out_send = SendPtr(out_ptr);
             let parts = &parts;
-            crate::threading::parallel_for_each(0..dest_len, nthreads, &|range| {
-                // SAFETY: worker ranges are disjoint, the destination is
-                // injective, and the view proves every source offset reachable
-                // from its kept coordinates.
-                unsafe {
-                    reduce_axis_range::<T, Op, M, R, U>(
-                        src_send.as_const(),
-                        out_send.as_ptr(),
-                        range,
-                        parts,
-                    )
-                }
-            });
+            if dest_linear {
+                crate::threading::parallel_for_each(0..dest_len, nthreads, &|range| {
+                    // SAFETY: worker ranges are disjoint, the destination is
+                    // injective, and the view proves every source offset
+                    // reachable from its kept coordinates.
+                    unsafe {
+                        reduce_axis_range_linear::<T, Op, M, R, U>(
+                            src_send.as_const(),
+                            out_send.as_ptr(),
+                            range,
+                            parts,
+                        )
+                    }
+                });
+            } else {
+                crate::threading::parallel_for_each(0..dest_len, nthreads, &|range| {
+                    // SAFETY: as for the linear path.
+                    unsafe {
+                        reduce_axis_range_strided::<T, Op, M, R, U>(
+                            src_send.as_const(),
+                            out_send.as_ptr(),
+                            range,
+                            parts,
+                        )
+                    }
+                });
+            }
             return Ok(());
         }
     }
 
     // SAFETY: as for the parallel ranges, with one range covering all outputs.
-    unsafe { reduce_axis_range::<T, Op, M, R, U>(src_ptr, out_ptr, 0..dest_len, &parts) };
+    if dest_linear {
+        unsafe {
+            reduce_axis_range_linear::<T, Op, M, R, U>(src_ptr, out_ptr, 0..dest_len, &parts)
+        };
+    } else {
+        unsafe {
+            reduce_axis_range_strided::<T, Op, M, R, U>(src_ptr, out_ptr, 0..dest_len, &parts)
+        };
+    }
     Ok(())
 }
 
-/// Shared inputs of [`reduce_axis_range`].
+/// Shared inputs of [`reduce_axis_range_linear`] and
+/// [`reduce_axis_range_strided`].
 struct AxisParts<'a, M, R, U> {
     /// `(extent, source stride)` of every kept axis, in output order.
     kept: &'a [(usize, isize)],
@@ -506,53 +553,16 @@ struct AxisParts<'a, M, R, U> {
     dest_strides: &'a [isize],
     axis_len: usize,
     axis_stride: isize,
-    /// Whether the destination is the column-major output, so its offset is the
-    /// linear output index and no destination cursor is needed.
-    dest_linear: bool,
     map_fn: &'a M,
     reduce_fn: &'a R,
     init: &'a U,
 }
 
-/// Computes outputs `range` (column-major logical output indices) of
-/// [`reduce_axis_into`].
-///
-/// # Safety
-/// `out` must be a destination of `parts.kept` extents with injective layout,
-/// `range` a subrange of its logical output indices that no other thread
-/// writes, and every source offset reachable from a kept coordinate plus
-/// `k * parts.axis_stride` for `k < parts.axis_len` must be a readable element
-/// of `src`.
-/// Computes outputs `range` of [`reduce_axis_into`], dispatching on the
-/// destination layout so the common column-major case runs the same cursor as
-/// the array-returning wrapper used before this was split (#306 performance).
-///
-/// # Safety
-/// As [`reduce_axis_range_linear`] / [`reduce_axis_range_strided`].
-unsafe fn reduce_axis_range<T, Op, M, R, U>(
-    src: *const T,
-    out: *mut U,
-    range: Range<usize>,
-    parts: &AxisParts<'_, M, R, U>,
-) where
-    T: Copy,
-    Op: ElementOp<T>,
-    M: Fn(T) -> U,
-    R: Fn(U, U) -> U,
-    U: Clone,
-{
-    if parts.dest_linear {
-        // SAFETY: forwarded caller contract; a linear destination is a valid
-        // destination for the kept extents.
-        unsafe { reduce_axis_range_linear::<T, Op, M, R, U>(src, out, range, parts) }
-    } else {
-        // SAFETY: forwarded caller contract.
-        unsafe { reduce_axis_range_strided::<T, Op, M, R, U>(src, out, range, parts) }
-    }
-}
-
 /// Column-major destination cursor: the destination offset is the linear output
 /// index, so no destination stride bookkeeping is needed.
+///
+/// Kept out of line so the common path stays the same single-cursor loop as the
+/// pre-split kernel.
 ///
 /// # Safety
 /// `out` must be a column-major destination of `parts.kept` extents, `range` a
@@ -560,6 +570,7 @@ unsafe fn reduce_axis_range<T, Op, M, R, U>(
 /// every source offset reachable from a kept coordinate plus
 /// `k * parts.axis_stride` for `k < parts.axis_len` must be a readable element
 /// of `src`.
+#[inline(never)]
 unsafe fn reduce_axis_range_linear<T, Op, M, R, U>(
     src: *const T,
     out: *mut U,
@@ -577,9 +588,19 @@ unsafe fn reduce_axis_range_linear<T, Op, M, R, U>(
     let sweep = lead_stride == 1 && lead_extent >= AXIS_SWEEP_MIN_LEN && parts.axis_len > 1;
     let block = (AXIS_SWEEP_BLOCK_BYTES / std::mem::size_of::<U>().max(1)).max(AXIS_SWEEP_MIN_LEN);
 
-    // Decode the first output once, then advance incrementally. `coords` is
-    // inline at rank <= INLINE_RANK.
-    let mut coords: InlineVec<usize> = (0..kept.len()).map(|_| 0usize).collect();
+    // Decode the first output once, then advance incrementally. A fixed stack
+    // array with a spill covers every inline rank without the per-access enum
+    // match a `TinyVec` cursor would add to the hot loop, and allocates only
+    // above `INLINE_RANK` (#306 P1).
+    let coords_len = kept.len();
+    let mut coords_inline = [0usize; strided_view::INLINE_RANK];
+    let mut coords_heap: Vec<usize> = Vec::new();
+    let coords: &mut [usize] = if coords_len <= strided_view::INLINE_RANK {
+        &mut coords_inline[..coords_len]
+    } else {
+        coords_heap.resize(coords_len, 0);
+        &mut coords_heap[..]
+    };
     let mut rest = range.start;
     let mut src_off = 0isize;
     for (coord, &(extent, stride)) in coords.iter_mut().zip(kept) {
@@ -642,6 +663,7 @@ unsafe fn reduce_axis_range_linear<T, Op, M, R, U>(
 /// writes, and every source offset reachable from a kept coordinate plus
 /// `k * parts.axis_stride` for `k < parts.axis_len` must be a readable element
 /// of `src`.
+#[inline(never)]
 unsafe fn reduce_axis_range_strided<T, Op, M, R, U>(
     src: *const T,
     out: *mut U,
