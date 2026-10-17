@@ -36,7 +36,8 @@ inputs also stay serial.
 The policy-aware parallel replay currently covers:
 
 - full reductions, partitioned over layout traversal ranges that each run the
-  serial run kernel, with partials combined in a fixed tree;
+  serial run kernel, with partials combined in a fixed tree (both the
+  one-operand `reduce`/`sum` and the two-operand `zip_reduce`);
 - axis reductions, partitioned over independent outputs. Their threshold
   domain is the number of source elements read (outputs times reduced
   elements), not the output count, so shapes such as a 2048 by 2048 matrix
@@ -61,6 +62,29 @@ It must preserve deterministic column-major update order unless a future API
 provides a separately validated non-overlap contract. Raw `CopyPlan` replay
 also remains serial: the initial range-partitioned implementation regressed
 large contiguous copies. Both remain benchmark targets.
+
+### Reduction evaluation order and the deterministic route
+
+The public reduction entries (`reduce`, `zip_reduce`, `sum`, `dot`) do not
+promise a strict left-to-right fold, and none of them promises cross-machine
+bitwise equality: independent lane kernels, cache-friendly traversal orders,
+SIMD kernels and the parallel partial-combine tree all reorder the additions.
+What they do promise is documented per entry:
+
+- under the sequential policy — `ExecContext::serial()` or
+  `with_execution_policy(ExecutionPolicy::Sequential, ..)` — the result is
+  independent of the ambient Rayon pool width, because only serial branches
+  run; this is the deterministic route for a caller that needs one result per
+  input, and it is asserted for `reduce`, `zip_reduce`, `sum` and `dot` by
+  `strided-basic/tests/zip_reduce.rs`;
+- under a parallel policy the split depends on the effective thread count, so
+  the result is repeatable for a fixed thread count only.
+
+`zip_reduce` (tensor4all/strided-rs#280) is the two-input mapped reduction that
+makes a widening accumulator expressible (`f32` operands accumulated in `f64`);
+`dot` cannot widen because it pins the result type to `A * B`. `zip_reduce`
+reuses the full-reduction threshold and the same partial-combine tree as
+`reduce`.
 
 ## Changing a threshold or fast path
 
