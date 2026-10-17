@@ -1,7 +1,9 @@
 //! Runtime-DAG fused elementwise kernels.
 
 use core::mem::MaybeUninit;
-use strided_basic::execution::is_injective_layout;
+use strided_basic::execution::validate_destination_layout;
+#[cfg(test)]
+use strided_basic::execution::{is_injective_layout, validate_destination_layout_without_alloc};
 
 use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
 use strided_basic::execution::{
@@ -9,8 +11,8 @@ use strided_basic::execution::{
     SMALL_TENSOR_THRESHOLD,
 };
 use strided_basic::execution::{
-    map_into_validated, validate_destination_layout_without_alloc, zip_map2_into_validated,
-    zip_map3_into_validated, zip_map4_into_validated, ValidatedDestinationLayout,
+    map_into_validated, zip_map2_into_validated, zip_map3_into_validated, zip_map4_into_validated,
+    ValidatedDestinationLayout,
 };
 use strided_basic::{with_execution_policy, ExecutionPolicy};
 
@@ -815,26 +817,19 @@ pub(crate) fn validate_plan_for_scalar<T: FusedScalar>(
 fn validate_shapes<T: FusedScalar>(
     dests: &[StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],
-) -> Result<()> {
+) -> Result<ValidatedDestinationLayout> {
     let dims = dests[0].dims();
-    for dest in dests {
-        validate_destination_layout(dest)?;
-    }
+    // Validate the layout once and hand the marker to the specialization, so
+    // the injectivity check does not run twice on the hot single-output path.
+    let first = validate_destination_layout(dests[0].dims(), dests[0].strides())?;
     for dest in &dests[1..] {
+        validate_destination_layout(dest.dims(), dest.strides())?;
         ensure_same_shape(dims, dest.dims())?;
     }
     for input in inputs {
         ensure_same_shape(dims, input.dims())?;
     }
-    Ok(())
-}
-
-fn validate_destination_layout<T>(dest: &StridedViewMut<'_, T>) -> Result<()> {
-    if is_injective_layout(dest.dims(), dest.strides()) {
-        Ok(())
-    } else {
-        Err(StridedError::NonInjectiveOutputLayout)
-    }
+    Ok(first)
 }
 
 #[inline(always)]
@@ -1196,30 +1191,18 @@ where
     Ok(true)
 }
 
-fn try_static_specialization<T: FusedScalar>(
+/// Take the initialized specialization with an already validated destination
+/// layout, so the caller does not run the injectivity check twice.
+fn try_static_specialization_initialized<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
-) -> Result<bool> {
-    try_static_specialization_scoped(dests, inputs, plan, false)
-}
-
-/// Static specialization with an explicit serial request.
-///
-/// The specialized kernels choose their own fanout from the ambient execution
-/// policy, so a serial caller pins [`ExecutionPolicy::Sequential`] while they
-/// run. Skipping the specialization instead is what made serial replay fall
-/// back to the per-element interpreter (tensor4all/strided-rs#305).
-fn try_static_specialization_scoped<T: FusedScalar>(
-    dests: &mut [StridedViewMut<'_, T>],
-    inputs: &[StridedView<'_, T>],
-    plan: &FusedPlan,
+    validated: ValidatedDestinationLayout,
     serial: bool,
 ) -> Result<bool> {
     if dests.len() != 1 {
         return Ok(false);
     }
-    let validated = validate_destination_layout_without_alloc(dests[0].dims(), dests[0].strides())?;
     try_static_specialization_validated_scoped::<T, InitializedStaticOutput>(
         &mut dests[0],
         inputs,
@@ -1229,6 +1212,31 @@ fn try_static_specialization_scoped<T: FusedScalar>(
     )
 }
 
+/// Test-only thin wrapper over `validate_destination_layout_without_alloc` plus
+/// [`try_static_specialization_initialized`], matching the helper the
+/// specialization tests used before the layout marker was threaded through.
+#[cfg(test)]
+fn try_static_specialization<T: FusedScalar>(
+    dests: &mut [StridedViewMut<'_, T>],
+    inputs: &[StridedView<'_, T>],
+    plan: &FusedPlan,
+) -> Result<bool> {
+    if dests.len() != 1 {
+        return Ok(false);
+    }
+    let validated = strided_basic::execution::validate_destination_layout_without_alloc(
+        dests[0].dims(),
+        dests[0].strides(),
+    )?;
+    try_static_specialization_initialized(dests, inputs, plan, validated, false)
+}
+
+/// Static specialization with an explicit serial request.
+///
+/// The specialized kernels choose their own fanout from the ambient execution
+/// policy, so a serial caller pins [`ExecutionPolicy::Sequential`] while they
+/// run. Skipping the specialization instead is what made serial replay fall
+/// back to the per-element interpreter (tensor4all/strided-rs#305).
 fn try_static_specialization_validated_scoped<T, O>(
     dest: &mut StridedViewMut<'_, O::Value>,
     inputs: &[StridedView<'_, T>],
@@ -1608,8 +1616,8 @@ pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
     plan: &FusedPlan,
 ) -> Result<()> {
     validate_plan_for_scalar::<T>(plan, inputs.len(), dests.len())?;
-    validate_shapes(dests, inputs)?;
-    if try_static_specialization_scoped(dests, inputs, plan, true)? {
+    let validated = validate_shapes(dests, inputs)?;
+    if try_static_specialization_initialized(dests, inputs, plan, validated, true)? {
         return Ok(());
     }
     interpret_fused_elementwise_into_serial(dests, inputs, plan)
@@ -1953,8 +1961,8 @@ pub fn fused_elementwise_into<T: FusedScalar>(
     plan: &FusedPlan,
 ) -> Result<()> {
     validate_plan_for_scalar::<T>(plan, inputs.len(), dests.len())?;
-    validate_shapes(dests, inputs)?;
-    if try_static_specialization(dests, inputs, plan)? {
+    let validated = validate_shapes(dests, inputs)?;
+    if try_static_specialization_initialized(dests, inputs, plan, validated, false)? {
         return Ok(());
     }
     interpret_fused_elementwise_into(dests, inputs, plan)

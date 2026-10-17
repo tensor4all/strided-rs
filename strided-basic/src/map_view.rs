@@ -45,8 +45,15 @@ const TRANSPOSED_SCALAR_TILE_MAX_INNER_ROW_ASPECT: usize = 8;
 #[derive(Clone, Copy, Debug)]
 pub struct ValidatedDestinationLayout(());
 
+/// Validate destination injectivity and return the replay marker.
+///
+/// Runs the exact (allocation-free pairwise, then spilling) injectivity check,
+/// so every injective layout the other kernel entry points accept is accepted
+/// here. Kernel families that need the marker for more than one step (for
+/// example validating shapes and then taking a specialization) should call this
+/// once and pass the marker on instead of re-running the check.
 #[inline]
-fn validate_destination_layout(
+pub fn validate_destination_layout(
     dims: &[usize],
     strides: &[isize],
 ) -> Result<ValidatedDestinationLayout> {

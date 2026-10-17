@@ -31,7 +31,10 @@ pub use crate::erased_common::{
 };
 pub use crate::kernel::{ensure_same_shape, KernelPlan, SMALL_TENSOR_THRESHOLD};
 pub use crate::layout_check::is_injective_layout;
-pub use crate::map_view::{validate_destination_layout_without_alloc, ValidatedDestinationLayout};
+pub use crate::map_view::{
+    validate_destination_layout, validate_destination_layout_without_alloc,
+    ValidatedDestinationLayout,
+};
 #[cfg(feature = "parallel")]
 pub use crate::threading::{
     parallel_map_reduce, parallel_threads_for_len, SendPtr, MINTHREADLENGTH,
