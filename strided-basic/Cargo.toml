@@ -2,9 +2,9 @@
 name = "strided-basic"
 # Versioned per crate, not by the workspace: crates are released individually
 # when their library code changes. See
-# docs/worklogs/2026-10-17-cpu-perf-batch-release.md for this release and
+# docs/worklogs/2026-10-17-fused-blockers-release.md for this release and
 # docs/worklogs/2026-10-15-tenferro-2150-product-order.md for the recipe.
-version = "0.5.3"
+version = "0.5.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
