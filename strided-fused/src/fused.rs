@@ -16,10 +16,71 @@ use strided_basic::{with_execution_policy, ExecutionPolicy};
 
 mod chunk;
 
+/// Reborrow the initialized prefix of a stack buffer of destination views.
+///
+/// Used by the erased multi-output entry points so their stack-buffer cast stays
+/// out of the erased raw-boundary modules.
+///
+/// # Safety
+/// `storage[..len]` must be initialized and `len <= storage.len()`.
+pub(crate) unsafe fn initialized_views_mut<'a, 'b, T, const N: usize>(
+    storage: &'b mut [MaybeUninit<StridedViewMut<'a, T>>; N],
+    len: usize,
+) -> &'b mut [StridedViewMut<'a, T>] {
+    debug_assert!(len <= N);
+    // SAFETY: the caller guarantees the prefix is initialized, and
+    // `MaybeUninit<StridedViewMut>` has the same layout as `StridedViewMut`.
+    unsafe {
+        core::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<StridedViewMut<'a, T>>(), len)
+    }
+}
+
+/// A raw operand pointer that is `Default` and `Send + Sync`, so pointer lists
+/// can live in an inline operand vector and be captured by worker closures.
+///
+/// `repr(transparent)` over `*mut T`, so a slice of them can be viewed as a
+/// slice of raw pointers without copying.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OperandPtr<T>(*mut T);
+
+impl<T> Default for OperandPtr<T> {
+    fn default() -> Self {
+        Self(core::ptr::null_mut())
+    }
+}
+
+// SAFETY: only used to move/copy validated operand addresses to worker threads;
+// the owning views establish liveness, aliasing and access at each use.
+unsafe impl<T> Send for OperandPtr<T> {}
+unsafe impl<T> Sync for OperandPtr<T> {}
+
+impl<T> OperandPtr<T> {
+    #[inline]
+    fn new(ptr: *mut T) -> Self {
+        Self(ptr)
+    }
+}
+
+/// View an inline operand vector as a `&[*mut T]` slice.
+#[inline]
+fn operand_ptrs<T>(ptrs: &[OperandPtr<T>]) -> &[*mut T] {
+    // SAFETY: `OperandPtr<T>` is `repr(transparent)` over `*mut T`.
+    unsafe { core::slice::from_raw_parts(ptrs.as_ptr().cast::<*mut T>(), ptrs.len()) }
+}
+
+/// View an inline operand vector as a `&[*const T]` slice.
+#[inline]
+fn operand_const_ptrs<T>(ptrs: &[OperandPtr<T>]) -> &[*const T] {
+    // SAFETY: `OperandPtr<T>` is `repr(transparent)` over `*mut T`, and
+    // `*mut T` and `*const T` have the same layout.
+    unsafe { core::slice::from_raw_parts(ptrs.as_ptr().cast::<*const T>(), ptrs.len()) }
+}
+
 #[cfg(feature = "parallel")]
 use strided_basic::execution::compute_costs;
 #[cfg(feature = "parallel")]
-use strided_basic::execution::{mapreduce_threaded, SendPtr, MINTHREADLENGTH};
+use strided_basic::execution::{mapreduce_threaded, MINTHREADLENGTH};
 
 /// Runtime scalar operation for a fused elementwise plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,10 +134,45 @@ impl FusedOp {
 }
 
 /// One SSA instruction in a [`FusedPlan`].
+///
+/// `inputs` holds at most [`OPERAND_CAP`](strided_basic::OPERAND_CAP) value ids
+/// inline and spills above that, so a bounded program builds without touching
+/// the heap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FusedInst {
     pub op: FusedOp,
-    pub inputs: Vec<usize>,
+    pub inputs: strided_basic::OperandVec<usize>,
+}
+
+impl FusedInst {
+    /// Build an instruction from an operation and its input value ids.
+    ///
+    /// ```
+    /// use strided_fused::{FusedInst, FusedOp};
+    /// let inst = FusedInst::new(FusedOp::Add, [0, 1]);
+    /// assert_eq!(inst.inputs.as_slice(), &[0, 1]);
+    /// ```
+    pub fn new(op: FusedOp, inputs: impl IntoIterator<Item = usize>) -> Self {
+        Self {
+            op,
+            inputs: inputs.into_iter().collect(),
+        }
+    }
+}
+
+impl Default for FusedOp {
+    fn default() -> Self {
+        Self::Add
+    }
+}
+
+impl Default for FusedInst {
+    fn default() -> Self {
+        Self {
+            op: FusedOp::default(),
+            inputs: strided_basic::OperandVec::new(),
+        }
+    }
 }
 
 /// Topologically ordered fused elementwise SSA DAG.
@@ -87,6 +183,13 @@ pub struct FusedInst {
 /// instruction writes value `2`, the second writes value `3`, and so on.
 /// `outputs` contains the value ids to write to `dests` in order.
 ///
+/// The program is stored inline: at most eight instructions, five outputs and
+/// [`OPERAND_CAP`](strided_basic::OPERAND_CAP) inputs per instruction, spilling
+/// to the heap only above those bounds. Build one with [`FusedPlan::new`] to
+/// keep `vec!`-based construction ergonomic; the `pub` fields accept the inline
+/// collection directly. (Changing the field type from `Vec` is a 0.6.0 breaking
+/// change.)
+///
 /// All inputs and destinations passed to [`fused_elementwise_into`] must have
 /// the same shape and scalar type. Broadcast inputs should be represented with
 /// `StridedView::broadcast` before building the plan; the fused API does not
@@ -94,8 +197,36 @@ pub struct FusedInst {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FusedPlan {
     pub input_count: usize,
-    pub outputs: Vec<usize>,
-    pub ops: Vec<FusedInst>,
+    pub outputs: strided_basic::OperandVec<usize>,
+    pub ops: strided_basic::InlineVec<FusedInst>,
+}
+
+impl FusedPlan {
+    /// Build a plan from an input count, output value ids, and instructions.
+    ///
+    /// ```
+    /// use strided_fused::{FusedInst, FusedOp, FusedPlan};
+    /// let plan = FusedPlan::new(
+    ///     2,
+    ///     vec![3],
+    ///     vec![
+    ///         FusedInst::new(FusedOp::Add, vec![0, 1]),
+    ///         FusedInst::new(FusedOp::Negate, vec![2]),
+    ///     ],
+    /// );
+    /// assert_eq!(plan.ops.len(), 2);
+    /// ```
+    pub fn new(
+        input_count: usize,
+        outputs: impl IntoIterator<Item = usize>,
+        ops: impl IntoIterator<Item = FusedInst>,
+    ) -> Self {
+        Self {
+            input_count,
+            outputs: outputs.into_iter().collect(),
+            ops: ops.into_iter().collect(),
+        }
+    }
 }
 
 /// Scalar types supported by [`fused_elementwise_into`].
@@ -1067,6 +1198,10 @@ where
     }
 }
 
+/// Registers the scalar interpreter keeps inline; a larger program spills to
+/// the heap (#306 item 6).
+const INLINE_REGS: usize = 12;
+
 unsafe fn interpret_inner_loop<T: FusedScalar>(
     dst_ptrs: &[*mut T],
     input_ptrs: &[*const T],
@@ -1075,26 +1210,71 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
     len: usize,
     strides: &[isize],
 ) {
-    let output_count = dst_ptrs.len();
-    let mut regs = Vec::with_capacity(plan.input_count + plan.ops.len());
+    let register_count = plan.input_count + plan.ops.len();
+    if len == 0 || register_count == 0 {
+        return;
+    }
+    // SAFETY: a validated plan with instructions has at least one input, and
+    // the enclosing kernel proved every operand addresses a readable element.
+    let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
+    if register_count <= INLINE_REGS {
+        let mut inline = [init; INLINE_REGS];
+        // SAFETY: forwarded contract.
+        unsafe {
+            interpret_loop_body(
+                dst_ptrs,
+                input_ptrs,
+                plan,
+                offsets,
+                len,
+                strides,
+                &mut inline[..register_count],
+            )
+        };
+    } else {
+        let mut heap = vec![init; register_count];
+        // SAFETY: forwarded contract.
+        unsafe {
+            interpret_loop_body(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
+        };
+    }
+}
 
+/// One interpreter pass over a block, writing the register file by index so a
+/// stack or heap file is used identically.
+///
+/// # Safety
+/// As [`interpret_inner_loop`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn interpret_loop_body<T: FusedScalar>(
+    dst_ptrs: &[*mut T],
+    input_ptrs: &[*const T],
+    plan: &FusedPlan,
+    offsets: &[isize],
+    len: usize,
+    strides: &[isize],
+    regs: &mut [T],
+) {
+    let output_count = dst_ptrs.len();
     for i in 0..len {
         let i = i as isize;
-        regs.clear();
-
         for (input_index, &input_ptr) in input_ptrs.iter().enumerate() {
             let stride_index = output_count + input_index;
             let stride = inner_stride(strides, stride_index);
-            regs.push(*input_ptr.offset(offsets[stride_index] + i * stride));
+            // SAFETY: forwarded caller contract.
+            regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
-
-        for inst in &plan.ops {
-            regs.push(eval_op(inst.op, &regs, &inst.inputs));
+        for (instruction, inst) in plan.ops.iter().enumerate() {
+            let output = plan.input_count + instruction;
+            regs[output] = eval_op(inst.op, &regs[..output], &inst.inputs);
         }
-
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
-            *dst_ptr.offset(offsets[output_index] + i * stride) = regs[plan.outputs[output_index]];
+            // SAFETY: forwarded caller contract.
+            unsafe {
+                *dst_ptr.offset(offsets[output_index] + i * stride) =
+                    regs[plan.outputs[output_index]];
+            }
         }
     }
 }
@@ -1113,11 +1293,12 @@ fn chunk_seed<T: FusedScalar>(inputs: &[StridedView<'_, T>]) -> Option<T> {
 
 /// Register file for `seed`, or an empty one when the chunked path is declined.
 #[inline]
-fn register_file<T: FusedScalar>(plan: &FusedPlan, seed: Option<T>) -> Vec<T> {
-    match seed {
-        Some(seed) => chunk::new_register_file(plan, seed),
-        None => Vec::new(),
-    }
+fn register_file<T: FusedScalar, R>(
+    plan: &FusedPlan,
+    seed: Option<T>,
+    f: impl FnOnce(&mut [T]) -> R,
+) -> R {
+    chunk::with_register_file(plan, seed, f)
 }
 
 /// Inputs the chunked path reads straight from the operand, empty when it is
@@ -1133,7 +1314,7 @@ fn direct_inputs<T: FusedScalar, S: AsRef<[isize]>>(
     seed: Option<T>,
     ordered_strides: &[S],
     output_count: usize,
-) -> Vec<bool> {
+) -> strided_basic::OperandVec<bool> {
     match seed {
         Some(_) => {
             let mut direct = chunk::single_use_inputs(plan);
@@ -1149,7 +1330,7 @@ fn direct_inputs<T: FusedScalar, S: AsRef<[isize]>>(
             }
             direct
         }
-        None => Vec::new(),
+        None => strided_basic::OperandVec::new(),
     }
 }
 
@@ -1169,15 +1350,22 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
 ) -> Result<()> {
     #[cfg(feature = "parallel")]
     {
-        let dims = dests[0].dims().to_vec();
         if dests[0].is_empty() {
             return Ok(());
         }
+        let dims: strided_basic::OperandVec<usize> = dests[0].dims().iter().copied().collect();
 
-        let dst_ptrs: Vec<*mut T> = dests.iter_mut().map(|dest| dest.as_mut_ptr()).collect();
-        let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
+        let dst_ptrs: strided_basic::OperandVec<OperandPtr<T>> = dests
+            .iter_mut()
+            .map(|dest| OperandPtr::new(dest.as_mut_ptr()))
+            .collect();
+        let input_ptrs: strided_basic::OperandVec<OperandPtr<T>> = inputs
+            .iter()
+            .map(|input| OperandPtr::new(input.ptr() as *mut T))
+            .collect();
 
-        let mut strides_list: Vec<&[isize]> = Vec::with_capacity(dests.len() + inputs.len());
+        let mut strides_list: strided_basic::OperandVec<&[isize]> =
+            strided_basic::OperandVec::with_capacity(dests.len() + inputs.len());
         for dest in dests.iter() {
             strides_list.push(dest.strides());
         }
@@ -1198,16 +1386,10 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         let total: usize = fused_dims.iter().product();
         let nthreads = strided_basic::execution::rayon_threads();
         if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send: Vec<SendPtr<T>> = dst_ptrs.iter().map(|&ptr| SendPtr(ptr)).collect();
-            let input_send: Vec<SendPtr<T>> = input_ptrs
-                .iter()
-                .map(|&ptr| SendPtr(ptr as *mut T))
-                .collect();
-
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-
             let costs = unsafe { compute_costs(&ordered_strides) };
-            let initial_offsets = vec![0isize; ordered_strides.len()];
+            let initial_offsets: strided_basic::OperandVec<isize> =
+                ordered_strides.iter().map(|_| 0isize).collect();
             let seed = chunk_seed(inputs);
             let operands = dst_ptrs.len() + input_ptrs.len();
             let run_partition = |dims: &[usize],
@@ -1215,40 +1397,52 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                                  strides_list: &[&[isize]],
                                  offsets: &[isize]|
              -> Result<()> {
-                let dst_ptrs: Vec<*mut T> = dst_send.iter().map(|ptr| ptr.as_ptr()).collect();
-                let input_ptrs: Vec<*const T> =
-                    input_send.iter().map(|ptr| ptr.as_const()).collect();
-                let mut regs = register_file(plan, seed);
                 let direct = direct_inputs(plan, seed, strides_list, dst_ptrs.len());
-                let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
-                    if seed.is_some()
-                        && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
-                    {
-                        // SAFETY: validated shapes/layouts and the derived block bound every access.
-                        unsafe {
-                            chunk::replay_chunked(
-                                &dst_ptrs,
-                                &input_ptrs,
-                                plan,
-                                offsets,
-                                len,
-                                strides,
-                                &direct,
-                                &mut regs,
-                            );
-                        }
-                        return Ok(());
-                    }
-                    // SAFETY: validated shapes/layouts and the derived block bound every access.
+                register_file(plan, seed, |regs| {
+                    let run_block =
+                        |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+                            if seed.is_some()
+                                && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
+                            {
+                                // SAFETY: validated shapes/layouts and the derived block bound every access.
+                                unsafe {
+                                    chunk::replay_chunked(
+                                        operand_ptrs(&dst_ptrs),
+                                        operand_const_ptrs(&input_ptrs),
+                                        plan,
+                                        offsets,
+                                        len,
+                                        strides,
+                                        &direct,
+                                        regs,
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            // SAFETY: validated shapes/layouts and the derived block bound every access.
+                            unsafe {
+                                interpret_inner_loop(
+                                    operand_ptrs(&dst_ptrs),
+                                    operand_const_ptrs(&input_ptrs),
+                                    plan,
+                                    offsets,
+                                    len,
+                                    strides,
+                                );
+                            }
+                            Ok(())
+                        };
+                    // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
                     unsafe {
-                        interpret_inner_loop(&dst_ptrs, &input_ptrs, plan, offsets, len, strides);
+                        for_each_inner_block_preordered(
+                            dims,
+                            blocks,
+                            strides_list,
+                            offsets,
+                            run_block,
+                        )
                     }
-                    Ok(())
-                };
-                // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-                unsafe {
-                    for_each_inner_block_preordered(dims, blocks, strides_list, offsets, run_block)
-                }
+                })
             };
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
             return unsafe {
@@ -1275,15 +1469,22 @@ fn interpret_fused_elementwise_into_serial<T: FusedScalar>(
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
 ) -> Result<()> {
-    let dims = dests[0].dims().to_vec();
     if dests[0].is_empty() {
         return Ok(());
     }
+    let dims: strided_basic::OperandVec<usize> = dests[0].dims().iter().copied().collect();
 
-    let dst_ptrs: Vec<*mut T> = dests.iter_mut().map(|dest| dest.as_mut_ptr()).collect();
-    let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
+    let dst_ptrs: strided_basic::OperandVec<OperandPtr<T>> = dests
+        .iter_mut()
+        .map(|dest| OperandPtr::new(dest.as_mut_ptr()))
+        .collect();
+    let input_ptrs: strided_basic::OperandVec<OperandPtr<T>> = inputs
+        .iter()
+        .map(|input| OperandPtr::new(input.ptr() as *mut T))
+        .collect();
 
-    let mut strides_list: Vec<&[isize]> = Vec::with_capacity(dests.len() + inputs.len());
+    let mut strides_list: strided_basic::OperandVec<&[isize]> =
+        strided_basic::OperandVec::with_capacity(dests.len() + inputs.len());
     for dest in dests.iter() {
         strides_list.push(dest.strides());
     }
@@ -1301,44 +1502,53 @@ fn interpret_fused_elementwise_into_serial<T: FusedScalar>(
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), elem_size) }
     };
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: strided_basic::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     let seed = chunk_seed(inputs);
     let operands = dst_ptrs.len() + input_ptrs.len();
-    let mut regs = register_file(plan, seed);
     let direct = direct_inputs(plan, seed, &ordered_strides, dst_ptrs.len());
-    let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
-        if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands) {
+    register_file(plan, seed, |regs| {
+        let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+            if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands) {
+                // SAFETY: validated shapes/layouts and the derived block bound every access.
+                unsafe {
+                    chunk::replay_chunked(
+                        operand_ptrs(&dst_ptrs),
+                        operand_const_ptrs(&input_ptrs),
+                        plan,
+                        offsets,
+                        len,
+                        strides,
+                        &direct,
+                        regs,
+                    );
+                }
+                return Ok(());
+            }
             // SAFETY: validated shapes/layouts and the derived block bound every access.
             unsafe {
-                chunk::replay_chunked(
-                    &dst_ptrs,
-                    &input_ptrs,
+                interpret_inner_loop(
+                    operand_ptrs(&dst_ptrs),
+                    operand_const_ptrs(&input_ptrs),
                     plan,
                     offsets,
                     len,
                     strides,
-                    &direct,
-                    &mut regs,
                 );
             }
-            return Ok(());
-        }
-        // SAFETY: validated shapes/layouts and the derived block bound every access.
+            Ok(())
+        };
+        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
         unsafe {
-            interpret_inner_loop(&dst_ptrs, &input_ptrs, plan, offsets, len, strides);
+            for_each_inner_block_preordered(
+                &fused_dims,
+                &kernel_plan.block,
+                &ordered_strides,
+                &initial_offsets,
+                run_block,
+            )
         }
-        Ok(())
-    };
-    // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-    unsafe {
-        for_each_inner_block_preordered(
-            &fused_dims,
-            &kernel_plan.block,
-            &ordered_strides,
-            &initial_offsets,
-            run_block,
-        )
-    }
+    })
 }
 
 pub(crate) fn fused_elementwise_into_serial<T: FusedScalar>(
@@ -1362,23 +1572,70 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
     len: usize,
     strides: &[isize],
 ) {
+    let register_count = plan.input_count + plan.ops.len();
+    if len == 0 || register_count == 0 {
+        return;
+    }
+    // SAFETY: a validated plan with instructions has at least one input, and
+    // the enclosing kernel proved every operand addresses a readable element.
+    let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
+    if register_count <= INLINE_REGS {
+        let mut inline = [init; INLINE_REGS];
+        // SAFETY: forwarded contract.
+        unsafe {
+            interpret_loop_body_uninit(
+                dst_ptrs,
+                input_ptrs,
+                plan,
+                offsets,
+                len,
+                strides,
+                &mut inline[..register_count],
+            )
+        };
+    } else {
+        let mut heap = vec![init; register_count];
+        // SAFETY: forwarded contract.
+        unsafe {
+            interpret_loop_body_uninit(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
+        };
+    }
+}
+
+/// Uninitialized-destination sibling of [`interpret_loop_body`].
+///
+/// # Safety
+/// As [`interpret_inner_loop_uninit`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
+    dst_ptrs: &[*mut MaybeUninit<T>],
+    input_ptrs: &[*const T],
+    plan: &FusedPlan,
+    offsets: &[isize],
+    len: usize,
+    strides: &[isize],
+    regs: &mut [T],
+) {
     let output_count = dst_ptrs.len();
-    let mut regs = Vec::with_capacity(plan.input_count + plan.ops.len());
     for i in 0..len {
         let i = i as isize;
-        regs.clear();
         for (input_index, &input_ptr) in input_ptrs.iter().enumerate() {
             let stride_index = output_count + input_index;
             let stride = inner_stride(strides, stride_index);
-            regs.push(*input_ptr.offset(offsets[stride_index] + i * stride));
+            // SAFETY: forwarded caller contract.
+            regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
-        for inst in &plan.ops {
-            regs.push(eval_op(inst.op, &regs, &inst.inputs));
+        for (instruction, inst) in plan.ops.iter().enumerate() {
+            let output = plan.input_count + instruction;
+            regs[output] = eval_op(inst.op, &regs[..output], &inst.inputs);
         }
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
-            *dst_ptr.offset(offsets[output_index] + i * stride) =
-                MaybeUninit::new(regs[plan.outputs[output_index]]);
+            // SAFETY: forwarded caller contract.
+            unsafe {
+                *dst_ptr.offset(offsets[output_index] + i * stride) =
+                    MaybeUninit::new(regs[plan.outputs[output_index]]);
+            }
         }
     }
 }
@@ -1447,11 +1704,17 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
     plan: &FusedPlan,
     _serial: bool,
 ) -> Result<()> {
-    let dims = dests[0].dims().to_vec();
-    let dst_ptrs: Vec<*mut MaybeUninit<T>> =
-        dests.iter_mut().map(|dest| dest.as_mut_ptr()).collect();
-    let input_ptrs: Vec<*const T> = inputs.iter().map(StridedView::ptr).collect();
-    let mut strides_list: Vec<&[isize]> = Vec::with_capacity(dests.len() + inputs.len());
+    let dims: strided_basic::OperandVec<usize> = dests[0].dims().iter().copied().collect();
+    let dst_ptrs: strided_basic::OperandVec<OperandPtr<MaybeUninit<T>>> = dests
+        .iter_mut()
+        .map(|dest| OperandPtr::new(dest.as_mut_ptr()))
+        .collect();
+    let input_ptrs: strided_basic::OperandVec<OperandPtr<T>> = inputs
+        .iter()
+        .map(|input| OperandPtr::new(input.ptr() as *mut T))
+        .collect();
+    let mut strides_list: strided_basic::OperandVec<&[isize]> =
+        strided_basic::OperandVec::with_capacity(dests.len() + inputs.len());
     for dest in dests.iter() {
         strides_list.push(dest.strides());
     }
@@ -1472,15 +1735,10 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         let total: usize = fused_dims.iter().product();
         let nthreads = strided_basic::execution::rayon_threads();
         if !_serial && total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send: Vec<SendPtr<MaybeUninit<T>>> =
-                dst_ptrs.iter().map(|&ptr| SendPtr(ptr)).collect();
-            let input_send: Vec<SendPtr<T>> = input_ptrs
-                .iter()
-                .map(|&ptr| SendPtr(ptr as *mut T))
-                .collect();
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
             let costs = unsafe { compute_costs(&ordered_strides) };
-            let initial_offsets = vec![0isize; ordered_strides.len()];
+            let initial_offsets: strided_basic::OperandVec<isize> =
+                ordered_strides.iter().map(|_| 0isize).collect();
             let seed = chunk_seed(inputs);
             let operands = dst_ptrs.len() + input_ptrs.len();
             let run_partition = |dims: &[usize],
@@ -1488,48 +1746,52 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                                  strides_list: &[&[isize]],
                                  offsets: &[isize]|
              -> Result<()> {
-                let dst_ptrs: Vec<*mut MaybeUninit<T>> =
-                    dst_send.iter().map(|ptr| ptr.as_ptr()).collect();
-                let input_ptrs: Vec<*const T> =
-                    input_send.iter().map(|ptr| ptr.as_const()).collect();
-                let mut regs = register_file(plan, seed);
                 let direct = direct_inputs(plan, seed, strides_list, dst_ptrs.len());
-                let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
-                    if seed.is_some()
-                        && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
-                    {
-                        // SAFETY: validated shapes/layouts and the derived block bound every access.
-                        unsafe {
-                            chunk::replay_chunked_uninit(
-                                &dst_ptrs,
-                                &input_ptrs,
-                                plan,
-                                offsets,
-                                len,
-                                strides,
-                                &direct,
-                                &mut regs,
-                            );
-                        }
-                        return Ok(());
-                    }
-                    // SAFETY: validated shapes/layouts and the derived block bound every access.
+                register_file(plan, seed, |regs| {
+                    let run_block =
+                        |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+                            if seed.is_some()
+                                && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
+                            {
+                                // SAFETY: validated shapes/layouts and the derived block bound every access.
+                                unsafe {
+                                    chunk::replay_chunked_uninit(
+                                        operand_ptrs(&dst_ptrs),
+                                        operand_const_ptrs(&input_ptrs),
+                                        plan,
+                                        offsets,
+                                        len,
+                                        strides,
+                                        &direct,
+                                        regs,
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            // SAFETY: validated shapes/layouts and the derived block bound every access.
+                            unsafe {
+                                interpret_inner_loop_uninit(
+                                    operand_ptrs(&dst_ptrs),
+                                    operand_const_ptrs(&input_ptrs),
+                                    plan,
+                                    offsets,
+                                    len,
+                                    strides,
+                                );
+                            }
+                            Ok(())
+                        };
+                    // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
                     unsafe {
-                        interpret_inner_loop_uninit(
-                            &dst_ptrs,
-                            &input_ptrs,
-                            plan,
+                        for_each_inner_block_preordered(
+                            dims,
+                            blocks,
+                            strides_list,
                             offsets,
-                            len,
-                            strides,
-                        );
+                            run_block,
+                        )
                     }
-                    Ok(())
-                };
-                // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-                unsafe {
-                    for_each_inner_block_preordered(dims, blocks, strides_list, offsets, run_block)
-                }
+                })
             };
             // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
             return unsafe {
@@ -1548,44 +1810,53 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         }
     }
 
-    let initial_offsets = vec![0isize; ordered_strides.len()];
+    let initial_offsets: strided_basic::OperandVec<isize> =
+        ordered_strides.iter().map(|_| 0isize).collect();
     let seed = chunk_seed(inputs);
     let operands = dst_ptrs.len() + input_ptrs.len();
-    let mut regs = register_file(plan, seed);
     let direct = direct_inputs(plan, seed, &ordered_strides, dst_ptrs.len());
-    let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
-        if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands) {
+    register_file(plan, seed, |regs| {
+        let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
+            if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands) {
+                // SAFETY: validated shapes/layouts and the derived block bound every access.
+                unsafe {
+                    chunk::replay_chunked_uninit(
+                        operand_ptrs(&dst_ptrs),
+                        operand_const_ptrs(&input_ptrs),
+                        plan,
+                        offsets,
+                        len,
+                        strides,
+                        &direct,
+                        regs,
+                    );
+                }
+                return Ok(());
+            }
             // SAFETY: validated shapes/layouts and the derived block bound every access.
             unsafe {
-                chunk::replay_chunked_uninit(
-                    &dst_ptrs,
-                    &input_ptrs,
+                interpret_inner_loop_uninit(
+                    operand_ptrs(&dst_ptrs),
+                    operand_const_ptrs(&input_ptrs),
                     plan,
                     offsets,
                     len,
                     strides,
-                    &direct,
-                    &mut regs,
                 );
             }
-            return Ok(());
-        }
-        // SAFETY: validated shapes/layouts and the derived block bound every access.
+            Ok(())
+        };
+        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
         unsafe {
-            interpret_inner_loop_uninit(&dst_ptrs, &input_ptrs, plan, offsets, len, strides);
+            for_each_inner_block_preordered(
+                &fused_dims,
+                &kernel_plan.block,
+                &ordered_strides,
+                &initial_offsets,
+                run_block,
+            )
         }
-        Ok(())
-    };
-    // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
-    unsafe {
-        for_each_inner_block_preordered(
-            &fused_dims,
-            &kernel_plan.block,
-            &ordered_strides,
-            &initial_offsets,
-            run_block,
-        )
-    }
+    })
 }
 
 /// Evaluate a runtime-DAG elementwise plan into one or more destinations.

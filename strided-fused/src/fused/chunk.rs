@@ -59,10 +59,12 @@ pub(super) fn block_replay_eligible(
 /// A destination may itself name an input register (an identity pass-through
 /// output), and the store step reads it after the instructions have run, so a
 /// register the plan outputs must stay in the file.
-pub(super) fn single_use_inputs(plan: &FusedPlan) -> Vec<bool> {
-    let mut reads = vec![0usize; plan.input_count];
+pub(super) fn single_use_inputs(plan: &FusedPlan) -> strided_basic::OperandVec<bool> {
+    let mut reads: strided_basic::OperandVec<usize> =
+        strided_basic::OperandVec::with_capacity(plan.input_count);
+    reads.resize(plan.input_count, 0);
     for inst in &plan.ops {
-        for &input in &inst.inputs {
+        for &input in inst.inputs.iter() {
             if input < plan.input_count {
                 reads[input] += 1;
             }
@@ -83,9 +85,38 @@ pub(super) fn is_real_chunk_scalar<T: 'static>() -> bool {
 
 /// Register file seeded with `seed`. Every chunk overwrites the registers it
 /// reads before reading them (SSA order), so the seed is never observed.
-#[inline]
-pub(super) fn new_register_file<T: FusedScalar>(plan: &FusedPlan, seed: T) -> Vec<T> {
-    vec![seed; register_file_len(plan)]
+///
+/// The file is kept in a per-thread buffer and grown once, so a steady-state
+/// chunked replay allocates nothing (#306 item 6). A `None` seed declines the
+/// chunked path and hands the callback an empty file.
+pub(super) fn with_register_file<T: FusedScalar, R>(
+    plan: &FusedPlan,
+    seed: Option<T>,
+    f: impl FnOnce(&mut [T]) -> R,
+) -> R {
+    use std::cell::RefCell;
+    let Some(seed) = seed else {
+        return f(&mut []);
+    };
+    debug_assert!(size_of::<T>() <= size_of::<u128>());
+    thread_local! {
+        static SCRATCH: RefCell<Vec<MaybeUninit<u128>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|cell| {
+        let mut buffer = cell.borrow_mut();
+        let len = register_file_len(plan);
+        let words = (len * size_of::<T>()).div_ceil(size_of::<u128>());
+        if buffer.len() < words {
+            buffer.resize(words, MaybeUninit::uninit());
+        }
+        // SAFETY: the `u128` buffer is aligned for `T` (the chunk path only
+        // reaches f32/f64), and `seed` initializes every `len` slot before the
+        // callback observes the slice.
+        let regs = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<T>(), len) };
+        regs.fill(seed);
+        f(regs)
+    })
 }
 
 /// Replay one eligible block into initialized destinations.

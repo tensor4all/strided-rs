@@ -247,17 +247,19 @@ fn bench_fused(context: ExecContext) {
         KernelDType::F64,
         FusedPlan {
             input_count: 2,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 0],
+                    inputs: vec![2, 0].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();

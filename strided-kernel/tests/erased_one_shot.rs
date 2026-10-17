@@ -9,11 +9,13 @@ use strided_kernel::{
 fn single_op_plan(input_count: usize, op: FusedOp) -> FusedPlan {
     FusedPlan {
         input_count,
-        outputs: vec![input_count],
+        outputs: vec![input_count].into_iter().collect(),
         ops: vec![FusedInst {
             op,
             inputs: (0..input_count).collect(),
-        }],
+        }]
+        .into_iter()
+        .collect(),
     }
 }
 

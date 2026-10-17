@@ -9,22 +9,26 @@ use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 fn binary_plan(op: FusedOp) -> FusedPlan {
     FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     }
 }
 
 fn unary_plan(op: FusedOp) -> FusedPlan {
     FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     }
 }
 
@@ -63,11 +67,13 @@ fn erased_fused_plan_executes_f32_ternary_clamp_with_ambient_context() {
         KernelDType::F32,
         FusedPlan {
             input_count: 3,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Clamp,
-                inputs: vec![0, 1, 2],
-            }],
+                inputs: vec![0, 1, 2].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -136,21 +142,23 @@ fn erased_fused_plan_executes_f64_four_input_dag() {
         KernelDType::F64,
         FusedPlan {
             input_count: 4,
-            outputs: vec![6],
+            outputs: vec![6].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 3],
+                    inputs: vec![2, 3].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![4, 5],
+                    inputs: vec![4, 5].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -182,37 +190,39 @@ fn erased_fused_plan_executes_i32_safe_integer_dag() {
         KernelDType::I32,
         FusedPlan {
             input_count: 4,
-            outputs: vec![10],
+            outputs: vec![10].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![4, 0],
+                    inputs: vec![4, 0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Negate,
-                    inputs: vec![5],
+                    inputs: vec![5].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Abs,
-                    inputs: vec![6],
+                    inputs: vec![6].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Maximum,
-                    inputs: vec![7, 2],
+                    inputs: vec![7, 2].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Minimum,
-                    inputs: vec![8, 3],
+                    inputs: vec![8, 3].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Clamp,
-                    inputs: vec![9, 2, 3],
+                    inputs: vec![9, 2, 3].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -364,7 +374,7 @@ fn erased_fused_plan_exposes_dtype_and_plan() {
 
     assert_eq!(plan.dtype(), KernelDType::F64);
     assert_eq!(plan.plan().input_count, 2);
-    assert_eq!(plan.plan().outputs, [2]);
+    assert_eq!(plan.plan().outputs.as_slice(), &[2]);
 }
 
 #[test]
@@ -394,8 +404,8 @@ fn erased_fused_plan_rejects_unsupported_ops_by_dtype() {
 fn erased_fused_plan_rejects_unsupported_arity() {
     let too_many_inputs = FusedPlan {
         input_count: 5,
-        outputs: vec![0],
-        ops: vec![],
+        outputs: vec![0].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
     let unsupported_arity =
         ErasedFusedPlan::compile(KernelDType::F64, too_many_inputs).unwrap_err();
@@ -406,8 +416,8 @@ fn erased_fused_plan_rejects_unsupported_arity() {
 
     let zero_inputs = FusedPlan {
         input_count: 0,
-        outputs: vec![0],
-        ops: vec![],
+        outputs: vec![0].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
     let unsupported_arity = ErasedFusedPlan::compile(KernelDType::F64, zero_inputs).unwrap_err();
     assert!(matches!(
@@ -421,27 +431,29 @@ fn erased_fused_plan_rejects_invalid_output_contracts() {
     // Repeated output ids are allowed: each name writes the same value.
     let repeated = FusedPlan {
         input_count: 2,
-        outputs: vec![2, 2],
+        outputs: vec![2, 2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
     let compiled = ErasedFusedPlan::compile(KernelDType::F64, repeated).unwrap();
-    assert_eq!(compiled.plan().outputs, [2, 2]);
+    assert_eq!(compiled.plan().outputs.as_slice(), &[2, 2]);
 
     let zero_outputs = FusedPlan {
         input_count: 2,
-        outputs: vec![],
-        ops: vec![],
+        outputs: vec![].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
     let err = ErasedFusedPlan::compile(KernelDType::F64, zero_outputs).unwrap_err();
     assert!(matches!(err, StridedError::RankMismatch(0, 1)));
 
     let invalid_output = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
-        ops: vec![],
+        outputs: vec![3].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
     let err = ErasedFusedPlan::compile(KernelDType::F64, invalid_output).unwrap_err();
     assert!(matches!(
@@ -462,17 +474,19 @@ fn erased_fused_plan_executes_multiple_outputs_with_pass_through_and_intermediat
             input_count: 1,
             // First output is the input pass-through, second is a value computed
             // from the intermediate, third is the intermediate itself.
-            outputs: vec![0, 2, 1],
+            outputs: vec![0, 2, 1].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![0, 0],
+                    inputs: vec![0, 0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Negate,
-                    inputs: vec![1],
+                    inputs: vec![1].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -503,17 +517,19 @@ fn erased_fused_plan_executes_multiple_uninit_outputs_for_f32() {
         KernelDType::F32,
         FusedPlan {
             input_count: 1,
-            outputs: vec![1, 2, 0],
+            outputs: vec![1, 2, 0].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Negate,
-                    inputs: vec![0],
+                    inputs: vec![0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Abs,
-                    inputs: vec![1],
+                    inputs: vec![1].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -553,17 +569,19 @@ fn erased_fused_plan_executes_multiple_outputs_for_integer_dtype() {
         KernelDType::I32,
         FusedPlan {
             input_count: 2,
-            outputs: vec![2, 3],
+            outputs: vec![2, 3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 0],
+                    inputs: vec![2, 0].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -594,11 +612,13 @@ fn erased_fused_plan_executes_rank_zero_multiple_outputs() {
         KernelDType::F64,
         FusedPlan {
             input_count: 1,
-            outputs: vec![0, 1],
+            outputs: vec![0, 1].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![0],
-            }],
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -626,17 +646,19 @@ fn erased_fused_plan_executes_rank_zero_uninit_multiple_outputs() {
         KernelDType::F64,
         FusedPlan {
             input_count: 1,
-            outputs: vec![0, 1, 2],
+            outputs: vec![0, 1, 2].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Negate,
-                    inputs: vec![0],
+                    inputs: vec![0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Negate,
-                    inputs: vec![1],
+                    inputs: vec![1].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -672,11 +694,13 @@ fn erased_fused_plan_writes_a_repeated_output_id_to_every_destination() {
         KernelDType::F64,
         FusedPlan {
             input_count: 1,
-            outputs: vec![0, 0, 1],
+            outputs: vec![0, 0, 1].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![0],
-            }],
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -707,11 +731,13 @@ fn erased_fused_plan_rejects_destination_count_mismatch() {
         KernelDType::F64,
         FusedPlan {
             input_count: 1,
-            outputs: vec![0, 1],
+            outputs: vec![0, 1].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![0],
-            }],
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -735,11 +761,13 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
         KernelDType::F64,
         FusedPlan {
             input_count: 1,
-            outputs: vec![0, 1],
+            outputs: vec![0, 1].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![0],
-            }],
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();

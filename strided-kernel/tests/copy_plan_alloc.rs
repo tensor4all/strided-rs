@@ -373,31 +373,35 @@ fn execute_is_allocation_free_up_to_rank_limit() {
 
     let add_mul = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 0],
+                inputs: vec![2, 0].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let fallback = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Exp,
-                inputs: vec![2],
+                inputs: vec![2].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     for ctx in [ExecContext::serial(), ExecContext::max_threads(4).unwrap()] {
         assert_fused_uninit_allocation_parity(&ctx, add_mul.clone());
@@ -1015,11 +1019,13 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         KernelDType::F64,
         FusedPlan {
             input_count: 2,
-            outputs: vec![2],
+            outputs: vec![2].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
-            }],
+                inputs: vec![0, 1].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();

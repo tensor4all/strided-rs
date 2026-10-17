@@ -10,11 +10,13 @@ use strided_kernel::{
 fn add_plan() -> FusedPlan {
     FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     }
 }
 

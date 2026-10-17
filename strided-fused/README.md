@@ -9,11 +9,11 @@ use strided_basic::StridedArray;
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan};
 let input = StridedArray::<f64>::from_parts(vec![2.0, 3.0], &[2], &[1], 0).unwrap();
 let mut output = StridedArray::<f64>::col_major(&[2]);
-let plan = FusedPlan {
-    input_count: 1,
-    outputs: vec![1],
-    ops: vec![FusedInst { op: FusedOp::Negate, inputs: vec![0] }],
-};
+let plan = FusedPlan::new(
+    1,
+    vec![1],
+    vec![FusedInst::new(FusedOp::Negate, vec![0])],
+);
 fused_elementwise_into(&mut [output.view_mut()], &[input.view()], &plan).unwrap();
 assert_eq!(output.get(&[1]), -3.0);
 ```

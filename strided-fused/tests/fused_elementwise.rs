@@ -13,8 +13,8 @@ fn fused_rejects_input_count_mismatch() {
     let mut out = StridedArray::<f64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![0],
-        ops: vec![],
+        outputs: vec![0].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
 
     let err =
@@ -31,8 +31,8 @@ fn fused_rejects_destination_count_mismatch() {
     let mut out = StridedArray::<f64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![0, 0],
-        ops: vec![],
+        outputs: vec![0, 0].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
 
     let err =
@@ -49,11 +49,13 @@ fn fused_rejects_bad_value_id_before_writing() {
     let mut out = StridedArray::<f64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Negate,
-            inputs: vec![2],
-        }],
+            inputs: vec![2].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let err =
@@ -73,11 +75,13 @@ fn fused_rejects_wrong_op_arity_before_writing() {
     let mut out = StridedArray::<f64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let err =
@@ -95,11 +99,13 @@ fn fused_rejects_shape_mismatch_before_writing() {
     let mut out = StridedArray::<f64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan)
@@ -116,11 +122,13 @@ fn fused_rejects_stride_zero_destination_before_writing() {
     let mut out = StridedArray::<f64>::from_parts(vec![0.0], &[4], &[0], 0).unwrap();
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Negate,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let err =
@@ -137,11 +145,13 @@ fn fused_rejects_overlapping_destination_offsets_before_writing() {
         StridedArray::<f64>::from_parts(vec![0.0, 0.0, 0.0], &[2, 2], &[1, 1], 0).unwrap();
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Negate,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let err =
@@ -158,17 +168,19 @@ fn fused_interprets_reused_dag_value() {
     let mut out = StridedArray::<f64>::col_major(&[4]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 0],
+                inputs: vec![2, 0].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
@@ -190,17 +202,19 @@ fn fused_interprets_multiple_outputs() {
     let mut product = StridedArray::<f64>::col_major(&[4]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2, 3],
+        outputs: vec![2, 3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(
@@ -230,21 +244,23 @@ fn fused_interprets_broadcast_stride_zero_inputs() {
     let mut out = StridedArray::<f64>::col_major(&[4]);
     let plan = FusedPlan {
         input_count: 3,
-        outputs: vec![5],
+        outputs: vec![5].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![3, 2],
+                inputs: vec![3, 2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Exp,
-                inputs: vec![4],
+                inputs: vec![4].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(
@@ -275,11 +291,13 @@ fn fused_interprets_noncontiguous_inputs_and_outputs() {
     let out = out_base.view_mut().permute(&[1, 0]).unwrap();
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out], &[a.clone(), b.clone()], &plan).unwrap();
@@ -304,17 +322,19 @@ fn fused_real_maximum_minimum_match_nan_contract() {
     let mut min_out = StridedArray::<f64>::col_major(&[3]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2, 3],
+        outputs: vec![2, 3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Maximum,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Minimum,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(
@@ -340,11 +360,13 @@ fn fused_real_clamp_does_not_panic_on_unordered_or_nan_bounds() {
     let mut out = StridedArray::<f64>::col_major(&[3]);
     let plan = FusedPlan {
         input_count: 3,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Clamp,
-            inputs: vec![0, 1, 2],
-        }],
+            inputs: vec![0, 1, 2].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -369,11 +391,13 @@ fn fused_integer_add_uses_wrapping_arithmetic() {
     let mut out = StridedArray::<i32>::col_major(&[3]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
@@ -388,11 +412,13 @@ fn fused_bool_arithmetic_is_rejected_before_writing() {
     let mut out = StridedArray::<bool>::from_parts(vec![true, true], &[2], &[1], 0).unwrap();
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan)
@@ -427,11 +453,13 @@ fn fused_complex_divide_matches_native_complex_division() {
     let mut out = StridedArray::<Complex64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Divide,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
@@ -455,11 +483,13 @@ fn fused_complex_abs_returns_norm_in_real_component() {
     let mut out = StridedArray::<Complex64>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Abs,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).unwrap();
@@ -489,17 +519,19 @@ fn fused_complex32_add_multiply_matches_native_complex_arithmetic() {
     let mut out = StridedArray::<Complex32>::col_major(&[2]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 0],
+                inputs: vec![2, 0].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
@@ -526,49 +558,51 @@ fn fused_all_real_ops_have_basic_parity() {
         ops: vec![
             FusedInst {
                 op: FusedOp::Divide,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Clamp,
-                inputs: vec![0, 2, 3],
+                inputs: vec![0, 2, 3].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Log,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Sin,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Cos,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Tanh,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Sqrt,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Rsqrt,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Pow,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Expm1,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Log1p,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     {
@@ -612,11 +646,13 @@ fn fused_specialized_binary_plan_handles_broadcast_inputs() {
     let mut out = StridedArray::<f64>::col_major(&[4]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b_broadcast], &plan).unwrap();

@@ -210,84 +210,92 @@ fn replay_all_static_families(ctx: crate::ExecContext, mut collect: impl FnMut(&
     run(
         FusedPlan {
             input_count: 2,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 0],
+                    inputs: vec![2, 0].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
         &[a.clone(), b.clone()],
     );
     run(
         FusedPlan {
             input_count: 2,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![0, 2],
+                    inputs: vec![0, 2].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
         &[a.clone(), b.clone()],
     );
     run(
         FusedPlan {
             input_count: 3,
-            outputs: vec![5],
+            outputs: vec![5].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![3, 2],
+                    inputs: vec![3, 2].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Exp,
-                    inputs: vec![4],
+                    inputs: vec![4].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
         &[a.clone(), b.clone(), c.clone()],
     );
     run(
         FusedPlan {
             input_count: 4,
-            outputs: vec![8],
+            outputs: vec![8].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Divide,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Maximum,
-                    inputs: vec![4, 2],
+                    inputs: vec![4, 2].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Minimum,
-                    inputs: vec![5, 3],
+                    inputs: vec![5, 3].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Sqrt,
-                    inputs: vec![6],
+                    inputs: vec![6].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Rsqrt,
-                    inputs: vec![7],
+                    inputs: vec![7].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
         &[a, b, c, d],
     );
@@ -338,11 +346,13 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
     let inputs = [lhs, rhs];
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
     let four = NonZeroUsize::new(4).unwrap();
 
@@ -379,8 +389,8 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
 fn single_op(input_count: usize, op: FusedOp, inputs: Vec<usize>) -> FusedPlan {
     FusedPlan {
         input_count,
-        outputs: vec![input_count],
-        ops: vec![FusedInst { op, inputs }],
+        outputs: vec![input_count].into_iter().collect(),
+        ops: vec![FusedInst::new(op, inputs)].into_iter().collect(),
     }
 }
 
@@ -389,11 +399,13 @@ fn specializes_unary_exp() {
     let a = input(&[1.0, 2.0, 3.0]);
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Exp,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     assert_static_matches_interpreter(plan, &[a]);
@@ -405,11 +417,13 @@ fn specializes_binary_add() {
     let b = input(&[10.0, 20.0, 30.0]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     assert_static_matches_interpreter(plan, &[a, b]);
@@ -422,11 +436,13 @@ fn specializes_ternary_clamp() {
     let hi = input(&[2.5, 2.5, 2.5]);
     let plan = FusedPlan {
         input_count: 3,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Clamp,
-            inputs: vec![0, 1, 2],
-        }],
+            inputs: vec![0, 1, 2].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     assert_static_matches_interpreter(plan, &[x, lo, hi]);
@@ -438,17 +454,19 @@ fn specializes_add_then_multiply_reusing_input() {
     let b = input(&[10.0, 20.0, 30.0]);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 0],
+                inputs: vec![2, 0].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     assert_static_matches_interpreter(plan, &[a, b]);
@@ -461,21 +479,23 @@ fn specializes_exp_of_multiply_add_chain() {
     let c = input(&[2.0, 2.0, 2.0]);
     let plan = FusedPlan {
         input_count: 3,
-        outputs: vec![5],
+        outputs: vec![5].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![3, 2],
+                inputs: vec![3, 2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Exp,
-                inputs: vec![4],
+                inputs: vec![4].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     // The one analytic instruction is worth one ULP of its own output
@@ -491,29 +511,31 @@ fn specializes_divide_clamp_sqrt_rsqrt_chain() {
     let hi = input(&[8.0, 8.0, 8.0]);
     let plan = FusedPlan {
         input_count: 4,
-        outputs: vec![8],
+        outputs: vec![8].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Divide,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Maximum,
-                inputs: vec![4, 2],
+                inputs: vec![4, 2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Minimum,
-                inputs: vec![5, 3],
+                inputs: vec![5, 3].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Sqrt,
-                inputs: vec![6],
+                inputs: vec![6].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Rsqrt,
-                inputs: vec![7],
+                inputs: vec![7].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     assert_static_matches_interpreter(plan, &[a, b, lo, hi]);
@@ -601,11 +623,13 @@ fn validate_plan_rejects_out_of_range_output() {
     // output id refers to a value that no instruction produces.
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![5],
+        outputs: vec![5].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Exp,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
     assert!(validate_plan(&plan, 1, 1).is_err());
 }
@@ -630,8 +654,8 @@ fn uninitialized_serial_replay_accepts_an_empty_destination() {
 fn validate_plan_rejects_zero_outputs() {
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![],
-        ops: vec![],
+        outputs: vec![].into_iter().collect(),
+        ops: vec![].into_iter().collect(),
     };
     assert!(validate_plan(&plan, 1, 0).is_err());
 }
@@ -776,17 +800,19 @@ fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
     let b: Vec<BroadcastTracked> = (0..len).map(|i| BroadcastTracked(i as u64)).collect();
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![2, 1],
+                inputs: vec![2, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let pool = rayon::ThreadPoolBuilder::new()
