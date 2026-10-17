@@ -943,6 +943,26 @@ impl ErasedUpdatePlan {
     ///
     /// `alpha`, `beta`, and `op` are resolved once per call; the layout check
     /// and replay are the same allocation-free [`UpdatePlan`] path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_basic::{
+    ///     ErasedRawStridedMut, ErasedRawStridedRef, ErasedUpdatePlan, ExecContext, KernelDType,
+    ///     UpdateOp,
+    /// };
+    ///
+    /// let plan = ErasedUpdatePlan::compile(KernelDType::F64, &[2], &[1], &[1]).unwrap();
+    /// let src_data = [1.0_f64, 2.0];
+    /// let mut dst_data = [10.0_f64, 20.0];
+    /// let src = ErasedRawStridedRef::from_slice(&src_data, &[2], &[1], 0).unwrap();
+    /// let mut dst = ErasedRawStridedMut::from_slice_mut(&mut dst_data, &[2], &[1], 0).unwrap();
+    /// // dst = 2 * src + 3 * dst
+    /// plan.execute(&ExecContext::serial(), &mut dst, &src, 2.0, 3.0, UpdateOp::Identity)
+    ///     .unwrap();
+    /// drop(dst);
+    /// assert_eq!(dst_data, [32.0, 64.0]);
+    /// ```
     pub fn execute<T>(
         &self,
         ctx: &ExecContext,
