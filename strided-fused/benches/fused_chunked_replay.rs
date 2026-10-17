@@ -55,21 +55,23 @@ impl Row {
         match self {
             Self::Tanh => FusedPlan {
                 input_count: 1,
-                outputs: vec![10],
+                outputs: vec![10].into_iter().collect(),
                 ops: (0..10)
                     .map(|index| FusedInst {
                         op: FusedOp::Tanh,
-                        inputs: vec![index],
+                        inputs: vec![index].into_iter().collect(),
                     })
                     .collect(),
             },
             Self::Mul | Self::BroadcastMul => FusedPlan {
                 input_count: 2,
-                outputs: vec![11],
+                outputs: vec![11].into_iter().collect(),
                 ops: (0..10)
                     .map(|index| FusedInst {
                         op: FusedOp::Multiply,
-                        inputs: vec![if index == 0 { 0 } else { 1 + index }, 1],
+                        inputs: vec![if index == 0 { 0 } else { 1 + index }, 1]
+                            .into_iter()
+                            .collect(),
                     })
                     .collect(),
             },
@@ -77,17 +79,19 @@ impl Row {
                 let mut ops: Vec<FusedInst> = (0..10)
                     .map(|index| FusedInst {
                         op: FusedOp::Multiply,
-                        inputs: vec![if index == 0 { 0 } else { 1 + index }, 1],
+                        inputs: vec![if index == 0 { 0 } else { 1 + index }, 1]
+                            .into_iter()
+                            .collect(),
                     })
                     .collect();
                 ops.push(FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![11, 0],
+                    inputs: vec![11, 0].into_iter().collect(),
                 });
                 FusedPlan {
                     input_count: 2,
-                    outputs: vec![11, 12],
-                    ops,
+                    outputs: vec![11, 12].into_iter().collect(),
+                    ops: ops.into_iter().collect(),
                 }
             }
         }

@@ -104,10 +104,10 @@ pub struct ErasedArgReducePlan {
     dtype: KernelDType,
     index_dtype: KernelDType,
     op: ArgReduceOp,
-    src_dims: Vec<usize>,
-    src_strides: Vec<isize>,
-    dest_dims: Vec<usize>,
-    dest_strides: Vec<isize>,
+    src_dims: crate::inline::InlineVec<usize>,
+    src_strides: crate::inline::InlineVec<isize>,
+    dest_dims: crate::inline::InlineVec<usize>,
+    dest_strides: crate::inline::InlineVec<isize>,
     layout: LineLayout,
 }
 
@@ -171,12 +171,15 @@ impl ErasedArgReducePlan {
         if axis >= rank {
             return Err(StridedError::InvalidAxis { axis, rank });
         }
-        let expected: Vec<usize> = (0..rank)
+        let expected: crate::inline::InlineVec<usize> = (0..rank)
             .filter(|&a| a != axis)
             .map(|a| src_dims[a])
             .collect();
         if dest_dims != expected.as_slice() {
-            return Err(StridedError::ShapeMismatch(dest_dims.to_vec(), expected));
+            return Err(StridedError::ShapeMismatch(
+                dest_dims.to_vec(),
+                expected.to_vec(),
+            ));
         }
         if src_dims[axis] == 0 {
             return Err(StridedError::UnsupportedOp {
@@ -198,10 +201,10 @@ impl ErasedArgReducePlan {
             dtype,
             index_dtype,
             op,
-            src_dims: src_dims.to_vec(),
-            src_strides: src_strides.to_vec(),
-            dest_dims: dest_dims.to_vec(),
-            dest_strides: dest_strides.to_vec(),
+            src_dims: src_dims.into(),
+            src_strides: src_strides.into(),
+            dest_dims: dest_dims.into(),
+            dest_strides: dest_strides.into(),
             layout,
         })
     }

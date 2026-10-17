@@ -49,7 +49,7 @@ fn test_compute_blocks_small() {
     );
 
     // Should use full dimensions since it fits
-    assert_eq!(blocks, vec![10, 10]);
+    assert_eq!(blocks.as_slice(), vec![10, 10]);
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn test_compute_blocks_min_stride_larger_than_blocksize() {
     );
 
     // With minimum stride > blocksize, should return all 1s
-    assert_eq!(blocks, vec![1, 1]);
+    assert_eq!(blocks.as_slice(), vec![1, 1]);
 }
 
 #[test]

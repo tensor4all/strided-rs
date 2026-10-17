@@ -8,15 +8,13 @@
 use core::{mem::MaybeUninit, ops::Add};
 
 use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
+use crate::inline::InlineVec;
 use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
 use crate::{
     MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
 };
 
-#[cfg(feature = "parallel")]
-type AxisVec<T> = smallvec::SmallVec<[T; RAW_FUSED_RANK_LIMIT]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+type AxisVec<T> = InlineVec<T>;
 
 /// Gather configuration shared by generic and erased replay.
 ///
@@ -71,7 +69,7 @@ pub struct GatherPlan {
     total: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct GatherReplayAxis {
     dest_step: isize,
     dest_reset: isize,
@@ -95,7 +93,7 @@ struct GatherReplayState {
     index_batch_offset: isize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct WindowReplayAxis {
     source_step: isize,
     source_reset: isize,
@@ -599,6 +597,12 @@ impl GatherPlan {
             index_component_offsets.push(checked_offset_add(0, vector_stride, component)?);
         }
 
+        let index_operand_strides: AxisVec<isize> = spec
+            .start_index_map
+            .iter()
+            .map(|&axis| operand_strides[axis])
+            .collect();
+
         Ok(Self {
             operand_dims: operand_dims.into(),
             operand_strides: operand_strides.into(),
@@ -606,15 +610,11 @@ impl GatherPlan {
             index_strides: index_strides.into(),
             dest_dims: dest_dims.into(),
             dest_strides: dest_strides.into(),
-            spec: spec.clone(),
+            spec,
             replay: GatherReplay {
                 axes: replay_axes,
                 index_component_offsets,
-                index_operand_strides: spec
-                    .start_index_map
-                    .iter()
-                    .map(|&axis| operand_strides[axis])
-                    .collect(),
+                index_operand_strides,
             },
             total,
         })
@@ -2055,7 +2055,10 @@ impl ScatterPlan {
 }
 
 fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
-    let mut seen = vec![false; rank];
+    // Inline boolean metadata: rank <= INLINE_RANK validation allocates
+    // nothing, and it spills above the inline bound.
+    let mut seen: InlineVec<bool> = InlineVec::new();
+    seen.resize(rank, false);
     for &axis in axes {
         if axis >= rank {
             return Err(StridedError::InvalidAxis { axis, rank });

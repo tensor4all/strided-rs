@@ -43,6 +43,12 @@ jobs:
       - name: Run parallel feature tests
         run: cargo test --profile ci -p strided-basic -p strided-kernel -p strided-fused --features parallel
 
+      - name: Overhead smoke gates (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          OVERHEAD_GATE=1 cargo bench --profile release -p strided-basic --bench overhead_smoke
+          OVERHEAD_GATE=1 cargo bench --profile release -p strided-fused --bench overhead_smoke
+
       - name: Report Cargo artifact usage
         if: always()
         run: |

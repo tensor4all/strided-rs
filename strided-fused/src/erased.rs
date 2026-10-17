@@ -95,14 +95,11 @@ impl ErasedFusedPlan {
     ///
     /// let plan = ErasedFusedPlan::compile(
     ///     KernelDType::F64,
-    ///     FusedPlan {
-    ///         input_count: 1,
-    ///         outputs: vec![0, 1],
-    ///         ops: vec![FusedInst {
-    ///             op: FusedOp::Negate,
-    ///             inputs: vec![0],
-    ///         }],
-    ///     },
+    ///     FusedPlan::new(
+    ///         1,
+    ///         vec![0, 1],
+    ///         vec![FusedInst::new(FusedOp::Negate, vec![0])],
+    ///     ),
     /// )
     /// .unwrap();
     /// let input = [1.0_f64, -2.0];
@@ -217,14 +214,11 @@ impl ErasedFusedPlan {
     ///
     /// let plan = ErasedFusedPlan::compile(
     ///     KernelDType::F32,
-    ///     FusedPlan {
-    ///         input_count: 1,
-    ///         outputs: vec![0, 1],
-    ///         ops: vec![FusedInst {
-    ///             op: FusedOp::Negate,
-    ///             inputs: vec![0],
-    ///         }],
-    ///     },
+    ///     FusedPlan::new(
+    ///         1,
+    ///         vec![0, 1],
+    ///         vec![FusedInst::new(FusedOp::Negate, vec![0])],
+    ///     ),
     /// )
     /// .unwrap();
     /// let input = [1.0_f32, -2.0];
@@ -289,21 +283,11 @@ impl ErasedFusedPlan {
                 validate_uninit_no_overlap(dest, input, index)?;
             }
         }
-        // A single destination validates its layout into a stack token so the
-        // hot single-output replay stays allocation-free, matching the typed
-        // kernel it may dispatch to.
-        if dests.len() == 1 {
-            let validated = [validate_destination_layout_without_alloc(
-                dests[0].dims(),
-                dests[0].strides(),
-            )?];
-            if ctx.is_serial() {
-                return self.dispatch_uninit(ctx, dests, inputs, &validated);
-            }
-            return ctx.run(|| self.dispatch_uninit(ctx, dests, inputs, &validated));
-        }
-
-        let mut validated = Vec::with_capacity(dests.len());
+        // Store the validation tokens inline: the destination-count bound is
+        // the five-stream operand bound, so two outputs plus one input allocate
+        // nothing. Above the bound the vector spills by contract.
+        let mut validated: strided_basic::OperandVec<ValidatedDestinationLayout> =
+            strided_basic::OperandVec::with_capacity(dests.len());
         for dest in dests.iter() {
             validated.push(validate_destination_layout_without_alloc(
                 dest.dims(),
@@ -311,9 +295,9 @@ impl ErasedFusedPlan {
             )?);
         }
         if ctx.is_serial() {
-            self.dispatch_uninit(ctx, dests, inputs, &validated)
+            self.dispatch_uninit(ctx, dests, inputs, validated.as_slice())
         } else {
-            ctx.run(|| self.dispatch_uninit(ctx, dests, inputs, &validated))
+            ctx.run(|| self.dispatch_uninit(ctx, dests, inputs, validated.as_slice()))
         }
     }
 
@@ -413,7 +397,8 @@ where
     T: FusedScalar + KernelStorageElement,
 {
     // The single-output case uses stack storage so the hot path allocates
-    // nothing; several destinations need the heap.
+    // nothing; several destinations stay inline up to the operand bound and
+    // spill above it.
     if dests.len() == 1 {
         let dims = dests[0].dims();
         let strides = dests[0].strides();
@@ -422,6 +407,22 @@ where
         let mut dest_views =
             [unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) }];
         return execute_fused_inputs(ctx, &mut dest_views, inputs, plan);
+    }
+
+    if dests.len() <= strided_basic::OPERAND_CAP {
+        let mut storage =
+            [const { MaybeUninit::<StridedViewMut<'_, T>>::uninit() }; strided_basic::OPERAND_CAP];
+        // SAFETY: `storage` has `OPERAND_CAP` writable slots and outlives the
+        // guard (declared after it); at most `OPERAND_CAP` views are pushed.
+        let mut views = unsafe { crate::fused::InitializedViewsMut::new(storage.as_mut_ptr()) };
+        for dest in dests.iter_mut() {
+            let dims = dest.dims();
+            let strides = dest.strides();
+            let offset = dest.offset();
+            let data = dest.data_as_mut::<T>()?;
+            views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
+        }
+        return execute_fused_inputs(ctx, views.as_mut_slice(), inputs, plan);
     }
 
     let mut dest_views = Vec::with_capacity(dests.len());
@@ -495,6 +496,22 @@ where
         let mut dest_views =
             [unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) }];
         return execute_fused_uninit_inputs(plan, &mut dest_views, inputs, serial, validated);
+    }
+
+    if dests.len() <= strided_basic::OPERAND_CAP {
+        let mut storage = [const { MaybeUninit::<StridedViewMut<'_, MaybeUninit<T>>>::uninit() };
+            strided_basic::OPERAND_CAP];
+        // SAFETY: `storage` has `OPERAND_CAP` writable slots and outlives the
+        // guard (declared after it); at most `OPERAND_CAP` views are pushed.
+        let mut views = unsafe { crate::fused::InitializedViewsMut::new(storage.as_mut_ptr()) };
+        for dest in dests.iter_mut() {
+            let dims = dest.dims();
+            let strides = dest.strides();
+            let offset = dest.offset();
+            let data = dest.data_as_uninit_mut::<T>()?;
+            views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
+        }
+        return execute_fused_uninit_inputs(plan, views.as_mut_slice(), inputs, serial, validated);
     }
 
     let mut dest_views = Vec::with_capacity(dests.len());

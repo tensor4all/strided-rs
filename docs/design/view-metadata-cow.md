@@ -1,5 +1,10 @@
 # Borrowed view metadata
 
+> Superseded by [`view-metadata-inline.md`](view-metadata-inline.md)
+> (2026-10-17, #306 P3/P5). The `Cow` design below removed `Arc` and made
+> borrowed construction free, but it still allocated `Vec` metadata for every
+> derived view; the inline design replaces it in 0.6.0.
+
 Date: 2026-10-12 (branch `refactor/view-metadata-cow`)
 
 ## Context

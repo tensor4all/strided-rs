@@ -3,18 +3,12 @@
 use core::mem::MaybeUninit;
 use std::ops::Mul;
 
-#[cfg(feature = "parallel")]
-use smallvec::SmallVec;
-
 use crate::view::{StridedView, StridedViewMut};
 use crate::MaybeSendSync;
 use crate::{broadcast_mul_into, broadcast_mul_into_uninit};
 use crate::{ElementOp, Result, StridedError};
 
-#[cfg(feature = "parallel")]
-type AxisVec<T> = SmallVec<[T; 8]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+type AxisVec<T> = crate::inline::InlineVec<T>;
 
 /// Compute `dest[lhs_free..., rhs_free..., batch...] =
 /// lhs[lhs_free..., batch...] * rhs[rhs_free..., batch...]`.

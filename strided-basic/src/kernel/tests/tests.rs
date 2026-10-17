@@ -165,9 +165,9 @@ fn test_build_plan_fused_compresses() {
     let strides_list: Vec<&[isize]> = vec![&strides];
     let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), 8);
     // After fusion + compression, should be 1D
-    assert_eq!(fused_dims, vec![6]);
+    assert_eq!(fused_dims.as_slice(), vec![6]);
     assert_eq!(fused_strides.len(), 1);
-    assert_eq!(fused_strides[0], vec![1]);
+    assert_eq!(fused_strides[0].as_slice(), vec![1]);
     assert_eq!(plan.block.len(), 1);
 }
 
@@ -199,6 +199,7 @@ fn test_kernel_nd_iterative_total_elements_match() {
         stride_val *= d as isize;
     }
     let strides = vec![sv.clone(), sv];
+    let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
     let mut offsets = vec![0isize, 0isize];
     let mut total = 0usize;
 
@@ -235,6 +236,7 @@ fn verify_kernel_total_and_offsets(rank: usize) {
         stride_val *= d as isize;
     }
     let strides = vec![sv.clone(), sv];
+    let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
     let mut offsets = vec![0isize, 0isize];
     let mut total = 0usize;
     let expected: usize = dims.iter().product();
@@ -337,6 +339,7 @@ fn verify_kernel_visits_all_elements(rank: usize) {
         stride_val *= d as isize;
     }
     let strides = vec![sv];
+    let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
 
     // Collect all linear offsets visited
     let mut visited = std::collections::HashSet::new();

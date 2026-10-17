@@ -411,11 +411,13 @@ fn run_large_fused_add(
     let inputs = [lhs, rhs];
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Add,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     with_execution_policy(policy, || {

@@ -9,10 +9,7 @@ use core::mem::MaybeUninit;
 
 use crate::{CopyPlan, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
 
-#[cfg(feature = "parallel")]
-type AxisVec<T> = smallvec::SmallVec<[T; crate::RAW_FUSED_RANK_LIMIT]>;
-#[cfg(not(feature = "parallel"))]
-type AxisVec<T> = Vec<T>;
+type AxisVec<T> = crate::inline::InlineVec<T>;
 
 /// A compiled static-slice traversal.
 ///
@@ -118,19 +115,25 @@ struct ContiguousPadAxis0Columns {
 /// A compiled multi-input concatenate traversal.
 ///
 /// Each input segment is lowered to a prepared strided copy into the
-/// corresponding destination window.
+/// corresponding destination window. The per-input collections are inline up
+/// to [`OPERAND_CAP`](crate::inline::OPERAND_CAP) slots (destination plus four
+/// inputs), so a bounded concatenate compiles and executes without touching the
+/// heap; above that bound they spill gracefully. `segment_starts` carries one
+/// more entry than there are inputs (the `input_count + 1` prefix-sum sentinel
+/// whose last entry is the destination total), which is why its bound is the
+/// same operand cap.
 #[derive(Clone, Debug)]
 pub struct ConcatenatePlan {
-    input_dims: Vec<AxisVec<usize>>,
-    input_strides: Vec<AxisVec<isize>>,
+    input_dims: crate::inline::OperandVec<AxisVec<usize>>,
+    input_strides: crate::inline::OperandVec<AxisVec<isize>>,
     dest_dims: AxisVec<usize>,
     dest_strides: AxisVec<isize>,
-    dest_offset_deltas: Vec<isize>,
+    dest_offset_deltas: crate::inline::OperandVec<isize>,
     /// Logical start of each segment in the concatenated index space
     /// (segment totals prefix sums); the last entry is the destination total.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    segment_starts: Vec<usize>,
-    copy_plans: Vec<CopyPlan>,
+    segment_starts: crate::inline::OperandVec<usize>,
+    copy_plans: crate::inline::OperandVec<CopyPlan>,
 }
 
 impl SlicePlan {
@@ -1181,14 +1184,6 @@ impl PadPlan {
     }
 }
 
-#[cfg(feature = "parallel")]
-struct ConcatSegment<'a, T> {
-    layout: &'a crate::raw_ops::FusedPairLayout,
-    dest_offset: isize,
-    src_ptr: crate::threading::SendPtr<T>,
-    src_offset: isize,
-}
-
 impl ConcatenatePlan {
     /// Compile a multi-input concatenate plan for fixed input and destination layouts.
     pub fn compile(
@@ -1225,11 +1220,11 @@ impl ConcatenatePlan {
 
         let mut expected_dest_dims: AxisVec<usize> = input_dims[0].into();
         expected_dest_dims[axis] = 0;
-        let mut stored_input_dims = Vec::with_capacity(input_dims.len());
-        let mut stored_input_strides = Vec::with_capacity(input_dims.len());
-        let mut dest_offset_deltas = Vec::with_capacity(input_dims.len());
-        let mut copy_plans = Vec::with_capacity(input_dims.len());
-        let mut segment_starts = Vec::with_capacity(input_dims.len() + 1);
+        let mut stored_input_dims = crate::inline::OperandVec::with_capacity(input_dims.len());
+        let mut stored_input_strides = crate::inline::OperandVec::with_capacity(input_dims.len());
+        let mut dest_offset_deltas = crate::inline::OperandVec::with_capacity(input_dims.len());
+        let mut copy_plans = crate::inline::OperandVec::with_capacity(input_dims.len());
+        let mut segment_starts = crate::inline::OperandVec::with_capacity(input_dims.len() + 1);
         segment_starts.push(0usize);
         let mut axis_base = 0usize;
 
@@ -1373,28 +1368,35 @@ impl ConcatenatePlan {
         if nthreads <= 1 {
             return Ok(false);
         }
-        let mut segments = Vec::with_capacity(inputs.len());
-        for (position, input) in inputs.iter().enumerate() {
-            let Some(layout) = self.copy_plans[position].fused_layout() else {
+        // Precompute each segment's destination base offset once into an
+        // inline operand vector (allocation-free within the operand bound);
+        // the per-segment descriptors are read straight from `self`/`inputs`
+        // inside the loop, so the parallel replay allocates nothing.
+        let mut dest_offsets: crate::inline::OperandVec<isize> =
+            crate::inline::OperandVec::with_capacity(inputs.len());
+        for position in 0..inputs.len() {
+            if self.copy_plans[position].fused_layout().is_none() {
                 return Ok(false);
-            };
-            segments.push(ConcatSegment {
-                layout,
-                dest_offset: self.segment_offset(position, dest.offset())?,
-                src_ptr: crate::threading::SendPtr(input.data().as_ptr() as *mut T),
-                src_offset: input.offset(),
-            });
+            }
+            dest_offsets.push(self.segment_offset(position, dest.offset())?);
         }
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         let starts = &self.segment_starts;
-        let segments = &segments;
+        let dest_offsets = &dest_offsets;
         crate::threading::parallel_for_each(0..total, nthreads, &|range| {
             // First segment whose end lies past the range start.
             let mut position = starts[1..].partition_point(|&end| end <= range.start);
-            while position < segments.len() && starts[position] < range.end {
-                let segment = &segments[position];
+            while position < inputs.len() && starts[position] < range.end {
                 let local_start = range.start.max(starts[position]) - starts[position];
                 let local_end = range.end.min(starts[position + 1]) - starts[position];
+                // The whole-plan guard above proved every segment has an
+                // inline fused layout; skip one only if a future caller
+                // relaxes that check.
+                let Some(layout) = self.copy_plans[position].fused_layout() else {
+                    position += 1;
+                    continue;
+                };
+                let input = &inputs[position];
                 // SAFETY: `check_dest_layout`/`check_input_layout` proved the
                 // views carry the compiled layouts, so each segment window
                 // (input dims, destination strides, checked segment offset) is
@@ -1407,10 +1409,10 @@ impl ConcatenatePlan {
                 unsafe {
                     crate::raw_ops::apply_fused_range(
                         dest_ptr.as_ptr(),
-                        segment.dest_offset,
-                        segment.src_ptr.as_const(),
-                        segment.src_offset,
-                        segment.layout,
+                        dest_offsets[position],
+                        input.data().as_ptr(),
+                        input.offset(),
+                        layout,
                         local_start,
                         local_end - local_start,
                         &apply,

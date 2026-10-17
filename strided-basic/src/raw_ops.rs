@@ -56,6 +56,19 @@ pub(crate) struct FusedPairLayout {
 }
 
 impl FusedPairLayout {
+    /// An empty rank-zero layout (one element at the base offset).
+    ///
+    /// Used as the neutral value when an inline `TinyVec<[CopyPlan; N]>` is
+    /// default-initialized; it is never executed as a real plan.
+    fn empty() -> Self {
+        Self {
+            rank: 0,
+            dims: [1; RAW_FUSED_RANK_LIMIT],
+            dst_strides: [0; RAW_FUSED_RANK_LIMIT],
+            src_strides: [0; RAW_FUSED_RANK_LIMIT],
+        }
+    }
+
     fn from_axes(axes: &[FusedAxis]) -> Self {
         debug_assert!(axes.len() <= RAW_FUSED_RANK_LIMIT);
         let mut layout = Self {
@@ -89,7 +102,25 @@ pub(crate) enum PairTraversal {
     Spilled(Vec<FusedAxis>),
 }
 
+impl Default for FusedPairLayout {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Default for PairTraversal {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl PairTraversal {
+    /// The empty inline layout, used as a neutral default.
+    #[inline]
+    fn empty() -> Self {
+        Self::Inline(FusedPairLayout::empty())
+    }
+
     /// The inline layout, or `None` when the traversal spilled.
     #[cfg(any(test, feature = "parallel"))]
     #[inline]

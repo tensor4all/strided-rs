@@ -73,10 +73,12 @@ mod exec_context;
 pub mod execution;
 mod execution_policy;
 mod fuse;
+mod inline;
 mod kernel;
 mod layout_check;
 mod map_view;
 mod maybe_sync;
+mod nan_select;
 mod ops_view;
 mod order;
 mod raw_ops;
@@ -85,20 +87,23 @@ mod simd;
 mod threading;
 mod update_view;
 pub use complex_div::{robust_complex_divide_f32, robust_complex_divide_f64};
-pub use copy_plan::CopyPlan;
+pub use copy_plan::{CopyPlan, UpdatePlan};
 pub use dense_update::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
 pub use erased::{
     ArgReduceOp, ErasedArgReducePlan, ErasedConcatenatePlan, ErasedCopyPlan, ErasedNormPlan,
-    ErasedReducePlan, ErasedScanPlan, NormKind, NormSpec, ReduceOp, ScanOp, ScanOptions,
+    ErasedReducePlan, ErasedScanPlan, ErasedUpdatePlan, NormKind, NormSpec, ReduceOp, ScanOp,
+    ScanOptions, UpdateOp,
 };
 pub use exec_context::ExecContext;
 pub use execution_policy::{with_execution_policy, ExecutionPolicy};
+pub use inline::{InlineVec, OperandVec, OPERAND_CAP};
 pub use map_view::{
     broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
     map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
     zip_map4_into, CompareOp,
 };
 pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
+pub use nan_select::{nan_propagating_maximum, nan_propagating_minimum};
 pub use ops_view::{
     add, axpy, copy_conj, copy_into, copy_into_col_major, copy_into_uninit, copy_scale,
     copy_transpose_scale_into, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
@@ -106,7 +111,7 @@ pub use ops_view::{
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,
 };
-pub use reduce_view::{reduce, reduce_axis};
+pub use reduce_view::{reduce, reduce_axis, reduce_axis_into};
 pub use simd::MaybeSimdOps;
 pub use strided_view::view;
 pub use strided_view::*;

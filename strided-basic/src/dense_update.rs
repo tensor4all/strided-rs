@@ -197,7 +197,7 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
         return Ok(());
     }
     isize::try_from(out_len).map_err(|_| StridedError::OffsetOverflow)?;
-    let mut out_shape = shape.to_vec();
+    let mut out_shape: crate::InlineVec<usize> = shape.iter().copied().collect();
     out_shape.insert(insert_axis, shape[axis]);
     // INVARIANT: nonempty products fit isize, so every prefix stride fits too.
     let src_strides = crate::col_major_strides(shape);

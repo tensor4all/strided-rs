@@ -119,7 +119,7 @@ fn any_layouts(len: usize) -> Vec<AnyLayout> {
         dims.push(len >> rank.saturating_sub(1));
         layouts.push(AnyLayout {
             label: format!("compact_rank{rank}"),
-            strides: col_major_strides(&dims),
+            strides: col_major_strides(&dims).to_vec(),
             dims,
             data: nonzero_i32(len),
             offset: 0,
@@ -244,7 +244,7 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
     let mut public_group = c.benchmark_group("erased_integer_zip_preflight");
     for case in cases {
         for layout in any_layouts(case.len) {
-            let dest_strides = col_major_strides(&layout.dims);
+            let dest_strides = col_major_strides(&layout.dims).to_vec();
             let lhs_data = nonzero_i32(case.len);
             let lhs =
                 ErasedRawStridedRef::from_slice(&lhs_data, &layout.dims, &dest_strides, 0).unwrap();
@@ -299,7 +299,7 @@ fn bench_axis_reduce(c: &mut Criterion) {
         let rows = 2usize;
         let columns = (case.len / rows).max(1);
         let src_dims = [rows, columns];
-        let src_strides = col_major_strides(&src_dims);
+        let src_strides = col_major_strides(&src_dims).to_vec();
         let dest_dims = [columns];
         let dest_strides = [1isize];
         let input = patterned_f64(rows * columns);
@@ -363,7 +363,7 @@ fn bench_erased_reduce_variant<M: Measurement>(
     src_dims.push(case.len / (1usize << (rank - 1)));
     let src_strides = match variant {
         ReduceLayoutVariant::CompactSingle(_) | ReduceLayoutVariant::CompactMulti(_) => {
-            col_major_strides(&src_dims)
+            col_major_strides(&src_dims).to_vec()
         }
         ReduceLayoutVariant::NonunitRank4 => vec![2, 4, 8, 16],
         ReduceLayoutVariant::NegativeRank4 => vec![1, 2, 4, -8],
@@ -372,7 +372,7 @@ fn bench_erased_reduce_variant<M: Measurement>(
         .filter(|axis| !reduce_axes.contains(axis))
         .collect();
     let dest_dims: Vec<_> = kept_axes.iter().map(|&axis| src_dims[axis]).collect();
-    let dest_strides = col_major_strides(&dest_dims);
+    let dest_strides = col_major_strides(&dest_dims).to_vec();
     let source_offset = match variant {
         ReduceLayoutVariant::NegativeRank4 => 8 * (src_dims[3] - 1) as isize,
         _ => 0,
@@ -525,7 +525,7 @@ fn bench_gather_variant<M: Measurement>(
                 let batch = case.len / window;
                 let mut dims = vec![2; rank - 1];
                 dims.push(batch);
-                let strides = col_major_strides(&dims);
+                let strides = col_major_strides(&dims).to_vec();
                 (dims, strides, case.len, 0, vec![1, batch as isize], batch)
             }
             LayoutVariant::NonunitRank2 => {
@@ -554,7 +554,7 @@ fn bench_gather_variant<M: Measurement>(
     let batch = operand_dims[operand_dims.len() - 1];
     let index_dims = vec![batch, 1];
     let dest_dims = operand_dims.clone();
-    let dest_strides = col_major_strides(&dest_dims);
+    let dest_strides = col_major_strides(&dest_dims).to_vec();
     let indices = varying_starts(batch);
     let mut index_data = vec![0i64; index_len];
     for (index, &start) in indices.iter().enumerate() {
@@ -639,7 +639,7 @@ fn bench_dynamic_slice_variant<M: Measurement>(
     *operand_dims.last_mut().unwrap() += 128;
     let (operand_strides, operand_len, operand_offset) = match variant {
         LayoutVariant::Compact(_) => (
-            col_major_strides(&operand_dims),
+            col_major_strides(&operand_dims).to_vec(),
             operand_dims.iter().product(),
             0,
         ),
@@ -650,7 +650,7 @@ fn bench_dynamic_slice_variant<M: Measurement>(
             2 * (batch + 127) as isize,
         ),
     };
-    let dest_strides = col_major_strides(&window_dims);
+    let dest_strides = col_major_strides(&window_dims).to_vec();
     let starts_dims = vec![rank];
     let starts_strides = vec![1isize];
     let mut starts = vec![0i64; rank];
@@ -720,9 +720,9 @@ fn bench_dynamic_update_variant<M: Measurement>(
     update_dims.push(batch);
     let mut padded_dims = update_dims.clone();
     *padded_dims.last_mut().unwrap() += 128;
-    let operand_strides = col_major_strides(&padded_dims);
+    let operand_strides = col_major_strides(&padded_dims).to_vec();
     let update_strides = match variant {
-        LayoutVariant::Compact(_) => col_major_strides(&update_dims),
+        LayoutVariant::Compact(_) => col_major_strides(&update_dims).to_vec(),
         LayoutVariant::NonunitRank2 => vec![2, 4],
         LayoutVariant::NegativeRank2 => vec![1, -2],
     };
@@ -1002,7 +1002,7 @@ fn bench_erased_pad_generic_rank_layout(c: &mut Criterion) {
             let operand_strides = if nonunit {
                 vec![2isize, 4]
             } else {
-                col_major_strides(&operand_dims)
+                col_major_strides(&operand_dims).to_vec()
             };
             let dest_dims: Vec<_> = operand_dims
                 .iter()
@@ -1015,7 +1015,7 @@ fn bench_erased_pad_generic_rank_layout(c: &mut Criterion) {
             let dest_strides = if nonunit {
                 vec![2isize, 6]
             } else {
-                col_major_strides(&dest_dims)
+                col_major_strides(&dest_dims).to_vec()
             };
             let span = |dims: &[usize], strides: &[isize]| {
                 dims.iter()
@@ -1123,7 +1123,7 @@ fn bench_erased_scatter_variant<M: Measurement>(
             let batch = case.len / window_elems;
             let mut dims = vec![batch];
             dims.extend((0..rank - 1).map(|_| 2usize));
-            let strides = col_major_strides(&dims);
+            let strides = col_major_strides(&dims).to_vec();
             (
                 rank,
                 batch,

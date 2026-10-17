@@ -31,13 +31,18 @@ pub use crate::erased_common::{
 };
 pub use crate::kernel::{ensure_same_shape, KernelPlan, SMALL_TENSOR_THRESHOLD};
 pub use crate::layout_check::is_injective_layout;
-pub use crate::map_view::{validate_destination_layout_without_alloc, ValidatedDestinationLayout};
+pub use crate::map_view::{
+    validate_destination_layout, validate_destination_layout_without_alloc,
+    ValidatedDestinationLayout,
+};
 #[cfg(feature = "parallel")]
 pub use crate::threading::{
     parallel_map_reduce, parallel_threads_for_len, SendPtr, MINTHREADLENGTH,
 };
 
-use crate::{ElementOp, MaybeSendSync, MaybeSync, Result, StridedView, StridedViewMut};
+use crate::{
+    ElementOp, InlineVec, MaybeSendSync, MaybeSync, OperandVec, Result, StridedView, StridedViewMut,
+};
 
 /// Prevalidated build plan fused for kernel-family implementations.
 ///
@@ -65,7 +70,7 @@ pub unsafe fn build_plan_fused(
     strides_list: &[&[isize]],
     dest_index: Option<usize>,
     elem_size: usize,
-) -> (Vec<usize>, Vec<Vec<isize>>, KernelPlan) {
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
     crate::kernel::build_plan_fused(dims, strides_list, dest_index, elem_size)
 }
@@ -93,7 +98,7 @@ pub unsafe fn build_plan_fused(
 pub unsafe fn build_plan_fused_small(
     dims: &[usize],
     strides_list: &[&[isize]],
-) -> (Vec<usize>, Vec<Vec<isize>>, KernelPlan) {
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
     crate::kernel::build_plan_fused_small(dims, strides_list)
 }
@@ -123,10 +128,10 @@ pub unsafe fn build_plan_fused_small(
 /// Forwards errors from the owning kernel or callback; callers must still
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
-pub unsafe fn for_each_inner_block_preordered<F>(
+pub unsafe fn for_each_inner_block_preordered<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
-    strides: &[Vec<isize>],
+    strides: &[S],
     initial_offsets: &[isize],
     f: F,
 ) -> Result<()>
@@ -134,7 +139,13 @@ where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::kernel::for_each_inner_block_preordered::<F>(dims, blocks, strides, initial_offsets, f)
+    crate::kernel::for_each_inner_block_preordered::<S, F>(
+        dims,
+        blocks,
+        strides,
+        initial_offsets,
+        f,
+    )
 }
 
 /// Prevalidated map into validated for kernel-family implementations.
@@ -418,10 +429,10 @@ pub unsafe fn zip_map2_raw_into_validated<
 /// use strided_basic::execution::*;
 /// // SAFETY: the example supplies matching bounded layouts and disjoint storage.
 /// let costs = unsafe { compute_costs(&[vec![1, 4], vec![1, 8]]) };
-/// assert_eq!(costs, [2, 8]);
+/// assert_eq!(costs.as_slice(), [2, 8]);
 /// ```
 #[inline]
-pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
+pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<isize> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
     crate::fuse::compute_costs::<S>(all_strides)
 }
@@ -453,10 +464,10 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> 
 /// Forwards errors from the owning kernel or callback; callers must still
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
-pub unsafe fn mapreduce_threaded<F>(
+pub unsafe fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
-    strides_list: &[Vec<isize>],
+    strides_list: &[S],
     offsets: &[isize],
     costs: &[isize],
     nthreads: usize,
@@ -465,10 +476,10 @@ pub unsafe fn mapreduce_threaded<F>(
     f: &F,
 ) -> Result<()>
 where
-    F: Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync,
+    F: Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<()> + Sync,
 {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::threading::mapreduce_threaded::<F>(
+    crate::threading::mapreduce_threaded::<S, F>(
         dims,
         blocks,
         strides_list,

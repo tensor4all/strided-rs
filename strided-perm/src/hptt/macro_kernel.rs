@@ -158,24 +158,27 @@ pub unsafe fn const_stride1_copy<T: Copy>(
         let mut d = dst;
         for _ in 0..count {
             *d = *s;
-            s = s.offset(src_stride);
-            d = d.add(1);
+            // The cursor advance after the last copy may leave the
+            // allocation and is never dereferenced, so it must not use
+            // `offset`/`add` (which require the result to stay in bounds).
+            s = s.wrapping_offset(src_stride);
+            d = d.wrapping_offset(1);
         }
     } else if src_stride == 1 {
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
             *d = *s;
-            s = s.add(1);
-            d = d.offset(dst_stride);
+            s = s.wrapping_offset(1);
+            d = d.wrapping_offset(dst_stride);
         }
     } else {
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
             *d = *s;
-            s = s.offset(src_stride);
-            d = d.offset(dst_stride);
+            s = s.wrapping_offset(src_stride);
+            d = d.wrapping_offset(dst_stride);
         }
     }
 }
@@ -295,5 +298,19 @@ mod tests {
         assert_eq!(dst[0], 1.0);
         assert_eq!(dst[1], 2.0);
         assert_eq!(dst[2], 3.0);
+    }
+
+    #[test]
+    fn const_stride1_leaf_advances_wrap_at_the_allocation_end() {
+        // Two elements with source stride 3 live at offsets 0 and 3 in a
+        // 4-element buffer; the copy's terminal advance would read offset 6.
+        // The cursor is not dereferenced after the last copy, so the advance
+        // must be a wrapping one; Miri flags the pre-fix `offset`.
+        let src = vec![1.0f64, 2.0, 3.0, 4.0];
+        let mut dst = vec![0.0f64; 2];
+        unsafe {
+            const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 2, 3, 1);
+        }
+        assert_eq!(dst, vec![1.0, 4.0]);
     }
 }

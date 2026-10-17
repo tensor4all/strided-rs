@@ -15,11 +15,11 @@ use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, Fused
 fn ten_unary(op: FusedOp) -> FusedPlan {
     FusedPlan {
         input_count: 1,
-        outputs: vec![10],
+        outputs: vec![10].into_iter().collect(),
         ops: (0..10)
             .map(|index| FusedInst {
                 op,
-                inputs: vec![index],
+                inputs: vec![index].into_iter().collect(),
             })
             .collect(),
     }
@@ -30,13 +30,15 @@ fn ten_unary(op: FusedOp) -> FusedPlan {
 fn ten_binary(op: FusedOp) -> FusedPlan {
     FusedPlan {
         input_count: 2,
-        outputs: vec![11],
+        outputs: vec![11].into_iter().collect(),
         ops: (0..10)
             .map(|index| FusedInst {
                 op,
                 // Instruction `k` writes register `2 + k` and reads the previous
                 // running value plus the second input.
-                inputs: vec![if index == 0 { 0 } else { 1 + index }, 1],
+                inputs: vec![if index == 0 { 0 } else { 1 + index }, 1]
+                    .into_iter()
+                    .collect(),
             })
             .collect(),
     }
@@ -63,14 +65,16 @@ fn unspecialized(op: FusedOp, arity: usize) -> FusedPlan {
         .collect();
     FusedPlan {
         input_count: arity,
-        outputs: vec![conj + 1],
+        outputs: vec![conj + 1].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
-            FusedInst { op, inputs },
-        ],
+            FusedInst::new(op, inputs),
+        ]
+        .into_iter()
+        .collect(),
     }
 }
 
@@ -79,9 +83,7 @@ fn replay<T: FusedScalar>(plan: &FusedPlan, len: usize, operands: &[(&[T], isize
     let dims = [len];
     let views: Vec<StridedView<'_, T>> = operands
         .iter()
-        .map(|(data, stride)| {
-            StridedView::new_owned(data, dims.to_vec(), vec![*stride], 0).unwrap()
-        })
+        .map(|(data, stride)| StridedView::new(data, &dims, &[*stride], 0).unwrap())
         .collect();
     let mut output = vec![operands[0].0[0]; len];
     {
@@ -355,9 +357,7 @@ fn replay_multi<T: FusedScalar>(
     let dims = [len];
     let views: Vec<StridedView<'_, T>> = operands
         .iter()
-        .map(|(data, stride)| {
-            StridedView::new_owned(data, dims.to_vec(), vec![*stride], 0).unwrap()
-        })
+        .map(|(data, stride)| StridedView::new(data, &dims, &[*stride], 0).unwrap())
         .collect();
     let mut outputs: Vec<Vec<T>> = (0..plan.outputs.len())
         .map(|_| vec![operands[0].0[0]; len])
@@ -379,25 +379,27 @@ fn chunked_replay_handles_multiple_outputs_and_reused_inputs() {
     let gapped_a = gapped(&a);
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![0, 2, 4],
+        outputs: vec![0, 2, 4].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![0, 0],
+                inputs: vec![0, 0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![1, 0],
+                inputs: vec![1, 0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Sqrt,
-                inputs: vec![2],
+                inputs: vec![2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![3],
+                inputs: vec![3].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let chunked = replay_multi(&plan, len, &[(&a, 1)]);
     let scalar = replay_multi(&plan, len, &[(&gapped_a, 2)]);
@@ -440,8 +442,8 @@ fn chunked_replay_handles_several_blocks_with_different_bases() {
         let mut output = vec![0.0f64; cols * row_gap];
         {
             let inputs = [
-                StridedView::new_owned(lhs, dims.to_vec(), strides.to_vec(), 0).unwrap(),
-                StridedView::new_owned(rhs, dims.to_vec(), strides.to_vec(), 0).unwrap(),
+                StridedView::new(lhs, &dims, &strides, 0).unwrap(),
+                StridedView::new(rhs, &dims, &strides, 0).unwrap(),
             ];
             let mut dest = StridedViewMut::new(&mut output, &dims, &gapped_strides, 0).unwrap();
             fused_elementwise_into(&mut [dest], &inputs, &plan).unwrap();
@@ -504,11 +506,13 @@ fn a_destination_that_names_an_input_register_reads_the_loaded_chunk() {
     let gapped_a = gapped(&a);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![0],
+        outputs: vec![0].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Negate,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
     let chunked = replay(&plan, a.len(), &[(&a, 1), (&b, 1)]);
     let scalar = replay(&plan, a.len(), &[(&gapped_a, 2), (&b, 1)]);
@@ -528,9 +532,7 @@ fn run_rank1<T: FusedScalar>(
     let dims = [len];
     let views: Vec<StridedView<'_, T>> = operands
         .iter()
-        .map(|(data, stride)| {
-            StridedView::new_owned(data, dims.to_vec(), vec![*stride], 0).unwrap()
-        })
+        .map(|(data, stride)| StridedView::new(data, &dims, &[*stride], 0).unwrap())
         .collect();
     let seed = operands[0].0[0];
     let mut outputs: Vec<Vec<T>> = dest_strides
@@ -567,17 +569,19 @@ fn chunked_replay_handles_inner_broadcast_inputs_for_f64_and_f32() {
         // Single use: `conj(a) * b` with `a` broadcast on the blocked axis.
         let single = FusedPlan {
             input_count: 2,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Conj,
-                    inputs: vec![0],
+                    inputs: vec![0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 1],
+                    inputs: vec![2, 1].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         };
         let got = run_rank1(&single, length, &[(&a, 0), (&b, 1)], &[1]);
         let want: Vec<f64> = b.iter().map(|&x| 2.5 * x).collect();
@@ -587,21 +591,23 @@ fn chunked_replay_handles_inner_broadcast_inputs_for_f64_and_f32() {
         // register: outputs `[0, 3]` with `3 = (conj(a) + a) * a`.
         let reused = FusedPlan {
             input_count: 1,
-            outputs: vec![0, 3],
+            outputs: vec![0, 3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Conj,
-                    inputs: vec![0],
+                    inputs: vec![0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![1, 0],
+                    inputs: vec![1, 0].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 0],
+                    inputs: vec![2, 0].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         };
         let got = run_rank1(&reused, length, &[(&a, 0)], &[1, 1]);
         assert_exact(&got[0], &vec![2.5f64; length]);
@@ -614,17 +620,19 @@ fn chunked_replay_handles_inner_broadcast_inputs_for_f64_and_f32() {
     let a = [1.25f32];
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![1],
+                inputs: vec![1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let got = run_rank1(&plan, length, &[(&a, 0)], &[1]);
     assert_exact(&got[0], &vec![-1.25f32; length]);
@@ -641,21 +649,23 @@ fn chunked_replay_handles_rank2_inner_broadcast() {
     let peer: Vec<f64> = (0..rows * cols).map(|i| (i % 17) as f64 - 8.0).collect();
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![2, 1],
+                inputs: vec![2, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let views = [
-        StridedView::new_owned(&row, dims.to_vec(), vec![0isize, 1], 0).unwrap(),
-        StridedView::new_owned(&peer, dims.to_vec(), vec![1isize, rows as isize], 0).unwrap(),
+        StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap(),
+        StridedView::new(&peer, &dims, &[1isize, rows as isize], 0).unwrap(),
     ];
     let mut output = vec![0.0f64; rows * cols];
     {
@@ -685,21 +695,23 @@ fn chunked_replay_handles_outer_varying_broadcast() {
     let peer: Vec<f64> = (0..rows * cols).map(|i| (i % 19) as f64 - 9.0).collect();
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 1],
+                inputs: vec![2, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let views = [
-        StridedView::new_owned(&row, dims.to_vec(), vec![0isize, 1], 0).unwrap(),
-        StridedView::new_owned(&peer, dims.to_vec(), vec![cols as isize, 1], 0).unwrap(),
+        StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap(),
+        StridedView::new(&peer, &dims, &[cols as isize, 1], 0).unwrap(),
     ];
     let mut output = vec![0.0f64; rows * cols];
     {
@@ -726,20 +738,21 @@ fn chunked_replay_handles_rank3_inner_broadcast() {
     let plane: Vec<f64> = (0..b * c).map(|i| (i % 23) as f64 * 0.25 - 2.0).collect();
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![1],
+                inputs: vec![1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
-    let views =
-        [StridedView::new_owned(&plane, dims.to_vec(), vec![0isize, 1, b as isize], 0).unwrap()];
+    let views = [StridedView::new(&plane, &dims, &[0isize, 1, b as isize], 0).unwrap()];
     let mut output = vec![0.0f64; a * b * c];
     {
         let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
@@ -765,11 +778,13 @@ fn chunked_replay_handles_rank_zero_multi_output() {
     let dims: [usize; 0] = [];
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![0, 1],
+        outputs: vec![0, 1].into_iter().collect(),
         ops: vec![FusedInst {
             op: FusedOp::Negate,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
     let a = [3.5f64];
     let views = [StridedView::new(&a, &dims, &[], 0).unwrap()];
@@ -793,20 +808,22 @@ fn chunked_replay_stores_multiple_outputs_with_different_outer_layouts() {
     let (rows, cols) = (4usize, 130usize);
     let dims = [rows, cols];
     let row: Vec<f64> = (0..cols).map(|c| c as f64 * 0.5 + 0.25).collect();
-    let input = StridedView::new_owned(&row, dims.to_vec(), vec![0isize, 1], 0).unwrap();
+    let input = StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap();
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![0, 1, 2],
+        outputs: vec![0, 1, 2].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![1, 1],
+                inputs: vec![1, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let gap = rows + 2;
     let out0_strides = [1isize, rows as isize];
@@ -840,20 +857,22 @@ fn chunked_replay_falls_back_for_differing_output_inner_strides() {
     let (rows, cols) = (4usize, 130usize);
     let dims = [rows, cols];
     let row: Vec<f64> = (0..cols).map(|c| c as f64 * 0.5 + 0.25).collect();
-    let input = StridedView::new_owned(&row, dims.to_vec(), vec![0isize, 1], 0).unwrap();
+    let input = StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap();
     let plan = FusedPlan {
         input_count: 1,
-        outputs: vec![0, 1],
+        outputs: vec![0, 1].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![1],
+                inputs: vec![1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     // out0 is column-major (inner axis 0), out1 is row-major (inner axis 1).
     let col_major = [1isize, rows as isize];
@@ -903,17 +922,19 @@ fn chunked_replay_parallel_pool_matches_reference() {
     let a = [2.5f64];
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![0, 3],
+        outputs: vec![0, 3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
+                inputs: vec![0].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 1],
+                inputs: vec![2, 1].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
     let erased = ErasedFusedPlan::compile(KernelDType::F64, plan).unwrap();
     let dims = [len];

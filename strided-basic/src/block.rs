@@ -5,6 +5,7 @@
 //! and `_computeblocks` for iterative block size reduction.
 
 use crate::fuse::compute_costs;
+use crate::inline::{InlineVec, OperandVec};
 use crate::{BLOCK_MEMORY_SIZE, CACHE_LINE_SIZE};
 use strided_view::auxiliary::index_order;
 
@@ -28,16 +29,16 @@ pub(crate) fn compute_block_sizes(
     order: &[usize],
     strides_list: &[&[isize]],
     elem_size: usize,
-) -> Vec<usize> {
+) -> InlineVec<usize> {
     if order.is_empty() {
-        return Vec::new();
+        return InlineVec::new();
     }
 
     // Reorder dims to iteration order
-    let ordered_dims: Vec<usize> = order.iter().map(|&i| dims[i]).collect();
+    let ordered_dims: InlineVec<usize> = order.iter().map(|&i| dims[i]).collect();
 
     // Compute byte strides in iteration order
-    let byte_strides: Vec<Vec<isize>> = strides_list
+    let byte_strides: OperandVec<InlineVec<isize>> = strides_list
         .iter()
         .map(|strides| {
             order
@@ -48,20 +49,24 @@ pub(crate) fn compute_block_sizes(
         .collect();
 
     // Compute stride orders (in iteration order)
-    let stride_orders: Vec<Vec<usize>> = byte_strides.iter().map(|bs| index_order(bs)).collect();
+    let stride_orders: OperandVec<InlineVec<usize>> =
+        byte_strides.iter().map(|bs| index_order(bs)).collect();
 
     // Reorder strides for cost computation
-    let reordered_strides: Vec<Vec<isize>> = strides_list
+    let reordered_strides: OperandVec<InlineVec<isize>> = strides_list
         .iter()
         .map(|strides| order.iter().map(|&i| strides[i]).collect())
         .collect();
 
-    let reordered_refs: Vec<&[isize]> = reordered_strides.iter().map(|s| s.as_slice()).collect();
+    let reordered_refs: OperandVec<&[isize]> =
+        reordered_strides.iter().map(|s| s.as_slice()).collect();
     let costs = compute_costs(&reordered_refs);
 
     // Convert byte_strides to slices
-    let byte_stride_refs: Vec<&[isize]> = byte_strides.iter().map(|s| s.as_slice()).collect();
-    let stride_order_refs: Vec<&[usize]> = stride_orders.iter().map(|s| s.as_slice()).collect();
+    let byte_stride_refs: OperandVec<&[isize]> =
+        byte_strides.iter().map(|s| s.as_slice()).collect();
+    let stride_order_refs: OperandVec<&[usize]> =
+        stride_orders.iter().map(|s| s.as_slice()).collect();
 
     compute_blocks(
         &ordered_dims,
@@ -89,44 +94,56 @@ fn compute_blocks(
     byte_strides: &[&[isize]],
     stride_orders: &[&[usize]],
     block_size: usize,
-) -> Vec<usize> {
+) -> InlineVec<usize> {
+    compute_blocks_at(dims, 0, costs, byte_strides, stride_orders, block_size)
+}
+
+/// Recursive core of [`compute_blocks`] with `offset` tracking how many
+/// leading axes have already been fixed. Indexing each operand's stride slice
+/// from `offset` keeps the recursion allocation-free at the inline bound
+/// (#306 P1).
+fn compute_blocks_at(
+    dims: &[usize],
+    offset: usize,
+    costs: &[isize],
+    byte_strides: &[&[isize]],
+    stride_orders: &[&[usize]],
+    block_size: usize,
+) -> InlineVec<usize> {
     let n = dims.len();
     if n == 0 {
-        return vec![];
+        return InlineVec::new();
     }
 
     // If everything fits in cache, use full dims
-    if total_memory_region(dims, byte_strides) <= block_size {
-        return dims.to_vec();
+    if total_memory_region_at(dims, byte_strides, offset) <= block_size {
+        return dims.iter().copied().collect();
     }
 
     // Check if first dimension is smallest stride for all arrays
     let min_order = stride_orders
         .iter()
-        .filter_map(|orders| orders.iter().min().copied())
+        .filter_map(|orders| orders[offset..].iter().min().copied())
         .min()
         .unwrap_or(1);
 
     if stride_orders
         .iter()
-        .all(|orders| !orders.is_empty() && orders[0] == min_order)
+        .all(|orders| !orders[offset..].is_empty() && orders[offset] == min_order)
     {
         // First dimension has smallest stride in all arrays
         // Keep first dimension, recurse on rest
-        let tail_dims: Vec<usize> = dims[1..].to_vec();
-        let tail_costs: Vec<isize> = costs[1..].to_vec();
-        let tail_byte_strides: Vec<&[isize]> = byte_strides.iter().map(|s| &s[1..]).collect();
-        let tail_stride_orders: Vec<&[usize]> = stride_orders.iter().map(|s| &s[1..]).collect();
-
-        let tail_blocks = compute_blocks(
-            &tail_dims,
-            &tail_costs,
-            &tail_byte_strides,
-            &tail_stride_orders,
+        let tail_blocks = compute_blocks_at(
+            &dims[1..],
+            offset + 1,
+            &costs[1..],
+            byte_strides,
+            stride_orders,
             block_size,
         );
 
-        let mut result = vec![dims[0]];
+        let mut result: InlineVec<usize> = InlineVec::new();
+        result.push(dims[0]);
         result.extend(tail_blocks);
         return result;
     }
@@ -134,19 +151,19 @@ fn compute_blocks(
     // Check if minimum stride is larger than block size
     let min_stride = byte_strides
         .iter()
-        .filter_map(|s| s.iter().map(|x| x.unsigned_abs()).min())
+        .filter_map(|s| s[offset..].iter().map(|x| x.unsigned_abs()).min())
         .min()
         .unwrap_or(0);
 
     if min_stride > block_size {
-        return vec![1; n];
+        return (0..n).map(|_| 1).collect();
     }
 
     // Iteratively reduce blocks
-    let mut blocks = dims.to_vec();
+    let mut blocks: InlineVec<usize> = dims.iter().copied().collect();
 
     // Phase 1: Halve until within 2x of target
-    while total_memory_region(&blocks, byte_strides) >= 2 * block_size {
+    while total_memory_region_at(&blocks, byte_strides, offset) >= 2 * block_size {
         let i = last_argmax_weighted(&blocks, costs);
         if i.is_none() || blocks[i.unwrap()] <= 1 {
             break;
@@ -156,7 +173,7 @@ fn compute_blocks(
     }
 
     // Phase 2: Decrement until within target
-    while total_memory_region(&blocks, byte_strides) > block_size {
+    while total_memory_region_at(&blocks, byte_strides, offset) > block_size {
         let i = last_argmax_weighted(&blocks, costs);
         if i.is_none() || blocks[i.unwrap()] <= 1 {
             break;
@@ -195,11 +212,19 @@ fn compute_blocks(
 ///     return memoryregion
 /// end
 /// ```
+#[cfg(test)]
 fn total_memory_region(dims: &[usize], byte_strides: &[&[isize]]) -> usize {
+    total_memory_region_at(dims, byte_strides, 0)
+}
+
+/// As [`total_memory_region`], but with the leading `offset` axes fixed. The
+/// recursion in `compute_blocks_at` uses it to avoid materializing tail slices.
+fn total_memory_region_at(dims: &[usize], byte_strides: &[&[isize]], offset: usize) -> usize {
     let cache_line = CACHE_LINE_SIZE;
     let mut memory_region = 0usize;
 
     for strides in byte_strides {
+        let strides = &strides[offset..];
         let mut num_contiguous_cache_lines = 0isize;
         let mut num_cache_line_blocks = 1usize;
 

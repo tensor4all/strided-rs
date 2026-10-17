@@ -23,17 +23,19 @@ fn bench_add_mul(c: &mut Criterion) {
     let mut out = StridedArray::<f64>::col_major(&DIMS);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![3],
+        outputs: vec![3].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![2, 0],
+                inputs: vec![2, 0].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let mut group = c.benchmark_group("fused_add_mul");
@@ -64,21 +66,23 @@ fn bench_broadcast_exp_mul_add(c: &mut Criterion) {
     let mut out = StridedArray::<f64>::col_major(&DIMS);
     let plan = FusedPlan {
         input_count: 3,
-        outputs: vec![5],
+        outputs: vec![5].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![3, 2],
+                inputs: vec![3, 2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Exp,
-                inputs: vec![4],
+                inputs: vec![4].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let mut group = c.benchmark_group("fused_broadcast_exp_mul_add");
@@ -122,29 +126,31 @@ fn bench_long_chain(c: &mut Criterion) {
     let mut out = StridedArray::<f64>::col_major(&DIMS);
     let plan = FusedPlan {
         input_count: 4,
-        outputs: vec![8],
+        outputs: vec![8].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Divide,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Maximum,
-                inputs: vec![4, 2],
+                inputs: vec![4, 2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Minimum,
-                inputs: vec![5, 3],
+                inputs: vec![5, 3].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Sqrt,
-                inputs: vec![6],
+                inputs: vec![6].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Rsqrt,
-                inputs: vec![7],
+                inputs: vec![7].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let mut group = c.benchmark_group("fused_long_chain");
@@ -192,21 +198,23 @@ fn bench_interpreter_fallback(c: &mut Criterion) {
     let mut out = StridedArray::<f64>::col_major(&DIMS);
     let plan = FusedPlan {
         input_count: 2,
-        outputs: vec![4],
+        outputs: vec![4].into_iter().collect(),
         ops: vec![
             FusedInst {
                 op: FusedOp::Add,
-                inputs: vec![0, 1],
+                inputs: vec![0, 1].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Negate,
-                inputs: vec![2],
+                inputs: vec![2].into_iter().collect(),
             },
             FusedInst {
                 op: FusedOp::Exp,
-                inputs: vec![3],
+                inputs: vec![3].into_iter().collect(),
             },
-        ],
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let mut group = c.benchmark_group("fused_interpreter_fallback");

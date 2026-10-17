@@ -4,7 +4,7 @@
 //! dimension-splitting strategy using `rayon::join`.
 
 #[cfg(feature = "parallel")]
-use smallvec::SmallVec;
+use crate::inline::InlineVec;
 #[cfg(feature = "parallel")]
 use std::ops::Range;
 
@@ -16,7 +16,7 @@ use crate::Result;
 /// Stack-allocated Vec for dims/offsets in recursive threading.
 /// 8 elements covers up to 8-dimensional arrays (after fusion, typically 2-4).
 #[cfg(feature = "parallel")]
-type SVec<T> = SmallVec<[T; 8]>;
+type SVec<T> = InlineVec<T>;
 
 /// A raw pointer wrapper that is `Send` + `Sync`.
 ///
@@ -247,14 +247,14 @@ pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + crate::MaybeSendSync>(
     fill_contiguous(span, core::mem::MaybeUninit::new(value));
 }
 
-pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync>(
+pub(crate) fn copy_into_col_major<T: Copy + crate::MaybeSendSync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
     strided_perm::copy_into_col_major(dest, src)
 }
 
-pub(crate) fn copy_permuted_serial<T: Copy + crate::MaybeSendSync>(
+pub(crate) fn copy_permuted_serial<T: Copy + crate::MaybeSendSync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
@@ -298,7 +298,7 @@ fn with_permutation_copy_scheduler<R>(operation: impl FnOnce() -> R) -> R {
 }
 
 #[cfg(feature = "parallel")]
-pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync>(
+pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
@@ -374,10 +374,10 @@ where
 /// The leaf function `f` receives `(dims, blocks, strides_list, offsets)` describing
 /// the sub-region to process.
 #[cfg(feature = "parallel")]
-pub(crate) fn mapreduce_threaded<F>(
+pub(crate) fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
-    strides_list: &[Vec<isize>],
+    strides_list: &[S],
     offsets: &[isize],
     costs: &[isize],
     nthreads: usize,
@@ -386,33 +386,28 @@ pub(crate) fn mapreduce_threaded<F>(
     f: &F,
 ) -> Result<()>
 where
-    F: Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync,
+    F: Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<()> + Sync,
 {
     // The recursive splitter (rayon join) is compiled once; the leaf is `dyn`,
-    // called once per leaf region.
+    // called once per leaf region. Borrowed per-operand stride slices are built
+    // once here so the splitter and its leaves share them without owning a
+    // `Vec<Vec<isize>>` (#306 P1).
+    let refs: SVec<&[isize]> = strides_list.iter().map(|s| s.as_ref()).collect();
     mapreduce_threaded_dyn(
-        dims,
-        blocks,
-        strides_list,
-        offsets,
-        costs,
-        nthreads,
-        spacing,
-        taskindex,
-        f,
+        dims, blocks, &refs, offsets, costs, nthreads, spacing, taskindex, f,
     )
 }
 
 /// The leaf callback of a threaded region.
 #[cfg(feature = "parallel")]
-type LeafFn<'a> = &'a (dyn Fn(&[usize], &[usize], &[Vec<isize>], &[isize]) -> Result<()> + Sync);
+type LeafFn<'a> = &'a (dyn Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<()> + Sync);
 
 #[cfg(feature = "parallel")]
 #[inline(never)]
 fn mapreduce_threaded_dyn(
     dims: &[usize],
     blocks: &[usize],
-    strides_list: &[Vec<isize>],
+    strides_list: &[&[isize]],
     offsets: &[isize],
     costs: &[isize],
     nthreads: usize,
@@ -438,7 +433,7 @@ fn mapreduce_threaded_dyn(
 #[cfg(feature = "parallel")]
 struct ThreadedMapReduce<'a> {
     blocks: &'a [usize],
-    strides_list: &'a [Vec<isize>],
+    strides_list: &'a [&'a [isize]],
     costs: &'a [isize],
     spacing: isize,
     policy: crate::ExecutionPolicy,
@@ -460,7 +455,7 @@ impl ThreadedMapReduce<'_> {
         // Base case: single thread or below threshold
         if nthreads <= 1 || total <= MINTHREADLENGTH {
             if self.spacing != 0 {
-                let mut spaced: SVec<isize> = SmallVec::from_slice(offsets);
+                let mut spaced: SVec<isize> = offsets.iter().copied().collect();
                 spaced[0] += self.spacing * (taskindex as isize - 1);
                 return crate::execution_policy::with_owned_execution(
                     self.policy,
@@ -491,7 +486,7 @@ impl ThreadedMapReduce<'_> {
         // Guard: costs[i] == 0 || dims[i] <= min(blocks[i], 1024)
         if self.costs[i] == 0 || dims[i] <= self.blocks[i].min(1024) {
             if self.spacing != 0 {
-                let mut spaced: SVec<isize> = SmallVec::from_slice(offsets);
+                let mut spaced: SVec<isize> = offsets.iter().copied().collect();
                 spaced[0] += self.spacing * (taskindex as isize - 1);
                 return crate::execution_policy::with_owned_execution(
                     self.policy,
@@ -511,18 +506,18 @@ impl ThreadedMapReduce<'_> {
         let nt_right = nthreads - nt_left;
 
         // Left half: dims[i] = ndi, same offsets
-        let mut left_dims: SVec<usize> = SmallVec::from_slice(dims);
+        let mut left_dims: SVec<usize> = dims.iter().copied().collect();
         left_dims[i] = ndi;
 
         // Right half: dims[i] = di - ndi, offsets advanced by ndi * stride[i]
-        let mut right_dims: SVec<usize> = SmallVec::from_slice(dims);
+        let mut right_dims: SVec<usize> = dims.iter().copied().collect();
         right_dims[i] = di - ndi;
-        let mut right_offsets: SVec<isize> = SmallVec::from_slice(offsets);
+        let mut right_offsets: SVec<isize> = offsets.iter().copied().collect();
         for (k, strides) in self.strides_list.iter().enumerate() {
             right_offsets[k] += ndi as isize * strides[i];
         }
 
-        let left_offsets: SVec<isize> = SmallVec::from_slice(offsets);
+        let left_offsets: SVec<isize> = offsets.iter().copied().collect();
 
         let (r1, r2) = join_with_policy(
             self.policy,
@@ -543,16 +538,133 @@ impl ThreadedMapReduce<'_> {
     }
 }
 
+/// Recursive dimension-splitting parallel fold.
+///
+/// Like [`mapreduce_threaded`], but the leaf returns a partial result and each
+/// split combines the two children with `combine`. A full reduction therefore
+/// never needs a worker-count-sized output-slot vector (#306 scope addition).
+/// `f` must reduce the whole sub-region it is handed, using the supplied
+/// `for_each_inner_block_with_offsets` traversal.
+#[cfg(feature = "parallel")]
+pub(crate) fn mapreduce_threaded_fold<S, F, C, R>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides_list: &[S],
+    offsets: &[isize],
+    costs: &[isize],
+    nthreads: usize,
+    f: &F,
+    combine: &C,
+) -> Result<R>
+where
+    S: AsRef<[isize]>,
+    F: Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<R> + Sync,
+    C: Fn(R, R) -> R + Sync,
+    R: Send,
+{
+    let refs: SVec<&[isize]> = strides_list.iter().map(|s| s.as_ref()).collect();
+    // Normalize whole-dimension blocks before splitting, matching the
+    // `mapreduce_threaded` path (#313): a block that covers its dimension would
+    // otherwise suppress the split for a small whole tensor.
+    let blocks = scheduler_blocks(dims, blocks);
+    FoldMapReduce {
+        blocks: &blocks,
+        strides_list: &refs,
+        costs,
+        policy: crate::execution_policy::active_policy(),
+        f,
+        combine,
+    }
+    .run(dims, offsets, nthreads, false)
+}
+
+#[cfg(feature = "parallel")]
+struct FoldMapReduce<'a, F, C> {
+    blocks: &'a [usize],
+    strides_list: &'a [&'a [isize]],
+    costs: &'a [isize],
+    policy: crate::ExecutionPolicy,
+    f: &'a F,
+    combine: &'a C,
+}
+
+#[cfg(feature = "parallel")]
+impl<F, C> FoldMapReduce<'_, F, C> {
+    fn run<R: Send>(
+        &self,
+        dims: &[usize],
+        offsets: &[isize],
+        nthreads: usize,
+        in_fanout: bool,
+    ) -> Result<R>
+    where
+        F: Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<R> + Sync,
+        C: Fn(R, R) -> R + Sync,
+    {
+        let total = crate::kernel::total_len(dims)?;
+
+        // Base case: single thread or below threshold.
+        if nthreads <= 1 || total <= MINTHREADLENGTH {
+            return crate::execution_policy::with_owned_execution(self.policy, in_fanout, || {
+                (self.f)(dims, self.blocks, self.strides_list, offsets)
+            });
+        }
+
+        // Select split dimension: _lastargmax((dims .- 1) .* costs).
+        let (i, _) = dims.iter().zip(self.costs.iter()).enumerate().fold(
+            (0, isize::MIN),
+            |(best_i, best_v), (idx, (&d, &c))| {
+                let score = (d as isize - 1) * c;
+                if score >= best_v {
+                    (idx, score)
+                } else {
+                    (best_i, best_v)
+                }
+            },
+        );
+
+        // Guard: costs[i] == 0 || dims[i] <= min(blocks[i], 1024).
+        if self.costs[i] == 0 || dims[i] <= self.blocks[i].min(1024) {
+            return crate::execution_policy::with_owned_execution(self.policy, in_fanout, || {
+                (self.f)(dims, self.blocks, self.strides_list, offsets)
+            });
+        }
+
+        // Split dimension i in half and combine the two partial results.
+        let di = dims[i];
+        let ndi = di / 2;
+        let nt_left = nthreads / 2;
+        let nt_right = nthreads - nt_left;
+
+        let mut left_dims: SVec<usize> = dims.iter().copied().collect();
+        left_dims[i] = ndi;
+        let mut right_dims: SVec<usize> = dims.iter().copied().collect();
+        right_dims[i] = di - ndi;
+        let mut right_offsets: SVec<isize> = offsets.iter().copied().collect();
+        for (k, strides) in self.strides_list.iter().enumerate() {
+            right_offsets[k] += ndi as isize * strides[i];
+        }
+        let left_offsets: SVec<isize> = offsets.iter().copied().collect();
+
+        let (r1, r2) = join_with_policy(
+            self.policy,
+            || self.run(&left_dims, &left_offsets, nt_left, true),
+            || self.run(&right_dims, &right_offsets, nt_right, true),
+        );
+        Ok((self.combine)(r1?, r2?))
+    }
+}
+
 /// Execute the kernel on a sub-region defined by initial offsets.
 ///
 /// Delegates to `for_each_inner_block_preordered` which directly calls
 /// kernel functions with the initial offsets, avoiding redundant re-ordering
 /// and per-callback `Vec` allocation.
 #[cfg(feature = "parallel")]
-pub(crate) fn for_each_inner_block_with_offsets<F>(
+pub(crate) fn for_each_inner_block_with_offsets<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
-    strides_list: &[Vec<isize>],
+    strides_list: &[S],
     initial_offsets: &[isize],
     f: F,
 ) -> Result<()>

@@ -264,19 +264,23 @@ fn typed_uninitialized_full_overwrite_siblings_match_initialized_paths() {
 fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specialization_family() {
     let unary = |op| FusedPlan {
         input_count: 1,
-        outputs: vec![1],
+        outputs: vec![1].into_iter().collect(),
         ops: vec![FusedInst {
             op,
-            inputs: vec![0],
-        }],
+            inputs: vec![0].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
     let binary = |op| FusedPlan {
         input_count: 2,
-        outputs: vec![2],
+        outputs: vec![2].into_iter().collect(),
         ops: vec![FusedInst {
             op,
-            inputs: vec![0, 1],
-        }],
+            inputs: vec![0, 1].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
     };
 
     assert_fused_differential(
@@ -326,11 +330,13 @@ fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specializa
         &[vec![1.0, 4.0], vec![0.0, 3.0], vec![2.0, 2.0]],
         FusedPlan {
             input_count: 3,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Clamp,
-                inputs: vec![0, 1, 2],
-            }],
+                inputs: vec![0, 1, 2].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     );
     assert_fused_differential(
@@ -338,17 +344,19 @@ fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specializa
         &[vec![1.0, 2.0], vec![3.0, 4.0]],
         FusedPlan {
             input_count: 2,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![2, 0],
+                    inputs: vec![2, 0].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     );
     assert_fused_differential(
@@ -356,17 +364,19 @@ fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specializa
         &[vec![1.0, 2.0], vec![3.0, 4.0]],
         FusedPlan {
             input_count: 2,
-            outputs: vec![3],
+            outputs: vec![3].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![0, 2],
+                    inputs: vec![0, 2].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     );
     assert_fused_differential(
@@ -374,21 +384,23 @@ fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specializa
         &[vec![1.0, 2.0], vec![2.0, 3.0], vec![0.5, 1.0]],
         FusedPlan {
             input_count: 3,
-            outputs: vec![5],
+            outputs: vec![5].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Multiply,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Add,
-                    inputs: vec![3, 2],
+                    inputs: vec![3, 2].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Exp,
-                    inputs: vec![4],
+                    inputs: vec![4].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     );
     assert_fused_differential(
@@ -401,29 +413,31 @@ fn erased_fused_uninitialized_matches_initialized_for_every_dtype_and_specializa
         ],
         FusedPlan {
             input_count: 4,
-            outputs: vec![8],
+            outputs: vec![8].into_iter().collect(),
             ops: vec![
                 FusedInst {
                     op: FusedOp::Divide,
-                    inputs: vec![0, 1],
+                    inputs: vec![0, 1].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Maximum,
-                    inputs: vec![4, 2],
+                    inputs: vec![4, 2].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Minimum,
-                    inputs: vec![5, 3],
+                    inputs: vec![5, 3].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Sqrt,
-                    inputs: vec![6],
+                    inputs: vec![6].into_iter().collect(),
                 },
                 FusedInst {
                     op: FusedOp::Rsqrt,
-                    inputs: vec![7],
+                    inputs: vec![7].into_iter().collect(),
                 },
-            ],
+            ]
+            .into_iter()
+            .collect(),
         },
     );
 }
@@ -437,11 +451,13 @@ fn erased_fused_uninitialized_replay_writes_valid_bool_output() {
         KernelDType::Bool,
         FusedPlan {
             input_count: 1,
-            outputs: vec![1],
+            outputs: vec![1].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
-            }],
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -486,11 +502,13 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         KernelDType::I32,
         FusedPlan {
             input_count: 1,
-            outputs: vec![1],
+            outputs: vec![1].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Conj,
-                inputs: vec![0],
-            }],
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
@@ -616,11 +634,13 @@ fn erased_fused_uninitialized_parallel_replay_preserves_wrapping_integer_semanti
         KernelDType::I32,
         FusedPlan {
             input_count: 2,
-            outputs: vec![2],
+            outputs: vec![2].into_iter().collect(),
             ops: vec![FusedInst {
                 op: FusedOp::Multiply,
-                inputs: vec![0, 1],
-            }],
+                inputs: vec![0, 1].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
         },
     )
     .unwrap();
