@@ -511,3 +511,445 @@ fn a_destination_that_names_an_input_register_reads_the_loaded_chunk() {
     assert_exact(&chunked, &scalar);
     assert_exact(&chunked, &a);
 }
+
+/// Replay a rank-1 plan over operands with explicit strides. Each destination's
+/// stride is `dest_strides[i]`; the backing buffer is returned so a caller can
+/// read logical element `j` at `buffer[j * stride]`.
+fn run_rank1<T: FusedScalar>(
+    plan: &FusedPlan,
+    len: usize,
+    operands: &[(&[T], isize)],
+    dest_strides: &[isize],
+) -> Vec<Vec<T>> {
+    let dims = [len];
+    let views: Vec<StridedView<'_, T>> = operands
+        .iter()
+        .map(|(data, stride)| {
+            StridedView::new(data, &dims, &[*stride], 0).unwrap()
+        })
+        .collect();
+    let seed = operands[0].0[0];
+    let mut outputs: Vec<Vec<T>> = dest_strides
+        .iter()
+        .map(|&stride| {
+            let span = if len == 0 {
+                0
+            } else {
+                (len - 1) * stride as usize + 1
+            };
+            vec![seed; span]
+        })
+        .collect();
+    {
+        let dest_layouts: Vec<[isize; 1]> = dest_strides.iter().map(|&stride| [stride]).collect();
+        let mut dests: Vec<StridedViewMut<'_, T>> = outputs
+            .iter_mut()
+            .zip(&dest_layouts)
+            .map(|(data, strides)| StridedViewMut::new(data, &dims, strides, 0).unwrap())
+            .collect();
+        fused_elementwise_into(&mut dests, &views, plan).unwrap();
+    }
+    outputs
+}
+
+/// An input with stride 0 along the blocked axis must be replayed through the
+/// chunk machine (not the interpreter) and must read the one broadcast value.
+#[test]
+fn chunked_replay_handles_inner_broadcast_inputs_for_f64_and_f32() {
+    for length in LENGTHS {
+        let b: Vec<f64> = (0..length).map(|v| (v % 13) as f64 * 0.25 - 1.0).collect();
+        let a = [2.5f64];
+
+        // Single use: `conj(a) * b` with `a` broadcast on the blocked axis.
+        let single = FusedPlan {
+            input_count: 2,
+            outputs: vec![3],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Conj,
+                    inputs: vec![0],
+                },
+                FusedInst {
+                    op: FusedOp::Multiply,
+                    inputs: vec![2, 1],
+                },
+            ],
+        };
+        let got = run_rank1(&single, length, &[(&a, 0), (&b, 1)], &[1]);
+        let want: Vec<f64> = b.iter().map(|&x| 2.5 * x).collect();
+        assert_exact(&got[0], &want);
+
+        // Reused broadcast plus a pass-through output that names the broadcast
+        // register: outputs `[0, 3]` with `3 = (conj(a) + a) * a`.
+        let reused = FusedPlan {
+            input_count: 1,
+            outputs: vec![0, 3],
+            ops: vec![
+                FusedInst {
+                    op: FusedOp::Conj,
+                    inputs: vec![0],
+                },
+                FusedInst {
+                    op: FusedOp::Add,
+                    inputs: vec![1, 0],
+                },
+                FusedInst {
+                    op: FusedOp::Multiply,
+                    inputs: vec![2, 0],
+                },
+            ],
+        };
+        let got = run_rank1(&reused, length, &[(&a, 0)], &[1, 1]);
+        assert_exact(&got[0], &vec![2.5f64; length]);
+        assert_exact(&got[1], &vec![12.5f64; length]);
+    }
+
+    // One f32 chain over a broadcast input, so the f32 chunk kernels see a
+    // broadcast register too.
+    let length = 1025;
+    let a = [1.25f32];
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![2],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Conj,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![1],
+            },
+        ],
+    };
+    let got = run_rank1(&plan, length, &[(&a, 0)], &[1]);
+    assert_exact(&got[0], &vec![-1.25f32; length]);
+}
+
+/// Rank-2 inner broadcast: the broadcast input is constant along the blocked
+/// axis 0 and contiguous along axis 1.
+#[test]
+fn chunked_replay_handles_rank2_inner_broadcast() {
+    let (rows, cols) = (5usize, 300usize);
+    let dims = [rows, cols];
+    let out_strides = [1isize, rows as isize];
+    let row: Vec<f64> = (0..cols).map(|c| c as f64 * 0.5 + 1.0).collect();
+    let peer: Vec<f64> = (0..rows * cols).map(|i| (i % 17) as f64 - 8.0).collect();
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![3],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Conj,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Add,
+                inputs: vec![2, 1],
+            },
+        ],
+    };
+    let views = [
+        StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap(),
+        StridedView::new(&peer, &dims, &[1isize, rows as isize], 0).unwrap(),
+    ];
+    let mut output = vec![0.0f64; rows * cols];
+    {
+        let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
+        fused_elementwise_into(&mut [dest], &views, &plan).unwrap();
+    }
+    for r in 0..rows {
+        for c in 0..cols {
+            assert_eq!(
+                output[c * rows + r],
+                row[c] + peer[c * rows + r],
+                "({r},{c})"
+            );
+        }
+    }
+}
+
+/// `[0, 1]` outer-varying broadcast: the input is constant along the outer axis
+/// and contiguous along the blocked axis, so the block load is a normal
+/// contiguous read with a stride-0 outer coordinate.
+#[test]
+fn chunked_replay_handles_outer_varying_broadcast() {
+    let (rows, cols) = (5usize, 300usize);
+    let dims = [rows, cols];
+    let out_strides = [cols as isize, 1isize];
+    let row: Vec<f64> = (0..cols).map(|c| c as f64 * 0.5 + 1.0).collect();
+    let peer: Vec<f64> = (0..rows * cols).map(|i| (i % 19) as f64 - 9.0).collect();
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![3],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Conj,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Multiply,
+                inputs: vec![2, 1],
+            },
+        ],
+    };
+    let views = [
+        StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap(),
+        StridedView::new(&peer, &dims, &[cols as isize, 1], 0).unwrap(),
+    ];
+    let mut output = vec![0.0f64; rows * cols];
+    {
+        let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
+        fused_elementwise_into(&mut [dest], &views, &plan).unwrap();
+    }
+    for r in 0..rows {
+        for c in 0..cols {
+            assert_eq!(
+                output[r * cols + c],
+                row[c] * peer[r * cols + c],
+                "({r},{c})"
+            );
+        }
+    }
+}
+
+/// Rank-3 inner broadcast, so the fill happens once per outer `(j, k)` block.
+#[test]
+fn chunked_replay_handles_rank3_inner_broadcast() {
+    let dims = [4usize, 3, 200];
+    let (a, b, c) = (dims[0], dims[1], dims[2]);
+    let out_strides = [1isize, a as isize, (a * b) as isize];
+    let plane: Vec<f64> = (0..b * c).map(|i| (i % 23) as f64 * 0.25 - 2.0).collect();
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![2],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Conj,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![1],
+            },
+        ],
+    };
+    let views =
+        [StridedView::new(&plane, &dims, &[0isize, 1, b as isize], 0).unwrap()];
+    let mut output = vec![0.0f64; a * b * c];
+    {
+        let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
+        fused_elementwise_into(&mut [dest], &views, &plan).unwrap();
+    }
+    for i in 0..a {
+        for j in 0..b {
+            for k in 0..c {
+                assert_eq!(
+                    output[i + j * a + k * a * b],
+                    -plane[j + k * b],
+                    "({i},{j},{k})"
+                );
+            }
+        }
+    }
+}
+
+/// A rank-zero DAG with several outputs: the block callback has no strides, so
+/// the interpreter must treat every operand as stride 0 instead of indexing.
+#[test]
+fn chunked_replay_handles_rank_zero_multi_output() {
+    let dims: [usize; 0] = [];
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![0, 1],
+        ops: vec![FusedInst {
+            op: FusedOp::Negate,
+            inputs: vec![0],
+        }],
+    };
+    let a = [3.5f64];
+    let views = [StridedView::new(&a, &dims, &[], 0).unwrap()];
+    let mut pass_through = [0.0f64; 1];
+    let mut negated = [0.0f64; 1];
+    {
+        let mut dests = [
+            StridedViewMut::new(&mut pass_through, &dims, &[], 0).unwrap(),
+            StridedViewMut::new(&mut negated, &dims, &[], 0).unwrap(),
+        ];
+        fused_elementwise_into(&mut dests, &views, &plan).unwrap();
+    }
+    assert_eq!(pass_through, [3.5]);
+    assert_eq!(negated, [-3.5]);
+}
+
+/// Multiple destinations with differing outer strides: all inner strides stay 1
+/// (so the chunk machine stores them) while the offsets differ per destination.
+#[test]
+fn chunked_replay_stores_multiple_outputs_with_different_outer_layouts() {
+    let (rows, cols) = (4usize, 130usize);
+    let dims = [rows, cols];
+    let row: Vec<f64> = (0..cols).map(|c| c as f64 * 0.5 + 0.25).collect();
+    let input = StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap();
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![0, 1, 2],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Multiply,
+                inputs: vec![1, 1],
+            },
+        ],
+    };
+    let gap = rows + 2;
+    let out0_strides = [1isize, rows as isize];
+    let out1_strides = [1isize, gap as isize];
+    let out2_strides = [1isize, rows as isize];
+    let mut out0 = vec![0.0f64; rows * cols];
+    let mut out1 = vec![0.0f64; gap * cols];
+    let mut out2 = vec![0.0f64; rows * cols];
+    {
+        let mut dests = [
+            StridedViewMut::new(&mut out0, &dims, &out0_strides, 0).unwrap(),
+            StridedViewMut::new(&mut out1, &dims, &out1_strides, 0).unwrap(),
+            StridedViewMut::new(&mut out2, &dims, &out2_strides, 0).unwrap(),
+        ];
+        fused_elementwise_into(&mut dests, &[input], &plan).unwrap();
+    }
+    for c in 0..cols {
+        for r in 0..rows {
+            assert_eq!(out0[c * rows + r], row[c]);
+            assert_eq!(out1[c * gap + r], -row[c]);
+            assert_eq!(out2[c * rows + r], row[c] * row[c]);
+        }
+    }
+}
+
+/// Differing inner strides across destinations: the chunk machine requires every
+/// output stride to be 1, so this must fall back to the interpreter and still
+/// agree with an unfused reference.
+#[test]
+fn chunked_replay_falls_back_for_differing_output_inner_strides() {
+    let (rows, cols) = (4usize, 130usize);
+    let dims = [rows, cols];
+    let row: Vec<f64> = (0..cols).map(|c| c as f64 * 0.5 + 0.25).collect();
+    let input = StridedView::new(&row, &dims, &[0isize, 1], 0).unwrap();
+    let plan = FusedPlan {
+        input_count: 1,
+        outputs: vec![0, 1],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Negate,
+                inputs: vec![1],
+            },
+        ],
+    };
+    // out0 is column-major (inner axis 0), out1 is row-major (inner axis 1).
+    let col_major = [1isize, rows as isize];
+    let row_major = [cols as isize, 1isize];
+    let mut out0 = vec![0.0f64; rows * cols];
+    let mut out1 = vec![0.0f64; rows * cols];
+    {
+        let mut dests = [
+            StridedViewMut::new(&mut out0, &dims, &col_major, 0).unwrap(),
+            StridedViewMut::new(&mut out1, &dims, &row_major, 0).unwrap(),
+        ];
+        fused_elementwise_into(&mut dests, &[input], &plan).unwrap();
+    }
+    for r in 0..rows {
+        for c in 0..cols {
+            assert_eq!(out0[c * rows + r], row[c]);
+            assert_eq!(out1[r * cols + c], -row[c]);
+        }
+    }
+}
+
+/// Parallel replay of a broadcast, multi-output plan in an explicit two-worker
+/// pool, over a length that is above the threading threshold and not divisible
+/// by the worker count.
+#[cfg(feature = "parallel")]
+#[test]
+fn chunked_replay_parallel_pool_matches_reference() {
+    use strided_basic::execution::MINTHREADLENGTH;
+    use strided_basic::{
+        ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext,
+        KernelDType,
+    };
+    use strided_fused::ErasedFusedPlan;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    assert_eq!(
+        pool.current_num_threads(),
+        2,
+        "verify the pool really has two workers"
+    );
+
+    let len = MINTHREADLENGTH + 65;
+    let b: Vec<f64> = (0..len).map(|i| (i % 29) as f64 - 14.0).collect();
+    let a = [2.5f64];
+    let plan = FusedPlan {
+        input_count: 2,
+        outputs: vec![0, 3],
+        ops: vec![
+            FusedInst {
+                op: FusedOp::Conj,
+                inputs: vec![0],
+            },
+            FusedInst {
+                op: FusedOp::Multiply,
+                inputs: vec![2, 1],
+            },
+        ],
+    };
+    let erased = ErasedFusedPlan::compile(KernelDType::F64, plan).unwrap();
+    let dims = [len];
+    let unit = [1isize];
+    let broadcast = [0isize];
+    let mut pass_through = vec![MaybeUninit::<f64>::uninit(); len];
+    let mut product = vec![MaybeUninit::<f64>::uninit(); len];
+
+    ExecContext::run_on(&pool, 2, |ctx| {
+        assert_eq!(
+            rayon::current_num_threads(),
+            2,
+            "verify the effective worker count inside the pool"
+        );
+        // The raw pointer descriptors are built inside the worker closure so no
+        // non-`Send` descriptor has to cross the pool boundary; the borrowed
+        // input slices are `Sync`.
+        let a_ref = ErasedRawStridedRef::from_slice(&a, &dims, &broadcast, 0).unwrap();
+        let b_ref = ErasedRawStridedRef::from_slice(&b, &dims, &unit, 0).unwrap();
+        let pointers = [
+            ErasedRawStridedPtr::from_ref(&a_ref),
+            ErasedRawStridedPtr::from_ref(&b_ref),
+        ];
+        let mut dests = [
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut pass_through, &dims, &unit, 0)
+                .unwrap(),
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut product, &dims, &unit, 0).unwrap(),
+        ];
+        erased
+            .execute_outputs_uninit(&ctx, &mut dests, &pointers)
+            .unwrap();
+    })
+    .unwrap();
+
+    for index in 0..len {
+        // SAFETY: `execute_outputs_uninit` writes every reachable element.
+        let pass = unsafe { pass_through[index].assume_init() };
+        // SAFETY: as above.
+        let value = unsafe { product[index].assume_init() };
+        assert_eq!(pass, a[0], "pass-through element {index}");
+        assert_eq!(value, a[0] * b[index], "product element {index}");
+    }
+}

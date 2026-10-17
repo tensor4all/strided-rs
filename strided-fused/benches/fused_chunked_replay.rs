@@ -2,43 +2,55 @@
 //!
 //! The acceptance in #304 is that a fused region is at least as fast as
 //! dispatching the same instructions one at a time through the workspace's
-//! vector kernels. Both sides run the same ten-instruction chains with the same
-//! `elem-simd-math` kernels, on the reported `1024x64` region and a larger one,
-//! at one worker thread.
+//! vector kernels. Both sides run the same instruction chains over the reported
+//! `1024x64` and `4096x256` regions at one and four worker threads.
+//!
+//! The rows cover the two shapes that used to force the fused chain onto its
+//! interpreter: a stride-0 broadcast input on the blocked axis, and a plan whose
+//! shared chain feeds two live outputs.
 //!
 //! Run it as:
 //!
 //! ```text
-//! RAYON_NUM_THREADS=1 cargo bench -p strided-fused --bench fused_chunked_replay
+//! RAYON_NUM_THREADS=8 cargo bench -p strided-fused --features parallel --bench fused_chunked_replay
 //! ```
 //!
-//! The harness asserts the worker count and owns every buffer, view and plan,
-//! so the timed region holds only the operation itself (plus whatever the
-//! operation allocates internally, which is part of the measured path for both
-//! sides).
+//! The harness asserts the worker count it reports and owns every buffer, view
+//! and plan, so the timed region holds only the operation itself (plus whatever
+//! the operation allocates internally, which is part of the measured path for
+//! both sides).
 
 use core::mem::MaybeUninit;
 use std::hint::black_box;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use strided_basic::{
-    map_into_uninit_with_kernel, mul_into_uninit, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, ExecContext, KernelDType, KernelStorageElement, MaybeSendSync,
-    StridedView, StridedViewMut,
+    map_into_uninit_with_kernel, mul_into_uninit, with_execution_policy, zip_map2_into,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext,
+    ExecutionPolicy, KernelDType, KernelStorageElement, MaybeSendSync, StridedView, StridedViewMut,
 };
 use strided_fused::{
     fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan, FusedScalar,
 };
 
-/// The chains #304 reports: ten `tanh` over one input, ten `mul` by a second one.
+/// The instruction chains measured for each region.
 #[derive(Clone, Copy)]
-enum Chain {
+enum Row {
+    /// Ten `tanh` over one input.
     Tanh,
+    /// Ten `mul` by a second input.
     Mul,
+    /// Ten `mul` by a second input, with the first input broadcast on the
+    /// blocked axis (stride 0).
+    BroadcastMul,
+    /// Ten shared `mul` instructions plus `add(input0)`: two live outputs over
+    /// the same chain.
+    TwoOutput,
 }
 
-impl Chain {
+impl Row {
     fn plan(self) -> FusedPlan {
         match self {
             Self::Tanh => FusedPlan {
@@ -51,7 +63,7 @@ impl Chain {
                     })
                     .collect(),
             },
-            Self::Mul => FusedPlan {
+            Self::Mul | Self::BroadcastMul => FusedPlan {
                 input_count: 2,
                 outputs: vec![11],
                 ops: (0..10)
@@ -61,6 +73,23 @@ impl Chain {
                     })
                     .collect(),
             },
+            Self::TwoOutput => {
+                let mut ops: Vec<FusedInst> = (0..10)
+                    .map(|index| FusedInst {
+                        op: FusedOp::Multiply,
+                        inputs: vec![if index == 0 { 0 } else { 1 + index }, 1],
+                    })
+                    .collect();
+                ops.push(FusedInst {
+                    op: FusedOp::Add,
+                    inputs: vec![11, 0],
+                });
+                FusedPlan {
+                    input_count: 2,
+                    outputs: vec![11, 12],
+                    ops,
+                }
+            }
         }
     }
 
@@ -68,14 +97,27 @@ impl Chain {
         match self {
             Self::Tanh => "ten_tanh",
             Self::Mul => "ten_mul",
+            Self::BroadcastMul => "ten_mul_broadcast",
+            Self::TwoOutput => "ten_mul_add_two_output",
         }
     }
 
     fn inputs(self) -> usize {
         match self {
             Self::Tanh => 1,
-            Self::Mul => 2,
+            Self::Mul | Self::BroadcastMul | Self::TwoOutput => 2,
         }
+    }
+
+    fn outputs(self) -> usize {
+        match self {
+            Self::TwoOutput => 2,
+            _ => 1,
+        }
+    }
+
+    fn broadcast(self) -> bool {
+        matches!(self, Self::BroadcastMul)
     }
 }
 
@@ -86,13 +128,12 @@ trait BenchScalar:
     + Send
     + Sync
     + std::ops::Mul<Self, Output = Self>
+    + std::ops::Add<Self, Output = Self>
     + 'static
 {
     fn kernel_dtype() -> KernelDType;
     /// The vector kernel the per-instruction dispatch side calls.
     fn tanh_slice(src: &[Self], dst: &mut [MaybeUninit<Self>]);
-    /// `dst = a * b`, the arithmetic leaf of the `mul` chain.
-
     fn value(index: usize) -> Self;
 }
 
@@ -124,119 +165,212 @@ impl BenchScalar for f32 {
     }
 }
 
-/// Ten passes over the whole region, alternating between two preallocated
-/// buffers: exactly what dispatching the plan one instruction at a time
-/// through the workspace's kernels costs. The `tanh` chain goes through
-/// `map_into_uninit_with_kernel` with the `elem-simd-math` kernel, the `mul`
-/// chain through the workspace's own SIMD multiply. Pass 0 reads the input,
-/// pass `p` reads the buffer pass `p - 1` wrote.
-fn dispatch_ten<T: BenchScalar>(
-    chain: Chain,
-    a: &[T],
-    b: &[T],
-    buffers: &mut [Vec<MaybeUninit<T>>; 2],
+/// Ten multiplies over preallocated buffers, ping-ponging between `first` and
+/// `second`. The first pass reads `a_view` (which may be broadcast); pass `p`
+/// reads the buffer pass `p - 1` wrote. The result ends in `second`.
+fn ping_pong_mul<T: BenchScalar>(
+    a_view: &StridedView<'_, T>,
+    b_view: &StridedView<'_, T>,
+    dims: &[usize],
+    strides: &[isize],
+    len: usize,
+    first: &mut [MaybeUninit<T>],
+    second: &mut [MaybeUninit<T>],
 ) {
-    let len = a.len();
-    let dims = [len];
-    let strides = [1isize];
-    let b_view = StridedView::<T>::new(b, &dims, &strides, 0).unwrap();
-    for pass in 0..10 {
-        // SAFETY: pass 0 reads `a`; later passes read the buffer the previous
-        // pass wrote in full.
-        let source: &[T] = unsafe {
-            let pointer = if pass == 0 {
-                a.as_ptr()
-            } else {
-                buffers[1 - pass % 2].as_ptr().cast::<T>()
-            };
-            std::slice::from_raw_parts(pointer, len)
-        };
-        let destination = &mut buffers[pass % 2];
-        let mut dest = StridedViewMut::new(destination, &dims, &strides, 0).unwrap();
-        let src = StridedView::<T>::new(source, &dims, &strides, 0).unwrap();
-        match chain {
-            Chain::Tanh => map_into_uninit_with_kernel(
-                &mut dest,
-                &src,
-                |src: &[T], dst: &mut [MaybeUninit<T>]| {
-                    T::tanh_slice(src, dst);
-                    true
-                },
-                |value| value,
-            ),
-            Chain::Mul => mul_into_uninit(&mut dest, &src, &b_view),
+    {
+        let mut dest = StridedViewMut::new(first, dims, strides, 0).unwrap();
+        mul_into_uninit(&mut dest, a_view, b_view).unwrap();
+    }
+    for pass in 1..10 {
+        // SAFETY: `first`/`second` are distinct buffers; the raw read of one and
+        // the mutable borrow of the other do not overlap.
+        if pass % 2 == 1 {
+            let src_data: &[T] =
+                unsafe { std::slice::from_raw_parts(first.as_ptr().cast::<T>(), len) };
+            let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
+            let mut dest = StridedViewMut::new(second, dims, strides, 0).unwrap();
+            mul_into_uninit(&mut dest, &src, b_view).unwrap();
+        } else {
+            let src_data: &[T] =
+                unsafe { std::slice::from_raw_parts(second.as_ptr().cast::<T>(), len) };
+            let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
+            let mut dest = StridedViewMut::new(first, dims, strides, 0).unwrap();
+            mul_into_uninit(&mut dest, &src, b_view).unwrap();
         }
-        .unwrap();
     }
 }
 
-fn bench_size<T: BenchScalar>(c: &mut Criterion, label: &str, rows: usize, cols: usize) {
+/// Ten `tanh` passes over preallocated buffers, ping-ponging as
+/// [`ping_pong_mul`]. The result ends in `second`.
+fn ping_pong_tanh<T: BenchScalar>(
+    a_view: &StridedView<'_, T>,
+    dims: &[usize],
+    strides: &[isize],
+    len: usize,
+    first: &mut [MaybeUninit<T>],
+    second: &mut [MaybeUninit<T>],
+) {
+    let map = |dest: &mut [MaybeUninit<T>], src: &StridedView<'_, T>| {
+        let mut dest = StridedViewMut::new(dest, dims, strides, 0).unwrap();
+        map_into_uninit_with_kernel(
+            &mut dest,
+            src,
+            |src: &[T], dst: &mut [MaybeUninit<T>]| {
+                T::tanh_slice(src, dst);
+                true
+            },
+            |value| value,
+        )
+        .unwrap();
+    };
+    map(first, a_view);
+    for pass in 1..10 {
+        // SAFETY: as for `ping_pong_mul`.
+        let src_data: &[T] = unsafe {
+            let pointer = if pass % 2 == 1 {
+                first.as_ptr()
+            } else {
+                second.as_ptr()
+            };
+            std::slice::from_raw_parts(pointer.cast::<T>(), len)
+        };
+        let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
+        if pass % 2 == 1 {
+            map(second, &src);
+        } else {
+            map(first, &src);
+        }
+    }
+}
+
+/// The per-instruction dispatch cost: the same instructions one at a time
+/// through the workspace's vector kernels. For [`Row::TwoOutput`] the shared
+/// chain runs once; its buffer is both the first output and the input of the
+/// final `add(input0)` that produces the second output, and every op goes
+/// through a threaded kernel.
+#[allow(clippy::too_many_arguments)]
+fn per_instruction<T: BenchScalar>(
+    row: Row,
+    a_data: &[T],
+    a_strides: &[isize],
+    b_data: &[T],
+    b_strides: &[isize],
+    dims: &[usize],
+    len: usize,
+    buffers: &mut [Vec<MaybeUninit<T>>; 3],
+) {
+    let [buffer0, buffer1, buffer2] = buffers;
+    let a_view = StridedView::<T>::new(a_data, dims, a_strides, 0).unwrap();
+    let b_view = StridedView::<T>::new(b_data, dims, b_strides, 0).unwrap();
+    match row {
+        Row::Tanh => ping_pong_tanh(&a_view, dims, b_strides, len, buffer0, buffer1),
+        Row::Mul | Row::BroadcastMul => {
+            ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer0, buffer1)
+        }
+        Row::TwoOutput => {
+            // The shared chain runs once and ends in `buffer1`.
+            ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer0, buffer1);
+            // SAFETY: `buffer1` is read through a raw pointer while `buffer2`
+            // is written; they are distinct buffers.
+            let chain_data: &[T] =
+                unsafe { std::slice::from_raw_parts(buffer1.as_ptr().cast::<T>(), len) };
+            let chain = StridedView::<T>::new(chain_data, dims, b_strides, 0).unwrap();
+            let mut dest = StridedViewMut::new(buffer2, dims, b_strides, 0).unwrap();
+            zip_map2_into(&mut dest, &chain, &a_view, |x, y| MaybeUninit::new(x + y)).unwrap();
+        }
+    }
+}
+
+fn bench_size<T: BenchScalar>(
+    c: &mut Criterion,
+    label: &str,
+    rows: usize,
+    cols: usize,
+    threads: usize,
+) {
     let len = rows * cols;
     let dims = [rows, cols];
-    let strides = [1isize, rows as isize];
+    let cont = [1isize, rows as isize];
+    let broadcast = [0isize, 1isize];
 
-    let a: Vec<T> = (0..len).map(T::value).collect();
+    let a_full: Vec<T> = (0..len).map(T::value).collect();
+    let a_broadcast: Vec<T> = (0..cols).map(T::value).collect();
     let b: Vec<T> = (0..len).map(|index| T::value(index + 7)).collect();
 
-    for chain in [Chain::Tanh, Chain::Mul] {
-        let plan = chain.plan();
-        let group_name = format!("{label}_{}_{}x{}", chain.name(), rows, cols);
+    for row in [Row::Tanh, Row::Mul, Row::BroadcastMul, Row::TwoOutput] {
+        let plan = row.plan();
+        let group_name = format!("{label}_{}_{}x{}_{}t", row.name(), rows, cols, threads);
         let mut group = c.benchmark_group(group_name);
         group.measurement_time(Duration::from_secs(3));
 
+        let a_data: &[T] = if row.broadcast() {
+            &a_broadcast
+        } else {
+            &a_full
+        };
+        let a_strides: &[isize] = if row.broadcast() { &broadcast } else { &cont };
+
         // Typed initialized entry.
-        let mut typed_out = vec![T::value(0); len];
-        let mut typed_dests =
-            vec![StridedViewMut::new(&mut typed_out, &dims, &strides, 0).unwrap()];
-        let views: Vec<StridedView<'_, T>> = if chain.inputs() == 1 {
-            vec![StridedView::new(&a, &dims, &strides, 0).unwrap()]
+        let output_count = row.outputs();
+        let mut typed_outputs: Vec<Vec<T>> =
+            (0..output_count).map(|_| vec![T::value(0); len]).collect();
+        let input_views: Vec<StridedView<'_, T>> = if row.inputs() == 1 {
+            vec![StridedView::<T>::new(a_data, &dims, a_strides, 0).unwrap()]
         } else {
             vec![
-                StridedView::new(&a, &dims, &strides, 0).unwrap(),
-                StridedView::new(&b, &dims, &strides, 0).unwrap(),
+                StridedView::<T>::new(a_data, &dims, a_strides, 0).unwrap(),
+                StridedView::<T>::new(&b, &dims, &cont, 0).unwrap(),
             ]
         };
-        group.bench_function("fused_typed", |bencher| {
-            bencher.iter(|| {
-                fused_elementwise_into(&mut typed_dests, &views, &plan).unwrap();
-                black_box(typed_dests[0].as_mut_ptr());
+        {
+            let mut typed_views: Vec<StridedViewMut<'_, T>> = typed_outputs
+                .iter_mut()
+                .map(|data| StridedViewMut::new(data, &dims, &cont, 0).unwrap())
+                .collect();
+            group.bench_function("fused_typed", |bencher| {
+                bencher.iter(|| {
+                    fused_elementwise_into(&mut typed_views, &input_views, &plan).unwrap();
+                    black_box(typed_views[0].as_mut_ptr());
+                });
             });
-        });
+        }
 
         // Erased uninitialized entry, which is what tenferro's fused lane calls.
         let erased = ErasedFusedPlan::compile(T::kernel_dtype(), plan.clone()).unwrap();
-        let refs: Vec<ErasedRawStridedRef<'_>> = if chain.inputs() == 1 {
-            vec![ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap()]
+        let a_ref = ErasedRawStridedRef::from_slice(a_data, &dims, a_strides, 0).unwrap();
+        let b_ref = ErasedRawStridedRef::from_slice(&b, &dims, &cont, 0).unwrap();
+        let refs = if row.inputs() == 1 {
+            vec![a_ref]
         } else {
-            vec![
-                ErasedRawStridedRef::from_slice(&a, &dims, &strides, 0).unwrap(),
-                ErasedRawStridedRef::from_slice(&b, &dims, &strides, 0).unwrap(),
-            ]
+            vec![a_ref, b_ref]
         };
-        let ptrs: Vec<ErasedRawStridedPtr<'_>> =
+        let pointers: Vec<ErasedRawStridedPtr<'_>> =
             refs.iter().map(ErasedRawStridedPtr::from_ref).collect();
-        let mut uninit_out = vec![MaybeUninit::<T>::uninit(); len];
-        let mut uninit_dest =
-            ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit_out, &dims, &strides, 0)
-                .unwrap();
-        let ctx = ExecContext::serial();
+        let mut uninitialized_outputs: Vec<Vec<MaybeUninit<T>>> = (0..output_count)
+            .map(|_| vec![MaybeUninit::uninit(); len])
+            .collect();
+        let mut erased_views: Vec<ErasedRawStridedUninitMut<'_>> = uninitialized_outputs
+            .iter_mut()
+            .map(|data| {
+                ErasedRawStridedUninitMut::from_uninit_slice(data, &dims, &cont, 0).unwrap()
+            })
+            .collect();
+        let ctx = ExecContext::ambient();
         group.bench_function("fused_erased_uninit", |bencher| {
             bencher.iter(|| {
                 erased
-                    .execute_uninit(&ctx, &mut uninit_dest, &ptrs)
+                    .execute_outputs_uninit(&ctx, &mut erased_views, &pointers)
                     .unwrap();
-                black_box(uninit_dest.dims());
+                black_box(erased_views[0].dims());
             });
         });
 
         // One instruction at a time over preallocated buffers.
-        let mut buffers = [
-            vec![MaybeUninit::<T>::uninit(); len],
-            vec![MaybeUninit::<T>::uninit(); len],
-        ];
+        let mut buffers: [Vec<MaybeUninit<T>>; 3] =
+            std::array::from_fn(|_| vec![MaybeUninit::uninit(); len]);
         group.bench_function("per_instruction_dispatch", |bencher| {
             bencher.iter(|| {
-                dispatch_ten(chain, &a, &b, &mut buffers);
+                per_instruction(row, a_data, a_strides, &b, &cont, &dims, len, &mut buffers);
                 black_box(buffers[0].as_ptr());
             });
         });
@@ -245,15 +379,37 @@ fn bench_size<T: BenchScalar>(c: &mut Criterion, label: &str, rows: usize, cols:
     }
 }
 
+#[cfg(feature = "parallel")]
+fn thread_counts() -> [usize; 2] {
+    [1, 4]
+}
+
+#[cfg(not(feature = "parallel"))]
+fn thread_counts() -> [usize; 1] {
+    [1]
+}
+
 fn benchmarks(c: &mut Criterion) {
-    assert_eq!(
-        rayon::current_num_threads(),
-        1,
-        "run with RAYON_NUM_THREADS=1: the numbers must belong to one worker thread"
-    );
-    for (rows, cols) in [(1024, 64), (4096, 256)] {
-        bench_size::<f64>(c, "f64", rows, cols);
-        bench_size::<f32>(c, "f32", rows, cols);
+    for threads in thread_counts() {
+        if threads > 1 {
+            assert!(
+                rayon::current_num_threads() >= threads,
+                "run with RAYON_NUM_THREADS>={threads} so the {threads}-thread rows are real"
+            );
+        }
+        let policy = if threads == 1 {
+            ExecutionPolicy::Sequential
+        } else {
+            ExecutionPolicy::Rayon {
+                max_threads: NonZeroUsize::new(threads).unwrap(),
+            }
+        };
+        with_execution_policy(policy, || {
+            for (rows, cols) in [(1024usize, 64usize), (4096, 256)] {
+                bench_size::<f64>(c, "f64", rows, cols, threads);
+                bench_size::<f32>(c, "f32", rows, cols, threads);
+            }
+        });
     }
 }
 

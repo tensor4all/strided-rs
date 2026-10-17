@@ -5,14 +5,16 @@
 //! fused region is slower than dispatching the same instructions one at a time
 //! through this workspace's vector kernels (tensor4all/strided-rs#304).
 //!
-//! This module replays a **contiguous block** — every operand unit-stride
-//! along the block's innermost axis — through chunk-sized register buffers:
-//! load each input chunk once, run every instruction over the chunk with a
-//! monomorphized kernel, store the output chunks once. Values in the large
-//! arrays are read and written once, and the intermediates stay in L1.
+//! This module replays a **contiguous block** — every output unit-stride along
+//! the block's innermost axis and every input unit-stride or broadcast (stride
+//! 0) along it — through chunk-sized register buffers: load each input chunk
+//! once, run every instruction over the chunk with a monomorphized kernel, store
+//! the output chunks once. Values in the large arrays are read and written once,
+//! and the intermediates stay in L1. A stride-0 input has one value for the whole
+//! block, so its register chunk is filled from that value once per block.
 //!
-//! A block that is not contiguous for every operand, a rank-zero block, and any
-//! scalar that is not `f32`/`f64` keep the per-element interpreter.
+//! A block with any other stride, a rank-zero block, and any scalar that is not
+//! `f32`/`f64` keep the per-element interpreter.
 
 use core::mem::{align_of, size_of, MaybeUninit};
 use std::any::TypeId;
@@ -31,13 +33,24 @@ pub(super) fn register_file_len(plan: &FusedPlan) -> usize {
     (plan.input_count + plan.ops.len()) * FUSED_CHUNK_ELEMS
 }
 
-/// True when the block's innermost stride is 1 for every operand.
+/// True when the block can be replayed through the register machine.
 ///
-/// `strides` carries one entry per operand (outputs first, then inputs) and is
-/// empty for a rank-zero block, which therefore falls back.
+/// `strides` carries one entry per operand (outputs first, then inputs). Every
+/// output stride must be 1, and every input stride must be 1 (a contiguous
+/// load) or 0 (a broadcast value). Any other stride falls back to the
+/// per-element interpreter, as does a rank-zero block, whose `strides` is empty.
 #[inline]
-pub(super) fn block_is_contiguous(strides: &[isize], operands: usize) -> bool {
-    strides.len() == operands && !strides.is_empty() && strides.iter().all(|&stride| stride == 1)
+pub(super) fn block_replay_eligible(
+    strides: &[isize],
+    output_count: usize,
+    operands: usize,
+) -> bool {
+    if strides.len() != operands || strides.is_empty() {
+        return false;
+    }
+    let (outputs, inputs) = strides.split_at(output_count);
+    outputs.iter().all(|&stride| stride == 1)
+        && inputs.iter().all(|&stride| stride == 0 || stride == 1)
 }
 
 /// Input registers that exactly one instruction reads. Their chunk is read
@@ -75,29 +88,46 @@ pub(super) fn new_register_file<T: FusedScalar>(plan: &FusedPlan, seed: T) -> Ve
     vec![seed; register_file_len(plan)]
 }
 
-/// Replay one contiguous block into initialized destinations.
+/// Replay one eligible block into initialized destinations.
 ///
 /// # Safety
 /// Each entry of `dst_ptrs` and `input_ptrs` must address `offsets[i]` plus
 /// `len` contiguous readable (inputs) or writable (outputs) elements, the plan
-/// must be validated for these operand counts, and `regs` must hold
-/// [`register_file_len`] elements.
+/// must be validated for these operand counts, `strides` must satisfy
+/// [`block_replay_eligible`], and `regs` must hold [`register_file_len`]
+/// elements.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn replay_chunked<T: FusedScalar>(
     dst_ptrs: &[*mut T],
     input_ptrs: &[*const T],
     plan: &FusedPlan,
     offsets: &[isize],
     len: usize,
+    strides: &[isize],
     direct: &[bool],
     regs: &mut [T],
 ) {
     let output_count = dst_ptrs.len();
+    // SAFETY: the caller proved every operand addresses this block's `len`
+    // contiguous elements, so the broadcast value is readable.
+    unsafe { fill_broadcast_inputs(input_ptrs, offsets, output_count, strides, regs) };
     let mut done = 0;
     while done < len {
         let chunk = (len - done).min(FUSED_CHUNK_ELEMS);
         // SAFETY: the caller proved every operand addresses this block's `len`
         // contiguous elements, so the chunk is inside the operand.
-        unsafe { load_input_chunks(input_ptrs, offsets, output_count, direct, done, chunk, regs) };
+        unsafe {
+            load_input_chunks(
+                input_ptrs,
+                offsets,
+                output_count,
+                direct,
+                strides,
+                done,
+                chunk,
+                regs,
+            )
+        };
         // SAFETY: as for the load.
         unsafe {
             run_chunks(
@@ -117,56 +147,108 @@ pub(super) unsafe fn replay_chunked<T: FusedScalar>(
     }
 }
 
-/// Replay one contiguous block into uninitialized storage.
+/// Replay one eligible block into uninitialized destinations.
 ///
 /// # Safety
-/// As for [`replay_chunked`], with `dst_ptr` addressing `offsets[0]` plus `len`
-/// writable `MaybeUninit<T>` elements. Every reachable element is written.
+/// As for [`replay_chunked`], with each entry of `dst_ptrs` addressing
+/// `offsets[i]` plus `len` writable `MaybeUninit<T>` elements. Every reachable
+/// element is written.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn replay_chunked_uninit<T: FusedScalar>(
-    dst_ptr: *mut MaybeUninit<T>,
+    dst_ptrs: &[*mut MaybeUninit<T>],
     input_ptrs: &[*const T],
     plan: &FusedPlan,
     offsets: &[isize],
     len: usize,
+    strides: &[isize],
     direct: &[bool],
     regs: &mut [T],
 ) {
+    let output_count = dst_ptrs.len();
+    // SAFETY: the caller proved every operand addresses this block's `len`
+    // contiguous elements, so the broadcast value is readable.
+    unsafe { fill_broadcast_inputs(input_ptrs, offsets, output_count, strides, regs) };
     let mut done = 0;
     while done < len {
         let chunk = (len - done).min(FUSED_CHUNK_ELEMS);
         // SAFETY: the caller proved every operand addresses this block's `len`
         // contiguous elements, so the chunk is inside the operand.
-        unsafe { load_input_chunks(input_ptrs, offsets, 1, direct, done, chunk, regs) };
-        // SAFETY: as for the load.
-        unsafe { run_chunks(plan, chunk, input_ptrs, offsets, 1, direct, done, regs) };
-        // SAFETY: as for the load, and the destination chunk is writable.
         unsafe {
-            let dst =
-                std::slice::from_raw_parts_mut(dst_ptr.offset(offsets[0] + done as isize), chunk);
-            let values = &regs[plan.outputs[0] * FUSED_CHUNK_ELEMS..][..chunk];
-            for (slot, &value) in dst.iter_mut().zip(values) {
-                slot.write(value);
-            }
-        }
+            load_input_chunks(
+                input_ptrs,
+                offsets,
+                output_count,
+                direct,
+                strides,
+                done,
+                chunk,
+                regs,
+            )
+        };
+        // SAFETY: as for the load.
+        unsafe {
+            run_chunks(
+                plan,
+                chunk,
+                input_ptrs,
+                offsets,
+                output_count,
+                direct,
+                done,
+                regs,
+            )
+        };
+        // SAFETY: as for the load, and the destination chunks are writable.
+        unsafe { store_output_chunks_uninit(dst_ptrs, plan, offsets, done, chunk, regs) };
         done += chunk;
+    }
+}
+
+/// Fill the register chunk of every stride-0 input with its single value.
+///
+/// A stride-0 operand is constant across the block, so its value is read once
+/// per block instead of once per chunk. Instructions only write registers
+/// `input_count..`, so the filled input register survives every later chunk.
+///
+/// # Safety
+/// Every operand must address a readable element at its block offset.
+#[inline]
+unsafe fn fill_broadcast_inputs<T: FusedScalar>(
+    input_ptrs: &[*const T],
+    offsets: &[isize],
+    first_operand: usize,
+    strides: &[isize],
+    regs: &mut [T],
+) {
+    for (index, &ptr) in input_ptrs.iter().enumerate() {
+        if strides[first_operand + index] != 0 {
+            continue;
+        }
+        // SAFETY: the caller proved the operand addresses this block.
+        let value = unsafe { *ptr.offset(offsets[first_operand + index]) };
+        regs[index * FUSED_CHUNK_ELEMS..][..FUSED_CHUNK_ELEMS].fill(value);
     }
 }
 
 /// # Safety
 /// See [`replay_chunked`]; `first_operand` is the index of the first input in
-/// `offsets` (the output count).
+/// `offsets` (the output count). Only stride-1 inputs that are not `direct` are
+/// copied here; stride-0 inputs were already filled by
+/// [`fill_broadcast_inputs`].
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn load_input_chunks<T: FusedScalar>(
     input_ptrs: &[*const T],
     offsets: &[isize],
     first_operand: usize,
     direct: &[bool],
+    strides: &[isize],
     done: usize,
     chunk: usize,
     regs: &mut [T],
 ) {
     for (index, &ptr) in input_ptrs.iter().enumerate() {
-        if direct[index] {
+        if direct[index] || strides[first_operand + index] == 0 {
             continue;
         }
         // SAFETY: the caller proved the block is contiguous for this operand.
@@ -197,6 +279,31 @@ unsafe fn store_output_chunks<T: FusedScalar>(
             std::slice::from_raw_parts_mut(ptr.offset(offsets[index] + done as isize), chunk)
         };
         dst.copy_from_slice(&regs[plan.outputs[index] * FUSED_CHUNK_ELEMS..][..chunk]);
+    }
+}
+
+/// Store every destination's chunk from its output register.
+///
+/// # Safety
+/// See [`replay_chunked_uninit`].
+#[inline]
+unsafe fn store_output_chunks_uninit<T: FusedScalar>(
+    dst_ptrs: &[*mut MaybeUninit<T>],
+    plan: &FusedPlan,
+    offsets: &[isize],
+    done: usize,
+    chunk: usize,
+    regs: &[T],
+) {
+    for (index, &ptr) in dst_ptrs.iter().enumerate() {
+        // SAFETY: the caller proved the block is contiguous for this operand.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(ptr.offset(offsets[index] + done as isize), chunk)
+        };
+        let values = &regs[plan.outputs[index] * FUSED_CHUNK_ELEMS..][..chunk];
+        for (slot, &value) in dst.iter_mut().zip(values) {
+            slot.write(value);
+        }
     }
 }
 
