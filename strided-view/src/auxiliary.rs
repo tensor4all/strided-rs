@@ -35,7 +35,8 @@
 /// ```
 pub fn index_order(strides: &[isize]) -> crate::AxisVec {
     let n = strides.len();
-    let mut result = crate::AxisVec::from_elem(1usize, n);
+    let mut result = crate::AxisVec::new();
+    result.resize(n, 1usize);
 
     for i in 0..n {
         let si = strides[i].unsigned_abs();

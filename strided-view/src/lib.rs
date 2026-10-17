@@ -61,7 +61,7 @@ pub const INLINE_RANK: usize = 8;
 /// let strides: StrideVec = [1isize, 2, 4].into_iter().collect();
 /// assert_eq!(&strides[..], &[1, 2, 4]);
 /// ```
-pub type StrideVec = smallvec::SmallVec<[isize; INLINE_RANK]>;
+pub type StrideVec = tinyvec::TinyVec<[isize; INLINE_RANK]>;
 
 /// Axis metadata with inline storage for up to [`INLINE_RANK`] dimensions.
 ///
@@ -75,7 +75,7 @@ pub type StrideVec = smallvec::SmallVec<[isize; INLINE_RANK]>;
 /// let axes: AxisVec = [3usize, 1, 2].into_iter().collect();
 /// assert_eq!(&axes[..], &[3, 1, 2]);
 /// ```
-pub type AxisVec = smallvec::SmallVec<[usize; INLINE_RANK]>;
+pub type AxisVec = tinyvec::TinyVec<[usize; INLINE_RANK]>;
 
 // ============================================================================
 // Element operations

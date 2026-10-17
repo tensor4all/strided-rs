@@ -12,121 +12,84 @@
 //! transform allocates nothing up to that rank and spills gracefully above
 //! it. The view itself only borrows the element data.
 //!
-//! The container is deliberately not `smallvec::SmallVec`: the generic
-//! `SmallVec` clone/`from_slice` walks elements and does capacity
-//! bookkeeping, which dominates a metadata copy of a handful of words. See
-//! [`InlineVec`].
+//! The metadata container is `tinyvec::ArrayVec`, unified across tensor4all
+//! repositories (tensor4all-agent-rules#22, strided-rs#312). `ArrayVec` is
+//! `Copy` for `Copy` items, so a clone is one fixed-size bitwise copy, and the
+//! heap fallback for rank above [`INLINE_RANK`] lives in a separate
+//! `Option<Box<SpilledMeta>>` so the inline value has no drop glue.
 
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
 
-use smallvec::SmallVec;
+use tinyvec::ArrayVec;
 
 use crate::element_op::{ComposableElementOp, ElementOp, ElementOpApply, Identity};
 use crate::{AxisVec, Result, StrideVec, StridedError, INLINE_RANK};
 
-/// Inline metadata for up to [`INLINE_RANK`] elements, stored as a `Copy`
-/// fixed array.
+/// Build an `ArrayVec` from at most [`INLINE_RANK`] elements.
 ///
-/// The buffer is `MaybeUninit` so only the live prefix is ever written; the
-/// value is nevertheless `Copy`, and its `Copy`/`Clone` is one fixed-size
-/// bitwise copy (the uninitialized tail is never read as `T`). An owning enum
-/// variant would add drop glue to every clone, and a runtime-length copy is
-/// lowered to a `memcpy` PLT call; this has neither.
-#[derive(Clone, Copy)]
-struct InlineVec<T: Copy> {
-    len: u8,
-    buf: [MaybeUninit<T>; INLINE_RANK],
-}
-
-impl<T: Copy> InlineVec<T> {
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            len: 0,
-            buf: [MaybeUninit::uninit(); INLINE_RANK],
+/// The value is written with literal-count arms: a runtime-length
+/// `copy_from_slice` or loop is recognized by LLVM and lowered to a `memcpy`
+/// PLT call, whose overhead dominates a handful of words.
+#[inline(always)]
+fn arrayvec_from_slice<T: Copy + Default>(src: &[T]) -> ArrayVec<[T; INLINE_RANK]> {
+    debug_assert!(src.len() <= INLINE_RANK);
+    let n = src.len();
+    let mut buf = [T::default(); INLINE_RANK];
+    match n {
+        0 => {}
+        1 => buf[0] = src[0],
+        2 => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+        }
+        3 => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+            buf[2] = src[2];
+        }
+        4 => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+            buf[2] = src[2];
+            buf[3] = src[3];
+        }
+        5 => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+            buf[2] = src[2];
+            buf[3] = src[3];
+            buf[4] = src[4];
+        }
+        6 => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+            buf[2] = src[2];
+            buf[3] = src[3];
+            buf[4] = src[4];
+            buf[5] = src[5];
+        }
+        7 => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+            buf[2] = src[2];
+            buf[3] = src[3];
+            buf[4] = src[4];
+            buf[5] = src[5];
+            buf[6] = src[6];
+        }
+        _ => {
+            buf[0] = src[0];
+            buf[1] = src[1];
+            buf[2] = src[2];
+            buf[3] = src[3];
+            buf[4] = src[4];
+            buf[5] = src[5];
+            buf[6] = src[6];
+            buf[7] = src[7];
         }
     }
-
-    #[inline(always)]
-    fn from_slice(src: &[T]) -> Self {
-        debug_assert!(src.len() <= INLINE_RANK);
-        let n = src.len();
-        let mut buf = [MaybeUninit::<T>::uninit(); INLINE_RANK];
-        // Literal-count writes: a runtime-length loop or `copy_from_slice` is
-        // recognized by LLVM and lowered to a `memcpy` call, whose PLT
-        // overhead dominates these few words.
-        match n {
-            0 => {}
-            1 => {
-                buf[0].write(src[0]);
-            }
-            2 => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-            }
-            3 => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-                buf[2].write(src[2]);
-            }
-            4 => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-                buf[2].write(src[2]);
-                buf[3].write(src[3]);
-            }
-            5 => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-                buf[2].write(src[2]);
-                buf[3].write(src[3]);
-                buf[4].write(src[4]);
-            }
-            6 => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-                buf[2].write(src[2]);
-                buf[3].write(src[3]);
-                buf[4].write(src[4]);
-                buf[5].write(src[5]);
-            }
-            7 => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-                buf[2].write(src[2]);
-                buf[3].write(src[3]);
-                buf[4].write(src[4]);
-                buf[5].write(src[5]);
-                buf[6].write(src[6]);
-            }
-            _ => {
-                buf[0].write(src[0]);
-                buf[1].write(src[1]);
-                buf[2].write(src[2]);
-                buf[3].write(src[3]);
-                buf[4].write(src[4]);
-                buf[5].write(src[5]);
-                buf[6].write(src[6]);
-                buf[7].write(src[7]);
-            }
-        }
-        Self { len: n as u8, buf }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[T] {
-        // SAFETY: the first `len` elements are initialized by `from_slice`,
-        // and the `Copy`/`Clone` of the container preserves those bytes.
-        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const T, self.len as usize) }
-    }
-}
-
-impl<T: Copy + std::fmt::Debug> std::fmt::Debug for InlineVec<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_slice().fmt(f)
-    }
+    ArrayVec::from_array_len(buf, n)
 }
 
 /// Heap-owned metadata used only above [`INLINE_RANK`].
@@ -138,14 +101,14 @@ struct SpilledMeta {
 
 /// Shape and strides of a view or array.
 ///
-/// Rank `<= INLINE_RANK` is stored inline in two [`InlineVec`]s and the
+/// Rank `<= INLINE_RANK` is stored inline in two `ArrayVec`s and the
 /// `spilled` slot is `None`, so cloning the whole metadata is a fixed-size
-/// copy with one predictable `None` check. A higher rank keeps the inline
-/// buffers empty and boxes both vectors.
+/// bitwise copy with one predictable `None` check. A higher rank keeps the
+/// inline buffers empty and boxes both vectors.
 #[derive(Debug)]
 struct ViewMeta {
-    inline_dims: InlineVec<usize>,
-    inline_strides: InlineVec<isize>,
+    inline_dims: ArrayVec<[usize; INLINE_RANK]>,
+    inline_strides: ArrayVec<[isize; INLINE_RANK]>,
     spilled: Option<Box<SpilledMeta>>,
 }
 
@@ -166,14 +129,14 @@ impl ViewMeta {
         debug_assert_eq!(dims.len(), strides.len());
         if dims.len() <= INLINE_RANK {
             Self {
-                inline_dims: InlineVec::from_slice(dims),
-                inline_strides: InlineVec::from_slice(strides),
+                inline_dims: arrayvec_from_slice(dims),
+                inline_strides: arrayvec_from_slice(strides),
                 spilled: None,
             }
         } else {
             Self {
-                inline_dims: InlineVec::new(),
-                inline_strides: InlineVec::new(),
+                inline_dims: ArrayVec::new(),
+                inline_strides: ArrayVec::new(),
                 spilled: Some(Box::new(SpilledMeta {
                     dims: dims.into(),
                     strides: strides.into(),
@@ -311,7 +274,8 @@ pub fn col_major_strides(dims: &[usize]) -> StrideVec {
     if rank == 0 {
         return StrideVec::new();
     }
-    let mut strides = StrideVec::from_elem(1isize, rank);
+    let mut strides = StrideVec::new();
+    strides.resize(rank, 1isize);
     for i in 1..rank {
         strides[i] = strides[i - 1] * dims[i - 1] as isize;
     }
@@ -337,7 +301,8 @@ pub fn row_major_strides(dims: &[usize]) -> StrideVec {
     if rank == 0 {
         return StrideVec::new();
     }
-    let mut strides = StrideVec::from_elem(1isize, rank);
+    let mut strides = StrideVec::new();
+    strides.resize(rank, 1isize);
     for i in (0..rank - 1).rev() {
         strides[i] = strides[i + 1] * dims[i + 1] as isize;
     }
@@ -546,7 +511,8 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
-        let mut seen: SmallVec<[bool; INLINE_RANK]> = SmallVec::from_elem(false, rank);
+        let mut seen: tinyvec::TinyVec<[bool; INLINE_RANK]> = tinyvec::TinyVec::new();
+        seen.resize(rank, false);
         for &p in perm {
             if p >= rank {
                 return Err(StridedError::InvalidAxis { axis: p, rank });
@@ -583,10 +549,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// `A[i,i,j]` shape=`[n,n,m]` strides=`[s0,s1,s2]` -> shape=`[n,m]` strides=`[s0+s1, s2]`
     pub fn diagonal_view(&self, axis_pairs: &[(usize, usize)]) -> Result<StridedView<'a, T, Op>> {
         let ndim = self.ndim();
-        let mut dims: AxisVec = SmallVec::from_slice(self.dims());
-        let mut strides: StrideVec = SmallVec::from_slice(self.strides());
+        let mut dims: AxisVec = AxisVec::new();
+        dims.extend_from_slice(self.dims());
+        let mut strides: StrideVec = StrideVec::new();
+        strides.extend_from_slice(self.strides());
 
-        let mut axes_to_remove: SmallVec<[usize; INLINE_RANK]> = SmallVec::new();
+        let mut axes_to_remove: tinyvec::TinyVec<[usize; INLINE_RANK]> = tinyvec::TinyVec::new();
         for &(a, b) in axis_pairs {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             if hi >= ndim {
@@ -609,8 +577,13 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         }
 
         axes_to_remove.sort_unstable();
-        axes_to_remove.dedup();
-        for &ax in axes_to_remove.iter().rev() {
+        let mut unique_axes: tinyvec::TinyVec<[usize; INLINE_RANK]> = tinyvec::TinyVec::new();
+        for &axis in axes_to_remove.iter() {
+            if unique_axes.last() != Some(&axis) {
+                unique_axes.push(axis);
+            }
+        }
+        for &ax in unique_axes.iter().rev() {
             dims.remove(ax);
             strides.remove(ax);
         }
@@ -888,7 +861,8 @@ impl<'a, T> StridedViewMut<'a, T> {
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
-        let mut seen: SmallVec<[bool; INLINE_RANK]> = SmallVec::from_elem(false, rank);
+        let mut seen: tinyvec::TinyVec<[bool; INLINE_RANK]> = tinyvec::TinyVec::new();
+        seen.resize(rank, false);
         for &p in perm {
             if p >= rank {
                 return Err(StridedError::InvalidAxis { axis: p, rank });
@@ -1054,7 +1028,8 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = col_major_strides(dims);
         let rank = dims.len();
         let mut data = Vec::with_capacity(total);
-        let mut idx: AxisVec = SmallVec::from_elem(0usize, rank);
+        let mut idx: AxisVec = AxisVec::new();
+        idx.resize(rank, 0usize);
         for _ in 0..total {
             data.push(f(&idx));
             for d in 0..rank {
@@ -1080,7 +1055,8 @@ impl<T: Clone + Default> StridedArray<T> {
         let strides = row_major_strides(dims);
         let rank = dims.len();
         let mut data = Vec::with_capacity(total);
-        let mut idx: AxisVec = SmallVec::from_elem(0usize, rank);
+        let mut idx: AxisVec = AxisVec::new();
+        idx.resize(rank, 0usize);
         for _ in 0..total {
             data.push(f(&idx));
             for d in (0..rank).rev() {
@@ -1199,7 +1175,8 @@ impl<T> StridedArray<T> {
         if perm.len() != rank {
             return Err(StridedError::RankMismatch(perm.len(), rank));
         }
-        let mut seen: SmallVec<[bool; INLINE_RANK]> = SmallVec::from_elem(false, rank);
+        let mut seen: tinyvec::TinyVec<[bool; INLINE_RANK]> = tinyvec::TinyVec::new();
+        seen.resize(rank, false);
         for &p in perm {
             if p >= rank {
                 return Err(StridedError::InvalidAxis { axis: p, rank });
