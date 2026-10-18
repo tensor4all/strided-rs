@@ -791,12 +791,41 @@ fn parallel_simd_sum<T: Copy + Zero + Add<Output = T> + simd::MaybeSimdOps + Sen
 }
 
 /// Sum all elements: `sum(src)`.
+///
+/// # Evaluation order
+///
+/// The result is independent of the ambient pool width when the call runs under
+/// the sequential policy — [`ExecContext::serial`](crate::ExecContext::serial)
+/// or [`with_execution_policy`](crate::with_execution_policy) with
+/// [`ExecutionPolicy::Sequential`](crate::ExecutionPolicy::Sequential). Under a
+/// parallel policy a contiguous identity operand above the threading threshold
+/// is summed per worker and the partial sums are combined in a tree, so the
+/// result is repeatable for a fixed thread count but can differ between thread
+/// counts.
+///
+/// Neither path is a strict left to right sum: a contiguous run is folded with
+/// independent SIMD or scalar lanes (see [`reduce`] for the lane scheme of the
+/// generic path). The last bits can therefore differ from a naive loop, and no
+/// bitwise equality across machines or target features is guaranteed.
+///
+/// For a deterministic accumulation of `f32` data in `f64`, use
+/// [`zip_reduce`](crate::zip_reduce) with an `f64` map and a `0.0f64` init.
+///
+/// # Allocation
+///
+/// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
+/// the traversal plan are stored inline, so a call performs no heap allocation.
 pub fn sum<
     T: Copy + Zero + Add<Output = T> + MaybeSendSync + simd::MaybeSimdOps,
     Op: ElementOp<T>,
 >(
     src: &StridedView<T, Op>,
 ) -> Result<T> {
+    // A zero-element sum is the additive identity. Return before any planning
+    // so an empty view with an enormous stride never reaches block sizing.
+    if total_len(src.dims())? == 0 {
+        return Ok(T::zero());
+    }
     // SIMD fast path: contiguous Identity view with SIMD support
     if Op::IS_IDENTITY {
         if same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
@@ -822,6 +851,26 @@ pub fn sum<
 ///
 /// Operands may have different element types. Result type `R` must be `A * B`.
 /// SIMD fast path fires only when `A == B == R` (same type) and both Identity ops.
+///
+/// A widening dot — `f32` operands with an `f64` accumulator — is not
+/// expressible here because `R` is pinned to `A * B`; use
+/// [`zip_reduce`](crate::zip_reduce) with a
+/// `|x, y| x as f64 * y as f64` map instead.
+///
+/// # Evaluation order
+///
+/// This entry takes no parallel branch, so its result does not depend on the
+/// ambient pool width at all: it is computed on the calling thread whatever the
+/// execution policy is. The homogeneous contiguous fast path folds with the SIMD
+/// lane scheme of the element type; every other layout folds a single
+/// accumulator along the traversal order of the fused plan, which is left to
+/// right over each unit-stride run. Neither is guaranteed to be bitwise equal
+/// across machines or target features.
+///
+/// # Allocation
+///
+/// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
+/// the traversal plan are stored inline, so a call performs no heap allocation.
 pub fn dot<A, B, R, OpA, OpB>(a: &StridedView<A, OpA>, b: &StridedView<B, OpB>) -> Result<R>
 where
     A: Copy + Mul<B, Output = R> + MaybeSendSync + 'static,
@@ -838,6 +887,13 @@ where
     let b_strides = b.strides();
     let a_dims = a.dims();
     let len = total_len(a_dims)?;
+
+    // A zero-element dot product is the additive identity. Return before any
+    // planning so an empty view with an enormous stride never reaches block
+    // sizing.
+    if len == 0 {
+        return Ok(R::zero());
+    }
 
     if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
         // SIMD fast path: both contiguous, both Identity ops, same type

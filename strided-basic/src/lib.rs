@@ -30,7 +30,14 @@
 //! ## Reduce Operations
 //!
 //! - [`reduce`]: Full reduction with map function
+//! - [`zip_reduce`]: Two-input full reduction with a map function (the
+//!   widening route, e.g. `f32` operands accumulated in `f64`)
 //! - [`reduce_axis`]: Reduce along a single axis
+//!
+//! A reduction that can fan out (`reduce`, `zip_reduce`, `sum`) gives a result
+//! that is independent of the ambient pool width only under the sequential
+//! policy; `dot` never enters a parallel branch, so its result does not depend
+//! on the pool at all. See each entry's evaluation-order section.
 //!
 //! ## Basic Operations
 //!
@@ -111,7 +118,7 @@ pub use ops_view::{
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,
 };
-pub use reduce_view::{reduce, reduce_axis, reduce_axis_into};
+pub use reduce_view::{reduce, reduce_axis, reduce_axis_into, zip_reduce};
 pub use simd::MaybeSimdOps;
 pub use strided_view::view;
 pub use strided_view::*;

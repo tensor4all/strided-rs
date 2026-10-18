@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use strided_basic::{
     add, axpy, batched_outer_product_into, col_major_strides, dot, embed_diagonal_into_uninit, fma,
-    map_into, map_update_into, mul, reduce_axis_into, symmetrize_into, with_execution_policy,
-    zip_map2_into, zip_map3_into, zip_map4_into, zip_update2_into, zip_update3_into,
-    ExecutionPolicy, Identity, StridedArray, StridedView, StridedViewMut,
+    map_into, map_update_into, mul, reduce, reduce_axis_into, sum, symmetrize_into,
+    with_execution_policy, zip_map2_into, zip_map3_into, zip_map4_into, zip_reduce,
+    zip_update2_into, zip_update3_into, ExecutionPolicy, Identity, StridedArray, StridedView,
+    StridedViewMut,
 };
 
 const SMALL_TENSOR_THRESHOLD: usize = 1024;
@@ -269,6 +270,28 @@ fn run_map_entries(dims: &[usize], pool: &rayon::ThreadPool) {
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let _ = dot::<f64, f64, f64, Identity, Identity>(&va, &vb).unwrap();
+    });
+
+    // Single- and two-operand full reductions (#280). `dot` above is the typed
+    // two-operand entry; `zip_reduce` is the mapped one, and `reduce`/`sum` are
+    // the one-operand entries.
+    assert_entry("reduce", pool, dims, &kinds, |kind| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let _ = reduce(&source, |x| x, |x, y| x + y, 0.0).unwrap();
+    });
+
+    assert_entry("sum", pool, dims, &kinds, |kind| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let _ = sum(&source).unwrap();
+    });
+
+    assert_entry("zip_reduce", pool, dims, &kinds, |kind| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let _: f64 = zip_reduce(&va, &vb, |x, y| x * y, |x, y| x + y, 0.0).unwrap();
     });
 
     assert_entry("map_update_into", pool, dims, &kinds, |_kind| {
