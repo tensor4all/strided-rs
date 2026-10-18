@@ -59,11 +59,22 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
-/// Allocations made by every thread while `run` executes.
-fn count_allocations(run: impl FnOnce()) -> usize {
-    let before = ALLOCATIONS.load(Ordering::SeqCst);
-    run();
-    ALLOCATIONS.load(Ordering::SeqCst) - before
+/// Steady-state allocations made by every thread while `run` executes.
+///
+/// The window runs three times and reports the minimum. A pool worker the
+/// warm-up never scheduled pays one-time first-touch costs (thread-local
+/// registration allocates on macOS) the first time it picks up a split, which
+/// is not a per-call allocation; a per-call allocation shows up in every round.
+/// (#321)
+fn count_allocations(mut run: impl FnMut()) -> usize {
+    (0..3)
+        .map(|_| {
+            let before = ALLOCATIONS.load(Ordering::SeqCst);
+            run();
+            ALLOCATIONS.load(Ordering::SeqCst) - before
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 /// Allocations made by the calling thread while `run` executes.

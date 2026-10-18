@@ -74,10 +74,17 @@ fn count_allocations(run: impl FnOnce()) -> usize {
 
 /// Allocations made by every thread while `run` executes, so a parallel
 /// context's worker allocations are counted too.
-fn count_allocations_all_threads(run: impl FnOnce()) -> usize {
-    let before = ALLOCATIONS.load(Ordering::SeqCst);
-    run();
-    ALLOCATIONS.load(Ordering::SeqCst) - before
+fn count_allocations_all_threads(mut run: impl FnMut()) -> usize {
+    // Minimum of three rounds: a pool worker's one-time first touch (thread-local
+    // registration allocates on macOS) is not a per-call allocation (#321).
+    (0..3)
+        .map(|_| {
+            let before = ALLOCATIONS.load(Ordering::SeqCst);
+            run();
+            ALLOCATIONS.load(Ordering::SeqCst) - before
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 fn assert_fused_uninit_allocation_parity(ctx: &ExecContext, fused_plan: FusedPlan) {
