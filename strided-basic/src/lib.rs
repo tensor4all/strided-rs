@@ -34,8 +34,10 @@
 //!   widening route, e.g. `f32` operands accumulated in `f64`)
 //! - [`reduce_axis`]: Reduce along a single axis
 //!
-//! A reduction result is independent of the ambient pool width only when it
-//! runs under the sequential policy; see each entry's evaluation-order section.
+//! A reduction that can fan out (`reduce`, `zip_reduce`, `sum`) gives a result
+//! that is independent of the ambient pool width only under the sequential
+//! policy; `dot` never enters a parallel branch, so its result does not depend
+//! on the pool at all. See each entry's evaluation-order section.
 //!
 //! ## Basic Operations
 //!

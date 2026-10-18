@@ -821,6 +821,11 @@ pub fn sum<
 >(
     src: &StridedView<T, Op>,
 ) -> Result<T> {
+    // A zero-element sum is the additive identity. Return before any planning
+    // so an empty view with an enormous stride never reaches block sizing.
+    if total_len(src.dims())? == 0 {
+        return Ok(T::zero());
+    }
     // SIMD fast path: contiguous Identity view with SIMD support
     if Op::IS_IDENTITY {
         if same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
@@ -882,6 +887,13 @@ where
     let b_strides = b.strides();
     let a_dims = a.dims();
     let len = total_len(a_dims)?;
+
+    // A zero-element dot product is the additive identity. Return before any
+    // planning so an empty view with an enormous stride never reaches block
+    // sizing.
+    if len == 0 {
+        return Ok(R::zero());
+    }
 
     if same_contiguous_layout(a_dims, &[a_strides, b_strides]).is_some() {
         // SIMD fast path: both contiguous, both Identity ops, same type

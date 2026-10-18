@@ -72,13 +72,19 @@ SIMD kernels and the parallel partial-combine tree all reorder the additions.
 What they do promise is documented per entry:
 
 - under the sequential policy — `ExecContext::serial()` or
-  `with_execution_policy(ExecutionPolicy::Sequential, ..)` — the result is
-  independent of the ambient Rayon pool width, because only serial branches
-  run; this is the deterministic route for a caller that needs one result per
-  input, and it is asserted for `reduce`, `zip_reduce`, `sum` and `dot` by
+  `with_execution_policy(ExecutionPolicy::Sequential, ..)` — the result of a
+  reduction that can fan out (`reduce`, `zip_reduce`, `sum`) is independent of
+  the ambient Rayon pool width, because only serial branches run; this is the
+  deterministic route for a caller that needs one result per input, and it is
+  asserted for `reduce`, `zip_reduce`, `sum` and `dot` by
   `strided-basic/tests/zip_reduce.rs`;
-- under a parallel policy the split depends on the effective thread count, so
-  the result is repeatable for a fixed thread count only.
+- under a parallel policy those entries split by the effective thread count, so
+  the result is repeatable for a fixed thread count only;
+- `dot` is the exception: it has no parallel branch under any policy, so its
+  result never depends on the ambient pool width. It still is not a strict
+  left-to-right fold (its homogeneous contiguous kernel accumulates in SIMD
+  lanes), so the sequential policy is not needed for reproducibility there,
+  only for the lane-order guarantee.
 
 `zip_reduce` (tensor4all/strided-rs#280) is the two-input mapped reduction that
 makes a widening accumulator expressible (`f32` operands accumulated in `f64`);

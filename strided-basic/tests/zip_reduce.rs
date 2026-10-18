@@ -6,10 +6,15 @@
 //! to `A * B`, so `f32` operands cannot accumulate in `f64` there. The
 //! determinism case pins the documented sequential policy: under
 //! `ExecContext::serial()` the result must be bitwise identical whatever the
-//! ambient Rayon pool width is, for an input above the threading threshold.
+//! ambient Rayon pool width is, for inputs above the threading threshold on
+//! both the contiguous and the gapped layout. The empty-layout cases pin the
+//! identity return that keeps a zero-extent view with an arbitrary stride out
+//! of the block planner.
 
 use num_complex::Complex;
-use strided_basic::{dot, zip_reduce, Conj, ElementOp, Identity, StridedArray, StridedView};
+use strided_basic::{
+    dot, reduce, sum, zip_reduce, Conj, ElementOp, Identity, StridedArray, StridedView,
+};
 
 /// Threading threshold of the crate (`threading::MINTHREADLENGTH`); inputs
 /// above it take the parallel branches under a parallel policy.
@@ -230,6 +235,21 @@ fn empty_operand_returns_init() {
     assert_eq!(result, 7.0);
 }
 
+/// A zero-extent dimension makes any stride representable, including one the
+/// block planner cannot multiply out. Every reduction entry must return its
+/// identity before planning (`tensor4all/strided-rs#280` post-review).
+#[test]
+fn empty_non_contiguous_view_returns_the_identity() {
+    let data: [f64; 0] = [];
+    let view = StridedView::<f64, Identity>::new(&data, &[0, 2], &[0, isize::MAX], 0).unwrap();
+    let zipped = zip_reduce(&view, &view, |x: f64, y: f64| x * y, |x, y| x + y, 7.0).unwrap();
+    assert_eq!(zipped, 7.0);
+    assert_eq!(reduce(&view, |x| x, |x, y| x + y, 7.0).unwrap(), 7.0);
+    assert_eq!(sum(&view).unwrap(), 0.0);
+    let dotted = dot::<f64, f64, f64, Identity, Identity>(&view, &view).unwrap();
+    assert_eq!(dotted, 0.0);
+}
+
 #[test]
 fn shape_mismatch_is_rejected() {
     let data_a = [1.0f64, 2.0, 3.0, 4.0];
@@ -248,40 +268,54 @@ fn shape_mismatch_is_rejected() {
     ));
 }
 
-/// Pair data above the threading threshold on a gapped layout, so the fused
-/// plan path (not the contiguous slice path) is the one that splits.
+/// One pair of operands above the threading threshold.
 ///
-/// `exact` integer-valued data make every fold order exact, which lets the
-/// parallel branch be compared bitwise with the naive reference. The inexact
-/// data are the ones that can detect a reordered fold, and the
+/// `exact` integer-valued data make every fold order exact, which lets a
+/// split fold be compared bitwise with the naive reference. The inexact data
+/// are the ones that can detect a reordered fold, and the
 /// `fold_order_is_observable` control pins that property instead of assuming
 /// it.
 #[cfg(feature = "parallel")]
-fn threshold_case(exact: bool) -> (StridedArray<f64>, StridedArray<f64>) {
-    let dims = [257usize, 128];
-    assert!(dims.iter().product::<usize>() > THREADING_THRESHOLD);
-    let strides = [1isize, 300];
-    let len = (dims[0] - 1) + (dims[1] - 1) * strides[1] as usize + 1;
-    let (src_a, src_b): (Vec<f64>, Vec<f64>) = if exact {
-        let a = (0..len).map(|i| (i % 13) as f64 - 6.0).collect();
-        let b = (0..len).map(|i| (i % 7) as f64 - 3.0).collect();
-        (a, b)
-    } else {
-        let a = (0..len).map(|i| 1.0 / ((i % 97) as f64 + 1.0)).collect();
-        let b = (0..len).map(|i| (i % 89) as f64 * 0.1 + 0.3).collect();
-        (a, b)
-    };
-    (
-        StridedArray::from_parts(src_a, &dims, &strides, 0).unwrap(),
-        StridedArray::from_parts(src_b, &dims, &strides, 0).unwrap(),
-    )
+struct ThresholdCase {
+    name: &'static str,
+    a: StridedArray<f64>,
+    b: StridedArray<f64>,
+}
+
+/// Both above-threshold layouts: the contiguous pair (serial contiguous kernel
+/// and the parallel contiguous leaf) and the gapped pair (general fused plan
+/// with a non-unit stride on both operands).
+#[cfg(feature = "parallel")]
+fn threshold_cases(exact: bool) -> Vec<ThresholdCase> {
+    const DIMS: [usize; 2] = [257, 128];
+    assert!(DIMS.iter().product::<usize>() > THREADING_THRESHOLD);
+    [("contiguous", [1isize, 257]), ("gapped", [1, 300])]
+        .into_iter()
+        .map(|(name, strides)| {
+            let len = (DIMS[0] - 1) + (DIMS[1] - 1) * strides[1] as usize + 1;
+            let (src_a, src_b): (Vec<f64>, Vec<f64>) = if exact {
+                let a = (0..len).map(|i| (i % 13) as f64 - 6.0).collect();
+                let b = (0..len).map(|i| (i % 7) as f64 - 3.0).collect();
+                (a, b)
+            } else {
+                let a = (0..len).map(|i| 1.0 / ((i % 97) as f64 + 1.0)).collect();
+                let b = (0..len).map(|i| (i % 89) as f64 * 0.1 + 0.3).collect();
+                (a, b)
+            };
+            ThresholdCase {
+                name,
+                a: StridedArray::from_parts(src_a, &DIMS, &strides, 0).unwrap(),
+                b: StridedArray::from_parts(src_b, &DIMS, &strides, 0).unwrap(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
     use std::num::NonZeroUsize;
-    use strided_basic::{reduce, sum, with_execution_policy, ExecContext, ExecutionPolicy};
+    use strided_basic::{with_execution_policy, ExecContext, ExecutionPolicy};
 
     fn pools() -> Vec<rayon::ThreadPool> {
         [1usize, 2, 4]
@@ -295,29 +329,30 @@ mod parallel {
             .collect()
     }
 
-    /// Positive control for the determinism tests: the inexact threshold data must
-    /// be able to distinguish fold orders, otherwise a leaked parallel branch would
-    /// go unnoticed. A reversed traversal and a left-to-right naive fold both see a
-    /// different order from the forward reduction.
+    /// Positive control for the determinism tests: the inexact threshold data
+    /// must be able to distinguish fold orders, otherwise a leaked parallel
+    /// branch would go unnoticed. A reversed traversal and a left-to-right naive
+    /// fold both see a different order from the forward reduction.
     #[test]
     fn fold_order_is_observable() {
-        let (a, b) = threshold_case(false);
-        let forward = ExecContext::serial().run(|| zip_reduce_sum(&a, &b));
-        // The same elements with both axes reversed: negative strides and an
-        // offset at the far corner visit them in the opposite order.
+        // The gapped case, reversed on both axes: negative strides and an
+        // offset at the far corner visit the same elements in the opposite
+        // order.
+        let case = &threshold_cases(false)[1];
+        let forward = ExecContext::serial().run(|| zip_reduce_sum(case));
         let dims = [257usize, 128];
         let strides = [-1isize, -300];
         let offset = 256 + 127 * 300;
         let reversed_a =
-            StridedView::<f64, Identity>::new(a.data(), &dims, &strides, offset).unwrap();
+            StridedView::<f64, Identity>::new(case.a.data(), &dims, &strides, offset).unwrap();
         let reversed_b =
-            StridedView::<f64, Identity>::new(b.data(), &dims, &strides, offset).unwrap();
+            StridedView::<f64, Identity>::new(case.b.data(), &dims, &strides, offset).unwrap();
         let reversed = ExecContext::serial().run(|| {
             zip_reduce(&reversed_a, &reversed_b, |x, y| x * y, |x, y| x + y, 0.0f64).unwrap()
         });
         let left_to_right = naive_reference(
-            &a.view(),
-            &b.view(),
+            &case.a.view(),
+            &case.b.view(),
             |x: f64, y: f64| x * y,
             |x, y| x + y,
             0.0f64,
@@ -330,33 +365,45 @@ mod parallel {
         assert_ne!(forward.to_bits(), left_to_right.to_bits());
     }
 
-    fn zip_reduce_sum(a: &StridedArray<f64>, b: &StridedArray<f64>) -> f64 {
-        zip_reduce(&a.view(), &b.view(), |x, y| x * y, |x, y| x + y, 0.0f64).unwrap()
-    }
-
-    /// Above the threading threshold the fused-plan path of `zip_reduce` is
-    /// split across workers; exact integer-valued data makes every split order
-    /// exact, so the parallel branch must equal the naive reference bitwise.
-    #[test]
-    fn parallel_branch_matches_the_naive_reference_above_the_threshold() {
-        let (a, b) = threshold_case(true);
-        let reference = naive_reference(
-            &a.view(),
-            &b.view(),
-            |x: f64, y: f64| x * y,
+    fn zip_reduce_sum(case: &ThresholdCase) -> f64 {
+        zip_reduce(
+            &case.a.view(),
+            &case.b.view(),
+            |x, y| x * y,
             |x, y| x + y,
             0.0f64,
-        );
-        for pool in pools()
-            .into_iter()
-            .filter(|pool| pool.current_num_threads() > 1)
-        {
-            let width = pool.current_num_threads();
-            let policy = ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(width).unwrap(),
-            };
-            let actual = pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&a, &b)));
-            assert_eq!(actual, reference, "width {width}");
+        )
+        .unwrap()
+    }
+
+    /// Above the threading threshold `zip_reduce` splits work across workers on
+    /// both the contiguous leaf path and the general fused plan; exact
+    /// integer-valued data makes every split order exact, so each parallel
+    /// branch must equal the naive reference bitwise.
+    #[test]
+    fn parallel_branch_matches_the_naive_reference_above_the_threshold() {
+        for case in threshold_cases(true) {
+            let reference = naive_reference(
+                &case.a.view(),
+                &case.b.view(),
+                |x: f64, y: f64| x * y,
+                |x, y| x + y,
+                0.0f64,
+            );
+            let serial = ExecContext::serial().run(|| zip_reduce_sum(&case));
+            assert_eq!(serial, reference, "{} serial", case.name);
+            for pool in pools()
+                .into_iter()
+                .filter(|pool| pool.current_num_threads() > 1)
+            {
+                let width = pool.current_num_threads();
+                let policy = ExecutionPolicy::Rayon {
+                    max_threads: NonZeroUsize::new(width).unwrap(),
+                };
+                let actual =
+                    pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&case)));
+                assert_eq!(actual, reference, "{} width {width}", case.name);
+            }
         }
     }
 
@@ -365,71 +412,86 @@ mod parallel {
     /// matter which pool the call runs inside.
     #[test]
     fn serial_policy_result_is_pool_width_independent() {
-        let (a, b) = threshold_case(false);
-        // References run under the same sequential policy, outside any pool:
-        // the ambient policy would use the global pool and could split.
-        let pool_free = ExecContext::serial().run(|| zip_reduce_sum(&a, &b));
-        let reference_reduce =
-            ExecContext::serial().run(|| reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64));
-        let reference_reduce = reference_reduce.unwrap();
-        let reference_sum = ExecContext::serial().run(|| sum(&a.view())).unwrap();
-        let reference_dot = ExecContext::serial()
-            .run(|| dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()))
-            .unwrap();
+        for case in threshold_cases(false) {
+            let a = &case.a;
+            let b = &case.b;
+            // References run under the same sequential policy, outside any
+            // pool: the ambient policy would use the global pool and could
+            // split.
+            let pool_free = ExecContext::serial().run(|| zip_reduce_sum(&case));
+            let reference_reduce =
+                ExecContext::serial().run(|| reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64));
+            let reference_reduce = reference_reduce.unwrap();
+            let reference_sum = ExecContext::serial().run(|| sum(&a.view())).unwrap();
+            let reference_dot = ExecContext::serial()
+                .run(|| dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()))
+                .unwrap();
 
-        let mut seen = Vec::new();
-        for pool in pools() {
-            let width = pool.current_num_threads();
-            let (zipped, reduced, summed, dotted) = pool.install(|| {
-                ExecContext::serial().run(|| {
-                    (
-                        zip_reduce_sum(&a, &b),
-                        reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64).unwrap(),
-                        sum(&a.view()).unwrap(),
-                        dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()).unwrap(),
-                    )
-                })
-            });
-            assert_eq!(
-                zipped.to_bits(),
-                pool_free.to_bits(),
-                "zip_reduce differed inside a {width}-worker pool"
-            );
-            assert_eq!(
-                reduced.to_bits(),
-                reference_reduce.to_bits(),
-                "reduce differed inside a {width}-worker pool"
-            );
-            assert_eq!(
-                summed.to_bits(),
-                reference_sum.to_bits(),
-                "sum differed inside a {width}-worker pool"
-            );
-            assert_eq!(
-                dotted.to_bits(),
-                reference_dot.to_bits(),
-                "dot differed inside a {width}-worker pool"
-            );
-            seen.push(width);
+            let mut seen = Vec::new();
+            for pool in pools() {
+                let width = pool.current_num_threads();
+                let (zipped, reduced, summed, dotted) = pool.install(|| {
+                    ExecContext::serial().run(|| {
+                        (
+                            zip_reduce_sum(&case),
+                            reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64).unwrap(),
+                            sum(&a.view()).unwrap(),
+                            dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()).unwrap(),
+                        )
+                    })
+                });
+                assert_eq!(
+                    zipped.to_bits(),
+                    pool_free.to_bits(),
+                    "{} zip_reduce differed inside a {width}-worker pool",
+                    case.name
+                );
+                assert_eq!(
+                    reduced.to_bits(),
+                    reference_reduce.to_bits(),
+                    "{} reduce differed inside a {width}-worker pool",
+                    case.name
+                );
+                assert_eq!(
+                    summed.to_bits(),
+                    reference_sum.to_bits(),
+                    "{} sum differed inside a {width}-worker pool",
+                    case.name
+                );
+                assert_eq!(
+                    dotted.to_bits(),
+                    reference_dot.to_bits(),
+                    "{} dot differed inside a {width}-worker pool",
+                    case.name
+                );
+                seen.push(width);
+            }
+            assert_eq!(seen, vec![1, 2, 4], "{}", case.name);
         }
-        assert_eq!(seen, vec![1, 2, 4]);
     }
 
     /// Under a parallel policy the result is repeatable for a fixed thread
     /// count.
     #[test]
     fn parallel_policy_is_repeatable_for_a_fixed_thread_count() {
-        let (a, b) = threshold_case(false);
-        for pool in pools() {
-            let width = pool.current_num_threads();
-            let policy = ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(width).unwrap(),
-            };
-            let first = pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&a, &b)));
-            for _ in 0..3 {
-                let result =
-                    pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&a, &b)));
-                assert_eq!(result.to_bits(), first.to_bits(), "width {width}");
+        for case in threshold_cases(false) {
+            for pool in pools() {
+                let width = pool.current_num_threads();
+                let policy = ExecutionPolicy::Rayon {
+                    max_threads: NonZeroUsize::new(width).unwrap(),
+                };
+                let first =
+                    pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&case)));
+                for _ in 0..3 {
+                    let result =
+                        pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&case)));
+                    assert_eq!(
+                        result.to_bits(),
+                        first.to_bits(),
+                        "{} width {width}",
+                        case.name
+                    );
+                }
             }
         }
     }
