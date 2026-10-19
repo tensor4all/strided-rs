@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use strided_basic::{
     broadcast_mul_into, copy_into, copy_transpose_scale_into, map_into, mul_into, reduce,
-    reduce_axis, with_execution_policy, zip_map2_into, zip_map3_into, ElementOp, ExecutionPolicy,
-    Identity, StridedArray, StridedView, StridedViewMut,
+    reduce_axis, with_execution_policy, with_execution_pool, zip_map2_into, zip_map3_into,
+    ElementOp, ExecutionPolicy, Identity, StridedArray, StridedView, StridedViewMut,
 };
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, FusedScalar};
 
@@ -1148,7 +1148,9 @@ fn parallel_source_violations(relative: &std::path::Path, source: &str) -> Vec<S
         ("rayon::join(", 2usize),
         ("rayon::current_num_threads()", 1),
         ("rayon::ThreadPool>", 1),
-        ("rayon::ThreadPool,", 1),
+        // `run_on_pool`, `with_execution_pool`, and the scoped target-pool
+        // field each name the runtime handle once.
+        ("rayon::ThreadPool,", 3),
         ("rayon::ThreadPoolBuilder::new()", 1),
         ("strided_perm::copy_into_par(", 1),
         ("strided_perm::copy_into(", 1),
@@ -1274,4 +1276,46 @@ fn production_parallelism_is_routed_through_the_execution_policy_layer() {
         violations.extend(parallel_source_violations(relative, &source));
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// A target-pool scope routes the fused scheduler into the caller's pool: the
+/// fused element operations run on that pool's workers, not on the ambient one.
+#[test]
+fn target_pool_scope_runs_fused_add_on_pool_workers() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let caller = std::thread::current().id();
+
+    let (participants, output) = with_execution_pool(&pool, NonZeroUsize::new(4).unwrap(), || {
+        run_large_fused_add(ExecutionPolicy::AmbientRayon, 2)
+    });
+
+    assert!(participants.max_active() >= 2);
+    let threads = participants.thread_ids();
+    assert!(threads.len() >= 2);
+    assert!(!threads.contains(&caller));
+    assert_eq!(output[LARGE_LEN - 1].value, LARGE_LEN as f64 + 1.0);
+}
+
+/// Without an explicit policy the target pool also owns the placement of a
+/// large non-contiguous copy that fans out through the map scheduler.
+#[test]
+fn target_pool_scope_runs_large_transposed_copy_on_pool_workers() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let caller = std::thread::current().id();
+
+    let (participants, output) = with_execution_pool(&pool, NonZeroUsize::new(4).unwrap(), || {
+        run_large_transposed_copy(ExecutionPolicy::AmbientRayon, 2)
+    });
+
+    assert!(participants.max_active() >= 2);
+    let threads = participants.thread_ids();
+    assert!(threads.len() >= 2);
+    assert!(!threads.contains(&caller));
+    assert_eq!(output[1 + 2 * 512].value, 258.0);
 }

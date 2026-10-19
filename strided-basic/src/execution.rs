@@ -29,6 +29,8 @@
 pub use crate::erased_common::{
     check_dtype, check_static_indexing_dtype, erased_view, validate_uninit_no_overlap,
 };
+#[cfg(feature = "parallel")]
+pub use crate::exec_context::with_execution_pool;
 pub use crate::kernel::{ensure_same_shape, KernelPlan, SMALL_TENSOR_THRESHOLD};
 pub use crate::layout_check::is_injective_layout;
 pub use crate::map_view::{
