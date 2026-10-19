@@ -3,7 +3,7 @@ name = "strided-basic"
 # Versioned per crate, not by the workspace: crates are released individually
 # when their library code changes. See
 # docs/worklogs/2026-10-18-issue-280-widening-reduce.md for this release.
-version = "0.6.1"
+version = "0.6.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
