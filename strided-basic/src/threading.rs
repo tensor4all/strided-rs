@@ -116,7 +116,15 @@ where
 {
     match policy {
         crate::ExecutionPolicy::AmbientRayon => rayon::join(left, right),
-        crate::ExecutionPolicy::Sequential | crate::ExecutionPolicy::Rayon { .. } => {
+        // A sequential policy owns no fanout, even when a low-level caller
+        // passes a thread budget above one. Do not let `rayon::join` resolve
+        // the global pool through the scheduler suspension below; keep the
+        // same owned policy/fanout state the join branch would have installed.
+        crate::ExecutionPolicy::Sequential => (
+            crate::execution_policy::with_owned_execution(policy, false, left),
+            crate::execution_policy::with_owned_execution(policy, false, right),
+        ),
+        crate::ExecutionPolicy::Rayon { .. } => {
             crate::execution_policy::with_scheduler_suspended(|| {
                 rayon::join(
                     || crate::execution_policy::with_owned_execution(policy, false, left),
@@ -302,10 +310,17 @@ pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
 ) -> crate::Result<()> {
+    // Resolve the policy before touching Rayon. A sequential policy must not
+    // probe the ambient pool width: outside a worker, `current_num_threads`
+    // resolves the global registry and starts the global Rayon pool.
+    let policy = crate::execution_policy::active_policy();
     let total = crate::kernel::total_len(dest.dims())?;
+    if policy == crate::ExecutionPolicy::Sequential {
+        return copy_permuted_serial(dest, src);
+    }
     let current_pool_threads = current_pool_threads();
     let parallel_eligible = crate::execution_policy::permutation_copy_parallel_eligible(
-        crate::execution_policy::active_policy(),
+        policy,
         crate::execution_policy::fanout_active(),
         current_pool_threads,
     );
