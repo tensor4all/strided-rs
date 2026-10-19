@@ -135,7 +135,17 @@ pub fn with_execution_policy<R>(policy: ExecutionPolicy, operation: impl FnOnce(
 
 #[cfg(feature = "parallel")]
 pub(crate) fn active_policy() -> ExecutionPolicy {
-    ACTIVE_POLICY.with(Cell::get)
+    let policy = ACTIVE_POLICY.with(Cell::get);
+    let Some(width) = crate::threading::target_pool_width() else {
+        return policy;
+    };
+    if width <= 1 {
+        return ExecutionPolicy::Sequential;
+    }
+    let Some(max_threads) = NonZeroUsize::new(width) else {
+        return policy;
+    };
+    restrict(policy, ExecutionPolicy::Rayon { max_threads })
 }
 
 #[cfg(feature = "parallel")]
@@ -197,12 +207,15 @@ pub fn rayon_threads() -> usize {
     if fanout_active() {
         return 1;
     }
-    match active_policy() {
+    let target_width = crate::threading::target_pool_width();
+    match ACTIVE_POLICY.with(Cell::get) {
         ExecutionPolicy::Sequential => 1,
-        ExecutionPolicy::AmbientRayon => crate::threading::current_pool_threads(),
-        ExecutionPolicy::Rayon { max_threads } => {
-            crate::threading::current_pool_threads().min(max_threads.get())
+        ExecutionPolicy::AmbientRayon => {
+            target_width.unwrap_or_else(crate::threading::current_pool_threads)
         }
+        ExecutionPolicy::Rayon { max_threads } => target_width
+            .unwrap_or_else(crate::threading::current_pool_threads)
+            .min(max_threads.get()),
     }
 }
 

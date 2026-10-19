@@ -101,6 +101,8 @@ pub use erased::{
     ErasedReducePlan, ErasedScanPlan, ErasedUpdatePlan, NormKind, NormSpec, ReduceOp, ScanOp,
     ScanOptions, UpdateOp,
 };
+#[cfg(feature = "parallel")]
+pub use exec_context::with_execution_pool;
 pub use exec_context::ExecContext;
 pub use execution_policy::{with_execution_policy, ExecutionPolicy};
 pub use inline::{InlineVec, OperandVec, OPERAND_CAP};

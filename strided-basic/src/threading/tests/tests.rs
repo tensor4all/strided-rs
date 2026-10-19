@@ -221,3 +221,61 @@ fn internal_join_wait_does_not_leak_policy_to_an_unrelated_ambient_job() {
     assert_eq!(observed.0, ExecutionPolicy::AmbientRayon);
     assert!(!observed.1);
 }
+
+/// The permutation engine resolves Rayon's current pool internally, so the
+/// target-pool scope must install around the whole parallel entry: exactly once,
+/// on the calling thread, with the scoped pool doing the work.
+#[test]
+fn target_pool_scope_installs_once_for_parallel_permutation_copy() {
+    const ROWS: usize = 257;
+    const COLS: usize = 129;
+    const _: () = assert!(ROWS * COLS > MINTHREADLENGTH);
+
+    let pool = test_pool(4);
+    let source = crate::StridedArray::<f64>::from_fn_col_major(&[ROWS, COLS], |index| {
+        (index[0] + ROWS * index[1]) as f64
+    });
+    let transposed = source.view().permute(&[1, 0]).unwrap();
+    let mut destination = crate::StridedArray::<f64>::row_major(&[COLS, ROWS]);
+
+    reset_target_pool_install_count();
+    with_execution_pool(&pool, NonZeroUsize::new(4).unwrap(), || {
+        copy_permuted_with_active_policy(&mut destination.view_mut(), &transposed).unwrap();
+    });
+
+    assert_eq!(target_pool_install_count(), 1);
+    for row in 0..ROWS {
+        for column in 0..COLS {
+            assert_eq!(destination.get(&[column, row]), source.get(&[row, column]));
+        }
+    }
+}
+
+/// A one-worker target pool behaves like the sequential policy even when a
+/// low-level caller passes a larger split budget: nothing is installed and no
+/// ambient pool is consulted.
+#[test]
+fn one_worker_target_pool_forces_serial_with_a_larger_budget() {
+    let pool = test_pool(1);
+    let caller = std::thread::current().id();
+    let off_caller = std::sync::atomic::AtomicUsize::new(0);
+
+    reset_target_pool_install_count();
+    let sum = with_execution_pool(&pool, NonZeroUsize::new(4).unwrap(), || {
+        parallel_map_reduce(
+            0..(MINTHREADLENGTH * 2),
+            4,
+            &|range| {
+                if std::thread::current().id() != caller {
+                    off_caller.fetch_add(range.len(), Ordering::SeqCst);
+                }
+                range.sum::<usize>()
+            },
+            &|left, right| left + right,
+        )
+    });
+
+    assert_eq!(sum, (0..(MINTHREADLENGTH * 2)).sum::<usize>());
+    assert_eq!(off_caller.load(Ordering::SeqCst), 0);
+    assert_eq!(target_pool_install_count(), 0);
+}
