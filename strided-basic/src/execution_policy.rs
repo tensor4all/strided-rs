@@ -177,13 +177,26 @@ pub(crate) fn with_owned_execution<R>(
 
 #[cfg(feature = "parallel")]
 pub(crate) fn with_scheduler_suspended<R>(operation: impl FnOnce() -> R) -> R {
-    with_state(
-        ExecutionState {
-            policy: ExecutionPolicy::AmbientRayon,
-            fanout_active: false,
-        },
-        operation,
-    )
+    crate::threading::with_target_pool_suspended(|| {
+        with_state(
+            ExecutionState {
+                policy: ExecutionPolicy::AmbientRayon,
+                fanout_active: false,
+            },
+            operation,
+        )
+    })
+}
+
+/// Clamp a caller-supplied split budget to the effective policy width.
+#[cfg(feature = "parallel")]
+#[inline]
+pub(crate) fn clamp_fanout_width(requested: usize, policy: ExecutionPolicy) -> usize {
+    match policy {
+        ExecutionPolicy::Sequential => requested.min(1),
+        ExecutionPolicy::AmbientRayon => requested,
+        ExecutionPolicy::Rayon { max_threads } => requested.min(max_threads.get()),
+    }
 }
 
 #[cfg(feature = "parallel")]

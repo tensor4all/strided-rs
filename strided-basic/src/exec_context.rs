@@ -166,7 +166,8 @@ impl Default for ExecContext {
 /// they enter `pool` with [`rayon::ThreadPool::install`] exactly once, and only
 /// when that width exceeds one and the caller is not already one of the pool's
 /// workers. A width of one, or a call already inside the pool, runs in place.
-/// The scope never resolves the global Rayon registry.
+/// The scope never resolves the global Rayon registry. Nested scopes replace
+/// the pool but keep the smaller enclosing thread budget.
 ///
 /// The scope is thread-local in the same way as [`with_execution_policy`]: it is
 /// restored even if `operation` panics, but it is not propagated into Rayon

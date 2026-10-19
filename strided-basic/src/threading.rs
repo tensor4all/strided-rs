@@ -158,10 +158,11 @@ where
     Map: Fn(Range<usize>) -> R + Sync,
     Reduce: Fn(R, R) -> R + Sync,
 {
+    let policy = crate::execution_policy::active_policy();
     parallel_map_reduce_with_policy(
         range,
-        nthreads,
-        crate::execution_policy::active_policy(),
+        crate::execution_policy::clamp_fanout_width(nthreads, policy),
+        policy,
         false,
         map,
         reduce,
@@ -318,6 +319,24 @@ pub(crate) fn reset_target_pool_install_count() {
     TARGET_POOL_INSTALLS.with(|count| count.set(0));
 }
 
+#[cfg(all(test, feature = "parallel"))]
+static PERMUTATION_FALLBACK_WORKERS: std::sync::Mutex<Vec<Option<String>>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "parallel"))]
+fn record_permutation_fallback_worker() {
+    let name = std::thread::current().name().map(str::to_owned);
+    let mut workers = PERMUTATION_FALLBACK_WORKERS.lock().unwrap();
+    if workers.len() < 32 && !workers.iter().any(|entry| *entry == name) {
+        workers.push(name);
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) fn take_permutation_fallback_workers() -> Vec<Option<String>> {
+    std::mem::take(&mut *PERMUTATION_FALLBACK_WORKERS.lock().unwrap())
+}
+
 #[cfg(feature = "parallel")]
 struct TargetPoolGuard {
     previous: Option<TargetPool>,
@@ -347,10 +366,25 @@ pub(crate) fn with_execution_pool<R>(
     operation: impl FnOnce() -> R,
 ) -> R {
     let previous = target_pool();
+    // Nested scopes stay conservative: the inner pool takes over placement,
+    // but it cannot enlarge an enclosing thread budget.
+    let max_threads = previous
+        .map(|outer| outer.max_threads.min(max_threads))
+        .unwrap_or(max_threads);
     set_target_pool(Some(TargetPool {
         pool: pool as *const _,
         max_threads,
     }));
+    let _guard = TargetPoolGuard { previous };
+    operation()
+}
+
+/// Suspend the target-pool scope while the caller may run unrelated Rayon
+/// work (an owned install or a scheduler boundary).
+#[cfg(feature = "parallel")]
+pub(crate) fn with_target_pool_suspended<R>(operation: impl FnOnce() -> R) -> R {
+    let previous = target_pool();
+    set_target_pool(None);
     let _guard = TargetPoolGuard { previous };
     operation()
 }
@@ -364,6 +398,20 @@ pub(crate) fn target_pool_width() -> Option<usize> {
         // thread-local borrow is executing.
         let pool = unsafe { &*target.pool };
         target.max_threads.get().min(pool.current_num_threads())
+    })
+}
+
+/// Physical worker count of the scoped target pool, ignoring the thread budget.
+///
+/// Permutation eligibility needs this: the HPTT entry parallelizes over every
+/// worker in the installed pool, so a pool larger than the cap must use the
+/// bounded map fallback instead.
+#[cfg(feature = "parallel")]
+pub(crate) fn target_pool_physical_threads() -> Option<usize> {
+    target_pool().map(|target| {
+        // SAFETY: see `target_pool_width`.
+        let pool = unsafe { &*target.pool };
+        pool.current_num_threads()
     })
 }
 
@@ -382,7 +430,11 @@ pub(crate) fn enter_target_pool<R: Send>(operation: impl FnOnce() -> R + Send) -
     } else {
         #[cfg(all(test, feature = "parallel"))]
         TARGET_POOL_INSTALLS.with(|count| count.set(count.get() + 1));
-        pool.install(operation)
+        // The caller waits here and Rayon may let it run unrelated work from its
+        // own pool. Suspend both the execution policy and the target-pool scope
+        // so that work cannot inherit this operation's cap. The installed child
+        // receives the captured policy explicitly.
+        crate::execution_policy::with_scheduler_suspended(|| pool.install(operation))
     }
 }
 
@@ -427,11 +479,12 @@ pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 
     if policy == crate::ExecutionPolicy::Sequential {
         return copy_permuted_serial(dest, src);
     }
-    let current_pool_threads = target_pool_width().unwrap_or_else(current_pool_threads);
+    let physical_pool_threads = target_pool_physical_threads().unwrap_or_else(current_pool_threads);
+    let effective_pool_threads = target_pool_width().unwrap_or(physical_pool_threads);
     let parallel_eligible = crate::execution_policy::permutation_copy_parallel_eligible(
         policy,
         crate::execution_policy::fanout_active(),
-        current_pool_threads,
+        physical_pool_threads,
     );
     if total > MINTHREADLENGTH && parallel_eligible {
         // The permutation engine resolves Rayon's current pool internally, so
@@ -440,12 +493,16 @@ pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 
             with_permutation_copy_scheduler(|| strided_perm::copy_into_par(dest, src))
         });
     }
-    if total > MINTHREADLENGTH && current_pool_threads > 1 {
+    if total > MINTHREADLENGTH && effective_pool_threads > 1 {
         // A bounded policy (`Rayon { max_threads }` below the pool size) is not
         // eligible for the permutation engine's own parallel entry, but the
         // element map honours the same policy budget, so it keeps more workers
         // than the serial permutation copy would.
-        return crate::map_view::map_into(dest, src, |value| value);
+        return crate::map_view::map_into(dest, src, |value| {
+            #[cfg(all(test, feature = "parallel"))]
+            record_permutation_fallback_worker();
+            value
+        });
     }
     copy_permuted_serial(dest, src)
 }
@@ -521,6 +578,10 @@ where
     // once here so the splitter and its leaves share them without owning a
     // `Vec<Vec<isize>>` (#306 P1).
     let refs: SVec<&[isize]> = strides_list.iter().map(|s| s.as_ref()).collect();
+    let nthreads = crate::execution_policy::clamp_fanout_width(
+        nthreads,
+        crate::execution_policy::active_policy(),
+    );
     mapreduce_threaded_dyn(
         dims, blocks, &refs, offsets, costs, nthreads, spacing, taskindex, f,
     )
@@ -691,6 +752,8 @@ where
     R: Send,
 {
     let refs: SVec<&[isize]> = strides_list.iter().map(|s| s.as_ref()).collect();
+    let policy = crate::execution_policy::active_policy();
+    let nthreads = crate::execution_policy::clamp_fanout_width(nthreads, policy);
     // Normalize whole-dimension blocks before splitting, matching the
     // `mapreduce_threaded` path (#313): a block that covers its dimension would
     // otherwise suppress the split for a small whole tensor.
@@ -699,7 +762,7 @@ where
         blocks: &blocks,
         strides_list: &refs,
         costs,
-        policy: crate::execution_policy::active_policy(),
+        policy,
         f,
         combine,
     }
