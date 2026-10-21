@@ -281,6 +281,15 @@ pub(crate) fn copy_permuted_serial<T: Copy + crate::MaybeSendSync + 'static>(
     strided_perm::copy_into(dest, src)
 }
 
+/// [`copy_permuted_serial`] into an uninitialized destination, dispatched on
+/// the source element type.
+pub(crate) fn copy_permuted_uninit_serial<T: Copy + crate::MaybeSendSync + 'static>(
+    dest: &mut crate::StridedViewMut<core::mem::MaybeUninit<T>>,
+    src: &crate::StridedView<T>,
+) -> crate::Result<()> {
+    strided_perm::copy_into_uninit(dest, src)
+}
+
 #[cfg(test)]
 #[path = "threading/tests/default_tests.rs"]
 mod default_tests;
@@ -543,7 +552,7 @@ pub(crate) fn copy_permuted_uninit_with_active_policy<T: Copy + crate::MaybeSend
         PermutationRoute::BoundedMap => {
             crate::map_view::map_into(dest, src, core::mem::MaybeUninit::new)
         }
-        PermutationRoute::Serial => strided_perm::copy_into_uninit(dest, src),
+        PermutationRoute::Serial => copy_permuted_uninit_serial(dest, src),
     }
 }
 

@@ -304,7 +304,7 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
         return crate::threading::copy_permuted_uninit_with_active_policy(dest, src);
     }
     #[cfg(not(feature = "parallel"))]
-    strided_perm::copy_into_uninit(dest, src)
+    crate::threading::copy_permuted_uninit_serial(dest, src)
 }
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
