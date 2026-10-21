@@ -296,22 +296,15 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     {
         return map_into(dest, src, MaybeUninit::new);
     }
-    let data = src.data();
-    // SAFETY: MaybeUninit<T> has T's size/alignment and accepts every initialized
-    // T representation. The source borrow and its extent are unchanged. No
-    // reference to initialized T is formed over destination storage.
-    let data =
-        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<MaybeUninit<T>>(), data.len()) };
-    let source = StridedView::new(data, src.dims(), src.strides(), src.offset())?;
     #[cfg(feature = "parallel")]
     {
-        // INVARIANT: the permutation engine selects its float paths by element
-        // size and only stores into the destination, so an uninitialized
-        // destination with an initialized source is valid.
-        return crate::threading::copy_permuted_with_active_policy(dest, &source);
+        // INVARIANT: the permutation engine selects its float paths by the
+        // source element type and only stores into the destination, so an
+        // uninitialized destination with an initialized source is valid.
+        return crate::threading::copy_permuted_uninit_with_active_policy(dest, src);
     }
     #[cfg(not(feature = "parallel"))]
-    copy_into_col_major(dest, &source)
+    crate::threading::copy_permuted_uninit_serial(dest, src)
 }
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.

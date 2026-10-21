@@ -1155,6 +1155,8 @@ fn parallel_source_violations(relative: &std::path::Path, source: &str) -> Vec<S
         ("strided_perm::copy_into_par(", 1),
         ("strided_perm::copy_into(", 1),
         ("strided_perm::copy_into_col_major(", 1),
+        ("strided_perm::copy_into_uninit_par(", 1),
+        ("strided_perm::copy_into_uninit(", 1),
     ];
     let mut central_counts = vec![0usize; approved_central_identifiers.len()];
 

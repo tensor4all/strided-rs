@@ -24,6 +24,11 @@ copy_into(&mut dst.view_mut(), &transposed).unwrap();
 Use `copy_into_col_major` when the destination is known to be column-major and
 you want to make that layout contract explicit.
 
+`copy_into_uninit` (and `copy_into_uninit_par`) takes a `StridedViewMut<MaybeUninit<T>>`
+destination over fresh storage. It runs the same engine, selected on `T` rather than on
+`MaybeUninit<T>`, so the native `f32`/`f64` kernels still apply; every element the views
+describe is written exactly once, through raw pointers only.
+
 ## Parallel Feature
 
 Enable the `parallel` feature to use Rayon-backed copy entry points:
