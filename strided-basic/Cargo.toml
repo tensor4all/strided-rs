@@ -4,7 +4,7 @@ name = "strided-basic"
 # when their library code changes. 0.6.3 adds strided-source variants of the
 # structural kernels (`triangular_mask_view_into_uninit`,
 # `embed_diagonal_view_into_uninit`).
-version = "0.6.3"
+version = "0.6.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
