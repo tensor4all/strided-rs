@@ -95,7 +95,10 @@ mod threading;
 mod update_view;
 pub use complex_div::{robust_complex_divide_f32, robust_complex_divide_f64};
 pub use copy_plan::{CopyPlan, UpdatePlan};
-pub use dense_update::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
+pub use dense_update::{
+    axpby_accum, embed_diagonal_into_uninit, embed_diagonal_view_into_uninit,
+    triangular_mask_into_uninit, triangular_mask_view_into_uninit,
+};
 pub use erased::{
     ArgReduceOp, ErasedArgReducePlan, ErasedConcatenatePlan, ErasedCopyPlan, ErasedNormPlan,
     ErasedReducePlan, ErasedScanPlan, ErasedUpdatePlan, NormKind, NormSpec, ReduceOp, ScanOp,

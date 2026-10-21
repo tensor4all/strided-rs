@@ -1,5 +1,18 @@
 use core::mem::MaybeUninit;
-use strided_basic::{axpby_accum, embed_diagonal_into_uninit, triangular_mask_into_uninit};
+use strided_basic::{
+    axpby_accum, embed_diagonal_into_uninit, embed_diagonal_view_into_uninit,
+    triangular_mask_into_uninit, triangular_mask_view_into_uninit,
+};
+use strided_view::StridedView;
+
+/// Reference value of `src` at `coord`, from the view's own offset formula.
+fn at(src: &StridedView<'_, i32>, coord: &[usize]) -> i32 {
+    let offset: isize = coord
+        .iter()
+        .zip(src.strides())
+        .fold(src.offset(), |acc, (&c, &s)| acc + c as isize * s);
+    src.data()[offset as usize]
+}
 
 fn initialized<T: Copy>(out: &[MaybeUninit<T>]) -> Vec<T> {
     // SAFETY: tests call this only after a successful full-overwrite kernel.
@@ -151,4 +164,103 @@ fn bounded_and_sequential_policy_inside_pool() {
             });
         }
     });
+}
+
+#[test]
+fn triangular_mask_reads_transposed_source_without_staging() {
+    // base is 3x4 column-major; the source is its transpose (4x3).
+    let base: Vec<i32> = (0..12).collect();
+    let src = StridedView::new(&base, &[4, 3], &[3, 1], 0).unwrap();
+    let mut out = vec![MaybeUninit::uninit(); 12];
+    triangular_mask_view_into_uninit(&mut out, &src, 0, false, -1).unwrap();
+    let got = initialized(&out);
+    let want: Vec<i32> = (0..12)
+        .map(|flat| {
+            let (row, col) = (flat % 4, flat / 4);
+            if row >= col {
+                at(&src, &[row, col])
+            } else {
+                -1
+            }
+        })
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn triangular_mask_reads_reversed_offset_source() {
+    // rows visited backwards: shape [4, 3], strides [-3, 1], offset 9.
+    let base: Vec<i32> = (0..12).collect();
+    let src = StridedView::new(&base, &[4, 3], &[-3, 1], 9).unwrap();
+    let mut out = vec![MaybeUninit::uninit(); 12];
+    triangular_mask_view_into_uninit(&mut out, &src, 1, true, -1).unwrap();
+    let got = initialized(&out);
+    let want: Vec<i32> = (0..12)
+        .map(|flat| {
+            let (row, col) = (flat % 4, flat / 4);
+            // upper with k=1 keeps rows <= col - 1.
+            if row + 1 <= col {
+                at(&src, &[row, col])
+            } else {
+                -1
+            }
+        })
+        .collect();
+    assert_eq!(got, want);
+    // The source buffer is untouched.
+    assert_eq!(base, (0..12).collect::<Vec<_>>());
+}
+
+#[test]
+fn triangular_mask_reads_permuted_batch_strides() {
+    // rank 3, batch axes permuted: shape [3, 2, 2], strides [1, 3, 6].
+    let base: Vec<i32> = (0..12).collect();
+    let src = StridedView::new(&base, &[3, 2, 2], &[1, 3, 6], 0).unwrap();
+    let mut out = vec![MaybeUninit::uninit(); 12];
+    triangular_mask_view_into_uninit(&mut out, &src, 0, false, -1).unwrap();
+    let got = initialized(&out);
+    let want: Vec<i32> = (0..12)
+        .map(|flat| {
+            let (row, rest) = (flat % 3, flat / 3);
+            let (col, batch) = (rest % 2, rest / 2);
+            let coord = [row, col, batch];
+            if row >= col {
+                at(&src, &coord)
+            } else {
+                -1
+            }
+        })
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn embed_diagonal_reads_strided_source() {
+    // src picks offsets 1, 3, 5 of base.
+    let base = [10, 1, 11, 2, 12, 3];
+    let src = StridedView::new(&base, &[3], &[2], 1).unwrap();
+    let mut out = vec![MaybeUninit::uninit(); 9];
+    embed_diagonal_view_into_uninit(&mut out, &src, 0, 1, -1).unwrap();
+    assert_eq!(initialized(&out), vec![1, -1, -1, -1, 2, -1, -1, -1, 3]);
+    assert_eq!(base, [10, 1, 11, 2, 12, 3]);
+}
+
+#[test]
+fn view_variants_agree_with_dense_variants() {
+    let base: Vec<i32> = (0..24).collect();
+    // Dense column-major strides of [4, 3, 2].
+    let strides = [1, 4, 12];
+    let src = StridedView::new(&base, &[4, 3, 2], &strides, 0).unwrap();
+    let mut dense = vec![MaybeUninit::uninit(); 24];
+    let mut via_view = vec![MaybeUninit::uninit(); 24];
+    triangular_mask_into_uninit(&mut dense, &base, &[4, 3, 2], -1, false, 0).unwrap();
+    triangular_mask_view_into_uninit(&mut via_view, &src, -1, false, 0).unwrap();
+    assert_eq!(initialized(&dense), initialized(&via_view));
+
+    // shape[axis] == 3 inserted, so 24 * 3 elements.
+    let mut dense = vec![MaybeUninit::uninit(); 72];
+    let mut via_view = vec![MaybeUninit::uninit(); 72];
+    embed_diagonal_into_uninit(&mut dense, &base, &[4, 3, 2], 1, 0, 0).unwrap();
+    embed_diagonal_view_into_uninit(&mut via_view, &src, 1, 0, 0).unwrap();
+    assert_eq!(initialized(&dense), initialized(&via_view));
 }
