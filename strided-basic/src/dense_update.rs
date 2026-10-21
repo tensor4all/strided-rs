@@ -50,6 +50,45 @@ fn for_each_chunk<T: MaybeSendSync, F: Fn(usize, &mut [T]) + crate::MaybeSync>(
     operation(0, output);
 }
 
+/// Source offset of a linear batch index within `shape[2..]`.
+fn batch_source_offset(mut batch: usize, shape: &[usize], strides: &[isize]) -> isize {
+    let mut offset = 0isize;
+    for (&dim, &stride) in shape.iter().zip(strides) {
+        let coord = batch % dim;
+        batch /= dim;
+        offset += coord as isize * stride;
+    }
+    offset
+}
+
+/// Borrow `data` as a dense column-major view of `shape`.
+fn dense_view<'a, T>(data: &'a [T], shape: &[usize]) -> Result<StridedView<'a, T>> {
+    let len = product(shape)?;
+    same_len(data.len(), len)?;
+    let strides = crate::col_major_strides(shape);
+    StridedView::new(data, shape, &strides, 0)
+}
+
+/// Copy `dst.len()` source elements starting at reachable byte-free offset
+/// `base` with element step `stride`.
+fn copy_strided_run<T: Copy>(dst: &mut [MaybeUninit<T>], data: &[T], base: isize, stride: isize) {
+    if stride == 1 {
+        // INVARIANT: `base` is reachable inside a view-validated buffer, so
+        // the run start plus its length stays in bounds.
+        let start = base as usize;
+        let src = &data[start..start + dst.len()];
+        for (slot, &value) in dst.iter_mut().zip(src) {
+            slot.write(value);
+        }
+    } else {
+        let mut offset = base;
+        for slot in dst.iter_mut() {
+            slot.write(data[offset as usize]);
+            offset += stride;
+        }
+    }
+}
+
 /// Update caller-owned contiguous storage: `y = alpha * x + beta * y`.
 ///
 /// This is an accumulation operation: it reads the old `y`, even for beta=0
@@ -104,23 +143,57 @@ pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
     upper: bool,
     fill: T,
 ) -> Result<()> {
+    let src = dense_view(input, shape)?;
+    triangular_mask_view_into_uninit(output, &src, k, upper, fill)
+}
+
+/// Mask a triangular region of a strided input into caller-owned contiguous
+/// storage.
+///
+/// The source layout is given by `src`; reads follow its strides and offset, so
+/// a reversed, transposed or otherwise strided source needs no staging copy.
+/// Kept elements come from `src`; masked elements receive `fill`. Every output
+/// element is written exactly once and the masked region of the source is
+/// never read.
+///
+/// # Errors
+/// Returns `RankMismatch` or `ShapeMismatch` for invalid shapes and buffer
+/// lengths, and `OffsetOverflow` for unrepresentable layouts, before writing.
+pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
+    output: &mut [MaybeUninit<T>],
+    src: &StridedView<'_, T>,
+    k: i64,
+    upper: bool,
+    fill: T,
+) -> Result<()> {
+    let shape = src.dims();
     if shape.len() < 2 {
         return Err(StridedError::RankMismatch(shape.len(), 2));
     }
     let len = product(shape)?;
-    same_len(input.len(), len)?;
     same_len(output.len(), len)?;
     if len == 0 {
         return Ok(());
     }
     let rows = shape[0];
     let cols = shape[1];
+    let data = src.data();
+    let strides = src.strides();
+    let offset = src.offset();
     for_each_chunk(output, |start, chunk| {
         let mut pos = 0;
+        let mut batch = usize::MAX;
+        let mut batch_offset = 0isize;
         while pos < chunk.len() {
             let flat = start + pos;
             let row = flat % rows;
             let col = (flat / rows) % cols;
+            // INVARIANT: `product(shape)` succeeded, so `rows * cols` fits.
+            let run_batch = flat / (rows * cols);
+            if run_batch != batch {
+                batch = run_batch;
+                batch_offset = batch_source_offset(run_batch, &shape[2..], &strides[2..]);
+            }
             let count = (rows - row).min(chunk.len() - pos);
             let boundary = col as i128 - k as i128;
             let split = if upper {
@@ -131,16 +204,18 @@ pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
             .clamp(row as i128, (row + count) as i128) as usize
                 - row;
             let (low, high) = chunk[pos..pos + count].split_at_mut(split);
-            let (kept, source, masked) = if upper {
-                (low, &input[flat..flat + split], high)
+            let (kept, first_row, masked) = if upper {
+                (low, row, high)
             } else {
-                (high, &input[flat + split..flat + count], low)
+                (high, row + split, low)
             };
+            let base = offset
+                + batch_offset
+                + (col as isize) * strides[1]
+                + (first_row as isize) * strides[0];
             // Full overwrite: never read masked input or copy it only to
             // overwrite it a second time. Each output element is written once.
-            for (dst, &src) in kept.iter_mut().zip(source) {
-                dst.write(src);
-            }
+            copy_strided_run(kept, data, base, strides[0]);
             masked.fill(MaybeUninit::new(fill));
             pos += count;
         }
@@ -189,6 +264,43 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
     }
     let len = product(shape)?;
     same_len(input.len(), len)?;
+    let src = dense_view(input, shape)?;
+    embed_diagonal_view_into_uninit(output, &src, axis, insert_axis, zero)
+}
+
+/// Embed a strided input on a diagonal in a new axis of caller-owned
+/// contiguous storage.
+///
+/// The source layout is given by `src`; the diagonal copy follows its strides
+/// and offset, so a strided source needs no staging copy. Off-diagonal entries
+/// receive `zero`, which is part of the result rather than scratch
+/// initialization.
+///
+/// # Errors
+/// Returns `InvalidAxis`, `ShapeMismatch`, or `OffsetOverflow` for invalid
+/// axes, lengths or unrepresentable layouts. Destination layout validation may
+/// return `NonInjectiveOutputLayout` if injectivity cannot be established.
+pub fn embed_diagonal_view_into_uninit<T: Copy + MaybeSendSync + 'static>(
+    output: &mut [MaybeUninit<T>],
+    src: &StridedView<'_, T>,
+    axis: usize,
+    insert_axis: usize,
+    zero: T,
+) -> Result<()> {
+    let shape = src.dims();
+    if axis >= shape.len() {
+        return Err(StridedError::InvalidAxis {
+            axis,
+            rank: shape.len(),
+        });
+    }
+    if insert_axis > shape.len() {
+        return Err(StridedError::InvalidAxis {
+            axis: insert_axis,
+            rank: shape.len() + 1,
+        });
+    }
+    let len = product(shape)?;
     let out_len = len
         .checked_mul(shape[axis])
         .ok_or(StridedError::OffsetOverflow)?;
@@ -199,14 +311,11 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
     isize::try_from(out_len).map_err(|_| StridedError::OffsetOverflow)?;
     let mut out_shape: crate::InlineVec<usize> = shape.iter().copied().collect();
     out_shape.insert(insert_axis, shape[axis]);
-    // INVARIANT: nonempty products fit isize, so every prefix stride fits too.
-    let src_strides = crate::col_major_strides(shape);
     let mut dst_strides = crate::col_major_strides(&out_shape);
     let inserted_stride = dst_strides.remove(insert_axis);
     dst_strides[axis] = dst_strides[axis]
         .checked_add(inserted_stride)
         .ok_or(StridedError::OffsetOverflow)?;
-    let src = StridedView::<T>::new(input, shape, &src_strides, 0)?;
     let mut dst = StridedViewMut::new(output, shape, &dst_strides, 0)?;
     crate::map_view::validate_destination_layout_without_alloc(shape, &dst_strides)?;
     // INVARIANT: off-diagonal zeros are part of the mathematical result, not
@@ -214,5 +323,5 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
     for_each_chunk(dst.data_mut(), |_, chunk| {
         chunk.fill(MaybeUninit::new(zero))
     });
-    crate::map_into(&mut dst, &src, MaybeUninit::new)
+    crate::map_into(&mut dst, src, MaybeUninit::new)
 }
