@@ -3,7 +3,7 @@
 use crate::fuse::FusionPlanError;
 #[cfg(feature = "parallel")]
 use crate::hptt::execute_permute_blocked_par;
-use crate::hptt::{build_permute_plan, execute_permute_blocked};
+use crate::hptt::{build_permute_plan, execute_permute_blocked, PermutePlan};
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
 
 /// Map a permutation planning failure onto the shared view error vocabulary.
@@ -66,17 +66,27 @@ fn is_both_contiguous(dims: &[usize], dst_strides: &[isize], src_strides: &[isiz
     row_ok
 }
 
-/// Copy elements from source to destination: `dest[i] = src[i]`.
+/// The validated raw geometry of one copy: the shared dims, both stride
+/// runs and the two origins. `U` is the destination element type: `T` for
+/// an initialized destination, `MaybeUninit<T>` for a fresh one.
+struct RawCopy<'a, T, U> {
+    dims: &'a [usize],
+    dst_strides: &'a [isize],
+    src_strides: &'a [isize],
+    dst: *mut U,
+    src: *const T,
+}
+
+/// Validates rank and shape and extracts the raw geometry; `None` for a
+/// zero-sized copy, which has nothing to write.
 ///
-/// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
-/// cache-aware blocking, and optimal loop ordering.
-///
-/// This is a simple copy without ElementOp support. For copies with
-/// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
-pub fn copy_into<T: Copy + 'static>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T>,
-) -> Result<()> {
+/// A zero-sized view validates without its other extents or strides forming
+/// an in-range product, so neither the contiguous fast path nor the
+/// permutation planner may see it.
+fn prepare<'a, T, U>(
+    dest: &'a mut StridedViewMut<U>,
+    src: &'a StridedView<T>,
+) -> Result<Option<RawCopy<'a, T, U>>> {
     let dst_dims = dest.dims();
     let src_dims = src.dims();
     if dst_dims.len() != src_dims.len() {
@@ -88,23 +98,37 @@ pub fn copy_into<T: Copy + 'static>(
             src_dims.to_vec(),
         ));
     }
-    // A zero-sized view has nothing to copy. It validates without its other
-    // extents or strides forming an in-range product, so neither the
-    // contiguous fast path nor the permutation planner may see it.
     if dst_dims.contains(&0) {
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(RawCopy {
+        dims: dst_dims,
+        dst_strides: dest.strides(),
+        src_strides: src.strides(),
+        dst: dest.as_mut_ptr(),
+        src: src.ptr(),
+    }))
+}
 
-    let dst_ptr = dest.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_strides = dest.strides();
-    let src_strides = src.strides();
-
+/// The copy over validated raw geometry; `execute` is the serial or the
+/// parallel permutation engine.
+///
+/// # Safety
+///
+/// `raw.dst` must be valid for writes of `T` at every destination offset and
+/// `raw.src` valid for reads of initialized `T` at every source offset; the
+/// two ranges must not overlap. Every store goes through raw pointers, so the
+/// destination may be uninitialized storage.
+unsafe fn copy_raw<T: Copy + 'static, U>(
+    raw: RawCopy<'_, T, U>,
+    execute: impl FnOnce(*const T, *mut T, &PermutePlan),
+) -> Result<()> {
+    let dst_ptr = raw.dst.cast::<T>();
     // Fast path: both contiguous. A contiguous layout is injective by
     // construction, so it skips the validation below.
-    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
-        let len = total_len(dst_dims);
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
+    if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
+        let len = total_len(raw.dims);
+        unsafe { std::ptr::copy_nonoverlapping(raw.src, dst_ptr, len) };
         return Ok(());
     }
 
@@ -113,19 +137,59 @@ pub fn copy_into<T: Copy + 'static>(
     // (issue #263) even when its destination is also non-injective; planning
     // only builds metadata and writes nothing.
     let elem_size = std::mem::size_of::<T>();
-    let plan =
-        build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
+    let plan = build_permute_plan(raw.dims, raw.src_strides, raw.dst_strides, elem_size)
+        .map_err(plan_error)?;
     // A non-injective destination maps distinct logical elements onto one
     // offset, so the unsafe write loop would produce overlapping writes (and a
     // data race under `parallel`). This matches the sibling output-writing
-    // APIs (issue #281).
-    if !strided_view::is_injective_layout(dst_dims, dst_strides) {
+    // APIs (issue #281). The check is global over the destination, so two
+    // worker partitions (disjoint logical positions) can never write one
+    // offset; no extra per-partition separation proof is needed.
+    if !strided_view::is_injective_layout(raw.dims, raw.dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
-    unsafe {
-        execute_permute_blocked(src_ptr, dst_ptr, &plan);
-    }
+    execute(raw.src, dst_ptr, &plan);
     Ok(())
+}
+
+/// Copy elements from source to destination: `dest[i] = src[i]`.
+///
+/// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
+/// cache-aware blocking, and optimal loop ordering.
+///
+/// This is a simple copy without ElementOp support. For copies with
+/// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
+pub fn copy_into<T: Copy + 'static>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: both views are validated layouts over live, non-overlapping
+        // storage (`StridedViewMut` is exclusive), and `prepare` matched them.
+        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked(s, d, plan)) },
+        None => Ok(()),
+    }
+}
+
+/// Copy elements into an uninitialized destination: `dest[i] = src[i]`.
+///
+/// The same permutation engine as [`copy_into`], selected on `T` rather than
+/// on `MaybeUninit<T>`: the engine's native `f32`/`f64` kernels are chosen by
+/// element type, so a destination reinterpreted as `MaybeUninit<T>` would
+/// otherwise fall to the generic element path (about 2.5x slower on a
+/// 4096x4096 `f64` transpose). Every destination element the views describe
+/// is written exactly once; the stores go through raw pointers only, so no
+/// reference to uninitialized storage is formed.
+pub fn copy_into_uninit<T: Copy + 'static>(
+    dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: as `copy_into`; `MaybeUninit<T>` has `T`'s layout and the
+        // engine only stores into the destination.
+        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked(s, d, plan)) },
+        None => Ok(()),
+    }
 }
 
 /// Copy elements to a col-major destination.
@@ -149,54 +213,24 @@ pub fn copy_into_par<T: Copy + Send + Sync + 'static>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
-    let dst_dims = dest.dims();
-    let src_dims = src.dims();
-    if dst_dims.len() != src_dims.len() {
-        return Err(StridedError::RankMismatch(dst_dims.len(), src_dims.len()));
+    match prepare(dest, src)? {
+        // SAFETY: as `copy_into`.
+        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked_par(s, d, plan)) },
+        None => Ok(()),
     }
-    if dst_dims != src_dims {
-        return Err(StridedError::ShapeMismatch(
-            dst_dims.to_vec(),
-            src_dims.to_vec(),
-        ));
-    }
-    // A zero-sized view has nothing to copy. It validates without its other
-    // extents or strides forming an in-range product, so neither the
-    // contiguous fast path nor the permutation planner may see it.
-    if dst_dims.contains(&0) {
-        return Ok(());
-    }
+}
 
-    let dst_ptr = dest.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_strides = dest.strides();
-    let src_strides = src.strides();
-
-    // Fast path: both contiguous (memcpy is already bandwidth-limited, and a
-    // contiguous layout is injective by construction).
-    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
-        let len = total_len(dst_dims);
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
-        return Ok(());
+/// [`copy_into_uninit`] with Rayon parallelism; see [`copy_into_par`].
+#[cfg(feature = "parallel")]
+pub fn copy_into_uninit_par<T: Copy + Send + Sync + 'static>(
+    dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
+    src: &StridedView<T>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: as `copy_into_uninit`.
+        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked_par(s, d, plan)) },
+        None => Ok(()),
     }
-
-    // Planning runs before the injectivity check so an unrepresentable layout
-    // keeps reporting `OffsetOverflow` (issue #263); planning writes nothing.
-    let elem_size = std::mem::size_of::<T>();
-    let plan =
-        build_permute_plan(dst_dims, src_strides, dst_strides, elem_size).map_err(plan_error)?;
-    // Reject overlapping destination layouts before any unsafe write, serial
-    // or parallel (issue #281). The check is global over the destination, so
-    // two worker partitions (disjoint logical positions) can never write one
-    // offset; no extra per-partition separation proof is needed.
-    if !strided_view::is_injective_layout(dst_dims, dst_strides) {
-        return Err(StridedError::NonInjectiveOutputLayout);
-    }
-
-    unsafe {
-        execute_permute_blocked_par(src_ptr, dst_ptr, &plan);
-    }
-    Ok(())
 }
 
 /// Copy elements to a col-major destination with Rayon parallelism.
@@ -208,10 +242,6 @@ pub fn copy_into_col_major_par<T: Copy + Send + Sync + 'static>(
     copy_into_par(dst, src)
 }
 
-/// Try to fuse a contiguous dimension group into a single (total_size, innermost_stride).
-///
-/// For the group to be fusable, consecutive dimensions must have contiguous strides.
-/// Returns `None` if strides are not contiguous within the group.
 #[cfg(test)]
 fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
     match dims.len() {

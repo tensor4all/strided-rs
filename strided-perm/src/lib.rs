@@ -23,9 +23,9 @@ mod kernel;
 mod order;
 
 // Re-export primary API
-pub use copy::{copy_into, copy_into_col_major};
+pub use copy::{copy_into, copy_into_col_major, copy_into_uninit};
 #[cfg(feature = "parallel")]
-pub use copy::{copy_into_col_major_par, copy_into_par};
+pub use copy::{copy_into_col_major_par, copy_into_par, copy_into_uninit_par};
 pub use fuse::{plan_bilateral_fusion, BilateralFusionPlan, FusionPlanError};
 
 // Constants

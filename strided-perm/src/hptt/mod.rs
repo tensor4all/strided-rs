@@ -20,4 +20,4 @@ mod plan;
 pub(crate) use execute::execute_permute_blocked;
 #[cfg(feature = "parallel")]
 pub(crate) use execute::execute_permute_blocked_par;
-pub(crate) use plan::build_permute_plan;
+pub(crate) use plan::{build_permute_plan, PermutePlan};

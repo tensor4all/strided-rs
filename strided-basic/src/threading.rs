@@ -465,19 +465,29 @@ fn with_permutation_copy_scheduler<R>(operation: impl FnOnce() -> R) -> R {
     crate::execution_policy::with_scheduler_suspended(operation)
 }
 
+/// Which entry a permutation copy takes under the active policy.
 #[cfg(feature = "parallel")]
-pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 'static>(
-    dest: &mut crate::StridedViewMut<T>,
-    src: &crate::StridedView<T>,
-) -> crate::Result<()> {
-    // Resolve the policy before touching Rayon. A sequential policy must not
-    // probe the ambient pool width: outside a worker, `current_num_threads`
-    // resolves the global registry and starts the global Rayon pool. A target
-    // pool scope reports its own width and never consults the ambient registry.
+enum PermutationRoute {
+    /// The permutation engine's own parallel entry, inside the target pool.
+    Parallel,
+    /// A bounded policy (`Rayon { max_threads }` below the pool size) is not
+    /// eligible for the permutation engine's own parallel entry, but the
+    /// element map honours the same policy budget, so it keeps more workers
+    /// than the serial permutation copy would.
+    BoundedMap,
+    Serial,
+}
+
+/// Resolves the policy before touching Rayon. A sequential policy must not
+/// probe the ambient pool width: outside a worker, `current_num_threads`
+/// resolves the global registry and starts the global Rayon pool. A target
+/// pool scope reports its own width and never consults the ambient registry.
+#[cfg(feature = "parallel")]
+fn permutation_route(dims: &[usize]) -> crate::Result<PermutationRoute> {
     let policy = crate::execution_policy::active_policy();
-    let total = crate::kernel::total_len(dest.dims())?;
+    let total = crate::kernel::total_len(dims)?;
     if policy == crate::ExecutionPolicy::Sequential {
-        return copy_permuted_serial(dest, src);
+        return Ok(PermutationRoute::Serial);
     }
     let physical_pool_threads = target_pool_physical_threads().unwrap_or_else(current_pool_threads);
     let effective_pool_threads = target_pool_width().unwrap_or(physical_pool_threads);
@@ -486,25 +496,55 @@ pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 
         crate::execution_policy::fanout_active(),
         physical_pool_threads,
     );
-    if total > MINTHREADLENGTH && parallel_eligible {
+    Ok(if total > MINTHREADLENGTH && parallel_eligible {
+        PermutationRoute::Parallel
+    } else if total > MINTHREADLENGTH && effective_pool_threads > 1 {
+        PermutationRoute::BoundedMap
+    } else {
+        PermutationRoute::Serial
+    })
+}
+
+#[cfg(feature = "parallel")]
+pub(crate) fn copy_permuted_with_active_policy<T: Copy + crate::MaybeSendSync + 'static>(
+    dest: &mut crate::StridedViewMut<T>,
+    src: &crate::StridedView<T>,
+) -> crate::Result<()> {
+    match permutation_route(dest.dims())? {
         // The permutation engine resolves Rayon's current pool internally, so
         // the target pool must be installed around the whole parallel entry.
-        return enter_target_pool(|| {
+        PermutationRoute::Parallel => enter_target_pool(|| {
             with_permutation_copy_scheduler(|| strided_perm::copy_into_par(dest, src))
-        });
-    }
-    if total > MINTHREADLENGTH && effective_pool_threads > 1 {
-        // A bounded policy (`Rayon { max_threads }` below the pool size) is not
-        // eligible for the permutation engine's own parallel entry, but the
-        // element map honours the same policy budget, so it keeps more workers
-        // than the serial permutation copy would.
-        return crate::map_view::map_into(dest, src, |value| {
+        }),
+        PermutationRoute::BoundedMap => crate::map_view::map_into(dest, src, |value| {
             #[cfg(all(test, feature = "parallel"))]
             record_permutation_fallback_worker();
             value
-        });
+        }),
+        PermutationRoute::Serial => copy_permuted_serial(dest, src),
     }
-    copy_permuted_serial(dest, src)
+}
+
+/// [`copy_permuted_with_active_policy`] into an uninitialized destination.
+///
+/// The permutation engine is entered on the source element type, so its
+/// native `f32`/`f64` paths apply: a destination reinterpreted as
+/// `MaybeUninit<T>` fell to the generic element path, measured 2.5x slower on
+/// a 4096x4096 `f64` transpose.
+#[cfg(feature = "parallel")]
+pub(crate) fn copy_permuted_uninit_with_active_policy<T: Copy + crate::MaybeSendSync + 'static>(
+    dest: &mut crate::StridedViewMut<core::mem::MaybeUninit<T>>,
+    src: &crate::StridedView<T>,
+) -> crate::Result<()> {
+    match permutation_route(dest.dims())? {
+        PermutationRoute::Parallel => enter_target_pool(|| {
+            with_permutation_copy_scheduler(|| strided_perm::copy_into_uninit_par(dest, src))
+        }),
+        PermutationRoute::BoundedMap => {
+            crate::map_view::map_into(dest, src, core::mem::MaybeUninit::new)
+        }
+        PermutationRoute::Serial => strided_perm::copy_into_uninit(dest, src),
+    }
 }
 
 #[cfg(feature = "parallel")]
