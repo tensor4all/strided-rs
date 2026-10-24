@@ -25,21 +25,39 @@ const GROUP_BYTES: usize = 32 * 1024;
 /// Minimum work, in bytes, that justifies one worker.
 const MIN_BYTES_PER_TASK: usize = 32 * 1024;
 
-/// Elements of caller scratch one softmax call needs for `tasks` workers.
+/// Elements of caller scratch one softmax call needs for `len` elements and
+/// `workers` workers.
 ///
-/// The kernel runs at most `tasks` concurrent tasks, each holding one
-/// cache-sized group of columns in scratch. A scratch of `n` such groups also
-/// caps the fan-out at `n`, so the worker count never exceeds what the caller
-/// sized for.
+/// One task holds one cache-sized group of columns; the number of tasks is what
+/// `workers` and the work per task allow, not the thread count itself, so a wide
+/// pool on a short input does not reserve scratch for workers that never run.
+/// The scratch also caps the fan-out: a region per task and no more.
 ///
 /// # Examples
 ///
 /// ```
 /// use strided_nn::scratch_len;
-/// assert!(scratch_len::<f32>(1024, 4) >= 4 * 1024);
+/// // Eight cache-sized groups, four of them tasks.
+/// assert_eq!(scratch_len::<f32>(1024, 1024 * 1024, 4), 32 * 1024);
+/// // One column of one million elements is one task, so one group.
+/// assert_eq!(scratch_len::<f64>(1_000_000, 1_000_000, 64), 1_000_000);
 /// ```
-pub fn scratch_len<T>(axis_len: usize, tasks: usize) -> usize {
-    group_elements(axis_len, core::mem::size_of::<T>()).saturating_mul(tasks.max(1))
+pub fn scratch_len<T>(axis_len: usize, len: usize, workers: usize) -> usize {
+    let element_size = core::mem::size_of::<T>();
+    let group = group_elements(axis_len, element_size);
+    group.saturating_mul(tasks_for(len, group, element_size, workers))
+}
+
+/// Tasks one call runs: capped by the scratch capacity, the worker budget and
+/// the work per task.
+fn tasks_for(len: usize, group: usize, element_size: usize, workers: usize) -> usize {
+    let groups = len.div_ceil(group).max(1);
+    len.saturating_mul(element_size)
+        .checked_div(MIN_BYTES_PER_TASK)
+        .unwrap_or(0)
+        .max(1)
+        .min(workers.max(1))
+        .min(groups)
 }
 
 /// Elements in one cache-sized group of columns.
@@ -97,20 +115,17 @@ impl Plan {
             });
         }
         let group = group_elements(axis_len, element_size);
-        // The scratch decides how many tasks may run at once; the policy in the
-        // `ExecContext` clamps that further.
-        let workers = scratch_len / group;
-        if workers == 0 {
+        // The scratch capacity decides how many tasks may run at once; the policy
+        // in the `ExecContext` clamps that further.
+        let capacity = scratch_len / group;
+        if capacity == 0 {
             return Err(SoftmaxError::ScratchTooSmall {
                 need: group,
                 got: scratch_len,
             });
         }
         let groups = input_len.div_ceil(group);
-        let workers = (input_len.saturating_mul(element_size) / MIN_BYTES_PER_TASK)
-            .max(1)
-            .min(workers)
-            .min(groups);
+        let workers = tasks_for(input_len, group, element_size, capacity);
         let groups_per_task = groups.div_ceil(workers).max(1);
         let task = (group * groups_per_task).min(input_len).max(1);
         Ok(Self {

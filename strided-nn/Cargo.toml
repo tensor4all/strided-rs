@@ -1,7 +1,8 @@
 [package]
 name = "strided-nn"
-# The workspace releases crates individually; a new crate starts at 0.1.0.
-version = "0.1.0"
+# The workspace releases crates individually; 0.1.1 makes `scratch_len` take the
+# input length so a wide pool on a short input does not over-reserve scratch.
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

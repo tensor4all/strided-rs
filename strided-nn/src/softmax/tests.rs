@@ -39,7 +39,7 @@ fn columns_normalize_in_both_dtypes() {
     let want = reference(&xs, 3);
     for (got, &want) in run(
         |out| {
-            let mut scratch = vec![0.0f64; scratch_len::<f64>(3, 2)];
+            let mut scratch = vec![0.0f64; scratch_len::<f64>(3, xs.len(), 2)];
             softmax_axis0_f64(ExecContext::serial(), 3, &xs, out, &mut scratch)
         },
         xs.len(),
@@ -52,7 +52,7 @@ fn columns_normalize_in_both_dtypes() {
     let xs32: Vec<f32> = xs.iter().map(|&v| v as f32).collect();
     let got = run(
         |out| {
-            let mut scratch = vec![0.0f32; scratch_len::<f32>(3, 2)];
+            let mut scratch = vec![0.0f32; scratch_len::<f32>(3, xs32.len(), 2)];
             softmax_axis0_f32(ExecContext::serial(), 3, &xs32, out, &mut scratch)
         },
         xs32.len(),
@@ -75,14 +75,14 @@ fn multi_worker_scratch_matches_the_serial_result() {
         .collect();
     let want = run(
         |out| {
-            let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, 1)];
+            let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 1)];
             softmax_axis0_f32(ExecContext::serial(), axis_len, &xs, out, &mut scratch)
         },
         xs.len(),
     );
     let got = run(
         |out| {
-            let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, 4)];
+            let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 4)];
             softmax_axis0_f32(
                 ExecContext::max_threads(4).unwrap(),
                 axis_len,
@@ -106,7 +106,7 @@ fn a_nan_column_stays_nan_and_leaves_the_others_alone() {
     let xs = [f32::NAN, 1.0, 2.0, 1.0, 2.0, 3.0];
     let got = run(
         |out| {
-            let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, 1)];
+            let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 1)];
             softmax_axis0_f32(ExecContext::serial(), axis_len, &xs, out, &mut scratch)
         },
         xs.len(),
@@ -155,11 +155,13 @@ fn contract_violations_are_typed_errors() {
 #[test]
 fn scratch_len_covers_one_group_per_task() {
     // A long column stays whole, so one group is one column.
-    assert_eq!(scratch_len::<f64>(1_000_000, 1), 1_000_000);
-    assert_eq!(scratch_len::<f64>(1_000_000, 3), 3_000_000);
+    assert_eq!(scratch_len::<f64>(1_000_000, 1_000_000, 1), 1_000_000);
+    assert_eq!(scratch_len::<f64>(1_000_000, 3_000_000, 3), 3_000_000);
+    // A wide pool on one column reserves one task, not one region per worker.
+    assert_eq!(scratch_len::<f64>(1_000_000, 1_000_000, 64), 1_000_000);
     // A short column is grouped up to the cache-sized bound.
-    assert_eq!(scratch_len::<f32>(64, 2), 2 * 8_192);
-    assert_eq!(scratch_len::<f64>(64, 1), 4_096);
+    assert_eq!(scratch_len::<f32>(64, 8_192 * 2, 2), 2 * 8_192);
+    assert_eq!(scratch_len::<f64>(64, 4_096, 1), 4_096);
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -16,7 +16,7 @@ use strided_nn::{scratch_len, softmax_axis0_f32};
 // Two columns of three, column-major.
 let input = [1.0f32, 2.0, 3.0, -1.0, 0.0, 1.0];
 let mut output = [MaybeUninit::<f32>::uninit(); 6];
-let mut scratch = vec![0.0f32; scratch_len::<f32>(3, 1)];
+let mut scratch = vec![0.0f32; scratch_len::<f32>(3, 6, 1)];
 softmax_axis0_f32(
     ExecContext::serial(),
     3,
