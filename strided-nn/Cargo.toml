@@ -1,0 +1,27 @@
+[package]
+name = "strided-nn"
+# The workspace releases crates individually; a new crate starts at 0.1.0.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/strided-nn"
+homepage = "https://github.com/tensor4all/strided-rs"
+description = "Fused neural-network kernels (softmax) over strided CPU slices."
+keywords = ["tensor", "strided", "kernels", "softmax"]
+categories = ["science", "mathematics", "algorithms"]
+
+[dependencies]
+# The kernel fans out through strided-basic's policy-aware primitive; a serial
+# `ExecContext` still runs it inline without touching any pool.
+strided-basic = { workspace = true, features = ["parallel"] }
+elem-simd-math.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rayon.workspace = true
+
+[lib]
+bench = false

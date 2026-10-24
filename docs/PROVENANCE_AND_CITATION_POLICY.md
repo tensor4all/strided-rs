@@ -49,6 +49,7 @@ relationship; the role is stated only on the first row.
 | `strided-basic` | Shared cache-optimized map/reduce/broadcast kernels, threading | [Strided.jl](https://github.com/Jutho/Strided.jl) | Port (fusion, ordering, blocking, `_mapreduce_threaded!`) |
 | `strided-kernel` | Dtype-erased ordinary arithmetic/indexing adapters | strided-basic / Strided.jl lineage | Separated from the original kernel crate; inherited notices retained |
 | `strided-fused` | Runtime-DAG fused execution | strided-basic / Strided.jl lineage | Shared traversal foundation; inherited notices retained |
+| `strided-nn` | Fused axis-0 softmax over contiguous slices | tenferro-rs CPU softmax kernel; pipeline shape follows PyTorch's `_vec_softmax_lastdim`; `exp` from [`elem-simd-math`](https://github.com/tensor4all/elem-simd-math) (SLEEF lineage) | Moved from tenferro-rs (first-party); inspired by PyTorch's fused per-slice formulation |
 | `strided-perm` | Cache-efficient tensor permutation / transpose | [HPTT](https://github.com/springer13/hptt) | Derived (BSD-3-Clause): algorithm and structure of the C++ implementation; SIMD kernels and autotuning not ported |
 
 The `strided-rs` facade (original) and the einsum crates were removed from
