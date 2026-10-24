@@ -7,6 +7,7 @@ members = [
     "strided-view",
     "strided-perm",
     "strided-kernel",
+    "strided-exec",
 ]
 resolver = "2"
 

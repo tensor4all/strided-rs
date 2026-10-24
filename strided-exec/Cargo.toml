@@ -1,0 +1,37 @@
+[package]
+name = "strided-exec"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/strided-exec"
+homepage = "https://github.com/tensor4all/strided-rs"
+description = "Splittable CPU placement token (Pool, Exec) for strided kernels: the only place that starts tasks."
+keywords = ["tensor", "strided", "threading", "scheduler"]
+categories = ["science", "concurrency"]
+
+[features]
+default = ["parallel"]
+# Run entries on a private Rayon pool. Without it the same types exist, every
+# pool has width 1 and every entry runs inline on the calling thread.
+parallel = ["dep:rayon"]
+# `Exec::faer`: hand faer a `Par` whose width follows the token budget.
+faer = ["dep:faer"]
+# Test support: per-root live-task ledger and entry counters. Zero cost when off.
+ledger = []
+
+[dependencies]
+rayon = { workspace = true, optional = true }
+thiserror.workspace = true
+# One faer identity with tenferro-rs (`t4a-faer` published under the name `faer`),
+# mirrored from its workspace manifest. The `rayon` feature is always on so that
+# `Par::rayon` exists; `Exec::faer` hands out `Par::Seq` when `parallel` is off.
+faer = { package = "t4a-faer", version = "0.24.8", default-features = false, features = ["std", "rayon"], optional = true }
+
+[dev-dependencies]
+rayon.workspace = true
+
+[lib]
+bench = false

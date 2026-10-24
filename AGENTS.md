@@ -44,6 +44,7 @@ license-bearing attributions (`strided-perm` is
 | `strided-fused` | Runtime-DAG fused execution using the shared basic implementation |
 | `strided-nn` | Fused neural-network kernels (axis-0 softmax) over contiguous slices, with caller-provided scratch |
 | `strided-perm` | Cache-efficient permutation / transpose (HPTT-derived, `src/hptt/`), feature `parallel` |
+| `strided-exec` | Splittable CPU placement token (`Pool`, `Exec`): the only crate that starts tasks; unused by the other crates until the migration (docs/design/cpu-exec-placement.md) |
 
 Dense flat-buffer APIs are column-major; see `REPOSITORY_RULES.md` for the
 layout and copy-semantics contracts.
