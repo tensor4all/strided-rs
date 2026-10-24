@@ -42,6 +42,7 @@ license-bearing attributions (`strided-perm` is
 | `strided-basic` | Shared typed primitives, layout/indexing plans, copy/reduction, execution policy, Rayon and pulp SIMD |
 | `strided-kernel` | Ordinary dtype-erased arithmetic/indexing and re-exported typed APIs |
 | `strided-fused` | Runtime-DAG fused execution using the shared basic implementation |
+| `strided-nn` | Fused neural-network kernels (axis-0 softmax) over contiguous slices, with caller-provided scratch |
 | `strided-perm` | Cache-efficient permutation / transpose (HPTT-derived, `src/hptt/`), feature `parallel` |
 
 Dense flat-buffer APIs are column-major; see `REPOSITORY_RULES.md` for the

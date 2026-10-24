@@ -18,6 +18,7 @@ are currently available from this workspace checkout, not yet from crates.io.
 - [`strided-basic`](strided-basic/README.md): shared typed primitives and copy/concatenation/reduction execution
 - [`strided-kernel`](strided-kernel/README.md): concrete ordinary arithmetic/indexing dispatch and typed APIs
 - [`strided-fused`](strided-fused/README.md): runtime-DAG fused execution
+- [`strided-nn`](strided-nn/README.md): fused neural-network kernels (axis-0 softmax)
 
 The `strided-rs` facade and the einsum crates (`strided-einsum2`,
 `strided-opteinsum`, `mdarray-opteinsum`, `ndarray-opteinsum`) were removed
@@ -70,6 +71,7 @@ See each sub-crate README for usage examples:
 - [`strided-basic`](strided-basic/README.md) — shared primitives and lightweight execution
 - [`strided-kernel`](strided-kernel/README.md) — ordinary erased dispatch and typed APIs
 - [`strided-fused`](strided-fused/README.md) — runtime-DAG fusion
+- [`strided-nn`](strided-nn/README.md) — fused softmax over contiguous axis-0 slices
 
 Design notes:
 - [CPU kernel boundaries](docs/design/cpu-kernel-boundaries.md) — generic code ownership, execution contracts and concrete dispatch

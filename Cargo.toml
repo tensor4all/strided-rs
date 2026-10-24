@@ -2,6 +2,7 @@
 members = [
     "strided-basic",
     "strided-fused",
+    "strided-nn",
     "strided-traits",
     "strided-view",
     "strided-perm",
@@ -18,6 +19,7 @@ repository = "https://github.com/tensor4all/strided-rs"
 
 [workspace.dependencies]
 strided-basic = { version = "0.6.4", path = "strided-basic", default-features = false }
+strided-nn = { version = "0.1.1", path = "strided-nn", default-features = false }
 strided-fused = { version = "0.6.0", path = "strided-fused", default-features = false }
 strided-traits = { version = "0.6.0", path = "strided-traits" }
 strided-view = { version = "0.6.0", path = "strided-view" }
