@@ -1,9 +1,22 @@
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use strided_kernel::{
     col_major_strides, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedRawStridedMut,
-    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScatterPlan,
-    ExecContext, KernelDType, ScatterSpec, StridedError,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScatterPlan, Exec,
+    KernelDType, ScatterSpec, StridedError,
 };
 
 #[test]
@@ -40,13 +53,8 @@ fn erased_dynamic_slice_plan_executes_fixed_window_with_clamped_starts() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest_ref,
-        &operand_ref,
-        &starts_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, &starts_ref, Exec::serial())
+        .unwrap();
 
     assert_eq!(dest, [10.0, 11.0, 20.0, 21.0]);
 }
@@ -89,11 +97,11 @@ fn erased_dynamic_update_slice_plan_overwrites_clamped_window_after_copy() {
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
-        &ExecContext::serial(),
         &mut dest_ref,
         &operand_ref,
         &update_ref,
         &starts_ref,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -145,11 +153,11 @@ fn erased_scatter_plan_adds_overlapping_updates_in_col_major_order() {
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
     plan.execute(
-        &ExecContext::max_threads(2).unwrap(),
         &mut dest_ref,
         &operand_ref,
         &index_ref,
         &update_ref,
+        bounded(2),
     )
     .unwrap();
 
@@ -288,18 +296,18 @@ where
             .unwrap();
     contiguous_slice_plan
         .execute(
-            &ExecContext::max_threads(4).unwrap(),
             &mut contiguous_slice_ref,
             &contiguous_operand_ref,
             &starts_ref,
+            bounded(4),
         )
         .unwrap();
     strided_slice_plan
         .execute(
-            &ExecContext::max_threads(4).unwrap(),
             &mut strided_slice_ref,
             &strided_operand_ref,
             &starts_ref,
+            bounded(4),
         )
         .unwrap();
     let strided_slice_values = strided_slice.iter().step_by(2).copied().collect::<Vec<_>>();
@@ -354,20 +362,20 @@ where
             .unwrap();
     contiguous_update_plan
         .execute(
-            &ExecContext::max_threads(4).unwrap(),
             &mut contiguous_dest_ref,
             &contiguous_operand_ref,
             &contiguous_update_ref,
             &starts_ref,
+            bounded(4),
         )
         .unwrap();
     strided_update_plan
         .execute(
-            &ExecContext::max_threads(4).unwrap(),
             &mut strided_dest_ref,
             &strided_operand_ref,
             &strided_update_ref,
             &starts_ref,
+            bounded(4),
         )
         .unwrap();
     let strided_dest_values = strided_dest.iter().step_by(2).copied().collect::<Vec<_>>();
@@ -634,10 +642,10 @@ where
     .unwrap();
     slice
         .execute(
-            &ExecContext::serial(),
             &mut initialized_slice_ref,
             &operand,
             &starts,
+            Exec::serial(),
         )
         .unwrap();
     assert_initialized_layout(
@@ -658,10 +666,10 @@ where
     .unwrap();
     slice
         .execute_uninit(
-            &ExecContext::serial(),
             &mut raw_slice_ref,
             &ErasedRawStridedPtr::from_ref(&operand),
             &ErasedRawStridedPtr::from_ref(&starts),
+            Exec::serial(),
         )
         .unwrap();
     assert_uninitialized_layout(
@@ -718,11 +726,11 @@ where
     .unwrap();
     update
         .execute(
-            &ExecContext::serial(),
             &mut initialized_update_ref,
             &operand,
             &update_ref,
             &starts,
+            Exec::serial(),
         )
         .unwrap();
     assert_initialized_layout(
@@ -743,11 +751,11 @@ where
     .unwrap();
     update
         .execute_uninit(
-            &ExecContext::serial(),
             &mut raw_update_ref,
             &ErasedRawStridedPtr::from_ref(&operand),
             &ErasedRawStridedPtr::from_ref(&update_ref),
             &ErasedRawStridedPtr::from_ref(&starts),
+            Exec::serial(),
         )
         .unwrap();
     assert_uninitialized_layout(
@@ -795,11 +803,11 @@ fn erased_dynamic_update_zero_window_still_copies_operand() {
     let mut initialized_ref =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &operand_dims, &[1, 2], 0).unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut initialized_ref,
         &source,
         &update_ref,
         &starts_ref,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(initialized, operand);
@@ -808,11 +816,11 @@ fn erased_dynamic_update_zero_window_still_copies_operand() {
     let mut raw_ref =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &operand_dims, &[1, 2], 0).unwrap();
     plan.execute_uninit(
-        &ExecContext::serial(),
         &mut raw_ref,
         &ErasedRawStridedPtr::from_ref(&source),
         &ErasedRawStridedPtr::from_ref(&update_ref),
         &ErasedRawStridedPtr::from_ref(&starts_ref),
+        Exec::serial(),
     )
     .unwrap();
     for (actual, expected) in raw.iter().zip(operand) {
@@ -887,11 +895,11 @@ where
         let mut initialized_ref =
             ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
         plan.execute(
-            &ExecContext::serial(),
             &mut initialized_ref,
             &operand_ref,
             &index_ref,
             &update_ref,
+            Exec::serial(),
         )
         .unwrap();
         assert_eq!(initialized, expected);
@@ -901,11 +909,11 @@ where
             ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
                 .unwrap();
         plan.execute_uninit(
-            &ExecContext::max_threads(4).unwrap(),
             &mut uninitialized_ref,
             &ErasedRawStridedPtr::from_ref(&operand_ref),
             &ErasedRawStridedPtr::from_ref(&index_ref),
             &ErasedRawStridedPtr::from_ref(&update_ref),
+            bounded(4),
         )
         .unwrap();
         assert_uninitialized_layout(&uninitialized, &expected, &dims, &strides, 0);
@@ -973,11 +981,11 @@ fn erased_scatter_replays_imaginary_vector_axis_and_reordered_windows() {
         ErasedRawStridedMut::from_slice_mut(&mut actual, &operand_dims, &operand_strides, 0)
             .unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut dest,
         &operand_ref,
         &index_ref,
         &update_ref,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(actual, expected);
@@ -1053,11 +1061,11 @@ fn run_rank2_layout_scatter<I>(
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &dest_strides, dest_offset)
             .unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut initialized_ref,
         &operand_ref,
         &index_ref,
         &update_ref,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(initialized, expected);
@@ -1071,11 +1079,11 @@ fn run_rank2_layout_scatter<I>(
     )
     .unwrap();
     plan.execute_uninit(
-        &ExecContext::serial(),
         &mut uninitialized_ref,
         &ErasedRawStridedPtr::from_ref(&operand_ref),
         &ErasedRawStridedPtr::from_ref(&index_ref),
         &ErasedRawStridedPtr::from_ref(&update_ref),
+        Exec::serial(),
     )
     .unwrap();
     assert_uninitialized_layout(&uninitialized, &expected, &dims, &dest_strides, dest_offset);
@@ -1120,11 +1128,11 @@ fn erased_scatter_empty_domain_is_a_noop_for_initialized_and_uninitialized() {
     let mut initialized_ref =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut initialized_ref,
         &operand_ref,
         &index_ref,
         &update_ref,
+        Exec::serial(),
     )
     .unwrap();
     let mut uninitialized = Vec::<MaybeUninit<i32>>::new();
@@ -1132,11 +1140,11 @@ fn erased_scatter_empty_domain_is_a_noop_for_initialized_and_uninitialized() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
             .unwrap();
     plan.execute_uninit(
-        &ExecContext::serial(),
         &mut uninitialized_ref,
         &ErasedRawStridedPtr::from_ref(&operand_ref),
         &ErasedRawStridedPtr::from_ref(&index_ref),
         &ErasedRawStridedPtr::from_ref(&update_ref),
+        Exec::serial(),
     )
     .unwrap();
 }
@@ -1162,12 +1170,7 @@ fn erased_dynamic_slice_preserves_empty_and_negative_stride_generic_cases() {
     let starts_ref = ErasedRawStridedRef::from_slice(&starts, &[1], &[1], 0).unwrap();
     let mut empty_ref = ErasedRawStridedMut::from_slice_mut(&mut empty, &[0], &[1], 0).unwrap();
     empty_plan
-        .execute(
-            &ExecContext::serial(),
-            &mut empty_ref,
-            &operand_ref,
-            &starts_ref,
-        )
+        .execute(&mut empty_ref, &operand_ref, &starts_ref, Exec::serial())
         .unwrap();
 
     let reverse_plan = ErasedDynamicSlicePlan::compile(
@@ -1188,10 +1191,10 @@ fn erased_dynamic_slice_preserves_empty_and_negative_stride_generic_cases() {
         ErasedRawStridedMut::from_slice_mut(&mut reversed, &[4], &[1], 0).unwrap();
     reverse_plan
         .execute(
-            &ExecContext::serial(),
             &mut reversed_ref,
             &reverse_operand,
             &starts_ref,
+            Exec::serial(),
         )
         .unwrap();
     assert_eq!(reversed, [3.0, 2.0, 1.0, 0.0]);

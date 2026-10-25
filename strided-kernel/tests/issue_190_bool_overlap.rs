@@ -2,8 +2,8 @@ use std::mem::MaybeUninit;
 use std::{fs, path::Path, ptr::NonNull};
 
 use strided_kernel::{
-    ErasedConcatenatePlan, ErasedRawStridedPtr, ErasedRawStridedUninitMut, ExecContext,
-    KernelDType, StridedError,
+    ErasedConcatenatePlan, ErasedRawStridedPtr, ErasedRawStridedUninitMut, Exec, KernelDType,
+    StridedError,
 };
 
 #[test]
@@ -59,11 +59,7 @@ fn concatenate_checks_all_overlaps_before_deferred_bool_validation() {
     }
     .unwrap();
 
-    let result = plan.execute_uninit(
-        &ExecContext::serial(),
-        &mut output,
-        &[invalid_ptr, overlapping_ptr],
-    );
+    let result = plan.execute_uninit(&mut output, &[invalid_ptr, overlapping_ptr], Exec::serial());
     // The first input is invalid, but the second input overlaps the output.
     // This exact error proves every overlap is checked before deferred Bool
     // validation of any input.
@@ -118,7 +114,7 @@ fn bool_mutation_after_raw_pointer_handoff_is_validated_before_writes() {
         )
     }
     .unwrap();
-    let result = plan.execute_uninit(&ExecContext::serial(), &mut output, &[handed_off]);
+    let result = plan.execute_uninit(&mut output, &[handed_off], Exec::serial());
     assert!(matches!(result, Err(StridedError::InvalidBoolByte { .. })));
     assert_eq!(unsafe { destination[0].assume_init() }, 7);
 }
@@ -168,7 +164,7 @@ fn bool_uninitialized_replay_does_not_read_strided_holes() {
     }
     .unwrap();
 
-    plan.execute_uninit(&ExecContext::serial(), &mut output, &[input_ptr])
+    plan.execute_uninit(&mut output, &[input_ptr], Exec::serial())
         .unwrap();
     // Only offsets 0 and 2 are reachable. The hole at offset 1 remains
     // MaybeUninit and is deliberately never read or assumed initialized.

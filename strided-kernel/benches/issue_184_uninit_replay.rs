@@ -8,17 +8,29 @@
 //! `taskset -c 60 "$bench_exe" 1`
 //! `taskset -c 60-63 "$bench_exe" 4`
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 use strided_kernel::{
     batched_outer_product_into, batched_outer_product_into_uninit, broadcast_mul_into,
-    broadcast_mul_into_uninit, compare_into, compare_into_uninit, with_execution_policy, CompareOp,
-    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    ExecContext, ExecutionPolicy, Identity, KernelDType, StridedView, StridedViewMut,
+    broadcast_mul_into_uninit, compare_into, compare_into_uninit, CompareOp, ErasedRawStridedMut,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, Exec, Identity,
+    KernelDType, StridedView, StridedViewMut,
 };
 
 const WARMUPS: usize = 8;
@@ -142,11 +154,12 @@ fn bench_mul() {
     measure_pair(
         "mul",
         || {
-            strided_kernel::mul_into(&mut initialized, &lhs, &rhs).unwrap();
+            strided_kernel::mul_into(&mut initialized, &lhs, &rhs, Exec::serial()).unwrap();
             black_box(initialized.data()[0]);
         },
         || {
-            strided_kernel::mul_into_uninit(&mut uninitialized, &lhs, &rhs).unwrap();
+            strided_kernel::mul_into_uninit(&mut uninitialized, &lhs, &rhs, Exec::serial())
+                .unwrap();
             black_box(unsafe { uninitialized.data()[0].assume_init() });
         },
     );
@@ -171,11 +184,12 @@ fn bench_broadcast_mul() {
     measure_pair(
         "broadcast_mul",
         || {
-            broadcast_mul_into(&mut initialized, &lhs, &[0], &rhs, &[1]).unwrap();
+            broadcast_mul_into(&mut initialized, &lhs, &[0], &rhs, &[1], Exec::serial()).unwrap();
             black_box(initialized.data()[0]);
         },
         || {
-            broadcast_mul_into_uninit(&mut uninitialized, &lhs, &[0], &rhs, &[1]).unwrap();
+            broadcast_mul_into_uninit(&mut uninitialized, &lhs, &[0], &rhs, &[1], Exec::serial())
+                .unwrap();
             black_box(unsafe { uninitialized.data()[0].assume_init() });
         },
     );
@@ -199,11 +213,12 @@ fn bench_outer() {
     measure_pair(
         "outer",
         || {
-            batched_outer_product_into(&mut initialized, &lhs, &rhs, 1, 1).unwrap();
+            batched_outer_product_into(&mut initialized, &lhs, &rhs, 1, 1, Exec::serial()).unwrap();
             black_box(initialized.data()[0]);
         },
         || {
-            batched_outer_product_into_uninit(&mut uninitialized, &lhs, &rhs, 1, 1).unwrap();
+            batched_outer_product_into_uninit(&mut uninitialized, &lhs, &rhs, 1, 1, Exec::serial())
+                .unwrap();
             black_box(unsafe { uninitialized.data()[0].assume_init() });
         },
     );
@@ -224,17 +239,34 @@ fn bench_compare() {
     measure_pair(
         "compare",
         || {
-            compare_into(&mut initialized, &lhs, &rhs, CompareOp::Lt).unwrap();
+            compare_into(&mut initialized, &lhs, &rhs, CompareOp::Lt, Exec::serial()).unwrap();
             black_box(initialized.data()[0]);
         },
         || {
-            compare_into_uninit(&mut uninitialized, &lhs, &rhs, CompareOp::Lt).unwrap();
+            compare_into_uninit(
+                &mut uninitialized,
+                &lhs,
+                &rhs,
+                CompareOp::Lt,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(unsafe { uninitialized.data()[0].assume_init() });
         },
     );
 }
 
-fn bench_fused(context: ExecContext) {
+fn bench_fused(threads: usize) {
+    let mut context = if threads == 1 {
+        Exec::serial()
+    } else {
+        bounded(threads)
+    };
+    let mut context_uninit = if threads == 1 {
+        Exec::serial()
+    } else {
+        bounded(threads)
+    };
     let dims = [VECTOR_LEN];
     let strides = [1];
     let lhs = vector_values(VECTOR_LEN, 1.0);
@@ -274,11 +306,12 @@ fn bench_fused(context: ExecContext) {
     measure_pair(
         "fused_add_mul",
         || {
-            plan.execute(&context, &mut initialized, &refs).unwrap();
+            plan.execute(&mut initialized, &refs, context.reborrow())
+                .unwrap();
             black_box(initialized.data_as::<f64>().unwrap()[0]);
         },
         || {
-            plan.execute_uninit(&context, &mut uninitialized, &ptrs)
+            plan.execute_uninit(&mut uninitialized, &ptrs, context_uninit.reborrow())
                 .unwrap();
             black_box(unsafe {
                 uninitialized.data_as_uninit_mut::<f64>().unwrap()[0].assume_init()
@@ -288,32 +321,23 @@ fn bench_fused(context: ExecContext) {
 }
 
 fn main() {
-    let threads = std::env::args()
-        .nth(1)
-        .expect("usage: issue_184_uninit_replay <threads>")
+    // Without a thread count (for example when `cargo test --all-targets` runs
+    // this harness-free bench) there is nothing to measure.
+    let Some(arg) = std::env::args().nth(1) else {
+        eprintln!("usage: issue_184_uninit_replay <threads>");
+        return;
+    };
+    let threads = arg
         .parse::<usize>()
         .expect("threads must be a positive integer");
-    let max_threads = NonZeroUsize::new(threads).expect("threads must be nonzero");
-    let context = if threads == 1 {
-        ExecContext::serial()
-    } else {
-        ExecContext::max_threads(threads).unwrap()
-    };
-    let policy = if threads == 1 {
-        ExecutionPolicy::Sequential
-    } else {
-        ExecutionPolicy::Rayon { max_threads }
-    };
 
     println!(
         "CONFIG,threads={threads},warmups={WARMUPS},samples={SAMPLES},vector_len={VECTOR_LEN},broadcast={BROADCAST_ROWS}x{BROADCAST_COLUMNS},outer={OUTER_LEN}x{OUTER_LEN}"
     );
     println!("HEADER,family,sample,order,initialized_ms,uninitialized_ms,ratio");
-    with_execution_policy(policy, || {
-        bench_mul();
-        bench_broadcast_mul();
-        bench_outer();
-        bench_compare();
-        bench_fused(context);
-    });
+    bench_mul();
+    bench_broadcast_mul();
+    bench_outer();
+    bench_compare();
+    bench_fused(threads);
 }

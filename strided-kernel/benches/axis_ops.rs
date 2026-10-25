@@ -4,8 +4,8 @@
 //!
 //! `cargo bench -p strided-kernel --features parallel --bench axis_ops`
 //!
-//! Each case runs at one thread (`ExecContext::serial()`) and at four threads
-//! (`ExecContext::max_threads(4)` inside a four-worker pool whose size is
+//! Each case runs at one thread (`Exec::serial()`) and at four threads
+//! (`Exec::max_threads(4)` inside a four-worker pool whose size is
 //! asserted). Shapes cover the feature-first decode activations of
 //! tenferro-rs#2006 (`(d, len, batch)` normalized over a unit-stride `d`), a
 //! size past the last level cache, and a strided normalized axis, which runs
@@ -15,13 +15,26 @@
 //! passes over memory but not the per-op allocation and dispatch a tensor
 //! runtime adds on top. Each `SUMMARY` line reports medians in milliseconds.
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use std::hint::black_box;
 use std::time::Instant;
 
 use strided_kernel::{
     erased_zip_into, map_into, ArgReduceOp, ErasedArgReducePlan, ErasedNormPlan,
     ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedReducePlan,
-    ErasedScanPlan, ErasedZipOp, ExecContext, KernelDType, NormSpec, ReduceOp, ScanOp, ScanOptions,
+    ErasedScanPlan, ErasedZipOp, Exec, KernelDType, NormSpec, ReduceOp, ScanOp, ScanOptions,
     StridedView, StridedViewMut,
 };
 
@@ -151,7 +164,6 @@ impl Composed {
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
-        ctx: &ExecContext,
         case: &NormCase,
         x: &[f32],
         weight: &[f32],
@@ -160,6 +172,7 @@ impl Composed {
         scaled: &mut [f32],
         centered: &mut [f32],
         out: &mut [f32],
+        mut ctx: Exec<'_>,
     ) {
         let dims = &case.dims;
         let st = &case.strides;
@@ -170,30 +183,38 @@ impl Composed {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(stat, &self.stat_dims, &self.stat_strides, 0)
                     .unwrap();
-            self.sum.execute(ctx, &mut dest, &x_ref).unwrap();
+            self.sum.execute(&mut dest, &x_ref, ctx.reborrow()).unwrap();
         }
         map_into(
             &mut StridedViewMut::new(scaled, &[stat.len()], &[1], 0).unwrap(),
             &StridedView::<f32>::new(stat, &[stat.len()], &[1], 0).unwrap(),
             |s| s / n,
+            Exec::serial(),
         )
         .unwrap();
         // centered = x - mean
-        let zip = |op, out: &mut [f32], lhs: &[f32], ls: &[isize], rhs: &[f32], rs: &[isize]| {
+        let zip = |mut ctx: Exec<'_>,
+                   op,
+                   out: &mut [f32],
+                   lhs: &[f32],
+                   ls: &[isize],
+                   rhs: &[f32],
+                   rs: &[isize]| {
             let lhs = ErasedRawStridedRef::from_slice(lhs, dims, ls, 0).unwrap();
             let rhs = ErasedRawStridedRef::from_slice(rhs, dims, rs, 0).unwrap();
             let mut dest = ErasedRawStridedMut::from_slice_mut(out, dims, st, 0).unwrap();
             erased_zip_into(
                 KernelDType::F32,
                 op,
-                ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&lhs),
                 &ErasedRawStridedPtr::from_ref(&rhs),
+                ctx.reborrow(),
             )
             .unwrap();
         };
         zip(
+            ctx.reborrow(),
             ErasedZipOp::Subtract,
             centered,
             x,
@@ -207,15 +228,19 @@ impl Composed {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(stat, &self.stat_dims, &self.stat_strides, 0)
                     .unwrap();
-            self.sumsq.execute(ctx, &mut dest, &c_ref).unwrap();
+            self.sumsq
+                .execute(&mut dest, &c_ref, ctx.reborrow())
+                .unwrap();
         }
         map_into(
             &mut StridedViewMut::new(scaled, &[stat.len()], &[1], 0).unwrap(),
             &StridedView::<f32>::new(stat, &[stat.len()], &[1], 0).unwrap(),
             |s| 1.0 / (s / n + 1e-5).sqrt(),
+            Exec::serial(),
         )
         .unwrap();
         zip(
+            ctx.reborrow(),
             ErasedZipOp::Multiply,
             out,
             centered,
@@ -225,6 +250,7 @@ impl Composed {
         );
         centered.copy_from_slice(out);
         zip(
+            ctx.reborrow(),
             ErasedZipOp::Multiply,
             out,
             centered,
@@ -234,6 +260,7 @@ impl Composed {
         );
         centered.copy_from_slice(out);
         zip(
+            ctx.reborrow(),
             ErasedZipOp::Add,
             out,
             centered,
@@ -257,7 +284,7 @@ fn naive_layer_norm(x: &[f32], d: usize, weight: &[f32], bias: &[f32], out: &mut
     }
 }
 
-fn bench_norm(pool4: &rayon::ThreadPool) {
+fn bench_norm() {
     for case in norm_cases() {
         let len: usize = case.dims.iter().product();
         let d = case.dims[case.axis];
@@ -282,19 +309,16 @@ fn bench_norm(pool4: &rayon::ThreadPool) {
         let composed = Composed::new(&case);
 
         for threads in [1usize, 4] {
-            let ctx = if threads == 1 {
-                ExecContext::serial()
+            let mut ctx = if threads == 1 {
+                Exec::serial()
             } else {
-                ExecContext::max_threads(threads).unwrap()
+                bounded(threads)
             };
             let run = |f: &mut (dyn FnMut() + Send)| {
                 if threads == 1 {
                     median_ms(len, f)
                 } else {
-                    pool4.install(|| {
-                        assert_eq!(rayon::current_num_threads(), 4);
-                        median_ms(len, f)
-                    })
+                    median_ms(len, f)
                 }
             };
             let fused_ms = run(&mut || {
@@ -305,13 +329,12 @@ fn bench_norm(pool4: &rayon::ThreadPool) {
                     ErasedRawStridedMut::from_slice_mut(&mut out, &case.dims, &case.strides, 0)
                         .unwrap();
                 fused
-                    .execute(&ctx, &mut dest, &x, Some(&w), Some(&b))
+                    .execute(&mut dest, &x, Some(&w), Some(&b), ctx.reborrow())
                     .unwrap();
                 black_box(&mut dest);
             });
             let composed_ms = run(&mut || {
                 composed.run(
-                    &ctx,
                     &case,
                     &x,
                     &weight,
@@ -320,6 +343,7 @@ fn bench_norm(pool4: &rayon::ThreadPool) {
                     &mut scaled,
                     &mut centered,
                     &mut out,
+                    ctx.reborrow(),
                 );
                 black_box(&mut out);
             });
@@ -343,7 +367,7 @@ fn bench_norm(pool4: &rayon::ThreadPool) {
     }
 }
 
-fn bench_scan_and_arg(pool4: &rayon::ThreadPool) {
+fn bench_scan_and_arg() {
     // (label, dims, axis): a unit-stride scanned axis, a strided one (panel
     // kernels) and a large unit-stride case.
     let cases: [(&str, [usize; 2], usize); 3] = [
@@ -380,33 +404,30 @@ fn bench_scan_and_arg(pool4: &rayon::ThreadPool) {
         )
         .unwrap();
         for threads in [1usize, 4] {
-            let ctx = if threads == 1 {
-                ExecContext::serial()
+            let mut ctx = if threads == 1 {
+                Exec::serial()
             } else {
-                ExecContext::max_threads(threads).unwrap()
+                bounded(threads)
             };
             let run = |f: &mut (dyn FnMut() + Send)| {
                 if threads == 1 {
                     median_ms(len, f)
                 } else {
-                    pool4.install(|| {
-                        assert_eq!(rayon::current_num_threads(), 4);
-                        median_ms(len, f)
-                    })
+                    median_ms(len, f)
                 }
             };
             let scan_ms = run(&mut || {
                 let src = ErasedRawStridedRef::from_slice(&x, &dims, &st, 0).unwrap();
                 let mut dest =
                     ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &st, 0).unwrap();
-                scan.execute(&ctx, &mut dest, &src).unwrap();
+                scan.execute(&mut dest, &src, ctx.reborrow()).unwrap();
                 black_box(&mut dest);
             });
             let arg_ms = run(&mut || {
                 let src = ErasedRawStridedRef::from_slice(&x, &dims, &st, 0).unwrap();
                 let mut dest =
                     ErasedRawStridedMut::from_slice_mut(&mut idx, &out_dims, &[1], 0).unwrap();
-                arg.execute(&ctx, &mut dest, &src).unwrap();
+                arg.execute(&mut dest, &src, ctx.reborrow()).unwrap();
                 black_box(&mut dest);
             });
             let (naive_scan, naive_arg) = if threads == 1 {
@@ -462,10 +483,6 @@ fn main() {
     if std::env::args().any(|arg| arg == "--list") {
         return;
     }
-    let pool4 = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
-    bench_norm(&pool4);
-    bench_scan_and_arg(&pool4);
+    bench_norm();
+    bench_scan_and_arg();
 }

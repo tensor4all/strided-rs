@@ -1,3 +1,16 @@
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use std::ptr::NonNull;
@@ -8,7 +21,7 @@ use strided_kernel::{
     batched_outer_product_into, batched_outer_product_into_uninit, broadcast_mul_into,
     broadcast_mul_into_uninit, compare_into, compare_into_uninit, mul_into, mul_into_uninit,
     CompareOp, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, ExecContext, Identity, KernelDType, StridedError, StridedView,
+    ErasedRawStridedUninitMut, Exec, Identity, KernelDType, StridedError, StridedView,
     StridedViewMut,
 };
 
@@ -31,14 +44,21 @@ where
         + core::fmt::Debug
         + PartialEq
         + core::ops::Mul<Output = T>
-        + strided_kernel::MaybeSendSync
+        + Send
+        + Sync
         + 'static,
 {
     let dims = [lhs.len()];
     let lhs_view = StridedView::<_, Identity>::new(lhs, &dims, &[1], 0).unwrap();
     let rhs_view = StridedView::<_, Identity>::new(rhs, &dims, &[1], 0).unwrap();
     let mut output = vec![MaybeUninit::uninit(); lhs.len()];
-    mul_into_uninit(&mut uninit_view(&mut output, &dims), &lhs_view, &rhs_view).unwrap();
+    mul_into_uninit(
+        &mut uninit_view(&mut output, &dims),
+        &lhs_view,
+        &rhs_view,
+        Exec::serial(),
+    )
+    .unwrap();
     assert_eq!(assume_init(output), expected);
 }
 
@@ -49,7 +69,8 @@ where
         + core::fmt::Debug
         + PartialEq
         + core::ops::Mul<Output = T>
-        + strided_kernel::MaybeSendSync
+        + Send
+        + Sync
         + 'static,
 {
     let dims = [lhs.len()];
@@ -61,6 +82,7 @@ where
         &mut StridedViewMut::new(&mut initialized, &dims, &[1], 0).unwrap(),
         &lhs_view,
         &rhs_view,
+        Exec::serial(),
     )
     .unwrap();
     let mut uninitialized = vec![MaybeUninit::uninit(); lhs.len()];
@@ -68,6 +90,7 @@ where
         &mut uninit_view(&mut uninitialized, &dims),
         &lhs_view,
         &rhs_view,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(assume_init(uninitialized), initialized);
@@ -79,6 +102,7 @@ where
         &[0],
         &rhs_view,
         &[0],
+        Exec::serial(),
     )
     .unwrap();
     let mut uninitialized = vec![MaybeUninit::uninit(); lhs.len()];
@@ -88,6 +112,7 @@ where
         &[0],
         &rhs_view,
         &[0],
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(assume_init(uninitialized), initialized);
@@ -102,6 +127,7 @@ where
         &rhs_view,
         1,
         1,
+        Exec::serial(),
     )
     .unwrap();
     let mut uninitialized = vec![MaybeUninit::uninit(); 4];
@@ -111,6 +137,7 @@ where
         &rhs_view,
         1,
         1,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(assume_init(uninitialized), initialized);
@@ -118,11 +145,7 @@ where
 
 fn assert_compare_differential<T>(lhs: &[T], rhs: &[T])
 where
-    T: Copy
-        + core::fmt::Debug
-        + PartialOrd
-        + strided_kernel::MaybeSendSync
-        + strided_kernel::KernelStorageElement,
+    T: Copy + core::fmt::Debug + PartialOrd + Send + Sync + strided_kernel::KernelStorageElement,
 {
     let dims = [lhs.len()];
     let lhs_view = StridedView::<_, Identity>::new(lhs, &dims, &[1], 0).unwrap();
@@ -140,6 +163,7 @@ where
             &lhs_view,
             &rhs_view,
             op,
+            Exec::serial(),
         )
         .unwrap();
         let mut uninitialized = vec![MaybeUninit::uninit(); lhs.len()];
@@ -148,6 +172,7 @@ where
             &lhs_view,
             &rhs_view,
             op,
+            Exec::serial(),
         )
         .unwrap();
         assert_eq!(assume_init(uninitialized), initialized);
@@ -167,18 +192,18 @@ where
     let ptrs: Vec<_> = refs.iter().map(ErasedRawStridedPtr::from_ref).collect();
     let plan = ErasedFusedPlan::compile(dtype, plan).unwrap();
 
-    for context in [ExecContext::serial(), ExecContext::max_threads(2).unwrap()] {
+    for mut context in [Exec::serial(), bounded(2)] {
         let mut initialized = vec![inputs[0][0]; dims[0]];
         let mut initialized_dest =
             ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
-        plan.execute(&context, &mut initialized_dest, &refs)
+        plan.execute(&mut initialized_dest, &refs, context.reborrow())
             .unwrap();
 
         let mut uninitialized = vec![MaybeUninit::<T>::uninit(); dims[0]];
         let mut uninitialized_dest =
             ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
                 .unwrap();
-        plan.execute_uninit(&context, &mut uninitialized_dest, &ptrs)
+        plan.execute_uninit(&mut uninitialized_dest, &ptrs, context.reborrow())
             .unwrap();
         assert_eq!(assume_init(uninitialized), initialized);
     }
@@ -192,7 +217,13 @@ fn typed_uninitialized_full_overwrite_siblings_match_initialized_paths() {
     let rhs_view = StridedView::<_, Identity>::new(&rhs, &[4], &[1], 0).unwrap();
 
     let mut mul_out = vec![MaybeUninit::uninit(); 4];
-    mul_into_uninit(&mut uninit_view(&mut mul_out, &[4]), &lhs_view, &rhs_view).unwrap();
+    mul_into_uninit(
+        &mut uninit_view(&mut mul_out, &[4]),
+        &lhs_view,
+        &rhs_view,
+        Exec::serial(),
+    )
+    .unwrap();
     assert_eq!(assume_init(mul_out), [5, 12, 21, 32]);
 
     let mut compare_out = vec![MaybeUninit::uninit(); 4];
@@ -201,6 +232,7 @@ fn typed_uninitialized_full_overwrite_siblings_match_initialized_paths() {
         &lhs_view,
         &rhs_view,
         CompareOp::Lt,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(assume_init(compare_out), [true; 4]);
@@ -212,6 +244,7 @@ fn typed_uninitialized_full_overwrite_siblings_match_initialized_paths() {
         &[0],
         &rhs_view,
         &[0],
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(assume_init(broadcast_out), [5, 12, 21, 32]);
@@ -222,8 +255,15 @@ fn typed_uninitialized_full_overwrite_siblings_match_initialized_paths() {
     let rhs_outer_view = StridedView::<_, Identity>::new(&rhs_outer, &[3], &[1], 0).unwrap();
     let mut outer_out = vec![MaybeUninit::uninit(); 6];
     let mut outer_view = StridedViewMut::new(&mut outer_out, &[2, 3], &[1, 2], 0).unwrap();
-    batched_outer_product_into_uninit(&mut outer_view, &lhs_outer_view, &rhs_outer_view, 1, 1)
-        .unwrap();
+    batched_outer_product_into_uninit(
+        &mut outer_view,
+        &lhs_outer_view,
+        &rhs_outer_view,
+        1,
+        1,
+        Exec::serial(),
+    )
+    .unwrap();
     assert_eq!(assume_init(outer_out), [20, 30, 40, 60, 60, 90]);
 
     assert_mul_dtype(&[1.0f32, -2.0], &[3.0, 4.0], &[3.0, -8.0]);
@@ -466,8 +506,7 @@ fn erased_fused_uninitialized_replay_writes_valid_bool_output() {
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     let inputs = inputs.map(|input| ErasedRawStridedPtr::from_ref(&input));
-    plan.execute_uninit(&ExecContext::max_threads(1).unwrap(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute_uninit(&mut dest, &inputs, bounded(1)).unwrap();
     assert_eq!(assume_init(output), lhs);
 }
 
@@ -483,6 +522,7 @@ fn typed_uninitialized_validation_errors_leave_sentinels_untouched() {
         &mut StridedViewMut::new(&mut output, &[2], &[0], 0).unwrap(),
         &lhs_view,
         &rhs_view,
+        Exec::serial(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -529,7 +569,7 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     assert!(matches!(
-        plan.execute_uninit(&ExecContext::serial(), &mut dest, &[overlapping]),
+        plan.execute_uninit(&mut dest, &[overlapping], Exec::serial()),
         Err(StridedError::OverlappingInputOutput { input: 0 })
     ));
     assert!(output
@@ -544,9 +584,9 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(
-            &ExecContext::serial(),
             &mut dest,
-            &[ErasedRawStridedPtr::from_ref(&wrong_dtype_ref)]
+            &[ErasedRawStridedPtr::from_ref(&wrong_dtype_ref)],
+            Exec::serial()
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
@@ -563,9 +603,9 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(
-            &ExecContext::serial(),
             &mut dest,
-            &[ErasedRawStridedPtr::from_ref(&short_ref)]
+            &[ErasedRawStridedPtr::from_ref(&short_ref)],
+            Exec::serial()
         ),
         Err(StridedError::ShapeMismatch(_, _))
     ));
@@ -580,7 +620,7 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
     let mut noninjective =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &[0], 0).unwrap();
     assert!(matches!(
-        plan.execute_uninit(&ExecContext::serial(), &mut noninjective, &[input_ptr]),
+        plan.execute_uninit(&mut noninjective, &[input_ptr], Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
     assert!(output
@@ -613,7 +653,13 @@ fn partial_write_panic_leaves_maybe_uninit_destination_safe_to_drop() {
     let rhs_view = StridedView::<_, Identity>::new(&rhs, &[8], &[1], 0).unwrap();
     let mut output = vec![MaybeUninit::new(99i32); 8];
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        mul_into_uninit(&mut uninit_view(&mut output, &[8]), &lhs_view, &rhs_view).unwrap();
+        mul_into_uninit(
+            &mut uninit_view(&mut output, &[8]),
+            &lhs_view,
+            &rhs_view,
+            Exec::serial(),
+        )
+        .unwrap();
     }));
     assert!(result.is_err());
     assert_eq!(unsafe { output[0].assume_init() }, 6);
@@ -652,8 +698,7 @@ fn erased_fused_uninitialized_parallel_replay_preserves_wrapping_integer_semanti
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     let inputs = inputs.map(|input| ErasedRawStridedPtr::from_ref(&input));
-    plan.execute_uninit(&ExecContext::max_threads(2).unwrap(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute_uninit(&mut dest, &inputs, bounded(2)).unwrap();
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == -2 }));

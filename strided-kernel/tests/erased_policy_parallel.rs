@@ -1,11 +1,24 @@
 #![cfg(feature = "parallel")]
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use strided_kernel::{
     erased_zip_into, ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan,
     ErasedDynamicUpdateSlicePlan, ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut,
     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan,
-    ErasedScatterPlan, ErasedZipOp, ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    ErasedScatterPlan, ErasedZipOp, Exec, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
     StridedError,
 };
 
@@ -20,8 +33,8 @@ fn as_bytes<T>(data: &[T]) -> &[u8] {
     }
 }
 
-fn bounded_context() -> ExecContext {
-    ExecContext::max_threads(2).unwrap()
+fn bounded_context() -> Exec<'static> {
+    bounded(2)
 }
 
 #[test]
@@ -33,7 +46,7 @@ fn large_one_shot_zip_matches_serial() {
         .map(|index| (LARGE_LEN - index) as f64)
         .collect();
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let lhs = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
         let rhs = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
         let mut output = vec![0.0f64; LARGE_LEN];
@@ -42,16 +55,16 @@ fn large_one_shot_zip_matches_serial() {
         erased_zip_into(
             KernelDType::F64,
             ErasedZipOp::Add,
-            &ctx,
             &mut dest,
             &ErasedRawStridedPtr::from_ref(&lhs),
             &ErasedRawStridedPtr::from_ref(&rhs),
+            ctx,
         )
         .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 }
 
 #[test]
@@ -70,10 +83,10 @@ fn bounded_one_shot_rejects_noninjective_destination_before_raw_replay() {
     let error = erased_zip_into(
         KernelDType::F64,
         ErasedZipOp::Add,
-        &bounded_context(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs),
         &ErasedRawStridedPtr::from_ref(&rhs),
+        bounded_context(),
     )
     .unwrap_err();
 
@@ -93,16 +106,16 @@ fn large_erased_copy_matches_serial() {
     let plan =
         ErasedCopyPlan::compile(KernelDType::I64, &dims, &dest_strides, &src_strides).unwrap();
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let source_ref = ErasedRawStridedRef::from_slice(&source, &dims, &src_strides, 0).unwrap();
         let mut output = vec![0i64; LEN];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &dest_strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &source_ref).unwrap();
+        plan.execute(&mut dest, &source_ref, ctx).unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 }
 
 #[test]
@@ -125,17 +138,17 @@ fn large_erased_axis_reduce_matches_serial() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let source_ref =
             ErasedRawStridedRef::from_slice(&source, &src_dims, &src_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &source_ref).unwrap();
+        plan.execute(&mut dest, &source_ref, ctx).unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 
     let rank8_dims = [2, 2, 2, 2, 2, 2, 2, LARGE_LEN];
     let rank8_strides = [1, 2, 4, 8, 16, 32, 64, 128];
@@ -152,19 +165,16 @@ fn large_erased_axis_reduce_matches_serial() {
         &[6, 0, 3, 1, 5, 2, 4],
     )
     .unwrap();
-    let run_rank8 = |ctx: ExecContext| {
+    let run_rank8 = |ctx: Exec| {
         let source_ref =
             ErasedRawStridedRef::from_slice(&rank8_source, &rank8_dims, &rank8_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-        rank8_plan.execute(&ctx, &mut dest, &source_ref).unwrap();
+        rank8_plan.execute(&mut dest, &source_ref, ctx).unwrap();
         output
     };
-    assert_eq!(
-        run_rank8(bounded_context()),
-        run_rank8(ExecContext::serial())
-    );
+    assert_eq!(run_rank8(bounded_context()), run_rank8(Exec::serial()));
 }
 
 #[test]
@@ -195,18 +205,18 @@ fn large_erased_gather_matches_serial() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
         let index_ref = ErasedRawStridedRef::from_slice(&indices, &dims, &strides, 0).unwrap();
         let mut output = vec![0.0f64; LARGE_LEN];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &operand_ref, &index_ref)
+        plan.execute(&mut dest, &operand_ref, &index_ref, ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 }
 
 #[test]
@@ -249,14 +259,14 @@ fn generic_gather_matches_across_threshold_for_initialized_and_uninit_outputs() 
         let mut serial_dest =
             ErasedRawStridedMut::from_slice_mut(&mut expected, &dest_dims, &dest_strides, 0)
                 .unwrap();
-        plan.execute(&ExecContext::serial(), &mut serial_dest, &source, &index)
+        plan.execute(&mut serial_dest, &source, &index, Exec::serial())
             .unwrap();
 
         let mut initialized = vec![0.0f64; len];
         let mut initialized_dest =
             ErasedRawStridedMut::from_slice_mut(&mut initialized, &dest_dims, &dest_strides, 0)
                 .unwrap();
-        plan.execute(&bounded_context(), &mut initialized_dest, &source, &index)
+        plan.execute(&mut initialized_dest, &source, &index, bounded_context())
             .unwrap();
         assert_eq!(initialized, expected);
 
@@ -265,10 +275,10 @@ fn generic_gather_matches_across_threshold_for_initialized_and_uninit_outputs() 
             ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dest_dims, &dest_strides, 0)
                 .unwrap();
         plan.execute_uninit(
-            &bounded_context(),
             &mut uninit_dest,
             &ErasedRawStridedPtr::from_ref(&source),
             &ErasedRawStridedPtr::from_ref(&index),
+            bounded_context(),
         )
         .unwrap();
         for (actual, expected) in raw.iter().zip(&expected) {
@@ -319,7 +329,7 @@ fn large_erased_dynamic_slice_and_update_match_serial() {
     )
     .unwrap();
 
-    let run_slice = |ctx: ExecContext| {
+    let run_slice = |mut ctx: Exec| {
         let operand_ref =
             ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let starts_ref =
@@ -329,11 +339,11 @@ fn large_erased_dynamic_slice_and_update_match_serial() {
             ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
                 .unwrap();
         slice
-            .execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+            .execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
             .unwrap();
         output
     };
-    let run_update = |ctx: ExecContext| {
+    let run_update = |ctx: Exec| {
         let operand_ref =
             ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let update_ref =
@@ -345,19 +355,13 @@ fn large_erased_dynamic_slice_and_update_match_serial() {
             ErasedRawStridedMut::from_slice_mut(&mut output, &operand_dims, &operand_strides, 0)
                 .unwrap();
         update_slice
-            .execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
+            .execute(&mut dest, &operand_ref, &update_ref, &starts_ref, ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(
-        run_slice(bounded_context()),
-        run_slice(ExecContext::serial())
-    );
-    assert_eq!(
-        run_update(bounded_context()),
-        run_update(ExecContext::serial())
-    );
+    assert_eq!(run_slice(bounded_context()), run_slice(Exec::serial()));
+    assert_eq!(run_update(bounded_context()), run_update(Exec::serial()));
 }
 
 #[test]
@@ -406,17 +410,15 @@ fn dynamic_slice_and_update_match_serial_at_threshold_boundaries() {
         )
         .unwrap();
 
-        let run_slice = |ctx: ExecContext| {
+        let run_slice = |mut ctx: Exec| {
             let mut output = vec![0i32; len];
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
                     .unwrap();
-            slice
-                .execute(&ctx, &mut dest, &source, &starts_ref)
-                .unwrap();
+            slice.execute(&mut dest, &source, &starts_ref, ctx).unwrap();
             output
         };
-        let run_update = |ctx: ExecContext| {
+        let run_update = |ctx: Exec| {
             let mut output = vec![0i32; 3 * cols];
             let mut dest = ErasedRawStridedMut::from_slice_mut(
                 &mut output,
@@ -426,19 +428,13 @@ fn dynamic_slice_and_update_match_serial_at_threshold_boundaries() {
             )
             .unwrap();
             update_slice
-                .execute(&ctx, &mut dest, &source, &update_ref, &starts_ref)
+                .execute(&mut dest, &source, &update_ref, &starts_ref, ctx)
                 .unwrap();
             output
         };
 
-        assert_eq!(
-            run_slice(bounded_context()),
-            run_slice(ExecContext::serial())
-        );
-        assert_eq!(
-            run_update(bounded_context()),
-            run_update(ExecContext::serial())
-        );
+        assert_eq!(run_slice(bounded_context()), run_slice(Exec::serial()));
+        assert_eq!(run_update(bounded_context()), run_update(Exec::serial()));
     }
 }
 
@@ -465,18 +461,18 @@ fn large_erased_pad_matches_serial() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let operand_ref =
             ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN + 128];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+        plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 }
 
 #[test]
@@ -499,21 +495,17 @@ fn generic_pad_matches_serial_at_threshold_boundaries() {
             &interior,
         )
         .unwrap();
-        let run = |ctx: ExecContext| {
+        let run = |ctx: Exec| {
             let operand_ref =
                 ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
             let mut output = vec![0i32; len];
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
-            plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+            plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx)
                 .unwrap();
             output
         };
-        assert_eq!(
-            run(bounded_context()),
-            run(ExecContext::serial()),
-            "len={len}"
-        );
+        assert_eq!(run(bounded_context()), run(Exec::serial()), "len={len}");
     }
 }
 
@@ -549,7 +541,7 @@ fn large_erased_scatter_matches_serial_with_overlaps() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
         let index_ref =
             ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
@@ -557,12 +549,12 @@ fn large_erased_scatter_matches_serial_with_overlaps() {
         let mut output = vec![0.0f64; LARGE_LEN];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
+        plan.execute(&mut dest, &operand_ref, &index_ref, &update_ref, ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 }
 
 #[test]
@@ -617,14 +609,14 @@ fn large_erased_concatenate_matches_serial_for_initialized_and_uninit_outputs() 
         }
     }
 
-    let run = |ctx: ExecContext| {
+    let run = |ctx: Exec| {
         let mut output = vec![-1i64; total];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &inputs).unwrap();
+        plan.execute(&mut dest, &inputs, ctx).unwrap();
         output
     };
-    let run_uninit = |ctx: ExecContext| {
+    let run_uninit = |ctx: Exec| {
         let ptrs: Vec<ErasedRawStridedPtr<'_>> =
             inputs.iter().map(ErasedRawStridedPtr::from_ref).collect();
         let mut storage = vec![MaybeUninit::<i64>::uninit(); total];
@@ -635,7 +627,7 @@ fn large_erased_concatenate_matches_serial_for_initialized_and_uninit_outputs() 
             0,
         )
         .unwrap();
-        plan.execute_uninit(&ctx, &mut dest, &ptrs).unwrap();
+        plan.execute_uninit(&mut dest, &ptrs, ctx).unwrap();
         // SAFETY: the dense destination reaches every slot and a successful
         // uninit execute initializes every reachable slot.
         storage
@@ -643,9 +635,10 @@ fn large_erased_concatenate_matches_serial_for_initialized_and_uninit_outputs() 
             .map(|value| unsafe { value.assume_init() })
             .collect::<Vec<_>>()
     };
-    for ctx in [ExecContext::serial(), bounded_context()] {
-        assert_eq!(run(ctx.clone()), expected);
-        assert_eq!(run_uninit(ctx), expected);
+    let makers: [fn() -> Exec<'static>; 2] = [Exec::serial, bounded_context];
+    for make in makers {
+        assert_eq!(run(make()), expected);
+        assert_eq!(run_uninit(make()), expected);
     }
 }
 
@@ -719,13 +712,13 @@ fn large_erased_rank_two_dynamic_slice_and_update_match_serial() {
         }
     }
 
-    for ctx in [ExecContext::serial(), bounded_context()] {
+    for mut ctx in [Exec::serial(), bounded_context()] {
         let mut output = vec![f64::NAN; 257 * 131];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
                 .unwrap();
         slice
-            .execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+            .execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
             .unwrap();
         assert_eq!(output, expected_slice);
 
@@ -734,7 +727,13 @@ fn large_erased_rank_two_dynamic_slice_and_update_match_serial() {
             ErasedRawStridedMut::from_slice_mut(&mut output, &operand_dims, &dest_strides, 0)
                 .unwrap();
         update_slice
-            .execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
+            .execute(
+                &mut dest,
+                &operand_ref,
+                &update_ref,
+                &starts_ref,
+                ctx.reborrow(),
+            )
             .unwrap();
         assert_eq!(output, expected_update);
     }

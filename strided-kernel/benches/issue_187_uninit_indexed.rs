@@ -5,14 +5,35 @@ use std::{
     process,
     time::{Duration, Instant},
 };
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this bench.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
+fn token(threads: usize) -> Exec<'static> {
+    if threads == 1 {
+        Exec::serial()
+    } else {
+        bounded(threads)
+    }
+}
+
 use strided_kernel::{
     ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedGatherPlan, ErasedRawStridedMut,
     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan,
-    ErasedScatterPlan, ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    ErasedScatterPlan, Exec, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
 };
 
 fn sample(
-    ctx: &ExecContext,
+    threads: usize,
     plan: &ErasedReducePlan,
     source: &ErasedRawStridedRef<'_>,
     init: &mut [f64],
@@ -22,7 +43,7 @@ fn sample(
     let initialized = || {
         let mut dest = ErasedRawStridedMut::from_slice_mut(init, &[], &[], 0).unwrap();
         let start = Instant::now();
-        plan.execute(ctx, &mut dest, source).unwrap();
+        plan.execute(&mut dest, source, token(threads)).unwrap();
         black_box(init);
         start.elapsed()
     };
@@ -30,7 +51,8 @@ fn sample(
         let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(raw, &[], &[], 0).unwrap();
         let ptr = ErasedRawStridedPtr::from_ref(source);
         let start = Instant::now();
-        plan.execute_uninit(ctx, &mut dest, &ptr).unwrap();
+        plan.execute_uninit(&mut dest, &ptr, token(threads))
+            .unwrap();
         black_box(raw);
         start.elapsed()
     };
@@ -84,7 +106,7 @@ fn run_pairs(
 
 fn main() {
     let threads = env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(1);
-    let ctx = ExecContext::max_threads(threads).expect("threads must be positive");
+    let mut ctx = token(threads);
     let n = 131_073;
     let dims = [n];
     let strides = [1isize];
@@ -97,7 +119,7 @@ fn main() {
     let mut uninitialized = Vec::with_capacity(31);
     for sample_index in 0..31 {
         let (a, b) = sample(
-            &ctx,
+            threads,
             &plan,
             &source,
             &mut init,
@@ -144,7 +166,7 @@ fn main() {
                     .unwrap();
             let start = Instant::now();
             gather
-                .execute(&ctx, &mut dest, &operand_ref, &index_ref)
+                .execute(&mut dest, &operand_ref, &index_ref, ctx.reborrow())
                 .unwrap();
             black_box(&gather_init);
             start.elapsed()
@@ -161,7 +183,7 @@ fn main() {
             let index = ErasedRawStridedPtr::from_ref(&index_ref);
             let start = Instant::now();
             gather
-                .execute_uninit(&ctx, &mut dest, &operand, &index)
+                .execute_uninit(&mut dest, &operand, &index, token(threads))
                 .unwrap();
             black_box(&gather_raw);
             start.elapsed()
@@ -195,7 +217,7 @@ fn main() {
                     .unwrap();
             let start = Instant::now();
             slice
-                .execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+                .execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
                 .unwrap();
             black_box(&slice_init);
             start.elapsed()
@@ -208,7 +230,7 @@ fn main() {
             let starts = ErasedRawStridedPtr::from_ref(&starts_ref);
             let start = Instant::now();
             slice
-                .execute_uninit(&ctx, &mut dest, &operand, &starts)
+                .execute_uninit(&mut dest, &operand, &starts, token(threads))
                 .unwrap();
             black_box(&slice_raw);
             start.elapsed()
@@ -239,7 +261,13 @@ fn main() {
                 ErasedRawStridedMut::from_slice_mut(&mut update_init, &[8192], &[1], 0).unwrap();
             let start = Instant::now();
             update_plan
-                .execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
+                .execute(
+                    &mut dest,
+                    &operand_ref,
+                    &update_ref,
+                    &starts_ref,
+                    ctx.reborrow(),
+                )
                 .unwrap();
             black_box(&update_init);
             start.elapsed()
@@ -253,7 +281,7 @@ fn main() {
             let starts = ErasedRawStridedPtr::from_ref(&starts_ref);
             let start = Instant::now();
             update_plan
-                .execute_uninit(&ctx, &mut dest, &operand, &update, &starts)
+                .execute_uninit(&mut dest, &operand, &update, &starts, token(threads))
                 .unwrap();
             black_box(&update_raw);
             start.elapsed()
@@ -291,7 +319,7 @@ fn main() {
         ErasedRawStridedRef::from_slice(&scatter_updates, &scatter_update_dims, &[1], 0).unwrap();
     let mut scatter_init = vec![0.0f64; 8192];
     let mut scatter_raw = vec![MaybeUninit::<f64>::uninit(); 8192];
-    let serial = ExecContext::serial();
+    let mut serial = Exec::serial();
     ok &= run_pairs(
         "scatter_serial",
         || {
@@ -301,11 +329,11 @@ fn main() {
             let start = Instant::now();
             scatter
                 .execute(
-                    &serial,
                     &mut dest,
                     &operand_ref,
                     &scatter_index_ref,
                     &scatter_update_ref,
+                    serial.reborrow(),
                 )
                 .unwrap();
             black_box(&scatter_init);
@@ -324,7 +352,7 @@ fn main() {
             let update = ErasedRawStridedPtr::from_ref(&scatter_update_ref);
             let start = Instant::now();
             scatter
-                .execute_uninit(&serial, &mut dest, &operand, &index, &update)
+                .execute_uninit(&mut dest, &operand, &index, &update, Exec::serial())
                 .unwrap();
             black_box(&scatter_raw);
             start.elapsed()

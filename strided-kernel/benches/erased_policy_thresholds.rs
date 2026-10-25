@@ -1,3 +1,16 @@
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use criterion::measurement::Measurement;
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion,
@@ -7,7 +20,7 @@ use strided_kernel::{
     col_major_strides, erased_zip_into, ErasedCopyPlan, ErasedDynamicSlicePlan,
     ErasedDynamicUpdateSlicePlan, ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut,
     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedReducePlan, ErasedScatterPlan, ErasedZipOp,
-    ExecContext, GatherSpec, KernelDType, RawStridedRef, ReduceOp, ScatterSpec, StridedError,
+    Exec, GatherSpec, KernelDType, RawStridedRef, ReduceOp, ScatterSpec, StridedError,
 };
 
 #[derive(Clone, Copy)]
@@ -20,7 +33,9 @@ struct BenchCase {
 fn profile_cases() -> Vec<BenchCase> {
     let profile = std::env::var("STRIDED_KERNEL_ERASED_POLICY_BENCH_PROFILE")
         .unwrap_or_else(|_| "quick".to_string());
-    let default_threads = rayon::current_num_threads().min(2);
+    let default_threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(2);
     let threads = std::env::var("STRIDED_KERNEL_ERASED_POLICY_BENCH_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -61,11 +76,11 @@ fn profile_cases() -> Vec<BenchCase> {
         .collect()
 }
 
-fn context(case: BenchCase) -> ExecContext {
+fn context(case: BenchCase) -> Exec<'static> {
     if case.threads == 1 {
-        ExecContext::serial()
+        Exec::serial()
     } else {
-        ExecContext::max_threads(case.threads).unwrap()
+        bounded(case.threads)
     }
 }
 
@@ -257,7 +272,7 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
             .unwrap();
             let lhs_ptr = ErasedRawStridedPtr::from_ref(&lhs);
             let rhs_ptr = ErasedRawStridedPtr::from_ref(&rhs);
-            let ctx = context(case);
+            let mut ctx = context(case);
             for op in [ErasedZipOp::Add, ErasedZipOp::Divide] {
                 public_group.bench_function(
                     BenchmarkId::new(
@@ -277,10 +292,10 @@ fn bench_raw_any_integer_preflight(c: &mut Criterion) {
                             erased_zip_into(
                                 KernelDType::I32,
                                 op,
-                                &ctx,
                                 &mut dest,
                                 &lhs_ptr,
                                 &rhs_ptr,
+                                ctx.reborrow(),
                             )
                             .unwrap();
                             black_box(&mut dest);
@@ -314,7 +329,7 @@ fn bench_axis_reduce(c: &mut Criterion) {
         )
         .unwrap();
         let source = ErasedRawStridedRef::from_slice(&input, &src_dims, &src_strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; columns];
@@ -322,7 +337,7 @@ fn bench_axis_reduce(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &source).unwrap();
+                plan.execute(&mut dest, &source, ctx.reborrow()).unwrap();
                 black_box(&mut dest);
             });
         });
@@ -405,7 +420,7 @@ fn bench_erased_reduce_variant<M: Measurement>(
     let mut output = vec![0.0f64; dest_dims.iter().product()];
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-    let ctx = context(case);
+    let mut ctx = context(case);
     let id = BenchmarkId::new(
         format!("{}_{}", variant.label(), context_label(case)),
         format!("{}_n{}", case.label, case.len),
@@ -413,7 +428,7 @@ fn bench_erased_reduce_variant<M: Measurement>(
 
     group.bench_function(id, |bencher| {
         bencher.iter(|| {
-            plan.execute(&ctx, &mut dest, &source).unwrap();
+            plan.execute(&mut dest, &source, ctx.reborrow()).unwrap();
             black_box(&mut dest);
         });
     });
@@ -473,7 +488,7 @@ fn bench_gather_take(c: &mut Criterion) {
             ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let index_ref =
             ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
@@ -481,7 +496,7 @@ fn bench_gather_take(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &operand_ref, &index_ref)
+                plan.execute(&mut dest, &operand_ref, &index_ref, ctx.reborrow())
                     .unwrap();
                 black_box(&mut dest);
             });
@@ -592,7 +607,7 @@ fn bench_gather_variant<M: Measurement>(
     let mut output = vec![0.0f64; case.len];
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-    let ctx = context(case);
+    let mut ctx = context(case);
     let id = BenchmarkId::new(
         format!("{}_{}", variant.label(), context_label(case)),
         format!("{}_n{}", case.label, case.len),
@@ -600,7 +615,7 @@ fn bench_gather_variant<M: Measurement>(
 
     group.bench_function(id, |bencher| {
         bencher.iter(|| {
-            plan.execute(&ctx, &mut dest, &operand_ref, &index_ref)
+            plan.execute(&mut dest, &operand_ref, &index_ref, ctx.reborrow())
                 .unwrap();
             black_box(&mut dest);
         });
@@ -676,14 +691,14 @@ fn bench_dynamic_slice_variant<M: Measurement>(
     let mut output = vec![0.0f64; case.len];
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &dest_strides, 0).unwrap();
-    let ctx = context(case);
+    let mut ctx = context(case);
     let id = BenchmarkId::new(
         format!("{}_{}", variant.label(), context_label(case)),
         format!("{}_n{}", case.label, case.len),
     );
     group.bench_function(id, |bencher| {
         bencher.iter(|| {
-            plan.execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+            plan.execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
                 .unwrap();
             black_box(&mut dest);
         });
@@ -761,15 +776,21 @@ fn bench_dynamic_update_variant<M: Measurement>(
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &padded_dims, &operand_strides, 0)
             .unwrap();
-    let ctx = context(case);
+    let mut ctx = context(case);
     let id = BenchmarkId::new(
         format!("{}_{}", variant.label(), context_label(case)),
         format!("{}_n{}", case.label, case.len),
     );
     group.bench_function(id, |bencher| {
         bencher.iter(|| {
-            plan.execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
-                .unwrap();
+            plan.execute(
+                &mut dest,
+                &operand_ref,
+                &update_ref,
+                &starts_ref,
+                ctx.reborrow(),
+            )
+            .unwrap();
             black_box(&mut dest);
         });
     });
@@ -819,7 +840,7 @@ fn bench_dynamic_slice(c: &mut Criterion) {
             ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let starts_ref =
             ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
@@ -827,7 +848,7 @@ fn bench_dynamic_slice(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+                plan.execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
                     .unwrap();
                 black_box(&mut dest);
             });
@@ -869,7 +890,7 @@ fn bench_dynamic_update_slice(c: &mut Criterion) {
             ErasedRawStridedRef::from_slice(&update, &update_dims, &update_strides, 0).unwrap();
         let starts_ref =
             ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0i32; case.len + 128];
@@ -877,8 +898,14 @@ fn bench_dynamic_update_slice(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
-                    .unwrap();
+                plan.execute(
+                    &mut dest,
+                    &operand_ref,
+                    &update_ref,
+                    &starts_ref,
+                    ctx.reborrow(),
+                )
+                .unwrap();
                 black_box(&mut dest);
             });
         });
@@ -913,7 +940,7 @@ fn bench_pad_fill_and_copy(c: &mut Criterion) {
         .unwrap();
         let operand_ref =
             ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0i32; dest_dims[0]];
@@ -921,7 +948,7 @@ fn bench_pad_fill_and_copy(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+                plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx.reborrow())
                     .unwrap();
                 black_box(&mut dest);
             });
@@ -957,10 +984,10 @@ fn bench_pad_edge_padding_2d(c: &mut Criterion) {
     let operand_ref =
         ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
     for (label, threads) in [("serial", 1usize), ("max_threads_4", 4)] {
-        let ctx = if threads == 1 {
-            ExecContext::serial()
+        let mut ctx = if threads == 1 {
+            Exec::serial()
         } else {
-            ExecContext::max_threads(threads).unwrap()
+            bounded(threads)
         };
         group.bench_function(label, |bencher| {
             let mut output = vec![0.0f64; dest_dims[0] * dest_dims[1]];
@@ -968,7 +995,7 @@ fn bench_pad_edge_padding_2d(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+                plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx.reborrow())
                     .unwrap();
                 black_box(&mut dest);
             });
@@ -1040,7 +1067,7 @@ fn bench_erased_pad_generic_rank_layout(c: &mut Criterion) {
             let operand_ref =
                 ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0)
                     .unwrap();
-            let ctx = context(case);
+            let mut ctx = context(case);
             let id = BenchmarkId::new(
                 format!("{label}_{}", context_label(case)),
                 format!("n{}", case.len),
@@ -1051,7 +1078,7 @@ fn bench_erased_pad_generic_rank_layout(c: &mut Criterion) {
                     .unwrap();
             group.bench_function(id, |bencher| {
                 bencher.iter(|| {
-                    plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+                    plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx.reborrow())
                         .unwrap();
                     black_box(&mut dest);
                 });
@@ -1069,14 +1096,14 @@ fn bench_copy_raw_path(c: &mut Criterion) {
         let source_data = patterned_f64(case.len);
         let plan = ErasedCopyPlan::compile(KernelDType::F64, &dims, &strides, &strides).unwrap();
         let source = ErasedRawStridedRef::from_slice(&source_data, &dims, &strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &source).unwrap();
+                plan.execute(&mut dest, &source, ctx.reborrow()).unwrap();
                 black_box(&mut dest);
             });
         });
@@ -1203,7 +1230,7 @@ fn bench_erased_scatter_variant<M: Measurement>(
         ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
     let update_ref =
         ErasedRawStridedRef::from_slice(&updates, &dims, &update_strides, update_offset).unwrap();
-    let ctx = context(case);
+    let mut ctx = context(case);
     let id = BenchmarkId::new(
         format!("{}_{}", variant.label(), context_label(case)),
         format!("n{}", case.len),
@@ -1215,8 +1242,14 @@ fn bench_erased_scatter_variant<M: Measurement>(
             ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &dest_strides, dest_offset)
                 .unwrap();
         bencher.iter(|| {
-            plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
-                .unwrap();
+            plan.execute(
+                &mut dest,
+                &operand_ref,
+                &index_ref,
+                &update_ref,
+                ctx.reborrow(),
+            )
+            .unwrap();
             black_box(dest.data_as_mut::<i32>().unwrap());
         });
     });
@@ -1280,7 +1313,7 @@ fn bench_scatter_additive(c: &mut Criterion) {
             ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
         let update_ref =
             ErasedRawStridedRef::from_slice(&updates, &update_dims, &update_strides, 0).unwrap();
-        let ctx = context(case);
+        let mut ctx = context(case);
 
         group.bench_function(bench_id(case), |bencher| {
             let mut output = vec![0.0f64; case.len];
@@ -1288,8 +1321,14 @@ fn bench_scatter_additive(c: &mut Criterion) {
                 ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0)
                     .unwrap();
             bencher.iter(|| {
-                plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
-                    .unwrap();
+                plan.execute(
+                    &mut dest,
+                    &operand_ref,
+                    &index_ref,
+                    &update_ref,
+                    ctx.reborrow(),
+                )
+                .unwrap();
                 black_box(dest.data_as_mut::<f64>().unwrap());
             });
         });
