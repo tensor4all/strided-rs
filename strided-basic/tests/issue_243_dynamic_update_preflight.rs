@@ -1,5 +1,5 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use strided_basic::{DynamicUpdateSlicePlan, RawStridedMut, RawStridedRef};
+use strided_basic::{DynamicUpdateSlicePlan, Exec, RawStridedMut, RawStridedRef};
 
 fn pick_stride(rng: &mut StdRng) -> isize {
     let m = isize::MAX;
@@ -94,7 +94,7 @@ fn issue_243_validated_layouts_never_fail_after_copy() {
             extreme += 1;
         }
         let mut dest = dest;
-        if let Err(e) = plan.execute(&mut dest, &op, &up, &st) {
+        if let Err(e) = plan.execute(&mut dest, &op, &up, &st, Exec::serial()) {
             panic!("post-check failure {e:?} dims={dims:?} ds={ds:?} os={os:?} ud={ud:?} us={us:?} offs={doff},{ooff},{uoff} starts={starts:?}");
         }
     }

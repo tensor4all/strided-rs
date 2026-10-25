@@ -18,31 +18,31 @@ depend on one another.
 ## Quick Example
 
 ```rust
-use strided_kernel::{map_into, StridedArray};
+use strided_kernel::{map_into, Exec, StridedArray};
 
 let src = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1]) as f64);
 let mut dst = StridedArray::<f64>::row_major(&[2, 3]);
-map_into(&mut dst.view_mut(), &src.view(), |x| 2.0 * x).unwrap();
+map_into(&mut dst.view_mut(), &src.view(), |x| 2.0 * x, Exec::serial()).unwrap();
 assert_eq!(dst.get(&[1, 2]), 10.0);
 ```
 
 ## Map and Reduce Operations
 
 ```rust
-use strided_kernel::{StridedArray, map_into, zip_map2_into, reduce};
+use strided_kernel::{Exec, StridedArray, map_into, zip_map2_into, reduce};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[0] as f64);
 let b = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| idx[1] as f64);
 let mut out = StridedArray::<f64>::row_major(&[4, 5]);
 
 // Unary map: dest[i] = f(src[i])
-map_into(&mut out.view_mut(), &a.view(), |x| x * 2.0).unwrap();
+map_into(&mut out.view_mut(), &a.view(), |x| x * 2.0, Exec::serial()).unwrap();
 
 // Binary zip map: dest[i] = f(a[i], b[i])
-zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
+zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y, Exec::serial()).unwrap();
 
 // Full reduction
-let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
+let total = reduce(&a.view(), |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
 ```
 
 ### Built-in Erased Reduction Order
@@ -70,11 +70,11 @@ narrower, explicit determinism contract than the generic closure-based
   the point at which an intermediate overflows or underflows. Consequently,
   floating product may differ in finite/zero/infinite/NaN classification from
   a strict left fold.
-- `ExecContext::serial()` and `ExecContext::max_threads(1)` use the same serial
-  algorithm. A fixed nonzero thread budget has deterministic partition and
-  merge order for a fixed executable, target, input, and layout; worker
-  completion order does not affect the result. Different budgets may produce
-  different floating or complex roundoff.
+- `Exec::serial()` and a token of budget one use the same serial algorithm. A
+  fixed budget has deterministic partition and merge order for a fixed
+  executable, target, input, and layout; task completion order does not affect
+  the result. Different budgets may produce different floating or complex
+  roundoff.
 - Empty sum, product, and sum-of-squares return zero, one, and zero
   respectively. No tolerance or correctness gate is relaxed for the optimized
   association.
@@ -82,22 +82,22 @@ narrower, explicit determinism contract than the generic closure-based
 ## High-Level Operations
 
 ```rust
-use strided_kernel::{StridedArray, copy_into, add, dot, symmetrize_into};
+use strided_kernel::{Exec, StridedArray, copy_into, add, dot, symmetrize_into};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
 let mut out = StridedArray::<f64>::row_major(&[4, 4]);
 
 // Copy
-copy_into(&mut out.view_mut(), &a.view()).unwrap();
+copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
 // Element-wise add: dest[i] += src[i]
-add(&mut out.view_mut(), &a.view()).unwrap();
+add(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
 // Dot product
 let d = dot(&a.view(), &a.view()).unwrap();
 
 // Symmetrize: dest = (src + src^T) / 2
-symmetrize_into(&mut out.view_mut(), &a.view()).unwrap();
+symmetrize_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 ```
 
 ## Cache Optimization
@@ -116,34 +116,30 @@ The library automatically optimizes iteration order for cache efficiency:
 strided-kernel = { version = "0.4", features = ["parallel"] }
 ```
 
-The default `ExecutionPolicy::AmbientRayon` behavior uses the current installed
-Rayon pool (or the global pool). Explicit runtimes can bound strided-owned
-fanout without creating another pool:
+Every operation that can fan out takes a `strided_exec::Exec` placement token as
+its last argument; `Exec`, `Pool` and `PoolBuilder` are re-exported from the
+crate root. The caller owns a pool, mints a token for a budget of its slots,
+and passes it by value. `Exec::serial()` runs inline on the calling thread.
 
 ```rust
-use std::num::NonZeroUsize;
-use strided_kernel::{
-    map_into, with_execution_policy, ExecutionPolicy, StridedArray,
-};
+use strided_kernel::{map_into, Exec, Pool, StridedArray};
 
 let source = StridedArray::<f64>::from_fn_col_major(&[4], |index| index[0] as f64);
 let mut destination = StridedArray::<f64>::col_major(&[4]);
-let max_threads = NonZeroUsize::new(2).unwrap();
+let pool = Pool::builder().threads(2).build().unwrap();
 
-with_execution_policy(ExecutionPolicy::Rayon { max_threads }, || {
-    map_into(&mut destination.view_mut(), &source.view(), |value| value + 1.0).unwrap();
-});
+map_into(
+    &mut destination.view_mut(),
+    &source.view(),
+    |value| value + 1.0,
+    Exec::new(&pool, 2).unwrap(),
+)
+.unwrap();
 assert_eq!(destination.into_data(), vec![1.0, 2.0, 3.0, 4.0]);
 ```
 
-`ExecutionPolicy` controls fanout, not CPU placement or pool construction.
-Nested strided operations inside a bounded worker partition run sequentially.
-The opaque parallel permutation-copy path is used under an explicit Rayon
-policy only when the installed pool size fits the requested budget; otherwise
-that copy falls back to its serial implementation because the external copy
-cannot be capped per call.
-The policy is worker-local; callbacks that depend on isolation from unrelated
-work must not invoke their own Rayon scheduling or yielding APIs.
+The token carries the budget and the pool, so no thread-local placement state
+exists and nested operations split the budget they were given.
 
 ## Benchmarks
 

@@ -1,7 +1,7 @@
 //! Asserts the per-call allocation contract of the `strided-perm` copy entry
 //! points (#306 item 7 / P4, #281).
 //!
-//! `copy_into` and `copy_into_par` build their `PermutePlan` (fused metadata,
+//! `copy_into` builds their `PermutePlan` (fused metadata,
 //! flattened loop levels, grouped-tile offset tables) per call. The plan
 //! metadata is inline up to [`INLINE_RANK`], so a rank-≤ 8 plan allocates
 //! nothing. The grouped-tile offset tables are sized by the product of a
@@ -22,9 +22,10 @@ use std::cell::Cell;
 #[cfg(feature = "parallel")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use strided_perm::copy_into;
+use strided_exec::Exec;
 #[cfg(feature = "parallel")]
-use strided_perm::copy_into_par;
+use strided_exec::Pool;
+use strided_perm::copy_into;
 use strided_view::{StridedArray, StridedViewMut, INLINE_RANK};
 
 struct CountingAllocator;
@@ -122,7 +123,7 @@ fn serial_allocations(dims: &[usize], src_strides: &[isize], dst_strides: &[isiz
     let mut dst_data = vec![0.0f64; max_offset(dims, dst_strides) as usize + 1];
     let mut dst = StridedViewMut::new(&mut dst_data, dims, dst_strides, 0).unwrap();
     let src_view = src.view();
-    count_thread_allocations(|| copy_into(&mut dst, &src_view).unwrap())
+    count_thread_allocations(|| copy_into(&mut dst, &src_view, Exec::serial()).unwrap())
 }
 
 fn check_serial_contract() {
@@ -209,19 +210,35 @@ fn check_serial_contract() {
     println!("spill case [2,3,..,9] swapped allocations = {allocations}");
 }
 
-/// Parallel windows. The process-wide counter sees every worker, so a
-/// per-call allocation on a stolen task fails the assertion.
+/// Pooled windows. The process-wide counter sees every worker, so a per-call
+/// allocation on a worker that took a task fails the assertion.
+///
+/// A fan-out itself costs the scheduler's per-task bookkeeping (one boxed job
+/// per spawned task), which is not the permutation plan's. The windows below
+/// therefore compare a pooled call against the same call with a budget-one
+/// token, which runs inline on the calling thread: the plan contributes the same
+/// allocations to both, and the difference is bounded by the number of tasks the
+/// pool may start.
 #[cfg(feature = "parallel")]
 fn check_parallel_contract() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
+    let pool = Pool::builder().threads(2).build().unwrap();
+    // Let the workers finish their own start-up allocations before any counted
+    // window opens: the process-wide counter sees them.
+    Exec::new(&pool, 2).unwrap().fork(2, |_, _| {});
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let pooled_extra = |dst: &mut StridedViewMut<f64>, src: &strided_view::StridedView<f64>| {
+        // Tokens are minted outside the windows: with the `ledger` feature a
+        // root token registers itself, which allocates.
+        let one = Exec::new(&pool, 1).unwrap();
+        let two = Exec::new(&pool, 2).unwrap();
+        let inline = count_thread_allocations(|| copy_into(dst, src, one).unwrap());
+        let pooled = count_process_allocations(|| copy_into(dst, src, two).unwrap());
+        (inline, pooled)
+    };
 
     // Ranks 1..=INLINE_RANK with extent-2 layouts whose grouped tables stay
-    // inside the inline bound. The totals are below the threading threshold,
-    // so the parallel entry falls back to the serial engine after building the
-    // plan; the plan build still runs on a pool worker.
+    // inside the inline bound.
     for rank in 1..=INLINE_RANK {
         let dims = vec![2usize; rank];
         let dst_strides = col_major_strides(&dims);
@@ -237,18 +254,18 @@ fn check_parallel_contract() {
             let mut dst = StridedViewMut::new(&mut dst_data, &dims, &dst_strides, 0).unwrap();
             let src_view = src.view();
             // Warm up outside the counted window.
-            pool.install(|| copy_into_par(&mut dst, &src_view).unwrap());
-            let allocations = pool.install(|| {
-                count_process_allocations(|| {
-                    copy_into_par(&mut dst, &src_view).unwrap();
-                })
-            });
-            assert_eq!(allocations, 0, "parallel {label} rank {rank}");
+            copy_into(&mut dst, &src_view, Exec::new(&pool, 2).unwrap()).unwrap();
+            let (inline, pooled) = pooled_extra(&mut dst, &src_view);
+            assert_eq!(inline, 0, "inline {label} rank {rank}");
+            assert!(
+                pooled <= MAX_SCHEDULER_ALLOCATIONS,
+                "pooled {label} rank {rank}: {pooled} allocations"
+            );
         }
     }
 
-    // A layout large enough to enter the parallel branch (>= 32768 elements),
-    // with a transposing source so the plan is non-trivial.
+    // A layout large enough to split, with a transposing source so the plan is
+    // non-trivial.
     let dims = [32usize, 32, 32];
     let src_strides = [1024isize, 1, 32];
     let src = source_array(&dims, &src_strides);
@@ -256,39 +273,37 @@ fn check_parallel_contract() {
     let dst_strides = col_major_strides(&dims);
     let mut dst = StridedViewMut::new(&mut dst_data, &dims, &dst_strides, 0).unwrap();
     let src_view = src.view();
-
-    // Warm the pool and both one-time codepaths outside the counted window.
     for _ in 0..4 {
-        pool.install(|| copy_into_par(&mut dst, &src_view).unwrap());
+        copy_into(&mut dst, &src_view, Exec::new(&pool, 2).unwrap()).unwrap();
     }
-    let allocations = pool.install(|| {
-        count_process_allocations(|| {
-            copy_into_par(&mut dst, &src_view).unwrap();
-        })
-    });
-    assert_eq!(
-        allocations, 0,
-        "parallel copy at rank 3 must not allocate on any worker"
+    let (inline, pooled) = pooled_extra(&mut dst, &src_view);
+    assert_eq!(inline, 0, "inline copy at rank 3");
+    assert!(
+        pooled <= MAX_SCHEDULER_ALLOCATIONS,
+        "pooled copy at rank 3: {pooled} allocations"
     );
 
-    // The rank-8 grouped layout also stays allocation-free in the pool.
+    // The rank-8 grouped layout.
     let (dims8, src8) = grouped_rank8_strides();
     let src8 = source_array(&dims8, &src8);
     let dst8_strides = col_major_strides(&dims8);
     let mut dst8_data = vec![0.0f64; max_offset(&dims8, &dst8_strides) as usize + 1];
     let mut dst8 = StridedViewMut::new(&mut dst8_data, &dims8, &dst8_strides, 0).unwrap();
     let src8_view = src8.view();
-    pool.install(|| copy_into_par(&mut dst8, &src8_view).unwrap());
-    let allocations = pool.install(|| {
-        count_process_allocations(|| {
-            copy_into_par(&mut dst8, &src8_view).unwrap();
-        })
-    });
-    assert_eq!(
-        allocations, 0,
-        "parallel grouped rank-8 copy must not allocate on any worker"
+    copy_into(&mut dst8, &src8_view, Exec::new(&pool, 2).unwrap()).unwrap();
+    let (inline, pooled) = pooled_extra(&mut dst8, &src8_view);
+    assert_eq!(inline, 0, "inline grouped rank-8 copy");
+    assert!(
+        pooled <= MAX_SCHEDULER_ALLOCATIONS,
+        "pooled grouped rank-8 copy: {pooled} allocations"
     );
 }
+
+/// Upper bound on the scheduler's own allocations for one two-task fan-out
+/// (boxed jobs and the occasional queue block). The plan itself contributes
+/// none: the inline windows above assert exactly zero.
+#[cfg(feature = "parallel")]
+const MAX_SCHEDULER_ALLOCATIONS: usize = 16;
 
 #[test]
 fn copy_entries_are_allocation_free_within_the_contract() {

@@ -1,6 +1,6 @@
 use approx::assert_relative_eq;
 use num_complex::{Complex32, Complex64};
-use strided_basic::{StridedArray, StridedError};
+use strided_basic::{Exec, StridedArray, StridedError};
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan};
 
 fn input(values: &[f64], dims: &[usize]) -> StridedArray<f64> {
@@ -17,8 +17,8 @@ fn fused_rejects_input_count_mismatch() {
         ops: vec![].into_iter().collect(),
     };
 
-    let err =
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("must fail");
 
     assert!(matches!(err, StridedError::RankMismatch(1, 2)));
     assert_eq!(out.get(&[0]), 0.0);
@@ -35,8 +35,8 @@ fn fused_rejects_destination_count_mismatch() {
         ops: vec![].into_iter().collect(),
     };
 
-    let err =
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("must fail");
 
     assert!(matches!(err, StridedError::RankMismatch(1, 2)));
     assert_eq!(out.get(&[0]), 0.0);
@@ -58,8 +58,8 @@ fn fused_rejects_bad_value_id_before_writing() {
         .collect(),
     };
 
-    let err =
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("must fail");
 
     assert!(matches!(
         err,
@@ -84,8 +84,8 @@ fn fused_rejects_wrong_op_arity_before_writing() {
         .collect(),
     };
 
-    let err =
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("must fail");
 
     assert!(matches!(err, StridedError::RankMismatch(1, 2)));
     assert_eq!(out.get(&[0]), 0.0);
@@ -108,8 +108,13 @@ fn fused_rejects_shape_mismatch_before_writing() {
         .collect(),
     };
 
-    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan)
-        .expect_err("must fail");
+    let err = fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .expect_err("must fail");
 
     assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
     assert_eq!(out.get(&[0]), 0.0);
@@ -131,8 +136,8 @@ fn fused_rejects_stride_zero_destination_before_writing() {
         .collect(),
     };
 
-    let err =
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("must fail");
 
     assert!(err.to_string().contains("output layout"));
     assert_eq!(out.data(), &[0.0]);
@@ -154,8 +159,8 @@ fn fused_rejects_overlapping_destination_offsets_before_writing() {
         .collect(),
     };
 
-    let err =
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).expect_err("must fail");
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("must fail");
 
     assert!(err.to_string().contains("output layout"));
     assert_eq!(out.data(), &[0.0, 0.0, 0.0]);
@@ -183,7 +188,13 @@ fn fused_interprets_reused_dag_value() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..4 {
         assert_relative_eq!(
@@ -221,6 +232,7 @@ fn fused_interprets_multiple_outputs() {
         &mut [sum.view_mut(), product.view_mut()],
         &[a.view(), b.view()],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -267,6 +279,7 @@ fn fused_interprets_broadcast_stride_zero_inputs() {
         &mut [out.view_mut()],
         &[a.view(), b.view(), c_broadcast],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -300,7 +313,7 @@ fn fused_interprets_noncontiguous_inputs_and_outputs() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out], &[a.clone(), b.clone()], &plan).unwrap();
+    fused_elementwise_into(&mut [out], &[a.clone(), b.clone()], &plan, Exec::serial()).unwrap();
 
     let out = out_base.view().permute(&[1, 0]).unwrap();
     for i in 0..2 {
@@ -344,6 +357,7 @@ fn fused_real_maximum_minimum_match_nan_contract() {
         &mut [max_out.view_mut(), min_out.view_mut()],
         &[a.view(), b.view()],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -380,6 +394,7 @@ fn fused_real_clamp_propagates_nan_bounds() {
             &mut [out.view_mut()],
             &[x.view(), lo.view(), hi.view()],
             &plan,
+            Exec::serial(),
         )
     }));
 
@@ -410,7 +425,13 @@ fn fused_f32_static_maximum_minimum_and_clamp_propagate_nan() {
             .into_iter()
             .collect(),
         };
-        fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+        fused_elementwise_into(
+            &mut [out.view_mut()],
+            &[a.view(), b.view()],
+            &plan,
+            Exec::serial(),
+        )
+        .unwrap();
         assert!(out.get(&[0]).is_nan(), "{op:?} lhs NaN");
         assert!(out.get(&[1]).is_nan(), "{op:?} rhs NaN");
         assert_eq!(out.get(&[2]).to_bits(), (-0.0f32).to_bits(), "{op:?}");
@@ -434,6 +455,7 @@ fn fused_f32_static_maximum_minimum_and_clamp_propagate_nan() {
         &mut [out.view_mut()],
         &[x.view(), lo.view(), hi.view()],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(out.get(&[0]), 1.0);
@@ -464,6 +486,7 @@ fn fused_clamp_signed_zero_ties_match_the_ordinary_kernel() {
         &mut [out.view_mut()],
         &[x.view(), lo.view(), hi.view()],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(out.get(&[0]).to_bits(), 0.0f64.to_bits());
@@ -499,6 +522,7 @@ fn fused_maximum_minimum_interpreter_propagates_nan() {
         &mut [max_out.view_mut(), min_out.view_mut()],
         &[a.view(), b.view()],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
     assert!(max_out.get(&[0]).is_nan());
@@ -556,6 +580,7 @@ fn fused_maximum_minimum_chunked_replay_propagates_nan_across_chunks() {
         &mut [max_out.view_mut(), min_out.view_mut()],
         &[a.view(), b.view()],
         &plan,
+        Exec::serial(),
     )
     .unwrap();
     for index in 0..LEN {
@@ -583,7 +608,13 @@ fn fused_integer_add_uses_wrapping_arithmetic() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .unwrap();
 
     assert_eq!(out.data(), &[i32::MIN, i32::MAX, -1]);
 }
@@ -604,8 +635,13 @@ fn fused_bool_arithmetic_is_rejected_before_writing() {
         .collect(),
     };
 
-    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan)
-        .expect_err("bool add must fail");
+    let err = fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .expect_err("bool add must fail");
 
     assert!(matches!(
         err,
@@ -645,7 +681,13 @@ fn fused_complex_divide_matches_native_complex_division() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..2 {
         let expected = a.get(&[i]) / b.get(&[i]);
@@ -675,7 +717,7 @@ fn fused_complex_abs_returns_norm_in_real_component() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan).unwrap();
+    fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial()).unwrap();
 
     assert_relative_eq!(out.get(&[0]).re, 5.0, epsilon = 1e-12);
     assert_relative_eq!(out.get(&[0]).im, 0.0, epsilon = 1e-12);
@@ -717,7 +759,13 @@ fn fused_complex32_add_multiply_matches_native_complex_arithmetic() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..2 {
         let expected = (a.get(&[i]) + b.get(&[i])) * a.get(&[i]);
@@ -794,6 +842,7 @@ fn fused_all_real_ops_have_basic_parity() {
             &mut views,
             &[x.view(), y.view(), lo.view(), hi.view()],
             &plan,
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -838,7 +887,13 @@ fn fused_specialized_binary_plan_handles_broadcast_inputs() {
         .collect(),
     };
 
-    fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b_broadcast], &plan).unwrap();
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b_broadcast],
+        &plan,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..4 {
         assert_relative_eq!(out.get(&[i]), a.get(&[i]) + 10.0, epsilon = 1e-12);

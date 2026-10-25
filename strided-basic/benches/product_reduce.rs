@@ -6,7 +6,7 @@
 //! on in-range normal inputs and must not regress on the extreme-exponent case
 //! that the stable variant exists to handle.
 //!
-//! Every case runs at one and four workers in an explicitly bounded Rayon pool
+//! Every case runs at one and four workers in an explicitly bounded strided pool
 //! whose thread count is asserted, so the number on a `SUMMARY` line always
 //! belongs to the configuration named there. Setup is outside the timed
 //! region: inputs are built once and each plan is compiled before the timed
@@ -17,13 +17,13 @@
 //! ```
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use strided_basic::{
-    with_execution_policy, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan,
-    ExecutionPolicy, KernelDType, KernelStorageElement, ReduceOp,
+    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, KernelDType, KernelStorageElement,
+    ReduceOp,
 };
+use strided_basic::{Exec, Pool};
 
 const WARMUPS: usize = 2;
 const SAMPLES: usize = 9;
@@ -53,18 +53,24 @@ fn plan_full(dtype: KernelDType, op: ReduceOp, n: usize) -> ErasedReducePlan {
 }
 
 /// Full reduction through the erased plan for the concrete dtype.
-fn full_reduce<T: KernelStorageElement + Default>(plan: &ErasedReducePlan, values: &[T]) -> T {
+fn full_reduce<T: KernelStorageElement + Default>(
+    plan: &ErasedReducePlan,
+    values: &[T],
+    pool: &Pool,
+    threads: usize,
+) -> T {
     let dims = [values.len()];
     let strides = [1isize];
     let source = ErasedRawStridedRef::from_slice(values, &dims, &strides, 0).unwrap();
     let mut output = [T::default()];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-    plan.execute(&strided_basic::ExecContext::ambient(), &mut dest, &source)
+    plan.execute(&mut dest, &source, Exec::new(pool, threads).unwrap())
         .unwrap();
     output[0]
 }
 
 fn measure_case<T: KernelStorageElement + Default>(
+    pool: &Pool,
     label: &str,
     threads: usize,
     n: usize,
@@ -74,7 +80,7 @@ fn measure_case<T: KernelStorageElement + Default>(
 ) {
     let run = |label: &str, plan: &ErasedReducePlan| {
         let mut operation = || {
-            black_box(full_reduce(plan, values));
+            black_box(full_reduce(plan, values, pool, threads));
         };
         for _ in 0..WARMUPS {
             operation();
@@ -118,45 +124,50 @@ fn main() {
         .collect();
 
     for threads in THREAD_COUNTS {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap();
-        pool.install(|| {
-            assert_eq!(
-                rayon::current_num_threads(),
-                threads,
-                "the pool must actually hold the thread count the line reports"
-            );
-            with_execution_policy(
-                ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(threads).unwrap(),
-                },
-                || {
-                    let f64_fast = plan_full(KernelDType::F64, ReduceOp::Product, n);
-                    let f64_stable = plan_full(KernelDType::F64, ReduceOp::StableProduct, n);
-                    let f32_fast = plan_full(KernelDType::F32, ReduceOp::Product, n);
-                    let f32_stable = plan_full(KernelDType::F32, ReduceOp::StableProduct, n);
-                    measure_case("f64 near1", threads, n, &near_f64, &f64_fast, &f64_stable);
-                    measure_case(
-                        "f64 wild-exp",
-                        threads,
-                        n,
-                        &wild_f64,
-                        &f64_fast,
-                        &f64_stable,
-                    );
-                    measure_case("f32 near1", threads, n, &near_f32, &f32_fast, &f32_stable);
-                    measure_case(
-                        "f32 wild-exp",
-                        threads,
-                        n,
-                        &wild_f32,
-                        &f32_fast,
-                        &f32_stable,
-                    );
-                },
-            );
-        });
+        let pool = Pool::builder().threads(threads).build().unwrap();
+        {
+            {
+                let f64_fast = plan_full(KernelDType::F64, ReduceOp::Product, n);
+                let f64_stable = plan_full(KernelDType::F64, ReduceOp::StableProduct, n);
+                let f32_fast = plan_full(KernelDType::F32, ReduceOp::Product, n);
+                let f32_stable = plan_full(KernelDType::F32, ReduceOp::StableProduct, n);
+                measure_case(
+                    &pool,
+                    "f64 near1",
+                    threads,
+                    n,
+                    &near_f64,
+                    &f64_fast,
+                    &f64_stable,
+                );
+                measure_case(
+                    &pool,
+                    "f64 wild-exp",
+                    threads,
+                    n,
+                    &wild_f64,
+                    &f64_fast,
+                    &f64_stable,
+                );
+                measure_case(
+                    &pool,
+                    "f32 near1",
+                    threads,
+                    n,
+                    &near_f32,
+                    &f32_fast,
+                    &f32_stable,
+                );
+                measure_case(
+                    &pool,
+                    "f32 wild-exp",
+                    threads,
+                    n,
+                    &wild_f32,
+                    &f32_fast,
+                    &f32_stable,
+                );
+            };
+        };
     }
 }

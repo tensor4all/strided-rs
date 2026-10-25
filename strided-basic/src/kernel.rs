@@ -5,7 +5,7 @@
 
 use crate::fuse::{compress_dims, fuse_dims};
 use crate::inline::{InlineVec, OperandVec};
-use crate::{block, order, Result, StridedError};
+use crate::{block, order, Exec, Result, StridedError};
 
 /// Maximum total elements for the small tensor fast path.
 /// Tensors at or below this size skip `compute_order` and `compute_block_sizes`
@@ -694,22 +694,13 @@ pub(crate) fn total_len(dims: &[usize]) -> Result<usize> {
 
 /// Whether the sequential contiguous fast path should be used.
 ///
-/// When the `parallel` feature is enabled and the total element count exceeds
-/// the threading threshold, we normally must *not* take the contiguous fast path
-/// so that the parallel kernel path can be reached. If the active Rayon pool has
-/// only one worker, however, there is no threaded path to reach and the
+/// When `total` exceeds the threading threshold and `exec` has a second slot,
+/// the contiguous fast path must not be taken so that the parallel kernel path
+/// can be reached. A serial token has no threaded path to reach and the
 /// sequential slice loop is the right kernel.
 #[inline]
-pub(crate) fn use_sequential_fast_path(total: usize) -> bool {
-    #[cfg(feature = "parallel")]
-    {
-        total <= crate::threading::MINTHREADLENGTH || crate::execution_policy::rayon_threads() <= 1
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let _ = total;
-        true
-    }
+pub(crate) fn use_sequential_fast_path(total: usize, exec: &Exec<'_>) -> bool {
+    !crate::threading::is_parallel(total, exec)
 }
 
 /// Returns the common contiguous layout if **all** provided stride arrays
@@ -732,7 +723,7 @@ pub(crate) fn same_contiguous_layout(
 }
 
 /// Returns the common contiguous layout only when the sequential fast path
-/// should be used (total elements <= threading threshold).
+/// should be used (total elements <= threading threshold, or a serial token).
 ///
 /// Returns [`StridedError::OffsetOverflow`] when the element count of `dims`
 /// does not fit in `usize`.
@@ -740,8 +731,9 @@ pub(crate) fn same_contiguous_layout(
 pub(crate) fn sequential_contiguous_layout(
     dims: &[usize],
     strides_list: &[&[isize]],
+    exec: &Exec<'_>,
 ) -> Result<Option<ContiguousLayout>> {
-    if !use_sequential_fast_path(total_len(dims)?) {
+    if !use_sequential_fast_path(total_len(dims)?, exec) {
         return Ok(None);
     }
     Ok(same_contiguous_layout(dims, strides_list))

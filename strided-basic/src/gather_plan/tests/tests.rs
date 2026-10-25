@@ -1,4 +1,6 @@
-use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, ScatterPlan, ScatterSpec, WindowReplay};
+use super::{
+    DynamicSlicePlan, DynamicUpdateSlicePlan, Exec, ScatterPlan, ScatterSpec, WindowReplay,
+};
 
 #[test]
 fn window_replay_fuses_only_bilaterally_contiguous_axes() {
@@ -200,7 +202,8 @@ fn dynamic_slice_fused_window_matches_reference_for_general_layouts() {
 
         let mut out = vec![-1i64; total];
         let mut dest = super::RawStridedMut::new(&mut out, &window, &dest_strides, 0).unwrap();
-        plan.execute(&mut dest, &source, &start_ref).unwrap();
+        plan.execute(&mut dest, &source, &start_ref, Exec::serial())
+            .unwrap();
         assert_eq!(
             read_back(&out),
             expected,
@@ -209,7 +212,8 @@ fn dynamic_slice_fused_window_matches_reference_for_general_layouts() {
 
         let mut storage = vec![MaybeUninit::<i64>::uninit(); total];
         let mut dest = super::RawStridedMut::new(&mut storage, &window, &dest_strides, 0).unwrap();
-        plan.execute_uninit(&mut dest, &source, &start_ref).unwrap();
+        plan.execute_uninit(&mut dest, &source, &start_ref, Exec::serial())
+            .unwrap();
         // SAFETY: the dense destination reaches every slot and a successful
         // uninit execute initializes every reachable slot.
         let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
@@ -258,13 +262,13 @@ fn dynamic_update_slice_fused_window_matches_reference() {
 
     let mut out = vec![0i64; 63];
     let mut dest = super::RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
-    plan.execute(&mut dest, &source, &update_ref, &start_ref)
+    plan.execute(&mut dest, &source, &update_ref, &start_ref, Exec::serial())
         .unwrap();
     assert_eq!(out, expected);
 
     let mut storage = vec![MaybeUninit::<i64>::uninit(); 63];
     let mut dest = super::RawStridedMut::new(&mut storage, &dims, &dest_strides, 0).unwrap();
-    plan.execute_uninit(&mut dest, &source, &update_ref, &start_ref)
+    plan.execute_uninit(&mut dest, &source, &update_ref, &start_ref, Exec::serial())
         .unwrap();
     // SAFETY: the dense destination reaches every slot and a successful
     // uninit execute initializes every reachable slot.

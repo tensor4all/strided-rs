@@ -64,11 +64,11 @@ impl ErasedFusedPlan {
     /// unsupported-operation error before any destination is written.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         inputs: &[ErasedRawStridedRef<'_>],
+        exec: Exec<'_>,
     ) -> Result<()> {
-        self.execute_outputs(ctx, std::slice::from_mut(dest), inputs)
+        self.execute_outputs(std::slice::from_mut(dest), inputs, exec)
     }
 
     /// Execute a plan into one or more destinations in a single replay.
@@ -89,7 +89,7 @@ impl ErasedFusedPlan {
     ///
     /// ```
     /// use strided_basic::{
-    ///     ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType,
+    ///     ErasedRawStridedMut, ErasedRawStridedRef, Exec, KernelDType,
     /// };
     /// use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
     ///
@@ -113,7 +113,7 @@ impl ErasedFusedPlan {
     ///         ErasedRawStridedMut::from_slice_mut(&mut pass_through, &dims, &strides, 0).unwrap(),
     ///         ErasedRawStridedMut::from_slice_mut(&mut negated, &dims, &strides, 0).unwrap(),
     ///     ];
-    ///     plan.execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+    ///     plan.execute_outputs(&mut dests, &inputs, Exec::serial())
     ///         .unwrap();
     /// }
     /// assert_eq!(pass_through, [1.0, -2.0]);
@@ -121,9 +121,9 @@ impl ErasedFusedPlan {
     /// ```
     pub fn execute_outputs(
         &self,
-        ctx: &ExecContext,
         dests: &mut [ErasedRawStridedMut<'_>],
         inputs: &[ErasedRawStridedRef<'_>],
+        exec: Exec<'_>,
     ) -> Result<()> {
         if inputs.len() != self.plan.input_count {
             return Err(StridedError::RankMismatch(
@@ -152,13 +152,13 @@ impl ErasedFusedPlan {
         }
 
         match self.dtype {
-            KernelDType::F32 => execute_fused_multi::<f32>(&self.plan, ctx, dests, inputs),
-            KernelDType::F64 => execute_fused_multi::<f64>(&self.plan, ctx, dests, inputs),
-            KernelDType::I32 => execute_fused_multi::<i32>(&self.plan, ctx, dests, inputs),
-            KernelDType::I64 => execute_fused_multi::<i64>(&self.plan, ctx, dests, inputs),
-            KernelDType::Bool => execute_fused_multi::<bool>(&self.plan, ctx, dests, inputs),
-            KernelDType::C32 => execute_fused_multi::<Complex32>(&self.plan, ctx, dests, inputs),
-            KernelDType::C64 => execute_fused_multi::<Complex64>(&self.plan, ctx, dests, inputs),
+            KernelDType::F32 => execute_fused_multi::<f32>(&self.plan, dests, inputs, exec),
+            KernelDType::F64 => execute_fused_multi::<f64>(&self.plan, dests, inputs, exec),
+            KernelDType::I32 => execute_fused_multi::<i32>(&self.plan, dests, inputs, exec),
+            KernelDType::I64 => execute_fused_multi::<i64>(&self.plan, dests, inputs, exec),
+            KernelDType::Bool => execute_fused_multi::<bool>(&self.plan, dests, inputs, exec),
+            KernelDType::C32 => execute_fused_multi::<Complex32>(&self.plan, dests, inputs, exec),
+            KernelDType::C64 => execute_fused_multi::<Complex64>(&self.plan, dests, inputs, exec),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
@@ -178,11 +178,11 @@ impl ErasedFusedPlan {
     /// any destination is written.
     pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         inputs: &[ErasedRawStridedPtr<'_>],
+        exec: Exec<'_>,
     ) -> Result<()> {
-        self.execute_outputs_uninit(ctx, std::slice::from_mut(dest), inputs)
+        self.execute_outputs_uninit(std::slice::from_mut(dest), inputs, exec)
     }
 
     /// Execute a plan into one or more fully overwritten uninitialized
@@ -208,7 +208,7 @@ impl ErasedFusedPlan {
     /// use core::mem::MaybeUninit;
     /// use strided_basic::{
     ///     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    ///     ExecContext, KernelDType,
+    ///     Exec, KernelDType,
     /// };
     /// use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
     ///
@@ -239,7 +239,7 @@ impl ErasedFusedPlan {
     ///         .unwrap(),
     ///         ErasedRawStridedUninitMut::from_uninit_slice(&mut negated, &dims, &strides, 0).unwrap(),
     ///     ];
-    ///     plan.execute_outputs_uninit(&ExecContext::serial(), &mut dests, &pointers)
+    ///     plan.execute_outputs_uninit(&mut dests, &pointers, Exec::serial())
     ///         .unwrap();
     /// }
     /// // SAFETY: `execute_outputs_uninit` overwrites every reachable element.
@@ -249,9 +249,9 @@ impl ErasedFusedPlan {
     /// ```
     pub fn execute_outputs_uninit(
         &self,
-        ctx: &ExecContext,
         dests: &mut [ErasedRawStridedUninitMut<'_>],
         inputs: &[ErasedRawStridedPtr<'_>],
+        exec: Exec<'_>,
     ) -> Result<()> {
         if inputs.len() != self.plan.input_count {
             return Err(StridedError::RankMismatch(
@@ -294,43 +294,38 @@ impl ErasedFusedPlan {
                 dest.strides(),
             )?);
         }
-        if ctx.is_serial() {
-            self.dispatch_uninit(ctx, dests, inputs, validated.as_slice())
-        } else {
-            ctx.run(|| self.dispatch_uninit(ctx, dests, inputs, validated.as_slice()))
-        }
+        self.dispatch_uninit(dests, inputs, validated.as_slice(), exec)
     }
 
     fn dispatch_uninit(
         &self,
-        ctx: &ExecContext,
         dests: &mut [ErasedRawStridedUninitMut<'_>],
         inputs: &[ErasedRawStridedPtr<'_>],
         validated: &[ValidatedDestinationLayout],
+        exec: Exec<'_>,
     ) -> Result<()> {
-        let serial = ctx.is_serial();
         match self.dtype {
             KernelDType::F32 => {
-                execute_fused_uninit_multi::<f32>(&self.plan, dests, inputs, serial, validated)
+                execute_fused_uninit_multi::<f32>(&self.plan, dests, inputs, validated, exec)
             }
             KernelDType::F64 => {
-                execute_fused_uninit_multi::<f64>(&self.plan, dests, inputs, serial, validated)
+                execute_fused_uninit_multi::<f64>(&self.plan, dests, inputs, validated, exec)
             }
             KernelDType::I32 => {
-                execute_fused_uninit_multi::<i32>(&self.plan, dests, inputs, serial, validated)
+                execute_fused_uninit_multi::<i32>(&self.plan, dests, inputs, validated, exec)
             }
             KernelDType::I64 => {
-                execute_fused_uninit_multi::<i64>(&self.plan, dests, inputs, serial, validated)
+                execute_fused_uninit_multi::<i64>(&self.plan, dests, inputs, validated, exec)
             }
             KernelDType::Bool => {
-                execute_fused_uninit_multi::<bool>(&self.plan, dests, inputs, serial, validated)
+                execute_fused_uninit_multi::<bool>(&self.plan, dests, inputs, validated, exec)
             }
-            KernelDType::C32 => execute_fused_uninit_multi::<Complex32>(
-                &self.plan, dests, inputs, serial, validated,
-            ),
-            KernelDType::C64 => execute_fused_uninit_multi::<Complex64>(
-                &self.plan, dests, inputs, serial, validated,
-            ),
+            KernelDType::C32 => {
+                execute_fused_uninit_multi::<Complex32>(&self.plan, dests, inputs, validated, exec)
+            }
+            KernelDType::C64 => {
+                execute_fused_uninit_multi::<Complex64>(&self.plan, dests, inputs, validated, exec)
+            }
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
@@ -389,9 +384,9 @@ fn validate_fused_plan_for_dtype(dtype: KernelDType, plan: &FusedPlan) -> Result
 
 fn execute_fused_multi<T>(
     plan: &FusedPlan,
-    ctx: &ExecContext,
     dests: &mut [ErasedRawStridedMut<'_>],
     inputs: &[ErasedRawStridedRef<'_>],
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: FusedScalar + KernelStorageElement,
@@ -406,7 +401,7 @@ where
         let data = dests[0].data_as_mut::<T>()?;
         let mut dest_views =
             [unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) }];
-        return execute_fused_inputs(ctx, &mut dest_views, inputs, plan);
+        return execute_fused_inputs(&mut dest_views, inputs, plan, exec);
     }
 
     if dests.len() <= strided_basic::OPERAND_CAP {
@@ -422,7 +417,7 @@ where
             let data = dest.data_as_mut::<T>()?;
             views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
         }
-        return execute_fused_inputs(ctx, views.as_mut_slice(), inputs, plan);
+        return execute_fused_inputs(views.as_mut_slice(), inputs, plan, exec);
     }
 
     let mut dest_views = Vec::with_capacity(dests.len());
@@ -433,14 +428,14 @@ where
         let data = dest.data_as_mut::<T>()?;
         dest_views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
     }
-    execute_fused_inputs(ctx, &mut dest_views, inputs, plan)
+    execute_fused_inputs(&mut dest_views, inputs, plan, exec)
 }
 
 fn execute_fused_inputs<T>(
-    ctx: &ExecContext,
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[ErasedRawStridedRef<'_>],
     plan: &FusedPlan,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: FusedScalar + KernelStorageElement,
@@ -448,11 +443,11 @@ where
     match inputs {
         [a] => {
             let views = [erased_view::<T>(a)?];
-            execute_fused_views(ctx, dests, &views, plan)
+            execute_fused_views(dests, &views, plan, exec)
         }
         [a, b] => {
             let views = [erased_view::<T>(a)?, erased_view::<T>(b)?];
-            execute_fused_views(ctx, dests, &views, plan)
+            execute_fused_views(dests, &views, plan, exec)
         }
         [a, b, c] => {
             let views = [
@@ -460,7 +455,7 @@ where
                 erased_view::<T>(b)?,
                 erased_view::<T>(c)?,
             ];
-            execute_fused_views(ctx, dests, &views, plan)
+            execute_fused_views(dests, &views, plan, exec)
         }
         [a, b, c, d] => {
             let views = [
@@ -469,7 +464,7 @@ where
                 erased_view::<T>(c)?,
                 erased_view::<T>(d)?,
             ];
-            execute_fused_views(ctx, dests, &views, plan)
+            execute_fused_views(dests, &views, plan, exec)
         }
         _ => Err(StridedError::UnsupportedArity {
             arity: inputs.len(),
@@ -482,8 +477,8 @@ fn execute_fused_uninit_multi<T>(
     plan: &FusedPlan,
     dests: &mut [ErasedRawStridedUninitMut<'_>],
     inputs: &[ErasedRawStridedPtr<'_>],
-    serial: bool,
     validated: &[ValidatedDestinationLayout],
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: FusedScalar + KernelStorageElement,
@@ -495,7 +490,7 @@ where
         let data = dests[0].data_as_uninit_mut::<T>()?;
         let mut dest_views =
             [unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) }];
-        return execute_fused_uninit_inputs(plan, &mut dest_views, inputs, serial, validated);
+        return execute_fused_uninit_inputs(plan, &mut dest_views, inputs, validated, exec);
     }
 
     if dests.len() <= strided_basic::OPERAND_CAP {
@@ -511,7 +506,7 @@ where
             let data = dest.data_as_uninit_mut::<T>()?;
             views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
         }
-        return execute_fused_uninit_inputs(plan, views.as_mut_slice(), inputs, serial, validated);
+        return execute_fused_uninit_inputs(plan, views.as_mut_slice(), inputs, validated, exec);
     }
 
     let mut dest_views = Vec::with_capacity(dests.len());
@@ -522,15 +517,15 @@ where
         let data = dest.data_as_uninit_mut::<T>()?;
         dest_views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
     }
-    execute_fused_uninit_inputs(plan, &mut dest_views, inputs, serial, validated)
+    execute_fused_uninit_inputs(plan, &mut dest_views, inputs, validated, exec)
 }
 
 fn execute_fused_uninit_inputs<T>(
     plan: &FusedPlan,
     dests: &mut [StridedViewMut<'_, MaybeUninit<T>>],
     inputs: &[ErasedRawStridedPtr<'_>],
-    serial: bool,
     validated: &[ValidatedDestinationLayout],
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: FusedScalar + KernelStorageElement,
@@ -541,9 +536,7 @@ where
         [a] => {
             let refs = [unsafe { a.try_as_ref_after_no_overlap()? }];
             let views = [erased_view::<T>(&refs[0])?];
-            crate::fused::fused_elementwise_into_uninit_multi(
-                dests, &views, plan, serial, validated,
-            )
+            crate::fused::fused_elementwise_into_uninit_multi(dests, &views, plan, validated, exec)
         }
         [a, b] => {
             let refs = [
@@ -553,9 +546,7 @@ where
                 unsafe { b.try_as_ref_after_no_overlap()? },
             ];
             let views = [erased_view::<T>(&refs[0])?, erased_view::<T>(&refs[1])?];
-            crate::fused::fused_elementwise_into_uninit_multi(
-                dests, &views, plan, serial, validated,
-            )
+            crate::fused::fused_elementwise_into_uninit_multi(dests, &views, plan, validated, exec)
         }
         [a, b, c] => {
             let refs = [
@@ -571,9 +562,7 @@ where
                 erased_view::<T>(&refs[1])?,
                 erased_view::<T>(&refs[2])?,
             ];
-            crate::fused::fused_elementwise_into_uninit_multi(
-                dests, &views, plan, serial, validated,
-            )
+            crate::fused::fused_elementwise_into_uninit_multi(dests, &views, plan, validated, exec)
         }
         [a, b, c, d] => {
             let refs = [
@@ -592,9 +581,7 @@ where
                 erased_view::<T>(&refs[2])?,
                 erased_view::<T>(&refs[3])?,
             ];
-            crate::fused::fused_elementwise_into_uninit_multi(
-                dests, &views, plan, serial, validated,
-            )
+            crate::fused::fused_elementwise_into_uninit_multi(dests, &views, plan, validated, exec)
         }
         _ => Err(StridedError::UnsupportedArity {
             arity: inputs.len(),
@@ -604,17 +591,13 @@ where
 }
 
 fn execute_fused_views<T>(
-    ctx: &ExecContext,
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],
     plan: &FusedPlan,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: FusedScalar + KernelStorageElement,
 {
-    if ctx.is_serial() {
-        crate::fused::fused_elementwise_into_serial(dests, inputs, plan)
-    } else {
-        ctx.run(|| fused_elementwise_into(dests, inputs, plan))
-    }
+    fused_elementwise_into(dests, inputs, plan, exec)
 }

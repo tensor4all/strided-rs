@@ -16,29 +16,23 @@
 //! parameter (`Identity`, `Conj`, ...), so a conjugating update is a
 //! monomorphized loop with no per-element flag. Traversal, blocking, contiguous
 //! inner loops and threading are those of the other map kernels (threading
-//! follows the active [`ExecContext`](crate::ExecContext)).
+//! follows the budget of the [`Exec`](crate::Exec) token each entry takes).
 
 use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
 use crate::layout_check::is_injective_layout;
-use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
-use crate::{Result, StridedError};
+use crate::{Exec, Result, StridedError};
 use strided_view::ElementOp;
 
-#[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
-#[cfg(feature = "parallel")]
-use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH};
+use crate::threading::{for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded};
 
 /// The per-inner-block callback: `(offsets, len, strides)`.
-#[cfg(feature = "parallel")]
 type Body<'a> = &'a (dyn Fn(&[isize], usize, &[isize]) + Sync);
-#[cfg(not(feature = "parallel"))]
-type Body<'a> = &'a dyn Fn(&[isize], usize, &[isize]);
 
 /// A raw pointer that may cross threads: dereferenced only at the validated,
 /// disjoint (for the destination) offsets the traversal generates.
@@ -83,6 +77,7 @@ fn run_update(
     strides_list: &[&[isize]],
     elem_size: usize,
     body: Body<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     let total = total_len(dims)?;
     if total == 0 {
@@ -92,7 +87,7 @@ fn run_update(
     // one unit-stride block replaces planning and blocking. The sequential
     // guard keeps the parallel branch reachable for large tensors (see
     // `use_sequential_fast_path`).
-    if sequential_contiguous_layout(dims, strides_list)?.is_some() {
+    if sequential_contiguous_layout(dims, strides_list, &exec)?.is_some() {
         let zeros: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
         let ones: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 1isize).collect();
         body(&zeros, total, &ones);
@@ -111,11 +106,9 @@ fn run_update(
         build_plan_fused(dims, strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
     {
         let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
+        if is_parallel(total, &exec) {
             let costs = compute_costs(&ordered_strides);
             let initial_offsets: crate::inline::OperandVec<isize> =
                 strides_list.iter().map(|_| 0isize).collect();
@@ -125,9 +118,7 @@ fn run_update(
                 &ordered_strides,
                 &initial_offsets,
                 &costs,
-                nthreads,
-                0,
-                1,
+                exec,
                 &|dims, blocks, strides_list, offsets| {
                     for_each_inner_block_with_offsets(
                         dims,
@@ -274,17 +265,18 @@ unsafe fn inner_loop_update3<
 /// # Examples
 ///
 /// ```
-/// use strided_basic::{map_update_into, Identity, StridedArray};
+/// use strided_basic::{map_update_into, Exec, Identity, StridedArray};
 /// let mut d = StridedArray::<f64>::from_fn_col_major(&[2, 2], |i| (i[0] + 2 * i[1]) as f64);
-/// map_update_into::<_, Identity>(&mut d.view_mut(), |x| 2.0 * x + 1.0).unwrap();
+/// map_update_into::<_, Identity>(&mut d.view_mut(), |x| 2.0 * x + 1.0, Exec::serial()).unwrap();
 /// assert_eq!(d.get(&[1, 1]), 7.0);
 /// ```
 pub fn map_update_into<D, OpD>(
     dest: &mut StridedViewMut<D>,
-    f: impl Fn(D) -> D + MaybeSync,
+    f: impl Fn(D) -> D + Sync,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
     OpD: ElementOp<D>,
 {
     validate_destination(dest.dims(), dest.strides())?;
@@ -299,6 +291,7 @@ where
                 inner_loop_update1::<D, OpD>(dp.get().offset(offsets[0]), strides[0], len, &f);
             }
         },
+        exec,
     )
 }
 
@@ -312,24 +305,25 @@ where
 /// # Examples
 ///
 /// ```
-/// use strided_basic::{zip_update2_into, Identity, StridedArray};
+/// use strided_basic::{zip_update2_into, Exec, Identity, StridedArray};
 /// let a = StridedArray::<f64>::from_fn_col_major(&[3], |i| i[0] as f64);
 /// let mut d = StridedArray::<f64>::from_fn_col_major(&[3], |_| 10.0);
 /// // d = 2 * a + 0.5 * d
-/// zip_update2_into::<_, _, Identity, Identity>(&mut d.view_mut(), &a.view(), |d, a| {
-///     2.0 * a + 0.5 * d
-/// })
+/// zip_update2_into::<_, _, Identity, Identity>(
+///     &mut d.view_mut(), &a.view(), |d, a| 2.0 * a + 0.5 * d, Exec::serial(),
+/// )
 /// .unwrap();
 /// assert_eq!(d.get(&[2]), 9.0);
 /// ```
 pub fn zip_update2_into<D, A, OpD, OpA>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
-    f: impl Fn(D, A) -> D + MaybeSync,
+    f: impl Fn(D, A) -> D + Sync,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     OpD: ElementOp<D>,
     OpA: ElementOp<A>,
 {
@@ -354,6 +348,7 @@ where
                 );
             }
         },
+        exec,
     )
 }
 
@@ -367,7 +362,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use strided_basic::{zip_update3_into, Conj, Identity, StridedArray};
+/// use strided_basic::{zip_update3_into, Conj, Exec, Identity, StridedArray};
 /// use num_complex::Complex64;
 /// let one = Complex64::new(1.0, 1.0);
 /// let a = StridedArray::<Complex64>::from_fn_col_major(&[2], |_| one);
@@ -375,7 +370,7 @@ where
 /// let mut d = StridedArray::<Complex64>::from_fn_col_major(&[2], |_| one);
 /// // d = conj(d) + a * b
 /// zip_update3_into::<_, _, _, Conj, Identity, Identity>(
-///     &mut d.view_mut(), &a.view(), &b.view(), |d, a, b| d + a * b,
+///     &mut d.view_mut(), &a.view(), &b.view(), |d, a, b| d + a * b, Exec::serial(),
 /// )
 /// .unwrap();
 /// assert_eq!(d.get(&[0]), Complex64::new(1.0, 1.0)); // (1 - i) + 2i
@@ -384,12 +379,13 @@ pub fn zip_update3_into<D, A, B, OpD, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(D, A, B) -> D + MaybeSync,
+    f: impl Fn(D, A, B) -> D + Sync,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpD: ElementOp<D>,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
@@ -421,6 +417,7 @@ where
                 );
             }
         },
+        exec,
     )
 }
 

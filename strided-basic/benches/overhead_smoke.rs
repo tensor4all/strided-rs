@@ -33,10 +33,10 @@
 
 use std::hint::black_box;
 
+use strided_basic::Exec;
 use strided_basic::{
-    copy_into, map_into, with_execution_policy, ErasedRawStridedMut, ErasedRawStridedRef,
-    ErasedUpdatePlan, ExecContext, ExecutionPolicy, KernelDType, RawStridedMut, RawStridedRef,
-    StridedArray, StridedView, StridedViewMut, UpdateOp, UpdatePlan,
+    copy_into, map_into, ErasedRawStridedMut, ErasedRawStridedRef, ErasedUpdatePlan, KernelDType,
+    RawStridedMut, RawStridedRef, StridedArray, StridedView, StridedViewMut, UpdateOp, UpdatePlan,
 };
 
 #[path = "support/mod.rs"]
@@ -100,12 +100,19 @@ fn s3_case(
                 iterations,
                 threshold,
                 || {
-                    map_into(&mut dst_view, &src_view, |value| value).unwrap();
+                    map_into(&mut dst_view, &src_view, |value| value, Exec::serial()).unwrap();
                     black_box(dst_view.as_mut_ptr());
                 },
                 || {
-                    plan.execute(&mut dst_ref, &src_ref, 1.0, 0.0, |value| value)
-                        .unwrap();
+                    plan.execute(
+                        &mut dst_ref,
+                        &src_ref,
+                        1.0,
+                        0.0,
+                        |value| value,
+                        Exec::serial(),
+                    )
+                    .unwrap();
                     black_box(dst_ref.dims());
                 },
             )
@@ -117,19 +124,25 @@ fn s3_case(
             let src_ref = ErasedRawStridedRef::from_slice(&src_data, dims, &strides, 0).unwrap();
             let mut dst_ref =
                 ErasedRawStridedMut::from_slice_mut(&mut raw_dst, dims, &strides, 0).unwrap();
-            let ctx = ExecContext::serial();
             measure_case(
                 label,
                 "map_into per call vs compiled ErasedUpdatePlan",
                 iterations,
                 threshold,
                 || {
-                    map_into(&mut dst_view, &src_view, |value| value).unwrap();
+                    map_into(&mut dst_view, &src_view, |value| value, Exec::serial()).unwrap();
                     black_box(dst_view.as_mut_ptr());
                 },
                 || {
-                    plan.execute(&ctx, &mut dst_ref, &src_ref, 1.0, 0.0, UpdateOp::Identity)
-                        .unwrap();
+                    plan.execute(
+                        &mut dst_ref,
+                        &src_ref,
+                        1.0,
+                        0.0,
+                        UpdateOp::Identity,
+                        Exec::serial(),
+                    )
+                    .unwrap();
                     black_box(dst_ref.dims());
                 },
             )
@@ -163,11 +176,11 @@ fn s4_case(
         iterations,
         None,
         || {
-            copy_into(&mut permuted_out, &permuted_src).unwrap();
+            copy_into(&mut permuted_out, &permuted_src, Exec::serial()).unwrap();
             black_box(permuted_out.as_mut_ptr());
         },
         || {
-            copy_into(&mut contiguous_out, &contiguous_src).unwrap();
+            copy_into(&mut contiguous_out, &contiguous_src, Exec::serial()).unwrap();
             black_box(contiguous_out.as_mut_ptr());
         },
     )
@@ -175,8 +188,8 @@ fn s4_case(
 
 fn main() {
     // Pin the traversal to one thread so the ratios are comparable on any CI
-    // runner; `with_execution_policy` is the crate's supported knob.
-    let cases = with_execution_policy(ExecutionPolicy::Sequential, || {
+    // runner; the serial token is the crate's supported knob.
+    let cases = {
         vec![
             // Gated against the typed compiled plan (P4 per-call planning).
             s3_case(&[16], "S3a", 20_000, S3Baseline::TypedUpdatePlan, Some(2.5)),
@@ -200,7 +213,7 @@ fn main() {
             s4_case(&[8, 8, 8], &[64, 8, 1], "S4a", 2_000),
             s4_case(&[32, 32, 32], &[1024, 32, 1], "S4b", 200),
         ]
-    });
+    };
 
     print_table(&cases, "### strided-basic overhead smoke");
     support::exit_if_failed(&cases);

@@ -1,24 +1,20 @@
 //! Reduce operations on dynamic-rank strided views.
 
-#[cfg(feature = "parallel")]
-use crate::kernel::same_contiguous_layout;
 use crate::kernel::{
-    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered,
+    build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, same_contiguous_layout,
     sequential_contiguous_layout, total_len,
 };
-use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{col_major_strides, StridedArray, StridedView, StridedViewMut};
-use crate::{Result, StridedError};
+use crate::{Exec, Result, StridedError};
+use core::num::NonZeroUsize;
 use std::ops::Range;
 use strided_view::ElementOp;
 
-#[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
 use crate::inline::InlineVec;
-#[cfg(feature = "parallel")]
 use crate::threading::{
-    for_each_inner_block_with_offsets, mapreduce_threaded_fold, SendPtr, MINTHREADLENGTH,
+    for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded_fold, SendPtr,
 };
 
 /// Number of independent accumulators of [`fold_contiguous`].
@@ -111,19 +107,16 @@ where
 ///
 /// # Evaluation order
 ///
-/// The result is independent of the ambient pool width when the call runs
-/// under the sequential policy — [`ExecContext::serial`](crate::ExecContext::serial)
-/// or [`with_execution_policy`](crate::with_execution_policy) with
-/// [`ExecutionPolicy::Sequential`](crate::ExecutionPolicy::Sequential): only
-/// serial branches run, and their fold order is fixed by the source layout.
-/// Under a parallel policy the fold is split over the effective thread count,
-/// so the result is repeatable for a fixed shape, layout and thread count but
-/// can differ between thread counts.
+/// The result is independent of the pool when the call runs with a serial
+/// token ([`Exec::serial`]) or a budget of one: only serial branches run, and
+/// their fold order is fixed by the source layout. With a larger budget the
+/// fold is split over the budget, so the result is repeatable for a fixed
+/// shape, layout and budget but can differ between budgets.
 ///
 /// In neither case is this a strict left to right fold: a contiguous source is
 /// folded with sixteen independent lanes (see the crate source for the exact
 /// lane assignment), non-contiguous sources are traversed in a cache-friendly
-/// loop order, and parallel execution folds per-worker chunks independently
+/// loop order, and parallel execution folds per-task chunks independently
 /// and combines them in a tree. Floating point results can therefore differ
 /// from a sequential left to right sum in the last bits, and no bitwise
 /// equality across machines or target features is guaranteed.
@@ -142,30 +135,32 @@ where
 /// select the dtype-specific SIMD kernels of [`crate::ErasedReducePlan`];
 /// callers that reduce with a known operation (sum, product, max, min) on a
 /// supported dtype can use that plan for the fastest path.
-pub fn reduce<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+pub fn reduce<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
     init: U,
+    exec: Exec<'_>,
 ) -> Result<U>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
-    reduce_impl(src, map_fn, reduce_fn, init)
+    reduce_impl(src, map_fn, reduce_fn, init, exec)
 }
 
-fn reduce_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+fn reduce_impl<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
     init: U,
+    exec: Exec<'_>,
 ) -> Result<U>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let src_ptr = src.ptr();
     let src_dims = src.dims();
@@ -178,7 +173,7 @@ where
         return Ok(init);
     }
 
-    let contiguous = sequential_contiguous_layout(src_dims, &[src_strides])?;
+    let contiguous = sequential_contiguous_layout(src_dims, &[src_strides], &exec)?;
     if contiguous.is_some() {
         let len = total_len(src_dims)?;
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -190,32 +185,25 @@ where
     // Parallel contiguous fast path: split into scheduler chunks with slice-based iteration.
     // This enables LLVM auto-vectorization on each chunk, unlike the general threaded path
     // which uses scalar pointer-offset loops.
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(src_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH
-            && nthreads > 1
-            && same_contiguous_layout(src_dims, &[src_strides]).is_some()
-        {
-            let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total) };
-            let result = crate::threading::parallel_map_reduce(
-                0..total,
-                nthreads,
-                &|range| {
-                    simd::dispatch_if_large(range.len(), || {
-                        fold_contiguous::<T, Op, M, R, U>(
-                            &src_slice[range],
-                            init.clone(),
-                            &map_fn,
-                            &reduce_fn,
-                        )
-                    })
-                },
-                &|a, b| reduce_fn(a, b),
-            );
-            return Ok(result);
-        }
+    let total = total_len(src_dims)?;
+    if is_parallel(total, &exec) && same_contiguous_layout(src_dims, &[src_strides]).is_some() {
+        let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total) };
+        let result = crate::threading::parallel_map_reduce(
+            0..total,
+            exec,
+            &|range| {
+                simd::dispatch_if_large(range.len(), || {
+                    fold_contiguous::<T, Op, M, R, U>(
+                        &src_slice[range],
+                        init.clone(),
+                        &map_fn,
+                        &reduce_fn,
+                    )
+                })
+            },
+            &|a, b| reduce_fn(a, b),
+        );
+        return Ok(result);
     }
 
     let strides_list: [&[isize]; 1] = [src_strides];
@@ -223,54 +211,50 @@ where
     let (fused_dims, ordered_strides, plan) =
         build_plan_fused(src_dims, &strides_list, None, std::mem::size_of::<T>());
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let src_send = SendPtr(src_ptr as *mut T);
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                ordered_strides.iter().map(|_| 0isize).collect();
-            let map_fn_ref = &map_fn;
-            let reduce_fn_ref = &reduce_fn;
-            let init_ref = &init;
-            // The reduction tree combines each split's partial result, so no
-            // worker-count-sized output-slot vector is needed (#306 scope).
-            let result = mapreduce_threaded_fold(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                &|dims, blocks, strides_list, offsets| {
-                    let mut acc = init_ref.clone();
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            let mut ptr = unsafe { src_send.as_const().offset(offsets[0]) };
-                            let stride = strides[0];
-                            for _ in 0..len {
-                                let val = Op::apply(unsafe { *ptr });
-                                let mapped = map_fn_ref(val);
-                                acc = reduce_fn_ref(acc.clone(), mapped);
-                                unsafe {
-                                    ptr = ptr.offset(stride);
-                                }
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        let src_send = SendPtr(src_ptr as *mut T);
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            ordered_strides.iter().map(|_| 0isize).collect();
+        let map_fn_ref = &map_fn;
+        let reduce_fn_ref = &reduce_fn;
+        let init_ref = &init;
+        // The reduction tree combines each split's partial result, so no
+        // worker-count-sized output-slot vector is needed (#306 scope).
+        let result = mapreduce_threaded_fold(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                let mut acc = init_ref.clone();
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        let mut ptr = unsafe { src_send.as_const().offset(offsets[0]) };
+                        let stride = strides[0];
+                        for _ in 0..len {
+                            let val = Op::apply(unsafe { *ptr });
+                            let mapped = map_fn_ref(val);
+                            acc = reduce_fn_ref(acc.clone(), mapped);
+                            unsafe {
+                                ptr = ptr.offset(stride);
                             }
-                            Ok(())
-                        },
-                    )?;
-                    Ok(acc)
-                },
-                &|a, b| reduce_fn_ref(a, b),
-            )?;
-            return Ok(result);
-        }
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok(acc)
+            },
+            &|a, b| reduce_fn_ref(a, b),
+        )?;
+        return Ok(result);
     }
 
     let mut acc = init;
@@ -426,7 +410,7 @@ where
 /// possible — for example an `f32` dot accumulated in `f64`:
 ///
 /// ```
-/// use strided_basic::{zip_reduce, StridedArray};
+/// use strided_basic::{zip_reduce, Exec, StridedArray};
 ///
 /// let a = StridedArray::<f32>::from_fn_col_major(&[2, 3], |i| (1 + i[0] + 2 * i[1]) as f32);
 /// let b = StridedArray::<f32>::from_fn_col_major(&[2, 3], |i| (1 + i[0]) as f32 * 0.5);
@@ -436,6 +420,7 @@ where
 ///     |x: f32, y: f32| x as f64 * y as f64,
 ///     |x, y| x + y,
 ///     0.0,
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// assert_eq!(dot, 16.5);
@@ -449,14 +434,11 @@ where
 ///
 /// # Evaluation order
 ///
-/// The result is independent of the ambient pool width when the call runs
-/// under the sequential policy — [`ExecContext::serial`](crate::ExecContext::serial)
-/// or [`with_execution_policy`](crate::with_execution_policy) with
-/// [`ExecutionPolicy::Sequential`](crate::ExecutionPolicy::Sequential): only
-/// serial branches run, and their fold order is fixed by the operand layouts.
-/// Under a parallel policy the fold is split over the effective thread count,
-/// so the result is repeatable for a fixed shape, layout and thread count but
-/// can differ between thread counts.
+/// The result is independent of the pool when the call runs with a serial
+/// token ([`Exec::serial`]) or a budget of one: only serial branches run, and
+/// their fold order is fixed by the operand layouts. With a larger budget the
+/// fold is split over the budget, so the result is repeatable for a fixed
+/// shape, layout and budget but can differ between budgets.
 ///
 /// In neither case is this a strict left to right fold: a contiguous operand
 /// pair is folded with the same sixteen independent lanes as [`reduce`], the
@@ -487,15 +469,16 @@ pub fn zip_reduce<A, B, OpA, OpB, M, R, U>(
     map_fn: M,
     reduce_fn: R,
     init: U,
+    exec: Exec<'_>,
 ) -> Result<U>
 where
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
-    M: Fn(A, B) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(A, B) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     ensure_same_shape(a.dims(), b.dims())?;
 
@@ -513,7 +496,7 @@ where
         return Ok(init);
     }
 
-    if sequential_contiguous_layout(dims, &[a_strides, b_strides])?.is_some() {
+    if sequential_contiguous_layout(dims, &[a_strides, b_strides], &exec)?.is_some() {
         return Ok(simd::dispatch_if_large(total, || {
             // SAFETY: both operands prove `total` readable elements.
             let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };
@@ -524,35 +507,29 @@ where
 
     // Parallel contiguous fast path: split into scheduler chunks so each chunk
     // folds two contiguous slices, matching the serial contiguous kernel.
-    #[cfg(feature = "parallel")]
+    if is_parallel(total, &exec) && same_contiguous_layout(dims, &[a_strides, b_strides]).is_some()
     {
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH
-            && nthreads > 1
-            && same_contiguous_layout(dims, &[a_strides, b_strides]).is_some()
-        {
-            // SAFETY: both operands prove `total` readable elements.
-            let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };
-            let sb = unsafe { std::slice::from_raw_parts(b_ptr, total) };
-            let result = crate::threading::parallel_map_reduce(
-                0..total,
-                nthreads,
-                &|range| {
-                    let len = range.len();
-                    simd::dispatch_if_large(len, || {
-                        fold_contiguous2::<A, B, OpA, OpB, M, R, U>(
-                            &sa[range.clone()],
-                            &sb[range],
-                            init.clone(),
-                            &map_fn,
-                            &reduce_fn,
-                        )
-                    })
-                },
-                &|left, right| reduce_fn(left, right),
-            );
-            return Ok(result);
-        }
+        // SAFETY: both operands prove `total` readable elements.
+        let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };
+        let sb = unsafe { std::slice::from_raw_parts(b_ptr, total) };
+        let result = crate::threading::parallel_map_reduce(
+            0..total,
+            exec,
+            &|range| {
+                let len = range.len();
+                simd::dispatch_if_large(len, || {
+                    fold_contiguous2::<A, B, OpA, OpB, M, R, U>(
+                        &sa[range.clone()],
+                        &sb[range],
+                        init.clone(),
+                        &map_fn,
+                        &reduce_fn,
+                    )
+                })
+            },
+            &|left, right| reduce_fn(left, right),
+        );
+        return Ok(result);
     }
 
     let strides_list: [&[isize]; 2] = [a_strides, b_strides];
@@ -560,59 +537,55 @@ where
     let (fused_dims, ordered_strides, plan) =
         build_plan_fused(dims, &strides_list, None, elem_size);
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let a_send = SendPtr(a_ptr as *mut A);
-            let b_send = SendPtr(b_ptr as *mut B);
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                ordered_strides.iter().map(|_| 0isize).collect();
-            let map_fn_ref = &map_fn;
-            let reduce_fn_ref = &reduce_fn;
-            let init_ref = &init;
-            // The reduction tree combines each split's partial result, so no
-            // worker-count-sized output-slot vector is needed (#306 scope).
-            let result = mapreduce_threaded_fold(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                &|dims, blocks, strides_list, offsets| {
-                    let mut acc = init_ref.clone();
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            // SAFETY: the plan proves every pair of this block
-                            // is a readable element of both operands.
-                            acc = unsafe {
-                                fold_run2::<A, B, OpA, OpB, M, R, U>(
-                                    a_send.as_const().offset(offsets[0]),
-                                    strides[0],
-                                    b_send.as_const().offset(offsets[1]),
-                                    strides[1],
-                                    len,
-                                    &acc,
-                                    map_fn_ref,
-                                    reduce_fn_ref,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )?;
-                    Ok(acc)
-                },
-                &|left, right| reduce_fn_ref(left, right),
-            )?;
-            return Ok(result);
-        }
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        let a_send = SendPtr(a_ptr as *mut A);
+        let b_send = SendPtr(b_ptr as *mut B);
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            ordered_strides.iter().map(|_| 0isize).collect();
+        let map_fn_ref = &map_fn;
+        let reduce_fn_ref = &reduce_fn;
+        let init_ref = &init;
+        // The reduction tree combines each split's partial result, so no
+        // worker-count-sized output-slot vector is needed (#306 scope).
+        let result = mapreduce_threaded_fold(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                let mut acc = init_ref.clone();
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        // SAFETY: the plan proves every pair of this block
+                        // is a readable element of both operands.
+                        acc = unsafe {
+                            fold_run2::<A, B, OpA, OpB, M, R, U>(
+                                a_send.as_const().offset(offsets[0]),
+                                strides[0],
+                                b_send.as_const().offset(offsets[1]),
+                                strides[1],
+                                len,
+                                &acc,
+                                map_fn_ref,
+                                reduce_fn_ref,
+                            )
+                        };
+                        Ok(())
+                    },
+                )?;
+                Ok(acc)
+            },
+            &|left, right| reduce_fn_ref(left, right),
+        )?;
+        return Ok(result);
     }
 
     let mut acc = init;
@@ -655,21 +628,22 @@ where
 /// scheme of [`reduce`], so `reduce_fn` must be associative and commutative.
 /// When the leading kept axis has unit stride, a block of adjacent outputs
 /// is accumulated one contiguous source column at a time, which keeps the
-/// left to right order per output. With the `parallel` feature, outputs are
-/// split across threads once the number of source elements read exceeds the
-/// threading threshold; each output is computed by one thread, so the result
-/// does not depend on the thread count.
-pub fn reduce_axis<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+/// left to right order per output. Outputs are split across the budget of
+/// `exec` once the number of source elements read exceeds the threading
+/// threshold; each output is computed by one task, so the result does not
+/// depend on the budget.
+pub fn reduce_axis<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,
     reduce_fn: R,
     init: U,
+    exec: Exec<'_>,
 ) -> Result<StridedArray<U>>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     if axis >= rank {
@@ -701,7 +675,7 @@ where
     {
         let mut dest = out.view_mut();
         // The fresh column-major destination needs no validation.
-        reduce_axis_into_impl(&mut dest, src, axis, map_fn, reduce_fn, init)?;
+        reduce_axis_into_impl(&mut dest, src, axis, map_fn, reduce_fn, init, exec)?;
     }
     Ok(out)
 }
@@ -724,28 +698,29 @@ where
 /// # Examples
 ///
 /// ```
-/// use strided_basic::{reduce_axis_into, StridedArray};
+/// use strided_basic::{reduce_axis_into, Exec, StridedArray};
 /// # let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |i| (i[0] + 2 * i[1]) as f64);
 /// let mut out = StridedArray::<f64>::col_major(&[3]);
-/// reduce_axis_into(&mut out.view_mut(), &src.view(), 0, |x| x, |a, b| a + b, 0.0).unwrap();
+/// reduce_axis_into(&mut out.view_mut(), &src.view(), 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
 /// assert_eq!(out.get(&[0]), 1.0);
 /// ```
 ///
-/// Validation runs here; [`reduce_axis_into_impl`] is the shared kernel. The
+/// Validation runs here; `reduce_axis_into_impl` is the shared kernel. The
 /// array-returning wrapper owns a fresh column-major destination and calls the
 /// kernel directly, so the common path does not re-validate.
-pub fn reduce_axis_into<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+pub fn reduce_axis_into<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     dest: &mut StridedViewMut<U>,
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,
     reduce_fn: R,
     init: U,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     if axis >= rank {
@@ -786,7 +761,7 @@ where
             return Err(StridedError::NonInjectiveOutputLayout);
         }
     }
-    reduce_axis_into_impl(dest, src, axis, map_fn, reduce_fn, init)
+    reduce_axis_into_impl(dest, src, axis, map_fn, reduce_fn, init, exec)
 }
 
 /// Shared kernel of [`reduce_axis_into`] and [`reduce_axis`].
@@ -795,18 +770,19 @@ where
 /// full reduction) and an injective layout; the public entry validates that,
 /// while the array-returning wrapper owns a freshly allocated column-major
 /// destination and can skip the re-validation.
-fn reduce_axis_into_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+fn reduce_axis_into_impl<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     dest: &mut StridedViewMut<U>,
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,
     reduce_fn: R,
     init: U,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     let src_dims = src.dims();
@@ -873,43 +849,41 @@ where
         init: &init,
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let work = dest_len.saturating_mul(axis_len);
-        let nthreads = crate::threading::parallel_threads_for_len(work).min(dest_len);
-        if nthreads > 1 {
-            let src_send = SendPtr(src_ptr as *mut T);
-            let out_send = SendPtr(out_ptr);
-            let parts = &parts;
-            if dest_linear {
-                crate::threading::parallel_for_each(0..dest_len, nthreads, &|range| {
-                    // SAFETY: worker ranges are disjoint, the destination is
-                    // injective, and the view proves every source offset
-                    // reachable from its kept coordinates.
-                    unsafe {
-                        reduce_axis_range_linear::<T, Op, M, R, U>(
-                            src_send.as_const(),
-                            out_send.as_ptr(),
-                            range,
-                            parts,
-                        )
-                    }
-                });
-            } else {
-                crate::threading::parallel_for_each(0..dest_len, nthreads, &|range| {
-                    // SAFETY: as for the linear path.
-                    unsafe {
-                        reduce_axis_range_strided::<T, Op, M, R, U>(
-                            src_send.as_const(),
-                            out_send.as_ptr(),
-                            range,
-                            parts,
-                        )
-                    }
-                });
-            }
-            return Ok(());
+    let work = dest_len.saturating_mul(axis_len);
+    let exec = crate::threading::for_len(exec, work)
+        .limit(NonZeroUsize::new(dest_len).unwrap_or(NonZeroUsize::MIN));
+    if !exec.is_serial() {
+        let src_send = SendPtr(src_ptr as *mut T);
+        let out_send = SendPtr(out_ptr);
+        let parts = &parts;
+        if dest_linear {
+            crate::threading::parallel_for_each(0..dest_len, exec, &|range| {
+                // SAFETY: worker ranges are disjoint, the destination is
+                // injective, and the view proves every source offset
+                // reachable from its kept coordinates.
+                unsafe {
+                    reduce_axis_range_linear::<T, Op, M, R, U>(
+                        src_send.as_const(),
+                        out_send.as_ptr(),
+                        range,
+                        parts,
+                    )
+                }
+            });
+        } else {
+            crate::threading::parallel_for_each(0..dest_len, exec, &|range| {
+                // SAFETY: as for the linear path.
+                unsafe {
+                    reduce_axis_range_strided::<T, Op, M, R, U>(
+                        src_send.as_const(),
+                        out_send.as_ptr(),
+                        range,
+                        parts,
+                    )
+                }
+            });
         }
+        return Ok(());
     }
 
     // SAFETY: as for the parallel ranges, with one range covering all outputs.

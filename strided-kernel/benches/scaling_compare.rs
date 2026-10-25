@@ -10,6 +10,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_kernel::Exec;
 use strided_kernel::{copy_into, sum, StridedArray};
 
 fn median(durations: &mut [Duration]) -> Duration {
@@ -90,7 +91,7 @@ fn benchmark_sum() {
         // Strided sum
         let a_view = a.view();
         let t_strided = bench_adaptive(|| {
-            let r = sum(&a_view).unwrap();
+            let r = sum(&a_view, Exec::serial()).unwrap();
             black_box(r);
         });
 
@@ -167,7 +168,7 @@ fn benchmark_permute(perm: &[usize], label: &str) {
         let a_view = a.view();
         let a_perm = a_view.permute(perm).unwrap();
         let t_strided = bench_adaptive(|| {
-            copy_into(&mut b.view_mut(), &a_perm).unwrap();
+            copy_into(&mut b.view_mut(), &a_perm, Exec::serial()).unwrap();
             black_box(b_ptr);
         });
 

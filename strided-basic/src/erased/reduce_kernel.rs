@@ -105,7 +105,7 @@ fn with_axis_block_scratch<Acc: Copy, R>(
 /// One reduction operation, fixed at compile time.
 pub(super) trait ReduceKernel<T: ErasedReduceScalar>: 'static {
     /// Accumulator carried through the range kernels.
-    type Acc: Copy + crate::MaybeSendSync;
+    type Acc: Copy + Send + Sync;
 
     /// Kernel used to recompute an output in source order when
     /// [`Self::needs_ordered_fallback`] reports that [`Self::Acc`] could not
@@ -436,9 +436,9 @@ impl<T: ErasedReduceScalar> ReduceKernel<T> for MinKernel {
 /// per-dtype split/combine/finish primitives. `f32` and `f64` track an exact
 /// signed exponent, integers use wrapping multiplication and complex values use
 /// the source-order fold.
-pub(super) trait StableProductScalar: Copy + crate::MaybeSendSync {
+pub(super) trait StableProductScalar: Copy + Send + Sync {
     /// Accumulator of the stable product kernel.
-    type StableProductAcc: Copy + crate::MaybeSendSync;
+    type StableProductAcc: Copy + Send + Sync;
 
     /// Whether `StableProductAcc` is layout-identical to `Self`.
     const SP_ACC_IS_SCALAR: bool = true;

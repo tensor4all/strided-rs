@@ -5,9 +5,14 @@
 //! declining a run leaves the destination untouched so the scalar path can write it, and that the
 //! layout checks still reject shapes and destinations the other map entry points reject.
 
+#[cfg(feature = "parallel")]
+mod common;
+#[cfg(feature = "parallel")]
+use common::Budget;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use strided_basic::Exec;
 use strided_basic::{
     map_into, map_into_uninit_with_kernel, Identity, StridedError, StridedView, StridedViewMut,
 };
@@ -45,6 +50,7 @@ fn run(
                 true
             },
             |x| x * 2.0,
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -64,7 +70,7 @@ fn reference(dims: &[usize], strides: &[isize], offset: isize, extent: usize) ->
     {
         let mut dest = StridedViewMut::new(&mut out, dims, strides, offset).unwrap();
         let view = StridedView::<f64, Identity>::new(&source, dims, strides, offset).unwrap();
-        map_into(&mut dest, &view, |x| x * 2.0).unwrap();
+        map_into(&mut dest, &view, |x| x * 2.0, Exec::serial()).unwrap();
     }
     out
 }
@@ -114,7 +120,7 @@ fn the_shape_and_layout_checks_still_apply() {
     let kernel = |_src: &[f64], _dst: &mut [MaybeUninit<f64>]| true;
     // The kernel accepts, but a mismatched shape must be rejected before it is consulted.
     assert!(matches!(
-        map_into_uninit_with_kernel(&mut dest, &view, kernel, |x| x),
+        map_into_uninit_with_kernel(&mut dest, &view, kernel, |x| x, Exec::serial()),
         Err(StridedError::ShapeMismatch { .. })
     ));
 
@@ -124,7 +130,7 @@ fn the_shape_and_layout_checks_still_apply() {
     let mut dest = StridedViewMut::new(&mut out, &[2, 2], &[1, 0], 0).unwrap();
     let view = StridedView::new(&source, &[2, 2], &[1, 0], 0).unwrap();
     assert!(matches!(
-        map_into_uninit_with_kernel(&mut dest, &view, kernel, |x| x),
+        map_into_uninit_with_kernel(&mut dest, &view, kernel, |x| x, Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
 }
@@ -132,44 +138,31 @@ fn the_shape_and_layout_checks_still_apply() {
 #[cfg(feature = "parallel")]
 #[test]
 fn the_parallel_path_offers_each_block_a_run() {
-    use std::num::NonZeroUsize;
-
-    use strided_basic::{with_execution_policy, ExecutionPolicy};
-
     let extent = 1usize << 20;
     let source: Vec<f64> = (0..extent).map(|i| i as f64 + 1.0).collect();
     let mut out = vec![MaybeUninit::new(SENTINEL); extent];
     let calls = AtomicUsize::new(0);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
+    {
+        let budget = Budget::Pooled(4);
+        let dims = [extent];
+        let unit = [1isize];
+        let mut dest = StridedViewMut::new(&mut out, &dims, &unit, 0).unwrap();
+        let view = StridedView::new(&source, &dims, &unit, 0).unwrap();
+        map_into_uninit_with_kernel(
+            &mut dest,
+            &view,
+            |src: &[f64], dst: &mut [MaybeUninit<f64>]| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                for (slot, value) in dst.iter_mut().zip(src) {
+                    slot.write(value * 2.0);
+                }
+                true
+            },
+            |x| x * 2.0,
+            budget.exec(),
+        )
         .unwrap();
-    pool.install(|| {
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(4).unwrap(),
-            },
-            || {
-                let dims = [extent];
-                let unit = [1isize];
-                let mut dest = StridedViewMut::new(&mut out, &dims, &unit, 0).unwrap();
-                let view = StridedView::new(&source, &dims, &unit, 0).unwrap();
-                map_into_uninit_with_kernel(
-                    &mut dest,
-                    &view,
-                    |src: &[f64], dst: &mut [MaybeUninit<f64>]| {
-                        calls.fetch_add(1, Ordering::Relaxed);
-                        for (slot, value) in dst.iter_mut().zip(src) {
-                            slot.write(value * 2.0);
-                        }
-                        true
-                    },
-                    |x| x * 2.0,
-                )
-                .unwrap();
-            },
-        );
-    });
+    }
 
     assert!(
         calls.load(Ordering::Relaxed) > 1,

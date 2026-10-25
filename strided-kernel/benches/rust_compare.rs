@@ -2,6 +2,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_kernel::Exec;
 use strided_kernel::{
     copy_into, copy_transpose_scale_into, map_into, zip_map2_into, zip_map4_into, StridedArray,
 };
@@ -74,7 +75,14 @@ fn main() {
         });
 
         bench_n("rust_strided", 1, 3, || {
-            zip_map2_into(&mut b.view_mut(), &a_view, &a_t, |x, y| (x + y) * 0.5).unwrap();
+            zip_map2_into(
+                &mut b.view_mut(),
+                &a_view,
+                &a_t,
+                |x, y| (x + y) * 0.5,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(b_ptr);
         });
         println!();
@@ -106,7 +114,7 @@ fn main() {
         });
 
         bench_n("rust_strided", 5, 10, || {
-            copy_transpose_scale_into(&mut b.view_mut(), &a_view, 3.0).unwrap();
+            copy_transpose_scale_into(&mut b.view_mut(), &a_view, 3.0, Exec::serial()).unwrap();
             black_box(b_ptr);
         });
         println!();
@@ -139,7 +147,7 @@ fn main() {
         });
 
         bench_n("rust_strided_map", 5, 10, || {
-            map_into(&mut b.view_mut(), &a_t, |x| 3.0 * x).unwrap();
+            map_into(&mut b.view_mut(), &a_t, |x| 3.0 * x, Exec::serial()).unwrap();
             black_box(b_ptr);
         });
 
@@ -170,9 +178,12 @@ fn main() {
         });
 
         bench_n("rust_strided", 3, 6, || {
-            map_into(&mut b.view_mut(), &a_view, |x| {
-                x * (-2.0 * x).exp() + (x * x).sin()
-            })
+            map_into(
+                &mut b.view_mut(),
+                &a_view,
+                |x| x * (-2.0 * x).exp() + (x * x).sin(),
+                Exec::serial(),
+            )
             .unwrap();
             black_box(b_ptr);
         });
@@ -216,7 +227,7 @@ fn main() {
         });
 
         bench_n("rust_strided", 20, 50, || {
-            copy_into(&mut b.view_mut(), &a_perm).unwrap();
+            copy_into(&mut b.view_mut(), &a_perm, Exec::serial()).unwrap();
             black_box(b_ptr);
         });
         println!();
@@ -269,9 +280,15 @@ fn main() {
         });
 
         bench_n("rust_strided_fused", 10, 30, || {
-            zip_map4_into(&mut b.view_mut(), &p1, &p2, &p3, &p4, |a, b, c, d| {
-                a + b + c + d
-            })
+            zip_map4_into(
+                &mut b.view_mut(),
+                &p1,
+                &p2,
+                &p3,
+                &p4,
+                |a, b, c, d| a + b + c + d,
+                Exec::serial(),
+            )
             .unwrap();
             black_box(b_ptr);
         });

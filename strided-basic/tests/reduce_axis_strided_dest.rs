@@ -10,6 +10,11 @@
 //! naive loop over the logical indices, and the data is exact `i64` so any
 //! lane or block order is exact.
 
+#[cfg(feature = "parallel")]
+mod common;
+#[cfg(feature = "parallel")]
+use common::Budget;
+use strided_basic::Exec;
 use strided_basic::{reduce_axis_into, StridedError, StridedView, StridedViewMut};
 
 /// A strided layout over a flat buffer.
@@ -120,6 +125,7 @@ fn check_case(src: &Layout, dest: &Layout, axis: usize, init: i64, label: &str) 
             |x| x,
             i64::wrapping_add,
             init,
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -136,7 +142,16 @@ fn reduce_axis_into_rejects_axis_out_of_range() {
     let src = StridedView::<i64>::new(&src_data, &[2, 3], &[3, 1], 0).unwrap();
     let mut dest_data = [0i64; 3];
     let mut dest = StridedViewMut::new(&mut dest_data, &[3], &[1], 0).unwrap();
-    let error = reduce_axis_into(&mut dest, &src, 2, |x| x, i64::wrapping_add, 0).unwrap_err();
+    let error = reduce_axis_into(
+        &mut dest,
+        &src,
+        2,
+        |x| x,
+        i64::wrapping_add,
+        0,
+        Exec::serial(),
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
         StridedError::InvalidAxis { axis: 2, rank: 2 }
@@ -150,7 +165,16 @@ fn reduce_axis_into_rejects_multi_element_full_reduction() {
     let src = StridedView::<i64>::new(&src_data, &[3], &[1], 0).unwrap();
     let mut dest_data = [0i64; 2];
     let mut dest = StridedViewMut::new(&mut dest_data, &[2], &[1], 0).unwrap();
-    let error = reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 0).unwrap_err();
+    let error = reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        0,
+        Exec::serial(),
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
         StridedError::ShapeMismatch(ref dims, ref expected)
@@ -166,7 +190,16 @@ fn reduce_axis_into_rejects_destination_rank_mismatch() {
     let src = StridedView::<i64>::new(&src_data, &[2, 3, 4], &[1, 2, 6], 0).unwrap();
     let mut dest_data = [0i64; 3];
     let mut dest = StridedViewMut::new(&mut dest_data, &[3], &[1], 0).unwrap();
-    let error = reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 0).unwrap_err();
+    let error = reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        0,
+        Exec::serial(),
+    )
+    .unwrap_err();
     assert!(matches!(error, StridedError::RankMismatch(1, 2)));
 }
 
@@ -177,7 +210,16 @@ fn reduce_axis_into_rejects_destination_shape_mismatch() {
     let src = StridedView::<i64>::new(&src_data, &[2, 3], &[3, 1], 0).unwrap();
     let mut dest_data = [0i64; 4];
     let mut dest = StridedViewMut::new(&mut dest_data, &[4], &[1], 0).unwrap();
-    let error = reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 0).unwrap_err();
+    let error = reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        0,
+        Exec::serial(),
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
         StridedError::ShapeMismatch(ref dims, ref expected)
@@ -192,7 +234,16 @@ fn reduce_axis_into_rejects_non_injective_destination() {
     let src = StridedView::<i64>::new(&src_data, &[2, 3], &[3, 1], 0).unwrap();
     let mut dest_data = [0i64; 1];
     let mut dest = StridedViewMut::new(&mut dest_data, &[3], &[0], 0).unwrap();
-    let error = reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 0).unwrap_err();
+    let error = reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        0,
+        Exec::serial(),
+    )
+    .unwrap_err();
     assert!(matches!(error, StridedError::NonInjectiveOutputLayout));
 }
 
@@ -280,7 +331,16 @@ fn empty_reduced_axis_skips_an_empty_destination() {
     let src = StridedView::<i64>::new(&src_data, &[0, 0], &[0, 1], 0).unwrap();
     let mut dest_data: [i64; 0] = [];
     let mut dest = StridedViewMut::new(&mut dest_data, &[0], &[1], 0).unwrap();
-    reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 9).unwrap();
+    reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        9,
+        Exec::serial(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -290,7 +350,16 @@ fn empty_reduced_axis_fills_a_rank0_destination() {
     let src = StridedView::<i64>::new(&src_data, &[0], &[1], 0).unwrap();
     let mut dest_data = [123i64];
     let mut dest = StridedViewMut::new(&mut dest_data, &[], &[], 0).unwrap();
-    reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 77).unwrap();
+    reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        77,
+        Exec::serial(),
+    )
+    .unwrap();
     assert_eq!(dest_data, [77]);
 }
 
@@ -310,7 +379,16 @@ fn empty_reduced_axis_spills_the_fill_cursor_above_inline_rank() {
         step *= dim as isize;
     }
     let mut dest = StridedViewMut::new(&mut dest_data, &dest_dims, &dest_strides, 0).unwrap();
-    reduce_axis_into(&mut dest, &src, 0, |x| x, i64::wrapping_add, 5).unwrap();
+    reduce_axis_into(
+        &mut dest,
+        &src,
+        0,
+        |x| x,
+        i64::wrapping_add,
+        5,
+        Exec::serial(),
+    )
+    .unwrap();
     assert!(dest_data.iter().all(|&value| value == 5));
 }
 
@@ -321,9 +399,6 @@ fn empty_reduced_axis_spills_the_fill_cursor_above_inline_rank() {
 #[cfg(feature = "parallel")]
 #[test]
 fn strided_destination_splits_across_two_workers() {
-    use std::num::NonZeroUsize;
-    use strided_basic::{with_execution_policy, ExecutionPolicy};
-
     // 32 * 32 outputs over a 64-element reduced axis exceeds MINTHREADLENGTH
     // (1 << 15) by enough to open a second worker.
     let (n, m, k) = (32usize, 64usize, 32usize);
@@ -340,24 +415,21 @@ fn strided_destination_splits_across_two_workers() {
     let src_view = StridedView::<i64>::new(&src_data, &src.dims, &src.strides, src.offset).unwrap();
     let expected = expected_values(&src_data, &src, &dest, 1, 0);
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
     let mut dest_data = vec![i64::MIN; dest.len];
-    pool.install(|| {
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(2).unwrap(),
-            },
-            || {
-                let mut dest_view =
-                    StridedViewMut::<i64>::new(&mut dest_data, &dest.dims, &dest.strides, 0)
-                        .unwrap();
-                reduce_axis_into(&mut dest_view, &src_view, 1, |x| x, i64::wrapping_add, 0)
-                    .unwrap();
-            },
-        );
-    });
+    {
+        let budget = Budget::Pooled(2);
+        let mut dest_view =
+            StridedViewMut::<i64>::new(&mut dest_data, &dest.dims, &dest.strides, 0).unwrap();
+        reduce_axis_into(
+            &mut dest_view,
+            &src_view,
+            1,
+            |x| x,
+            i64::wrapping_add,
+            0,
+            budget.exec(),
+        )
+        .unwrap();
+    }
     assert_matches(&dest_data, &dest, &expected, "parallel strided sweep");
 }

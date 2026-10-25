@@ -1,7 +1,20 @@
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use num_complex::{Complex32, Complex64};
 use strided_kernel::{
-    ErasedGatherPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, GatherSpec,
-    KernelDType, StridedError,
+    ErasedGatherPlan, ErasedRawStridedMut, ErasedRawStridedRef, Exec, GatherSpec, KernelDType,
+    StridedError,
 };
 
 #[test]
@@ -44,13 +57,8 @@ fn erased_gather_plan_executes_f64_column_gather_with_i64_indices() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest_ref,
-        &operand_ref,
-        &index_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, Exec::serial())
+        .unwrap();
 
     assert_eq!(dest, [20.0, 0.0, 21.0, 1.0, 22.0, 2.0]);
 }
@@ -93,13 +101,8 @@ fn erased_gather_plan_executes_f32_windows_with_i32_indices_and_clamping() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::max_threads(1).unwrap(),
-        &mut dest_ref,
-        &operand_ref,
-        &index_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, bounded(1))
+        .unwrap();
 
     assert_eq!(dest, [10.0, 12.0, 12.0, 11.0, 13.0, 13.0]);
 }
@@ -143,13 +146,8 @@ where
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::ambient(),
-        &mut dest_ref,
-        &operand_ref,
-        &index_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, bounded(4))
+        .unwrap();
 
     assert_eq!(output, vec![input[1], input[0]]);
 }
@@ -200,13 +198,8 @@ fn rank_one_scalar_take_clamps_indices_and_honors_offsets() {
     let mut output_ref =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 1).unwrap();
 
-    plan.execute(
-        &ExecContext::serial(),
-        &mut output_ref,
-        &operand_ref,
-        &index_ref,
-    )
-    .unwrap();
+    plan.execute(&mut output_ref, &operand_ref, &index_ref, Exec::serial())
+        .unwrap();
 
     assert_eq!(output, [-1.0, 10.0, 20.0, 30.0]);
 }
@@ -280,7 +273,7 @@ fn run_ranked_window_gather(rank: usize, batch_first: bool) {
     let index = ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 1).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source, &index)
+    plan.execute(&mut dest, &source, &index, Exec::serial())
         .unwrap();
 
     let expected: Vec<f64> = (0..total)
@@ -348,7 +341,7 @@ fn generic_gather_reads_fresh_multi_component_index_vectors() {
     let index = ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &[1], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source, &index)
+    plan.execute(&mut dest, &source, &index, Exec::serial())
         .unwrap();
 
     assert_eq!(output, [7, 2]);
@@ -388,7 +381,7 @@ fn generic_gather_accepts_valid_nonunit_negative_layouts() {
     let index = ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 1).unwrap();
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 3).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source, &index)
+    plan.execute(&mut dest, &source, &index, Exec::serial())
         .unwrap();
 
     assert_eq!(output[3], operand[1]);
@@ -433,12 +426,7 @@ fn erased_gather_plan_rejects_dtype_and_layout_mismatch_before_writing() {
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &strides, 0).unwrap();
 
     let err = plan
-        .execute(
-            &ExecContext::serial(),
-            &mut dest_ref,
-            &operand_ref,
-            &index_ref,
-        )
+        .execute(&mut dest_ref, &operand_ref, &index_ref, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
@@ -449,12 +437,7 @@ fn erased_gather_plan_rejects_dtype_and_layout_mismatch_before_writing() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &strides, 0).unwrap();
     let err = plan
-        .execute(
-            &ExecContext::serial(),
-            &mut dest_ref,
-            &operand_ref,
-            &bad_index_ref,
-        )
+        .execute(&mut dest_ref, &operand_ref, &bad_index_ref, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
@@ -492,7 +475,7 @@ fn generic_gather_zero_output_does_not_read_inputs() {
     let index = ErasedRawStridedRef::from_slice(&indices, &index_dims, &[1], 0).unwrap();
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &[1], isize::MAX).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source, &index)
+    plan.execute(&mut dest, &source, &index, Exec::serial())
         .unwrap();
 }
 

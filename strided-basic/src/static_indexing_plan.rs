@@ -7,7 +7,7 @@
 
 use core::mem::MaybeUninit;
 
-use crate::{CopyPlan, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
+use crate::{CopyPlan, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
 
@@ -131,7 +131,6 @@ pub struct ConcatenatePlan {
     dest_offset_deltas: crate::inline::OperandVec<isize>,
     /// Logical start of each segment in the concatenated index space
     /// (segment totals prefix sums); the last entry is the destination total.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     segment_starts: crate::inline::OperandVec<usize>,
     copy_plans: crate::inline::OperandVec<CopyPlan>,
 }
@@ -204,9 +203,10 @@ impl SlicePlan {
         &self,
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -221,7 +221,7 @@ impl SlicePlan {
                 source_offset,
             )
         };
-        self.copy_plan.execute(dest, &source)
+        self.copy_plan.execute(dest, &source, exec)
     }
 
     /// Execute into storage whose reachable destination elements are uninitialized.
@@ -229,9 +229,10 @@ impl SlicePlan {
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -246,7 +247,7 @@ impl SlicePlan {
                 source_offset,
             )
         };
-        self.copy_plan.execute_uninit(dest, &source)
+        self.copy_plan.execute_uninit(dest, &source, exec)
     }
 
     fn check_call<D, T>(
@@ -376,22 +377,24 @@ impl PadPlan {
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
         fill: T,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
+        let mut exec = exec;
         self.check_call(dest, operand)?;
         if self.operand_total == 0 {
-            return self.fill_dest(dest, fill);
+            return self.fill_dest(dest, fill, exec);
         }
         if let Some(columns) = &self.contiguous_axis0_columns {
-            return self.execute_axis0_columns(dest, operand, fill, columns);
+            return self.execute_axis0_columns(dest, operand, fill, columns, exec);
         }
-        self.fill_dest(dest, fill)?;
+        self.fill_dest(dest, fill, exec.reborrow())?;
         if let Some(run) = self.contiguous_axis0_run {
-            return self.copy_operand_axis0_runs(dest, operand, run);
+            return self.copy_operand_axis0_runs(dest, operand, run, exec);
         }
-        self.copy_operand(dest, operand)
+        self.copy_operand(dest, operand, exec)
     }
 
     /// Execute pad into storage whose reachable destination elements are uninitialized.
@@ -400,27 +403,29 @@ impl PadPlan {
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
         fill: T,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
+        let mut exec = exec;
         self.check_call(dest, operand)?;
         if self.operand_total == 0 {
-            return self.fill_dest(dest, MaybeUninit::new(fill));
+            return self.fill_dest(dest, MaybeUninit::new(fill), exec);
         }
         if let Some(columns) = &self.contiguous_axis0_columns {
-            return self.execute_axis0_columns_uninit(dest, operand, fill, columns);
+            return self.execute_axis0_columns_uninit(dest, operand, fill, columns, exec);
         }
-        self.fill_dest(dest, MaybeUninit::new(fill))?;
+        self.fill_dest(dest, MaybeUninit::new(fill), exec.reborrow())?;
         if let Some(run) = self.contiguous_axis0_run {
-            return self.copy_operand_axis0_runs_uninit(dest, operand, run);
+            return self.copy_operand_axis0_runs_uninit(dest, operand, run, exec);
         }
-        self.copy_operand_uninit(dest, operand)
+        self.copy_operand_uninit(dest, operand, exec)
     }
 
-    fn fill_dest<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T) -> Result<()>
+    fn fill_dest<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T, exec: Exec<'_>) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         if self.dest_total == 0 {
             return Ok(());
@@ -435,15 +440,12 @@ impl PadPlan {
             let dest_slice = dest_data
                 .get_mut(dest_offset..dest_end)
                 .ok_or(StridedError::OffsetOverflow)?;
-            crate::threading::fill_contiguous(dest_slice, fill);
+            crate::threading::fill_contiguous(dest_slice, fill, exec);
             return Ok(());
         }
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads = crate::threading::parallel_threads_for_len(self.dest_total);
-            if nthreads > 1 {
-                return self.fill_dest_parallel(dest, fill, nthreads);
-            }
+        let exec = crate::threading::for_len(exec, self.dest_total);
+        if !exec.is_serial() {
+            return self.fill_dest_parallel(dest, fill, exec);
         }
         self.fill_dest_serial(dest, fill)
     }
@@ -453,16 +455,17 @@ impl PadPlan {
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
         run: ContiguousPadAxis0Run,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr();
         // SAFETY: `check_call` proved `dest` carries the compiled destination
         // layout, so its validated data covers every reachable destination
         // slot, and the exclusive borrow is the only access during the call.
-        unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run) }
+        unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run, exec) }
     }
 
     fn copy_operand_axis0_runs_uninit<T>(
@@ -470,15 +473,16 @@ impl PadPlan {
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
         run: ContiguousPadAxis0Run,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr().cast::<T>();
         // SAFETY: as in `copy_operand_axis0_runs`; `MaybeUninit<T>` has the
         // layout of `T`, and only writes go through the cast pointer.
-        unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run) }
+        unsafe { self.copy_axis0_runs_raw(dest_ptr, dest_offset, operand, run, exec) }
     }
 
     fn execute_axis0_columns<T>(
@@ -487,9 +491,10 @@ impl PadPlan {
         operand: &RawStridedRef<'_, T>,
         fill: T,
         columns: &ContiguousPadAxis0Columns,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr();
@@ -506,6 +511,7 @@ impl PadPlan {
                 operand_offset,
                 fill,
                 columns,
+                exec,
             )
         }
     }
@@ -516,9 +522,10 @@ impl PadPlan {
         operand: &RawStridedRef<'_, T>,
         fill: T,
         columns: &ContiguousPadAxis0Columns,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr().cast::<T>();
@@ -534,6 +541,7 @@ impl PadPlan {
                 operand_offset,
                 fill,
                 columns,
+                exec,
             )
         }
     }
@@ -555,6 +563,7 @@ impl PadPlan {
     /// slot and no other access may overlap the call; the operand may only be
     /// read at coordinates that are copied, but no read is performed for a
     /// padding-only column.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn write_axis0_columns_raw<T, const UNINIT: bool>(
         &self,
         dest_ptr: *mut T,
@@ -563,23 +572,23 @@ impl PadPlan {
         operand_offset: isize,
         fill: T,
         columns: &ContiguousPadAxis0Columns,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let column_total = columns.column_total;
         if column_total == 0 {
             return Ok(());
         }
-        #[cfg(feature = "parallel")]
+        let exec = crate::threading::for_len(exec, self.dest_total);
         {
-            let nthreads = crate::threading::parallel_threads_for_len(self.dest_total);
-            if nthreads > 1 && column_total >= nthreads {
+            if exec.budget().get() > 1 && column_total >= exec.budget().get() {
                 let dest_ptr = crate::threading::SendPtr(dest_ptr);
                 let operand_ptr = crate::threading::SendPtr(operand_ptr as *mut T);
                 return crate::threading::parallel_map_reduce(
                     0..column_total,
-                    nthreads,
+                    exec,
                     &|range| {
                         let mut outer_idx_storage =
                             CoordScratch::new(columns.dest_outer_dims.len());
@@ -601,6 +610,7 @@ impl PadPlan {
                                 outer_idx,
                                 range.start,
                                 range.len(),
+                                Exec::serial(),
                             )
                         }
                     },
@@ -622,6 +632,7 @@ impl PadPlan {
                 outer_idx,
                 0,
                 column_total,
+                exec,
             )
         }
     }
@@ -645,9 +656,10 @@ impl PadPlan {
         outer_idx: &mut [usize],
         column_start: usize,
         count: usize,
+        mut exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         if count == 0 {
             return Ok(());
@@ -685,14 +697,25 @@ impl PadPlan {
                 // this call owns the whole column.
                 unsafe {
                     if UNINIT {
-                        fill_raw_span_uninit(dest_ptr.offset(dest_column_offset), low_len, fill);
+                        fill_raw_span_uninit(
+                            dest_ptr.offset(dest_column_offset),
+                            low_len,
+                            fill,
+                            exec.reborrow(),
+                        );
                     } else {
-                        fill_raw_span(dest_ptr.offset(dest_column_offset), low_len, fill);
+                        fill_raw_span(
+                            dest_ptr.offset(dest_column_offset),
+                            low_len,
+                            fill,
+                            exec.reborrow(),
+                        );
                     }
                     crate::threading::copy_contiguous(
                         operand_ptr.offset(operand_column_offset),
                         dest_ptr.offset(dest_column_offset + low_len as isize),
                         run_len,
+                        exec.reborrow(),
                     );
                     if UNINIT {
                         fill_raw_span_uninit(
@@ -700,6 +723,7 @@ impl PadPlan {
                                 .offset(dest_column_offset + low_len as isize + run_len as isize),
                             high_len,
                             fill,
+                            exec.reborrow(),
                         );
                     } else {
                         fill_raw_span(
@@ -707,6 +731,7 @@ impl PadPlan {
                                 .offset(dest_column_offset + low_len as isize + run_len as isize),
                             high_len,
                             fill,
+                            exec.reborrow(),
                         );
                     }
                 }
@@ -719,12 +744,14 @@ impl PadPlan {
                             dest_ptr.offset(dest_column_offset),
                             columns.dest_axis0_len,
                             fill,
+                            exec.reborrow(),
                         );
                     } else {
                         fill_raw_span(
                             dest_ptr.offset(dest_column_offset),
                             columns.dest_axis0_len,
                             fill,
+                            exec.reborrow(),
                         );
                     }
                 }
@@ -789,24 +816,24 @@ impl PadPlan {
         dest_offset: isize,
         operand: &RawStridedRef<'_, T>,
         run: ContiguousPadAxis0Run,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         if run.len == 0 {
             return Ok(());
         }
         let outer_dims = &self.operand_dims[1..];
         let outer_total = checked_total_len(outer_dims)?;
-        #[cfg(feature = "parallel")]
+        let copied = outer_total.saturating_mul(run.len);
+        let exec = crate::threading::for_len(exec, copied);
         {
-            let copied = outer_total.saturating_mul(run.len);
-            let nthreads = crate::threading::parallel_threads_for_len(copied);
-            if nthreads > 1 && outer_total >= nthreads {
+            if exec.budget().get() > 1 && outer_total >= exec.budget().get() {
                 let dest_ptr = crate::threading::SendPtr(dest_ptr);
                 return crate::threading::parallel_map_reduce(
                     0..outer_total,
-                    nthreads,
+                    exec,
                     &|range| {
                         let mut outer_idx_storage = CoordScratch::new(outer_dims.len());
                         let outer_idx = outer_idx_storage.as_mut_slice();
@@ -822,6 +849,7 @@ impl PadPlan {
                                 run,
                                 outer_idx,
                                 range.len(),
+                                Exec::serial(),
                             )
                         }
                     },
@@ -833,7 +861,15 @@ impl PadPlan {
         let outer_idx = outer_idx_storage.as_mut_slice();
         // SAFETY: forwarded from this function's contract.
         unsafe {
-            self.copy_axis0_run_range(dest_ptr, dest_offset, operand, run, outer_idx, outer_total)
+            self.copy_axis0_run_range(
+                dest_ptr,
+                dest_offset,
+                operand,
+                run,
+                outer_idx,
+                outer_total,
+                exec,
+            )
         }
     }
 
@@ -844,6 +880,7 @@ impl PadPlan {
     ///
     /// As for [`Self::copy_axis0_runs_raw`], and no other thread may write the
     /// destination runs visited by this call.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn copy_axis0_run_range<T>(
         &self,
         dest_ptr: *mut T,
@@ -852,9 +889,10 @@ impl PadPlan {
         run: ContiguousPadAxis0Run,
         outer_idx: &mut [usize],
         count: usize,
+        mut exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let outer_dims = &self.operand_dims[1..];
         let operand_ptr = operand.data().as_ptr();
@@ -888,6 +926,7 @@ impl PadPlan {
                         operand_ptr.offset(operand_offset),
                         dest_ptr.offset(dest_run_offset),
                         run.len,
+                        exec.reborrow(),
                     );
                 }
             }
@@ -930,21 +969,20 @@ impl PadPlan {
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     fn fill_dest_parallel<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
         fill: T,
-        nthreads: usize,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset_base = dest.offset();
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         crate::threading::parallel_map_reduce(
             0..self.dest_total,
-            nthreads,
+            exec,
             &|range| {
                 let mut cursor = PadFillState::decode(
                     range.start,
@@ -973,16 +1011,14 @@ impl PadPlan {
         &self,
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads = crate::threading::parallel_threads_for_len(self.generic_copy.total);
-            if nthreads > 1 {
-                return self.copy_operand_parallel(dest, operand, nthreads);
-            }
+        let exec = crate::threading::for_len(exec, self.generic_copy.total);
+        if !exec.is_serial() {
+            return self.copy_operand_parallel(dest, operand, exec);
         }
         self.copy_operand_serial(dest, operand)
     }
@@ -991,16 +1027,14 @@ impl PadPlan {
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads = crate::threading::parallel_threads_for_len(self.generic_copy.total);
-            if nthreads > 1 {
-                return self.copy_operand_uninit_parallel(dest, operand, nthreads);
-            }
+        let exec = crate::threading::for_len(exec, self.generic_copy.total);
+        if !exec.is_serial() {
+            return self.copy_operand_uninit_parallel(dest, operand, exec);
         }
         self.copy_operand_uninit_serial(dest, operand)
     }
@@ -1041,15 +1075,14 @@ impl PadPlan {
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     fn copy_operand_uninit_parallel<T>(
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
-        nthreads: usize,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let operand_base = operand
             .offset()
@@ -1063,7 +1096,7 @@ impl PadPlan {
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         crate::threading::parallel_map_reduce(
             0..self.generic_copy.total,
-            nthreads,
+            exec,
             &|range| {
                 let mut cursor =
                     PadCopyState::decode(range.start, operand_base, dest_base, &self.generic_copy)?;
@@ -1122,15 +1155,14 @@ impl PadPlan {
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     fn copy_operand_parallel<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
-        nthreads: usize,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let operand_base = operand
             .offset()
@@ -1144,7 +1176,7 @@ impl PadPlan {
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         crate::threading::parallel_map_reduce(
             0..self.generic_copy.total,
-            nthreads,
+            exec,
             &|range| {
                 let mut cursor =
                     PadCopyState::decode(range.start, operand_base, dest_base, &self.generic_copy)?;
@@ -1284,10 +1316,12 @@ impl ConcatenatePlan {
         &self,
         dest: &mut RawStridedMut<'_, T>,
         inputs: &[RawStridedRef<'_, T>],
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
+        let mut exec = exec;
         self.check_dest_layout(dest)?;
         if inputs.len() != self.input_dims.len() {
             return Err(StridedError::RankMismatch(
@@ -1299,12 +1333,16 @@ impl ConcatenatePlan {
             self.check_input_layout(position, input)?;
             self.segment_offset(position, dest.offset())?;
         }
-        #[cfg(feature = "parallel")]
-        if self.try_execute_parallel(dest, inputs, |dst: &mut T, value| *dst = value)? {
+        if self.try_execute_parallel(
+            dest,
+            inputs,
+            |dst: &mut T, value| *dst = value,
+            exec.reborrow(),
+        )? {
             return Ok(());
         }
         for (position, input) in inputs.iter().enumerate() {
-            self.execute_segment(position, dest, input)?;
+            self.execute_segment(position, dest, input, exec.reborrow())?;
         }
         Ok(())
     }
@@ -1314,10 +1352,12 @@ impl ConcatenatePlan {
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         inputs: &[RawStridedRef<'_, T>],
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
+        let mut exec = exec;
         self.check_dest_layout(dest)?;
         if inputs.len() != self.input_dims.len() {
             return Err(StridedError::RankMismatch(
@@ -1329,14 +1369,18 @@ impl ConcatenatePlan {
             self.check_input_layout(position, input)?;
             self.segment_offset(position, dest.offset())?;
         }
-        #[cfg(feature = "parallel")]
-        if self.try_execute_parallel(dest, inputs, |dst: &mut MaybeUninit<T>, value| {
-            dst.write(value);
-        })? {
+        if self.try_execute_parallel(
+            dest,
+            inputs,
+            |dst: &mut MaybeUninit<T>, value| {
+                dst.write(value);
+            },
+            exec.reborrow(),
+        )? {
             return Ok(());
         }
         for (position, input) in inputs.iter().enumerate() {
-            self.execute_segment_uninit(position, dest, input)?;
+            self.execute_segment_uninit(position, dest, input, exec.reborrow())?;
         }
         Ok(())
     }
@@ -1347,25 +1391,25 @@ impl ConcatenatePlan {
     /// keeps many small segments parallel as a group and splits a large
     /// segment across workers, with one fork-join for the whole call. Returns
     /// `Ok(false)` without writing when the serial per-segment path must run:
-    /// the destination is at most the repository threshold, the active policy
+    /// the destination is at most the repository threshold, the budget
     /// allows one thread, or a segment exceeds the fused-rank limit.
     ///
     /// The caller must have validated every input layout and segment offset.
-    #[cfg(feature = "parallel")]
     fn try_execute_parallel<D, T, Apply>(
         &self,
         dest: &mut RawStridedMut<'_, D>,
         inputs: &[RawStridedRef<'_, T>],
         apply: Apply,
+        exec: Exec<'_>,
     ) -> Result<bool>
     where
-        D: Copy + MaybeSendSync,
-        T: Copy + MaybeSendSync,
-        Apply: Fn(&mut D, T) + MaybeSendSync,
+        D: Copy + Send + Sync,
+        T: Copy + Send + Sync,
+        Apply: Fn(&mut D, T) + Send + Sync,
     {
         let total = self.segment_starts[self.segment_starts.len() - 1];
-        let nthreads = crate::threading::parallel_threads_for_len(total);
-        if nthreads <= 1 {
+        let exec = crate::threading::for_len(exec, total);
+        if exec.is_serial() {
             return Ok(false);
         }
         // Precompute each segment's destination base offset once into an
@@ -1383,7 +1427,7 @@ impl ConcatenatePlan {
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         let starts = &self.segment_starts;
         let dest_offsets = &dest_offsets;
-        crate::threading::parallel_for_each(0..total, nthreads, &|range| {
+        crate::threading::parallel_for_each(0..total, exec, &|range| {
             // First segment whose end lies past the range start.
             let mut position = starts[1..].partition_point(|&end| end <= range.start);
             while position < inputs.len() && starts[position] < range.end {
@@ -1450,19 +1494,12 @@ impl ConcatenatePlan {
         self.input_dims.len()
     }
 
-    /// Whether the whole-plan entry would replay in parallel under the
-    /// active execution policy. Erased callers use it to keep the
-    /// allocation-free per-segment loop for serial execution.
-    pub(crate) fn prefers_whole_plan(&self) -> bool {
-        #[cfg(feature = "parallel")]
-        {
-            let total = self.segment_starts[self.segment_starts.len() - 1];
-            crate::threading::parallel_threads_for_len(total) > 1
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            false
-        }
+    /// Whether the whole-plan entry would replay in parallel within the
+    /// budget of `exec`. Erased callers use it to keep the allocation-free
+    /// per-segment loop for serial execution.
+    pub(crate) fn prefers_whole_plan(&self, exec: &Exec<'_>) -> bool {
+        let total = self.segment_starts[self.segment_starts.len() - 1];
+        crate::threading::is_parallel(total, exec)
     }
 
     pub(crate) fn segment_offset(&self, position: usize, dest_offset: isize) -> Result<isize> {
@@ -1476,9 +1513,10 @@ impl ConcatenatePlan {
         position: usize,
         dest: &mut RawStridedMut<'_, T>,
         input: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let segment_offset = self.segment_offset(position, dest.offset())?;
         let dest_data = dest.data_mut();
@@ -1490,7 +1528,7 @@ impl ConcatenatePlan {
                 segment_offset,
             )
         };
-        self.copy_plans[position].execute(&mut segment, input)
+        self.copy_plans[position].execute(&mut segment, input, exec)
     }
 
     pub(crate) fn execute_segment_uninit<T>(
@@ -1498,9 +1536,10 @@ impl ConcatenatePlan {
         position: usize,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         input: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let segment_offset = self.segment_offset(position, dest.offset())?;
         let dest_data = dest.data_mut();
@@ -1512,7 +1551,7 @@ impl ConcatenatePlan {
                 segment_offset,
             )
         };
-        self.copy_plans[position].execute_uninit(&mut segment, input)
+        self.copy_plans[position].execute_uninit(&mut segment, input, exec)
     }
 }
 
@@ -1575,9 +1614,10 @@ impl ReversePlan {
         &self,
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -1592,7 +1632,7 @@ impl ReversePlan {
                 source_offset,
             )
         };
-        self.copy_plan.execute(dest, &source)
+        self.copy_plan.execute(dest, &source, exec)
     }
 
     /// Execute reverse into storage whose reachable destination elements are uninitialized.
@@ -1600,9 +1640,10 @@ impl ReversePlan {
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -1617,7 +1658,7 @@ impl ReversePlan {
                 source_offset,
             )
         };
-        self.copy_plan.execute_uninit(dest, &source)
+        self.copy_plan.execute_uninit(dest, &source, exec)
     }
 
     fn check_call<D, T>(
@@ -1949,21 +1990,20 @@ fn compile_contiguous_pad_axis0_columns(
     })
 }
 
-/// Fill a disjoint raw destination span, chunked across workers when the
-/// active policy allows it.
+/// Fill a disjoint raw destination span, chunked across the budget of `exec`.
 ///
 /// # Safety
 ///
 /// `ptr..ptr + len` must be a writable destination span with no concurrent
 /// access from another worker.
-unsafe fn fill_raw_span<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: T) {
+unsafe fn fill_raw_span<T: Copy + Send + Sync>(ptr: *mut T, len: usize, fill: T, exec: Exec<'_>) {
     if len == 0 {
         return;
     }
     // SAFETY: the caller guarantees the exact writable span; the slice is not
     // retained past `fill_contiguous`.
     let span = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
-    crate::threading::fill_contiguous(span, fill);
+    crate::threading::fill_contiguous(span, fill, exec);
 }
 
 /// Fill a disjoint raw destination span that may be uninitialized.
@@ -1972,13 +2012,18 @@ unsafe fn fill_raw_span<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: 
 ///
 /// `ptr..ptr + len` must be a writable destination span with no concurrent
 /// access from another worker.
-unsafe fn fill_raw_span_uninit<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: T) {
+unsafe fn fill_raw_span_uninit<T: Copy + Send + Sync>(
+    ptr: *mut T,
+    len: usize,
+    fill: T,
+    exec: Exec<'_>,
+) {
     if len == 0 {
         return;
     }
     // SAFETY: the caller guarantees the exact writable span; the
     // `MaybeUninit` view never forms a `&mut [T]` over uninitialized memory.
-    unsafe { crate::threading::fill_contiguous_uninit(ptr, len, fill) };
+    unsafe { crate::threading::fill_contiguous_uninit(ptr, len, fill, exec) };
 }
 
 fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
@@ -2010,7 +2055,6 @@ fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
     }
 }
 
-#[cfg(feature = "parallel")]
 fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
     for (axis, coord) in out.iter_mut().enumerate() {
         let dim = shape[axis];
@@ -2032,7 +2076,6 @@ impl PadFillState {
         }
     }
 
-    #[cfg(feature = "parallel")]
     fn decode(linear: usize, base: isize, shape: &[usize], cursor: &PadFillCursor) -> Result<Self> {
         let mut state = Self::new(base, shape, cursor);
         fill_col_major_index(linear, shape, state.coords.as_mut_slice());
@@ -2075,7 +2118,6 @@ impl PadCopyState {
         }
     }
 
-    #[cfg(feature = "parallel")]
     fn decode(
         linear: usize,
         source_base: isize,
@@ -2149,6 +2191,6 @@ impl CoordScratch {
 #[path = "static_indexing_plan/tests/tests.rs"]
 mod tests;
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 #[path = "static_indexing_plan/tests/parallel_tests.rs"]
 mod parallel_tests;

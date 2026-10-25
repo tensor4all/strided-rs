@@ -1,6 +1,7 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_kernel::Exec;
 use strided_kernel::{
     batched_outer_product_into, zip_map2_into, Identity, StridedArray, StridedView, StridedViewMut,
 };
@@ -57,14 +58,28 @@ fn main() {
     println!();
 
     bench_n("batched_outer compact", 20, 100, || {
-        batched_outer_product_into(&mut out.view_mut(), &lhs_compact.view(), &rhs.view(), 2, 1)
-            .unwrap();
+        batched_outer_product_into(
+            &mut out.view_mut(),
+            &lhs_compact.view(),
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     });
 
     bench_n("batched_outer noncompact", 20, 100, || {
-        batched_outer_product_into(&mut out.view_mut(), &lhs_noncompact, &rhs.view(), 2, 1)
-            .unwrap();
+        batched_outer_product_into(
+            &mut out.view_mut(),
+            &lhs_noncompact,
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     });
 
@@ -77,7 +92,15 @@ fn main() {
             0,
         )
         .unwrap();
-        batched_outer_product_into(&mut out_view, &lhs_noncompact, &rhs.view(), 2, 1).unwrap();
+        batched_outer_product_into(
+            &mut out_view,
+            &lhs_noncompact,
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out_torchlike.data().as_ptr());
     });
 
@@ -246,6 +269,7 @@ fn main() {
             &lhs_broadcast,
             &rhs_broadcast,
             |x, y| x * y,
+            Exec::serial(),
         )
         .unwrap();
         black_box(out.data().as_ptr());
@@ -263,7 +287,14 @@ fn main() {
                 0,
             )
             .unwrap();
-            zip_map2_into(&mut out_view, &lhs_broadcast, &rhs_broadcast, |x, y| x * y).unwrap();
+            zip_map2_into(
+                &mut out_view,
+                &lhs_broadcast,
+                &rhs_broadcast,
+                |x, y| x * y,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out_torchlike.data().as_ptr());
         },
     );

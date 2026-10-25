@@ -21,7 +21,7 @@ use crate::raw_ops::{
     apply_fused_range, apply_spilled_range, fuse_pair_traversal, fused_total, FusedAxis,
     FusedPairLayout, PairTraversal,
 };
-use crate::{ElementOpApply, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
+use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 
 // Same pattern as map_view.rs / outer_product.rs: inline storage in both
 // feature configurations. Only `compile` touches these; `execute*` never
@@ -176,7 +176,7 @@ where
 /// # Example
 ///
 /// ```rust
-/// use strided_basic::{CopyPlan, RawStridedMut, RawStridedRef};
+/// use strided_basic::{CopyPlan, Exec, RawStridedMut, RawStridedRef};
 ///
 /// let dims = [2usize, 3];
 /// let src_strides = [3isize, 1];
@@ -187,7 +187,7 @@ where
 /// let mut dst = [0.0f64; 6];
 /// let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
 /// let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
-/// plan.execute(&mut dst_mut, &src_ref).unwrap();
+/// plan.execute(&mut dst_mut, &src_ref, Exec::serial()).unwrap();
 /// assert_eq!(dst, [0.0, 10.0, 1.0, 11.0, 2.0, 12.0]);
 /// ```
 #[derive(Clone, Debug, Default)]
@@ -200,7 +200,6 @@ pub struct CopyPlan {
 
 impl CopyPlan {
     /// `None` when the fused traversal is stored in the rank-bounded spill.
-    #[cfg(feature = "parallel")]
     #[inline]
     pub(crate) fn fused_layout(&self) -> Option<&FusedPairLayout> {
         self.fused.inline()
@@ -210,12 +209,13 @@ impl CopyPlan {
         &self,
         dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
         src: &RawStridedRef<'_, T>,
-        f: impl for<'b> FnOnce(InitializedRawDest<'b, T>) -> R,
+        mut exec: Exec<'_>,
+        f: impl for<'b, 'e> FnOnce(InitializedRawDest<'b, T>, Exec<'e>) -> R,
     ) -> Result<R>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
-        self.execute_uninit(dest, src)?;
+        self.execute_uninit(dest, src, exec.reborrow())?;
         let data = dest.data_mut();
         let receipt = InitializedRawDest {
             ptr: data.as_mut_ptr().cast(),
@@ -225,7 +225,7 @@ impl CopyPlan {
             offset: dest.offset(),
             _marker: PhantomData,
         };
-        Ok(f(receipt))
+        Ok(f(receipt, exec))
     }
 
     /// Compile a copy plan for the given layout pair.
@@ -279,9 +279,10 @@ impl CopyPlan {
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         src: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -292,6 +293,7 @@ impl CopyPlan {
                 dst.write(value);
             },
             |value| value,
+            exec,
         );
         Ok(())
     }
@@ -302,9 +304,10 @@ impl CopyPlan {
         &self,
         dest: &mut RawStridedMut<'_, T>,
         src: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -313,6 +316,7 @@ impl CopyPlan {
             &self.fused,
             |dst, value| *dst = value,
             |value: T| value,
+            exec,
         );
         Ok(())
     }
@@ -324,9 +328,10 @@ impl CopyPlan {
         dest: &mut RawStridedMut<'_, T>,
         src: &RawStridedRef<'_, T>,
         scale: T,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Mul<T, Output = T> + MaybeSendSync,
+        T: Copy + Mul<T, Output = T> + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -335,6 +340,7 @@ impl CopyPlan {
             &self.fused,
             |dst, value| *dst = value,
             |value: T| scale * value,
+            exec,
         );
         Ok(())
     }
@@ -345,9 +351,10 @@ impl CopyPlan {
         &self,
         dest: &mut RawStridedMut<'_, T>,
         src: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + ElementOpApply + MaybeSendSync,
+        T: Copy + ElementOpApply + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -356,6 +363,7 @@ impl CopyPlan {
             &self.fused,
             |dst, value| *dst = value,
             |value: T| value.conj(),
+            exec,
         );
         Ok(())
     }
@@ -403,7 +411,7 @@ fn check_layout_pair<D, S>(
 /// # Example
 ///
 /// ```rust
-/// use strided_basic::{RawStridedMut, RawStridedRef, UpdatePlan};
+/// use strided_basic::{Exec, RawStridedMut, RawStridedRef, UpdatePlan};
 ///
 /// let dims = [2usize, 2];
 /// let dst_strides = [1isize, 2];
@@ -415,7 +423,7 @@ fn check_layout_pair<D, S>(
 /// let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
 /// let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
 /// // dst = 2 * src + 3 * dst
-/// plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x).unwrap();
+/// plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x, Exec::serial()).unwrap();
 /// assert_eq!(dst, [32.0, 64.0, 96.0, 128.0]);
 /// ```
 #[derive(Clone, Debug)]
@@ -475,18 +483,26 @@ impl UpdatePlan {
         alpha: T,
         beta: T,
         f: F,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
-        F: Fn(T) -> T + MaybeSendSync,
+        T: Copy + Send + Sync + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
+        F: Fn(T) -> T + Send + Sync,
     {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         if beta.is_zero() {
             // Write-only: never form a read of the old destination.
             if alpha.is_one() {
-                replay_fused(dest, src, &self.fused, |dst, value| *dst = value, f);
+                replay_fused(dest, src, &self.fused, |dst, value| *dst = value, f, exec);
             } else {
-                replay_fused(dest, src, &self.fused, |dst, value| *dst = alpha * value, f);
+                replay_fused(
+                    dest,
+                    src,
+                    &self.fused,
+                    |dst, value| *dst = alpha * value,
+                    f,
+                    exec,
+                );
             }
         } else {
             replay_fused(
@@ -495,6 +511,7 @@ impl UpdatePlan {
                 &self.fused,
                 |dst, value| *dst = alpha * value + beta * *dst,
                 f,
+                exec,
             );
         }
         Ok(())
@@ -517,7 +534,7 @@ impl UpdatePlan {
     ///
     /// ```rust
     /// use core::mem::MaybeUninit;
-    /// use strided_basic::{RawStridedMut, RawStridedRef, UpdatePlan};
+    /// use strided_basic::{Exec, RawStridedMut, RawStridedRef, UpdatePlan};
     ///
     /// let dims = [2usize, 2];
     /// let strides = [1isize, 2];
@@ -527,7 +544,7 @@ impl UpdatePlan {
     /// let mut dst = RawStridedMut::new(&mut storage, &dims, &strides, 0).unwrap();
     /// let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
     /// // dst = 2 * src
-    /// plan.execute_uninit(&mut dst, &source, 2.0, |x| x).unwrap();
+    /// plan.execute_uninit(&mut dst, &source, 2.0, |x| x, Exec::serial()).unwrap();
     /// drop(dst);
     /// // SAFETY: every reachable destination slot was initialized above.
     /// let values: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
@@ -539,10 +556,11 @@ impl UpdatePlan {
         src: &RawStridedRef<'_, T>,
         alpha: T,
         f: F,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync + Mul<Output = T> + One + PartialEq,
-        F: Fn(T) -> T + MaybeSendSync,
+        T: Copy + Send + Sync + Mul<Output = T> + One + PartialEq,
+        F: Fn(T) -> T + Send + Sync,
     {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         if alpha.is_one() {
@@ -554,6 +572,7 @@ impl UpdatePlan {
                     dst.write(value);
                 },
                 f,
+                exec,
             );
         } else {
             replay_fused(
@@ -564,14 +583,15 @@ impl UpdatePlan {
                     dst.write(alpha * value);
                 },
                 f,
+                exec,
             );
         }
         Ok(())
     }
 }
 
-/// Replay a compiled fused layout, splitting it across worker threads when the
-/// repository threshold and the active execution policy allow it.
+/// Replay a compiled fused layout, splitting it across the budget of `exec`
+/// when the repository threshold allows it.
 ///
 /// Parallel replay is sound only because [`CopyPlan::compile`] proved the
 /// destination layout injective: disjoint logical ranges then write disjoint
@@ -585,11 +605,12 @@ fn replay_fused<D, S, Apply, Op>(
     traversal: &PairTraversal,
     apply: Apply,
     op: Op,
+    exec: Exec<'_>,
 ) where
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Apply: Fn(&mut D, S) + MaybeSendSync,
-    Op: Fn(S) -> S + MaybeSendSync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+    Op: Fn(S) -> S + Send + Sync,
 {
     let src_ptr = src.data().as_ptr();
     let src_base = src.offset();
@@ -604,11 +625,11 @@ fn replay_fused<D, S, Apply, Op>(
     // borrow.
     unsafe {
         match traversal {
-            PairTraversal::Inline(layout) => {
-                replay_fused_raw(dst_ptr, dst_base, src_ptr, src_base, layout, apply, op)
-            }
+            PairTraversal::Inline(layout) => replay_fused_raw(
+                dst_ptr, dst_base, src_ptr, src_base, layout, apply, op, exec,
+            ),
             PairTraversal::Spilled(axes) => {
-                replay_spilled_raw(dst_ptr, dst_base, src_ptr, src_base, axes, apply, op)
+                replay_spilled_raw(dst_ptr, dst_base, src_ptr, src_base, axes, apply, op, exec)
             }
         }
     }
@@ -617,9 +638,8 @@ fn replay_fused<D, S, Apply, Op>(
 /// Pointer-level fused replay shared by [`CopyPlan`] and the dynamic slice
 /// plans, which replay a fused window layout at a runtime base offset.
 ///
-/// Splits `0..total` across workers when the repository threshold and the
-/// active execution policy allow more than one thread, otherwise runs the
-/// serial kernel directly.
+/// Splits `0..total` across the budget of `exec` when the repository threshold
+/// allows more than one slot, otherwise runs the serial kernel directly.
 ///
 /// # Safety
 ///
@@ -629,6 +649,7 @@ fn replay_fused<D, S, Apply, Op>(
 /// destination strides must be injective over `layout`, the destination
 /// must not overlap the source, and nothing else may access the destination
 /// slots during the call.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
     dst_ptr: *mut D,
     dst_base: isize,
@@ -637,43 +658,41 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
     layout: &FusedPairLayout,
     apply: Apply,
     op: Op,
+    exec: Exec<'_>,
 ) where
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Apply: Fn(&mut D, S) + MaybeSendSync,
-    Op: Fn(S) -> S + MaybeSendSync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+    Op: Fn(S) -> S + Send + Sync,
 {
     let total = fused_total(layout);
     if total == 0 {
         return;
     }
-    #[cfg(feature = "parallel")]
-    {
-        let nthreads = crate::threading::parallel_threads_for_len(total);
-        if nthreads > 1 {
-            let dst_ptr = crate::threading::SendPtr(dst_ptr);
-            let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
-            crate::threading::parallel_for_each(0..total, nthreads, &|range| {
-                // SAFETY: the caller contract makes every index in bounds; the
-                // worker ranges are disjoint and the destination strides
-                // injective, so no two workers write the same slot, and the
-                // source is only read.
-                unsafe {
-                    apply_fused_range(
-                        dst_ptr.as_ptr(),
-                        dst_base,
-                        src_ptr.as_const(),
-                        src_base,
-                        layout,
-                        range.start,
-                        range.len(),
-                        &apply,
-                        &op,
-                    );
-                }
-            });
-            return;
-        }
+    let exec = crate::threading::for_len(exec, total);
+    if !exec.is_serial() {
+        let dst_ptr = crate::threading::SendPtr(dst_ptr);
+        let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
+        crate::threading::parallel_for_each(0..total, exec, &|range| {
+            // SAFETY: the caller contract makes every index in bounds; the
+            // worker ranges are disjoint and the destination strides
+            // injective, so no two workers write the same slot, and the
+            // source is only read.
+            unsafe {
+                apply_fused_range(
+                    dst_ptr.as_ptr(),
+                    dst_base,
+                    src_ptr.as_const(),
+                    src_base,
+                    layout,
+                    range.start,
+                    range.len(),
+                    &apply,
+                    &op,
+                );
+            }
+        });
+        return;
     }
     // SAFETY: forwarded caller contract over the full range `0..total`.
     unsafe {
@@ -686,8 +705,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
 /// Pointer-level replay of a spilled axis list.
 ///
 /// Mirrors [`replay_fused_raw`] including its worker split; kept separate so
-/// that the inline replay keeps the shape it had before spilled layouts
-/// existed.
+/// that the inline replay keeps its fixed-rank shape.
 ///
 /// # Safety
 ///
@@ -696,6 +714,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
 /// of the destination and source allocations. The destination strides must be
 /// injective over `axes`, the destination must not overlap the source, and
 /// nothing else may access the destination slots during the call.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
     dst_ptr: *mut D,
     dst_base: isize,
@@ -704,43 +723,41 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
     axes: &[FusedAxis],
     apply: Apply,
     op: Op,
+    exec: Exec<'_>,
 ) where
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Apply: Fn(&mut D, S) + MaybeSendSync,
-    Op: Fn(S) -> S + MaybeSendSync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+    Op: Fn(S) -> S + Send + Sync,
 {
     let total = axes.iter().map(|axis| axis.dim).product::<usize>();
     if total == 0 {
         return;
     }
-    #[cfg(feature = "parallel")]
-    {
-        let nthreads = crate::threading::parallel_threads_for_len(total);
-        if nthreads > 1 {
-            let dst_ptr = crate::threading::SendPtr(dst_ptr);
-            let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
-            crate::threading::parallel_for_each(0..total, nthreads, &|range| {
-                // SAFETY: the caller contract makes every index in bounds; the
-                // worker ranges are disjoint and the destination strides
-                // injective, so no two workers write the same slot, and the
-                // source is only read.
-                unsafe {
-                    apply_spilled_range(
-                        dst_ptr.as_ptr(),
-                        dst_base,
-                        src_ptr.as_const(),
-                        src_base,
-                        axes,
-                        range.start,
-                        range.len(),
-                        &apply,
-                        &op,
-                    );
-                }
-            });
-            return;
-        }
+    let exec = crate::threading::for_len(exec, total);
+    if !exec.is_serial() {
+        let dst_ptr = crate::threading::SendPtr(dst_ptr);
+        let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
+        crate::threading::parallel_for_each(0..total, exec, &|range| {
+            // SAFETY: the caller contract makes every index in bounds; the
+            // worker ranges are disjoint and the destination strides
+            // injective, so no two workers write the same slot, and the
+            // source is only read.
+            unsafe {
+                apply_spilled_range(
+                    dst_ptr.as_ptr(),
+                    dst_base,
+                    src_ptr.as_const(),
+                    src_base,
+                    axes,
+                    range.start,
+                    range.len(),
+                    &apply,
+                    &op,
+                );
+            }
+        });
+        return;
     }
     // SAFETY: forwarded caller contract over the full range `0..total`.
     unsafe {
@@ -754,6 +771,6 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
 #[path = "copy_plan/tests/tests.rs"]
 mod tests;
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 #[path = "copy_plan/tests/parallel_tests.rs"]
 mod parallel_tests;

@@ -4,8 +4,7 @@ use core::mem::MaybeUninit;
 use std::ops::Mul;
 
 use crate::view::{StridedView, StridedViewMut};
-use crate::MaybeSendSync;
-use crate::{broadcast_mul_into, broadcast_mul_into_uninit};
+use crate::{broadcast_mul_into, broadcast_mul_into_uninit, Exec};
 use crate::{ElementOp, Result, StridedError};
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
@@ -22,11 +21,12 @@ pub fn batched_outer_product_into<D, A, B, OpA, OpB>(
     rhs: &StridedView<B, OpB>,
     lhs_free_ndim: usize,
     rhs_free_ndim: usize,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Send + Sync + Mul<B, Output = D> + 'static,
+    B: Copy + Send + Sync + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 {
@@ -43,7 +43,7 @@ where
     lhs_axes.extend(batch_axis_start..batch_axis_start + batch_ndim);
     rhs_axes.extend(batch_axis_start..batch_axis_start + batch_ndim);
 
-    broadcast_mul_into(dest, lhs, &lhs_axes, rhs, &rhs_axes)
+    broadcast_mul_into(dest, lhs, &lhs_axes, rhs, &rhs_axes, exec)
 }
 
 /// Compute a batched outer product into a fully overwritten uninitialized output.
@@ -70,11 +70,12 @@ pub fn batched_outer_product_into_uninit<D, A, B, OpA, OpB>(
     rhs: &StridedView<B, OpB>,
     lhs_free_ndim: usize,
     rhs_free_ndim: usize,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Send + Sync + Mul<B, Output = D> + 'static,
+    B: Copy + Send + Sync + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 {
@@ -87,7 +88,7 @@ where
     let batch_axis_start = lhs_free_ndim + rhs_free_ndim;
     lhs_axes.extend(batch_axis_start..batch_axis_start + batch_ndim);
     rhs_axes.extend(batch_axis_start..batch_axis_start + batch_ndim);
-    broadcast_mul_into_uninit(dest, lhs, &lhs_axes, rhs, &rhs_axes)
+    broadcast_mul_into_uninit(dest, lhs, &lhs_axes, rhs, &rhs_axes, exec)
 }
 
 fn validate_batched_outer_shape<D, A, OpA, B, OpB>(

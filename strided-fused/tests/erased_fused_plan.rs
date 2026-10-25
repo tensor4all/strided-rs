@@ -1,8 +1,8 @@
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use strided_basic::{
-    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    ExecContext, KernelDType, StridedError,
+    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, Exec,
+    KernelDType, StridedError,
 };
 use strided_fused::{ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 
@@ -48,14 +48,13 @@ fn erased_fused_plan_executes_f64_binary_add_transposed_layout() {
     ];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [100.0, 120.0, 102.0, 122.0, 104.0, 124.0]);
 }
 
 #[test]
-fn erased_fused_plan_executes_f32_ternary_clamp_with_ambient_context() {
+fn erased_fused_plan_executes_f32_ternary_clamp() {
     let dims = [3usize];
     let strides = [1isize];
     let x = [-2.0f32, 0.5, 4.0];
@@ -84,8 +83,7 @@ fn erased_fused_plan_executes_f32_ternary_clamp_with_ambient_context() {
     ];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
-    plan.execute(&ExecContext::ambient(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [-1.0, 0.5, 3.0]);
 }
@@ -101,8 +99,7 @@ fn erased_fused_plan_executes_c32_unary_conjugate() {
     let inputs = [ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap()];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [input[0].conj(), input[1].conj()]);
 }
@@ -122,8 +119,7 @@ fn erased_fused_plan_executes_c64_binary_multiply() {
     ];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
-    plan.execute(&ExecContext::max_threads(1).unwrap(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [a[0] * b[0], a[1] * b[1]]);
 }
@@ -170,8 +166,7 @@ fn erased_fused_plan_executes_f64_four_input_dag() {
     ];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [26.0, 46.0]);
 }
@@ -234,8 +229,7 @@ fn erased_fused_plan_executes_i32_safe_integer_dag() {
     ];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [3, 10, 10]);
 }
@@ -256,8 +250,7 @@ fn erased_fused_plan_executes_i64_binary_add_transposed_layout() {
     ];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, [100, 120, 102, 122, 104, 124]);
 }
@@ -273,8 +266,7 @@ fn erased_fused_plan_executes_bool_identity_conj() {
     let inputs = [ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap()];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
 
     assert_eq!(dst, input);
 }
@@ -295,7 +287,7 @@ fn erased_fused_plan_rejects_dtype_mismatch_before_writing() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &inputs)
+        .execute(&mut dest, &inputs, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
@@ -314,7 +306,7 @@ fn erased_fused_plan_rejects_input_count_mismatch_before_writing() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &inputs)
+        .execute(&mut dest, &inputs, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::RankMismatch(1, 2)));
@@ -337,7 +329,7 @@ fn erased_fused_plan_rejects_input_dtype_mismatch_before_writing() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &inputs)
+        .execute(&mut dest, &inputs, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
@@ -361,7 +353,7 @@ fn erased_fused_plan_rejects_runtime_shape_mismatch_before_writing() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dest_dims, &strides, 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &inputs)
+        .execute(&mut dest, &inputs, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
@@ -500,7 +492,7 @@ fn erased_fused_plan_executes_multiple_outputs_with_pass_through_and_intermediat
             ErasedRawStridedMut::from_slice_mut(&mut squared_negated, &dims, &gapped, 0).unwrap(),
             ErasedRawStridedMut::from_slice_mut(&mut squared, &dims, &unit, 0).unwrap(),
         ];
-        plan.execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+        plan.execute_outputs(&mut dests, &inputs, Exec::serial())
             .unwrap();
     }
     assert_eq!(pass_through, [2.0, -3.0]);
@@ -544,7 +536,7 @@ fn erased_fused_plan_executes_multiple_uninit_outputs_for_f32() {
             ErasedRawStridedUninitMut::from_uninit_slice(&mut second, &dims, &unit, 0).unwrap(),
             ErasedRawStridedUninitMut::from_uninit_slice(&mut third, &dims, &unit, 0).unwrap(),
         ];
-        plan.execute_outputs_uninit(&ExecContext::serial(), &mut dests, &pointers)
+        plan.execute_outputs_uninit(&mut dests, &pointers, Exec::serial())
             .unwrap();
     }
     let init = |slots: &[MaybeUninit<f32>; 3]| -> Vec<f32> {
@@ -596,7 +588,7 @@ fn erased_fused_plan_executes_multiple_outputs_for_integer_dtype() {
             ErasedRawStridedMut::from_slice_mut(&mut sums, &dims, &unit, 0).unwrap(),
             ErasedRawStridedMut::from_slice_mut(&mut scaled, &dims, &unit, 0).unwrap(),
         ];
-        plan.execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+        plan.execute_outputs(&mut dests, &inputs, Exec::serial())
             .unwrap();
     }
     assert_eq!(sums, [4, 2, 4]);
@@ -630,7 +622,7 @@ fn erased_fused_plan_executes_rank_zero_multiple_outputs() {
             ErasedRawStridedMut::from_slice_mut(&mut pass_through, &dims, &strides, 0).unwrap(),
             ErasedRawStridedMut::from_slice_mut(&mut negated, &dims, &strides, 0).unwrap(),
         ];
-        plan.execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+        plan.execute_outputs(&mut dests, &inputs, Exec::serial())
             .unwrap();
     }
     assert_eq!(pass_through, [2.0]);
@@ -674,7 +666,7 @@ fn erased_fused_plan_executes_rank_zero_uninit_multiple_outputs() {
             ErasedRawStridedUninitMut::from_uninit_slice(&mut negated, &dims, &strides, 0).unwrap(),
             ErasedRawStridedUninitMut::from_uninit_slice(&mut twice, &dims, &strides, 0).unwrap(),
         ];
-        plan.execute_outputs_uninit(&ExecContext::serial(), &mut dests, &pointers)
+        plan.execute_outputs_uninit(&mut dests, &pointers, Exec::serial())
             .unwrap();
     }
     // SAFETY: `execute_outputs_uninit` writes every reachable element.
@@ -714,7 +706,7 @@ fn erased_fused_plan_writes_a_repeated_output_id_to_every_destination() {
             ErasedRawStridedMut::from_slice_mut(&mut second, &dims, &unit, 0).unwrap(),
             ErasedRawStridedMut::from_slice_mut(&mut negated, &dims, &unit, 0).unwrap(),
         ];
-        plan.execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+        plan.execute_outputs(&mut dests, &inputs, Exec::serial())
             .unwrap();
     }
     assert_eq!(first, input);
@@ -746,7 +738,7 @@ fn erased_fused_plan_rejects_destination_count_mismatch() {
     {
         let mut dests = [ErasedRawStridedMut::from_slice_mut(&mut only, &dims, &unit, 0).unwrap()];
         let err = plan
-            .execute_outputs(&ExecContext::serial(), &mut dests, &inputs)
+            .execute_outputs(&mut dests, &inputs, Exec::serial())
             .unwrap_err();
         assert!(matches!(err, StridedError::RankMismatch(1, 2)));
     }
@@ -791,7 +783,7 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut first_storage, &dims, &unit, 0).unwrap();
     let err = {
         let mut dests = [first, overlapping];
-        plan.execute_outputs_uninit(&ExecContext::serial(), &mut dests, &[input])
+        plan.execute_outputs_uninit(&mut dests, &[input], Exec::serial())
             .unwrap_err()
     };
     assert!(matches!(

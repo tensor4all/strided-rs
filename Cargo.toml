@@ -2,27 +2,31 @@
 members = [
     "strided-basic",
     "strided-fused",
+    "strided-nn",
     "strided-traits",
     "strided-view",
     "strided-perm",
     "strided-kernel",
+    "strided-exec",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/strided-rs"
 
 [workspace.dependencies]
-strided-basic = { version = "0.6.4", path = "strided-basic", default-features = false }
-strided-fused = { version = "0.6.0", path = "strided-fused", default-features = false }
-strided-traits = { version = "0.6.0", path = "strided-traits" }
-strided-view = { version = "0.6.0", path = "strided-view" }
-strided-perm = { version = "0.6.1", path = "strided-perm" }
-strided-kernel = { version = "0.6.0", path = "strided-kernel" }
+strided-basic = { version = "0.7.0", path = "strided-basic", default-features = false }
+strided-nn = { version = "0.7.0", path = "strided-nn", default-features = false }
+strided-fused = { version = "0.7.0", path = "strided-fused", default-features = false }
+strided-traits = { version = "0.7.0", path = "strided-traits" }
+strided-view = { version = "0.7.0", path = "strided-view" }
+strided-perm = { version = "0.7.0", path = "strided-perm" }
+strided-kernel = { version = "0.7.0", path = "strided-kernel" }
+strided-exec = { version = "0.7.0", path = "strided-exec", default-features = false }
 
 approx = "0.5"
 criterion = "0.5"

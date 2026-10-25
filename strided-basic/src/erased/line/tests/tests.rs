@@ -1,4 +1,4 @@
-//! Serial and parallel replay of the single-axis plans agree bitwise.
+//! Serial and pooled replay of the single-axis plans agree bitwise.
 
 use crate::threading::run_serial_and_parallel;
 use crate::*;
@@ -40,12 +40,11 @@ fn scan_parallel_matches_serial() {
             ScanOptions::new().reverse(true),
         )
         .unwrap();
-        let (serial, parallel) = run_serial_and_parallel(|| {
+        let (serial, parallel) = run_serial_and_parallel(|exec| {
             let mut out = vec![0.0f64; src.len()];
             let src = ErasedRawStridedRef::from_slice(&src, &dims, &st, 0).unwrap();
             let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &st, 0).unwrap();
-            plan.execute(&ExecContext::ambient(), &mut dest, &src)
-                .unwrap();
+            plan.execute(&mut dest, &src, exec).unwrap();
             out
         });
         assert_eq!(serial, parallel);
@@ -69,13 +68,12 @@ fn argreduce_parallel_matches_serial() {
             axis,
         )
         .unwrap();
-        let (serial, parallel) = run_serial_and_parallel(|| {
+        let (serial, parallel) = run_serial_and_parallel(|exec| {
             let mut out = vec![-1i64; out_dims[0]];
             let src = ErasedRawStridedRef::from_slice(&src, &dims, &st, 0).unwrap();
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out, &out_dims, &[1], 0).unwrap();
-            plan.execute(&ExecContext::ambient(), &mut dest, &src)
-                .unwrap();
+            plan.execute(&mut dest, &src, exec).unwrap();
             out
         });
         assert_eq!(serial, parallel);
@@ -91,12 +89,12 @@ fn norm_parallel_matches_serial() {
         let weight = data(dims[axis]);
         let spec = NormSpec::layer_norm(1e-5).with_weight(1).with_bias(1);
         let plan = ErasedNormPlan::compile(KernelDType::F64, spec, &dims, &st, &st, axis).unwrap();
-        let (serial, parallel) = run_serial_and_parallel(|| {
+        let (serial, parallel) = run_serial_and_parallel(|exec| {
             let mut out = vec![0.0f64; src.len()];
             let src = ErasedRawStridedRef::from_slice(&src, &dims, &st, 0).unwrap();
             let w = ErasedRawStridedRef::from_slice(&weight, &dims[axis..=axis], &[1], 0).unwrap();
             let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &st, 0).unwrap();
-            plan.execute(&ExecContext::ambient(), &mut dest, &src, Some(&w), Some(&w))
+            plan.execute(&mut dest, &src, Some(&w), Some(&w), exec)
                 .unwrap();
             out
         });

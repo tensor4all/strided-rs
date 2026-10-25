@@ -8,7 +8,7 @@
 
 use core::mem::MaybeUninit;
 use num_traits::Float;
-use strided_basic::{StridedView, StridedViewMut};
+use strided_basic::{Exec, StridedView, StridedViewMut};
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, FusedScalar};
 
 /// Ten unary instructions over the same input; `op_arity(op)` is 1.
@@ -87,8 +87,8 @@ fn replay<T: FusedScalar>(plan: &FusedPlan, len: usize, operands: &[(&[T], isize
         .collect();
     let mut output = vec![operands[0].0[0]; len];
     {
-        let mut dest = StridedViewMut::new(&mut output, &dims, &[1isize], 0).unwrap();
-        fused_elementwise_into(&mut [dest], &views, plan).unwrap();
+        let dest = StridedViewMut::new(&mut output, &dims, &[1isize], 0).unwrap();
+        fused_elementwise_into(&mut [dest], &views, plan, Exec::serial()).unwrap();
     }
     output
 }
@@ -367,7 +367,7 @@ fn replay_multi<T: FusedScalar>(
             .iter_mut()
             .map(|data| StridedViewMut::new(data, &dims, &[1isize], 0).unwrap())
             .collect();
-        fused_elementwise_into(&mut dests, &views, plan).unwrap();
+        fused_elementwise_into(&mut dests, &views, plan, Exec::serial()).unwrap();
     }
     outputs
 }
@@ -445,8 +445,8 @@ fn chunked_replay_handles_several_blocks_with_different_bases() {
                 StridedView::new(lhs, &dims, &strides, 0).unwrap(),
                 StridedView::new(rhs, &dims, &strides, 0).unwrap(),
             ];
-            let mut dest = StridedViewMut::new(&mut output, &dims, &gapped_strides, 0).unwrap();
-            fused_elementwise_into(&mut [dest], &inputs, &plan).unwrap();
+            let dest = StridedViewMut::new(&mut output, &dims, &gapped_strides, 0).unwrap();
+            fused_elementwise_into(&mut [dest], &inputs, &plan, Exec::serial()).unwrap();
         }
         output
     };
@@ -466,8 +466,7 @@ fn chunked_replay_handles_several_blocks_with_different_bases() {
 #[test]
 fn erased_uninitialized_replay_matches_per_instruction_dispatch() {
     use strided_basic::{
-        ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext,
-        KernelDType,
+        ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, KernelDType,
     };
     use strided_fused::ErasedFusedPlan;
 
@@ -485,7 +484,7 @@ fn erased_uninitialized_replay_matches_per_instruction_dispatch() {
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     erased
-        .execute_uninit(&ExecContext::serial(), &mut dest, &pointers)
+        .execute_uninit(&mut dest, &pointers, Exec::serial())
         .unwrap();
 
     let reference = dispatch_ten_tanh_f32(&values);
@@ -553,7 +552,7 @@ fn run_rank1<T: FusedScalar>(
             .zip(&dest_layouts)
             .map(|(data, strides)| StridedViewMut::new(data, &dims, strides, 0).unwrap())
             .collect();
-        fused_elementwise_into(&mut dests, &views, plan).unwrap();
+        fused_elementwise_into(&mut dests, &views, plan, Exec::serial()).unwrap();
     }
     outputs
 }
@@ -670,7 +669,7 @@ fn chunked_replay_handles_rank2_inner_broadcast() {
     let mut output = vec![0.0f64; rows * cols];
     {
         let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
-        fused_elementwise_into(&mut [dest], &views, &plan).unwrap();
+        fused_elementwise_into(&mut [dest], &views, &plan, Exec::serial()).unwrap();
     }
     for r in 0..rows {
         for c in 0..cols {
@@ -716,7 +715,7 @@ fn chunked_replay_handles_outer_varying_broadcast() {
     let mut output = vec![0.0f64; rows * cols];
     {
         let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
-        fused_elementwise_into(&mut [dest], &views, &plan).unwrap();
+        fused_elementwise_into(&mut [dest], &views, &plan, Exec::serial()).unwrap();
     }
     for r in 0..rows {
         for c in 0..cols {
@@ -756,7 +755,7 @@ fn chunked_replay_handles_rank3_inner_broadcast() {
     let mut output = vec![0.0f64; a * b * c];
     {
         let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
-        fused_elementwise_into(&mut [dest], &views, &plan).unwrap();
+        fused_elementwise_into(&mut [dest], &views, &plan, Exec::serial()).unwrap();
     }
     for i in 0..a {
         for j in 0..b {
@@ -795,7 +794,7 @@ fn chunked_replay_handles_rank_zero_multi_output() {
             StridedViewMut::new(&mut pass_through, &dims, &[], 0).unwrap(),
             StridedViewMut::new(&mut negated, &dims, &[], 0).unwrap(),
         ];
-        fused_elementwise_into(&mut dests, &views, &plan).unwrap();
+        fused_elementwise_into(&mut dests, &views, &plan, Exec::serial()).unwrap();
     }
     assert_eq!(pass_through, [3.5]);
     assert_eq!(negated, [-3.5]);
@@ -838,7 +837,7 @@ fn chunked_replay_stores_multiple_outputs_with_different_outer_layouts() {
             StridedViewMut::new(&mut out1, &dims, &out1_strides, 0).unwrap(),
             StridedViewMut::new(&mut out2, &dims, &out2_strides, 0).unwrap(),
         ];
-        fused_elementwise_into(&mut dests, &[input], &plan).unwrap();
+        fused_elementwise_into(&mut dests, &[input], &plan, Exec::serial()).unwrap();
     }
     for c in 0..cols {
         for r in 0..rows {
@@ -884,7 +883,7 @@ fn chunked_replay_falls_back_for_differing_output_inner_strides() {
             StridedViewMut::new(&mut out0, &dims, &col_major, 0).unwrap(),
             StridedViewMut::new(&mut out1, &dims, &row_major, 0).unwrap(),
         ];
-        fused_elementwise_into(&mut dests, &[input], &plan).unwrap();
+        fused_elementwise_into(&mut dests, &[input], &plan, Exec::serial()).unwrap();
     }
     for r in 0..rows {
         for c in 0..cols {
@@ -902,20 +901,13 @@ fn chunked_replay_falls_back_for_differing_output_inner_strides() {
 fn chunked_replay_parallel_pool_matches_reference() {
     use strided_basic::execution::MINTHREADLENGTH;
     use strided_basic::{
-        ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext,
-        KernelDType,
+        ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, KernelDType,
     };
     use strided_fused::ErasedFusedPlan;
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
-    assert_eq!(
-        pool.current_num_threads(),
-        2,
-        "verify the pool really has two workers"
-    );
+    use strided_basic::Pool;
+
+    let pool = Pool::builder().threads(2).build().unwrap();
 
     let len = MINTHREADLENGTH + 65;
     let b: Vec<f64> = (0..len).map(|i| (i % 29) as f64 - 14.0).collect();
@@ -943,15 +935,14 @@ fn chunked_replay_parallel_pool_matches_reference() {
     let mut pass_through = vec![MaybeUninit::<f64>::uninit(); len];
     let mut product = vec![MaybeUninit::<f64>::uninit(); len];
 
-    ExecContext::run_on(&pool, 2, |ctx| {
-        assert_eq!(
-            rayon::current_num_threads(),
-            2,
-            "verify the effective worker count inside the pool"
-        );
-        // The raw pointer descriptors are built inside the worker closure so no
-        // non-`Send` descriptor has to cross the pool boundary; the borrowed
-        // input slices are `Sync`.
+    let exec = Exec::new(&pool, 2).unwrap();
+    assert_eq!(
+        exec.budget().get(),
+        2,
+        "verify the token really has two slots"
+    );
+    let root = exec.ledger_root().unwrap();
+    {
         let a_ref = ErasedRawStridedRef::from_slice(&a, &dims, &broadcast, 0).unwrap();
         let b_ref = ErasedRawStridedRef::from_slice(&b, &dims, &unit, 0).unwrap();
         let pointers = [
@@ -964,10 +955,10 @@ fn chunked_replay_parallel_pool_matches_reference() {
             ErasedRawStridedUninitMut::from_uninit_slice(&mut product, &dims, &unit, 0).unwrap(),
         ];
         erased
-            .execute_outputs_uninit(&ctx, &mut dests, &pointers)
+            .execute_outputs_uninit(&mut dests, &pointers, exec)
             .unwrap();
-    })
-    .unwrap();
+    }
+    assert!(strided_exec::ledger::max_live(root) <= 2);
 
     for index in 0..len {
         // SAFETY: `execute_outputs_uninit` writes every reachable element.

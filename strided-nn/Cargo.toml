@@ -1,0 +1,26 @@
+[package]
+name = "strided-nn"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/strided-nn"
+homepage = "https://github.com/tensor4all/strided-rs"
+description = "Fused neural-network kernels (softmax) over strided CPU slices."
+keywords = ["tensor", "strided", "kernels", "softmax"]
+categories = ["science", "mathematics", "algorithms"]
+
+[dependencies]
+# The kernel fans out through strided-basic's budgeted primitive; a serial
+# `Exec` still runs it inline without touching any pool.
+strided-basic = { workspace = true, features = ["parallel"] }
+elem-simd-math.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+strided-exec = { workspace = true, features = ["ledger"] }
+
+[lib]
+bench = false

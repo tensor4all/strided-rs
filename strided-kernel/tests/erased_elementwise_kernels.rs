@@ -7,12 +7,25 @@
 //! above the threading threshold. Special values cover NaN, signed zeros,
 //! integer overflow and complex inputs.
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use num_complex::Complex64;
 use strided_kernel::{
     erased_clamp_into_uninit, erased_compare_into_uninit, erased_map_into,
     erased_select_into_uninit, erased_zip_into, CompareOp, ErasedMapOp, ErasedRawStridedMut,
-    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, ExecContext,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, Exec,
     KernelDType, KernelStorageElement,
 };
 
@@ -20,11 +33,8 @@ use strided_kernel::{
 const LARGE: usize = (1 << 15) + 65;
 const LENGTHS: [usize; 5] = [1, 7, 17, 67, LARGE];
 
-fn contexts() -> Vec<(&'static str, ExecContext)> {
-    vec![
-        ("serial", ExecContext::serial()),
-        ("max_threads(4)", ExecContext::max_threads(4).unwrap()),
-    ]
+fn contexts() -> Vec<(&'static str, Exec<'static>)> {
+    vec![("serial", Exec::serial()), ("budget(4)", bounded(4))]
 }
 
 /// One input layout over a logical `[rows, cols]` tensor with `rows * cols`
@@ -156,7 +166,7 @@ impl Same for Complex64 {
 fn run_map<T: KernelStorageElement + Copy + Default>(
     dtype: KernelDType,
     op: ErasedMapOp,
-    ctx: &ExecContext,
+    ctx: Exec<'_>,
     data: &[T],
     layout: &Layout,
 ) -> Vec<T> {
@@ -168,9 +178,9 @@ fn run_map<T: KernelStorageElement + Copy + Default>(
     erased_map_into(
         dtype,
         op,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&source),
+        ctx,
     )
     .unwrap();
     out
@@ -179,7 +189,7 @@ fn run_map<T: KernelStorageElement + Copy + Default>(
 fn run_zip<T: KernelStorageElement + Copy + Default>(
     dtype: KernelDType,
     op: ErasedZipOp,
-    ctx: &ExecContext,
+    ctx: Exec<'_>,
     lhs: (&[T], &Layout),
     rhs: (&[T], &Layout),
 ) -> Vec<T> {
@@ -192,10 +202,10 @@ fn run_zip<T: KernelStorageElement + Copy + Default>(
     erased_zip_into(
         dtype,
         op,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&l),
         &ErasedRawStridedPtr::from_ref(&r),
+        ctx,
     )
     .unwrap();
     out
@@ -284,16 +294,16 @@ fn map_matches_naive_for_every_op_layout_and_context() {
             let f = f64_values(n, 1);
             let i = i64_values(n, 1);
             let c = c64_values(n, 1);
-            for (ctx_name, ctx) in contexts() {
+            for (ctx_name, mut ctx) in contexts() {
                 for op in MAP_OPS {
                     let what = format!("{op:?} {} {ctx_name} len={len}", layout.name);
-                    let got = run_map(KernelDType::F64, op, &ctx, &f, &layout);
+                    let got = run_map(KernelDType::F64, op, ctx.reborrow(), &f, &layout);
                     check(
                         &got,
                         coords(&layout.dims).map(|p| f64_map(op, at(&f, &layout, p))),
                         &format!("f64 {what}"),
                     );
-                    let got = run_map(KernelDType::I64, op, &ctx, &i, &layout);
+                    let got = run_map(KernelDType::I64, op, ctx.reborrow(), &i, &layout);
                     check(
                         &got,
                         coords(&layout.dims).map(|p| i64_map(op, at(&i, &layout, p))),
@@ -302,7 +312,7 @@ fn map_matches_naive_for_every_op_layout_and_context() {
                     // Complex abs and sign are checked in `complex_sign_matches_naive`
                     // and the existing one-shot tests.
                     if matches!(op, ErasedMapOp::Negate | ErasedMapOp::Conj) {
-                        let got = run_map(KernelDType::C64, op, &ctx, &c, &layout);
+                        let got = run_map(KernelDType::C64, op, ctx.reborrow(), &c, &layout);
                         check(
                             &got,
                             coords(&layout.dims).map(|p| {
@@ -326,8 +336,14 @@ fn map_matches_naive_for_every_op_layout_and_context() {
 fn complex_sign_matches_naive() {
     let layout = &layouts(67)[1];
     let c = c64_values(buffer_len(layout), 3);
-    for (_, ctx) in contexts() {
-        let got = run_map(KernelDType::C64, ErasedMapOp::Sign, &ctx, &c, layout);
+    for (_, mut ctx) in contexts() {
+        let got = run_map(
+            KernelDType::C64,
+            ErasedMapOp::Sign,
+            ctx.reborrow(),
+            &c,
+            layout,
+        );
         for ((g, p), index) in got.iter().zip(coords(&layout.dims)).zip(0..) {
             let v = at(&c, layout, p);
             if v.re.is_nan() || v.im.is_nan() {
@@ -362,7 +378,7 @@ fn zip_matches_naive_for_every_op_layout_and_context() {
                 .collect();
             let cl = c64_values(buffer_len(lhs_layout), 2);
             let cr = c64_values(buffer_len(rhs_layout), 9);
-            for (ctx_name, ctx) in contexts() {
+            for (ctx_name, mut ctx) in contexts() {
                 for op in ZIP_OPS {
                     let what = format!(
                         "{op:?} {}x{} {ctx_name} len={len}",
@@ -371,7 +387,7 @@ fn zip_matches_naive_for_every_op_layout_and_context() {
                     let got = run_zip(
                         KernelDType::F64,
                         op,
-                        &ctx,
+                        ctx.reborrow(),
                         (&fl, lhs_layout),
                         (&fr, rhs_layout),
                     );
@@ -384,7 +400,7 @@ fn zip_matches_naive_for_every_op_layout_and_context() {
                     let got = run_zip(
                         KernelDType::I64,
                         op,
-                        &ctx,
+                        ctx.reborrow(),
                         (&il, lhs_layout),
                         (&ir, rhs_layout),
                     );
@@ -397,7 +413,7 @@ fn zip_matches_naive_for_every_op_layout_and_context() {
                     let got = run_zip(
                         KernelDType::I32,
                         op,
-                        &ctx,
+                        ctx.reborrow(),
                         (&jl, lhs_layout),
                         (&jr, rhs_layout),
                     );
@@ -422,7 +438,7 @@ fn zip_matches_naive_for_every_op_layout_and_context() {
                         let got = run_zip(
                             KernelDType::C64,
                             op,
-                            &ctx,
+                            ctx.reborrow(),
                             (&cl, lhs_layout),
                             (&cr, rhs_layout),
                         );
@@ -454,7 +470,7 @@ fn maximum_minimum_signed_zero_ties_return_lhs() {
     let strides = [1isize];
     let lhs = [0.0f64, -0.0, 0.0, f64::NAN, 1.0];
     let rhs = [-0.0f64, 0.0, 0.0, 1.0, f64::NAN];
-    for (_, ctx) in contexts() {
+    for (_, mut ctx) in contexts() {
         for op in [ErasedZipOp::Maximum, ErasedZipOp::Minimum] {
             let l = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
             let r = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
@@ -464,10 +480,10 @@ fn maximum_minimum_signed_zero_ties_return_lhs() {
             erased_zip_into(
                 KernelDType::F64,
                 op,
-                &ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&l),
                 &ErasedRawStridedPtr::from_ref(&r),
+                ctx.reborrow(),
             )
             .unwrap();
             assert_eq!(out[0].to_bits(), 0.0f64.to_bits(), "{op:?}");
@@ -505,7 +521,7 @@ fn compare_select_clamp_match_naive() {
             let a_ref = ErasedRawStridedRef::from_slice(&a, dims, &a_layout.strides, 0).unwrap();
             let b_ref =
                 ErasedRawStridedRef::from_slice(&b, &b_layout.dims, &b_layout.strides, 0).unwrap();
-            for (ctx_name, ctx) in contexts() {
+            for (ctx_name, mut ctx) in contexts() {
                 for op in compare_ops {
                     let mut out = vec![MaybeUninit::<bool>::uninit(); total];
                     let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(
@@ -518,10 +534,10 @@ fn compare_select_clamp_match_naive() {
                     erased_compare_into_uninit(
                         KernelDType::F64,
                         op,
-                        &ctx,
                         &mut dest,
                         &ErasedRawStridedPtr::from_ref(&a_ref),
                         &ErasedRawStridedPtr::from_ref(&b_ref),
+                        ctx.reborrow(),
                     )
                     .unwrap();
                     let got = init(out);
@@ -554,11 +570,11 @@ fn compare_select_clamp_match_naive() {
                         .unwrap();
                 erased_select_into_uninit(
                     KernelDType::F64,
-                    &ctx,
                     &mut dest,
                     &ErasedRawStridedPtr::from_ref(&pred_ref),
                     &ErasedRawStridedPtr::from_ref(&a_ref),
                     &ErasedRawStridedPtr::from_ref(&b_ref),
+                    ctx.reborrow(),
                 )
                 .unwrap();
                 check(
@@ -586,11 +602,11 @@ fn compare_select_clamp_match_naive() {
                         .unwrap();
                 erased_clamp_into_uninit(
                     KernelDType::F64,
-                    &ctx,
                     &mut dest,
                     &ErasedRawStridedPtr::from_ref(&a_ref),
                     &ErasedRawStridedPtr::from_ref(&lo_ref),
                     &ErasedRawStridedPtr::from_ref(&hi_ref),
+                    ctx.reborrow(),
                 )
                 .unwrap();
                 check(

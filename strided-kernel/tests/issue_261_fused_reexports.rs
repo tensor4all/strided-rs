@@ -3,7 +3,7 @@
 //! the 0.4 line so downstream crates pinned to `strided-kernel = "0.4"` build.
 
 use strided_kernel::{
-    fused_elementwise_into, ErasedFusedPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext,
+    fused_elementwise_into, ErasedFusedPlan, ErasedRawStridedMut, ErasedRawStridedRef, Exec,
     FusedInst, FusedOp, FusedPlan, FusedScalar, KernelDType, StridedView, StridedViewMut,
 };
 
@@ -33,7 +33,7 @@ fn fused_api_is_reexported_at_0_4_0_paths() {
         let av = StridedView::new(&a, &[3], &[1], 0).unwrap();
         let bv = StridedView::new(&b, &[3], &[1], 0).unwrap();
         let mut dests = [StridedViewMut::new(&mut out, &[3], &[1], 0).unwrap()];
-        fused_elementwise_into(&mut dests, &[av, bv], &add_plan()).unwrap();
+        fused_elementwise_into(&mut dests, &[av, bv], &add_plan(), Exec::serial()).unwrap();
     }
     assert_eq!(out, [11.0, 22.0, 33.0]);
 
@@ -46,7 +46,7 @@ fn fused_api_is_reexported_at_0_4_0_paths() {
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut erased_out, &[3], &[1], 0).unwrap();
         ErasedFusedPlan::compile(KernelDType::F64, add_plan())
             .unwrap()
-            .execute(&ExecContext::serial(), &mut dest, &inputs)
+            .execute(&mut dest, &inputs, Exec::serial())
             .unwrap();
     }
     assert_eq!(erased_out, [11.0, 22.0, 33.0]);

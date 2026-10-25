@@ -55,6 +55,23 @@ jobs:
           du -sh target
           df -h target
 
+  placement:
+    name: placement rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Only strided-exec depends on rayon
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api
+      - name: No rayon type in the public API of strided-exec
+        run: scripts/check-no-public-rayon.sh
+
   scripts:
     name: maintenance scripts
     runs-on: ubuntu-latest

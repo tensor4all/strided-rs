@@ -1,4 +1,7 @@
+mod common;
+use common::Budget;
 use core::mem::MaybeUninit;
+use strided_basic::Exec;
 use strided_basic::{
     axpby_accum, embed_diagonal_into_uninit, embed_diagonal_view_into_uninit,
     triangular_mask_into_uninit, triangular_mask_view_into_uninit,
@@ -19,21 +22,20 @@ fn initialized<T: Copy>(out: &[MaybeUninit<T>]) -> Vec<T> {
     out.iter().map(|x| unsafe { x.assume_init() }).collect()
 }
 
-#[test]
-fn axpby_values_and_error_preserve_destination() {
+fn axpby_values_and_error_preserve_destination_with(budget: Budget) {
     for n in [0, 1, 3, 8, 32769, 65537] {
         let x: Vec<f64> = (0..n).map(|i| i as f64 - 7.0).collect();
         let mut y = vec![3.0; n];
-        axpby_accum(&mut y, &x, 2.0, -3.0).unwrap();
+        axpby_accum(&mut y, &x, 2.0, -3.0, budget.exec()).unwrap();
         assert_eq!(y, x.iter().map(|x| 2.0 * x - 9.0).collect::<Vec<_>>());
     }
     let mut y = [7.0];
-    assert!(axpby_accum(&mut y, &[], 1.0, 1.0).is_err());
+    assert!(axpby_accum(&mut y, &[], 1.0, 1.0, budget.exec()).is_err());
     assert_eq!(y, [7.0]);
-    axpby_accum(&mut y, &[f64::NAN], 0.0, 1.0).unwrap();
+    axpby_accum(&mut y, &[f64::NAN], 0.0, 1.0, budget.exec()).unwrap();
     assert!(y[0].is_nan());
     let mut y = [f64::NAN];
-    axpby_accum(&mut y, &[1.0], 1.0, 0.0).unwrap();
+    axpby_accum(&mut y, &[1.0], 1.0, 0.0, budget.exec()).unwrap();
     assert!(y[0].is_nan());
     use num_complex::Complex64;
     let x = [Complex64::new(2.0, 3.0)];
@@ -41,12 +43,16 @@ fn axpby_values_and_error_preserve_destination() {
     let alpha = Complex64::new(0.0, 1.0);
     let beta = Complex64::new(-1.0, 0.0);
     let expected = alpha * x[0] + beta * y[0];
-    axpby_accum(&mut y, &x, alpha, beta).unwrap();
+    axpby_accum(&mut y, &x, alpha, beta, budget.exec()).unwrap();
     assert_eq!(y[0], expected);
 }
 
 #[test]
-fn triangular_matches_elementwise_reference() {
+fn axpby_values_and_error_preserve_destination() {
+    axpby_values_and_error_preserve_destination_with(Budget::Serial);
+}
+
+fn triangular_matches_elementwise_reference_with(budget: Budget) {
     for shape in [
         vec![0, 3],
         vec![3, 0, 2],
@@ -59,7 +65,16 @@ fn triangular_matches_elementwise_reference() {
         for k in [i64::MIN, -4, -1, 0, 1, 4, i64::MAX] {
             for upper in [false, true] {
                 let mut output = vec![MaybeUninit::uninit(); n];
-                triangular_mask_into_uninit(&mut output, &input, &shape, k, upper, -99).unwrap();
+                triangular_mask_into_uninit(
+                    &mut output,
+                    &input,
+                    &shape,
+                    k,
+                    upper,
+                    -99,
+                    budget.exec(),
+                )
+                .unwrap();
                 let expected: Vec<_> = input
                     .iter()
                     .enumerate()
@@ -85,7 +100,11 @@ fn triangular_matches_elementwise_reference() {
 }
 
 #[test]
-fn embedding_all_axes_and_ranks() {
+fn triangular_matches_elementwise_reference() {
+    triangular_matches_elementwise_reference_with(Budget::Serial);
+}
+
+fn embedding_all_axes_and_ranks_with(budget: Budget) {
     for shape in [
         vec![0],
         vec![1],
@@ -102,7 +121,8 @@ fn embedding_all_axes_and_ranks() {
                 let mut out_shape = shape.clone();
                 out_shape.insert(b, shape[a]);
                 let mut output = vec![MaybeUninit::uninit(); n * shape[a]];
-                embed_diagonal_into_uninit(&mut output, &input, &shape, a, b, 0).unwrap();
+                embed_diagonal_into_uninit(&mut output, &input, &shape, a, b, 0, budget.exec())
+                    .unwrap();
                 let mut expected = vec![0; output.len()];
                 for (i, &value) in input.iter().enumerate() {
                     let mut rem = i;
@@ -128,42 +148,51 @@ fn embedding_all_axes_and_ranks() {
 }
 
 #[test]
+fn embedding_all_axes_and_ranks() {
+    embedding_all_axes_and_ranks_with(Budget::Serial);
+}
+
+#[test]
 fn invalid_shapes_do_not_write() {
     let mut output = [MaybeUninit::new(71_i32); 4];
-    assert!(triangular_mask_into_uninit(&mut output, &[1; 4], &[4], 0, true, 0).is_err());
-    assert!(triangular_mask_into_uninit(&mut output, &[1; 4], &[2, 3], 0, true, 0).is_err());
     assert!(
-        triangular_mask_into_uninit(&mut output, &[1; 4], &[usize::MAX, 2], 0, true, 0).is_err()
+        triangular_mask_into_uninit(&mut output, &[1; 4], &[4], 0, true, 0, Exec::serial())
+            .is_err()
     );
-    assert!(embed_diagonal_into_uninit(&mut output, &[1, 2], &[2], 1, 1, 0).is_err());
-    assert!(embed_diagonal_into_uninit(&mut output, &[1, 2], &[2], 0, 2, 0).is_err());
-    assert!(embed_diagonal_into_uninit(&mut output, &[1, 2], &[3], 0, 1, 0).is_err());
+    assert!(
+        triangular_mask_into_uninit(&mut output, &[1; 4], &[2, 3], 0, true, 0, Exec::serial())
+            .is_err()
+    );
+    assert!(triangular_mask_into_uninit(
+        &mut output,
+        &[1; 4],
+        &[usize::MAX, 2],
+        0,
+        true,
+        0,
+        Exec::serial()
+    )
+    .is_err());
+    assert!(
+        embed_diagonal_into_uninit(&mut output, &[1, 2], &[2], 1, 1, 0, Exec::serial()).is_err()
+    );
+    assert!(
+        embed_diagonal_into_uninit(&mut output, &[1, 2], &[2], 0, 2, 0, Exec::serial()).is_err()
+    );
+    assert!(
+        embed_diagonal_into_uninit(&mut output, &[1, 2], &[3], 0, 1, 0, Exec::serial()).is_err()
+    );
     assert_eq!(initialized(&output), [71; 4]);
 }
 
 #[cfg(feature = "parallel")]
 #[test]
 fn bounded_and_sequential_policy_inside_pool() {
-    use std::num::NonZeroUsize;
-    use strided_basic::{with_execution_policy, ExecutionPolicy};
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
-    pool.install(|| {
-        for policy in [
-            ExecutionPolicy::Sequential,
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(2).unwrap(),
-            },
-        ] {
-            with_execution_policy(policy, || {
-                triangular_matches_elementwise_reference();
-                embedding_all_axes_and_ranks();
-                axpby_values_and_error_preserve_destination();
-            });
-        }
-    });
+    for budget in [Budget::Serial, Budget::Pooled(2)] {
+        triangular_matches_elementwise_reference_with(budget);
+        embedding_all_axes_and_ranks_with(budget);
+        axpby_values_and_error_preserve_destination_with(budget);
+    }
 }
 
 #[test]
@@ -172,7 +201,7 @@ fn triangular_mask_reads_transposed_source_without_staging() {
     let base: Vec<i32> = (0..12).collect();
     let src = StridedView::new(&base, &[4, 3], &[3, 1], 0).unwrap();
     let mut out = vec![MaybeUninit::uninit(); 12];
-    triangular_mask_view_into_uninit(&mut out, &src, 0, false, -1).unwrap();
+    triangular_mask_view_into_uninit(&mut out, &src, 0, false, -1, Exec::serial()).unwrap();
     let got = initialized(&out);
     let want: Vec<i32> = (0..12)
         .map(|flat| {
@@ -193,7 +222,7 @@ fn triangular_mask_reads_reversed_offset_source() {
     let base: Vec<i32> = (0..12).collect();
     let src = StridedView::new(&base, &[4, 3], &[-3, 1], 9).unwrap();
     let mut out = vec![MaybeUninit::uninit(); 12];
-    triangular_mask_view_into_uninit(&mut out, &src, 1, true, -1).unwrap();
+    triangular_mask_view_into_uninit(&mut out, &src, 1, true, -1, Exec::serial()).unwrap();
     let got = initialized(&out);
     let want: Vec<i32> = (0..12)
         .map(|flat| {
@@ -217,7 +246,7 @@ fn triangular_mask_reads_permuted_batch_strides() {
     let base: Vec<i32> = (0..12).collect();
     let src = StridedView::new(&base, &[3, 2, 2], &[1, 3, 6], 0).unwrap();
     let mut out = vec![MaybeUninit::uninit(); 12];
-    triangular_mask_view_into_uninit(&mut out, &src, 0, false, -1).unwrap();
+    triangular_mask_view_into_uninit(&mut out, &src, 0, false, -1, Exec::serial()).unwrap();
     let got = initialized(&out);
     let want: Vec<i32> = (0..12)
         .map(|flat| {
@@ -240,7 +269,7 @@ fn embed_diagonal_reads_strided_source() {
     let base = [10, 1, 11, 2, 12, 3];
     let src = StridedView::new(&base, &[3], &[2], 1).unwrap();
     let mut out = vec![MaybeUninit::uninit(); 9];
-    embed_diagonal_view_into_uninit(&mut out, &src, 0, 1, -1).unwrap();
+    embed_diagonal_view_into_uninit(&mut out, &src, 0, 1, -1, Exec::serial()).unwrap();
     assert_eq!(initialized(&out), vec![1, -1, -1, -1, 2, -1, -1, -1, 3]);
     assert_eq!(base, [10, 1, 11, 2, 12, 3]);
 }
@@ -253,14 +282,15 @@ fn view_variants_agree_with_dense_variants() {
     let src = StridedView::new(&base, &[4, 3, 2], &strides, 0).unwrap();
     let mut dense = vec![MaybeUninit::uninit(); 24];
     let mut via_view = vec![MaybeUninit::uninit(); 24];
-    triangular_mask_into_uninit(&mut dense, &base, &[4, 3, 2], -1, false, 0).unwrap();
-    triangular_mask_view_into_uninit(&mut via_view, &src, -1, false, 0).unwrap();
+    triangular_mask_into_uninit(&mut dense, &base, &[4, 3, 2], -1, false, 0, Exec::serial())
+        .unwrap();
+    triangular_mask_view_into_uninit(&mut via_view, &src, -1, false, 0, Exec::serial()).unwrap();
     assert_eq!(initialized(&dense), initialized(&via_view));
 
     // shape[axis] == 3 inserted, so 24 * 3 elements.
     let mut dense = vec![MaybeUninit::uninit(); 72];
     let mut via_view = vec![MaybeUninit::uninit(); 72];
-    embed_diagonal_into_uninit(&mut dense, &base, &[4, 3, 2], 1, 0, 0).unwrap();
-    embed_diagonal_view_into_uninit(&mut via_view, &src, 1, 0, 0).unwrap();
+    embed_diagonal_into_uninit(&mut dense, &base, &[4, 3, 2], 1, 0, 0, Exec::serial()).unwrap();
+    embed_diagonal_view_into_uninit(&mut via_view, &src, 1, 0, 0, Exec::serial()).unwrap();
     assert_eq!(initialized(&dense), initialized(&via_view));
 }

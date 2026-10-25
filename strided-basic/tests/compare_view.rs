@@ -1,12 +1,7 @@
-#[cfg(feature = "parallel")]
-use std::num::NonZeroUsize;
-
+use strided_basic::Exec;
 use strided_basic::{
     compare_into, CompareOp, Identity, StridedArray, StridedError, StridedView, StridedViewMut,
 };
-#[cfg(feature = "parallel")]
-use strided_basic::{with_execution_policy, ExecutionPolicy};
-
 macro_rules! assert_all_compare_ops {
     ($ty:ty, $lhs:expr, $rhs:expr) => {{
         let lhs = StridedArray::from_parts($lhs, &[4], &[1], 0).unwrap();
@@ -21,7 +16,14 @@ macro_rules! assert_all_compare_ops {
 
         for (op, expected) in cases {
             let mut out = StridedArray::<bool>::col_major(&[4]);
-            compare_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), op).unwrap();
+            compare_into(
+                &mut out.view_mut(),
+                &lhs.view(),
+                &rhs.view(),
+                op,
+                Exec::serial(),
+            )
+            .unwrap();
             assert_eq!(out.data(), &expected, "operation {op:?}");
         }
     }};
@@ -45,7 +47,14 @@ fn compare_into_covers_ordered_kernel_dtypes_and_operations() {
     ];
     for (op, expected) in cases {
         let mut out = StridedArray::<bool>::col_major(&[4]);
-        compare_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), op).unwrap();
+        compare_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &rhs.view(),
+            op,
+            Exec::serial(),
+        )
+        .unwrap();
         assert_eq!(out.data(), &expected, "operation {op:?}");
     }
 }
@@ -63,7 +72,14 @@ fn compare_into_preserves_nan_unordered_semantics() {
         CompareOp::Ge,
     ] {
         let mut out = StridedArray::<bool>::col_major(&[1]);
-        compare_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), op).unwrap();
+        compare_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &rhs.view(),
+            op,
+            Exec::serial(),
+        )
+        .unwrap();
         assert_eq!(out.data(), &[false], "operation {op:?}");
     }
 }
@@ -76,7 +92,14 @@ fn compare_into_preserves_noncontiguous_view_semantics() {
     let lhs = StridedView::<i64, Identity>::new(&lhs_data, &dims, &[-1], 4).unwrap();
     let mut out = StridedArray::<bool>::col_major(&dims);
 
-    compare_into(&mut out.view_mut(), &lhs, &rhs.view(), CompareOp::Gt).unwrap();
+    compare_into(
+        &mut out.view_mut(),
+        &lhs,
+        &rhs.view(),
+        CompareOp::Gt,
+        Exec::serial(),
+    )
+    .unwrap();
 
     assert_eq!(out.data(), &[true, true, false, false, false]);
 }
@@ -88,7 +111,13 @@ fn compare_into_rejects_noninjective_destination_before_mutation() {
     let mut output = [true];
     let mut dest = StridedViewMut::new(&mut output, &[4], &[0], 0).unwrap();
 
-    let error = compare_into(&mut dest, &lhs.view(), &rhs.view(), CompareOp::Lt);
+    let error = compare_into(
+        &mut dest,
+        &lhs.view(),
+        &rhs.view(),
+        CompareOp::Lt,
+        Exec::serial(),
+    );
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [true]);
@@ -102,19 +131,10 @@ fn compare_into_rejects_large_noninjective_destination_before_parallel_mutation(
     let rhs = StridedArray::from_parts(vec![2_i64; LEN], &[LEN], &[1], 0).unwrap();
     let mut output = [true];
     let mut dest = StridedViewMut::new(&mut output, &[LEN], &[0], 0).unwrap();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
+    let pool = strided_basic::Pool::builder().threads(2).build().unwrap();
+    let exec = Exec::new(&pool, 2).unwrap();
 
-    let error = pool.install(|| {
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(2).unwrap(),
-            },
-            || compare_into(&mut dest, &lhs.view(), &rhs.view(), CompareOp::Lt),
-        )
-    });
+    let error = compare_into(&mut dest, &lhs.view(), &rhs.view(), CompareOp::Lt, exec);
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [true]);

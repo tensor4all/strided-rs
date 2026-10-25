@@ -4,47 +4,43 @@
 //! of implementation modules. Prevalidated entries require the caller to prove
 //! the exact destination geometry and every omitted shape check. A layout marker
 //! alone does not prove those obligations. Ordinary callers should use the
-//! checked APIs at the crate root. All families share the same execution policy.
+//! checked APIs at the crate root. Every family that can fan out takes the same
+//! [`Exec`] placement token as its last parameter.
 //!
 //! # Examples
 //!
 //! ```
-//! use strided_basic::{StridedArray, execution::*};
+//! use strided_basic::{Exec, StridedArray, execution::*};
 //! let src = StridedArray::<f64>::col_major(&[2]);
 //! let mut dst = StridedArray::<f64>::col_major(&[2]);
 //! let marker = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
 //! // SAFETY: both arrays have shape [2], distinct storage, and the checked layout.
-//! unsafe { map_into_validated(&mut dst.view_mut(), &src.view(), |x| x, marker) }.unwrap();
+//! unsafe { map_into_validated(&mut dst.view_mut(), &src.view(), |x| x, marker, Exec::serial()) }.unwrap();
 //! ```
 //!
 //! A marker alone does not make the prevalidated entry safe to call:
 //!
 //! ```compile_fail,E0133
-//! use strided_basic::{StridedArray, execution::*};
+//! use strided_basic::{Exec, StridedArray, execution::*};
 //! let src = StridedArray::<f64>::col_major(&[2]);
 //! let mut dst = StridedArray::<f64>::col_major(&[2]);
 //! let marker = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-//! map_into_validated(&mut dst.view_mut(), &src.view(), |x| x, marker).unwrap();
+//! map_into_validated(&mut dst.view_mut(), &src.view(), |x| x, marker, Exec::serial()).unwrap();
 //! ```
 pub use crate::erased_common::{
     check_dtype, check_static_indexing_dtype, erased_view, validate_uninit_no_overlap,
 };
-#[cfg(feature = "parallel")]
-pub use crate::exec_context::with_execution_pool;
 pub use crate::kernel::{ensure_same_shape, KernelPlan, SMALL_TENSOR_THRESHOLD};
 pub use crate::layout_check::is_injective_layout;
 pub use crate::map_view::{
     validate_destination_layout, validate_destination_layout_without_alloc,
     ValidatedDestinationLayout,
 };
-#[cfg(feature = "parallel")]
 pub use crate::threading::{
     parallel_map_reduce, parallel_threads_for_len, SendPtr, MINTHREADLENGTH,
 };
 
-use crate::{
-    ElementOp, InlineVec, MaybeSendSync, MaybeSync, OperandVec, Result, StridedView, StridedViewMut,
-};
+use crate::{ElementOp, Exec, InlineVec, OperandVec, Result, StridedView, StridedViewMut};
 
 /// Prevalidated build plan fused for kernel-family implementations.
 ///
@@ -53,8 +49,8 @@ use crate::{
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
 /// and every intermediate offset used by planning/iteration must be representable.
 /// Iteration blocks must be positive and offsets must correspond to the supplied
-/// layouts; threaded partitioning additionally requires positive thread counts,
-/// costs and nonnegative spacing. Callback memory accesses must be valid for each generated
+/// layouts; threaded partitioning additionally requires positive
+/// costs. Callback memory accesses must be valid for each generated
 /// block, with disjoint mutable regions when partitions execute concurrently.
 ///
 /// # Examples
@@ -84,8 +80,8 @@ pub unsafe fn build_plan_fused(
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
 /// and every intermediate offset used by planning/iteration must be representable.
 /// Iteration blocks must be positive and offsets must correspond to the supplied
-/// layouts; threaded partitioning additionally requires positive thread counts,
-/// costs and nonnegative spacing. Callback memory accesses must be valid for each generated
+/// layouts; threaded partitioning additionally requires positive
+/// costs. Callback memory accesses must be valid for each generated
 /// block, with disjoint mutable regions when partitions execute concurrently.
 ///
 /// # Examples
@@ -112,8 +108,8 @@ pub unsafe fn build_plan_fused_small(
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
 /// and every intermediate offset used by planning/iteration must be representable.
 /// Iteration blocks must be positive and offsets must correspond to the supplied
-/// layouts; threaded partitioning additionally requires positive thread counts,
-/// costs and nonnegative spacing. Callback memory accesses must be valid for each generated
+/// layouts; threaded partitioning additionally requires positive
+/// costs. Callback memory accesses must be valid for each generated
 /// block, with disjoint mutable regions when partitions execute concurrently.
 ///
 /// # Examples
@@ -167,7 +163,7 @@ where
 /// let src = StridedArray::<f64>::from_parts(vec![2.0; 2], &[2], &[1], 0).unwrap();
 /// let mut dst = StridedArray::<f64>::col_major(&[2]);
 /// let checked = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-/// unsafe { map_into_validated(&mut dst.view_mut(), &src.view(), |a| a, checked) }.unwrap();
+/// unsafe { map_into_validated(&mut dst.view_mut(), &src.view(), |a| a, checked, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(dst.get(&[1]), 2.0);
 /// ```
 ///
@@ -175,18 +171,15 @@ where
 /// Forwards errors from the owning kernel or callback; callers must still
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
-pub unsafe fn map_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    Op: ElementOp<A>,
->(
+pub unsafe fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::map_view::map_into_validated::<D, A, Op>(dest, src, f, validated)
+    crate::map_view::map_into_validated::<D, A, Op>(dest, src, f, validated, exec)
 }
 
 /// Prevalidated zip map2 into validated for kernel-family implementations.
@@ -206,7 +199,7 @@ pub unsafe fn map_into_validated<
 /// let src = StridedArray::<f64>::from_parts(vec![2.0; 2], &[2], &[1], 0).unwrap();
 /// let mut dst = StridedArray::<f64>::col_major(&[2]);
 /// let checked = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-/// unsafe { zip_map2_into_validated(&mut dst.view_mut(), &src.view(), &src.view(), |a, b| a + b, checked) }.unwrap();
+/// unsafe { zip_map2_into_validated(&mut dst.view_mut(), &src.view(), &src.view(), |a, b| a + b, checked, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(dst.get(&[1]), 4.0);
 /// ```
 ///
@@ -215,20 +208,21 @@ pub unsafe fn map_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map2_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::map_view::zip_map2_into_validated::<D, A, B, OpA, OpB>(dest, a, b, f, validated)
+    crate::map_view::zip_map2_into_validated::<D, A, B, OpA, OpB>(dest, a, b, f, validated, exec)
 }
 
 /// Prevalidated zip map3 into validated for kernel-family implementations.
@@ -248,7 +242,7 @@ pub unsafe fn zip_map2_into_validated<
 /// let src = StridedArray::<f64>::from_parts(vec![2.0; 2], &[2], &[1], 0).unwrap();
 /// let mut dst = StridedArray::<f64>::col_major(&[2]);
 /// let checked = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-/// unsafe { zip_map3_into_validated(&mut dst.view_mut(), &src.view(), &src.view(), &src.view(), |a, b, c| a + b + c, checked) }.unwrap();
+/// unsafe { zip_map3_into_validated(&mut dst.view_mut(), &src.view(), &src.view(), &src.view(), |a, b, c| a + b + c, checked, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(dst.get(&[1]), 6.0);
 /// ```
 ///
@@ -257,10 +251,10 @@ pub unsafe fn zip_map2_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map3_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -269,12 +263,13 @@ pub unsafe fn zip_map3_into_validated<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
-    f: impl Fn(A, B, C) -> D + MaybeSync,
+    f: impl Fn(A, B, C) -> D + Sync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
     crate::map_view::zip_map3_into_validated::<D, A, B, C, OpA, OpB, OpC>(
-        dest, a, b, c, f, validated,
+        dest, a, b, c, f, validated, exec,
     )
 }
 
@@ -295,7 +290,7 @@ pub unsafe fn zip_map3_into_validated<
 /// let src = StridedArray::<f64>::from_parts(vec![2.0; 2], &[2], &[1], 0).unwrap();
 /// let mut dst = StridedArray::<f64>::col_major(&[2]);
 /// let checked = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-/// unsafe { zip_map4_into_validated(&mut dst.view_mut(), &src.view(), &src.view(), &src.view(), &src.view(), |a, b, c, d| a + b + c + d, checked) }.unwrap();
+/// unsafe { zip_map4_into_validated(&mut dst.view_mut(), &src.view(), &src.view(), &src.view(), &src.view(), |a, b, c, d| a + b + c + d, checked, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(dst.get(&[1]), 8.0);
 /// ```
 ///
@@ -303,12 +298,13 @@ pub unsafe fn zip_map3_into_validated<
 /// Forwards errors from the owning kernel or callback; callers must still
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn zip_map4_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
-    E: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
+    E: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -319,12 +315,13 @@ pub unsafe fn zip_map4_into_validated<
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
     e: &StridedView<E, OpE>,
-    f: impl Fn(A, B, C, E) -> D + MaybeSync,
+    f: impl Fn(A, B, C, E) -> D + Sync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
     crate::map_view::zip_map4_into_validated::<D, A, B, C, E, OpA, OpB, OpC, OpE>(
-        dest, a, b, c, e, f, validated,
+        dest, a, b, c, e, f, validated, exec,
     )
 }
 
@@ -347,7 +344,7 @@ pub unsafe fn zip_map4_into_validated<
 /// let mut output = [0.0; 2];
 /// let mut dst = RawStridedMut::new(&mut output, &[2], &[1], 0).unwrap();
 /// let checked = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-/// unsafe { map_raw_into_validated::<f64, f64, Identity>(&mut dst, &src, |a| a, checked) }.unwrap();
+/// unsafe { map_raw_into_validated::<f64, f64, Identity>(&mut dst, &src, |a| a, checked, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(output, [2.0; 2]);
 /// ```
 ///
@@ -356,17 +353,18 @@ pub unsafe fn zip_map4_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn map_raw_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     Op: ElementOp<A>,
 >(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::map_view::map_raw_into_validated::<D, A, Op>(dest, src, f, validated)
+    crate::map_view::map_raw_into_validated::<D, A, Op>(dest, src, f, validated, exec)
 }
 
 /// Prevalidated zip map2 raw into validated for kernel-family implementations.
@@ -388,7 +386,7 @@ pub unsafe fn map_raw_into_validated<
 /// let mut output = [0.0; 2];
 /// let mut dst = RawStridedMut::new(&mut output, &[2], &[1], 0).unwrap();
 /// let checked = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
-/// unsafe { zip_map2_raw_into_validated::<f64, f64, f64, Identity, Identity>(&mut dst, &src, &src, |a, b| a + b, checked) }.unwrap();
+/// unsafe { zip_map2_raw_into_validated::<f64, f64, f64, Identity, Identity>(&mut dst, &src, &src, |a, b| a + b, checked, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(output, [4.0; 2]);
 /// ```
 ///
@@ -397,23 +395,25 @@ pub unsafe fn map_raw_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map2_raw_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut crate::RawStridedMut<'_, D>,
     a: &crate::RawStridedRef<'_, A>,
     b: &crate::RawStridedRef<'_, B>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::map_view::zip_map2_raw_into_validated::<D, A, B, OpA, OpB>(dest, a, b, f, validated)
+    crate::map_view::zip_map2_raw_into_validated::<D, A, B, OpA, OpB>(
+        dest, a, b, f, validated, exec,
+    )
 }
 
-#[cfg(feature = "parallel")]
 /// Prevalidated compute costs for kernel-family implementations.
 ///
 /// # Safety
@@ -421,8 +421,8 @@ pub unsafe fn zip_map2_raw_into_validated<
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
 /// and every intermediate offset used by planning/iteration must be representable.
 /// Iteration blocks must be positive and offsets must correspond to the supplied
-/// layouts; threaded partitioning additionally requires positive thread counts,
-/// costs and nonnegative spacing. Callback memory accesses must be valid for each generated
+/// layouts; threaded partitioning additionally requires positive
+/// costs. Callback memory accesses must be valid for each generated
 /// block, with disjoint mutable regions when partitions execute concurrently.
 ///
 /// # Examples
@@ -439,7 +439,6 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
     crate::fuse::compute_costs::<S>(all_strides)
 }
 
-#[cfg(feature = "parallel")]
 /// Prevalidated mapreduce threaded for kernel-family implementations.
 ///
 /// # Safety
@@ -447,8 +446,8 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
 /// and every intermediate offset used by planning/iteration must be representable.
 /// Iteration blocks must be positive and offsets must correspond to the supplied
-/// layouts; threaded partitioning additionally requires positive thread counts,
-/// costs and nonnegative spacing. Callback memory accesses must be valid for each generated
+/// layouts; threaded partitioning additionally requires positive
+/// costs. Callback memory accesses must be valid for each generated
 /// block, with disjoint mutable regions when partitions execute concurrently.
 ///
 /// # Examples
@@ -458,7 +457,7 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
 /// // SAFETY: the example supplies matching bounded layouts and disjoint storage.
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// let count = AtomicUsize::new(0);
-/// unsafe { mapreduce_threaded(&[4], &[4], &[vec![1]], &[0], &[2], 1, 0, 1, &|dims, _, _, _| { count.fetch_add(dims.iter().product::<usize>(), Ordering::Relaxed); Ok(()) }) }.unwrap();
+/// unsafe { mapreduce_threaded(&[4], &[4], &[vec![1]], &[0], &[2], strided_basic::Exec::serial(), &|dims, _, _, _| { count.fetch_add(dims.iter().product::<usize>(), Ordering::Relaxed); Ok(()) }) }.unwrap();
 /// assert_eq!(count.load(Ordering::Relaxed), 4);
 /// ```
 ///
@@ -472,9 +471,7 @@ pub unsafe fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     strides_list: &[S],
     offsets: &[isize],
     costs: &[isize],
-    nthreads: usize,
-    spacing: isize,
-    taskindex: usize,
+    exec: Exec<'_>,
     f: &F,
 ) -> Result<()>
 where
@@ -487,15 +484,10 @@ where
         strides_list,
         offsets,
         costs,
-        nthreads,
-        spacing,
-        taskindex,
+        exec,
         f,
     )
 }
-
-#[cfg(feature = "parallel")]
-pub use crate::execution_policy::rayon_threads;
 
 /// Full-overwrite indexed replay for an operation-family adapter.
 ///
@@ -521,7 +513,7 @@ pub use crate::execution_policy::rayon_threads;
 /// let mut values = [MaybeUninit::<i32>::uninit(); 2];
 /// let mut dst = RawStridedMut::new(&mut values, &[2], &[1], 0).unwrap();
 /// // SAFETY: input and output allocations are disjoint and layouts match the plan.
-/// unsafe { gather_into_uninit(&plan, &mut dst, &src, &indices) }.unwrap();
+/// unsafe { gather_into_uninit(&plan, &mut dst, &src, &indices, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(unsafe { values[1].assume_init() }, 3);
 /// ```
 ///
@@ -533,12 +525,13 @@ pub unsafe fn gather_into_uninit<T, I>(
     dest: &mut crate::RawStridedMut<'_, core::mem::MaybeUninit<T>>,
     operand: &crate::RawStridedRef<'_, T>,
     start_indices: &crate::RawStridedRef<'_, I>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
-    plan.execute_uninit(dest, operand, start_indices)
+    plan.execute_uninit(dest, operand, start_indices, exec)
 }
 
 /// Full-overwrite indexed replay for an operation-family adapter.
@@ -562,7 +555,7 @@ where
 /// let starts = RawStridedRef::new(&[1_i32], &[1], &[1], 0).unwrap();
 /// let mut values = [MaybeUninit::<i32>::uninit(); 2];
 /// let mut dst = RawStridedMut::new(&mut values, &[2], &[1], 0).unwrap();
-/// unsafe { dynamic_slice_into_uninit(&plan, &mut dst, &src, &starts) }.unwrap();
+/// unsafe { dynamic_slice_into_uninit(&plan, &mut dst, &src, &starts, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(unsafe { values[1].assume_init() }, 3);
 /// ```
 ///
@@ -575,12 +568,13 @@ pub unsafe fn dynamic_slice_into_uninit<T, I>(
     dest: &mut crate::RawStridedMut<'_, core::mem::MaybeUninit<T>>,
     operand: &crate::RawStridedRef<'_, T>,
     starts: &crate::RawStridedRef<'_, I>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
-    plan.execute_uninit(dest, operand, starts)
+    plan.execute_uninit(dest, operand, starts, exec)
 }
 
 /// Full-overwrite indexed replay for an operation-family adapter.
@@ -607,7 +601,7 @@ where
 /// let mut values = [MaybeUninit::<i32>::uninit(); 3];
 /// let mut dst = RawStridedMut::new(&mut values, &[3], &[1], 0).unwrap();
 /// // SAFETY: all inputs are initialized and disjoint from the matching output.
-/// unsafe { dynamic_update_into_uninit(&plan, &mut dst, &src, &update, &starts) }.unwrap();
+/// unsafe { dynamic_update_into_uninit(&plan, &mut dst, &src, &update, &starts, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(unsafe { values[1].assume_init() }, 9);
 /// ```
 ///
@@ -620,12 +614,13 @@ pub unsafe fn dynamic_update_into_uninit<'a, T, I>(
     operand: &crate::RawStridedRef<'_, T>,
     update: &crate::RawStridedRef<'_, T>,
     starts: &crate::RawStridedRef<'_, I>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
-    plan.execute_uninit(dest, operand, update, starts)
+    plan.execute_uninit(dest, operand, update, starts, exec)
 }
 
 /// Full-overwrite indexed replay for an operation-family adapter.
@@ -653,7 +648,7 @@ where
 /// let mut values = [MaybeUninit::<i32>::uninit(); 3];
 /// let mut dst = RawStridedMut::new(&mut values, &[3], &[1], 0).unwrap();
 /// // SAFETY: all inputs are initialized and disjoint from the matching output.
-/// unsafe { scatter_into_uninit(&plan, &mut dst, &src, &indices, &update, i32::wrapping_add) }.unwrap();
+/// unsafe { scatter_into_uninit(&plan, &mut dst, &src, &indices, &update, i32::wrapping_add, strided_basic::Exec::serial()) }.unwrap();
 /// assert_eq!(unsafe { values[1].assume_init() }, 11);
 /// ```
 ///
@@ -667,10 +662,11 @@ pub unsafe fn scatter_into_uninit<'a, T, I>(
     scatter_indices: &crate::RawStridedRef<'_, I>,
     updates: &crate::RawStridedRef<'_, T>,
     combine: fn(T, T) -> T,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + core::ops::Add<Output = T> + MaybeSendSync,
+    T: Copy + core::ops::Add<Output = T> + Send + Sync,
     I: crate::GatherIndex,
 {
-    plan.execute_uninit(dest, operand, scatter_indices, updates, combine)
+    plan.execute_uninit(dest, operand, scatter_indices, updates, combine, exec)
 }

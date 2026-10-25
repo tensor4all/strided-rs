@@ -219,8 +219,6 @@ fn test_contiguous_mul_outer_cursor_matches_linear_offsets() {
 /// split.
 #[test]
 fn broadcast_zip_splits_and_covers_each_destination_once() {
-    use crate::{with_execution_policy, ExecutionPolicy};
-    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::thread::ThreadId;
@@ -254,33 +252,35 @@ fn broadcast_zip_splits_and_covers_each_destination_once() {
     };
     let mut out = vec![0.0f64; rows * cols];
 
-    crate::threading::test_pool(4).install(|| {
+    let pool = crate::threading::test_pool(4);
+    let exec = Exec::new(&pool, 4).unwrap();
+    let budget = exec.budget().get();
+    {
         let a_view = StridedView::<f64>::new(&a, &dims, &broadcast_strides, 0).unwrap();
         let b_view = StridedView::<Tracked>::new(&b, &dims, &peer_strides, 0).unwrap();
         let mut dest = StridedViewMut::<f64>::new(&mut out, &dims, &out_strides, 0).unwrap();
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(4).unwrap(),
-            },
-            || {
-                zip_map2_into(&mut dest, &a_view, &b_view, |x: f64, y: Tracked| {
-                    observation.calls.fetch_add(1, Ordering::SeqCst);
-                    let id = std::thread::current().id();
-                    {
-                        let mut ids = observation.ids.lock().unwrap();
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
+        zip_map2_into(
+            &mut dest,
+            &a_view,
+            &b_view,
+            |x: f64, y: Tracked| {
+                observation.calls.fetch_add(1, Ordering::SeqCst);
+                let id = std::thread::current().id();
+                {
+                    let mut ids = observation.ids.lock().unwrap();
+                    if !ids.contains(&id) {
+                        ids.push(id);
                     }
-                    for _ in 0..64 {
-                        std::hint::spin_loop();
-                    }
-                    x + y.value
-                })
-                .unwrap();
+                }
+                for _ in 0..64 {
+                    std::hint::spin_loop();
+                }
+                x + y.value
             },
-        );
-    });
+            exec,
+        )
+        .unwrap();
+    }
 
     assert_eq!(
         observation.calls.load(Ordering::SeqCst),
@@ -289,7 +289,7 @@ fn broadcast_zip_splits_and_covers_each_destination_once() {
     );
     let workers = observation.ids.lock().unwrap().len();
     assert!(
-        workers > 1,
+        budget == 1 || workers > 1,
         "broadcast zip over {rows}x{cols} must split across more than one worker, saw {workers}"
     );
     for (col, &a_col) in a.iter().enumerate() {

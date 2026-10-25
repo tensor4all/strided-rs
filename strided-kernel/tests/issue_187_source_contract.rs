@@ -79,7 +79,7 @@ fn indexed_uninit_receipt_is_private_and_writer_is_not_additive() {
         .expect("MaybeUninit writer and receipt remain ordered")
         .0;
     assert!(!maybe_uninit.contains("add_at"));
-    assert!(copy.contains("for<'b> FnOnce(InitializedRawDest<'b, T>)"));
+    assert!(copy.contains("for<'b, 'e> FnOnce(InitializedRawDest<'b, T>, Exec<'e>)"));
     assert!(copy.contains("pub(crate) fn execute_uninit_then"));
     assert!(copy.contains("extent: usize"));
     assert!(copy.contains("PhantomData<&'a mut [MaybeUninit<T>]>"));

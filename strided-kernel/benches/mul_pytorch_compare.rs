@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::ops::Mul;
 use std::time::{Duration, Instant};
 
-use strided_kernel::MaybeSendSync;
+use strided_kernel::Exec;
 use strided_kernel::{
     batched_outer_product_into, broadcast_mul_into, mul_into, StridedArray, StridedViewMut,
 };
@@ -308,7 +308,7 @@ fn fill_value(indices: &[usize], salt: usize) -> f64 {
     ((acc % 1024) as f64 - 512.0) / 512.0
 }
 
-trait BenchScalar: Copy + Default + MaybeSendSync + Mul<Output = Self> + 'static {
+trait BenchScalar: Copy + Default + Send + Sync + Mul<Output = Self> + 'static {
     fn from_indices(indices: &[usize], salt: usize) -> Self;
 }
 
@@ -369,7 +369,13 @@ fn run_elementwise<T: BenchScalar>(n: usize) -> (f64, f64) {
     let rhs = make_col_major::<T>(&[n, n], 2);
     let mut out = StridedArray::<T>::col_major(&[n, n]);
     measure(|| {
-        mul_into(&mut out.view_mut(), &lhs.view(), &rhs.view()).unwrap();
+        mul_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &rhs.view(),
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -379,7 +385,15 @@ fn run_outer_product<T: BenchScalar>(n: usize) -> (f64, f64) {
     let rhs = make_col_major::<T>(&[n], 4);
     let mut out = StridedArray::<T>::col_major(&[n, n]);
     measure(|| {
-        broadcast_mul_into(&mut out.view_mut(), &lhs.view(), &[0], &rhs.view(), &[1]).unwrap();
+        broadcast_mul_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &[0],
+            &rhs.view(),
+            &[1],
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -389,7 +403,15 @@ fn run_batched_outer_compact<T: BenchScalar>(j: usize, k: usize, o: usize, t: us
     let rhs = make_col_major::<T>(&[o, t], 6);
     let mut out = StridedArray::<T>::col_major(&[j, k, o, t]);
     measure(|| {
-        batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 2, 1).unwrap();
+        batched_outer_product_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -405,7 +427,8 @@ fn run_batched_outer_noncompact<T: BenchScalar>(
     let rhs = make_col_major::<T>(&[o, t], 8);
     let mut out = StridedArray::<T>::col_major(&[j, k, o, t]);
     measure(|| {
-        batched_outer_product_into(&mut out.view_mut(), &lhs, &rhs.view(), 2, 1).unwrap();
+        batched_outer_product_into(&mut out.view_mut(), &lhs, &rhs.view(), 2, 1, Exec::serial())
+            .unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -424,7 +447,7 @@ fn run_batched_outer_noncompact_torchlike_output<T: BenchScalar>(
     let out_dims = [j, k, o, t];
     let mut out_view = StridedViewMut::new(out.data_mut(), &out_dims, &out_strides, 0).unwrap();
     measure(|| {
-        batched_outer_product_into(&mut out_view, &lhs, &rhs.view(), 2, 1).unwrap();
+        batched_outer_product_into(&mut out_view, &lhs, &rhs.view(), 2, 1, Exec::serial()).unwrap();
         black_box(out_view.as_mut_ptr());
     })
 }
@@ -442,7 +465,15 @@ fn run_batched_outer_noncompact_lhs_scalar<T: BenchScalar>(
     measure(|| {
         // Keep this as broadcast_mul_into: the case intentionally fixes operand
         // order so the scalar-on-lhs branch is benchmarked.
-        broadcast_mul_into(&mut out.view_mut(), &lhs.view(), &[2, 3], &rhs, &[0, 1, 3]).unwrap();
+        broadcast_mul_into(
+            &mut out.view_mut(),
+            &lhs.view(),
+            &[2, 3],
+            &rhs,
+            &[0, 1, 3],
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -463,7 +494,7 @@ fn run_permuted_elementwise<T: BenchScalar>(rank: usize, extent: usize) -> (f64,
     let rhs = rhs_base.view().permute(&rhs_perm).unwrap();
     let mut out = StridedArray::<T>::col_major(&dims);
     measure(|| {
-        mul_into(&mut out.view_mut(), &lhs.view(), &rhs).unwrap();
+        mul_into(&mut out.view_mut(), &lhs.view(), &rhs, Exec::serial()).unwrap();
         black_box(out.data().as_ptr());
     })
 }

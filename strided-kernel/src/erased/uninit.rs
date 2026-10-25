@@ -31,7 +31,7 @@ use strided_basic::execution::{
 /// use core::mem::MaybeUninit;
 /// use strided_kernel::{
 ///     erased_map_into_uninit, ErasedMapOp, ErasedRawStridedPtr, ErasedRawStridedRef,
-///     ErasedRawStridedUninitMut, ExecContext, KernelDType,
+///     ErasedRawStridedUninitMut, Exec, KernelDType,
 /// };
 ///
 /// let input = [-1.5_f64, 2.0];
@@ -41,9 +41,9 @@ use strided_basic::execution::{
 /// erased_map_into_uninit(
 ///     KernelDType::F64,
 ///     ErasedMapOp::Abs,
-///     &ExecContext::serial(),
 ///     &mut dest,
 ///     &ErasedRawStridedPtr::from_ref(&input),
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// // SAFETY: a successful call initializes every reachable element.
@@ -57,9 +57,9 @@ use strided_basic::execution::{
 pub fn erased_map_into_uninit(
     input_dtype: KernelDType,
     op: ErasedMapOp,
-    ctx: &ExecContext,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     input: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     check_dtype(input_dtype, input.dtype())?;
     check_dtype(map_output_dtype(input_dtype, op)?, dest.dtype())?;
@@ -67,24 +67,24 @@ pub fn erased_map_into_uninit(
     // SAFETY: input/output overlap was rejected before forming references.
     let input = unsafe { input.try_as_ref_after_no_overlap() }?;
 
-    ctx.run(|| match (input_dtype, op) {
+    match (input_dtype, op) {
         (KernelDType::C32, ErasedMapOp::Abs) => {
-            uninit_map_with::<f32, Complex32>(dest, &input, |value| value.norm())
+            uninit_map_with::<f32, Complex32>(dest, &input, |value| value.norm(), exec)
         }
         (KernelDType::C64, ErasedMapOp::Abs) => {
-            uninit_map_with::<f64, Complex64>(dest, &input, |value| value.norm())
+            uninit_map_with::<f64, Complex64>(dest, &input, |value| value.norm(), exec)
         }
-        (KernelDType::F32, _) => uninit_map::<f32>(op, dest, &input),
-        (KernelDType::F64, _) => uninit_map::<f64>(op, dest, &input),
-        (KernelDType::I32, _) => uninit_map::<i32>(op, dest, &input),
-        (KernelDType::I64, _) => uninit_map::<i64>(op, dest, &input),
-        (KernelDType::Bool, _) => uninit_map::<bool>(op, dest, &input),
-        (KernelDType::C32, _) => uninit_map::<Complex32>(op, dest, &input),
-        (KernelDType::C64, _) => uninit_map::<Complex64>(op, dest, &input),
+        (KernelDType::F32, _) => uninit_map::<f32>(op, dest, &input, exec),
+        (KernelDType::F64, _) => uninit_map::<f64>(op, dest, &input, exec),
+        (KernelDType::I32, _) => uninit_map::<i32>(op, dest, &input, exec),
+        (KernelDType::I64, _) => uninit_map::<i64>(op, dest, &input, exec),
+        (KernelDType::Bool, _) => uninit_map::<bool>(op, dest, &input, exec),
+        (KernelDType::C32, _) => uninit_map::<Complex32>(op, dest, &input, exec),
+        (KernelDType::C64, _) => uninit_map::<Complex64>(op, dest, &input, exec),
         _ => Err(StridedError::UnsupportedDType {
             dtype: input_dtype.label(),
         }),
-    })
+    }
 }
 
 /// Apply one runtime-selected binary operation into uninitialized storage.
@@ -100,7 +100,7 @@ pub fn erased_map_into_uninit(
 /// use core::mem::MaybeUninit;
 /// use strided_kernel::{
 ///     erased_zip_into_uninit, ErasedRawStridedPtr, ErasedRawStridedRef,
-///     ErasedRawStridedUninitMut, ErasedZipOp, ExecContext, KernelDType,
+///     ErasedRawStridedUninitMut, ErasedZipOp, Exec, KernelDType,
 /// };
 ///
 /// let lhs = [i32::MAX, 7];
@@ -112,10 +112,10 @@ pub fn erased_map_into_uninit(
 /// erased_zip_into_uninit(
 ///     KernelDType::I32,
 ///     ErasedZipOp::Add,
-///     &ExecContext::serial(),
 ///     &mut dest,
 ///     &ErasedRawStridedPtr::from_ref(&lhs),
 ///     &ErasedRawStridedPtr::from_ref(&rhs),
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// // SAFETY: a successful call initializes every reachable element.
@@ -130,10 +130,10 @@ pub fn erased_map_into_uninit(
 pub fn erased_zip_into_uninit(
     dtype: KernelDType,
     op: ErasedZipOp,
-    ctx: &ExecContext,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedPtr<'_>,
     rhs: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     check_dtype(dtype, dest.dtype())?;
     check_dtype(dtype, lhs.dtype())?;
@@ -145,18 +145,18 @@ pub fn erased_zip_into_uninit(
     // SAFETY: input/output overlap was rejected before forming references.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
-    ctx.run(|| match dtype {
-        KernelDType::F32 => uninit_zip::<f32>(op, dest, &lhs, &rhs),
-        KernelDType::F64 => uninit_zip::<f64>(op, dest, &lhs, &rhs),
-        KernelDType::I32 => uninit_zip::<i32>(op, dest, &lhs, &rhs),
-        KernelDType::I64 => uninit_zip::<i64>(op, dest, &lhs, &rhs),
-        KernelDType::Bool => uninit_zip::<bool>(op, dest, &lhs, &rhs),
-        KernelDType::C32 => uninit_zip::<Complex32>(op, dest, &lhs, &rhs),
-        KernelDType::C64 => uninit_zip::<Complex64>(op, dest, &lhs, &rhs),
+    match dtype {
+        KernelDType::F32 => uninit_zip::<f32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::F64 => uninit_zip::<f64>(op, dest, &lhs, &rhs, exec),
+        KernelDType::I32 => uninit_zip::<i32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::I64 => uninit_zip::<i64>(op, dest, &lhs, &rhs, exec),
+        KernelDType::Bool => uninit_zip::<bool>(op, dest, &lhs, &rhs, exec),
+        KernelDType::C32 => uninit_zip::<Complex32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::C64 => uninit_zip::<Complex64>(op, dest, &lhs, &rhs, exec),
         _ => Err(StridedError::UnsupportedDType {
             dtype: dtype.label(),
         }),
-    })
+    }
 }
 
 /// Compare two same-dtype operands elementwise into uninitialized `bool`
@@ -173,7 +173,7 @@ pub fn erased_zip_into_uninit(
 /// use core::mem::MaybeUninit;
 /// use strided_kernel::{
 ///     erased_compare_into_uninit, CompareOp, ErasedRawStridedPtr, ErasedRawStridedRef,
-///     ErasedRawStridedUninitMut, ExecContext, KernelDType,
+///     ErasedRawStridedUninitMut, Exec, KernelDType,
 /// };
 ///
 /// let lhs = [1.0_f64, f64::NAN];
@@ -185,10 +185,10 @@ pub fn erased_zip_into_uninit(
 /// erased_compare_into_uninit(
 ///     KernelDType::F64,
 ///     CompareOp::Lt,
-///     &ExecContext::serial(),
 ///     &mut dest,
 ///     &ErasedRawStridedPtr::from_ref(&lhs),
 ///     &ErasedRawStridedPtr::from_ref(&rhs),
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// // SAFETY: a successful call initializes every reachable element.
@@ -202,10 +202,10 @@ pub fn erased_zip_into_uninit(
 pub fn erased_compare_into_uninit(
     dtype: KernelDType,
     op: CompareOp,
-    ctx: &ExecContext,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedPtr<'_>,
     rhs: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     check_dtype(KernelDType::Bool, dest.dtype())?;
     check_dtype(dtype, lhs.dtype())?;
@@ -217,18 +217,18 @@ pub fn erased_compare_into_uninit(
     // SAFETY: input/output overlap was rejected before forming references.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
-    ctx.run(|| match dtype {
-        KernelDType::F32 => uninit_compare_ordered::<f32>(op, dest, &lhs, &rhs),
-        KernelDType::F64 => uninit_compare_ordered::<f64>(op, dest, &lhs, &rhs),
-        KernelDType::I32 => uninit_compare_ordered::<i32>(op, dest, &lhs, &rhs),
-        KernelDType::I64 => uninit_compare_ordered::<i64>(op, dest, &lhs, &rhs),
-        KernelDType::Bool => uninit_compare_ordered::<bool>(op, dest, &lhs, &rhs),
-        KernelDType::C32 => uninit_compare_eq::<Complex32>(op, dest, &lhs, &rhs),
-        KernelDType::C64 => uninit_compare_eq::<Complex64>(op, dest, &lhs, &rhs),
+    match dtype {
+        KernelDType::F32 => uninit_compare_ordered::<f32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::F64 => uninit_compare_ordered::<f64>(op, dest, &lhs, &rhs, exec),
+        KernelDType::I32 => uninit_compare_ordered::<i32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::I64 => uninit_compare_ordered::<i64>(op, dest, &lhs, &rhs, exec),
+        KernelDType::Bool => uninit_compare_ordered::<bool>(op, dest, &lhs, &rhs, exec),
+        KernelDType::C32 => uninit_compare_eq::<Complex32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::C64 => uninit_compare_eq::<Complex64>(op, dest, &lhs, &rhs, exec),
         _ => Err(StridedError::UnsupportedDType {
             dtype: dtype.label(),
         }),
-    })
+    }
 }
 
 /// Select elementwise between two same-dtype operands by a `bool` predicate,
@@ -243,7 +243,7 @@ pub fn erased_compare_into_uninit(
 /// use core::mem::MaybeUninit;
 /// use strided_kernel::{
 ///     erased_select_into_uninit, ErasedRawStridedPtr, ErasedRawStridedRef,
-///     ErasedRawStridedUninitMut, ExecContext, KernelDType,
+///     ErasedRawStridedUninitMut, Exec, KernelDType,
 /// };
 ///
 /// let pred = [true, false];
@@ -256,11 +256,11 @@ pub fn erased_compare_into_uninit(
 /// let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &[2], &[1], 0).unwrap();
 /// erased_select_into_uninit(
 ///     KernelDType::I64,
-///     &ExecContext::serial(),
 ///     &mut dest,
 ///     &ErasedRawStridedPtr::from_ref(&pred),
 ///     &ErasedRawStridedPtr::from_ref(&on_true),
 ///     &ErasedRawStridedPtr::from_ref(&on_false),
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// // SAFETY: a successful call initializes every reachable element.
@@ -273,11 +273,11 @@ pub fn erased_compare_into_uninit(
 /// overlap contracts. Validation completes before any write.
 pub fn erased_select_into_uninit(
     dtype: KernelDType,
-    ctx: &ExecContext,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     pred: &ErasedRawStridedPtr<'_>,
     on_true: &ErasedRawStridedPtr<'_>,
     on_false: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     check_dtype(dtype, dest.dtype())?;
     check_dtype(KernelDType::Bool, pred.dtype())?;
@@ -293,18 +293,18 @@ pub fn erased_select_into_uninit(
     // SAFETY: input/output overlap was rejected before forming references.
     let on_false = unsafe { on_false.try_as_ref_after_no_overlap() }?;
 
-    ctx.run(|| match dtype {
-        KernelDType::F32 => uninit_select::<f32>(dest, &pred, &on_true, &on_false),
-        KernelDType::F64 => uninit_select::<f64>(dest, &pred, &on_true, &on_false),
-        KernelDType::I32 => uninit_select::<i32>(dest, &pred, &on_true, &on_false),
-        KernelDType::I64 => uninit_select::<i64>(dest, &pred, &on_true, &on_false),
-        KernelDType::Bool => uninit_select::<bool>(dest, &pred, &on_true, &on_false),
-        KernelDType::C32 => uninit_select::<Complex32>(dest, &pred, &on_true, &on_false),
-        KernelDType::C64 => uninit_select::<Complex64>(dest, &pred, &on_true, &on_false),
+    match dtype {
+        KernelDType::F32 => uninit_select::<f32>(dest, &pred, &on_true, &on_false, exec),
+        KernelDType::F64 => uninit_select::<f64>(dest, &pred, &on_true, &on_false, exec),
+        KernelDType::I32 => uninit_select::<i32>(dest, &pred, &on_true, &on_false, exec),
+        KernelDType::I64 => uninit_select::<i64>(dest, &pred, &on_true, &on_false, exec),
+        KernelDType::Bool => uninit_select::<bool>(dest, &pred, &on_true, &on_false, exec),
+        KernelDType::C32 => uninit_select::<Complex32>(dest, &pred, &on_true, &on_false, exec),
+        KernelDType::C64 => uninit_select::<Complex64>(dest, &pred, &on_true, &on_false, exec),
         _ => Err(StridedError::UnsupportedDType {
             dtype: dtype.label(),
         }),
-    })
+    }
 }
 
 /// Clamp elementwise into uninitialized storage:
@@ -320,7 +320,7 @@ pub fn erased_select_into_uninit(
 /// use core::mem::MaybeUninit;
 /// use strided_kernel::{
 ///     erased_clamp_into_uninit, ErasedRawStridedPtr, ErasedRawStridedRef,
-///     ErasedRawStridedUninitMut, ExecContext, KernelDType,
+///     ErasedRawStridedUninitMut, Exec, KernelDType,
 /// };
 ///
 /// let x = [-3.0_f32, 0.5, 9.0];
@@ -334,11 +334,11 @@ pub fn erased_select_into_uninit(
 /// let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &[3], &[1], 0).unwrap();
 /// erased_clamp_into_uninit(
 ///     KernelDType::F32,
-///     &ExecContext::serial(),
 ///     &mut dest,
 ///     &ErasedRawStridedPtr::from_ref(&x),
 ///     &ErasedRawStridedPtr::from_ref(&lo),
 ///     &ErasedRawStridedPtr::from_ref(&hi),
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// // SAFETY: a successful call initializes every reachable element.
@@ -352,11 +352,11 @@ pub fn erased_select_into_uninit(
 /// overlap contracts. Validation completes before any write.
 pub fn erased_clamp_into_uninit(
     dtype: KernelDType,
-    ctx: &ExecContext,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     x: &ErasedRawStridedPtr<'_>,
     lo: &ErasedRawStridedPtr<'_>,
     hi: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     check_dtype(dtype, dest.dtype())?;
     check_dtype(dtype, x.dtype())?;
@@ -372,15 +372,15 @@ pub fn erased_clamp_into_uninit(
     // SAFETY: input/output overlap was rejected before forming references.
     let hi = unsafe { hi.try_as_ref_after_no_overlap() }?;
 
-    ctx.run(|| match dtype {
-        KernelDType::F32 => uninit_clamp::<f32>(dest, &x, &lo, &hi),
-        KernelDType::F64 => uninit_clamp::<f64>(dest, &x, &lo, &hi),
-        KernelDType::I32 => uninit_clamp::<i32>(dest, &x, &lo, &hi),
-        KernelDType::I64 => uninit_clamp::<i64>(dest, &x, &lo, &hi),
+    match dtype {
+        KernelDType::F32 => uninit_clamp::<f32>(dest, &x, &lo, &hi, exec),
+        KernelDType::F64 => uninit_clamp::<f64>(dest, &x, &lo, &hi, exec),
+        KernelDType::I32 => uninit_clamp::<i32>(dest, &x, &lo, &hi, exec),
+        KernelDType::I64 => uninit_clamp::<i64>(dest, &x, &lo, &hi, exec),
         _ => Err(StridedError::UnsupportedDType {
             dtype: dtype.label(),
         }),
-    })
+    }
 }
 
 /// Broadcast two same-dtype operands onto the destination axes and multiply
@@ -397,7 +397,7 @@ pub fn erased_clamp_into_uninit(
 /// use core::mem::MaybeUninit;
 /// use strided_kernel::{
 ///     erased_broadcast_mul_into_uninit, ErasedRawStridedPtr, ErasedRawStridedRef,
-///     ErasedRawStridedUninitMut, ExecContext, KernelDType,
+///     ErasedRawStridedUninitMut, Exec, KernelDType,
 /// };
 ///
 /// // Outer product: out[i, j] = a[i] * b[j], column-major 2 x 3 output.
@@ -410,12 +410,12 @@ pub fn erased_clamp_into_uninit(
 ///     ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &[2, 3], &[1, 2], 0).unwrap();
 /// erased_broadcast_mul_into_uninit(
 ///     KernelDType::F64,
-///     &ExecContext::serial(),
 ///     &mut dest,
 ///     &ErasedRawStridedPtr::from_ref(&a),
 ///     &[0],
 ///     &ErasedRawStridedPtr::from_ref(&b),
 ///     &[1],
+///     Exec::serial(),
 /// )
 /// .unwrap();
 /// // SAFETY: a successful call initializes every reachable element.
@@ -429,12 +429,12 @@ pub fn erased_clamp_into_uninit(
 /// output-layout, or overlap contracts. Validation completes before any write.
 pub fn erased_broadcast_mul_into_uninit(
     dtype: KernelDType,
-    ctx: &ExecContext,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedPtr<'_>,
     lhs_axes: &[usize],
     rhs: &ErasedRawStridedPtr<'_>,
     rhs_axes: &[usize],
+    exec: Exec<'_>,
 ) -> Result<()> {
     check_dtype(dtype, dest.dtype())?;
     check_dtype(dtype, lhs.dtype())?;
@@ -446,21 +446,25 @@ pub fn erased_broadcast_mul_into_uninit(
     // SAFETY: input/output overlap was rejected before forming references.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
-    ctx.run(|| match dtype {
-        KernelDType::F32 => uninit_broadcast_mul::<f32>(dest, &lhs, lhs_axes, &rhs, rhs_axes),
-        KernelDType::F64 => uninit_broadcast_mul::<f64>(dest, &lhs, lhs_axes, &rhs, rhs_axes),
-        KernelDType::C32 => uninit_broadcast_mul::<Complex32>(dest, &lhs, lhs_axes, &rhs, rhs_axes),
-        KernelDType::C64 => uninit_broadcast_mul::<Complex64>(dest, &lhs, lhs_axes, &rhs, rhs_axes),
+    match dtype {
+        KernelDType::F32 => uninit_broadcast_mul::<f32>(dest, &lhs, lhs_axes, &rhs, rhs_axes, exec),
+        KernelDType::F64 => uninit_broadcast_mul::<f64>(dest, &lhs, lhs_axes, &rhs, rhs_axes, exec),
+        KernelDType::C32 => {
+            uninit_broadcast_mul::<Complex32>(dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
+        }
+        KernelDType::C64 => {
+            uninit_broadcast_mul::<Complex64>(dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
+        }
         KernelDType::I32 => {
-            uninit_broadcast_mul_wrapping::<i32>(dest, &lhs, lhs_axes, &rhs, rhs_axes)
+            uninit_broadcast_mul_wrapping::<i32>(dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
         }
         KernelDType::I64 => {
-            uninit_broadcast_mul_wrapping::<i64>(dest, &lhs, lhs_axes, &rhs, rhs_axes)
+            uninit_broadcast_mul_wrapping::<i64>(dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
         }
         _ => Err(StridedError::UnsupportedDType {
             dtype: dtype.label(),
         }),
-    })
+    }
 }
 
 /// Validate the destination layout and the input shapes.
@@ -517,6 +521,7 @@ fn uninit_map<T: OneShotScalar>(
     op: ErasedMapOp,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     input: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     if !T::supports_map(op) {
         return Err(StridedError::UnsupportedOp {
@@ -527,17 +532,20 @@ fn uninit_map<T: OneShotScalar>(
     // Select the operation once, outside the element loop, so each replay
     // closure is monomorphic and the inner loop can vectorize.
     match op {
-        ErasedMapOp::Negate => {
-            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Negate, value))
-        }
+        ErasedMapOp::Negate => uninit_map_with::<T, T>(
+            dest,
+            input,
+            |value| T::map(ErasedMapOp::Negate, value),
+            exec,
+        ),
         ErasedMapOp::Conj => {
-            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Conj, value))
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Conj, value), exec)
         }
         ErasedMapOp::Abs => {
-            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Abs, value))
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Abs, value), exec)
         }
         ErasedMapOp::Sign => {
-            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Sign, value))
+            uninit_map_with::<T, T>(dest, input, |value| T::map(ErasedMapOp::Sign, value), exec)
         }
     }
 }
@@ -545,11 +553,12 @@ fn uninit_map<T: OneShotScalar>(
 fn uninit_map_with<D, A>(
     dest: &mut ErasedRawStridedUninitMut<'_>,
     input: &ErasedRawStridedRef<'_>,
-    map: impl Fn(A) -> D + crate::MaybeSync,
+    map: impl Fn(A) -> D + Sync,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + crate::MaybeSendSync + KernelStorageElement,
-    A: Copy + crate::MaybeSendSync + KernelStorageElement,
+    D: Copy + Send + Sync + KernelStorageElement,
+    A: Copy + Send + Sync + KernelStorageElement,
 {
     let Some(validated) = prepare_destination(dest, &[input.dims()])? else {
         return Ok(());
@@ -564,6 +573,7 @@ where
             &input,
             |value| MaybeUninit::new(map(value)),
             validated,
+            exec,
         )
     }
 }
@@ -573,6 +583,7 @@ fn uninit_zip<T: OneShotScalar>(
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedRef<'_>,
     rhs: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     if !T::supports_zip(op) {
         return Err(StridedError::UnsupportedOp {
@@ -605,6 +616,7 @@ fn uninit_zip<T: OneShotScalar>(
                     &rhs,
                     |lhs, rhs| MaybeUninit::new(T::zip(ErasedZipOp::$op, lhs, rhs)),
                     validated,
+                    exec,
                 )
             }
         };
@@ -624,10 +636,11 @@ fn uninit_compare_with<T>(
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedRef<'_>,
     rhs: &ErasedRawStridedRef<'_>,
-    compare: impl Fn(T, T) -> bool + crate::MaybeSync,
+    compare: impl Fn(T, T) -> bool + Sync,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     let Some(validated) = prepare_destination(dest, &[lhs.dims(), rhs.dims()])? else {
         return Ok(());
@@ -644,6 +657,7 @@ where
             &rhs,
             |lhs, rhs| MaybeUninit::new(compare(lhs, rhs)),
             validated,
+            exec,
         )
     }
 }
@@ -653,17 +667,18 @@ fn uninit_compare_ordered<T>(
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedRef<'_>,
     rhs: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement + PartialOrd,
+    T: Copy + Send + Sync + KernelStorageElement + PartialOrd,
 {
     // The comparison is selected once, outside the element loop.
     match op {
-        CompareOp::Eq => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a == b),
-        CompareOp::Lt => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a < b),
-        CompareOp::Le => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a <= b),
-        CompareOp::Gt => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a > b),
-        CompareOp::Ge => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a >= b),
+        CompareOp::Eq => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a == b, exec),
+        CompareOp::Lt => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a < b, exec),
+        CompareOp::Le => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a <= b, exec),
+        CompareOp::Gt => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a > b, exec),
+        CompareOp::Ge => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a >= b, exec),
         _ => Err(StridedError::UnsupportedOp {
             op: compare_label(op),
             dtype: T::DTYPE.label(),
@@ -676,12 +691,13 @@ fn uninit_compare_eq<T>(
     dest: &mut ErasedRawStridedUninitMut<'_>,
     lhs: &ErasedRawStridedRef<'_>,
     rhs: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement + PartialEq,
+    T: Copy + Send + Sync + KernelStorageElement + PartialEq,
 {
     match op {
-        CompareOp::Eq => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a == b),
+        CompareOp::Eq => uninit_compare_with::<T>(dest, lhs, rhs, |a, b| a == b, exec),
         _ => Err(StridedError::UnsupportedOp {
             op: compare_label(op),
             dtype: T::DTYPE.label(),
@@ -705,9 +721,10 @@ fn uninit_select<T>(
     pred: &ErasedRawStridedRef<'_>,
     on_true: &ErasedRawStridedRef<'_>,
     on_false: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     let dims: [&[usize]; 3] = [pred.dims(), on_true.dims(), on_false.dims()];
     if prepare_destination(dest, &dims)?.is_none() {
@@ -717,9 +734,14 @@ where
     let on_true = erased_view::<T>(on_true)?;
     let on_false = erased_view::<T>(on_false)?;
     let mut dest = uninit_view_mut::<T>(dest)?;
-    zip_map3_into(&mut dest, &pred, &on_true, &on_false, |pred, a, b| {
-        MaybeUninit::new(if pred { a } else { b })
-    })
+    zip_map3_into(
+        &mut dest,
+        &pred,
+        &on_true,
+        &on_false,
+        |pred, a, b| MaybeUninit::new(if pred { a } else { b }),
+        exec,
+    )
 }
 
 fn uninit_clamp<T: OneShotScalar>(
@@ -727,6 +749,7 @@ fn uninit_clamp<T: OneShotScalar>(
     x: &ErasedRawStridedRef<'_>,
     lo: &ErasedRawStridedRef<'_>,
     hi: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     let dims: [&[usize]; 3] = [x.dims(), lo.dims(), hi.dims()];
     if prepare_destination(dest, &dims)?.is_none() {
@@ -736,9 +759,14 @@ fn uninit_clamp<T: OneShotScalar>(
     let lo = erased_view::<T>(lo)?;
     let hi = erased_view::<T>(hi)?;
     let mut dest = uninit_view_mut::<T>(dest)?;
-    zip_map3_into(&mut dest, &x, &lo, &hi, |x, lo, hi| {
-        MaybeUninit::new(T::clamp(x, lo, hi))
-    })
+    zip_map3_into(
+        &mut dest,
+        &x,
+        &lo,
+        &hi,
+        |x, lo, hi| MaybeUninit::new(T::clamp(x, lo, hi)),
+        exec,
+    )
 }
 
 fn uninit_broadcast_mul<T>(
@@ -747,14 +775,15 @@ fn uninit_broadcast_mul<T>(
     lhs_axes: &[usize],
     rhs: &ErasedRawStridedRef<'_>,
     rhs_axes: &[usize],
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement + core::ops::Mul<Output = T>,
+    T: Copy + Send + Sync + KernelStorageElement + core::ops::Mul<Output = T>,
 {
     let lhs = erased_view::<T>(lhs)?;
     let rhs = erased_view::<T>(rhs)?;
     let mut dest = uninit_view_mut::<T>(dest)?;
-    broadcast_mul_into_uninit(&mut dest, &lhs, lhs_axes, &rhs, rhs_axes)
+    broadcast_mul_into_uninit(&mut dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
 }
 
 fn uninit_broadcast_mul_wrapping<T>(
@@ -763,10 +792,11 @@ fn uninit_broadcast_mul_wrapping<T>(
     lhs_axes: &[usize],
     rhs: &ErasedRawStridedRef<'_>,
     rhs_axes: &[usize],
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement,
-    Wrapping<T>: core::ops::Mul<Output = Wrapping<T>> + crate::MaybeSendSync,
+    T: Copy + Send + Sync + KernelStorageElement,
+    Wrapping<T>: core::ops::Mul<Output = Wrapping<T>> + Send + Sync,
 {
     let lhs_data = wrapping_slice(lhs.data_as::<T>()?);
     let rhs_data = wrapping_slice(rhs.data_as::<T>()?);
@@ -804,7 +834,7 @@ where
     };
     // SAFETY: the uninit descriptor validated every reachable offset.
     let mut dest = unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) };
-    broadcast_mul_into_uninit(&mut dest, &lhs, lhs_axes, &rhs, rhs_axes)
+    broadcast_mul_into_uninit(&mut dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
 }
 
 fn wrapping_slice<T>(data: &[T]) -> &[Wrapping<T>] {

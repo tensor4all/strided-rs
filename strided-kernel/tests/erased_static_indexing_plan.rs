@@ -1,9 +1,22 @@
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
 use strided_kernel::{
     ErasedConcatenatePlan, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr,
-    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReversePlan, ErasedSlicePlan,
-    ExecContext, KernelDType, StridedError,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReversePlan, ErasedSlicePlan, Exec,
+    KernelDType, StridedError,
 };
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
@@ -49,12 +62,8 @@ where
     let mut dest_ref =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut dest, &dims, &strides, 0).unwrap();
 
-    plan.execute_uninit(
-        &ExecContext::max_threads(2).unwrap(),
-        &mut dest_ref,
-        &operand_ptr,
-    )
-    .unwrap();
+    plan.execute_uninit(&mut dest_ref, &operand_ptr, bounded(2))
+        .unwrap();
 
     assert_eq!(assume_init_vec(dest), expected);
 }
@@ -86,7 +95,7 @@ where
     let mut dest_ref =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut empty_bytes, &dims, &strides, 0).unwrap();
 
-    plan.execute_uninit(&ExecContext::serial(), &mut dest_ref, &operand_ptr)
+    plan.execute_uninit(&mut dest_ref, &operand_ptr, Exec::serial())
         .unwrap();
 }
 
@@ -134,7 +143,7 @@ fn erased_reverse_uninit_handles_rank_above_inline_limit() {
     let mut dest_ref =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut dest, &dims, &strides, 0).unwrap();
 
-    plan.execute_uninit(&ExecContext::serial(), &mut dest_ref, &operand_ptr)
+    plan.execute_uninit(&mut dest_ref, &operand_ptr, Exec::serial())
         .unwrap();
 
     let dest = assume_init_vec(dest);
@@ -172,10 +181,10 @@ fn erased_pad_and_concatenate_uninit_cover_noncontiguous_and_multi_input_outputs
         ErasedRawStridedUninitMut::from_uninit_slice(&mut padded, &padded_dims, &padded_strides, 0)
             .unwrap();
     pad.execute_uninit(
-        &ExecContext::serial(),
         &mut padded_ref,
         &operand_ptr,
         as_bytes(&fill),
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(
@@ -211,7 +220,7 @@ fn erased_pad_and_concatenate_uninit_cover_noncontiguous_and_multi_input_outputs
         ErasedRawStridedUninitMut::from_uninit_slice(&mut joined, &concat_dims, &concat_strides, 0)
             .unwrap();
     concat
-        .execute_uninit(&ExecContext::serial(), &mut joined_ref, &inputs)
+        .execute_uninit(&mut joined_ref, &inputs, Exec::serial())
         .unwrap();
     assert_eq!(assume_init_vec(joined), [1, 2, 3, 4]);
 }
@@ -250,7 +259,7 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &dims, &strides, 0).unwrap();
 
     let error = plan
-        .execute_uninit(&ExecContext::serial(), &mut dest, &input_ptr)
+        .execute_uninit(&mut dest, &input_ptr, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(
@@ -300,7 +309,7 @@ fn erased_concatenate_validates_all_segment_offsets_before_writing() {
             .unwrap();
 
     let error = plan
-        .execute_uninit(&ExecContext::serial(), &mut dest_ref, &inputs)
+        .execute_uninit(&mut dest_ref, &inputs, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(error, StridedError::OffsetOverflow));
@@ -342,7 +351,7 @@ fn erased_slice_plan_executes_strided_static_slice() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest_ref, &operand_ref)
+    plan.execute(&mut dest_ref, &operand_ref, Exec::serial())
         .unwrap();
 
     assert_eq!(dest, [11.0, 13.0, 31.0, 33.0]);
@@ -361,12 +370,8 @@ fn erased_reverse_plan_executes_multi_axis_reverse() {
     let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
     let mut dest_ref = ErasedRawStridedMut::from_slice_mut(&mut dest, &dims, &strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::max_threads(1).unwrap(),
-        &mut dest_ref,
-        &operand_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, bounded(1))
+        .unwrap();
 
     assert_eq!(dest, [101, 100, 111, 110, 121, 120, 1, 0, 11, 10, 21, 20]);
 }
@@ -400,13 +405,8 @@ fn erased_pad_plan_fills_output_and_copies_cropped_interior_padded_input() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest_ref,
-        &operand_ref,
-        as_bytes(&fill),
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, as_bytes(&fill), Exec::serial())
+        .unwrap();
 
     assert_eq!(dest, [-1, 11, -1, 12, -1, -1]);
 }
@@ -441,13 +441,8 @@ where
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::max_threads(4).unwrap(),
-        &mut dest_ref,
-        &operand_ref,
-        as_bytes(&fill),
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, as_bytes(&fill), bounded(4))
+        .unwrap();
     assert_eq!(dest, expected);
 }
 
@@ -526,13 +521,8 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
         ErasedRawStridedRef::from_slice(&empty, &empty_dims, &empty_strides, 0).unwrap();
     let mut padded_ref =
         ErasedRawStridedMut::from_slice_mut(&mut padded, &padded_dims, &padded_strides, 0).unwrap();
-    plan.execute(
-        &ExecContext::serial(),
-        &mut padded_ref,
-        &empty_ref,
-        as_bytes(&fill),
-    )
-    .unwrap();
+    plan.execute(&mut padded_ref, &empty_ref, as_bytes(&fill), Exec::serial())
+        .unwrap();
     assert_eq!(padded, [-7; 3]);
 
     let scalar = [42i32];
@@ -544,10 +534,10 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
         ErasedRawStridedMut::from_slice_mut(&mut scalar_dest, &[], &[], 0).unwrap();
     scalar_plan
         .execute(
-            &ExecContext::serial(),
             &mut scalar_dest_ref,
             &scalar_ref,
             as_bytes(&fill),
+            Exec::serial(),
         )
         .unwrap();
     assert_eq!(scalar_dest, [42]);
@@ -574,12 +564,7 @@ fn erased_pad_handles_empty_rank_zero_and_noncontiguous_fallbacks() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut strided_dest, &dims, &dest_strides, 0).unwrap();
     fallback
-        .execute(
-            &ExecContext::serial(),
-            &mut dest_ref,
-            &operand_ref,
-            as_bytes(&fill),
-        )
+        .execute(&mut dest_ref, &operand_ref, as_bytes(&fill), Exec::serial())
         .unwrap();
     assert_eq!(strided_dest, [10, -9, 20, -9]);
 }
@@ -628,10 +613,10 @@ fn erased_pad_generic_cursor_matches_rank_scaling_ground_truth() {
         let mut dest_ref =
             ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
         plan.execute(
-            &ExecContext::serial(),
             &mut dest_ref,
             &operand_ref,
             as_bytes(&[-1i32]),
+            Exec::serial(),
         )
         .unwrap();
 
@@ -678,10 +663,10 @@ fn erased_pad_generic_cursor_handles_crops_negative_strides_offsets_and_holes() 
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 2).unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut dest_ref,
         &operand_ref,
         as_bytes(&[-7i32]),
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(dest, [30, -7, 40, 0, 50, -7, 60]);
@@ -696,10 +681,10 @@ fn erased_pad_generic_cursor_handles_crops_negative_strides_offsets_and_holes() 
         ErasedRawStridedMut::from_slice_mut(&mut fully_cropped, &[2], &[1], 0).unwrap();
     cropped_plan
         .execute(
-            &ExecContext::serial(),
             &mut cropped_dest,
             &cropped_ref,
             as_bytes(&[-9i32]),
+            Exec::serial(),
         )
         .unwrap();
     assert_eq!(fully_cropped, [-9, -9]);
@@ -729,13 +714,8 @@ fn erased_pad_contiguous_runs_honor_offsets_and_outer_axis_cropping() {
     let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 1).unwrap();
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &padded_dims, &strides, 1).unwrap();
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest_ref,
-        &operand_ref,
-        as_bytes(&fill),
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, as_bytes(&fill), Exec::serial())
+        .unwrap();
     assert_eq!(dest, [99, -7, 10, 20, 30, -7, 99]);
 
     let operand_dims = [2usize, 3];
@@ -762,13 +742,8 @@ fn erased_pad_contiguous_runs_honor_offsets_and_outer_axis_cropping() {
         ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest_ref,
-        &operand_ref,
-        as_bytes(&fill),
-    )
-    .unwrap();
+    plan.execute(&mut dest_ref, &operand_ref, as_bytes(&fill), Exec::serial())
+        .unwrap();
     assert_eq!(dest, [-7, 3, 4, -7, -7, 5, 6, -7]);
 }
 
@@ -807,7 +782,7 @@ fn erased_concatenate_plan_executes_three_input_axis_concatenate() {
     let mut dest_ref =
         ErasedRawStridedMut::from_slice_mut(&mut dest, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest_ref, &inputs)
+    plan.execute(&mut dest_ref, &inputs, Exec::serial())
         .unwrap();
 
     assert_eq!(dest, [0, 1, 10, 11, 20, 21, 30, 31]);
@@ -896,7 +871,7 @@ fn erased_static_indexing_plans_reject_mismatches_before_writing() {
         ErasedRawStridedMut::from_slice_mut(&mut f32_dest, &dims, &strides, 0).unwrap();
 
     let err = slice
-        .execute(&ExecContext::serial(), &mut dest_ref, &operand_ref)
+        .execute(&mut dest_ref, &operand_ref, Exec::serial())
         .unwrap_err();
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
     assert_eq!(f32_dest, [9.0, 9.0]);
@@ -921,7 +896,7 @@ fn erased_static_indexing_plans_reject_mismatches_before_writing() {
         ErasedRawStridedMut::from_slice_mut(&mut bool_dest, &dims, &strides, 0).unwrap();
 
     let err = pad
-        .execute(&ExecContext::serial(), &mut dest_ref, &operand_ref, &[2u8])
+        .execute(&mut dest_ref, &operand_ref, &[2u8], Exec::serial())
         .unwrap_err();
     assert!(matches!(err, StridedError::InvalidBoolByte { value: 2 }));
     assert_eq!(bool_dest, [false, false]);
@@ -961,13 +936,8 @@ fn erased_pad_single_pass_columns_matches_dense_generic_result() {
         let mut dest_ref =
             ErasedRawStridedMut::from_slice_mut(&mut initialized, &dest_dims, &dest_strides, 0)
                 .unwrap();
-        plan.execute(
-            &ExecContext::serial(),
-            &mut dest_ref,
-            &operand_ref,
-            as_bytes(&fill),
-        )
-        .unwrap();
+        plan.execute(&mut dest_ref, &operand_ref, as_bytes(&fill), Exec::serial())
+            .unwrap();
     }
 
     let mut storage = vec![MaybeUninit::new(f64::NAN); 72];
@@ -979,13 +949,8 @@ fn erased_pad_single_pass_columns_matches_dense_generic_result() {
             0,
         )
         .unwrap();
-        plan.execute_uninit(
-            &ExecContext::serial(),
-            &mut dest_ref,
-            &operand_ptr,
-            as_bytes(&fill),
-        )
-        .unwrap();
+        plan.execute_uninit(&mut dest_ref, &operand_ptr, as_bytes(&fill), Exec::serial())
+            .unwrap();
     }
     let values = assume_init_vec(storage);
     assert_eq!(values, initialized);

@@ -22,14 +22,13 @@
 
 use core::mem::MaybeUninit;
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use strided_basic::{
-    map_into_uninit_with_kernel, mul_into_uninit, with_execution_policy, zip_map2_into,
-    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ExecContext,
-    ExecutionPolicy, KernelDType, KernelStorageElement, MaybeSendSync, StridedView, StridedViewMut,
+    map_into_uninit_with_kernel, mul_into_uninit, zip_map2_into, ErasedRawStridedPtr,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, Exec, KernelDType, KernelStorageElement, Pool,
+    StridedView, StridedViewMut,
 };
 use strided_fused::{
     fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan, FusedScalar,
@@ -125,10 +124,26 @@ impl Row {
     }
 }
 
+/// Mints one token per call: serial for one thread, else `threads` slots of `pool`.
+#[derive(Clone, Copy)]
+struct Placement<'p> {
+    pool: &'p Pool,
+    threads: usize,
+}
+
+impl<'p> Placement<'p> {
+    fn exec(self) -> Exec<'p> {
+        if self.threads == 1 {
+            Exec::serial()
+        } else {
+            Exec::new(self.pool, self.threads).unwrap()
+        }
+    }
+}
+
 trait BenchScalar:
     FusedScalar
     + KernelStorageElement
-    + MaybeSendSync
     + Send
     + Sync
     + std::ops::Mul<Self, Output = Self>
@@ -180,10 +195,11 @@ fn ping_pong_mul<T: BenchScalar>(
     len: usize,
     first: &mut [MaybeUninit<T>],
     second: &mut [MaybeUninit<T>],
+    place: Placement<'_>,
 ) {
     {
         let mut dest = StridedViewMut::new(first, dims, strides, 0).unwrap();
-        mul_into_uninit(&mut dest, a_view, b_view).unwrap();
+        mul_into_uninit(&mut dest, a_view, b_view, place.exec()).unwrap();
     }
     for pass in 1..10 {
         // SAFETY: `first`/`second` are distinct buffers; the raw read of one and
@@ -193,13 +209,13 @@ fn ping_pong_mul<T: BenchScalar>(
                 unsafe { std::slice::from_raw_parts(first.as_ptr().cast::<T>(), len) };
             let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
             let mut dest = StridedViewMut::new(second, dims, strides, 0).unwrap();
-            mul_into_uninit(&mut dest, &src, b_view).unwrap();
+            mul_into_uninit(&mut dest, &src, b_view, place.exec()).unwrap();
         } else {
             let src_data: &[T] =
                 unsafe { std::slice::from_raw_parts(second.as_ptr().cast::<T>(), len) };
             let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
             let mut dest = StridedViewMut::new(first, dims, strides, 0).unwrap();
-            mul_into_uninit(&mut dest, &src, b_view).unwrap();
+            mul_into_uninit(&mut dest, &src, b_view, place.exec()).unwrap();
         }
     }
 }
@@ -213,6 +229,7 @@ fn ping_pong_tanh<T: BenchScalar>(
     len: usize,
     first: &mut [MaybeUninit<T>],
     second: &mut [MaybeUninit<T>],
+    place: Placement<'_>,
 ) {
     let map = |dest: &mut [MaybeUninit<T>], src: &StridedView<'_, T>| {
         let mut dest = StridedViewMut::new(dest, dims, strides, 0).unwrap();
@@ -224,6 +241,7 @@ fn ping_pong_tanh<T: BenchScalar>(
                 true
             },
             |value| value,
+            place.exec(),
         )
         .unwrap();
     };
@@ -262,25 +280,35 @@ fn per_instruction<T: BenchScalar>(
     dims: &[usize],
     len: usize,
     buffers: &mut [Vec<MaybeUninit<T>>; 3],
+    place: Placement<'_>,
 ) {
     let [buffer0, buffer1, buffer2] = buffers;
     let a_view = StridedView::<T>::new(a_data, dims, a_strides, 0).unwrap();
     let b_view = StridedView::<T>::new(b_data, dims, b_strides, 0).unwrap();
     match row {
-        Row::Tanh => ping_pong_tanh(&a_view, dims, b_strides, len, buffer0, buffer1),
-        Row::Mul | Row::BroadcastMul => {
-            ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer0, buffer1)
-        }
+        Row::Tanh => ping_pong_tanh(&a_view, dims, b_strides, len, buffer0, buffer1, place),
+        Row::Mul | Row::BroadcastMul => ping_pong_mul(
+            &a_view, &b_view, dims, b_strides, len, buffer0, buffer1, place,
+        ),
         Row::TwoOutput => {
             // The shared chain runs once and ends in `buffer1`.
-            ping_pong_mul(&a_view, &b_view, dims, b_strides, len, buffer0, buffer1);
+            ping_pong_mul(
+                &a_view, &b_view, dims, b_strides, len, buffer0, buffer1, place,
+            );
             // SAFETY: `buffer1` is read through a raw pointer while `buffer2`
             // is written; they are distinct buffers.
             let chain_data: &[T] =
                 unsafe { std::slice::from_raw_parts(buffer1.as_ptr().cast::<T>(), len) };
             let chain = StridedView::<T>::new(chain_data, dims, b_strides, 0).unwrap();
             let mut dest = StridedViewMut::new(buffer2, dims, b_strides, 0).unwrap();
-            zip_map2_into(&mut dest, &chain, &a_view, |x, y| MaybeUninit::new(x + y)).unwrap();
+            zip_map2_into(
+                &mut dest,
+                &chain,
+                &a_view,
+                |x, y| MaybeUninit::new(x + y),
+                place.exec(),
+            )
+            .unwrap();
         }
     }
 }
@@ -290,8 +318,9 @@ fn bench_size<T: BenchScalar>(
     label: &str,
     rows: usize,
     cols: usize,
-    threads: usize,
+    place: Placement<'_>,
 ) {
+    let threads = place.threads;
     let len = rows * cols;
     let dims = [rows, cols];
     let cont = [1isize, rows as isize];
@@ -333,7 +362,8 @@ fn bench_size<T: BenchScalar>(
                 .collect();
             group.bench_function("fused_typed", |bencher| {
                 bencher.iter(|| {
-                    fused_elementwise_into(&mut typed_views, &input_views, &plan).unwrap();
+                    fused_elementwise_into(&mut typed_views, &input_views, &plan, place.exec())
+                        .unwrap();
                     black_box(typed_views[0].as_mut_ptr());
                 });
             });
@@ -359,11 +389,10 @@ fn bench_size<T: BenchScalar>(
                 ErasedRawStridedUninitMut::from_uninit_slice(data, &dims, &cont, 0).unwrap()
             })
             .collect();
-        let ctx = ExecContext::ambient();
         group.bench_function("fused_erased_uninit", |bencher| {
             bencher.iter(|| {
                 erased
-                    .execute_outputs_uninit(&ctx, &mut erased_views, &pointers)
+                    .execute_outputs_uninit(&mut erased_views, &pointers, place.exec())
                     .unwrap();
                 black_box(erased_views[0].dims());
             });
@@ -374,7 +403,17 @@ fn bench_size<T: BenchScalar>(
             std::array::from_fn(|_| vec![MaybeUninit::uninit(); len]);
         group.bench_function("per_instruction_dispatch", |bencher| {
             bencher.iter(|| {
-                per_instruction(row, a_data, a_strides, &b, &cont, &dims, len, &mut buffers);
+                per_instruction(
+                    row,
+                    a_data,
+                    a_strides,
+                    &b,
+                    &cont,
+                    &dims,
+                    len,
+                    &mut buffers,
+                    place,
+                );
                 black_box(buffers[0].as_ptr());
             });
         });
@@ -395,25 +434,21 @@ fn thread_counts() -> [usize; 1] {
 
 fn benchmarks(c: &mut Criterion) {
     for threads in thread_counts() {
+        let pool = Pool::builder().threads(threads).build().unwrap();
         if threads > 1 {
             assert!(
-                rayon::current_num_threads() >= threads,
-                "run with RAYON_NUM_THREADS>={threads} so the {threads}-thread rows are real"
+                Exec::new(&pool, threads).unwrap().budget().get() >= threads,
+                "the {threads}-thread rows need a pool of at least {threads} workers"
             );
         }
-        let policy = if threads == 1 {
-            ExecutionPolicy::Sequential
-        } else {
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(threads).unwrap(),
-            }
+        let place = Placement {
+            pool: &pool,
+            threads,
         };
-        with_execution_policy(policy, || {
-            for (rows, cols) in [(1024usize, 64usize), (4096, 256)] {
-                bench_size::<f64>(c, "f64", rows, cols, threads);
-                bench_size::<f32>(c, "f32", rows, cols, threads);
-            }
-        });
+        for (rows, cols) in [(1024usize, 64usize), (4096, 256)] {
+            bench_size::<f64>(c, "f64", rows, cols, place);
+            bench_size::<f32>(c, "f32", rows, cols, place);
+        }
     }
 }
 

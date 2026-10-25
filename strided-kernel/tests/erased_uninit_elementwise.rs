@@ -2,6 +2,19 @@
 //! against the initialized one-shot entries and naive loops, plus semantics
 //! and boundary-validation checks.
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use num_complex::{Complex32, Complex64};
@@ -9,7 +22,7 @@ use strided_kernel::{
     erased_broadcast_mul_into_uninit, erased_clamp_into_uninit, erased_compare_into_uninit,
     erased_map_into, erased_map_into_uninit, erased_select_into_uninit, erased_zip_into,
     erased_zip_into_uninit, plan_lazy_outer_product, CompareOp, ErasedMapOp, ErasedRawStridedMut,
-    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, ExecContext,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, Exec,
     KernelDType, KernelStorageElement, StridedError,
 };
 
@@ -18,8 +31,8 @@ const DIMS: [usize; 2] = [3, 4];
 const T_STRIDES: [isize; 2] = [4, 1];
 const C_STRIDES: [isize; 2] = [1, 3];
 
-fn contexts() -> [ExecContext; 2] {
-    [ExecContext::serial(), ExecContext::max_threads(4).unwrap()]
+fn contexts() -> [Exec<'static>; 2] {
+    [Exec::serial(), bounded(4)]
 }
 
 fn f64_values(seed: u64) -> Vec<f64> {
@@ -53,7 +66,7 @@ fn run_map<T: KernelStorageElement + Copy + Default, D: KernelStorageElement + C
     dtype: KernelDType,
     op: ErasedMapOp,
     input: &[T],
-    ctx: &ExecContext,
+    mut ctx: Exec<'_>,
 ) -> (Vec<D>, Vec<D>) {
     let source = ErasedRawStridedRef::from_slice(input, &DIMS, &T_STRIDES, 0).unwrap();
     let mut expected = vec![D::default(); 12];
@@ -62,9 +75,9 @@ fn run_map<T: KernelStorageElement + Copy + Default, D: KernelStorageElement + C
     erased_map_into(
         dtype,
         op,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&source),
+        ctx.reborrow(),
     )
     .unwrap();
     let mut out = vec![MaybeUninit::<D>::uninit(); 12];
@@ -73,9 +86,9 @@ fn run_map<T: KernelStorageElement + Copy + Default, D: KernelStorageElement + C
     erased_map_into_uninit(
         dtype,
         op,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&source),
+        ctx.reborrow(),
     )
     .unwrap();
     (init(out), expected)
@@ -89,7 +102,7 @@ fn map_uninit_matches_initialized_entry_for_every_dtype_and_op() {
         ErasedMapOp::Abs,
         ErasedMapOp::Sign,
     ];
-    for ctx in contexts() {
+    for mut ctx in contexts() {
         let reals = f64_values(3);
         let ints = i64_values(4);
         let complex: Vec<Complex64> = reals
@@ -98,21 +111,23 @@ fn map_uninit_matches_initialized_entry_for_every_dtype_and_op() {
             .map(|(&re, im)| Complex64::new(re, im))
             .collect();
         for op in ops {
-            let (got, want) = run_map::<f64, f64>(KernelDType::F64, op, &reals, &ctx);
+            let (got, want) = run_map::<f64, f64>(KernelDType::F64, op, &reals, ctx.reborrow());
             assert_eq!(got, want);
-            let (got, want) = run_map::<i64, i64>(KernelDType::I64, op, &ints, &ctx);
+            let (got, want) = run_map::<i64, i64>(KernelDType::I64, op, &ints, ctx.reborrow());
             assert_eq!(got, want);
             if op == ErasedMapOp::Abs {
-                let (got, want) = run_map::<Complex64, f64>(KernelDType::C64, op, &complex, &ctx);
+                let (got, want) =
+                    run_map::<Complex64, f64>(KernelDType::C64, op, &complex, ctx.reborrow());
                 assert_eq!(got, want);
             } else {
                 let (got, want) =
-                    run_map::<Complex64, Complex64>(KernelDType::C64, op, &complex, &ctx);
+                    run_map::<Complex64, Complex64>(KernelDType::C64, op, &complex, ctx.reborrow());
                 assert_eq!(got, want);
             }
         }
         let bools: Vec<bool> = (0..12).map(|i| i % 3 == 0).collect();
-        let (got, want) = run_map::<bool, bool>(KernelDType::Bool, ErasedMapOp::Conj, &bools, &ctx);
+        let (got, want) =
+            run_map::<bool, bool>(KernelDType::Bool, ErasedMapOp::Conj, &bools, ctx.reborrow());
         assert_eq!(got, want);
     }
 }
@@ -133,9 +148,9 @@ fn complex_sign_keeps_unit_phase_for_tiny_magnitudes() {
             erased_map_into_uninit(
                 KernelDType::C64,
                 ErasedMapOp::Sign,
-                &ExecContext::serial(),
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&source),
+                Exec::serial(),
             )
             .unwrap();
             init(out)
@@ -145,9 +160,9 @@ fn complex_sign_keeps_unit_phase_for_tiny_magnitudes() {
             erased_map_into(
                 KernelDType::C64,
                 ErasedMapOp::Sign,
-                &ExecContext::serial(),
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&source),
+                Exec::serial(),
             )
             .unwrap();
             out
@@ -163,9 +178,9 @@ fn complex_sign_keeps_unit_phase_for_tiny_magnitudes() {
     erased_map_into_uninit(
         KernelDType::C32,
         ErasedMapOp::Sign,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&source),
+        Exec::serial(),
     )
     .unwrap();
     let got = unsafe { out[0].assume_init() };
@@ -177,7 +192,7 @@ fn run_zip<T: KernelStorageElement + Copy + Default>(
     op: ErasedZipOp,
     lhs: &[T],
     rhs: &[T],
-    ctx: &ExecContext,
+    mut ctx: Exec<'_>,
 ) -> (Result<Vec<T>, StridedError>, Result<Vec<T>, StridedError>) {
     let lhs = ErasedRawStridedRef::from_slice(lhs, &DIMS, &T_STRIDES, 0).unwrap();
     let rhs = ErasedRawStridedRef::from_slice(rhs, &DIMS, &C_STRIDES, 0).unwrap();
@@ -187,10 +202,10 @@ fn run_zip<T: KernelStorageElement + Copy + Default>(
     let want = erased_zip_into(
         dtype,
         op,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs),
         &ErasedRawStridedPtr::from_ref(&rhs),
+        ctx.reborrow(),
     )
     .map(|()| expected);
     let mut out = vec![MaybeUninit::<T>::uninit(); 12];
@@ -199,10 +214,10 @@ fn run_zip<T: KernelStorageElement + Copy + Default>(
     let got = erased_zip_into_uninit(
         dtype,
         op,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs),
         &ErasedRawStridedPtr::from_ref(&rhs),
+        ctx.reborrow(),
     )
     .map(|()| init(out));
     (got, want)
@@ -225,7 +240,7 @@ fn zip_uninit_matches_initialized_entry_including_nan_and_wrapping() {
         ErasedZipOp::Maximum,
         ErasedZipOp::Minimum,
     ];
-    for ctx in contexts() {
+    for mut ctx in contexts() {
         let mut lhs = f64_values(7);
         let mut rhs = f64_values(8);
         lhs[2] = f64::NAN;
@@ -239,9 +254,9 @@ fn zip_uninit_matches_initialized_entry_including_nan_and_wrapping() {
             .map(|v| if *v == 0 { 3 } else { *v })
             .collect();
         for op in ops {
-            let (got, want) = run_zip(KernelDType::F64, op, &lhs, &rhs, &ctx);
+            let (got, want) = run_zip(KernelDType::F64, op, &lhs, &rhs, ctx.reborrow());
             assert!(same_bits(&got.unwrap(), &want.unwrap()), "{op:?}");
-            let (got, want) = run_zip(KernelDType::I64, op, &ints_lhs, &ints_rhs, &ctx);
+            let (got, want) = run_zip(KernelDType::I64, op, &ints_lhs, &ints_rhs, ctx.reborrow());
             assert_eq!(got.unwrap(), want.unwrap(), "{op:?}");
         }
     }
@@ -251,7 +266,7 @@ fn zip_uninit_matches_initialized_entry_including_nan_and_wrapping() {
         ErasedZipOp::Multiply,
         &[i64::MAX; 12],
         &[2; 12],
-        &ExecContext::serial(),
+        Exec::serial(),
     );
     assert!(got.unwrap().iter().all(|&v| v == -2));
 }
@@ -280,10 +295,10 @@ fn zip_uninit_rejects_integer_zero_divisor_before_writes_at_high_rank() {
             let err = erased_zip_into_uninit(
                 KernelDType::I32,
                 op,
-                &ExecContext::serial(),
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&lhs),
                 &ErasedRawStridedPtr::from_ref(&rhs),
+                Exec::serial(),
             )
             .unwrap_err();
             assert!(matches!(err, StridedError::IntegerDivisionByZero { .. }));
@@ -296,7 +311,7 @@ fn zip_uninit_rejects_integer_zero_divisor_before_writes_at_high_rank() {
         ErasedZipOp::Divide,
         &[i32::MIN; 12],
         &[-1; 12],
-        &ExecContext::serial(),
+        Exec::serial(),
     );
     assert!(got.unwrap().iter().all(|&v| v == i32::MIN));
 }
@@ -316,10 +331,10 @@ fn compare<T: KernelStorageElement + Copy>(
     erased_compare_into_uninit(
         dtype,
         op,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs),
         &ErasedRawStridedPtr::from_ref(&rhs),
+        Exec::serial(),
     )
     .map(|()| init(out))
 }
@@ -388,18 +403,18 @@ fn select_uninit_matches_naive_for_every_dtype_with_strided_and_broadcast_operan
         // A stride-0 descriptor broadcasts one value.
         let on_false_ref =
             ErasedRawStridedRef::from_slice(&on_false_arr, &DIMS, &[0, 0], 0).unwrap();
-        for ctx in contexts() {
+        for mut ctx in contexts() {
             let mut out = vec![MaybeUninit::<T>::uninit(); 12];
             let mut dest =
                 ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &DIMS, &C_STRIDES, 0)
                     .unwrap();
             erased_select_into_uninit(
                 dtype,
-                &ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(pred_ref),
                 &ErasedRawStridedPtr::from_ref(&on_true_ref),
                 &ErasedRawStridedPtr::from_ref(&on_false_ref),
+                ctx.reborrow(),
             )
             .unwrap();
             let got = init(out);
@@ -448,11 +463,11 @@ fn clamp<T: KernelStorageElement + Copy>(
     let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(&mut out, n, &[1], 0).unwrap();
     erased_clamp_into_uninit(
         dtype,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&x),
         &ErasedRawStridedPtr::from_ref(&lo),
         &ErasedRawStridedPtr::from_ref(&hi),
+        Exec::serial(),
     )
     .map(|()| init(out))
 }
@@ -536,7 +551,6 @@ fn naive_broadcast_mul<T: Copy>(
 #[allow(clippy::too_many_arguments)]
 fn broadcast_mul<T: KernelStorageElement + Copy>(
     dtype: KernelDType,
-    ctx: &ExecContext,
     out_dims: &[usize],
     out_strides: &[isize],
     out_len: usize,
@@ -544,18 +558,19 @@ fn broadcast_mul<T: KernelStorageElement + Copy>(
     lhs_axes: &[usize],
     rhs: &ErasedRawStridedRef<'_>,
     rhs_axes: &[usize],
+    mut ctx: Exec<'_>,
 ) -> Result<Vec<T>, StridedError> {
     let mut out = vec![MaybeUninit::<T>::uninit(); out_len];
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut out, out_dims, out_strides, 0).unwrap();
     erased_broadcast_mul_into_uninit(
         dtype,
-        ctx,
         &mut dest,
         &ErasedRawStridedPtr::from_ref(lhs),
         lhs_axes,
         &ErasedRawStridedPtr::from_ref(rhs),
         rhs_axes,
+        ctx.reborrow(),
     )
     .map(|()| init(out))
 }
@@ -581,10 +596,9 @@ fn broadcast_mul_uninit_matches_naive_batched_outer_product() {
     );
     let lhs_ref = ErasedRawStridedRef::from_slice(&lhs, &[2, 3], &lhs_strides, 0).unwrap();
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &[4, 2], &rhs_strides, 0).unwrap();
-    for ctx in contexts() {
+    for mut ctx in contexts() {
         let got = broadcast_mul::<f64>(
             KernelDType::F64,
-            &ctx,
             &out_dims,
             &out_strides,
             24,
@@ -592,6 +606,7 @@ fn broadcast_mul_uninit_matches_naive_batched_outer_product() {
             &[2, 0],
             &rhs_ref,
             &[1, 2],
+            ctx.reborrow(),
         )
         .unwrap();
         assert_eq!(got, want);
@@ -612,7 +627,6 @@ fn broadcast_mul_uninit_matches_naive_batched_outer_product() {
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs_c, &[4, 2], &rhs_strides, 0).unwrap();
     let got = broadcast_mul::<Complex64>(
         KernelDType::C64,
-        &ExecContext::serial(),
         &out_dims,
         &out_strides,
         24,
@@ -620,6 +634,7 @@ fn broadcast_mul_uninit_matches_naive_batched_outer_product() {
         &[2, 0],
         &rhs_ref,
         &[1, 2],
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(got, want);
@@ -632,10 +647,9 @@ fn broadcast_mul_uninit_wraps_integer_overflow_and_broadcasts_scalars() {
     let lhs_ref = ErasedRawStridedRef::from_slice(&lhs, &[3], &[1], 0).unwrap();
     // Rank-0 operand broadcast over the output.
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &[], &[], 0).unwrap();
-    for ctx in contexts() {
+    for mut ctx in contexts() {
         let got = broadcast_mul::<i32>(
             KernelDType::I32,
-            &ctx,
             &[3],
             &[1],
             3,
@@ -643,6 +657,7 @@ fn broadcast_mul_uninit_wraps_integer_overflow_and_broadcasts_scalars() {
             &[0],
             &rhs_ref,
             &[],
+            ctx.reborrow(),
         )
         .unwrap();
         assert_eq!(got, [-2, 6, 0]);
@@ -653,7 +668,6 @@ fn broadcast_mul_uninit_wraps_integer_overflow_and_broadcasts_scalars() {
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &[3], &[1], 0).unwrap();
     let got = broadcast_mul::<i64>(
         KernelDType::I64,
-        &ExecContext::serial(),
         &[2, 3],
         &[1, 2],
         6,
@@ -661,6 +675,7 @@ fn broadcast_mul_uninit_wraps_integer_overflow_and_broadcasts_scalars() {
         &[0],
         &rhs_ref,
         &[1],
+        Exec::serial(),
     )
     .unwrap();
     let want = naive_broadcast_mul(
@@ -683,7 +698,6 @@ fn broadcast_mul_uninit_rejects_bool_and_invalid_axes() {
     assert!(matches!(
         broadcast_mul::<bool>(
             KernelDType::Bool,
-            &ExecContext::serial(),
             &[2],
             &[1],
             2,
@@ -691,6 +705,7 @@ fn broadcast_mul_uninit_rejects_bool_and_invalid_axes() {
             &[0],
             &bools,
             &[0],
+            Exec::serial()
         ),
         Err(StridedError::UnsupportedDType { .. })
     ));
@@ -699,7 +714,6 @@ fn broadcast_mul_uninit_rejects_bool_and_invalid_axes() {
     for axes in [&[1usize][..], &[0, 0][..]] {
         assert!(broadcast_mul::<f64>(
             KernelDType::F64,
-            &ExecContext::serial(),
             &[2],
             &[1],
             2,
@@ -707,6 +721,7 @@ fn broadcast_mul_uninit_rejects_bool_and_invalid_axes() {
             axes,
             &operand,
             &[0],
+            Exec::serial()
         )
         .is_err());
     }
@@ -755,7 +770,6 @@ fn lazy_outer_product_layout_filled_by_broadcast_mul_matches_logical_product() {
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs[..4], &rhs_dims, &rhs_strides, 0).unwrap();
     let base = broadcast_mul::<f64>(
         KernelDType::F64,
-        &ExecContext::serial(),
         &out_dims,
         &layout.output_strides,
         base_len,
@@ -763,6 +777,7 @@ fn lazy_outer_product_layout_filled_by_broadcast_mul_matches_logical_product() {
         &lhs_axes,
         &rhs_ref,
         &rhs_axes,
+        Exec::serial(),
     )
     .unwrap();
     // The base is written in physical order and read back through the strides.
@@ -803,7 +818,7 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
     let flags = [true; 4];
     let flags = ErasedRawStridedRef::from_slice(&flags, &dims, &strides, 0).unwrap();
     let flags = ErasedRawStridedPtr::from_ref(&flags);
-    let ctx = ExecContext::serial();
+    let mut ctx = Exec::serial();
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     let overlap = |result: Result<(), StridedError>, input: usize| {
@@ -816,9 +831,9 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
         erased_map_into_uninit(
             KernelDType::F64,
             ErasedMapOp::Negate,
-            &ctx,
             &mut dest,
             &overlapping,
+            ctx.reborrow(),
         ),
         0,
     );
@@ -826,44 +841,44 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
         erased_zip_into_uninit(
             KernelDType::F64,
             ErasedZipOp::Add,
-            &ctx,
             &mut dest,
             &other,
             &overlapping,
+            ctx.reborrow(),
         ),
         1,
     );
     overlap(
         erased_select_into_uninit(
             KernelDType::F64,
-            &ctx,
             &mut dest,
             &flags,
             &other,
             &overlapping,
+            ctx.reborrow(),
         ),
         2,
     );
     overlap(
         erased_clamp_into_uninit(
             KernelDType::F64,
-            &ctx,
             &mut dest,
             &overlapping,
             &other,
             &other,
+            ctx.reborrow(),
         ),
         0,
     );
     overlap(
         erased_broadcast_mul_into_uninit(
             KernelDType::F64,
-            &ctx,
             &mut dest,
             &other,
             &[0],
             &overlapping,
             &[0],
+            ctx.reborrow(),
         ),
         1,
     );
@@ -871,10 +886,10 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
         erased_zip_into_uninit(
             KernelDType::F32,
             ErasedZipOp::Add,
-            &ctx,
             &mut dest,
             &other,
-            &other
+            &other,
+            ctx.reborrow()
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
@@ -882,10 +897,10 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
         erased_compare_into_uninit(
             KernelDType::F64,
             CompareOp::Eq,
-            &ctx,
             &mut dest,
             &other,
-            &other
+            &other,
+            ctx.reborrow()
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
@@ -893,10 +908,10 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
         erased_zip_into_uninit(
             KernelDType::Bool,
             ErasedZipOp::Add,
-            &ctx,
             &mut dest,
             &flags,
-            &flags
+            &flags,
+            ctx.reborrow()
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
@@ -908,16 +923,16 @@ fn uninit_entries_reject_shape_mismatch_and_non_injective_output() {
     let values = [1.0f64; 4];
     let input = ErasedRawStridedRef::from_slice(&values, &[4], &[1], 0).unwrap();
     let input = ErasedRawStridedPtr::from_ref(&input);
-    let ctx = ExecContext::serial();
+    let mut ctx = Exec::serial();
     let mut out = vec![MaybeUninit::<f64>::uninit(); 3];
     let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &[3], &[1], 0).unwrap();
     assert!(matches!(
         erased_map_into_uninit(
             KernelDType::F64,
             ErasedMapOp::Negate,
-            &ctx,
             &mut dest,
-            &input
+            &input,
+            ctx.reborrow()
         ),
         Err(StridedError::ShapeMismatch(..) | StridedError::RankMismatch(..))
     ));
@@ -927,10 +942,10 @@ fn uninit_entries_reject_shape_mismatch_and_non_injective_output() {
         erased_zip_into_uninit(
             KernelDType::F64,
             ErasedZipOp::Add,
-            &ctx,
             &mut dest,
             &input,
-            &input
+            &input,
+            ctx.reborrow()
         ),
         Err(StridedError::NonInjectiveOutputLayout)
     ));

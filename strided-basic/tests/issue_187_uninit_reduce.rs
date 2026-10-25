@@ -1,9 +1,12 @@
+mod common;
+use common::Budget;
 use core::fmt::Debug;
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
+use strided_basic::Exec;
 use strided_basic::{
     ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    ErasedReducePlan, ExecContext, KernelDType, KernelStorageElement, ReduceOp,
+    ErasedReducePlan, KernelDType, KernelStorageElement, ReduceOp,
 };
 
 fn assert_uninit_replay<T>(input: Vec<T>, dtype: KernelDType, op: ReduceOp, expected: T)
@@ -17,7 +20,7 @@ where
     let mut initialized = [T::default()];
     let mut initialized_dest =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut initialized_dest, &source)
+    plan.execute(&mut initialized_dest, &source, Exec::serial())
         .unwrap();
     assert_eq!(initialized[0], expected);
 
@@ -25,9 +28,9 @@ where
     let mut uninitialized_dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &[], &[], 0).unwrap();
     plan.execute_uninit(
-        &ExecContext::serial(),
         &mut uninitialized_dest,
         &ErasedRawStridedPtr::from_ref(&source),
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(
@@ -46,22 +49,23 @@ macro_rules! differential {
             let plan = ErasedReducePlan::compile($dtype, ReduceOp::Sum, &dims, &strides).unwrap();
             let source = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
             let contexts = [
-                ExecContext::serial(),
-                ExecContext::max_threads(1).unwrap(),
-                ExecContext::max_threads(2).unwrap(),
-                ExecContext::max_threads(4).unwrap(),
+                Budget::Serial,
+                Budget::Pooled(1),
+                Budget::Pooled(2),
+                Budget::Pooled(4),
             ];
             for ctx in contexts {
                 let mut expected = [<$ty as Default>::default()];
                 let mut initialized =
                     ErasedRawStridedMut::from_slice_mut(&mut expected, &[], &[], 0).unwrap();
-                plan.execute(&ctx, &mut initialized, &source).unwrap();
+                plan.execute(&mut initialized, &source, ctx.exec()).unwrap();
 
                 let mut raw = vec![MaybeUninit::<$ty>::uninit(); 1];
                 let mut uninit =
                     ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &[], &[], 0).unwrap();
                 let source_ptr = ErasedRawStridedPtr::from_ref(&source);
-                plan.execute_uninit(&ctx, &mut uninit, &source_ptr).unwrap();
+                plan.execute_uninit(&mut uninit, &source_ptr, ctx.exec())
+                    .unwrap();
                 assert_eq!(unsafe { raw[0].assume_init_ref() }, &expected[0]);
             }
         }
@@ -123,7 +127,7 @@ fn axis_holes_negative_stride_and_identity_match() {
     expected[2] = input[5] * input[5] + input[3] * input[3] + input[1] * input[1];
     let mut initialized =
         ErasedRawStridedMut::from_slice_mut(&mut expected, &dest_dims, &dest_strides, 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut initialized, &source)
+    plan.execute(&mut initialized, &source, Exec::serial())
         .unwrap();
 
     let mut raw = vec![MaybeUninit::<f64>::new(0x5a as f64); 4];
@@ -132,12 +136,8 @@ fn axis_holes_negative_stride_and_identity_match() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dest_dims, &dest_strides, 0)
             .unwrap();
     let source_ptr = ErasedRawStridedPtr::from_ref(&source);
-    plan.execute_uninit(
-        &ExecContext::max_threads(4).unwrap(),
-        &mut uninit,
-        &source_ptr,
-    )
-    .unwrap();
+    plan.execute_uninit(&mut uninit, &source_ptr, Budget::Pooled(4).exec())
+        .unwrap();
     assert_eq!(unsafe { raw[0].assume_init_ref() }, &expected[0]);
     assert_eq!(unsafe { raw[2].assume_init_ref() }, &expected[2]);
     assert_eq!(unsafe { raw[1].assume_init_ref() }, unsafe {
@@ -168,15 +168,15 @@ fn uninit_reduce_product_and_nonfinite_match_initialized_replay() {
     let mut initialized = [0.0f64];
     let mut initialized_dest =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut initialized_dest, &source)
+    plan.execute(&mut initialized_dest, &source, Exec::serial())
         .unwrap();
     let mut uninitialized = vec![MaybeUninit::new(0.0f64)];
     let mut uninitialized_dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &[], &[], 0).unwrap();
     plan.execute_uninit(
-        &ExecContext::serial(),
         &mut uninitialized_dest,
         &ErasedRawStridedPtr::from_ref(&source),
+        Exec::serial(),
     )
     .unwrap();
     assert!(initialized[0].is_nan());
@@ -206,9 +206,9 @@ fn validation_errors_leave_uninitialized_bytes_untouched() {
     let wrong = ErasedRawStridedRef::from_slice(&[1i32, 2], &dims, &[1], 0).unwrap();
     assert!(plan
         .execute_uninit(
-            &ExecContext::serial(),
             &mut dest,
-            &ErasedRawStridedPtr::from_ref(&wrong)
+            &ErasedRawStridedPtr::from_ref(&wrong),
+            Exec::serial()
         )
         .is_err());
     assert_eq!(
@@ -217,9 +217,9 @@ fn validation_errors_leave_uninitialized_bytes_untouched() {
     );
     assert!(plan
         .execute_uninit(
-            &ExecContext::serial(),
             &mut dest,
-            &ErasedRawStridedPtr::from_ref(&source)
+            &ErasedRawStridedPtr::from_ref(&source),
+            Exec::serial()
         )
         .is_ok());
 }

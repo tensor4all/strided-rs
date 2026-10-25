@@ -22,8 +22,8 @@ use std::time::Instant;
 use strided_kernel::{
     erased_clamp_into_uninit, erased_map_into_uninit, erased_select_into_uninit,
     erased_zip_into_uninit, map_into, zip_map2_into, ErasedMapOp, ErasedRawStridedPtr,
-    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, ExecContext, KernelDType,
-    StridedView, StridedViewMut,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedZipOp, Exec, KernelDType, StridedView,
+    StridedViewMut,
 };
 
 const WARMUPS: usize = 6;
@@ -141,15 +141,19 @@ where
     let rhs_view = StridedView::<f64>::new(&rhs, &dims, &strides, 0).unwrap();
     let lhs_ref = ErasedRawStridedRef::from_slice(&lhs, &dims, &lhs_strides, 0).unwrap();
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
-    let ctx = ExecContext::serial();
+    let mut ctx = Exec::serial();
     measure_pair(
         &format!("zip_{label},{},{len}", layout.label()),
         len,
         || {
             let mut dest = StridedViewMut::new(&mut typed_out, &dims, &strides, 0).unwrap();
-            zip_map2_into(&mut dest, &lhs_view, &rhs_view, |a, b| {
-                MaybeUninit::new(typed_op(a, b))
-            })
+            zip_map2_into(
+                &mut dest,
+                &lhs_view,
+                &rhs_view,
+                |a, b| MaybeUninit::new(typed_op(a, b)),
+                Exec::serial(),
+            )
             .unwrap();
             black_box(&typed_out);
         },
@@ -160,10 +164,10 @@ where
             erased_zip_into_uninit(
                 KernelDType::F64,
                 op,
-                &ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&lhs_ref),
                 &ErasedRawStridedPtr::from_ref(&rhs_ref),
+                ctx.reborrow(),
             )
             .unwrap();
             black_box(&erased_out);
@@ -187,7 +191,7 @@ fn bench_select(len: usize) {
     let pred_ref = ErasedRawStridedRef::from_slice(&pred, &dims, &strides, 0).unwrap();
     let true_ref = ErasedRawStridedRef::from_slice(&on_true, &dims, &strides, 0).unwrap();
     let false_ref = ErasedRawStridedRef::from_slice(&on_false, &dims, &strides, 0).unwrap();
-    let ctx = ExecContext::serial();
+    let mut ctx = Exec::serial();
     measure_pair(
         &format!("select,vector,{len}"),
         len,
@@ -205,11 +209,11 @@ fn bench_select(len: usize) {
                     .unwrap();
             erased_select_into_uninit(
                 KernelDType::F64,
-                &ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&pred_ref),
                 &ErasedRawStridedPtr::from_ref(&true_ref),
                 &ErasedRawStridedPtr::from_ref(&false_ref),
+                ctx.reborrow(),
             )
             .unwrap();
             black_box(&erased_out);
@@ -229,7 +233,7 @@ fn bench_clamp(len: usize) {
     let x_ref = ErasedRawStridedRef::from_slice(&x, &dims, &strides, 0).unwrap();
     let lo_ref = ErasedRawStridedRef::from_slice(&lo, &dims, &strides, 0).unwrap();
     let hi_ref = ErasedRawStridedRef::from_slice(&hi, &dims, &strides, 0).unwrap();
-    let ctx = ExecContext::serial();
+    let mut ctx = Exec::serial();
     measure_pair(
         &format!("clamp,vector,{len}"),
         len,
@@ -251,11 +255,11 @@ fn bench_clamp(len: usize) {
                     .unwrap();
             erased_clamp_into_uninit(
                 KernelDType::F64,
-                &ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&x_ref),
                 &ErasedRawStridedPtr::from_ref(&lo_ref),
                 &ErasedRawStridedPtr::from_ref(&hi_ref),
+                ctx.reborrow(),
             )
             .unwrap();
             black_box(&erased_out);
@@ -274,13 +278,19 @@ where
     let mut erased_out = vec![MaybeUninit::<f64>::uninit(); len];
     let input_view = StridedView::<f64>::new(&input, &dims, &strides, 0).unwrap();
     let input_ref = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
-    let ctx = ExecContext::serial();
+    let mut ctx = Exec::serial();
     measure_pair(
         &format!("map_{label},vector,{len}"),
         len,
         || {
             let mut dest = StridedViewMut::new(&mut typed_out, &dims, &strides, 0).unwrap();
-            map_into(&mut dest, &input_view, |a| MaybeUninit::new(typed_op(a))).unwrap();
+            map_into(
+                &mut dest,
+                &input_view,
+                |a| MaybeUninit::new(typed_op(a)),
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(&typed_out);
         },
         || {
@@ -290,9 +300,9 @@ where
             erased_map_into_uninit(
                 KernelDType::F64,
                 op,
-                &ctx,
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&input_ref),
+                ctx.reborrow(),
             )
             .unwrap();
             black_box(&erased_out);

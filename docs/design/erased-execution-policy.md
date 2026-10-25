@@ -25,12 +25,12 @@ The repository uses one threshold,
 `threading::MINTHREADLENGTH == 1 << 15` elements. A family enters parallel
 replay only when:
 
-- the active execution policy exposes more than one worker; and
+- the `Exec` token passed to the entry has a budget above one; and
 - the family-specific independent domain contains more than
   `MINTHREADLENGTH` elements.
 
-Small tensors, `ExecContext::serial()`, `ExecContext::max_threads(1)`, nested
-fanout, and single-thread pools stay on the serial path. Exactly-threshold
+Small tensors, `Exec::serial()`, a token of budget one (including one from a
+single-thread pool) and code that received no token stay on the serial path. Exactly-threshold
 inputs also stay serial.
 
 The policy-aware parallel replay currently covers:
@@ -71,10 +71,8 @@ bitwise equality: independent lane kernels, cache-friendly traversal orders,
 SIMD kernels and the parallel partial-combine tree all reorder the additions.
 What they do promise is documented per entry:
 
-- under the sequential policy — `ExecContext::serial()` or
-  `with_execution_policy(ExecutionPolicy::Sequential, ..)` — the result of a
-  reduction that can fan out (`reduce`, `zip_reduce`, `sum`) is independent of
-  the ambient Rayon pool width, because only serial branches run; this is the
+- with `Exec::serial()` the result of a reduction that can fan out (`reduce`,
+  `zip_reduce`, `sum`) is independent of any pool width, because only serial branches run; this is the
   deterministic route for a caller that needs one result per input, and it is
   asserted for `reduce`, `zip_reduce`, `sum` and `dot` by
   `strided-basic/tests/zip_reduce.rs`;
@@ -116,8 +114,7 @@ the data.
 
 ## Running the repository benchmark
 
-The benchmark compares `ExecContext::serial()` with
-`ExecContext::max_threads(n)` for each selected size. Pin all participating
+The benchmark compares `Exec::serial()` with `Exec::new(&pool, n)` for each selected size. Pin all participating
 threads to idle cores in one cache domain and run benchmark processes
 sequentially.
 

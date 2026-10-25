@@ -181,7 +181,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
         ),
     ),
     (
-        re.compile(r"threading|rayon|parallel|execution_policy|thread_pool"),
+        re.compile(r"threading|rayon|parallel|strided_exec|Exec::|thread_pool"),
         frozenset({"CPU Threading Contract"}),
     ),
     (
@@ -221,7 +221,7 @@ CONTENT_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
         frozenset({"Unsafe And Fast-Path Boundaries"}),
     ),
     (
-        re.compile(r"rayon|par_iter|ExecutionPolicy|num_threads|join\("),
+        re.compile(r"rayon|par_iter|Exec::|for_ranges|fork\(|num_threads|join\("),
         frozenset({"CPU Threading Contract"}),
     ),
     (

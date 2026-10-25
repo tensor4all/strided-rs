@@ -76,7 +76,7 @@ impl ArgReduceOp {
 ///
 /// ```
 /// use strided_basic::{
-///     ArgReduceOp, ErasedArgReducePlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext,
+///     Exec, ArgReduceOp, ErasedArgReducePlan, ErasedRawStridedMut, ErasedRawStridedRef,
 ///     KernelDType,
 /// };
 ///
@@ -96,7 +96,7 @@ impl ArgReduceOp {
 /// .unwrap();
 /// let src_ref = ErasedRawStridedRef::from_slice(&src, &[3, 2], &[1, 3], 0).unwrap();
 /// let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[2], &[1], 0).unwrap();
-/// plan.execute(&ExecContext::serial(), &mut dest, &src_ref).unwrap();
+/// plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
 /// assert_eq!(out, [1, 2]); // lowest index wins the 5.0 tie
 /// ```
 #[derive(Clone, Debug)]
@@ -282,8 +282,8 @@ impl ErasedArgReducePlan {
     ///
     /// ```
     /// use strided_basic::{
-    ///     ArgReduceOp, ErasedArgReducePlan, ErasedRawStridedMut, ErasedRawStridedRef,
-    ///     ExecContext, KernelDType,
+    ///     Exec, ArgReduceOp, ErasedArgReducePlan, ErasedRawStridedMut, ErasedRawStridedRef,
+    ///     KernelDType,
     /// };
     /// let src = [3_i32, -9, 9, 1];
     /// let mut out = [0_i32; 1];
@@ -293,7 +293,7 @@ impl ErasedArgReducePlan {
     /// .unwrap();
     /// let src_ref = ErasedRawStridedRef::from_slice(&src, &[4], &[1], 0).unwrap();
     /// let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[], &[], 0).unwrap();
-    /// plan.execute(&ExecContext::serial(), &mut dest, &src_ref).unwrap();
+    /// plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
     /// assert_eq!(out, [1]);
     /// ```
     ///
@@ -303,9 +303,9 @@ impl ErasedArgReducePlan {
     /// not match the plan, before any destination write.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.index_dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -313,11 +313,11 @@ impl ErasedArgReducePlan {
         match self.index_dtype {
             KernelDType::I32 => {
                 let mut writer = reduce_writer::<i32>(dest)?;
-                self.dispatch_dtype(ctx, &mut writer, src)
+                self.dispatch_dtype(&mut writer, src, exec)
             }
             _ => {
                 let mut writer = reduce_writer::<i64>(dest)?;
-                self.dispatch_dtype(ctx, &mut writer, src)
+                self.dispatch_dtype(&mut writer, src, exec)
             }
         }
     }
@@ -333,8 +333,8 @@ impl ErasedArgReducePlan {
     /// use core::mem::MaybeUninit;
     /// use num_complex::Complex64;
     /// use strided_basic::{
-    ///     ArgReduceOp, ErasedArgReducePlan, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ///     ErasedRawStridedUninitMut, ExecContext, KernelDType,
+    ///     Exec, ArgReduceOp, ErasedArgReducePlan, ErasedRawStridedPtr, ErasedRawStridedRef,
+    ///     ErasedRawStridedUninitMut, KernelDType,
     /// };
     /// let src = [Complex64::new(3.0, 4.0), Complex64::new(0.0, 6.0)];
     /// let mut out = [MaybeUninit::<i64>::uninit()];
@@ -345,7 +345,7 @@ impl ErasedArgReducePlan {
     /// let src_ref = ErasedRawStridedRef::from_slice(&src, &[2], &[1], 0).unwrap();
     /// let src_ptr = ErasedRawStridedPtr::from_ref(&src_ref);
     /// let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &[], &[], 0).unwrap();
-    /// plan.execute_uninit(&ExecContext::serial(), &mut dest, &src_ptr).unwrap();
+    /// plan.execute_uninit(&mut dest, &src_ptr, Exec::serial()).unwrap();
     /// assert_eq!(unsafe { out[0].assume_init() }, 0);
     /// ```
     ///
@@ -355,9 +355,9 @@ impl ErasedArgReducePlan {
     /// overlaps the destination allocation.
     pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         src: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.index_dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -368,20 +368,20 @@ impl ErasedArgReducePlan {
         match self.index_dtype {
             KernelDType::I32 => {
                 let mut writer = reduce_uninit_writer::<i32>(dest)?;
-                self.dispatch_dtype(ctx, &mut writer, &src)
+                self.dispatch_dtype(&mut writer, &src, exec)
             }
             _ => {
                 let mut writer = reduce_uninit_writer::<i64>(dest)?;
-                self.dispatch_dtype(ctx, &mut writer, &src)
+                self.dispatch_dtype(&mut writer, &src, exec)
             }
         }
     }
 
     fn dispatch_dtype<I, W>(
         &self,
-        ctx: &ExecContext,
         dest: &mut W,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         I: ArgIndex,
@@ -392,12 +392,12 @@ impl ErasedArgReducePlan {
         macro_rules! real {
             ($ty:ty) => {
                 match self.op {
-                    ArgReduceOp::Max => self.run::<$ty, I, W, Plain, Greater>(ctx, dest, src),
-                    ArgReduceOp::Min => self.run::<$ty, I, W, Plain, Less>(ctx, dest, src),
+                    ArgReduceOp::Max => self.run::<$ty, I, W, Plain, Greater>(dest, src, exec),
+                    ArgReduceOp::Min => self.run::<$ty, I, W, Plain, Less>(dest, src, exec),
                     ArgReduceOp::MaxAbs => {
-                        self.run::<$ty, I, W, Magnitude, Greater>(ctx, dest, src)
+                        self.run::<$ty, I, W, Magnitude, Greater>(dest, src, exec)
                     }
-                    ArgReduceOp::MinAbs => self.run::<$ty, I, W, Magnitude, Less>(ctx, dest, src),
+                    ArgReduceOp::MinAbs => self.run::<$ty, I, W, Magnitude, Less>(dest, src, exec),
                 }
             };
         }
@@ -405,9 +405,9 @@ impl ErasedArgReducePlan {
             ($ty:ty) => {
                 match self.op {
                     ArgReduceOp::MaxAbs => {
-                        self.run::<$ty, I, W, Magnitude, Greater>(ctx, dest, src)
+                        self.run::<$ty, I, W, Magnitude, Greater>(dest, src, exec)
                     }
-                    ArgReduceOp::MinAbs => self.run::<$ty, I, W, Magnitude, Less>(ctx, dest, src),
+                    ArgReduceOp::MinAbs => self.run::<$ty, I, W, Magnitude, Less>(dest, src, exec),
                     // INVARIANT: check_arg_dtype rejects ordered complex ops at compile.
                     ArgReduceOp::Max | ArgReduceOp::Min => Err(StridedError::UnsupportedOp {
                         op: self.op.label(),
@@ -431,12 +431,12 @@ impl ErasedArgReducePlan {
 
     fn run<T, I, W, F, D>(
         &self,
-        ctx: &ExecContext,
         dest: &mut W,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: KernelStorageElement + MaybeSendSync,
+        T: KernelStorageElement + Send + Sync,
         I: ArgIndex,
         W: ReduceWriter<I>,
         F: KeyFn<T>,
@@ -462,7 +462,7 @@ impl ErasedArgReducePlan {
         // descriptors validated every reachable offset; (3) execute checked
         // exact plan-layout equality. Units own disjoint outputs.
         // SAFETY: the three-link invariant above.
-        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), kernel) }
+        unsafe { for_each_unit(layout, src.offset(), dest.offset(), kernel, exec) }
     }
 }
 
@@ -485,7 +485,7 @@ impl<T, I, F, D> Copy for ArgUnit<T, I, F, D> {}
 
 impl<T, I, F, D> UnitKernel for ArgUnit<T, I, F, D>
 where
-    T: KernelStorageElement + MaybeSendSync,
+    T: KernelStorageElement + Send + Sync,
     I: ArgIndex,
     F: KeyFn<T>,
     D: Direction,
@@ -529,7 +529,7 @@ fn check_arg_dtype(dtype: KernelDType, op: ArgReduceOp) -> Result<()> {
 }
 
 /// Index element written to the destination.
-pub(super) trait ArgIndex: KernelStorageElement + MaybeSendSync {
+pub(super) trait ArgIndex: KernelStorageElement + Send + Sync {
     fn from_index(index: usize) -> Self;
 }
 

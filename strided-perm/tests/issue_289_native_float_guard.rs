@@ -6,6 +6,7 @@
 //! example an 8-byte / align-2 array) has to take the generic element-wise
 //! path instead of a misaligned float access.
 
+use strided_exec::Exec;
 use strided_perm::copy_into;
 use strided_view::{StridedView, StridedViewMut};
 
@@ -27,14 +28,14 @@ struct U64Align1([u8; 8]);
 /// Copy `[3, 4]` with a transposing layout: source row-major `[4, 1]`,
 /// destination col-major `[1, 3]`. The planner selects the 2D micro-kernel
 /// path, which for the size-only match would reinterpret `T` as `f32`/`f64`.
-fn transposing_copy<T: Copy + 'static>(src_data: &[T], dst_data: &mut [T]) {
+fn transposing_copy<T: Copy + Send + Sync + 'static>(src_data: &[T], dst_data: &mut [T]) {
     let dims = [3usize, 4];
     let src = StridedView::new(src_data, &dims, &[4, 1], 0).unwrap();
     let mut dst = StridedViewMut::new(dst_data, &dims, &[1, 3], 0).unwrap();
-    copy_into(&mut dst, &src).unwrap();
+    copy_into(&mut dst, &src, Exec::serial()).unwrap();
 }
 
-fn assert_transposing_copy<T: Copy + 'static + PartialEq + core::fmt::Debug>(
+fn assert_transposing_copy<T: Copy + Send + Sync + 'static + PartialEq + core::fmt::Debug>(
     src_data: &[T],
     dst_data: &mut [T],
 ) {

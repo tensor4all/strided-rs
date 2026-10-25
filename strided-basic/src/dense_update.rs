@@ -8,7 +8,7 @@
 use core::mem::MaybeUninit;
 use core::ops::{Add, Mul};
 
-use crate::{MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
+use crate::{Exec, Result, StridedError, StridedView, StridedViewMut};
 
 fn same_len(actual: usize, expected: usize) -> Result<()> {
     if actual == expected {
@@ -27,25 +27,23 @@ fn product(shape: &[usize]) -> Result<usize> {
     })
 }
 
-fn for_each_chunk<T: MaybeSendSync, F: Fn(usize, &mut [T]) + crate::MaybeSync>(
+fn for_each_chunk<T: Send + Sync, F: Fn(usize, &mut [T]) + Sync>(
     output: &mut [T],
     operation: F,
+    exec: Exec<'_>,
 ) {
-    #[cfg(feature = "parallel")]
-    {
-        let threads = crate::threading::parallel_threads_for_len(output.len());
-        if threads > 1 {
-            let ptr = crate::threading::SendPtr(output.as_mut_ptr());
-            crate::threading::parallel_for_each(0..output.len(), threads, &|range| {
-                // SAFETY: the scoped scheduler partitions the exclusive output
-                // borrow into disjoint ranges; all tasks finish before return.
-                let chunk = unsafe {
-                    core::slice::from_raw_parts_mut(ptr.as_ptr().add(range.start), range.len())
-                };
-                operation(range.start, chunk);
-            });
-            return;
-        }
+    let exec = crate::threading::for_len(exec, output.len());
+    if !exec.is_serial() {
+        let ptr = crate::threading::SendPtr(output.as_mut_ptr());
+        crate::threading::parallel_for_each(0..output.len(), exec, &|range| {
+            // SAFETY: the scoped scheduler partitions the exclusive output
+            // borrow into disjoint ranges; all tasks finish before return.
+            let chunk = unsafe {
+                core::slice::from_raw_parts_mut(ptr.as_ptr().add(range.start), range.len())
+            };
+            operation(range.start, chunk);
+        });
+        return;
     }
     operation(0, output);
 }
@@ -93,27 +91,32 @@ fn copy_strided_run<T: Copy>(dst: &mut [MaybeUninit<T>], data: &[T], base: isize
 ///
 /// This is an accumulation operation: it reads the old `y`, even for beta=0
 /// (including ordinary IEEE NaN propagation). No temporary tensor is allocated.
-/// Execution obeys the active execution policy and shared parallel threshold.
+/// The update splits within the budget of `exec` above the shared parallel
+/// threshold.
 ///
 /// # Examples
 /// ```
 /// let mut y = [3.0, 4.0];
-/// strided_basic::axpby_accum(&mut y, &[1.0, 2.0], 2.0, 3.0).unwrap();
+/// strided_basic::axpby_accum(&mut y, &[1.0, 2.0], 2.0, 3.0, strided_basic::Exec::serial()).unwrap();
 /// assert_eq!(y, [11.0, 16.0]);
 /// ```
 /// # Errors
 /// Returns `ShapeMismatch` for unequal slice lengths, before modifying `y`.
-pub fn axpby_accum<T>(y: &mut [T], x: &[T], alpha: T, beta: T) -> Result<()>
+pub fn axpby_accum<T>(y: &mut [T], x: &[T], alpha: T, beta: T, exec: Exec<'_>) -> Result<()>
 where
     T: Copy + Send + Sync + Add<Output = T> + Mul<Output = T>,
 {
     same_len(x.len(), y.len())?;
-    for_each_chunk(y, |start, dst| {
-        let len = dst.len();
-        for (out, &src) in dst.iter_mut().zip(&x[start..start + len]) {
-            *out = alpha * src + beta * *out;
-        }
-    });
+    for_each_chunk(
+        y,
+        |start, dst| {
+            let len = dst.len();
+            for (out, &src) in dst.iter_mut().zip(&x[start..start + len]) {
+                *out = alpha * src + beta * *out;
+            }
+        },
+        exec,
+    );
     Ok(())
 }
 
@@ -128,23 +131,24 @@ where
 /// use core::mem::MaybeUninit;
 /// let mut out = [MaybeUninit::uninit(); 4];
 /// strided_basic::triangular_mask_into_uninit(
-///     &mut out, &[1, 2, 3, 4], &[2, 2], 0, false, 0).unwrap();
+///     &mut out, &[1, 2, 3, 4], &[2, 2], 0, false, 0, strided_basic::Exec::serial()).unwrap();
 /// // SAFETY: successful full-overwrite kernel initialized every element.
 /// assert_eq!(out.map(|v| unsafe { v.assume_init() }), [1, 2, 0, 4]);
 /// ```
 /// # Errors
 /// Returns `RankMismatch`, `ShapeMismatch`, or `OffsetOverflow` for invalid
 /// shape/buffer lengths, before writing output.
-pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
+pub fn triangular_mask_into_uninit<T: Copy + Send + Sync>(
     output: &mut [MaybeUninit<T>],
     input: &[T],
     shape: &[usize],
     k: i64,
     upper: bool,
     fill: T,
+    exec: Exec<'_>,
 ) -> Result<()> {
     let src = dense_view(input, shape)?;
-    triangular_mask_view_into_uninit(output, &src, k, upper, fill)
+    triangular_mask_view_into_uninit(output, &src, k, upper, fill, exec)
 }
 
 /// Mask a triangular region of a strided input into caller-owned contiguous
@@ -159,12 +163,13 @@ pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
 /// # Errors
 /// Returns `RankMismatch` or `ShapeMismatch` for invalid shapes and buffer
 /// lengths, and `OffsetOverflow` for unrepresentable layouts, before writing.
-pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
+pub fn triangular_mask_view_into_uninit<T: Copy + Send + Sync>(
     output: &mut [MaybeUninit<T>],
     src: &StridedView<'_, T>,
     k: i64,
     upper: bool,
     fill: T,
+    exec: Exec<'_>,
 ) -> Result<()> {
     let shape = src.dims();
     if shape.len() < 2 {
@@ -180,46 +185,50 @@ pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
     let data = src.data();
     let strides = src.strides();
     let offset = src.offset();
-    for_each_chunk(output, |start, chunk| {
-        let mut pos = 0;
-        let mut batch = usize::MAX;
-        let mut batch_offset = 0isize;
-        while pos < chunk.len() {
-            let flat = start + pos;
-            let row = flat % rows;
-            let col = (flat / rows) % cols;
-            // INVARIANT: `product(shape)` succeeded, so `rows * cols` fits.
-            let run_batch = flat / (rows * cols);
-            if run_batch != batch {
-                batch = run_batch;
-                batch_offset = batch_source_offset(run_batch, &shape[2..], &strides[2..]);
+    for_each_chunk(
+        output,
+        |start, chunk| {
+            let mut pos = 0;
+            let mut batch = usize::MAX;
+            let mut batch_offset = 0isize;
+            while pos < chunk.len() {
+                let flat = start + pos;
+                let row = flat % rows;
+                let col = (flat / rows) % cols;
+                // INVARIANT: `product(shape)` succeeded, so `rows * cols` fits.
+                let run_batch = flat / (rows * cols);
+                if run_batch != batch {
+                    batch = run_batch;
+                    batch_offset = batch_source_offset(run_batch, &shape[2..], &strides[2..]);
+                }
+                let count = (rows - row).min(chunk.len() - pos);
+                let boundary = col as i128 - k as i128;
+                let split = if upper {
+                    boundary.saturating_add(1)
+                } else {
+                    boundary
+                }
+                .clamp(row as i128, (row + count) as i128) as usize
+                    - row;
+                let (low, high) = chunk[pos..pos + count].split_at_mut(split);
+                let (kept, first_row, masked) = if upper {
+                    (low, row, high)
+                } else {
+                    (high, row + split, low)
+                };
+                let base = offset
+                    + batch_offset
+                    + (col as isize) * strides[1]
+                    + (first_row as isize) * strides[0];
+                // Full overwrite: never read masked input or copy it only to
+                // overwrite it a second time. Each output element is written once.
+                copy_strided_run(kept, data, base, strides[0]);
+                masked.fill(MaybeUninit::new(fill));
+                pos += count;
             }
-            let count = (rows - row).min(chunk.len() - pos);
-            let boundary = col as i128 - k as i128;
-            let split = if upper {
-                boundary.saturating_add(1)
-            } else {
-                boundary
-            }
-            .clamp(row as i128, (row + count) as i128) as usize
-                - row;
-            let (low, high) = chunk[pos..pos + count].split_at_mut(split);
-            let (kept, first_row, masked) = if upper {
-                (low, row, high)
-            } else {
-                (high, row + split, low)
-            };
-            let base = offset
-                + batch_offset
-                + (col as isize) * strides[1]
-                + (first_row as isize) * strides[0];
-            // Full overwrite: never read masked input or copy it only to
-            // overwrite it a second time. Each output element is written once.
-            copy_strided_run(kept, data, base, strides[0]);
-            masked.fill(MaybeUninit::new(fill));
-            pos += count;
-        }
-    });
+        },
+        exec,
+    );
     Ok(())
 }
 
@@ -228,13 +237,13 @@ pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
 /// Insert an axis of size `shape[axis]` at `insert_axis`. Its coordinate must
 /// equal the original `axis` coordinate; other entries receive `zero`.
 /// Output is fully initialized without reading its previous contents. The
-/// active execution policy governs fill and strided diagonal-copy traversal.
+/// budget of `exec` governs fill and strided diagonal-copy traversal.
 ///
 /// # Examples
 /// ```
 /// use core::mem::MaybeUninit;
 /// let mut out = [MaybeUninit::uninit(); 4];
-/// strided_basic::embed_diagonal_into_uninit(&mut out, &[3, 5], &[2], 0, 1, 0).unwrap();
+/// strided_basic::embed_diagonal_into_uninit(&mut out, &[3, 5], &[2], 0, 1, 0, strided_basic::Exec::serial()).unwrap();
 /// // SAFETY: successful full-overwrite kernel initialized every element.
 /// assert_eq!(out.map(|v| unsafe { v.assume_init() }), [3, 0, 0, 5]);
 /// ```
@@ -242,13 +251,14 @@ pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
 /// Returns `InvalidAxis`, `ShapeMismatch`, or `OffsetOverflow` for invalid
 /// axes, lengths or unrepresentable layouts. Destination layout validation
 /// may return `NonInjectiveOutputLayout` if injectivity cannot be established.
-pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
+pub fn embed_diagonal_into_uninit<T: Copy + Send + Sync + 'static>(
     output: &mut [MaybeUninit<T>],
     input: &[T],
     shape: &[usize],
     axis: usize,
     insert_axis: usize,
     zero: T,
+    exec: Exec<'_>,
 ) -> Result<()> {
     if axis >= shape.len() {
         return Err(StridedError::InvalidAxis {
@@ -265,7 +275,7 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
     let len = product(shape)?;
     same_len(input.len(), len)?;
     let src = dense_view(input, shape)?;
-    embed_diagonal_view_into_uninit(output, &src, axis, insert_axis, zero)
+    embed_diagonal_view_into_uninit(output, &src, axis, insert_axis, zero, exec)
 }
 
 /// Embed a strided input on a diagonal in a new axis of caller-owned
@@ -280,13 +290,15 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
 /// Returns `InvalidAxis`, `ShapeMismatch`, or `OffsetOverflow` for invalid
 /// axes, lengths or unrepresentable layouts. Destination layout validation may
 /// return `NonInjectiveOutputLayout` if injectivity cannot be established.
-pub fn embed_diagonal_view_into_uninit<T: Copy + MaybeSendSync + 'static>(
+pub fn embed_diagonal_view_into_uninit<T: Copy + Send + Sync + 'static>(
     output: &mut [MaybeUninit<T>],
     src: &StridedView<'_, T>,
     axis: usize,
     insert_axis: usize,
     zero: T,
+    exec: Exec<'_>,
 ) -> Result<()> {
+    let mut exec = exec;
     let shape = src.dims();
     if axis >= shape.len() {
         return Err(StridedError::InvalidAxis {
@@ -320,8 +332,10 @@ pub fn embed_diagonal_view_into_uninit<T: Copy + MaybeSendSync + 'static>(
     crate::map_view::validate_destination_layout_without_alloc(shape, &dst_strides)?;
     // INVARIANT: off-diagonal zeros are part of the mathematical result, not
     // scratch initialization. Only the diagonal subset is overwritten below.
-    for_each_chunk(dst.data_mut(), |_, chunk| {
-        chunk.fill(MaybeUninit::new(zero))
-    });
-    crate::map_into(&mut dst, src, MaybeUninit::new)
+    for_each_chunk(
+        dst.data_mut(),
+        |_, chunk| chunk.fill(MaybeUninit::new(zero)),
+        exec.reborrow(),
+    );
+    crate::map_into(&mut dst, src, MaybeUninit::new, exec)
 }

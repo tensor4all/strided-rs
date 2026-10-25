@@ -7,6 +7,19 @@
 //! test harness and runtime threads can allocate at any time and a process
 //! wide count made the typed baseline window flaky on Linux CI.
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::mem::MaybeUninit;
@@ -19,8 +32,8 @@ use strided_kernel::{
     ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan,
     ErasedGatherPlan, ErasedMapOp, ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedPtr,
     ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan, ErasedReversePlan,
-    ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, ExecContext, GatherSpec, Identity,
-    KernelDType, RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
+    ErasedScatterPlan, ErasedSlicePlan, ErasedZipOp, Exec, GatherSpec, Identity, KernelDType,
+    RawStridedMut, RawStridedRef, ReduceOp, ScatterSpec, StridedView, StridedViewMut,
 };
 
 struct CountingAllocator;
@@ -87,7 +100,9 @@ fn count_allocations_all_threads(mut run: impl FnMut()) -> usize {
         .unwrap_or(0)
 }
 
-fn assert_fused_uninit_allocation_parity(ctx: &ExecContext, fused_plan: FusedPlan) {
+fn assert_fused_uninit_allocation_parity(mint: &dyn Fn() -> Exec<'static>, fused_plan: FusedPlan) {
+    let mut initialized_exec = mint();
+    let mut uninitialized_exec = mint();
     let dims = [1usize << 16];
     let strides = [1isize];
     let lhs = vec![1.25f64; dims[0]];
@@ -103,22 +118,32 @@ fn assert_fused_uninit_allocation_parity(ctx: &ExecContext, fused_plan: FusedPla
     let mut initialized = vec![0.0f64; dims[0]];
     let mut initialized_dest =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
-    plan.execute(ctx, &mut initialized_dest, &inputs).unwrap();
+    plan.execute(&mut initialized_dest, &inputs, initialized_exec.reborrow())
+        .unwrap();
     let initialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
-            plan.execute(ctx, &mut initialized_dest, &inputs).unwrap();
+            plan.execute(&mut initialized_dest, &inputs, initialized_exec.reborrow())
+                .unwrap();
         }
     });
     let mut uninitialized = vec![MaybeUninit::<f64>::uninit(); dims[0]];
     let mut uninitialized_dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
             .unwrap();
-    plan.execute_uninit(ctx, &mut uninitialized_dest, &input_ptrs)
-        .unwrap();
+    plan.execute_uninit(
+        &mut uninitialized_dest,
+        &input_ptrs,
+        uninitialized_exec.reborrow(),
+    )
+    .unwrap();
     let uninitialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
-            plan.execute_uninit(ctx, &mut uninitialized_dest, &input_ptrs)
-                .unwrap();
+            plan.execute_uninit(
+                &mut uninitialized_dest,
+                &input_ptrs,
+                uninitialized_exec.reborrow(),
+            )
+            .unwrap();
         }
     });
     assert!(
@@ -156,12 +181,13 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
 
     // Warm up (first call may fault pages but must not allocate either).
-    plan.execute(&mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&mut dest, &source).unwrap();
-            plan.execute_scale(&mut dest, &source, 2.0).unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
+            plan.execute_scale(&mut dest, &source, 2.0, Exec::serial())
+                .unwrap();
         }
     });
     assert_eq!(allocations, 0, "execute/execute_scale must not allocate");
@@ -189,11 +215,12 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     );
 
     let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
-    plan.execute(&mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&mut dest, &source).unwrap();
-            plan.execute_scale(&mut dest, &source, 2.0).unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
+            plan.execute_scale(&mut dest, &source, 2.0, Exec::serial())
+                .unwrap();
         }
     });
     assert_eq!(
@@ -211,11 +238,13 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
     let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
-    plan.execute_conj(&mut dest, &source).unwrap();
+    plan.execute_conj(&mut dest, &source, Exec::serial())
+        .unwrap();
 
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute_conj(&mut dest, &source).unwrap();
+            plan.execute_conj(&mut dest, &source, Exec::serial())
+                .unwrap();
         }
     });
     assert_eq!(allocations, 0, "execute_conj must not allocate");
@@ -231,12 +260,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let source = ErasedRawStridedRef::from_slice(&src, &dims, &src_strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &source)
-                .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         }
     });
     assert_eq!(allocations, 0, "erased execute must not allocate");
@@ -256,24 +283,23 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         ErasedRawStridedMut::from_slice_mut(&mut success_dst, &dims, &strides, 0).unwrap();
     let mut reject_dest =
         ErasedRawStridedMut::from_slice_mut(&mut reject_dst, &dims, &strides, 0).unwrap();
-    let serial = ExecContext::serial();
     erased_zip_into(
         KernelDType::I64,
         ErasedZipOp::Divide,
-        &serial,
         &mut success_dest,
         &ErasedRawStridedPtr::from_ref(&lhs),
         &ErasedRawStridedPtr::from_ref(&rhs),
+        Exec::serial(),
     )
     .unwrap();
     assert!(matches!(
         erased_zip_into(
             KernelDType::I64,
             ErasedZipOp::Divide,
-            &serial,
             &mut reject_dest,
             &ErasedRawStridedPtr::from_ref(&lhs),
             &ErasedRawStridedPtr::from_ref(&rhs_zero),
+            Exec::serial()
         ),
         Err(strided_kernel::StridedError::IntegerDivisionByZero { op: "divide" })
     ));
@@ -281,10 +307,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         erased_zip_into(
             KernelDType::I64,
             ErasedZipOp::Divide,
-            &serial,
             &mut success_dest,
             &ErasedRawStridedPtr::from_ref(&lhs),
             &ErasedRawStridedPtr::from_ref(&rhs),
+            Exec::serial(),
         )
         .unwrap();
     });
@@ -293,10 +319,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
             erased_zip_into(
                 KernelDType::I64,
                 ErasedZipOp::Divide,
-                &serial,
                 &mut reject_dest,
                 &ErasedRawStridedPtr::from_ref(&lhs),
                 &ErasedRawStridedPtr::from_ref(&rhs_zero),
+                Exec::serial()
             ),
             Err(strided_kernel::StridedError::IntegerDivisionByZero { op: "divide" })
         ));
@@ -327,29 +353,43 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut typed_dest = StridedViewMut::new(&mut typed_dst, &dims, &strides, 0).unwrap();
     // Warm each exact counted sequence symmetrically so TLS/coverage runtime
     // initialization is outside both allocation windows.
-    zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
-    map_into(&mut typed_dest, &lhs_view, |value| -value).unwrap();
+    zip_map2_into(
+        &mut typed_dest,
+        &lhs_view,
+        &rhs_view,
+        |lhs, rhs| lhs + rhs,
+        Exec::serial(),
+    )
+    .unwrap();
+    map_into(&mut typed_dest, &lhs_view, |value| -value, Exec::serial()).unwrap();
     erased_zip_into(
         KernelDType::F64,
         ErasedZipOp::Add,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs_ref),
         &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        Exec::serial(),
     )
     .unwrap();
     erased_map_into(
         KernelDType::F64,
         ErasedMapOp::Negate,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        Exec::serial(),
     )
     .unwrap();
     let kernel_allocations = count_allocations(|| {
         for _ in 0..16 {
-            zip_map2_into(&mut typed_dest, &lhs_view, &rhs_view, |lhs, rhs| lhs + rhs).unwrap();
-            map_into(&mut typed_dest, &lhs_view, |value| -value).unwrap();
+            zip_map2_into(
+                &mut typed_dest,
+                &lhs_view,
+                &rhs_view,
+                |lhs, rhs| lhs + rhs,
+                Exec::serial(),
+            )
+            .unwrap();
+            map_into(&mut typed_dest, &lhs_view, |value| -value, Exec::serial()).unwrap();
         }
     });
     let allocations = count_allocations(|| {
@@ -357,18 +397,18 @@ fn execute_is_allocation_free_up_to_rank_limit() {
             erased_zip_into(
                 KernelDType::F64,
                 ErasedZipOp::Add,
-                &ExecContext::serial(),
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&lhs_ref),
                 &ErasedRawStridedPtr::from_ref(&rhs_ref),
+                Exec::serial(),
             )
             .unwrap();
             erased_map_into(
                 KernelDType::F64,
                 ErasedMapOp::Negate,
-                &ExecContext::serial(),
                 &mut dest,
                 &ErasedRawStridedPtr::from_ref(&lhs_ref),
+                Exec::serial(),
             )
             .unwrap();
         }
@@ -410,9 +450,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         .into_iter()
         .collect(),
     };
-    for ctx in [ExecContext::serial(), ExecContext::max_threads(4).unwrap()] {
-        assert_fused_uninit_allocation_parity(&ctx, add_mul.clone());
-        assert_fused_uninit_allocation_parity(&ctx, fallback.clone());
+    let mints: [&dyn Fn() -> Exec<'static>; 2] = [&|| Exec::serial(), &|| bounded(4)];
+    for mint in mints {
+        assert_fused_uninit_allocation_parity(mint, add_mul.clone());
+        assert_fused_uninit_allocation_parity(mint, fallback.clone());
     }
 
     let dims = [3usize, 2];
@@ -433,53 +474,53 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     erased_map_into(
         KernelDType::F64,
         ErasedMapOp::Negate,
-        &ExecContext::serial(),
         &mut reference_dest,
         &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        Exec::serial(),
     )
     .unwrap();
     erased_zip_into(
         KernelDType::F64,
         ErasedZipOp::Add,
-        &ExecContext::serial(),
         &mut reference_dest,
         &ErasedRawStridedPtr::from_ref(&lhs_ref),
         &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        Exec::serial(),
     )
     .unwrap();
     erased_map_into(
         KernelDType::F64,
         ErasedMapOp::Negate,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs_ref),
+        Exec::serial(),
     )
     .unwrap();
     erased_zip_into(
         KernelDType::F64,
         ErasedZipOp::Add,
-        &ExecContext::serial(),
         &mut dest,
         &ErasedRawStridedPtr::from_ref(&lhs_ref),
         &ErasedRawStridedPtr::from_ref(&rhs_ref),
+        Exec::serial(),
     )
     .unwrap();
     let kernel_allocations = count_allocations(|| {
         erased_map_into(
             KernelDType::F64,
             ErasedMapOp::Negate,
-            &ExecContext::serial(),
             &mut reference_dest,
             &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            Exec::serial(),
         )
         .unwrap();
         erased_zip_into(
             KernelDType::F64,
             ErasedZipOp::Add,
-            &ExecContext::serial(),
             &mut reference_dest,
             &ErasedRawStridedPtr::from_ref(&lhs_ref),
             &ErasedRawStridedPtr::from_ref(&rhs_ref),
+            Exec::serial(),
         )
         .unwrap();
     });
@@ -487,18 +528,18 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         erased_map_into(
             KernelDType::F64,
             ErasedMapOp::Negate,
-            &ExecContext::serial(),
             &mut dest,
             &ErasedRawStridedPtr::from_ref(&lhs_ref),
+            Exec::serial(),
         )
         .unwrap();
         erased_zip_into(
             KernelDType::F64,
             ErasedZipOp::Add,
-            &ExecContext::serial(),
             &mut dest,
             &ErasedRawStridedPtr::from_ref(&lhs_ref),
             &ErasedRawStridedPtr::from_ref(&rhs_ref),
+            Exec::serial(),
         )
         .unwrap();
     });
@@ -529,12 +570,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &source)
-                .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         }
     });
     assert_eq!(
@@ -553,11 +592,11 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     )
     .unwrap();
     sum_squares_axis_plan
-        .execute(&ExecContext::serial(), &mut dest, &source)
+        .execute(&mut dest, &source, Exec::serial())
         .unwrap();
     let allocations = count_allocations(|| {
         sum_squares_axis_plan
-            .execute(&ExecContext::serial(), &mut dest, &source)
+            .execute(&mut dest, &source, Exec::serial())
             .unwrap();
     });
     assert_eq!(
@@ -587,19 +626,11 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         ErasedRawStridedMut::from_slice_mut(&mut sum_squares_dst, &[], &[], 0).unwrap();
 
     sum_squares_plan
-        .execute(
-            &ExecContext::serial(),
-            &mut sum_squares_dest,
-            &sum_squares_source,
-        )
+        .execute(&mut sum_squares_dest, &sum_squares_source, Exec::serial())
         .unwrap();
     let allocations = count_allocations(|| {
         sum_squares_plan
-            .execute(
-                &ExecContext::serial(),
-                &mut sum_squares_dest,
-                &sum_squares_source,
-            )
+            .execute(&mut sum_squares_dest, &sum_squares_source, Exec::serial())
             .unwrap();
     });
     assert_eq!(
@@ -634,11 +665,11 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &slice_dims, &slice_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source, &starts_ref)
+    plan.execute(&mut dest, &source, &starts_ref, Exec::serial())
         .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &source, &starts_ref)
+            plan.execute(&mut dest, &source, &starts_ref, Exec::serial())
                 .unwrap();
         }
     });
@@ -672,24 +703,12 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &src_dims, &src_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest,
-        &source,
-        &update_ref,
-        &starts_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest, &source, &update_ref, &starts_ref, Exec::serial())
+        .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(
-                &ExecContext::serial(),
-                &mut dest,
-                &source,
-                &update_ref,
-                &starts_ref,
-            )
-            .unwrap();
+            plan.execute(&mut dest, &source, &update_ref, &starts_ref, Exec::serial())
+                .unwrap();
         }
     });
     assert_eq!(
@@ -732,24 +751,12 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &src_dims, &src_strides, 0).unwrap();
 
-    plan.execute(
-        &ExecContext::serial(),
-        &mut dest,
-        &source,
-        &index_ref,
-        &update_ref,
-    )
-    .unwrap();
+    plan.execute(&mut dest, &source, &index_ref, &update_ref, Exec::serial())
+        .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(
-                &ExecContext::serial(),
-                &mut dest,
-                &source,
-                &index_ref,
-                &update_ref,
-            )
-            .unwrap();
+            plan.execute(&mut dest, &source, &index_ref, &update_ref, Exec::serial())
+                .unwrap();
         }
     });
     assert_eq!(allocations, 0, "erased scatter execute must not allocate");
@@ -867,22 +874,22 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         ErasedRawStridedMut::from_slice_mut(&mut window_dst, &src_dims, &src_strides, 0).unwrap();
     window_plan
         .execute(
-            &ExecContext::serial(),
             &mut window_dest,
             &source,
             &window_index,
             &window_update,
+            Exec::serial(),
         )
         .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
             window_plan
                 .execute(
-                    &ExecContext::serial(),
                     &mut window_dest,
                     &source,
                     &window_index,
                     &window_update,
+                    Exec::serial(),
                 )
                 .unwrap();
         }
@@ -910,12 +917,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &src_dims, &src_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &source)
-                .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         }
     });
     assert_eq!(allocations, 0, "erased slice execute must not allocate");
@@ -926,7 +931,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let source_ptr = ErasedRawStridedPtr::from_ref(&source);
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute_uninit(&ExecContext::serial(), &mut uninit_dest, &source_ptr)
+            plan.execute_uninit(&mut uninit_dest, &source_ptr, Exec::serial())
                 .unwrap();
         }
     });
@@ -948,12 +953,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &src_dims, &src_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &source)
-                .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         }
     });
     assert_eq!(allocations, 0, "erased reverse execute must not allocate");
@@ -963,7 +966,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
             .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute_uninit(&ExecContext::serial(), &mut uninit_dest, &source_ptr)
+            plan.execute_uninit(&mut uninit_dest, &source_ptr, Exec::serial())
                 .unwrap();
         }
     });
@@ -994,11 +997,11 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &pad_dims, &pad_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source, as_bytes(&fill))
+    plan.execute(&mut dest, &source, as_bytes(&fill), Exec::serial())
         .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &source, as_bytes(&fill))
+            plan.execute(&mut dest, &source, as_bytes(&fill), Exec::serial())
                 .unwrap();
         }
     });
@@ -1010,10 +1013,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let allocations = count_allocations(|| {
         for _ in 0..16 {
             plan.execute_uninit(
-                &ExecContext::serial(),
                 &mut uninit_dest,
                 &source_ptr,
                 as_bytes(&fill),
+                Exec::serial(),
             )
             .unwrap();
         }
@@ -1049,12 +1052,10 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut dst, &src_dims, &src_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-        .unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute(&ExecContext::serial(), &mut dest, &inputs)
-                .unwrap();
+            plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
         }
     });
     assert_eq!(
@@ -1071,7 +1072,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
             .unwrap();
     let allocations = count_allocations(|| {
         for _ in 0..16 {
-            plan.execute_uninit(&ExecContext::serial(), &mut uninit_dest, &input_ptrs)
+            plan.execute_uninit(&mut uninit_dest, &input_ptrs, Exec::serial())
                 .unwrap();
         }
     });
@@ -1105,15 +1106,16 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         },
     )
     .unwrap();
-    let ctx = ExecContext::serial();
 
     let mut initialized = vec![0.0f64; 32];
     let mut initialized_dest =
         ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &strides, 0).unwrap();
-    plan.execute(&ctx, &mut initialized_dest, &inputs).unwrap();
+    plan.execute(&mut initialized_dest, &inputs, Exec::serial())
+        .unwrap();
     let initialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
-            plan.execute(&ctx, &mut initialized_dest, &inputs).unwrap();
+            plan.execute(&mut initialized_dest, &inputs, Exec::serial())
+                .unwrap();
         }
     });
 
@@ -1121,11 +1123,11 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     let mut uninitialized_dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut uninitialized, &dims, &strides, 0)
             .unwrap();
-    plan.execute_uninit(&ctx, &mut uninitialized_dest, &input_ptrs)
+    plan.execute_uninit(&mut uninitialized_dest, &input_ptrs, Exec::serial())
         .unwrap();
     let uninitialized_allocations = count_allocations_all_threads(|| {
         for _ in 0..8 {
-            plan.execute_uninit(&ctx, &mut uninitialized_dest, &input_ptrs)
+            plan.execute_uninit(&mut uninitialized_dest, &input_ptrs, Exec::serial())
                 .unwrap();
         }
     });

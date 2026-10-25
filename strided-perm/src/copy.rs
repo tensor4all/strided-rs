@@ -1,9 +1,8 @@
 //! Copy/permutation operations on strided views.
 
 use crate::fuse::FusionPlanError;
-#[cfg(feature = "parallel")]
-use crate::hptt::execute_permute_blocked_par;
-use crate::hptt::{build_permute_plan, execute_permute_blocked, PermutePlan};
+use crate::hptt::{build_permute_plan, execute_permute_blocked};
+use strided_exec::Exec;
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
 
 /// Map a permutation planning failure onto the shared view error vocabulary.
@@ -110,8 +109,7 @@ fn prepare<'a, T, U>(
     }))
 }
 
-/// The copy over validated raw geometry; `execute` is the serial or the
-/// parallel permutation engine.
+/// The copy over validated raw geometry, run within the budget of `exec`.
 ///
 /// # Safety
 ///
@@ -119,11 +117,22 @@ fn prepare<'a, T, U>(
 /// `raw.src` valid for reads of initialized `T` at every source offset; the
 /// two ranges must not overlap. Every store goes through raw pointers, so the
 /// destination may be uninitialized storage.
-unsafe fn copy_raw<T: Copy + 'static, U>(
+unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     raw: RawCopy<'_, T, U>,
-    execute: impl FnOnce(*const T, *mut T, &PermutePlan),
+    exec: Exec<'_>,
 ) -> Result<()> {
     let dst_ptr = raw.dst.cast::<T>();
+    // A copy this small costs less than a fan-out: keep it on one task.
+    let exec = if raw
+        .dims
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .is_some_and(|n| n <= crate::MINTHREADLENGTH)
+    {
+        exec.limit(std::num::NonZeroUsize::MIN)
+    } else {
+        exec
+    };
     // Fast path: both contiguous. A contiguous layout is injective by
     // construction, so it skips the validation below.
     if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
@@ -141,32 +150,51 @@ unsafe fn copy_raw<T: Copy + 'static, U>(
         .map_err(plan_error)?;
     // A non-injective destination maps distinct logical elements onto one
     // offset, so the unsafe write loop would produce overlapping writes (and a
-    // data race under `parallel`). This matches the sibling output-writing
+    // data race when `exec` fans out). This matches the sibling output-writing
     // APIs (issue #281). The check is global over the destination, so two
     // worker partitions (disjoint logical positions) can never write one
     // offset; no extra per-partition separation proof is needed.
     if !strided_view::is_injective_layout(raw.dims, raw.dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
-    execute(raw.src, dst_ptr, &plan);
+    execute_permute_blocked(raw.src, dst_ptr, &plan, exec);
     Ok(())
 }
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
 ///
 /// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
-/// cache-aware blocking, and optimal loop ordering.
+/// cache-aware blocking, and optimal loop ordering. The permutation is split
+/// across the budget of `exec`, except that a copy of at most
+/// [`MINTHREADLENGTH`](crate::MINTHREADLENGTH) elements stays on the calling
+/// thread. A caller that wants a large copy on one thread passes
+/// [`Exec::serial`] or narrows the token with [`Exec::limit`].
+/// A contiguous copy is a single `memcpy` on the calling thread.
 ///
 /// This is a simple copy without ElementOp support. For copies with
 /// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
-pub fn copy_into<T: Copy + 'static>(
+///
+/// # Examples
+///
+/// ```
+/// use strided_exec::Exec;
+/// use strided_perm::copy_into;
+/// use strided_view::StridedArray;
+///
+/// let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
+/// let mut dst = StridedArray::<f64>::col_major(&[2, 3]);
+/// copy_into(&mut dst.view_mut(), &src.view(), Exec::serial()).unwrap();
+/// assert_eq!(dst.get(&[1, 2]), 12.0);
+/// ```
+pub fn copy_into<T: Copy + Send + Sync + 'static>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
         // SAFETY: both views are validated layouts over live, non-overlapping
         // storage (`StridedViewMut` is exclusive), and `prepare` matched them.
-        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked(s, d, plan)) },
+        Some(raw) => unsafe { copy_raw(raw, exec) },
         None => Ok(()),
     }
 }
@@ -180,66 +208,30 @@ pub fn copy_into<T: Copy + 'static>(
 /// 4096x4096 `f64` transpose). Every destination element the views describe
 /// is written exactly once; the stores go through raw pointers only, so no
 /// reference to uninitialized storage is formed.
-pub fn copy_into_uninit<T: Copy + 'static>(
+pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
         // SAFETY: as `copy_into`; `MaybeUninit<T>` has `T`'s layout and the
         // engine only stores into the destination.
-        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked(s, d, plan)) },
+        Some(raw) => unsafe { copy_raw(raw, exec) },
         None => Ok(()),
     }
 }
 
 /// Copy elements to a col-major destination.
 ///
-/// This now delegates to the same HPTT-inspired blocked permutation as
-/// `copy_into`. The HPTT planner automatically handles the col-major
-/// destination case optimally.
-pub fn copy_into_col_major<T: Copy + 'static>(
+/// This delegates to the same HPTT-inspired blocked permutation as
+/// [`copy_into`]. The HPTT planner handles the col-major destination case
+/// optimally.
+pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
-    copy_into(dst, src)
-}
-
-/// Copy elements from source to destination with Rayon parallelism.
-///
-/// Parallelizes the outermost block loop of the HPTT-inspired permutation.
-/// Falls back to single-threaded for small tensors.
-#[cfg(feature = "parallel")]
-pub fn copy_into_par<T: Copy + Send + Sync + 'static>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T>,
-) -> Result<()> {
-    match prepare(dest, src)? {
-        // SAFETY: as `copy_into`.
-        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked_par(s, d, plan)) },
-        None => Ok(()),
-    }
-}
-
-/// [`copy_into_uninit`] with Rayon parallelism; see [`copy_into_par`].
-#[cfg(feature = "parallel")]
-pub fn copy_into_uninit_par<T: Copy + Send + Sync + 'static>(
-    dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
-    src: &StridedView<T>,
-) -> Result<()> {
-    match prepare(dest, src)? {
-        // SAFETY: as `copy_into_uninit`.
-        Some(raw) => unsafe { copy_raw(raw, |s, d, plan| execute_permute_blocked_par(s, d, plan)) },
-        None => Ok(()),
-    }
-}
-
-/// Copy elements to a col-major destination with Rayon parallelism.
-#[cfg(feature = "parallel")]
-pub fn copy_into_col_major_par<T: Copy + Send + Sync + 'static>(
-    dst: &mut StridedViewMut<T>,
-    src: &StridedView<T>,
-) -> Result<()> {
-    copy_into_par(dst, src)
+    copy_into(dst, src, exec)
 }
 
 #[cfg(test)]
@@ -313,7 +305,7 @@ mod tests {
         let src =
             StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
         let mut dst = StridedArray::<f64>::col_major(&[2, 3]);
-        copy_into(&mut dst.view_mut(), &src.view()).unwrap();
+        copy_into(&mut dst.view_mut(), &src.view(), Exec::serial()).unwrap();
         assert_eq!(dst.get(&[0, 0]), 0.0);
         assert_eq!(dst.get(&[1, 2]), 12.0);
     }
@@ -329,7 +321,7 @@ mod tests {
         )
         .unwrap();
         let mut dst = StridedArray::<f64>::col_major(&[3, 2]);
-        copy_into(&mut dst.view_mut(), &src.view()).unwrap();
+        copy_into(&mut dst.view_mut(), &src.view(), Exec::serial()).unwrap();
         assert_eq!(dst.get(&[0, 0]), 0.0);
         assert_eq!(dst.get(&[0, 1]), 1.0);
         assert_eq!(dst.get(&[1, 0]), 2.0);
@@ -341,7 +333,7 @@ mod tests {
         let src =
             StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
         let mut dst = StridedArray::<f64>::col_major(&[4, 3]);
-        copy_into_col_major(&mut dst.view_mut(), &src.view()).unwrap();
+        copy_into_col_major(&mut dst.view_mut(), &src.view(), Exec::serial()).unwrap();
         assert_eq!(dst.get(&[0, 0]), 0.0);
         assert_eq!(dst.get(&[3, 2]), 32.0);
     }
@@ -358,7 +350,7 @@ mod tests {
         )
         .unwrap();
         let mut dst = StridedArray::<f64>::col_major(&[2, 3, 4]);
-        copy_into_col_major(&mut dst.view_mut(), &src.view()).unwrap();
+        copy_into_col_major(&mut dst.view_mut(), &src.view(), Exec::serial()).unwrap();
         // Verify element-by-element
         for i in 0..2 {
             for j in 0..3 {
@@ -390,7 +382,7 @@ mod tests {
         let src_view = src.view().permute(&perm).unwrap();
         let mut dst = StridedArray::<u32>::col_major(&dims);
 
-        copy_into(&mut dst.view_mut(), &src_view).unwrap();
+        copy_into(&mut dst.view_mut(), &src_view, Exec::serial()).unwrap();
 
         for flat in 0..total {
             let mut rem = flat;
@@ -429,12 +421,11 @@ mod tests {
         assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
     }
 
-    #[cfg(feature = "parallel")]
     #[test]
     fn parallel_transpose_splits_the_full_tile_grid_for_a_short_row_extent() {
         // The source's unit-stride extent is the short side of the transpose, so
-        // the whole kernel would be a single row tile over `block`, and the total
-        // is above the threading threshold. The parallel entry must split the
+        // the whole kernel would be a single row tile over `block`, and the budget is
+        // two. The parallel entry must split the
         // column tiles too; a row-only split would leave the work on one worker.
         // The result is checked element by element.
         let rows = 20000usize;
@@ -442,12 +433,10 @@ mod tests {
         let data: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
         let src =
             StridedArray::<f64>::from_parts(data, &[rows, cols], &[cols as isize, 1], 0).unwrap();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
+        let pool = strided_exec::Pool::builder().threads(2).build().unwrap();
         let mut dst = StridedArray::<f64>::col_major(&[rows, cols]);
-        pool.install(|| copy_into_par(&mut dst.view_mut(), &src.view()).unwrap());
+        let exec = Exec::new(&pool, 2).unwrap();
+        copy_into(&mut dst.view_mut(), &src.view(), exec).unwrap();
         for r in 0..rows {
             for c in 0..cols {
                 assert_eq!(dst.get(&[r, c]), (r * cols + c) as f64);
@@ -459,7 +448,7 @@ mod tests {
     fn test_copy_shape_mismatch() {
         let src = StridedArray::<f64>::col_major(&[2, 3]);
         let mut dst = StridedArray::<f64>::col_major(&[3, 2]);
-        let result = copy_into(&mut dst.view_mut(), &src.view());
+        let result = copy_into(&mut dst.view_mut(), &src.view(), Exec::serial());
         assert!(result.is_err());
     }
 }

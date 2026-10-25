@@ -1,7 +1,10 @@
+mod common;
+use common::Budget;
 use num_complex::{Complex32, Complex64};
+use strided_basic::Exec;
 use strided_basic::{
-    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ExecContext, KernelDType,
-    MaybeSimdOps, ReduceOp, StridedError,
+    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, KernelDType, MaybeSimdOps,
+    ReduceOp, StridedError,
 };
 
 #[test]
@@ -16,8 +19,7 @@ fn erased_reduce_plan_executes_f64_sum_transposed_layout() {
     let source = ErasedRawStridedRef::from_slice(&input, &dims, &src_strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [36.0]);
 }
@@ -38,7 +40,7 @@ fn erased_reduce_plan_executes_c64_product() {
     let source = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::max_threads(1).unwrap(), &mut dest, &source)
+    plan.execute(&mut dest, &source, Budget::Pooled(1).exec())
         .unwrap();
 
     assert_eq!(output, [input[0] * input[1] * input[2]]);
@@ -55,8 +57,7 @@ fn erased_reduce_plan_executes_i32_sum_with_ambient_context() {
     let source = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::ambient(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [6]);
 }
@@ -74,7 +75,7 @@ fn erased_reduce_plan_integer_full_reductions_use_wrapping_arithmetic() {
     let mut sum_dest = ErasedRawStridedMut::from_slice_mut(&mut sum_output, &[], &[], 0).unwrap();
 
     sum_plan
-        .execute(&ExecContext::serial(), &mut sum_dest, &sum_source)
+        .execute(&mut sum_dest, &sum_source, Exec::serial())
         .unwrap();
 
     assert_eq!(sum_output, [i32::MIN]);
@@ -88,7 +89,7 @@ fn erased_reduce_plan_integer_full_reductions_use_wrapping_arithmetic() {
         ErasedRawStridedMut::from_slice_mut(&mut product_output, &[], &[], 0).unwrap();
 
     product_plan
-        .execute(&ExecContext::serial(), &mut product_dest, &product_source)
+        .execute(&mut product_dest, &product_source, Exec::serial())
         .unwrap();
 
     assert_eq!(product_output, [i64::MAX.wrapping_mul(2)]);
@@ -125,18 +126,14 @@ fn erased_reduce_plan_serial_full_sum_uses_fixed_multi_accumulator_order() {
     let mut serial_output = [0.0f64];
     let mut serial_dest =
         ErasedRawStridedMut::from_slice_mut(&mut serial_output, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut serial_dest, &source)
+    plan.execute(&mut serial_dest, &source, Exec::serial())
         .unwrap();
 
     let mut one_thread_output = [0.0f64];
     let mut one_thread_dest =
         ErasedRawStridedMut::from_slice_mut(&mut one_thread_output, &[], &[], 0).unwrap();
-    plan.execute(
-        &ExecContext::max_threads(1).unwrap(),
-        &mut one_thread_dest,
-        &source,
-    )
-    .unwrap();
+    plan.execute(&mut one_thread_dest, &source, Budget::Pooled(1).exec())
+        .unwrap();
 
     let expected =
         <f64 as MaybeSimdOps>::try_simd_sum(&input).unwrap_or_else(|| sixteen_lane_sum(&input));
@@ -159,13 +156,13 @@ fn erased_reduce_plan_fixed_bounded_context_is_bitwise_repeatable() {
         .collect::<Vec<f64>>();
     let plan = ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides).unwrap();
     let source = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
-    let ctx = ExecContext::max_threads(4).unwrap();
+    let ctx = Budget::Pooled(4);
     let mut expected = None;
 
     for _ in 0..8 {
         let mut output = [0.0f64];
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-        plan.execute(&ctx, &mut dest, &source).unwrap();
+        plan.execute(&mut dest, &source, ctx.exec()).unwrap();
         let bits = output[0].to_bits();
         assert_eq!(*expected.get_or_insert(bits), bits);
     }
@@ -187,13 +184,13 @@ fn erased_sum_squares_fixed_bounded_context_is_bitwise_repeatable() {
     let plan =
         ErasedReducePlan::compile(KernelDType::F64, ReduceOp::SumSquares, &dims, &strides).unwrap();
     let source = ErasedRawStridedRef::from_slice(&input, &dims, &strides, 0).unwrap();
-    let ctx = ExecContext::max_threads(4).unwrap();
+    let ctx = Budget::Pooled(4);
     let mut expected = None;
 
     for _ in 0..8 {
         let mut output = [0.0f64];
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-        plan.execute(&ctx, &mut dest, &source).unwrap();
+        plan.execute(&mut dest, &source, ctx.exec()).unwrap();
         let bits = output[0].to_bits();
         assert_eq!(*expected.get_or_insert(bits), bits);
     }
@@ -215,8 +212,7 @@ fn erased_reduce_plan_preserves_noncompact_and_nonfinite_semantics() {
     let mut output = [Complex64::new(0.0, 0.0)];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [input[0] + input[1] + input[3] + input[4]]);
 
@@ -238,11 +234,7 @@ fn erased_reduce_plan_preserves_noncompact_and_nonfinite_semantics() {
         ErasedRawStridedMut::from_slice_mut(&mut nonfinite_output, &[], &[], 0).unwrap();
 
     nonfinite_plan
-        .execute(
-            &ExecContext::serial(),
-            &mut nonfinite_dest,
-            &nonfinite_source,
-        )
+        .execute(&mut nonfinite_dest, &nonfinite_source, Exec::serial())
         .unwrap();
 
     assert!(nonfinite_output[0].is_nan());
@@ -261,8 +253,7 @@ fn erased_reduce_plan_contiguous_product_covers_vector_body_and_tail() {
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [2.0]);
 }
@@ -277,8 +268,7 @@ fn erased_reduce_plan_contiguous_fast_path_honors_offset_and_empty_layout() {
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [6.0]);
 
@@ -293,7 +283,7 @@ fn erased_reduce_plan_contiguous_fast_path_honors_offset_and_empty_layout() {
         ErasedRawStridedMut::from_slice_mut(&mut empty_output, &[], &[], 0).unwrap();
 
     empty_plan
-        .execute(&ExecContext::serial(), &mut empty_dest, &empty_source)
+        .execute(&mut empty_dest, &empty_source, Exec::serial())
         .unwrap();
 
     assert_eq!(empty_output, [1.0]);
@@ -321,8 +311,7 @@ fn erased_reduce_plan_stable_product_falls_back_for_subnormals() {
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(left_fold, 0.0);
     assert_eq!(output[0], left_fold);
@@ -353,8 +342,7 @@ fn erased_reduce_plan_stable_product_reports_only_real_overflow() {
     let source = ErasedRawStridedRef::from_slice(&alternating, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(output[0], 1.0);
 
     // The same run split over two contiguous runs: axis 1 is strided in this
@@ -372,8 +360,7 @@ fn erased_reduce_plan_stable_product_reports_only_real_overflow() {
     let source = ErasedRawStridedRef::from_slice(&interleaved, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(output[0], 1.0);
 
     // A product that genuinely leaves the range still reports it.
@@ -386,8 +373,7 @@ fn erased_reduce_plan_stable_product_reports_only_real_overflow() {
     let source = ErasedRawStridedRef::from_slice(&runaway, &dims, &strides, 0).unwrap();
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert!(output[0].is_infinite());
 }
 
@@ -413,8 +399,7 @@ fn erased_reduce_plan_full_stable_product_carries_one_accumulator_across_runs() 
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output[0], big);
 }
@@ -454,11 +439,11 @@ fn erased_reduce_plan_axis_stable_product_carries_one_accumulator_across_runs() 
     .unwrap();
     let source = ErasedRawStridedRef::from_slice(&storage, &dims, &strides, 0).unwrap();
 
-    for ctx in [ExecContext::serial(), ExecContext::max_threads(2).unwrap()] {
+    for ctx in [Budget::Serial, Budget::Pooled(2)] {
         let mut output = vec![0.0f64; kept];
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
-        plan.execute(&ctx, &mut dest, &source).unwrap();
+        plan.execute(&mut dest, &source, ctx.exec()).unwrap();
         let bad = output.iter().position(|&value| value != big);
         let bad_value = bad.map(|index| output[index]);
         assert_eq!(bad, None, "output {bad:?} is {bad_value:?}, expected {big}");
@@ -477,8 +462,7 @@ fn erased_reduce_plan_executes_remaining_supported_dtype_set() {
     assert_eq!(plan.op(), ReduceOp::Sum);
     let source = ErasedRawStridedRef::from_slice(&input_f32, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output_f32, &[1], &[1], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(output_f32, [4.0]);
 
     let input_i64 = [2i64, -3];
@@ -487,8 +471,7 @@ fn erased_reduce_plan_executes_remaining_supported_dtype_set() {
         ErasedReducePlan::compile(KernelDType::I64, ReduceOp::Product, &dims, &strides).unwrap();
     let source = ErasedRawStridedRef::from_slice(&input_i64, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output_i64, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(output_i64, [-6]);
 
     let input_c32 = [Complex32::new(1.0, 1.0), Complex32::new(2.0, -1.0)];
@@ -497,8 +480,7 @@ fn erased_reduce_plan_executes_remaining_supported_dtype_set() {
         ErasedReducePlan::compile(KernelDType::C32, ReduceOp::Product, &dims, &strides).unwrap();
     let source = ErasedRawStridedRef::from_slice(&input_c32, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output_c32, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(output_c32, [input_c32[0] * input_c32[1]]);
 }
 
@@ -517,11 +499,11 @@ fn erased_reduce_plan_empty_input_returns_operation_identity() {
 
     ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides)
         .unwrap()
-        .execute(&ExecContext::serial(), &mut sum_dest, &source)
+        .execute(&mut sum_dest, &source, Exec::serial())
         .unwrap();
     ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Product, &dims, &strides)
         .unwrap()
-        .execute(&ExecContext::serial(), &mut product_dest, &source)
+        .execute(&mut product_dest, &source, Exec::serial())
         .unwrap();
 
     assert_eq!(sum_output, [0.0]);
@@ -551,8 +533,7 @@ fn erased_reduce_plan_executes_single_axis_sum_into_strided_output() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [1.0, 21.0, 41.0]);
 }
@@ -580,8 +561,7 @@ fn erased_reduce_plan_integer_axis_reductions_use_wrapping_arithmetic() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [i32::MIN, i32::MAX]);
 }
@@ -615,7 +595,7 @@ fn erased_reduce_plan_executes_multi_axis_sum_with_kept_middle_axis() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::max_threads(2).unwrap(), &mut dest, &source)
+    plan.execute(&mut dest, &source, Budget::Pooled(2).exec())
         .unwrap();
 
     assert_eq!(output, [1204.0, 1284.0, 1364.0]);
@@ -652,8 +632,7 @@ fn erased_reduce_plan_rank8_reordered_axes_preserve_fold_order() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     let mut expected = [0.0f64; 32];
     for (output_linear, expected_value) in expected.iter_mut().enumerate() {
@@ -708,8 +687,7 @@ fn erased_reduce_plan_fused_rank8_axes_match_contiguous_order() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [8128, 24512]);
 }
@@ -743,8 +721,7 @@ fn erased_reduce_plan_partially_fused_inner_axes_preserve_order() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     let mut expected = [0.0f64; 2];
     for kept in 0..2 {
@@ -784,8 +761,7 @@ fn erased_reduce_plan_executes_all_axes_sum_into_rank0_scalar() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [63.0]);
 }
@@ -813,8 +789,7 @@ fn erased_reduce_plan_axis_reduction_writes_identity_for_empty_reduced_domain() 
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert_eq!(output, [1.0, 1.0]);
 }
@@ -881,7 +856,7 @@ fn erased_reduce_plan_rejects_dtype_mismatch_before_writing() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &source)
+        .execute(&mut dest, &source, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
@@ -908,7 +883,7 @@ fn erased_reduce_plan_rejects_layout_mismatch_before_writing() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &source)
+        .execute(&mut dest, &source, Exec::serial())
         .unwrap_err();
 
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
@@ -927,7 +902,7 @@ fn erased_reduce_plan_rejects_non_scalar_output_and_unsupported_dtype() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[2], &[1], 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &source)
+        .execute(&mut dest, &source, Exec::serial())
         .unwrap_err();
     assert!(matches!(err, StridedError::RankMismatch(2, 1)));
     assert_eq!(output, [9.0, 10.0]);
@@ -962,17 +937,13 @@ fn erased_reduce_plan_sum_squares_matches_materialized_full_reduction() {
 
     let mut serial_dest =
         ErasedRawStridedMut::from_slice_mut(&mut serial_output, &[], &[], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut serial_dest, &source)
+    plan.execute(&mut serial_dest, &source, Exec::serial())
         .unwrap();
 
     let mut max_one_dest =
         ErasedRawStridedMut::from_slice_mut(&mut max_one_output, &[], &[], 0).unwrap();
-    plan.execute(
-        &ExecContext::max_threads(1).unwrap(),
-        &mut max_one_dest,
-        &source,
-    )
-    .unwrap();
+    plan.execute(&mut max_one_dest, &source, Budget::Pooled(1).exec())
+        .unwrap();
 
     assert_eq!(serial_output, [expected]);
     assert_eq!(max_one_output[0].to_bits(), serial_output[0].to_bits());
@@ -1010,14 +981,10 @@ fn erased_reduce_plan_sum_squares_is_bitwise_materialized_sum() {
         ErasedRawStridedMut::from_slice_mut(&mut materialized_output, &[], &[], 0).unwrap();
 
     sum_squares_plan
-        .execute(&ExecContext::serial(), &mut fused_dest, &source)
+        .execute(&mut fused_dest, &source, Exec::serial())
         .unwrap();
     sum_plan
-        .execute(
-            &ExecContext::serial(),
-            &mut materialized_dest,
-            &squared_source,
-        )
+        .execute(&mut materialized_dest, &squared_source, Exec::serial())
         .unwrap();
 
     assert_eq!(fused_output[0].to_bits(), materialized_output[0].to_bits());
@@ -1047,7 +1014,7 @@ fn erased_reduce_plan_sum_squares_matches_materialized_axis_reduction() {
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
 
-    plan.execute(&ExecContext::max_threads(2).unwrap(), &mut dest, &source)
+    plan.execute(&mut dest, &source, Budget::Pooled(2).exec())
         .unwrap();
 
     let expected = [
@@ -1080,8 +1047,7 @@ fn erased_reduce_plan_sum_squares_axis_handles_negative_stride_offset_and_zero_e
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 1).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(output, [-1.0, 5.0, -1.0, 25.0, -1.0, 61.0]);
 
     let empty_src_dims = [2usize, 0];
@@ -1115,7 +1081,7 @@ fn erased_reduce_plan_sum_squares_axis_handles_negative_stride_offset_and_zero_e
     .unwrap();
 
     empty_plan
-        .execute(&ExecContext::serial(), &mut empty_dest, &empty_source)
+        .execute(&mut empty_dest, &empty_source, Exec::serial())
         .unwrap();
     assert_eq!(empty_output, [0.0, 0.0]);
 }
@@ -1137,7 +1103,7 @@ fn erased_reduce_plan_sum_squares_handles_empty_rank_zero_and_nonfinite_values()
     let mut empty_dest =
         ErasedRawStridedMut::from_slice_mut(&mut empty_output, &[], &[], 0).unwrap();
     empty_plan
-        .execute(&ExecContext::serial(), &mut empty_dest, &empty_source)
+        .execute(&mut empty_dest, &empty_source, Exec::serial())
         .unwrap();
     assert_eq!(empty_output, [0.0]);
 
@@ -1149,7 +1115,7 @@ fn erased_reduce_plan_sum_squares_handles_empty_rank_zero_and_nonfinite_values()
     let mut scalar_dest =
         ErasedRawStridedMut::from_slice_mut(&mut scalar_output, &[], &[], 0).unwrap();
     scalar_plan
-        .execute(&ExecContext::serial(), &mut scalar_dest, &scalar_source)
+        .execute(&mut scalar_dest, &scalar_source, Exec::serial())
         .unwrap();
     assert_eq!(scalar_output[0].to_bits(), 0.0f64.to_bits());
 
@@ -1161,11 +1127,7 @@ fn erased_reduce_plan_sum_squares_handles_empty_rank_zero_and_nonfinite_values()
     let mut nonfinite_dest =
         ErasedRawStridedMut::from_slice_mut(&mut nonfinite_output, &[], &[], 0).unwrap();
     nonfinite_plan
-        .execute(
-            &ExecContext::serial(),
-            &mut nonfinite_dest,
-            &nonfinite_source,
-        )
+        .execute(&mut nonfinite_dest, &nonfinite_source, Exec::serial())
         .unwrap();
     assert!(nonfinite_output[0].is_nan());
 }
@@ -1181,8 +1143,7 @@ fn erased_reduce_plan_sum_squares_rounds_multiplication_before_accumulation() {
     let mut output = [0.0f64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
 
-    plan.execute(&ExecContext::serial(), &mut dest, &source)
-        .unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     assert!(output[0].is_infinite());
     assert_eq!((input[1] * input[1]).to_bits(), 0.0f64.to_bits());
@@ -1207,15 +1168,13 @@ fn erased_reduce_plan_sum_squares_rejects_non_float_dtypes() {
 /// first half with `big * big` from the second still scales to the representable
 /// `big` instead of overflowing one worker to `infinity`.
 ///
-/// The pool is explicit because the ambient one is not: `ExecContext::max_threads`
+/// The pool is explicit: a `Budget::Pooled(2)` token
 /// only *caps* the pool it runs in, and the default feature set does not build the
-/// parallel path at all, so a `max_threads(2)` context alone proves nothing about it
+/// parallel path at all, so a two-slot token alone proves nothing about it
 /// (independent review of #2150's coverage).
 #[cfg(feature = "parallel")]
 #[test]
 fn erased_reduce_plan_stable_product_carries_the_exponent_across_a_two_thread_pool() {
-    use rayon::ThreadPoolBuilder;
-
     // The parallel full-reduction split only engages above the threading threshold,
     // so the run has to be longer than that or the guard is never reached: with too
     // short a run the test passes whether the guard is there or not (independent
@@ -1236,23 +1195,14 @@ fn erased_reduce_plan_stable_product_carries_the_exponent_across_a_two_thread_po
         ErasedReducePlan::compile(KernelDType::F64, ReduceOp::StableProduct, &dims, &strides)
             .unwrap();
     let source = ErasedRawStridedRef::from_slice(&values, &dims, &strides, 0).unwrap();
-    let context = ExecContext::max_threads(2).unwrap();
+    let context = Budget::Pooled(2);
 
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .expect("a two-thread pool");
-    let scaled = pool.install(|| {
-        assert_eq!(
-            rayon::current_num_threads(),
-            2,
-            "the test must run inside a two-wide pool for the split to be reachable"
-        );
+    let scaled = {
         let mut output = [0.0f64];
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-        plan.execute(&context, &mut dest, &source).unwrap();
+        plan.execute(&mut dest, &source, context.exec()).unwrap();
         output[0]
-    });
+    };
 
     assert_eq!(
         scaled, big,

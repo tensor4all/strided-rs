@@ -5,7 +5,7 @@ Runtime-DAG fused elementwise execution. The typed `FusedPlan` and dtype-erased
 and generic traversal without depending on `strided-kernel`.
 
 ```rust
-use strided_basic::StridedArray;
+use strided_basic::{Exec, StridedArray};
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan};
 let input = StridedArray::<f64>::from_parts(vec![2.0, 3.0], &[2], &[1], 0).unwrap();
 let mut output = StridedArray::<f64>::col_major(&[2]);
@@ -14,7 +14,7 @@ let plan = FusedPlan::new(
     vec![1],
     vec![FusedInst::new(FusedOp::Negate, vec![0])],
 );
-fused_elementwise_into(&mut [output.view_mut()], &[input.view()], &plan).unwrap();
+fused_elementwise_into(&mut [output.view_mut()], &[input.view()], &plan, Exec::serial()).unwrap();
 assert_eq!(output.get(&[1]), -3.0);
 ```
 

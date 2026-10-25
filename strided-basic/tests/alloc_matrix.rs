@@ -14,15 +14,13 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::mem::MaybeUninit;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use strided_basic::{
     add, axpy, batched_outer_product_into, col_major_strides, dot, embed_diagonal_into_uninit, fma,
-    map_into, map_update_into, mul, reduce, reduce_axis_into, sum, symmetrize_into,
-    with_execution_policy, zip_map2_into, zip_map3_into, zip_map4_into, zip_reduce,
-    zip_update2_into, zip_update3_into, ExecutionPolicy, Identity, StridedArray, StridedView,
-    StridedViewMut,
+    map_into, map_update_into, mul, reduce, reduce_axis_into, sum, symmetrize_into, zip_map2_into,
+    zip_map3_into, zip_map4_into, zip_reduce, zip_update2_into, zip_update3_into, Exec, Identity,
+    Pool, StridedArray, StridedView, StridedViewMut,
 };
 
 const SMALL_TENSOR_THRESHOLD: usize = 1024;
@@ -80,7 +78,7 @@ fn count_allocations(mut run: impl FnMut()) -> usize {
 /// Allocations made by the calling thread while `run` executes.
 ///
 /// Serial windows use this so a concurrently idle worker pool or the global
-/// Rayon pool cannot leak background allocations into the count.
+/// global pool cannot leak background allocations into the count.
 fn count_thread_allocations(run: impl FnOnce()) -> usize {
     let before = THREAD_ALLOCATIONS.with(Cell::get);
     run();
@@ -139,54 +137,58 @@ fn required_len(dims: &[usize], strides: &[isize]) -> usize {
     (max_offset + 1) as usize
 }
 
-/// Runs one entry serially and in a two-worker pool, asserting no allocations.
-/// `entry` is warmed up first so one-time runtime state stays outside the
-/// counted windows. Every input layout in `kinds` is exercised.
-fn assert_entry<'a>(
+/// `count_allocations` runs its window three times, and a pooled token is
+/// minted once per run: the pool entry and token setup stay outside the window.
+fn pooled_tokens(pool: &Pool, runs: usize) -> Vec<Exec<'_>> {
+    (0..runs).map(|_| Exec::new(pool, 2).unwrap()).collect()
+}
+
+/// Runs `f` on a worker of `pool`. A pooled entry called from a worker spawns
+/// into the current scope without installing, so the counted windows measure
+/// the entry itself, not the one-time cost of entering the pool from outside.
+fn on_worker<R: Send>(pool: &Pool, f: impl FnOnce(&Pool) -> R + Send) -> R {
+    let slot = std::sync::Mutex::new(Some(f));
+    let out = std::sync::Mutex::new(None);
+    Exec::new(pool, 2).unwrap().fork(2, |job, _child| {
+        if job == 0 {
+            let f = slot.lock().unwrap().take().unwrap();
+            *out.lock().unwrap() = Some(f(pool));
+        }
+    });
+    out.into_inner().unwrap().expect("job 0 ran on a worker")
+}
+
+/// Runs one entry serially and on a two-slot token of `pool`, asserting no
+/// allocations. `entry` is warmed up first so one-time runtime state stays
+/// outside the counted windows. Every input layout in `kinds` is exercised.
+fn assert_entry<'p>(
     name: &str,
-    pool: &rayon::ThreadPool,
+    pool: &'p Pool,
     dims: &[usize],
     kinds: &[LayoutKind],
-    mut entry: impl FnMut(LayoutKind) + Send,
+    mut entry: impl FnMut(LayoutKind, Exec<'p>) + Send,
 ) {
     for &kind in kinds {
-        // Warm up outside the counted windows, under both execution modes, so
-        // the ambient Rayon global pool is never initialized and cannot leak
-        // background allocations into the process-wide counter.
-        with_execution_policy(ExecutionPolicy::Sequential, || entry(kind));
-        pool.install(|| {
-            with_execution_policy(
-                ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(2).unwrap(),
-                },
-                || entry(kind),
-            );
-        });
-        let serial = count_thread_allocations(|| {
-            with_execution_policy(ExecutionPolicy::Sequential, || entry(kind));
-        });
+        // Warm up outside the counted windows.
+        entry(kind, Exec::serial());
+        let serial = count_thread_allocations(|| entry(kind, Exec::serial()));
         assert_eq!(
             serial, 0,
             "{name} {kind:?} serial at rank {dims:?} allocated {serial}"
         );
-        let parallel = pool.install(|| {
-            count_allocations(|| {
-                with_execution_policy(
-                    ExecutionPolicy::Rayon {
-                        max_threads: NonZeroUsize::new(2).unwrap(),
-                    },
-                    || entry(kind),
-                );
-            })
+        let parallel = on_worker(pool, |_| {
+            let mut tokens = pooled_tokens(pool, 4);
+            entry(kind, tokens.pop().unwrap());
+            count_allocations(|| entry(kind, tokens.pop().unwrap()))
         });
         assert_eq!(
             parallel, 0,
-            "{name} {kind:?} two-worker at rank {dims:?} allocated {parallel}"
+            "{name} {kind:?} two-slot at rank {dims:?} allocated {parallel}"
         );
     }
 }
 
-fn run_map_entries(dims: &[usize], pool: &rayon::ThreadPool) {
+fn run_map_entries(dims: &[usize], pool: &Pool) {
     let layouts = [
         strides_for(dims, LayoutKind::Contiguous),
         strides_for(dims, LayoutKind::Permuted),
@@ -213,70 +215,79 @@ fn run_map_entries(dims: &[usize], pool: &rayon::ThreadPool) {
         LayoutKind::Broadcast,
     ];
 
-    assert_entry("map_into", pool, dims, &kinds, |kind| {
+    assert_entry("map_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        map_into(&mut dest, &source, |x| x + 1.0).unwrap();
+        map_into(&mut dest, &source, |x| x + 1.0, exec).unwrap();
     });
 
-    assert_entry("zip_map2_into", pool, dims, &kinds, |kind| {
+    assert_entry("zip_map2_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        zip_map2_into(&mut dest, &va, &vb, |x, y| x + y).unwrap();
+        zip_map2_into(&mut dest, &va, &vb, |x, y| x + y, exec).unwrap();
     });
 
-    assert_entry("zip_map3_into", pool, dims, &kinds, |kind| {
+    assert_entry("zip_map3_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let vc = sv(&c, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        zip_map3_into(&mut dest, &va, &vb, &vc, |x, y, z| x + y + z).unwrap();
+        zip_map3_into(&mut dest, &va, &vb, &vc, |x, y, z| x + y + z, exec).unwrap();
     });
 
-    assert_entry("zip_map4_into", pool, dims, &kinds, |kind| {
+    assert_entry("zip_map4_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let vc = sv(&c, dims, &dst_strides, 0).unwrap();
         let vd = sv(&src, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        zip_map4_into(&mut dest, &va, &vb, &vc, &vd, |x, y, z, w| x + y + z + w).unwrap();
+        zip_map4_into(
+            &mut dest,
+            &va,
+            &vb,
+            &vc,
+            &vd,
+            |x, y, z, w| x + y + z + w,
+            exec,
+        )
+        .unwrap();
     });
 
-    assert_entry("add", pool, dims, &kinds, |kind| {
+    assert_entry("add", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        add(&mut dest, &source).unwrap();
+        add(&mut dest, &source, exec).unwrap();
     });
 
-    assert_entry("mul", pool, dims, &kinds, |kind| {
+    assert_entry("mul", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        mul(&mut dest, &source).unwrap();
+        mul(&mut dest, &source, exec).unwrap();
     });
 
-    assert_entry("axpy", pool, dims, &kinds, |kind| {
+    assert_entry("axpy", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        axpy(&mut dest, &source, 1.5).unwrap();
+        axpy(&mut dest, &source, 1.5, exec).unwrap();
     });
 
-    assert_entry("fma", pool, dims, &kinds, |kind| {
+    assert_entry("fma", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        fma(&mut dest, &va, &vb).unwrap();
+        fma(&mut dest, &va, &vb, exec).unwrap();
     });
 
-    assert_entry("dot", pool, dims, &kinds, |kind| {
+    assert_entry("dot", pool, dims, &kinds, |kind, _exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
@@ -286,38 +297,39 @@ fn run_map_entries(dims: &[usize], pool: &rayon::ThreadPool) {
     // Single- and two-operand full reductions (#280). `dot` above is the typed
     // two-operand entry; `zip_reduce` is the mapped one, and `reduce`/`sum` are
     // the one-operand entries.
-    assert_entry("reduce", pool, dims, &kinds, |kind| {
+    assert_entry("reduce", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
-        let _ = reduce(&source, |x| x, |x, y| x + y, 0.0).unwrap();
+        let _ = reduce(&source, |x| x, |x, y| x + y, 0.0, exec).unwrap();
     });
 
-    assert_entry("sum", pool, dims, &kinds, |kind| {
+    assert_entry("sum", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
-        let _ = sum(&source).unwrap();
+        let _ = sum(&source, exec).unwrap();
     });
 
-    assert_entry("zip_reduce", pool, dims, &kinds, |kind| {
+    assert_entry("zip_reduce", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
-        let _: f64 = zip_reduce(&va, &vb, |x, y| x * y, |x, y| x + y, 0.0).unwrap();
+        let _: f64 = zip_reduce(&va, &vb, |x, y| x * y, |x, y| x + y, 0.0, exec).unwrap();
     });
 
-    assert_entry("map_update_into", pool, dims, &kinds, |_kind| {
+    assert_entry("map_update_into", pool, dims, &kinds, |_kind, exec| {
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        map_update_into::<f64, Identity>(&mut dest, |x| x + 1.0).unwrap();
+        map_update_into::<f64, Identity>(&mut dest, |x| x + 1.0, exec).unwrap();
     });
 
-    assert_entry("zip_update2_into", pool, dims, &kinds, |kind| {
+    assert_entry("zip_update2_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        zip_update2_into::<f64, f64, Identity, Identity>(&mut dest, &va, |d, a| d + a).unwrap();
+        zip_update2_into::<f64, f64, Identity, Identity>(&mut dest, &va, |d, a| d + a, exec)
+            .unwrap();
     });
 
-    assert_entry("zip_update3_into", pool, dims, &kinds, |kind| {
+    assert_entry("zip_update3_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
@@ -327,6 +339,7 @@ fn run_map_entries(dims: &[usize], pool: &rayon::ThreadPool) {
             &va,
             &vb,
             |d, a, b| d + a + b,
+            exec,
         )
         .unwrap();
     });
@@ -336,18 +349,18 @@ fn run_map_entries(dims: &[usize], pool: &rayon::ThreadPool) {
         let reduced: Vec<usize> = dims[1..].to_vec();
         let reduced_len = total(&reduced);
         let reduced_strides = col_major_strides(&reduced);
-        assert_entry("reduce_axis_into", pool, dims, &kinds, |kind| {
+        assert_entry("reduce_axis_into", pool, dims, &kinds, |kind, exec| {
             let strides = &layouts[kind_index(kind)];
             let source = sv(&src, dims, &strides, 0).unwrap();
             let mut dest =
                 StridedViewMut::new(&mut out[..reduced_len], &reduced, &reduced_strides, 0)
                     .unwrap();
-            reduce_axis_into(&mut dest, &source, 0, |x| x, |x, y| x + y, 0.0).unwrap();
+            reduce_axis_into(&mut dest, &source, 0, |x| x, |x, y| x + y, 0.0, exec).unwrap();
         });
     }
 }
 
-fn run_composites(pool: &rayon::ThreadPool) {
+fn run_composites(pool: &Pool) {
     // symmetrize, rank 2.
     let dims = [8usize, 8];
     let len = 64;
@@ -359,10 +372,10 @@ fn run_composites(pool: &rayon::ThreadPool) {
         pool,
         &dims,
         &[LayoutKind::Permuted],
-        |_kind| {
+        |_kind, exec| {
             let source = sv(&src, &dims, &strides, 0).unwrap();
             let mut dest = StridedViewMut::new(&mut out, &dims, &strides, 0).unwrap();
-            symmetrize_into(&mut dest, &source).unwrap();
+            symmetrize_into(&mut dest, &source, exec).unwrap();
         },
     );
 
@@ -382,12 +395,12 @@ fn run_composites(pool: &rayon::ThreadPool) {
         pool,
         &dest_dims,
         &[LayoutKind::Contiguous],
-        |_kind| {
+        |_kind, exec| {
             let lhs_view = sv(&lhs, &lhs_dims, &lhs_strides, 0).unwrap();
             let rhs_view = sv(&rhs, &rhs_dims, &rhs_strides, 0).unwrap();
             let mut dest =
                 StridedViewMut::new(&mut dest_data, &dest_dims, &dest_strides, 0).unwrap();
-            batched_outer_product_into(&mut dest, &lhs_view, &rhs_view, 1, 1).unwrap();
+            batched_outer_product_into(&mut dest, &lhs_view, &rhs_view, 1, 1, exec).unwrap();
         },
     );
 
@@ -401,19 +414,15 @@ fn run_composites(pool: &rayon::ThreadPool) {
         pool,
         &shape,
         &[LayoutKind::Contiguous],
-        |_kind| {
-            embed_diagonal_into_uninit(&mut out, &input, &shape, 0, 0, 0.0).unwrap();
+        |_kind, exec| {
+            embed_diagonal_into_uninit(&mut out, &input, &shape, 0, 0, 0.0, exec).unwrap();
         },
     );
 }
 
 #[test]
 fn typed_entries_are_allocation_free_up_to_rank_limit() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
-    pool.install(|| assert_eq!(rayon::current_num_threads(), 2));
+    let pool = Pool::builder().threads(2).build().unwrap();
 
     for rank in 1..=8usize {
         let small = vec![2usize; rank];
@@ -439,7 +448,7 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
 /// Tensor-sized cases above the 32768-element threading threshold, so the
 /// two-worker counting windows exercise the real parallel branches rather than
 /// the serial fallback that the `large` shapes (1025..1152 elements) take.
-fn check_parallel_threshold(pool: &rayon::ThreadPool) {
+fn check_parallel_threshold(pool: &Pool) {
     let shapes: [&[usize]; 3] = [
         &[33, 33, 33],
         &[3, 3, 3, 3, 3, 3, 3, 21],
@@ -457,7 +466,7 @@ fn check_parallel_threshold(pool: &rayon::ThreadPool) {
 /// The recursive full-reduction fold (`reduce`, whose parallel path combines
 /// per-worker partials in a tree) must also be allocation-free on every worker
 /// for a non-contiguous source above the threading threshold.
-fn check_full_reduction(pool: &rayon::ThreadPool) {
+fn check_full_reduction(pool: &Pool) {
     use strided_basic::reduce;
 
     let dims = [257usize, 128];
@@ -472,54 +481,32 @@ fn check_full_reduction(pool: &rayon::ThreadPool) {
     // partial-combination fold runs instead of the contiguous lane fold.
     let source = sv(&src, &dims, &strides, 0).unwrap();
 
-    // Warm up under both execution modes outside the counted windows.
-    with_execution_policy(ExecutionPolicy::Sequential, || {
-        let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
-    });
-    pool.install(|| {
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(2).unwrap(),
-            },
-            || {
-                let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
-            },
-        );
-    });
+    // Warm up outside the counted windows.
+    let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
 
     let serial = count_thread_allocations(|| {
-        with_execution_policy(ExecutionPolicy::Sequential, || {
-            let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
-        });
+        let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     });
     assert_eq!(serial, 0, "serial full reduction allocated {serial}");
 
-    let parallel = pool.install(|| {
+    let parallel = on_worker(pool, |pool| {
+        let mut tokens = pooled_tokens(pool, 4);
+        let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, tokens.pop().unwrap()).unwrap();
         count_allocations(|| {
-            with_execution_policy(
-                ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(2).unwrap(),
-                },
-                || {
-                    let _ = reduce(&source, |x| x, |a, b| a + b, 0.0).unwrap();
-                },
-            );
+            let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, tokens.pop().unwrap()).unwrap();
         })
     });
-    assert_eq!(
-        parallel, 0,
-        "two-worker full reduction allocated {parallel}"
-    );
+    assert_eq!(parallel, 0, "two-slot full reduction allocated {parallel}");
 }
 
 /// Compiled plans must not allocate on compile or execute within the inline
 /// rank/operand bounds (P4), so downstream code that compiles per call and
 /// executes per accumulate does not touch the heap.
-fn check_plans(pool: &rayon::ThreadPool) {
+fn check_plans(_pool: &Pool) {
     use strided_basic::{
         ConcatenatePlan, ErasedConcatenatePlan, ErasedRawStridedMut, ErasedRawStridedPtr,
         ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan, ErasedUpdatePlan,
-        ExecContext, KernelDType, RawStridedMut, RawStridedRef, ReduceOp, UpdateOp, UpdatePlan,
+        KernelDType, RawStridedMut, RawStridedRef, ReduceOp, UpdateOp, UpdatePlan,
     };
     for rank in 1..=8usize {
         let dims = vec![2usize; rank];
@@ -529,13 +516,11 @@ fn check_plans(pool: &rayon::ThreadPool) {
         let mut dst = vec![0.0f64; len];
 
         // UpdatePlan: compile and execute allocation-free.
-        let plan = with_execution_policy(ExecutionPolicy::Sequential, || {
-            UpdatePlan::compile(&dims, &strides, &strides).unwrap()
-        });
+        let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
         {
             let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
             let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
-            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x)
+            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x, Exec::serial())
                 .unwrap();
         }
         let update_compile = count_thread_allocations(|| {
@@ -549,7 +534,7 @@ fn check_plans(pool: &rayon::ThreadPool) {
         let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
         let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
         let update_execute = count_thread_allocations(|| {
-            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x)
+            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x, Exec::serial())
                 .unwrap();
         });
         assert_eq!(
@@ -560,10 +545,10 @@ fn check_plans(pool: &rayon::ThreadPool) {
         // Write-only uninitialized destination: same allocation-free replay.
         let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); len];
         let mut uninit_mut = RawStridedMut::new(&mut uninit_dst, &dims, &strides, 0).unwrap();
-        plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x)
+        plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x, Exec::serial())
             .unwrap();
         let update_uninit = count_thread_allocations(|| {
-            plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x)
+            plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x, Exec::serial())
                 .unwrap();
         });
         assert_eq!(
@@ -581,12 +566,12 @@ fn check_plans(pool: &rayon::ThreadPool) {
                 ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dims, &strides, 0).unwrap();
             erased_update
                 .execute(
-                    &ExecContext::serial(),
                     &mut dest,
                     &source,
                     2.0,
                     3.0,
                     UpdateOp::Identity,
+                    Exec::serial(),
                 )
                 .unwrap();
         }
@@ -597,12 +582,12 @@ fn check_plans(pool: &rayon::ThreadPool) {
         let erased_update_execute = count_thread_allocations(|| {
             erased_update
                 .execute(
-                    &ExecContext::serial(),
                     &mut dest,
                     &source,
                     2.0,
                     3.0,
                     UpdateOp::Identity,
+                    Exec::serial(),
                 )
                 .unwrap();
         });
@@ -619,21 +604,21 @@ fn check_plans(pool: &rayon::ThreadPool) {
         let source_ptr = ErasedRawStridedPtr::from_ref(&source);
         erased_update
             .execute_uninit(
-                &ExecContext::serial(),
                 &mut uninit_dest,
                 &source_ptr,
                 1.0,
                 UpdateOp::Identity,
+                Exec::serial(),
             )
             .unwrap();
         let erased_update_uninit = count_thread_allocations(|| {
             erased_update
                 .execute_uninit(
-                    &ExecContext::serial(),
                     &mut uninit_dest,
                     &source_ptr,
                     1.0,
                     UpdateOp::Identity,
+                    Exec::serial(),
                 )
                 .unwrap();
         });
@@ -676,13 +661,17 @@ fn check_plans(pool: &rayon::ThreadPool) {
             let b = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
             let mut dest =
                 RawStridedMut::new(&mut concat_dst, &dest_dims, &dest_strides, 0).unwrap();
-            concat_plan.execute(&mut dest, &[a, b]).unwrap();
+            concat_plan
+                .execute(&mut dest, &[a, b], Exec::serial())
+                .unwrap();
         }
         let a = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
         let b = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
         let mut dest = RawStridedMut::new(&mut concat_dst, &dest_dims, &dest_strides, 0).unwrap();
         let concat_execute = count_thread_allocations(|| {
-            concat_plan.execute(&mut dest, &[a, b]).unwrap();
+            concat_plan
+                .execute(&mut dest, &[a, b], Exec::serial())
+                .unwrap();
         });
         assert_eq!(
             concat_execute, 0,
@@ -707,7 +696,7 @@ fn check_plans(pool: &rayon::ThreadPool) {
                 ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dest_dims, &dest_strides, 0)
                     .unwrap();
             erased_plan
-                .execute(&strided_basic::ExecContext::serial(), &mut dest, &[a, b])
+                .execute(&mut dest, &[a, b], Exec::serial())
                 .unwrap();
         }
         let a = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
@@ -717,7 +706,7 @@ fn check_plans(pool: &rayon::ThreadPool) {
                 .unwrap();
         let erased_concat_execute = count_thread_allocations(|| {
             erased_plan
-                .execute(&strided_basic::ExecContext::serial(), &mut dest, &[a, b])
+                .execute(&mut dest, &[a, b], Exec::serial())
                 .unwrap();
         });
         assert_eq!(
@@ -780,16 +769,14 @@ fn check_plans(pool: &rayon::ThreadPool) {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out, &reduced_dims, &reduced_strides, 0)
                     .unwrap();
-            plan.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
-                .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         }
         let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut out, &reduced_dims, &reduced_strides, 0)
                 .unwrap();
         let execute = count_thread_allocations(|| {
-            plan.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
-                .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         });
         assert_eq!(
             execute, 0,
@@ -801,37 +788,31 @@ fn check_plans(pool: &rayon::ThreadPool) {
     {
         let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut scalar, &[1], &[1], 0).unwrap();
-        full.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
-            .unwrap();
+        full.execute(&mut dest, &source, Exec::serial()).unwrap();
     }
     let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut scalar, &[1], &[1], 0).unwrap();
     let full_execute = count_thread_allocations(|| {
-        full.execute(&strided_basic::ExecContext::serial(), &mut dest, &source)
-            .unwrap();
+        full.execute(&mut dest, &source, Exec::serial()).unwrap();
     });
     assert_eq!(
         full_execute, 0,
         "ErasedReducePlan full execute allocated {full_execute}"
     );
-    let _ = pool;
 }
 
 /// `reduce_axis_into` must be allocation-free; the array-returning
 /// `reduce_axis` wrapper must allocate only its column-major output.
-fn check_reduce_axis(pool: &rayon::ThreadPool) {
+fn check_reduce_axis(_pool: &Pool) {
     use strided_basic::reduce_axis;
 
     let dims = [4usize, 4, 4];
     let src: Vec<f64> = (0..64).map(|v| v as f64).collect();
     let strides = col_major_strides(&dims);
     let source = sv(&src, &dims, &strides, 0).unwrap();
-    // Warm up under a serial policy so the ambient global pool is untouched.
-    with_execution_policy(ExecutionPolicy::Sequential, || {
-        let _ = reduce_axis(&source, 0, |x| x, |a, b| a + b, 0.0).unwrap();
-    });
+    let _ = reduce_axis(&source, 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     let wrapper = count_thread_allocations(|| {
-        let out = reduce_axis(&source, 0, |x| x, |a, b| a + b, 0.0).unwrap();
+        let out = reduce_axis(&source, 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
         std::hint::black_box(out);
     });
     assert_eq!(
@@ -842,18 +823,35 @@ fn check_reduce_axis(pool: &rayon::ThreadPool) {
     let reduced = [4usize, 4];
     let mut out = StridedArray::<f64>::col_major(&reduced);
     let mut dest = out.view_mut();
-    reduce_axis_into(&mut dest, &source, 0, |x| x, |a, b| a + b, 0.0).unwrap();
+    reduce_axis_into(
+        &mut dest,
+        &source,
+        0,
+        |x| x,
+        |a, b| a + b,
+        0.0,
+        Exec::serial(),
+    )
+    .unwrap();
     let into = count_thread_allocations(|| {
-        reduce_axis_into(&mut dest, &source, 0, |x| x, |a, b| a + b, 0.0).unwrap();
+        reduce_axis_into(
+            &mut dest,
+            &source,
+            0,
+            |x| x,
+            |a, b| a + b,
+            0.0,
+            Exec::serial(),
+        )
+        .unwrap();
     });
     assert_eq!(into, 0, "reduce_axis_into must not allocate");
-    let _ = pool;
 }
 
 /// Above `INLINE_RANK` the planner spills by contract. This records the spill
 /// instead of gating it, so a change from inline to unconditional heap use
 /// above the bound is visible without making rank 9 a failure.
-fn record_rank9_spill(pool: &rayon::ThreadPool) {
+fn record_rank9_spill(pool: &Pool) {
     let dims = vec![2usize; 9];
     let len = total(&dims);
     let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
@@ -862,25 +860,15 @@ fn record_rank9_spill(pool: &rayon::ThreadPool) {
     let src_strides = strides_for(&dims, LayoutKind::Permuted);
     let source = sv(&src, &dims, &src_strides, 0).unwrap();
     let mut dest = StridedViewMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
-    // Warm up under a serial policy so the ambient global pool is untouched.
-    with_execution_policy(ExecutionPolicy::Sequential, || {
-        map_into(&mut dest, &source, |x| x + 1.0).unwrap();
-    });
+    map_into(&mut dest, &source, |x| x + 1.0, Exec::serial()).unwrap();
     let serial = count_thread_allocations(|| {
-        with_execution_policy(ExecutionPolicy::Sequential, || {
-            map_into(&mut dest, &source, |x| x + 1.0).unwrap();
-        });
+        map_into(&mut dest, &source, |x| x + 1.0, Exec::serial()).unwrap();
     });
-    let parallel = pool.install(|| {
+    let parallel = on_worker(pool, |pool| {
+        let mut tokens = pooled_tokens(pool, 4);
+        map_into(&mut dest, &source, |x| x + 1.0, tokens.pop().unwrap()).unwrap();
         count_allocations(|| {
-            with_execution_policy(
-                ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(2).unwrap(),
-                },
-                || {
-                    map_into(&mut dest, &source, |x| x + 1.0).unwrap();
-                },
-            );
+            map_into(&mut dest, &source, |x| x + 1.0, tokens.pop().unwrap()).unwrap();
         })
     });
     eprintln!("rank-9 permuted map_into spill: serial={serial}, parallel={parallel}");

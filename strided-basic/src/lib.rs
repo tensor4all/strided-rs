@@ -12,8 +12,8 @@
 //! - [`StridedArray`]: Owned strided multidimensional array
 //! - [`ElementOp`] trait and implementations ([`Identity`], [`Conj`], [`Transpose`], [`Adjoint`]):
 //!   Type-level element operations applied lazily on access
-//! - [`ExecutionPolicy`] / [`with_execution_policy`]: optional bounds on
-//!   strided-owned CPU fanout without creating a Rayon pool
+//! - [`Exec`] / [`Pool`]: the placement token every fan-out entry takes as its
+//!   last parameter (re-exported from `strided-exec`)
 //!
 //! # Primary API (view-based, Julia-compatible)
 //!
@@ -35,9 +35,18 @@
 //! - [`reduce_axis`]: Reduce along a single axis
 //!
 //! A reduction that can fan out (`reduce`, `zip_reduce`, `sum`) gives a result
-//! that is independent of the ambient pool width only under the sequential
-//! policy; `dot` never enters a parallel branch, so its result does not depend
-//! on the pool at all. See each entry's evaluation-order section.
+//! that is independent of the token's budget only for a serial token; `dot`
+//! never enters a parallel branch, so its result does not depend on the token at
+//! all. See each entry's evaluation-order section.
+//!
+//! # Threading
+//!
+//! Every operation that can fan out takes `exec: Exec<'_>` by value as its last
+//! parameter. [`Exec::serial`] runs on the calling thread; a token minted from a
+//! [`Pool`] with [`Exec::new`] splits the work within its budget. Operations
+//! below the repository threshold (`execution::MINTHREADLENGTH` elements) stay on
+//! the calling thread whatever the budget. Without the `parallel` feature every
+//! token runs inline.
 //!
 //! ## Basic Operations
 //!
@@ -50,7 +59,7 @@
 //! # Example
 //!
 //! ```rust
-//! use strided_basic::{StridedView, StridedViewMut, StridedArray, Identity, map_into};
+//! use strided_basic::{StridedView, StridedViewMut, StridedArray, Identity, Exec, map_into};
 //!
 //! // Create a column-major array (Julia default)
 //! let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| {
@@ -59,7 +68,7 @@
 //! let mut dest = StridedArray::<f64>::col_major(&[2, 3]);
 //!
 //! // Map with view-based API
-//! map_into(&mut dest.view_mut(), &src.view(), |x| x * 2.0).unwrap();
+//! map_into(&mut dest.view_mut(), &src.view(), |x| x * 2.0, Exec::serial()).unwrap();
 //! assert_eq!(dest.get(&[1, 2]), 24.0); // (1*10 + 2) * 2
 //! ```
 //!
@@ -76,15 +85,12 @@ mod copy_plan;
 mod dense_update;
 mod erased;
 mod erased_common;
-mod exec_context;
 pub mod execution;
-mod execution_policy;
 mod fuse;
 mod inline;
 mod kernel;
 mod layout_check;
 mod map_view;
-mod maybe_sync;
 mod nan_select;
 mod ops_view;
 mod order;
@@ -104,17 +110,12 @@ pub use erased::{
     ErasedReducePlan, ErasedScanPlan, ErasedUpdatePlan, NormKind, NormSpec, ReduceOp, ScanOp,
     ScanOptions, UpdateOp,
 };
-#[cfg(feature = "parallel")]
-pub use exec_context::with_execution_pool;
-pub use exec_context::ExecContext;
-pub use execution_policy::{with_execution_policy, ExecutionPolicy};
 pub use inline::{InlineVec, OperandVec, OPERAND_CAP};
 pub use map_view::{
     broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
     map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
     zip_map4_into, CompareOp,
 };
-pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 pub use nan_select::{nan_propagating_maximum, nan_propagating_minimum};
 pub use ops_view::{
     add, axpy, copy_conj, copy_into, copy_into_col_major, copy_into_uninit, copy_scale,
@@ -125,6 +126,7 @@ pub use raw_ops::{
 };
 pub use reduce_view::{reduce, reduce_axis, reduce_axis_into, zip_reduce};
 pub use simd::MaybeSimdOps;
+pub use strided_exec::{Exec, Pool, PoolBuilder};
 pub use strided_view::view;
 pub use strided_view::*;
 pub use update_view::{map_update_into, zip_update2_into, zip_update3_into};

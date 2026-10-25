@@ -1,10 +1,13 @@
+mod common;
+use common::Budget;
 use core::fmt::Debug;
 use core::ptr::NonNull;
 
 use num_complex::{Complex32, Complex64};
+use strided_basic::Exec;
 use strided_basic::{
-    ErasedCopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType,
-    KernelStorageElement, StridedError,
+    ErasedCopyPlan, ErasedRawStridedMut, ErasedRawStridedRef, KernelDType, KernelStorageElement,
+    StridedError,
 };
 
 #[test]
@@ -22,8 +25,7 @@ fn erased_copy_plan_executes_f64_transposed_layout() {
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
 
-        plan.execute(&ExecContext::serial(), &mut dest, &source)
-            .unwrap();
+        plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     }
 
     assert_eq!(dst, [0.0, 10.0, 1.0, 11.0, 2.0, 12.0]);
@@ -41,7 +43,7 @@ fn erased_copy_plan_rejects_dtype_mismatch() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
 
     let err = plan
-        .execute(&ExecContext::serial(), &mut dest, &source)
+        .execute(&mut dest, &source, Exec::serial())
         .unwrap_err();
     assert!(matches!(err, StridedError::DTypeMismatch { .. }));
 }
@@ -59,8 +61,7 @@ where
         let source = ErasedRawStridedRef::from_slice(input, &dims, &strides, 0).unwrap();
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
-        plan.execute(&ExecContext::serial(), &mut dest, &source)
-            .unwrap();
+        plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     }
 
     assert_eq!(output, input);
@@ -117,25 +118,23 @@ fn erased_copy_plan_accepts_explicit_execution_contexts() {
     {
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut serial_dst, &dims, &strides, 0).unwrap();
-        plan.execute(&ExecContext::serial(), &mut dest, &source)
-            .unwrap();
+        plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     }
     {
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut bounded_dst, &dims, &strides, 0).unwrap();
-        let ctx = ExecContext::max_threads(1).unwrap();
-        plan.execute(&ctx, &mut dest, &source).unwrap();
+        let ctx = Budget::Pooled(1);
+        plan.execute(&mut dest, &source, ctx.exec()).unwrap();
     }
     {
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut ambient_dst, &dims, &strides, 0).unwrap();
-        plan.execute(&ExecContext::ambient(), &mut dest, &source)
-            .unwrap();
+        plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     }
 
     assert!(matches!(
-        ExecContext::max_threads(0).unwrap_err(),
-        StridedError::InvalidThreadBudget { max_threads: 0 }
+        Exec::new(common::shared_pool(), 0).unwrap_err(),
+        strided_exec::Error::ZeroBudget
     ));
     assert_eq!(serial_dst, src);
     assert_eq!(bounded_dst, src);

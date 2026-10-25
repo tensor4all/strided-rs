@@ -1,3 +1,4 @@
+use strided_exec::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::{StridedView, StridedViewMut};
 
@@ -24,25 +25,19 @@ fn check(dims: &[usize], strides: &[isize], offset: isize, source_len: usize) {
     copy_into(
         &mut StridedViewMut::new(&mut output, dims, &dest_strides, 0).unwrap(),
         &src,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(output, expected);
-    #[cfg(feature = "parallel")]
-    {
-        output.fill(f64::NAN);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap()
-            .install(|| {
-                strided_perm::copy_into_par(
-                    &mut StridedViewMut::new(&mut output, dims, &dest_strides, 0).unwrap(),
-                    &src,
-                )
-                .unwrap();
-            });
-        assert_eq!(output, expected);
-    }
+    output.fill(f64::NAN);
+    let pool = Pool::builder().threads(2).build().unwrap();
+    copy_into(
+        &mut StridedViewMut::new(&mut output, dims, &dest_strides, 0).unwrap(),
+        &src,
+        Exec::new(&pool, 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(output, expected);
 }
 
 #[test]
@@ -60,6 +55,7 @@ fn non_unit_destination_inner_axis_preserves_holes() {
         copy_into(
             &mut StridedViewMut::new(&mut output, &[2, 3], &strides, offset).unwrap(),
             &StridedView::new(&source, &[2, 3], &[3, 1], 0).unwrap(),
+            Exec::serial(),
         )
         .unwrap();
         assert_eq!(output, expected);
@@ -72,7 +68,7 @@ fn non_unit_inner_axes_preserve_source_coordinates() {
     check(&[2, 3, 2], &[0, 1, 3], 0, 6);
     check(&[2, 3], &[3, -1], 2, 6);
     check(&[2, 3], &[6, 2], 0, 11);
-    // Exceed the parallel executor's threshold as well.
+    // Long enough to split across the pooled token.
     check(&[16384, 3], &[1, 0], 0, 16384);
     check(&[2, 17000], &[17000, -1], 16999, 34000);
 }

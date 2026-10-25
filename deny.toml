@@ -1,0 +1,22 @@
+# Only `strided-exec` starts tasks on a thread pool. Every other workspace crate
+# reaches parallelism through `strided_exec::Exec`, so a direct `rayon`
+# dependency (normal, dev or build) anywhere else is rejected; criterion is the
+# one third-party crate that brings rayon in itself. faer and
+# spindle are banned outright: `Exec::external` hands a plain width to such a
+# library, and the library is the consumer's dependency, never strided's.
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+deny = [
+    { crate = "rayon", wrappers = [
+        "strided-exec",
+        "criterion",
+    ] },
+    { crate = "rayon-core", wrappers = ["rayon"] },
+    { crate = "faer" },
+    { crate = "t4a-faer" },
+    { crate = "spindle" },
+]

@@ -15,8 +15,8 @@
 //! rounds.
 //!
 //! Rows (see `#306`):
-//! - S1: erased fused `execute` under `ExecContext::serial()` vs
-//!   `ExecContext::max_threads(1)` for a two-op DAG, `8x8x8`; guards #305.
+//! - S1: erased fused `execute` under `Exec::serial()` vs a
+//!   budget-one `Exec::new(&pool, 1)` for a two-op DAG, `8x8x8`; guards #305.
 //! - S2: typed fused single `Add` vs `zip_map2_into` add, contiguous `8x8x8`;
 //!   guards per-element dispatch in the single-op specialization.
 //! - S5: unspecialized replay vs the specialized `add`-then-`multiply` DAG,
@@ -29,7 +29,7 @@
 use std::hint::black_box;
 
 use strided_basic::{
-    zip_map2_into, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType, StridedView,
+    zip_map2_into, ErasedRawStridedMut, ErasedRawStridedRef, Exec, KernelDType, Pool, StridedView,
     StridedViewMut,
 };
 use strided_fused::{fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
@@ -102,24 +102,27 @@ fn s1_case() -> CaseResult {
 
     let mut out_serial = vec![0.0f64; LEN];
     let mut out_parallel = vec![0.0f64; LEN];
-    let serial = ExecContext::serial();
-    let parallel = ExecContext::max_threads(1).unwrap();
+    let pool = Pool::builder().threads(1).build().unwrap();
+    // One root token, reborrowed per call: constructing a token under the
+    // `ledger` test feature (enabled for dev builds) registers a counter, which
+    // is not part of the entry being measured.
+    let mut pooled = Exec::new(&pool, 1).unwrap();
 
     measure_case(
         "S1",
-        "fused serial ctx vs 1-thread parallel ctx",
+        "fused serial token vs budget-one pooled token",
         2_000,
         Some(1.5),
         || {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out_serial, &dims, &strides, 0).unwrap();
-            plan.execute(&serial, &mut dest, &inputs).unwrap();
+            plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
             black_box(dest.dims());
         },
         || {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out_parallel, &dims, &strides, 0).unwrap();
-            plan.execute(&parallel, &mut dest, &inputs).unwrap();
+            plan.execute(&mut dest, &inputs, pooled.reborrow()).unwrap();
             black_box(dest.dims());
         },
     )
@@ -147,11 +150,24 @@ fn s2_case() -> CaseResult {
         5_000,
         Some(1.5),
         || {
-            fused_elementwise_into(std::slice::from_mut(&mut fused_view), &inputs, &plan).unwrap();
+            fused_elementwise_into(
+                std::slice::from_mut(&mut fused_view),
+                &inputs,
+                &plan,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(fused_view.as_mut_ptr());
         },
         || {
-            zip_map2_into(&mut map_view, &lhs_view, &rhs_view, |x, y| x + y).unwrap();
+            zip_map2_into(
+                &mut map_view,
+                &lhs_view,
+                &rhs_view,
+                |x, y| x + y,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(map_view.as_mut_ptr());
         },
     )
@@ -187,6 +203,7 @@ fn s5_case() -> CaseResult {
                 std::slice::from_mut(&mut unspecialized_view),
                 &inputs,
                 &unspecialized,
+                Exec::serial(),
             )
             .unwrap();
             black_box(unspecialized_view.as_mut_ptr());
@@ -196,6 +213,7 @@ fn s5_case() -> CaseResult {
                 std::slice::from_mut(&mut specialized_view),
                 &inputs,
                 &specialized,
+                Exec::serial(),
             )
             .unwrap();
             black_box(specialized_view.as_mut_ptr());
@@ -208,24 +226,8 @@ fn run_cases() -> Vec<CaseResult> {
 }
 
 fn main() {
-    // One thread for every row: the S1 comparison is serial vs a one-thread
-    // parallel context, and the typed rows must not fan out either.
-    #[cfg(feature = "parallel")]
-    let cases = {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        pool.install(|| {
-            assert_eq!(
-                rayon::current_num_threads(),
-                1,
-                "overhead smoke must run on one thread"
-            );
-            run_cases()
-        })
-    };
-    #[cfg(not(feature = "parallel"))]
+    // Every row carries its own token: S1 compares serial with a budget-one pooled
+    // token, and the typed rows are serial, so nothing fans out.
     let cases = run_cases();
 
     print_table(&cases, "### strided-fused overhead smoke");

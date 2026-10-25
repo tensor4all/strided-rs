@@ -7,10 +7,13 @@
 //! representable; the reference and the kernels therefore agree bitwise for
 //! any evaluation order. Separate tests pin the orders that are specified.
 
+mod common;
+use common::Budget;
 use num_complex::Complex64;
+use strided_basic::Exec;
 use strided_basic::{
-    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ExecContext, KernelDType,
-    KernelStorageElement, ReduceOp,
+    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, KernelDType, KernelStorageElement,
+    ReduceOp,
 };
 
 /// Larger than `MINTHREADLENGTH` so that parallel contexts split the work.
@@ -184,11 +187,8 @@ fn ops_for<T: Scalar>() -> &'static [ReduceOp] {
     T::OPS
 }
 
-fn contexts() -> Vec<(&'static str, ExecContext)> {
-    vec![
-        ("serial", ExecContext::serial()),
-        ("max_threads(4)", ExecContext::max_threads(4).unwrap()),
-    ]
+fn contexts() -> Vec<(&'static str, Budget)> {
+    vec![("serial", Budget::Serial), ("budget(4)", Budget::Pooled(4))]
 }
 
 fn value_for<T: Scalar>(op: ReduceOp, i: usize) -> T {
@@ -258,7 +258,7 @@ fn naive_full<T: Scalar>(
 
 fn run_full<T: Scalar>(
     op: ReduceOp,
-    ctx: &ExecContext,
+    ctx: &Budget,
     data: &[T],
     dims: &[usize],
     strides: &[isize],
@@ -268,7 +268,7 @@ fn run_full<T: Scalar>(
     let source = ErasedRawStridedRef::from_slice(data, dims, strides, offset).unwrap();
     let mut output = [T::identity(op)];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-    plan.execute(ctx, &mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, ctx.exec()).unwrap();
     output[0]
 }
 
@@ -451,7 +451,7 @@ fn full_parallel_reduce_is_repeatable_for_inexact_values() {
     let dims = [LARGE];
     let strides = [1isize];
     let data: Vec<f64> = (0..LARGE).map(|i| (i as f64 * 0.37).sin()).collect();
-    let ctx = ExecContext::max_threads(4).unwrap();
+    let ctx = Budget::Pooled(4);
     let first = run_full(ReduceOp::Sum, &ctx, &data, &dims, &strides, 0);
     for _ in 0..4 {
         let again = run_full(ReduceOp::Sum, &ctx, &data, &dims, &strides, 0);
@@ -501,7 +501,7 @@ fn axes_reference<T: Scalar>(op: ReduceOp, data: &[T], case: &AxesCase) -> (Vec<
 
 fn run_axes<T: Scalar>(
     op: ReduceOp,
-    ctx: &ExecContext,
+    ctx: &Budget,
     data: &[T],
     case: &AxesCase,
     dest_dims: &[usize],
@@ -527,7 +527,7 @@ fn run_axes<T: Scalar>(
     let mut output = vec![T::identity(op); dest_len];
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, dest_dims, &case.dest_strides, 0).unwrap();
-    plan.execute(ctx, &mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, ctx.exec()).unwrap();
     coords_of(dest_dims)
         .iter()
         .map(|c| output[offset_of(c, &case.dest_strides, 0)])
@@ -743,15 +743,9 @@ fn contiguous_run_axes_are_context_independent() {
         .map(|i| (i as f64 * 0.917).cos())
         .collect();
     let (dest_dims, naive) = axes_reference(ReduceOp::Sum, &data, &case);
-    let serial = run_axes(
-        ReduceOp::Sum,
-        &ExecContext::serial(),
-        &data,
-        &case,
-        &dest_dims,
-    );
+    let serial = run_axes(ReduceOp::Sum, &Budget::Serial, &data, &case, &dest_dims);
     for threads in [1usize, 2, 3, 4] {
-        let ctx = ExecContext::max_threads(threads).unwrap();
+        let ctx = Budget::Pooled(threads);
         let got = run_axes(ReduceOp::Sum, &ctx, &data, &case, &dest_dims);
         for (index, (&g, &s)) in got.iter().zip(&serial).enumerate() {
             assert_eq!(g.to_bits(), s.to_bits(), "threads={threads} out[{index}]");
@@ -770,7 +764,7 @@ fn all_axes_reduction_matches_full_plan() {
     let strides = [45isize, 5, 1];
     let data: Vec<f64> = (0..315).map(|i| (i as f64 * 0.3).sin()).collect();
     for op in ALL_OPS {
-        let full = run_full(op, &ExecContext::serial(), &data, &dims, &strides, 0);
+        let full = run_full(op, &Budget::Serial, &data, &dims, &strides, 0);
         let plan = ErasedReducePlan::compile_axes(
             KernelDType::F64,
             op,
@@ -784,8 +778,7 @@ fn all_axes_reduction_matches_full_plan() {
         let source = ErasedRawStridedRef::from_slice(&data, &dims, &strides, 0).unwrap();
         let mut output = [0.0f64];
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-        plan.execute(&ExecContext::serial(), &mut dest, &source)
-            .unwrap();
+        plan.execute(&mut dest, &source, Exec::serial()).unwrap();
         assert_eq!(output[0].to_bits(), full.to_bits(), "{op:?}");
     }
 }
@@ -832,7 +825,7 @@ fn strided_axis_of_column_major_matrix_uses_column_sweep() {
         let data: Vec<f64> = (0..rows * cols).map(|i| (i as f64 * 0.61).sin()).collect();
         let (dest_dims, expected) = axes_reference(ReduceOp::Sum, &data, &case);
         for threads in [1usize, 2, 3, 4] {
-            let ctx = ExecContext::max_threads(threads).unwrap();
+            let ctx = Budget::Pooled(threads);
             let got = run_axes(ReduceOp::Sum, &ctx, &data, &case, &dest_dims);
             for (index, (&g, &e)) in got.iter().zip(&expected).enumerate() {
                 assert_eq!(g.to_bits(), e.to_bits(), "threads={threads} out[{index}]");

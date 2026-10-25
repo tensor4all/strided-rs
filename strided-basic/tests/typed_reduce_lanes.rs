@@ -3,16 +3,12 @@
 //! every path against a naive reference on exact integer data (so any order
 //! is exact) and on floats with NaN, serially and in parallel.
 
-use std::num::NonZeroUsize;
-use strided_basic::{reduce, reduce_axis, with_execution_policy, ExecutionPolicy, StridedView};
+mod common;
+use common::Budget;
+use strided_basic::{reduce, reduce_axis, StridedView};
 
-fn policies() -> [ExecutionPolicy; 2] {
-    [
-        ExecutionPolicy::Sequential,
-        ExecutionPolicy::Rayon {
-            max_threads: NonZeroUsize::new(4).unwrap(),
-        },
-    ]
+fn budgets() -> [Budget; 2] {
+    [Budget::Serial, Budget::Pooled(4)]
 }
 
 /// A layout over `data`: dims, strides and offset.
@@ -160,14 +156,22 @@ fn typed_reduce_axis_matches_naive_integer_reference() {
                 .unwrap();
         for axis in 0..layout.dims.len() {
             let want = naive_axis_i64(&layout, &data, axis, 11);
-            for policy in policies() {
-                let got = with_execution_policy(policy, || {
-                    reduce_axis(&view, axis, |x| x.wrapping_mul(3), i64::wrapping_add, 11).unwrap()
-                });
+            for budget in budgets() {
+                let got = {
+                    reduce_axis(
+                        &view,
+                        axis,
+                        |x| x.wrapping_mul(3),
+                        i64::wrapping_add,
+                        11,
+                        budget.exec(),
+                    )
+                    .unwrap()
+                };
                 assert_eq!(
                     got.data(),
                     &want[..],
-                    "{} axis {axis} {policy:?}",
+                    "{} axis {axis} {budget:?}",
                     layout.name
                 );
             }
@@ -186,12 +190,19 @@ fn typed_reduce_full_matches_naive_integer_reference() {
         for_each_index(&layout.dims, |index| {
             want = want.wrapping_add(data[offset_of(&layout, index)].wrapping_mul(3));
         });
-        for policy in policies() {
-            let got = with_execution_policy(policy, || {
-                reduce(&view, |x| x.wrapping_mul(3), i64::wrapping_add, 0).unwrap()
-            });
+        for budget in budgets() {
+            let got = {
+                reduce(
+                    &view,
+                    |x| x.wrapping_mul(3),
+                    i64::wrapping_add,
+                    0,
+                    budget.exec(),
+                )
+                .unwrap()
+            };
             // `init` must be an identity once threads may split the work.
-            assert_eq!(got.wrapping_add(5), want, "{} {policy:?}", layout.name);
+            assert_eq!(got.wrapping_add(5), want, "{} {budget:?}", layout.name);
         }
     }
 }
@@ -206,14 +217,16 @@ fn typed_contiguous_fold_seeds_init_once() {
         let unit = [1isize];
         let view = StridedView::<i64>::new(&data, &dims, &unit, 0).unwrap();
         let want = data.iter().fold(1000i64, |acc, &x| acc.wrapping_add(x));
-        let got = with_execution_policy(ExecutionPolicy::Sequential, || {
-            reduce(&view, |x| x, i64::wrapping_add, 1000).unwrap()
-        });
+        let got = {
+            let budget = Budget::Serial;
+            reduce(&view, |x| x, i64::wrapping_add, 1000, budget.exec()).unwrap()
+        };
         assert_eq!(got, want, "len {len}");
         if len > 0 {
-            let got = with_execution_policy(ExecutionPolicy::Sequential, || {
-                reduce_axis(&view, 0, |x| x, i64::wrapping_add, 1000).unwrap()
-            });
+            let got = {
+                let budget = Budget::Serial;
+                reduce_axis(&view, 0, |x| x, i64::wrapping_add, 1000, budget.exec()).unwrap()
+            };
             assert_eq!(got.data(), &[want], "axis len {len}");
         }
     }
@@ -244,15 +257,21 @@ fn typed_float_max_propagates_nan_on_every_path() {
         let view =
             StridedView::<f64>::new(&data, &layout.dims, &layout.strides, layout.offset as isize)
                 .unwrap();
-        for policy in policies() {
-            let full = with_execution_policy(policy, || {
-                reduce(&view, |x| x, nan_max, f64::NEG_INFINITY).unwrap()
-            });
-            assert!(full.is_nan(), "{} full {policy:?}", layout.name);
+        for budget in budgets() {
+            let full = { reduce(&view, |x| x, nan_max, f64::NEG_INFINITY, budget.exec()).unwrap() };
+            assert!(full.is_nan(), "{} full {budget:?}", layout.name);
             for axis in 0..2 {
-                let got = with_execution_policy(policy, || {
-                    reduce_axis(&view, axis, |x| x, nan_max, f64::NEG_INFINITY).unwrap()
-                });
+                let got = {
+                    reduce_axis(
+                        &view,
+                        axis,
+                        |x| x,
+                        nan_max,
+                        f64::NEG_INFINITY,
+                        budget.exec(),
+                    )
+                    .unwrap()
+                };
                 let kept = 1 - axis;
                 for_each_index(&[layout.dims[kept]], |k| {
                     let mut want = f64::NEG_INFINITY;
@@ -265,7 +284,7 @@ fn typed_float_max_propagates_nan_on_every_path() {
                     let value = got.data()[k[0]];
                     assert!(
                         value == want || (value.is_nan() && want.is_nan()),
-                        "{} axis {axis} output {} {policy:?}: {value} vs {want}",
+                        "{} axis {axis} output {} {budget:?}: {value} vs {want}",
                         layout.name,
                         k[0]
                     );
@@ -289,12 +308,8 @@ fn typed_reduce_axis_column_sweep_is_thread_count_independent() {
         .map(|i| (0..dims[1]).fold(0.25, |acc, j| acc + data[i + j * dims[0]]))
         .collect();
     for threads in 1..=4 {
-        let policy = ExecutionPolicy::Rayon {
-            max_threads: NonZeroUsize::new(threads).unwrap(),
-        };
-        let got = with_execution_policy(policy, || {
-            reduce_axis(&view, 1, |x| x, |a, b| a + b, 0.25).unwrap()
-        });
+        let budget = Budget::Pooled(threads);
+        let got = { reduce_axis(&view, 1, |x| x, |a, b| a + b, 0.25, budget.exec()).unwrap() };
         let same = got
             .data()
             .iter()

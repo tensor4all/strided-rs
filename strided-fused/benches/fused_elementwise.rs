@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::time::Duration;
-use strided_basic::{map_into, zip_map2_into, StridedArray};
+use strided_basic::{map_into, zip_map2_into, Exec, StridedArray};
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan};
 
 const N: usize = 512;
@@ -41,14 +41,34 @@ fn bench_add_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group("fused_add_mul");
     group.bench_function("per_op_reused_buffers", |bch| {
         bch.iter(|| {
-            zip_map2_into(&mut tmp.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
-            zip_map2_into(&mut out.view_mut(), &tmp.view(), &a.view(), |x, y| x * y).unwrap();
+            zip_map2_into(
+                &mut tmp.view_mut(),
+                &a.view(),
+                &b.view(),
+                |x, y| x + y,
+                Exec::serial(),
+            )
+            .unwrap();
+            zip_map2_into(
+                &mut out.view_mut(),
+                &tmp.view(),
+                &a.view(),
+                |x, y| x * y,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out.data().as_ptr());
         });
     });
     group.bench_function("fused_static", |bch| {
         bch.iter(|| {
-            fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+            fused_elementwise_into(
+                &mut [out.view_mut()],
+                &[a.view(), b.view()],
+                &plan,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out.data().as_ptr());
         });
     });
@@ -88,15 +108,29 @@ fn bench_broadcast_exp_mul_add(c: &mut Criterion) {
     let mut group = c.benchmark_group("fused_broadcast_exp_mul_add");
     group.bench_function("per_op_reused_buffers", |bch| {
         bch.iter(|| {
-            zip_map2_into(&mut tmp_mul.view_mut(), &a.view(), &b.view(), |x, y| x * y).unwrap();
+            zip_map2_into(
+                &mut tmp_mul.view_mut(),
+                &a.view(),
+                &b.view(),
+                |x, y| x * y,
+                Exec::serial(),
+            )
+            .unwrap();
             zip_map2_into(
                 &mut tmp_add.view_mut(),
                 &tmp_mul.view(),
                 &c_broadcast,
                 |x, y| x + y,
+                Exec::serial(),
             )
             .unwrap();
-            map_into(&mut out.view_mut(), &tmp_add.view(), |x| x.exp()).unwrap();
+            map_into(
+                &mut out.view_mut(),
+                &tmp_add.view(),
+                |x| x.exp(),
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out.data().as_ptr());
         });
     });
@@ -106,6 +140,7 @@ fn bench_broadcast_exp_mul_add(c: &mut Criterion) {
                 &mut [out.view_mut()],
                 &[a.view(), b.view(), c_broadcast.clone()],
                 &plan,
+                Exec::serial(),
             )
             .unwrap();
             black_box(out.data().as_ptr());
@@ -156,12 +191,20 @@ fn bench_long_chain(c: &mut Criterion) {
     let mut group = c.benchmark_group("fused_long_chain");
     group.bench_function("per_op_reused_buffers", |bch| {
         bch.iter(|| {
-            zip_map2_into(&mut tmp_div.view_mut(), &a.view(), &b.view(), |x, y| x / y).unwrap();
+            zip_map2_into(
+                &mut tmp_div.view_mut(),
+                &a.view(),
+                &b.view(),
+                |x, y| x / y,
+                Exec::serial(),
+            )
+            .unwrap();
             zip_map2_into(
                 &mut tmp_max.view_mut(),
                 &tmp_div.view(),
                 &lo.view(),
                 |x, y| x.max(y),
+                Exec::serial(),
             )
             .unwrap();
             zip_map2_into(
@@ -169,10 +212,23 @@ fn bench_long_chain(c: &mut Criterion) {
                 &tmp_max.view(),
                 &hi.view(),
                 |x, y| x.min(y),
+                Exec::serial(),
             )
             .unwrap();
-            map_into(&mut tmp_sqrt.view_mut(), &tmp_min.view(), |x| x.sqrt()).unwrap();
-            map_into(&mut out.view_mut(), &tmp_sqrt.view(), |x| 1.0 / x.sqrt()).unwrap();
+            map_into(
+                &mut tmp_sqrt.view_mut(),
+                &tmp_min.view(),
+                |x| x.sqrt(),
+                Exec::serial(),
+            )
+            .unwrap();
+            map_into(
+                &mut out.view_mut(),
+                &tmp_sqrt.view(),
+                |x| 1.0 / x.sqrt(),
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out.data().as_ptr());
         });
     });
@@ -182,6 +238,7 @@ fn bench_long_chain(c: &mut Criterion) {
                 &mut [out.view_mut()],
                 &[a.view(), b.view(), lo.view(), hi.view()],
                 &plan,
+                Exec::serial(),
             )
             .unwrap();
             black_box(out.data().as_ptr());
@@ -220,15 +277,40 @@ fn bench_interpreter_fallback(c: &mut Criterion) {
     let mut group = c.benchmark_group("fused_interpreter_fallback");
     group.bench_function("per_op_reused_buffers", |bch| {
         bch.iter(|| {
-            zip_map2_into(&mut tmp_add.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
-            map_into(&mut tmp_neg.view_mut(), &tmp_add.view(), |x| -x).unwrap();
-            map_into(&mut out.view_mut(), &tmp_neg.view(), |x| x.exp()).unwrap();
+            zip_map2_into(
+                &mut tmp_add.view_mut(),
+                &a.view(),
+                &b.view(),
+                |x, y| x + y,
+                Exec::serial(),
+            )
+            .unwrap();
+            map_into(
+                &mut tmp_neg.view_mut(),
+                &tmp_add.view(),
+                |x| -x,
+                Exec::serial(),
+            )
+            .unwrap();
+            map_into(
+                &mut out.view_mut(),
+                &tmp_neg.view(),
+                |x| x.exp(),
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out.data().as_ptr());
         });
     });
     group.bench_function("fused_interpreter", |bch| {
         bch.iter(|| {
-            fused_elementwise_into(&mut [out.view_mut()], &[a.view(), b.view()], &plan).unwrap();
+            fused_elementwise_into(
+                &mut [out.view_mut()],
+                &[a.view(), b.view()],
+                &plan,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out.data().as_ptr());
         });
     });
