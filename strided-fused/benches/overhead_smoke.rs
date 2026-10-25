@@ -103,6 +103,10 @@ fn s1_case() -> CaseResult {
     let mut out_serial = vec![0.0f64; LEN];
     let mut out_parallel = vec![0.0f64; LEN];
     let pool = Pool::builder().threads(1).build().unwrap();
+    // One root token, reborrowed per call: constructing a token under the
+    // `ledger` test feature (enabled for dev builds) registers a counter, which
+    // is not part of the entry being measured.
+    let mut pooled = Exec::new(&pool, 1).unwrap();
 
     measure_case(
         "S1",
@@ -118,8 +122,7 @@ fn s1_case() -> CaseResult {
         || {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out_parallel, &dims, &strides, 0).unwrap();
-            plan.execute(&mut dest, &inputs, Exec::new(&pool, 1).unwrap())
-                .unwrap();
+            plan.execute(&mut dest, &inputs, pooled.reborrow()).unwrap();
             black_box(dest.dims());
         },
     )
