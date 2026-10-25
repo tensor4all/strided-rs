@@ -14,6 +14,7 @@ use std::mem::MaybeUninit;
 use std::ops::{Add, Mul};
 use strided_view::{ElementOp, ElementOpApply};
 
+use crate::cost::KernelClass;
 use crate::fuse::compute_costs;
 use crate::threading::{
     for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded, SendPtr,
@@ -351,7 +352,7 @@ pub fn add<D: Copy + Add<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         let dst_send = SendPtr(dst_ptr);
         let src_send = SendPtr(src_ptr as *mut S);
 
@@ -364,6 +365,7 @@ pub fn add<D: Copy + Add<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -449,7 +451,7 @@ pub fn mul<D: Copy + Mul<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         let dst_send = SendPtr(dst_ptr);
         let src_send = SendPtr(src_ptr as *mut S);
 
@@ -462,6 +464,7 @@ pub fn mul<D: Copy + Mul<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -554,7 +557,7 @@ where
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         let dst_send = SendPtr(dst_ptr);
         let src_send = SendPtr(src_ptr as *mut S);
 
@@ -567,6 +570,7 @@ where
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -670,7 +674,7 @@ where
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
         let b_send = SendPtr(b_ptr as *mut B);
@@ -684,6 +688,7 @@ where
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -776,10 +781,10 @@ pub fn sum<
 
             // The partial sums of the halves are combined in a tree; a type
             // without SIMD support takes the generic reduction below.
-            if is_parallel(len, &exec) && T::try_simd_sum(&[]).is_some() {
+            if T::try_simd_sum(&[]).is_some() && is_parallel(KernelClass::Reduce, len, &exec) {
                 return Ok(crate::threading::parallel_map_reduce(
                     0..len,
-                    exec,
+                    crate::cost::for_len_tree(exec, KernelClass::Reduce, len),
                     &|range| T::try_simd_sum(&src_slice[range]).unwrap(),
                     &|left, right| left + right,
                 ));
@@ -1067,7 +1072,8 @@ unsafe fn fill_2d<T: Copy + Send + Sync>(
     exec: Exec<'_>,
 ) {
     let total = dim0.saturating_mul(dim1);
-    if is_parallel(total, &exec) {
+    let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+    if !exec.is_serial() {
         let dst_send = SendPtr(dst);
         if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
             crate::threading::parallel_for_each(0..dim1, exec, &|columns| {
@@ -1209,7 +1215,8 @@ unsafe fn copy_transpose_scale_2d_f64_tiled_raw(
     let col_full = src_cols / TILE * TILE;
 
     let total = src_rows.saturating_mul(src_cols);
-    if is_parallel(total, &exec) {
+    let exec = crate::cost::for_len(exec, KernelClass::Map, total);
+    if !exec.is_serial() {
         let dst_send = SendPtr(dst);
         let src_send = SendPtr(src as *mut f64);
         let row_tiles = row_full / TILE;
@@ -1448,7 +1455,8 @@ unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     let col_full = src_cols / TILE * TILE;
 
     let total = src_rows.saturating_mul(src_cols);
-    if is_parallel(total, &exec) {
+    let exec = crate::cost::for_len(exec, KernelClass::Map, total);
+    if !exec.is_serial() {
         let dst_send = SendPtr(dst);
         let src_send = SendPtr(src as *mut T);
         let row_tiles = row_full / TILE;
@@ -1580,7 +1588,8 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
     T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync,
 {
     let total = src_rows.saturating_mul(src_cols);
-    if is_parallel(total, &exec) {
+    let exec = crate::cost::for_len(exec, KernelClass::Map, total);
+    if !exec.is_serial() {
         let dst_send = SendPtr(dst);
         let src_send = SendPtr(src as *mut T);
         if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {

@@ -229,7 +229,7 @@ pub(super) unsafe fn for_each_unit<K: UnitKernel>(
             kernel,
         })
     };
-    let exec = crate::threading::for_len(exec, layout.total)
+    let exec = crate::cost::for_len_tree(exec, crate::cost::KernelClass::Reduce, layout.total)
         .limit(core::num::NonZeroUsize::new(layout.units).unwrap_or(core::num::NonZeroUsize::MIN));
     crate::threading::parallel_map_reduce(0..layout.units, exec, &task, &|left, right| {
         left.and(right)

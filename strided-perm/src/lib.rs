@@ -14,9 +14,11 @@
 //! # Threading
 //!
 //! Every copy takes a [`threadteam::Exec`] placement token as its last
-//! parameter and splits the permutation within that budget. A copy of at most
-//! [`MINTHREADLENGTH`] elements runs on the calling thread whatever the budget,
-//! because a fan-out costs more than the copy. The crate never reaches a global
+//! parameter and splits the permutation within that budget. The width is
+//! decided by the token: the serial time of the copy
+//! ([`COPY_NS_PER_ELEMENT`] times its elements) against the dispatch cost of one
+//! section (`Exec::width_for`), so a copy too small to repay a fan-out runs on the
+//! calling thread whatever the budget. The crate never reaches a global
 //! pool; pass `Exec::serial()` for a copy on the calling thread.
 
 #[cfg(test)]
@@ -34,13 +36,13 @@ mod order;
 pub use copy::{copy_into, copy_into_col_major, copy_into_uninit};
 pub use fuse::{plan_bilateral_fusion, BilateralFusionPlan, FusionPlanError};
 
-/// Minimum number of elements for a copy to fan out.
+/// Serial throughput of a copy in nanoseconds per element.
 ///
-/// The single threshold of the strided stack: `copy_into*` narrow the token to
-/// one task at or below it, and `strided-basic` re-exports this constant for
-/// its own entries. Matches Julia's `MINTHREADLENGTH = 1 << 15`; see
-/// `docs/design/erased-execution-policy.md` for the decision record.
-pub const MINTHREADLENGTH: usize = 1 << 15;
+/// The `Copy` class of the strided stack (`strided_basic::execution::KernelClass`
+/// holds the class table; this crate sits below it and owns the one constant it
+/// needs). `copy_into*` multiply it by the element count and ask the token
+/// whether one section pays.
+pub const COPY_NS_PER_ELEMENT: f64 = 0.090;
 
 // Constants
 pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;

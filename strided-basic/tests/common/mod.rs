@@ -10,7 +10,13 @@ use strided_basic::{Exec, Pool};
 /// A four-slot pool shared by the tests in one binary.
 pub fn shared_pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+    POOL.get_or_init(|| {
+        Pool::builder()
+            .dispatch_costs(cheap_dispatch_costs())
+            .threads(4)
+            .build()
+            .unwrap()
+    })
 }
 
 /// Which token a test call receives.
@@ -30,4 +36,16 @@ impl Budget {
             Budget::Pooled(n) => Exec::new(shared_pool(), n).unwrap(),
         }
     }
+}
+
+/// Dispatch costs of the test pools: 100 ns per section whatever the token, so that the
+/// regions of tens of thousands of elements these tests use open the parallel branches
+/// (the host default costs would keep them serial).
+fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
+    use threadteam::{DispatchKind, WidthCosts};
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    threadteam::DispatchCosts::generic()
+        .with(DispatchKind::Team, cheap)
+        .with(DispatchKind::InPool, cheap)
+        .with(DispatchKind::Outside, cheap)
 }

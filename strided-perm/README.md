@@ -35,10 +35,12 @@ describe is written exactly once, through raw pointers only.
 
 `Exec::serial()` runs the copy on the calling thread. A token minted from a
 `threadteam::Pool` with `Exec::new(&pool, budget)` splits the permutation
-across `budget` tasks of that pool. The crate uses exactly the budget it is
-given: callers that want small copies to stay on one thread pass a serial token
-or narrow the token with `Exec::limit`. Without the `parallel` feature every
-token runs inline.
+across at most `budget` tasks of that pool. The width is the token's decision
+(`Exec::width_for`): the serial time of the copy, `COPY_NS_PER_ELEMENT` times
+its elements, against the dispatch cost of one section, so a small copy stays on
+the calling thread. A caller that wants a large copy on one thread passes a
+serial token or narrows the token with `Exec::limit`. Without the `parallel`
+feature every token runs inline.
 
 ```toml
 [dependencies]

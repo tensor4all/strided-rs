@@ -307,6 +307,7 @@ const POOL_PREFIX: &str = "placement-test-";
 /// A four-worker pool whose workers carry a recognisable name.
 fn named_pool() -> Pool {
     Pool::builder()
+        .dispatch_costs(cheap_dispatch_costs())
         .threads(4)
         .thread_name(|index| format!("{POOL_PREFIX}{index}"))
         .build()
@@ -773,8 +774,7 @@ fn bounded_tiled_transpose_scale_handles_non_tile_remainders() {
 /// within the outer budget: at most two threads ever run user code.
 #[test]
 fn nested_strided_operations_given_a_serial_token_stay_within_the_outer_budget() {
-    const NESTED_LEN: usize = MINTHREADLENGTH_FOR_TEST + 37;
-    const MINTHREADLENGTH_FOR_TEST: usize = 1 << 15;
+    const NESTED_LEN: usize = (1 << 16) + 37;
 
     let pool = named_pool();
     let active_threads = Arc::new(ActiveThreads::default());
@@ -976,4 +976,16 @@ fn large_transposed_copy_runs_on_pool_workers() {
     assert_on_pool_workers(participants);
     assert_within_budget(root, 4);
     assert_eq!(output[1 + 2 * 512].value, 258.0);
+}
+
+/// Dispatch costs of the test pools: 100 ns per section whatever the token, so that the
+/// regions of tens of thousands of elements these tests use open the parallel branches
+/// (the host default costs would keep them serial).
+fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
+    use threadteam::{DispatchKind, WidthCosts};
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    threadteam::DispatchCosts::generic()
+        .with(DispatchKind::Team, cheap)
+        .with(DispatchKind::InPool, cheap)
+        .with(DispatchKind::Outside, cheap)
 }

@@ -6,6 +6,8 @@
 //! token carries the budget and the pool, so this module holds no placement
 //! state of its own.
 
+use crate::cost::KernelClass;
+pub(crate) use crate::cost::{for_len, is_parallel};
 use crate::inline::InlineVec;
 use crate::kernel::for_each_inner_block_preordered;
 use crate::Result;
@@ -64,11 +66,6 @@ impl<T> core::fmt::Debug for SendPtr<T> {
     }
 }
 
-/// Minimum number of elements to justify multi-threaded execution.
-///
-/// Defined once, in `strided-perm`; see [`strided_perm::MINTHREADLENGTH`].
-pub use strided_perm::MINTHREADLENGTH;
-
 /// Block sizes handed to the parallel splitter.
 ///
 /// [`split_axis`] declines to split a dimension that fits in one cache block
@@ -88,38 +85,6 @@ fn scheduler_blocks(dims: &[usize], blocks: &[usize]) -> SVec<usize> {
             }
         })
         .collect()
-}
-
-/// Number of tasks a loop of `len` elements may use out of `budget` slots.
-///
-/// A pure function of its arguments: `1` up to [`MINTHREADLENGTH`] elements,
-/// `budget` above. Entries apply it with `Exec::limit`.
-///
-/// # Examples
-///
-/// ```
-/// use strided_basic::execution::{parallel_threads_for_len, MINTHREADLENGTH};
-///
-/// assert_eq!(parallel_threads_for_len(MINTHREADLENGTH, 4), 1);
-/// assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1, 4), 4);
-/// ```
-pub fn parallel_threads_for_len(len: usize, budget: usize) -> usize {
-    if len <= MINTHREADLENGTH {
-        1
-    } else {
-        budget.max(1)
-    }
-}
-
-/// Narrows `exec` to the width `len` elements justify.
-pub(crate) fn for_len(exec: Exec<'_>, len: usize) -> Exec<'_> {
-    let width = parallel_threads_for_len(len, exec.budget().get());
-    exec.limit(NonZeroUsize::new(width).unwrap_or(ONE))
-}
-
-/// Whether `len` elements are above the threshold and `exec` has a second slot.
-pub(crate) fn is_parallel(len: usize, exec: &Exec<'_>) -> bool {
-    len > MINTHREADLENGTH && !exec.is_serial()
 }
 
 /// Runs `left` and `right` as the two halves of `exec` and returns both results.
@@ -209,9 +174,9 @@ where
     });
 }
 
-/// Copy `len` contiguous elements, chunked across the budget of `exec` above
-/// the repository threshold ([`MINTHREADLENGTH`]) and as one direct
-/// `copy_nonoverlapping` otherwise.
+/// Copy `len` contiguous elements, chunked across the budget of `exec` when
+/// one section pays for a copy of that size (`KernelClass::Copy`) and as one
+/// direct `copy_nonoverlapping` otherwise.
 ///
 /// # Safety
 ///
@@ -224,7 +189,8 @@ pub(crate) unsafe fn copy_contiguous<T: Copy + Send + Sync>(
     len: usize,
     exec: Exec<'_>,
 ) {
-    if is_parallel(len, &exec) {
+    let exec = for_len(exec, KernelClass::Copy, len);
+    if !exec.is_serial() {
         let src = SendPtr(src as *mut T);
         let dst = SendPtr(dst);
         parallel_for_each(0..len, exec, &|range| {
@@ -245,11 +211,12 @@ pub(crate) unsafe fn copy_contiguous<T: Copy + Send + Sync>(
     unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
-/// Fill a contiguous slice, chunked across the budget of `exec` above the
-/// repository threshold and as one serial `fill` otherwise.
+/// Fill a contiguous slice, chunked across the budget of `exec` when a section
+/// pays for it (`KernelClass::Copy`) and as one serial `fill` otherwise.
 pub(crate) fn fill_contiguous<T: Copy + Send + Sync>(dst: &mut [T], value: T, exec: Exec<'_>) {
     let len = dst.len();
-    if is_parallel(len, &exec) {
+    let exec = for_len(exec, KernelClass::Copy, len);
+    if !exec.is_serial() {
         let dst = SendPtr(dst.as_mut_ptr());
         parallel_for_each(0..len, exec, &|range| {
             // SAFETY: `range` lies inside the exclusively borrowed slice
@@ -288,19 +255,17 @@ pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + Send + Sync>(
     fill_contiguous(span, core::mem::MaybeUninit::new(value), exec);
 }
 
-/// Permuting copy into a destination of any layout, split across `exec`
-/// above the repository threshold.
+/// Permuting copy into a destination of any layout, split across `exec`.
 ///
-/// The permutation engine honours the budget it is given, so this is the only
-/// route: a serial token (or a copy at or below the threshold) takes its
-/// calling-thread path.
+/// The permutation engine decides the width itself (copy class, one section),
+/// so this is the only route: a serial token (or a copy too small to repay a
+/// section) takes its calling-thread path.
 pub(crate) fn copy_permuted<T: Copy + Send + Sync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
     exec: Exec<'_>,
 ) -> crate::Result<()> {
-    let total = crate::kernel::total_len(dest.dims())?;
-    strided_perm::copy_into(dest, src, for_len(exec, total))
+    strided_perm::copy_into(dest, src, exec)
 }
 
 /// [`copy_permuted`] into an uninitialized destination.
@@ -314,8 +279,7 @@ pub(crate) fn copy_permuted_uninit<T: Copy + Send + Sync + 'static>(
     src: &crate::StridedView<T>,
     exec: Exec<'_>,
 ) -> crate::Result<()> {
-    let total = crate::kernel::total_len(dest.dims())?;
-    strided_perm::copy_into_uninit(dest, src, for_len(exec, total))
+    strided_perm::copy_into_uninit(dest, src, exec)
 }
 
 /// Dimension to halve: `_lastargmax((dims .- 1) .* costs)`, or `None` when
@@ -382,6 +346,7 @@ pub(crate) fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     strides_list: &[S],
     offsets: &[isize],
     costs: &[isize],
+    class: KernelClass,
     exec: Exec<'_>,
     f: &F,
 ) -> Result<()>
@@ -393,7 +358,7 @@ where
     // so the splitter and its leaves share them without owning a
     // `Vec<Vec<isize>>` (#306 P1).
     let refs: SVec<&[isize]> = strided_slices(strides_list);
-    mapreduce_threaded_dyn(dims, blocks, &refs, offsets, costs, exec, f)
+    mapreduce_threaded_dyn(dims, blocks, &refs, offsets, costs, class, exec, f)
 }
 
 fn strided_slices<S: AsRef<[isize]>>(strides_list: &[S]) -> SVec<&[isize]> {
@@ -410,6 +375,7 @@ fn mapreduce_threaded_dyn(
     strides_list: &[&[isize]],
     offsets: &[isize],
     costs: &[isize],
+    class: KernelClass,
     exec: Exec<'_>,
     f: LeafFn<'_>,
 ) -> Result<()> {
@@ -422,6 +388,7 @@ fn mapreduce_threaded_dyn(
         blocks: &blocks,
         strides_list,
         costs,
+        class,
         operation: f,
     }
     .run(dims, offsets, exec)
@@ -431,6 +398,7 @@ struct ThreadedMapReduce<'a> {
     blocks: &'a [usize],
     strides_list: &'a [&'a [isize]],
     costs: &'a [isize],
+    class: KernelClass,
     operation: LeafFn<'a>,
 }
 
@@ -438,8 +406,8 @@ impl ThreadedMapReduce<'_> {
     fn run(&self, dims: &[usize], offsets: &[isize], exec: Exec<'_>) -> Result<()> {
         let total = crate::kernel::total_len(dims)?;
 
-        // Base case: a single slot or below the threshold.
-        if exec.is_serial() || total <= MINTHREADLENGTH {
+        // Base case: a single slot, or a fork of this region does not pay.
+        if !is_parallel(self.class, total, &exec) {
             return (self.operation)(dims, self.blocks, self.strides_list, offsets);
         }
         let Some(i) = split_axis(dims, self.blocks, self.costs) else {
@@ -472,6 +440,7 @@ pub(crate) fn mapreduce_threaded_fold<S, F, C, R>(
     strides_list: &[S],
     offsets: &[isize],
     costs: &[isize],
+    class: KernelClass,
     exec: Exec<'_>,
     f: &F,
     combine: &C,
@@ -491,6 +460,7 @@ where
         blocks: &blocks,
         strides_list: &refs,
         costs,
+        class,
         f,
         combine,
     }
@@ -501,6 +471,7 @@ struct FoldMapReduce<'a, F, C> {
     blocks: &'a [usize],
     strides_list: &'a [&'a [isize]],
     costs: &'a [isize],
+    class: KernelClass,
     f: &'a F,
     combine: &'a C,
 }
@@ -513,8 +484,8 @@ impl<F, C> FoldMapReduce<'_, F, C> {
     {
         let total = crate::kernel::total_len(dims)?;
 
-        // Base case: a single slot or below the threshold.
-        if exec.is_serial() || total <= MINTHREADLENGTH {
+        // Base case: a single slot, or a fork of this region does not pay.
+        if !is_parallel(self.class, total, &exec) {
             return (self.f)(dims, self.blocks, self.strides_list, offsets);
         }
         let Some(i) = split_axis(dims, self.blocks, self.costs) else {
@@ -555,16 +526,30 @@ where
 pub(crate) fn test_pool(threads: usize) -> threadteam::Pool {
     threadteam::Pool::builder()
         .threads(threads)
+        .dispatch_costs(test_dispatch_costs())
         .build()
         .unwrap()
+}
+
+/// Dispatch costs of the unit-test pools: 100 nanoseconds per section whatever the
+/// token, so that regions of a few thousand elements open the parallel branches
+/// the tests compare against the serial ones.
+#[cfg(test)]
+pub(crate) fn test_dispatch_costs() -> threadteam::DispatchCosts {
+    use threadteam::{DispatchKind, WidthCosts};
+    let cheap = WidthCosts::flat(core::time::Duration::from_nanos(100));
+    threadteam::DispatchCosts::generic()
+        .with(DispatchKind::Team, cheap)
+        .with(DispatchKind::InPool, cheap)
+        .with(DispatchKind::Outside, cheap)
 }
 
 /// Run `operation` once with a serial token and once with a four-slot token of
 /// a four-worker pool, and return both results.
 ///
-/// The parallel run asserts that the repository gate actually opens for a
-/// length above [`MINTHREADLENGTH`], so equivalence tests with such sizes
-/// exercise the parallel branches. Without the `parallel` feature the pool has
+/// The parallel run asserts that the gate actually opens for a region of a
+/// million elements, so equivalence tests with such sizes exercise the parallel
+/// branches. Without the `parallel` feature the pool has
 /// width one and both runs are serial.
 #[cfg(test)]
 pub(crate) fn run_serial_and_parallel<R: Send>(operation: impl Fn(Exec<'_>) -> R + Sync) -> (R, R) {
@@ -572,10 +557,9 @@ pub(crate) fn run_serial_and_parallel<R: Send>(operation: impl Fn(Exec<'_>) -> R
     let pool = test_pool(4);
     let exec = Exec::new(&pool, 4).unwrap();
     assert_eq!(
-        parallel_threads_for_len(MINTHREADLENGTH + 1, exec.budget().get()),
+        crate::cost::parallel_width(&exec, KernelClass::Map, 1 << 20).get(),
         exec.budget().get()
     );
-    assert_eq!(parallel_threads_for_len(MINTHREADLENGTH, 4), 1);
     let parallel = operation(exec);
     (serial, parallel)
 }

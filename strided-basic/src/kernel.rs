@@ -694,13 +694,17 @@ pub(crate) fn total_len(dims: &[usize]) -> Result<usize> {
 
 /// Whether the sequential contiguous fast path should be used.
 ///
-/// When `total` exceeds the threading threshold and `exec` has a second slot,
+/// When a fork over `total` elements of `class` pays and `exec` has a second slot,
 /// the contiguous fast path must not be taken so that the parallel kernel path
 /// can be reached. A serial token has no threaded path to reach and the
 /// sequential slice loop is the right kernel.
 #[inline]
-pub(crate) fn use_sequential_fast_path(total: usize, exec: &Exec<'_>) -> bool {
-    !crate::threading::is_parallel(total, exec)
+pub(crate) fn use_sequential_fast_path(
+    class: crate::cost::KernelClass,
+    total: usize,
+    exec: &Exec<'_>,
+) -> bool {
+    !crate::threading::is_parallel(class, total, exec)
 }
 
 /// Returns the common contiguous layout if **all** provided stride arrays
@@ -733,7 +737,7 @@ pub(crate) fn sequential_contiguous_layout(
     strides_list: &[&[isize]],
     exec: &Exec<'_>,
 ) -> Result<Option<ContiguousLayout>> {
-    if !use_sequential_fast_path(total_len(dims)?, exec) {
+    if !use_sequential_fast_path(crate::cost::KernelClass::Map, total_len(dims)?, exec) {
         return Ok(None);
     }
     Ok(same_contiguous_layout(dims, strides_list))

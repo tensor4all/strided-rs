@@ -17,10 +17,9 @@ use core::mem::MaybeUninit;
 use std::ops::Mul;
 use strided_view::{ElementOp, Identity};
 
+use crate::cost::{for_len, KernelClass};
 use crate::fuse::compute_costs;
-use crate::threading::{
-    for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded, MINTHREADLENGTH,
-};
+use crate::threading::{for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded};
 use crate::Exec;
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
@@ -858,7 +857,9 @@ fn try_contiguous_range_mul<
     if total == 0 {
         return true;
     }
-    if total <= MINTHREADLENGTH {
+    // One flat section over the chunks: the width is the token's decision.
+    let exec = for_len(exec, KernelClass::Map, total);
+    if exec.is_serial() {
         return false;
     }
 
@@ -1370,7 +1371,7 @@ fn map_parts_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let src_send = SendPtr(src_ptr as *mut A);
@@ -1384,6 +1385,7 @@ fn map_parts_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -1720,7 +1722,7 @@ fn zip_map2_parts_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -1735,6 +1737,7 @@ fn zip_map2_parts_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -1840,7 +1843,7 @@ fn mul_identity_into_raw<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -1855,6 +1858,7 @@ fn mul_identity_into_raw<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -2244,7 +2248,7 @@ pub(crate) fn zip_map3_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -2260,6 +2264,7 @@ pub(crate) fn zip_map3_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -2423,7 +2428,7 @@ pub(crate) fn zip_map4_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -2440,6 +2445,7 @@ pub(crate) fn zip_map4_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(

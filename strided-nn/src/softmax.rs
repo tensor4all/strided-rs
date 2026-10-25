@@ -12,7 +12,7 @@
 
 use core::mem::MaybeUninit;
 
-use strided_basic::execution::SendPtr;
+use strided_basic::execution::{tree_width, KernelClass, SendPtr};
 use strided_basic::Exec;
 
 use crate::error::SoftmaxError;
@@ -22,16 +22,21 @@ use crate::simd;
 /// Bytes in one cache-sized group of columns.
 const GROUP_BYTES: usize = 32 * 1024;
 
-/// Minimum work, in bytes, that justifies one worker.
-const MIN_BYTES_PER_TASK: usize = 32 * 1024;
+/// Serial cost class of the softmax pipeline: the `exp` pass dominates the
+/// shift, sum and scale passes, so one element is a `Transcendental` element
+/// (see `strided_basic::execution::KernelClass`); the fan-out is a tree split
+/// (`parallel_map_reduce`), which `tree_width` counts section by section.
+const CLASS: KernelClass = KernelClass::Transcendental;
 
 /// Elements of caller scratch one softmax call needs for `len` elements when
 /// the call's [`Exec`] has the given `budget`.
 ///
-/// One task holds one cache-sized group of columns; the number of tasks is what
-/// the budget and the work per task allow, not the budget itself, so a wide
-/// token on a short input does not reserve scratch for tasks that never run.
-/// The scratch also caps the fan-out: a region per task and no more.
+/// One task holds one cache-sized group of columns; the number of tasks is at most
+/// the groups the input holds and the budget, so a wide token on a short input
+/// does not reserve scratch for tasks that never run. The call may run fewer
+/// tasks than the scratch holds: the token's dispatch cost decides how many pay
+/// (`strided_basic::execution::tree_width`). The scratch also caps the fan-out: a
+/// region per task and no more.
 ///
 /// # Examples
 ///
@@ -45,19 +50,12 @@ const MIN_BYTES_PER_TASK: usize = 32 * 1024;
 pub fn scratch_len<T>(axis_len: usize, len: usize, budget: usize) -> usize {
     let element_size = core::mem::size_of::<T>();
     let group = group_elements(axis_len, element_size);
-    group.saturating_mul(tasks_for(len, group, element_size, budget))
+    group.saturating_mul(tasks_for(len, group, budget))
 }
 
-/// Tasks one call runs: capped by the scratch capacity, the token budget and
-/// the work per task.
-fn tasks_for(len: usize, group: usize, element_size: usize, budget: usize) -> usize {
-    let groups = len.div_ceil(group).max(1);
-    len.saturating_mul(element_size)
-        .checked_div(MIN_BYTES_PER_TASK)
-        .unwrap_or(0)
-        .max(1)
-        .min(budget.max(1))
-        .min(groups)
+/// Tasks one call may run: capped by the groups of the input and `budget`.
+fn tasks_for(len: usize, group: usize, budget: usize) -> usize {
+    len.div_ceil(group).max(1).min(budget.max(1))
 }
 
 /// Elements in one cache-sized group of columns.
@@ -125,7 +123,7 @@ impl Plan {
             });
         }
         let groups = input_len.div_ceil(group);
-        let tasks = tasks_for(input_len, group, element_size, capacity.min(budget));
+        let tasks = tasks_for(input_len, group, capacity.min(budget));
         let groups_per_task = groups.div_ceil(tasks).max(1);
         let task = (group * groups_per_task).min(input_len).max(1);
         Ok(Self {
@@ -167,6 +165,10 @@ macro_rules! softmax_axis0 {
     ($(#[$doc:meta])* $name:ident, $scalar:ty, $size:expr, $shift:ident, $scale:ident, $exp_into:ident, $vector_exp:path) => {
         $(#[$doc])*
         ///
+        /// The number of tasks is the width the token's dispatch cost justifies for the
+        /// serial time of the call (elements times the `Transcendental` class), at most
+        /// what the scratch holds.
+        ///
         /// # Errors
         ///
         /// [`SoftmaxError`] when the slices do not describe whole `axis_len`
@@ -185,13 +187,15 @@ macro_rules! softmax_axis0 {
             if input.is_empty() {
                 return Ok(());
             }
+            let width = tree_width(&exec, CLASS, input.len());
+            let exec = exec.limit(width);
             let plan = Plan::new(
                 axis_len,
                 input.len(),
                 output.len(),
                 scratch.len(),
                 $size,
-                exec.budget().get(),
+                width.get(),
             )?;
             let out_ptr = SendPtr(output.as_mut_ptr());
             let scratch_ptr = SendPtr(scratch.as_mut_ptr());

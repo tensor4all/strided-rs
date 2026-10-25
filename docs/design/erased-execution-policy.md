@@ -7,9 +7,9 @@ to its implementation, benchmark, decision record, and published results.
 
 | Question | Source of truth |
 |---|---|
-| What selects serial versus parallel execution? | `strided-basic/src/threading.rs` (shared by ordinary and fused execution) |
+| What selects serial versus parallel execution? | `strided-basic/src/cost.rs` (the class table and the gate) and `strided-basic/src/threading.rs` (shared by ordinary and fused execution) |
 | How is the threshold exercised? | `strided-kernel/benches/erased_policy_thresholds.rs` |
-| Why was the current threshold selected? | This document and [strided-rs#163](https://github.com/tensor4all/strided-rs/issues/163) |
+| Why was the current rule selected? | This document and threadteam-rs `docs/design/thresholds.md` |
 | Where does one implementation session record its evidence? | A dated file under `docs/worklogs/` |
 | Where do durable cross-project tables belong? | [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite) |
 
@@ -21,17 +21,29 @@ comparison; do not put a performance table in a crate README.
 
 ## Current decision
 
-The repository uses one threshold,
-`threading::MINTHREADLENGTH == 1 << 15` elements. A family enters parallel
-replay only when:
+The repository has no element-count threshold. A kernel states how long its
+region takes on one thread (elements times the serial throughput of its
+`KernelClass`, the table in `strided-basic/src/cost.rs`) and the token decides:
+the region runs in parallel when that time is at least `PAYS` (3) times the
+dispatch cost of every section the entry opens (`Exec::pays`), and the width is
+the one that minimises the section cost plus the share of the work
+(`Exec::width_for`). A family enters parallel replay only when:
 
 - the `Exec` token passed to the entry has a budget above one; and
-- the family-specific independent domain contains more than
-  `MINTHREADLENGTH` elements.
+- the serial estimate of the family-specific independent domain repays the
+  sections of the entry.
+
+The throughputs are 0.090 ns per element for copies, 0.100 for element-wise
+maps, 1.38 for `exp`-like functions and 0.081 for reductions. A flat entry
+(`for_ranges`) declares one section; a tree entry (`parallel_map_reduce`, the
+dimension splitter) declares `ceil(log2 width)` sections, and the splitter gates
+every node on one fork. The dispatch cost belongs to the token and to the thread
+that calls (team, plain token inside its pool, plain token outside it), so the
+same region can be serial on a plain token called from outside and parallel on a
+team. The design record is `docs/design/thresholds.md` in threadteam-rs.
 
 Small tensors, `Exec::serial()`, a token of budget one (including one from a
-single-thread pool) and code that received no token stay on the serial path. Exactly-threshold
-inputs also stay serial.
+single-thread pool) and code that received no token stay on the serial path.
 
 The policy-aware parallel replay currently covers:
 
@@ -76,8 +88,10 @@ What they do promise is documented per entry:
   deterministic route for a caller that needs one result per input, and it is
   asserted for `reduce`, `zip_reduce`, `sum` and `dot` by
   `strided-basic/tests/zip_reduce.rs`;
-- under a parallel policy those entries split by the effective thread count, so
-  the result is repeatable for a fixed thread count only;
+- under a parallel policy those entries split by the width the token's dispatch
+  cost justifies, so the result is repeatable for a fixed layout, budget and kind
+  of token (a plain token called from inside its pool and from outside it have
+  different costs and can choose different widths);
 - `dot` is the exception: it has no parallel branch under any policy, so its
   result never depends on the ambient pool width. It still is not a strict
   left-to-right fold (its homogeneous contiguous kernel accumulates in SIMD
@@ -90,7 +104,7 @@ makes a widening accumulator expressible (`f32` operands accumulated in `f64`);
 reuses the full-reduction threshold and the same partial-combine tree as
 `reduce`.
 
-## Changing a threshold or fast path
+## Changing a throughput constant or fast path or fast path
 
 Before implementation, record the following in the issue or dated worklog:
 

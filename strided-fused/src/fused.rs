@@ -10,7 +10,7 @@ use strided_basic::execution::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     SMALL_TENSOR_THRESHOLD,
 };
-use strided_basic::execution::{compute_costs, mapreduce_threaded, parallel_threads_for_len};
+use strided_basic::execution::{compute_costs, mapreduce_threaded, parallel_width, KernelClass};
 use strided_basic::execution::{
     map_into_validated, zip_map2_into_validated, zip_map3_into_validated, zip_map4_into_validated,
     ValidatedDestinationLayout,
@@ -1507,18 +1507,44 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         &kernel_plan.block,
         &ordered_strides,
         &initial_offsets,
+        plan_class(plan),
         exec,
         &run_partition,
     )
 }
 
+/// Serial cost class of a fused program: `Transcendental` when any instruction is
+/// a libm-like function, `Map` for arithmetic chains (see
+/// `strided_basic::execution::KernelClass`).
+fn plan_class(plan: &FusedPlan) -> KernelClass {
+    let transcendental = plan.ops.iter().any(|inst| {
+        matches!(
+            inst.op,
+            FusedOp::Exp
+                | FusedOp::Log
+                | FusedOp::Sin
+                | FusedOp::Cos
+                | FusedOp::Tanh
+                | FusedOp::Pow
+                | FusedOp::Expm1
+                | FusedOp::Log1p
+        )
+    });
+    if transcendental {
+        KernelClass::Transcendental
+    } else {
+        KernelClass::Map
+    }
+}
+
 /// Run `run_partition` over the whole region on the calling thread, or split
-/// the region across the budget of `exec` once it is large enough.
+/// the region across the budget of `exec` once a fork pays for it.
 fn replay_partitions<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
     ordered_strides: &[S],
     initial_offsets: &[isize],
+    class: KernelClass,
     exec: Exec<'_>,
     run_partition: &F,
 ) -> Result<()>
@@ -1526,7 +1552,7 @@ where
     F: Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<()> + Sync,
 {
     let total: usize = dims.iter().product();
-    if parallel_threads_for_len(total, exec.budget().get()) > 1 {
+    if parallel_width(&exec, class, total).get() > 1 {
         // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
         let costs = unsafe { compute_costs(ordered_strides) };
         // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
@@ -1537,6 +1563,7 @@ where
                 ordered_strides,
                 initial_offsets,
                 &costs,
+                class,
                 exec,
                 run_partition,
             )
@@ -1766,6 +1793,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         &kernel_plan.block,
         &ordered_strides,
         &initial_offsets,
+        plan_class(plan),
         exec,
         &run_partition,
     )

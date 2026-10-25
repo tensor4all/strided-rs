@@ -21,8 +21,11 @@ unreachable holes.
 Every operation that can fan out takes a `threadteam::Exec` placement token
 as its last parameter (re-exported as `strided_basic::Exec`, with `Pool`).
 `Exec::serial()` runs on the calling thread; `Exec::new(&pool, budget)` splits
-the work within `budget` slots of a pool the caller owns, and an operation below
-the repository threshold stays on the calling thread whatever the budget. This
+the work within `budget` slots of a pool the caller owns. The width is the
+token's decision: the serial time of the region (elements times the throughput
+of its `execution::KernelClass`) against the dispatch cost of the sections it
+opens, so a region too small to repay a fork stays on the calling thread
+whatever the budget. This
 crate starts no task of its own and never reaches a global pool. Narrow a token
 with `Exec::limit` to bound one operation more tightly than its pool.
 
