@@ -5,7 +5,7 @@
 //! `cargo bench -p strided-kernel --features parallel --bench axis_ops`
 //!
 //! Each case runs at one thread (`Exec::serial()`) and at four threads
-//! (`Exec::max_threads(4)` inside a four-worker pool whose size is
+//! (`Exec::new(&pool, 4)` over a four-worker pool whose size is
 //! asserted). Shapes cover the feature-first decode activations of
 //! tenferro-rs#2006 (`(d, len, batch)` normalized over a unit-stride `d`), a
 //! size past the last level cache, and a strided normalized axis, which runs

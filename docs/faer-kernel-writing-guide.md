@@ -227,7 +227,7 @@ pub fn zip_map2_broadcast_into<D, A, B, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Send + Sync,
 ) -> Result<()>
 ```
 

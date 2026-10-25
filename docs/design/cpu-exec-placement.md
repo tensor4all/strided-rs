@@ -15,8 +15,8 @@ The CPU stack places work with **four** mechanisms at once:
 | Mechanism | Where it lives today | Failure mode |
 | --- | --- | --- |
 | Raw Rayon (ambient) | fixed in tensor4all/tenferro-rs#2273 | serial engine starts the process-global pool |
-| Thread-local scope | `strided-basic` (`TARGET_POOL`, `with_execution_pool`) | a job running on the blocked thread inherits another operation's pool/budget |
-| Explicit handle | `tcontract_exec::Exec`, tenferro `FanOut`, `with_faer_width` | 3 separate implementations of clamp / inline / suspend; the cross-pool wait inherits strided's thread-locals |
+| Thread-local scope | a per-thread pool or budget scope | a job running on the blocked thread inherits another operation's pool/budget |
+| Explicit handle | `tcontract_exec::Exec`, tenferro `FanOut`, `with_faer_width` | 3 separate implementations of clamp / inline / suspend; the cross-pool wait inherits per-thread scope state |
 | Width only (faer `Par`) | faer, BLAS adapters | silently ambient unless the caller installed first |
 
 Observed consequences: `install` costs 3.6 to 13 µs against 41 ns of work for a
@@ -150,7 +150,7 @@ thread run one of its children, which is one of the tasks already counted.
 | --- | --- |
 | tlinalg batch: `lanes = width`, each lane `Sequential` | `exec.for_ranges(batch, grain, ...)` or `exec.fork(lanes, \|i, _\| ...)` |
 | tlinalg batch: one lane, faer gets the whole width | `exec.external(\|w\| faer_call(Par::rayon(w.get())))` |
-| strided `par_chunks` under `with_execution_pool` | `exec.for_ranges(len, grain, ...)` |
+| per-chunk fan-out under a thread-local pool scope | `exec.for_ranges(len, grain, ...)` |
 | tcontract batched GEMM, batch x inner split | `exec.fork(b, \|i, child\| gemm(child, ...))`, `b` from `BatchPolicy` |
 | tenferro two independent graph nodes | `exec.fork(2, \|i, child\| run_node(i, child))` |
 
@@ -159,7 +159,7 @@ thread run one of its children, which is one of the tasks already counted.
 | Crate | Owns | Never owns |
 | --- | --- | --- |
 | `strided-exec` (strided-rs, the only Rayon dependent) | the `Pool` and `PoolBuilder` types, `Exec`, `fork`, `for_ranges`, `external`, `broadcast`, the test ledger | a pool instance, arena, policy |
-| `strided-basic` / `-fused` / `-perm` | kernels; take `Exec` by value; re-export it | its own placement (the `TARGET_POOL` scope is deleted) |
+| `strided-basic` / `-fused` / `-perm` | kernels; take `Exec` by value; re-export it | its own placement (no thread-local scope exists) |
 | `tcontract-exec` | `Pool` (borrowed/owned/shared, holding a `strided_exec::Pool`), `ArenaProvider`, workspace, `WorkModel`, `BatchPolicy`; mints tokens from its pool | a task spawner, a Rayon type |
 | `cpueinsum` | nothing new | threading |
 | `tlinalg` | batch driver expressed with `for_ranges` / `external` | threading |
@@ -201,17 +201,15 @@ thread run one of its children, which is one of the tasks already counted.
 1. **strided-rs 0.7.0, one pull request, no intermediate release**:
    - add `strided-exec` with `Pool`, `PoolBuilder`, `Exec`, the entries, the
      ledger and their tests, and the `cargo public-api` check;
-   - replace `ExecContext` with `Exec` (last parameter, by value) in every
-     fan-out entry and delete `ExecContext`, `ExecutionPolicy`,
-     `with_execution_policy`, `with_execution_pool`, `TARGET_POOL`,
-     `target_pool_width`, `rayon_threads`, `with_scheduler_suspended`, with no
-     deprecated aliases;
-   - merge each `*_par` / serial pair into one function taking `Exec`;
+   - every fan-out entry takes `Exec` as its last parameter, by value; no
+     context type, policy object or thread-local placement state exists, and
+     there are no deprecated aliases;
+   - one function per operation, taking `Exec` (no `*_par` / serial pairs);
      `strided-perm` uses the budget it is given and never picks a width, so the
      bounded-map permutation fallback is deleted; one `MINTHREADLENGTH`;
    - re-export `Exec`, `Pool`, `PoolBuilder` from `strided-basic`; drop the
      direct `rayon` dependency of every other crate; the `cargo deny` rule
-     replaces the source-scanning guard test.
+     keeps `rayon` out of them.
 2. **tcontract-exec**: its own placement implementation (`Par`, `install`,
    `for_each_partition`, `broadcast` and the SPMD mutex, `Pool::rayon_pool`) is
    deleted; `Exec` becomes the resource bundle that mints `strided_exec::Exec`

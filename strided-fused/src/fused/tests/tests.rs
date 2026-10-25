@@ -374,7 +374,7 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
         workers.len() > 1,
         "bounded replay must cross the parallel threshold"
     );
-    assert!(workers.len() <= 2, "bounded replay exceeded max_threads(2)");
+    assert!(workers.len() <= 2, "bounded replay exceeded a budget of 2");
 }
 
 // Single-instruction plan whose sole output is the instruction result. Such

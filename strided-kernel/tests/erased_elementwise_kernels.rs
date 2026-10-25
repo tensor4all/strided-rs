@@ -34,7 +34,7 @@ const LARGE: usize = (1 << 15) + 65;
 const LENGTHS: [usize; 5] = [1, 7, 17, 67, LARGE];
 
 fn contexts() -> Vec<(&'static str, Exec<'static>)> {
-    vec![("serial", Exec::serial()), ("max_threads(4)", bounded(4))]
+    vec![("serial", Exec::serial()), ("budget(4)", bounded(4))]
 }
 
 /// One input layout over a logical `[rows, cols]` tensor with `rows * cols`

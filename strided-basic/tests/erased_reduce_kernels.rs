@@ -188,10 +188,7 @@ fn ops_for<T: Scalar>() -> &'static [ReduceOp] {
 }
 
 fn contexts() -> Vec<(&'static str, Budget)> {
-    vec![
-        ("serial", Budget::Serial),
-        ("max_threads(4)", Budget::Pooled(4)),
-    ]
+    vec![("serial", Budget::Serial), ("budget(4)", Budget::Pooled(4))]
 }
 
 fn value_for<T: Scalar>(op: ReduceOp, i: usize) -> T {
