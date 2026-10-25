@@ -122,6 +122,17 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     exec: Exec<'_>,
 ) -> Result<()> {
     let dst_ptr = raw.dst.cast::<T>();
+    // A copy this small costs less than a fan-out: keep it on one task.
+    let exec = if raw
+        .dims
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .is_some_and(|n| n <= crate::MINTHREADLENGTH)
+    {
+        exec.limit(std::num::NonZeroUsize::MIN)
+    } else {
+        exec
+    };
     // Fast path: both contiguous. A contiguous layout is injective by
     // construction, so it skips the validation below.
     if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
@@ -154,9 +165,10 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 ///
 /// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
 /// cache-aware blocking, and optimal loop ordering. The permutation is split
-/// across the budget of `exec`: this function uses exactly the budget it is
-/// given and never narrows it, so a caller that wants small copies to stay on
-/// one thread passes [`Exec::serial`] or narrows the token with [`Exec::limit`].
+/// across the budget of `exec`, except that a copy of at most
+/// [`MINTHREADLENGTH`](crate::MINTHREADLENGTH) elements stays on the calling
+/// thread. A caller that wants a large copy on one thread passes
+/// [`Exec::serial`] or narrows the token with [`Exec::limit`].
 /// A contiguous copy is a single `memcpy` on the calling thread.
 ///
 /// This is a simple copy without ElementOp support. For copies with

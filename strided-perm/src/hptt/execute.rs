@@ -9,6 +9,7 @@ use crate::hptt::macro_kernel::{
 use crate::hptt::plan::{ExecMode, GroupedTilePlan, LoopLevel, PermutePlan};
 
 use core::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use strided_exec::Exec;
 
 const ONE: NonZeroUsize = NonZeroUsize::MIN;
@@ -469,8 +470,20 @@ fn for_each_tile_par(
 ) {
     let row_tiles = transpose_tile_rows(size_a, block);
     let col_tiles = transpose_tile_rows(size_b, block);
-    exec.for_ranges(row_tiles * col_tiles, ONE, |range| {
-        for tile in range {
+    let tiles = row_tiles * col_tiles;
+    // One task per budget slot, each pulling tiles from a shared counter, so a
+    // slow worker (a busy core, an efficiency core) does not leave the others
+    // idle behind a static split.
+    let next = AtomicUsize::new(0);
+    let tasks = exec.budget().get().min(tiles);
+    // Contiguous chunks, about eight per task, keep neighbouring tiles on one worker.
+    let chunk = tiles.div_ceil(tasks * 8).max(1);
+    exec.for_ranges(tasks, ONE, |_| loop {
+        let first = next.fetch_add(chunk, Ordering::Relaxed);
+        if first >= tiles {
+            break;
+        }
+        for tile in first..(first + chunk).min(tiles) {
             let ia = (tile / col_tiles) * block;
             let ib = (tile % col_tiles) * block;
             tile_kernel(ia, block.min(size_a - ia), ib, block.min(size_b - ib));

@@ -66,9 +66,8 @@ impl<T> core::fmt::Debug for SendPtr<T> {
 
 /// Minimum number of elements to justify multi-threaded execution.
 ///
-/// See `docs/design/erased-execution-policy.md` for the benchmark and decision
-/// record. Matches Julia's `MINTHREADLENGTH = 1 << 15`.
-pub const MINTHREADLENGTH: usize = 1 << 15;
+/// Defined once, in `strided-perm`; see [`strided_perm::MINTHREADLENGTH`].
+pub use strided_perm::MINTHREADLENGTH;
 
 /// Block sizes handed to the parallel splitter.
 ///
