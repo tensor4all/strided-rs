@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Conj, ExecContext, Identity};
+use crate::{Conj, Exec, Identity};
 use num_complex::Complex64 as C64;
 
 fn vals(seed: u32, n: usize) -> Vec<C64> {
@@ -31,9 +31,13 @@ fn check3<OD: ElementOp<C64>, OA: ElementOp<C64>, OB: ElementOp<C64>>() {
     let mut got = start.clone();
     {
         let mut dv = StridedViewMut::new(&mut got, &dims, &ds, 0).unwrap();
-        zip_update3_into::<_, _, _, OD, OA, OB>(&mut dv, &av, &bv, |d, a, b| {
-            C64::new(0.5, -0.25) * a * b + C64::new(-0.3, 0.2) * d
-        })
+        zip_update3_into::<_, _, _, OD, OA, OB>(
+            &mut dv,
+            &av,
+            &bv,
+            |d, a, b| C64::new(0.5, -0.25) * a * b + C64::new(-0.3, 0.2) * d,
+            Exec::serial(),
+        )
         .unwrap();
     }
     for i in 0..m {
@@ -68,7 +72,8 @@ fn zip_update2_and_map_update_match_a_naive_loop() {
     let mut got = start.clone();
     {
         let mut dv = StridedViewMut::new(&mut got, &dims, &[1, 5], 0).unwrap();
-        zip_update2_into::<_, _, Conj, Conj>(&mut dv, &av, |d, a| a + d * d).unwrap();
+        zip_update2_into::<_, _, Conj, Conj>(&mut dv, &av, |d, a| a + d * d, Exec::serial())
+            .unwrap();
     }
     for i in 0..5 {
         for j in 0..4 {
@@ -80,7 +85,7 @@ fn zip_update2_and_map_update_match_a_naive_loop() {
     let mut got = start.clone();
     {
         let mut dv = StridedViewMut::new(&mut got, &dims, &[1, 5], 0).unwrap();
-        map_update_into::<_, Conj>(&mut dv, |d| d * 2.0).unwrap();
+        map_update_into::<_, Conj>(&mut dv, |d| d * 2.0, Exec::serial()).unwrap();
     }
     for (g, s) in got.iter().zip(&start) {
         assert_eq!(*g, s.conj() * 2.0);
@@ -94,23 +99,26 @@ fn threaded_update_equals_serial_and_formula() {
     let a = vals(6, m * n);
     let b = vals(7, m * n);
     let start = vals(8, m * n);
-    let run = |ctx: ExecContext| {
+    let pool = crate::threading::test_pool(4);
+    let run = |exec: Exec<'_>| {
         let mut out = start.clone();
         let row_major = [n as isize, 1];
         let col_major = [1isize, m as isize];
         let av = StridedView::<C64, Identity>::new(&a, &dims, &row_major, 0).unwrap();
         let bv = StridedView::<C64, Conj>::new(&b, &dims, &col_major, 0).unwrap();
-        ctx.run(|| {
-            let mut dv = StridedViewMut::new(&mut out, &dims, &col_major, 0).unwrap();
-            zip_update3_into::<_, _, _, Conj, Identity, Conj>(&mut dv, &av, &bv, |d, a, b| {
-                d + a * b
-            })
-            .unwrap();
-        });
+        let mut dv = StridedViewMut::new(&mut out, &dims, &col_major, 0).unwrap();
+        zip_update3_into::<_, _, _, Conj, Identity, Conj>(
+            &mut dv,
+            &av,
+            &bv,
+            |d, a, b| d + a * b,
+            exec,
+        )
+        .unwrap();
         out
     };
-    let serial = run(ExecContext::serial());
-    let threaded = run(ExecContext::max_threads(4).unwrap());
+    let serial = run(Exec::serial());
+    let threaded = run(Exec::new(&pool, 4).unwrap());
     assert_eq!(serial, threaded);
     for i in 0..m {
         for j in 0..n {
@@ -127,13 +135,19 @@ fn invalid_calls_are_rejected_before_any_write() {
     // A non-injective destination (stride 0 over extent 4).
     let mut dv = StridedViewMut::new(&mut d, &[4], &[0], 0).unwrap();
     assert!(matches!(
-        map_update_into::<_, Identity>(&mut dv, |x| x + 1.0),
+        map_update_into::<_, Identity>(&mut dv, |x| x + 1.0, Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
     let mut d2 = [9.0f64; 4];
     let av = StridedView::<f64, Identity>::new(&a, &[4], &[1], 0).unwrap();
     let mut dv2 = StridedViewMut::new(&mut d2, &[2, 2], &[1, 2], 0).unwrap();
-    assert!(zip_update2_into::<_, _, Identity, Identity>(&mut dv2, &av, |d, a| d + a).is_err());
+    assert!(zip_update2_into::<_, _, Identity, Identity>(
+        &mut dv2,
+        &av,
+        |d, a| d + a,
+        Exec::serial()
+    )
+    .is_err());
     assert_eq!(d, [9.0; 4]);
     assert_eq!(d2, [9.0; 4]);
 }
@@ -144,12 +158,14 @@ fn empty_and_scalar_shapes() {
     let mut d: [f64; 0] = [];
     let av = StridedView::<f64, Identity>::new(&a, &[0], &[1], 0).unwrap();
     let mut dv = StridedViewMut::new(&mut d, &[0], &[1], 0).unwrap();
-    zip_update2_into::<_, _, Identity, Identity>(&mut dv, &av, |d, a| d + a).unwrap();
+    zip_update2_into::<_, _, Identity, Identity>(&mut dv, &av, |d, a| d + a, Exec::serial())
+        .unwrap();
     // Rank 0: one element.
     let a = [2.0f64];
     let mut d = [1.0f64];
     let av = StridedView::<f64, Identity>::new(&a, &[], &[], 0).unwrap();
     let mut dv = StridedViewMut::new(&mut d, &[], &[], 0).unwrap();
-    zip_update2_into::<_, _, Identity, Identity>(&mut dv, &av, |d, a| d + 3.0 * a).unwrap();
+    zip_update2_into::<_, _, Identity, Identity>(&mut dv, &av, |d, a| d + 3.0 * a, Exec::serial())
+        .unwrap();
     assert_eq!(d, [7.0]);
 }

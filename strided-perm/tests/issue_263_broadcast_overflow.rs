@@ -2,6 +2,7 @@
 //! fused extent overflows `usize` must return a typed error from the public
 //! permutation copy entry points instead of panicking inside the planner.
 
+use strided_exec::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::{StridedError, StridedView, StridedViewMut};
 
@@ -15,7 +16,7 @@ fn copy_into_reports_overflowing_broadcast_extent() {
     let mut dst = StridedViewMut::new(&mut dst_data, &[HUGE, HUGE], &[0, 0], 0).unwrap();
 
     assert!(matches!(
-        copy_into(&mut dst, &src),
+        copy_into(&mut dst, &src, Exec::serial()),
         Err(StridedError::OffsetOverflow)
     ));
     assert_eq!(dst_data, [0.0], "destination must be untouched on error");
@@ -31,7 +32,7 @@ fn copy_into_reports_extent_beyond_isize() {
     let mut dst = StridedViewMut::new(&mut dst_data, &[1usize << 63], &[0], 0).unwrap();
 
     assert!(matches!(
-        copy_into(&mut dst, &src),
+        copy_into(&mut dst, &src, Exec::serial()),
         Err(StridedError::OffsetOverflow)
     ));
 }
@@ -45,21 +46,22 @@ fn copy_into_broadcast_source_still_copies() {
     copy_into(
         &mut StridedViewMut::new(&mut out, &[2, 3], &[3, 1], 0).unwrap(),
         &src,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(out, [7.0, 7.0, 7.0, 8.0, 8.0, 8.0]);
 }
 
-#[cfg(feature = "parallel")]
 #[test]
-fn copy_into_par_reports_overflowing_broadcast_extent() {
+fn pooled_copy_into_reports_overflowing_broadcast_extent() {
     let src_data = [1.0f64];
     let mut dst_data = [0.0f64];
     let src = StridedView::new(&src_data, &[HUGE, HUGE], &[0, 0], 0).unwrap();
     let mut dst = StridedViewMut::new(&mut dst_data, &[HUGE, HUGE], &[0, 0], 0).unwrap();
 
+    let pool = Pool::builder().threads(2).build().unwrap();
     assert!(matches!(
-        strided_perm::copy_into_par(&mut dst, &src),
+        copy_into(&mut dst, &src, Exec::new(&pool, 2).unwrap()),
         Err(StridedError::OffsetOverflow)
     ));
     assert_eq!(dst_data, [0.0]);

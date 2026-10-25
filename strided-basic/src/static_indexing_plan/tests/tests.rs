@@ -3,7 +3,7 @@ use core::mem::MaybeUninit;
 
 use num_complex::{Complex32, Complex64};
 
-use super::{PadPlan, RawStridedMut, RawStridedRef};
+use super::{Exec, PadPlan, RawStridedMut, RawStridedRef};
 
 fn assert_contiguous_pad_matches_scalar<T>(operand_data: &[T], fill: T)
 where
@@ -46,12 +46,15 @@ where
     {
         let mut dest =
             RawStridedMut::new(&mut fast_dest, &dest_dims, &dest_strides, dest_offset).unwrap();
-        plan.execute(&mut dest, &operand, fill).unwrap();
+        plan.execute(&mut dest, &operand, fill, Exec::serial())
+            .unwrap();
     }
     {
         let mut dest =
             RawStridedMut::new(&mut scalar_dest, &dest_dims, &dest_strides, dest_offset).unwrap();
-        scalar_plan.execute(&mut dest, &operand, fill).unwrap();
+        scalar_plan
+            .execute(&mut dest, &operand, fill, Exec::serial())
+            .unwrap();
     }
     assert_eq!(fast_dest, scalar_dest);
 }
@@ -219,11 +222,14 @@ fn assert_axis0_columns_match_fallback(
     let mut generic = vec![fill; dest_total];
     {
         let mut dest = RawStridedMut::new(&mut fast, dest_dims, &dest_strides, 0).unwrap();
-        plan.execute(&mut dest, &source, fill).unwrap();
+        plan.execute(&mut dest, &source, fill, Exec::serial())
+            .unwrap();
     }
     {
         let mut dest = RawStridedMut::new(&mut generic, dest_dims, &dest_strides, 0).unwrap();
-        fallback.execute(&mut dest, &source, fill).unwrap();
+        fallback
+            .execute(&mut dest, &source, fill, Exec::serial())
+            .unwrap();
     }
     assert_eq!(fast, generic, "rank {:?}", operand_dims.len());
 }
@@ -279,7 +285,8 @@ fn axis0_columns_uninit_initializes_every_poisoned_slot() {
     let source = RawStridedRef::new(&operand, &operand_dims, &operand_strides, 0).unwrap();
     let mut storage = vec![MaybeUninit::new(f64::NAN); dest_dims.iter().product()];
     let mut dest = RawStridedMut::new(&mut storage, &dest_dims, &dest_strides, 0).unwrap();
-    plan.execute_uninit(&mut dest, &source, -1.0).unwrap();
+    plan.execute_uninit(&mut dest, &source, -1.0, Exec::serial())
+        .unwrap();
     // SAFETY: every reachable destination slot was written by the plan.
     let values: Vec<f64> = storage
         .iter()
@@ -289,7 +296,8 @@ fn axis0_columns_uninit_initializes_every_poisoned_slot() {
 
     let mut reference = vec![-1.0f64; dest_dims.iter().product()];
     let mut dest = RawStridedMut::new(&mut reference, &dest_dims, &dest_strides, 0).unwrap();
-    plan.execute(&mut dest, &source, -1.0).unwrap();
+    plan.execute(&mut dest, &source, -1.0, Exec::serial())
+        .unwrap();
     assert_eq!(values, reference);
 }
 
@@ -409,7 +417,8 @@ fn axis0_columns_uninit_writes_bool_slots() {
     let dest_total = dest_dims.iter().product();
     let mut storage = vec![MaybeUninit::<bool>::uninit(); dest_total];
     let mut dest = RawStridedMut::new(&mut storage, &dest_dims, &dest_strides, 0).unwrap();
-    plan.execute_uninit(&mut dest, &source, false).unwrap();
+    plan.execute_uninit(&mut dest, &source, false, Exec::serial())
+        .unwrap();
     // SAFETY: every reachable destination slot was written by the plan.
     let values: Vec<bool> = storage
         .iter()
@@ -418,6 +427,7 @@ fn axis0_columns_uninit_writes_bool_slots() {
 
     let mut reference = vec![false; dest_total];
     let mut dest = RawStridedMut::new(&mut reference, &dest_dims, &dest_strides, 0).unwrap();
-    plan.execute(&mut dest, &source, false).unwrap();
+    plan.execute(&mut dest, &source, false, Exec::serial())
+        .unwrap();
     assert_eq!(values, reference);
 }

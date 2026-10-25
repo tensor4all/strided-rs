@@ -3,6 +3,7 @@
 //! Every case is checked against a naive coordinate walk, serially and through
 //! the parallel executor.
 
+use strided_exec::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::{StridedView, StridedViewMut};
 
@@ -32,26 +33,20 @@ fn check(dims: [usize; 2], strides: [isize; 2], offset: isize, source_len: usize
     copy_into(
         &mut StridedViewMut::new(&mut out, &dims, &dst_strides, 0).unwrap(),
         &src,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(out, expected, "serial dims={dims:?} strides={strides:?}");
 
-    #[cfg(feature = "parallel")]
-    {
-        out.fill(f64::NAN);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap()
-            .install(|| {
-                strided_perm::copy_into_par(
-                    &mut StridedViewMut::new(&mut out, &dims, &dst_strides, 0).unwrap(),
-                    &src,
-                )
-                .unwrap();
-            });
-        assert_eq!(out, expected, "parallel dims={dims:?} strides={strides:?}");
-    }
+    out.fill(f64::NAN);
+    let pool = Pool::builder().threads(2).build().unwrap();
+    copy_into(
+        &mut StridedViewMut::new(&mut out, &dims, &dst_strides, 0).unwrap(),
+        &src,
+        Exec::new(&pool, 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(out, expected, "parallel dims={dims:?} strides={strides:?}");
 }
 
 #[test]
@@ -69,7 +64,7 @@ fn reversed_inner_source_axis_at_upper_boundary() {
 
 #[test]
 fn reversed_inner_source_axis_tiled_and_parallel() {
-    // Large enough for the tiled transpose area and the parallel threshold.
+    // Large enough for the tiled transpose area.
     let n = 256usize;
     let m = 96usize;
     check([n, m], [-1, n as isize], n as isize - 1, n * m);

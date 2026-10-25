@@ -1,4 +1,4 @@
-//! Serial versus parallel `ExecContext` equivalence for dynamic slice and
+//! Serial versus pooled `Exec` equivalence for dynamic slice and
 //! dynamic update slice, including the rank-1 contiguous memcpy path.
 
 use core::mem::MaybeUninit;
@@ -20,14 +20,16 @@ fn dynamic_slice_rank_one_contiguous_parallel_matches_serial() {
         let source = RawStridedRef::new(&operand, &[100_003], &[1], 0).unwrap();
         let start_ref = RawStridedRef::new(&starts, &[1], &[1], 0).unwrap();
         let dest_dims = [len];
-        let (serial, parallel) = run_serial_and_parallel(|| {
+        let (serial, parallel) = run_serial_and_parallel(|mut exec| {
             let mut out = vec![-1.0f64; len];
             let mut dest = RawStridedMut::new(&mut out, &dest_dims, &[1], 0).unwrap();
-            plan.execute(&mut dest, &source, &start_ref).unwrap();
+            plan.execute(&mut dest, &source, &start_ref, exec.reborrow())
+                .unwrap();
 
             let mut storage = vec![MaybeUninit::<f64>::uninit(); len];
             let mut dest = RawStridedMut::new(&mut storage, &dest_dims, &[1], 0).unwrap();
-            plan.execute_uninit(&mut dest, &source, &start_ref).unwrap();
+            plan.execute_uninit(&mut dest, &source, &start_ref, exec.reborrow())
+                .unwrap();
             // SAFETY: the dense destination reaches every slot and a
             // successful `execute_uninit` initializes every reachable slot.
             let uninit: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
@@ -56,10 +58,10 @@ fn dynamic_update_slice_parallel_matches_serial() {
     let start_ref = RawStridedRef::new(&starts, &[1], &[1], 0).unwrap();
     let mut expected = operand.clone();
     expected[12_345..12_345 + 40_001].copy_from_slice(&update);
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut out = vec![0i64; n];
         let mut dest = RawStridedMut::new(&mut out, &full, &[1], 0).unwrap();
-        plan.execute(&mut dest, &source, &update_ref, &start_ref)
+        plan.execute(&mut dest, &source, &update_ref, &start_ref, exec.reborrow())
             .unwrap();
         out
     });
@@ -98,10 +100,10 @@ fn dynamic_update_slice_parallel_matches_serial() {
             expected[(17 + i) + 301 * (160 + j)] = update[i + 101 * j];
         }
     }
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut out = vec![0i64; 301 * 211];
         let mut dest = RawStridedMut::new(&mut out, &dims, &[1, 301], 0).unwrap();
-        plan.execute(&mut dest, &source, &update_ref, &start_ref)
+        plan.execute(&mut dest, &source, &update_ref, &start_ref, exec.reborrow())
             .unwrap();
         out
     });
@@ -124,10 +126,11 @@ fn dynamic_slice_rank_six_parallel_matches_serial() {
     let source = RawStridedRef::new(&operand, &dims, &strides, 0).unwrap();
     let start_ref = RawStridedRef::new(&starts, &[6], &[1], 0).unwrap();
     let out_len: usize = slice.iter().product();
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut out = vec![-1i64; out_len];
         let mut dest = RawStridedMut::new(&mut out, &slice, &dest_strides, 0).unwrap();
-        plan.execute(&mut dest, &source, &start_ref).unwrap();
+        plan.execute(&mut dest, &source, &start_ref, exec.reborrow())
+            .unwrap();
         out
     });
     assert_eq!(serial, parallel);

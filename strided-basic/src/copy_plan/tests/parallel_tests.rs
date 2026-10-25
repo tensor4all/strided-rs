@@ -1,4 +1,4 @@
-//! Serial versus parallel `ExecContext` equivalence for `CopyPlan` replay.
+//! Serial versus pooled `Exec` equivalence for `CopyPlan` replay.
 
 use super::*;
 use crate::threading::run_serial_and_parallel;
@@ -128,18 +128,20 @@ fn copy_plan_serial_and_parallel_contexts_agree() {
             |v| 3.0 * v,
         );
 
-        let (serial, parallel) = run_serial_and_parallel(|| {
+        let (serial, parallel) = run_serial_and_parallel(|mut exec| {
             let mut copied = vec![-1.0f64; dst_len];
             let mut dest = RawStridedMut::new(&mut copied, dims, dst_strides, dst_offset).unwrap();
-            plan.execute(&mut dest, &source).unwrap();
+            plan.execute(&mut dest, &source, exec.reborrow()).unwrap();
 
             let mut scaled = vec![-1.0f64; dst_len];
             let mut dest = RawStridedMut::new(&mut scaled, dims, dst_strides, dst_offset).unwrap();
-            plan.execute_scale(&mut dest, &source, 3.0).unwrap();
+            plan.execute_scale(&mut dest, &source, 3.0, exec.reborrow())
+                .unwrap();
 
             let mut storage = vec![MaybeUninit::new(-1.0f64); dst_len];
             let mut dest = RawStridedMut::new(&mut storage, dims, dst_strides, dst_offset).unwrap();
-            plan.execute_uninit(&mut dest, &source).unwrap();
+            plan.execute_uninit(&mut dest, &source, exec.reborrow())
+                .unwrap();
             // SAFETY: every slot was initialized to -1.0 before the copy.
             let uninit: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
             (copied, scaled, uninit)
@@ -163,10 +165,11 @@ fn copy_plan_uninit_parallel_initializes_every_reachable_slot() {
     let plan = CopyPlan::compile(&dims, &[1], &[-1]).unwrap();
     let src: Vec<i64> = (0..40_009).collect();
     let source = RawStridedRef::new(&src, &dims, &[-1], 40_008).unwrap();
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut storage = vec![MaybeUninit::<i64>::uninit(); 40_009];
         let mut dest = RawStridedMut::new(&mut storage, &dims, &[1], 0).unwrap();
-        plan.execute_uninit(&mut dest, &source).unwrap();
+        plan.execute_uninit(&mut dest, &source, exec.reborrow())
+            .unwrap();
         // SAFETY: the dense unit-stride layout reaches every slot and
         // `execute_uninit` initializes every reachable slot on success.
         storage
@@ -189,10 +192,11 @@ fn copy_plan_conj_parallel_matches_serial() {
         .map(|v| Complex64::new(v as f64, -(v as f64) * 0.25))
         .collect();
     let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut out = vec![Complex64::new(0.0, 0.0); 181 * 187];
         let mut dest = RawStridedMut::new(&mut out, &dims, &dst_strides, 0).unwrap();
-        plan.execute_conj(&mut dest, &source).unwrap();
+        plan.execute_conj(&mut dest, &source, exec.reborrow())
+            .unwrap();
         out
     });
     assert_eq!(serial, parallel);
@@ -208,10 +212,11 @@ fn update_plan_beta_zero_parallel_ignores_nan_destination() {
     let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
     let src: Vec<f64> = (0..40_001).map(|value| value as f64).collect();
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut dst = vec![f64::NAN; 40_001];
         let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
-        plan.execute(&mut dest, &source, 2.0, 0.0, |x| x).unwrap();
+        plan.execute(&mut dest, &source, 2.0, 0.0, |x| x, exec.reborrow())
+            .unwrap();
         dst
     });
     let expected: Vec<f64> = (0..40_001).map(|value| 2.0 * value as f64).collect();
@@ -226,10 +231,11 @@ fn update_plan_execute_uninit_parallel_initializes_every_slot() {
     let plan = UpdatePlan::compile(&dims, &[1], &[-1]).unwrap();
     let src: Vec<i64> = (0..40_009).collect();
     let source = RawStridedRef::new(&src, &dims, &[-1], 40_008).unwrap();
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut storage = vec![MaybeUninit::<i64>::uninit(); 40_009];
         let mut dest = RawStridedMut::new(&mut storage, &dims, &[1], 0).unwrap();
-        plan.execute_uninit(&mut dest, &source, 1, |x| x).unwrap();
+        plan.execute_uninit(&mut dest, &source, 1, |x| x, exec.reborrow())
+            .unwrap();
         // SAFETY: the dense unit-stride destination reaches every slot and a
         // successful `execute_uninit` initializes every reachable slot.
         storage

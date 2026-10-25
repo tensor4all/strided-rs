@@ -140,7 +140,7 @@ impl ScanOptions {
 ///
 /// ```
 /// use strided_basic::{
-///     ErasedRawStridedMut, ErasedRawStridedRef, ErasedScanPlan, ExecContext, KernelDType,
+///     Exec, ErasedRawStridedMut, ErasedRawStridedRef, ErasedScanPlan, KernelDType,
 ///     ScanOp, ScanOptions,
 /// };
 ///
@@ -159,7 +159,7 @@ impl ScanOptions {
 /// .unwrap();
 /// let src_ref = ErasedRawStridedRef::from_slice(&src, &[3, 2], &[1, 3], 0).unwrap();
 /// let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[3, 2], &[1, 3], 0).unwrap();
-/// plan.execute(&ExecContext::serial(), &mut dest, &src_ref).unwrap();
+/// plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
 /// assert_eq!(out, [1.0, 3.0, 6.0, 10.0, 30.0, 60.0]);
 /// ```
 #[derive(Clone, Debug)]
@@ -321,7 +321,7 @@ impl ErasedScanPlan {
     ///
     /// ```
     /// use strided_basic::{
-    ///     ErasedRawStridedMut, ErasedRawStridedRef, ErasedScanPlan, ExecContext, KernelDType,
+    ///     Exec, ErasedRawStridedMut, ErasedRawStridedRef, ErasedScanPlan, KernelDType,
     ///     ScanOp, ScanOptions,
     /// };
     /// let src = [1_i32, 2, 3, 4];
@@ -332,7 +332,7 @@ impl ErasedScanPlan {
     ///         .unwrap();
     /// let src_ref = ErasedRawStridedRef::from_slice(&src, &[4], &[1], 0).unwrap();
     /// let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[4], &[1], 0).unwrap();
-    /// plan.execute(&ExecContext::serial(), &mut dest, &src_ref).unwrap();
+    /// plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
     /// assert_eq!(out, [9, 7, 4, 0]);
     /// ```
     ///
@@ -342,9 +342,9 @@ impl ErasedScanPlan {
     /// not match the plan, before any destination write.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -352,7 +352,7 @@ impl ErasedScanPlan {
         macro_rules! run {
             ($ty:ty) => {{
                 let mut writer = reduce_writer::<$ty>(dest)?;
-                self.dispatch::<$ty, _>(ctx, &mut writer, src)
+                self.dispatch::<$ty, _>(&mut writer, src, exec)
             }};
         }
         match self.dtype {
@@ -376,8 +376,8 @@ impl ErasedScanPlan {
     /// ```
     /// use core::mem::MaybeUninit;
     /// use strided_basic::{
-    ///     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScanPlan,
-    ///     ExecContext, KernelDType, ScanOp, ScanOptions,
+    ///     Exec, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScanPlan,
+    ///     KernelDType, ScanOp, ScanOptions,
     /// };
     /// let src = [2.0_f32, 3.0, 4.0];
     /// let mut out = [MaybeUninit::<f32>::uninit(); 3];
@@ -389,7 +389,7 @@ impl ErasedScanPlan {
     /// let src_ptr = ErasedRawStridedPtr::from_ref(&src_ref);
     /// let mut dest =
     ///     ErasedRawStridedUninitMut::from_uninit_slice(&mut out, &[3], &[1], 0).unwrap();
-    /// plan.execute_uninit(&ExecContext::serial(), &mut dest, &src_ptr).unwrap();
+    /// plan.execute_uninit(&mut dest, &src_ptr, Exec::serial()).unwrap();
     /// let out: Vec<f32> = out.iter().map(|v| unsafe { v.assume_init() }).collect();
     /// assert_eq!(out, [2.0, 6.0, 24.0]);
     /// ```
@@ -400,9 +400,9 @@ impl ErasedScanPlan {
     /// overlaps the destination allocation.
     pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         src: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -413,7 +413,7 @@ impl ErasedScanPlan {
         macro_rules! run {
             ($ty:ty) => {{
                 let mut writer = reduce_uninit_writer::<$ty>(dest)?;
-                self.dispatch::<$ty, _>(ctx, &mut writer, &src)
+                self.dispatch::<$ty, _>(&mut writer, &src, exec)
             }};
         }
         match self.dtype {
@@ -429,9 +429,9 @@ impl ErasedScanPlan {
 
     fn dispatch<T, W>(
         &self,
-        ctx: &ExecContext,
         dest: &mut W,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: ScanScalar,
@@ -440,30 +440,30 @@ impl ErasedScanPlan {
         // The op and options are matched once per execution; the loops below
         // are monomorphized for each combination.
         match (self.op, self.options.exclusive, self.options.reverse) {
-            (ScanOp::Sum, false, false) => self.run::<T, W, SumScan, false, false>(ctx, dest, src),
-            (ScanOp::Sum, false, true) => self.run::<T, W, SumScan, false, true>(ctx, dest, src),
-            (ScanOp::Sum, true, false) => self.run::<T, W, SumScan, true, false>(ctx, dest, src),
-            (ScanOp::Sum, true, true) => self.run::<T, W, SumScan, true, true>(ctx, dest, src),
+            (ScanOp::Sum, false, false) => self.run::<T, W, SumScan, false, false>(dest, src, exec),
+            (ScanOp::Sum, false, true) => self.run::<T, W, SumScan, false, true>(dest, src, exec),
+            (ScanOp::Sum, true, false) => self.run::<T, W, SumScan, true, false>(dest, src, exec),
+            (ScanOp::Sum, true, true) => self.run::<T, W, SumScan, true, true>(dest, src, exec),
             (ScanOp::Product, false, false) => {
-                self.run::<T, W, ProductScan, false, false>(ctx, dest, src)
+                self.run::<T, W, ProductScan, false, false>(dest, src, exec)
             }
             (ScanOp::Product, false, true) => {
-                self.run::<T, W, ProductScan, false, true>(ctx, dest, src)
+                self.run::<T, W, ProductScan, false, true>(dest, src, exec)
             }
             (ScanOp::Product, true, false) => {
-                self.run::<T, W, ProductScan, true, false>(ctx, dest, src)
+                self.run::<T, W, ProductScan, true, false>(dest, src, exec)
             }
             (ScanOp::Product, true, true) => {
-                self.run::<T, W, ProductScan, true, true>(ctx, dest, src)
+                self.run::<T, W, ProductScan, true, true>(dest, src, exec)
             }
         }
     }
 
     fn run<T, W, K, const EXCLUSIVE: bool, const REVERSE: bool>(
         &self,
-        ctx: &ExecContext,
         dest: &mut W,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: ScanScalar,
@@ -490,7 +490,7 @@ impl ErasedScanPlan {
         // reachable offset; (3) execute checked exact plan-layout equality.
         // Units cover disjoint lines, so their destination writes are disjoint.
         // SAFETY: the three-link invariant above.
-        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), kernel) }
+        unsafe { for_each_unit(layout, src.offset(), dest.offset(), kernel, exec) }
     }
 }
 

@@ -1,9 +1,9 @@
-//! Serial versus parallel `ExecContext` equivalence for the static structural
+//! Serial versus pooled `Exec` equivalence for the static structural
 //! plans (slice, reverse, concatenate, pad).
 
 use core::mem::MaybeUninit;
 
-use super::{ConcatenatePlan, PadPlan, RawStridedMut, RawStridedRef, ReversePlan, SlicePlan};
+use super::{ConcatenatePlan, Exec, PadPlan, RawStridedMut, RawStridedRef, ReversePlan, SlicePlan};
 use crate::threading::run_serial_and_parallel;
 
 /// Visit every multi-index of `dims` in column-major order.
@@ -104,18 +104,18 @@ fn check_both<F, G>(
     run: F,
     run_uninit: G,
 ) where
-    F: Fn(&mut RawStridedMut<'_, i64>) + Sync,
-    G: Fn(&mut RawStridedMut<'_, MaybeUninit<i64>>) + Sync,
+    F: Fn(&mut RawStridedMut<'_, i64>, Exec<'_>) + Sync,
+    G: Fn(&mut RawStridedMut<'_, MaybeUninit<i64>>, Exec<'_>) + Sync,
 {
     let (len, base) = layout_extent(dest_dims, dest_strides);
-    let (serial, parallel) = run_serial_and_parallel(|| {
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         let mut init = vec![-1i64; len];
         let mut dest = RawStridedMut::new(&mut init, dest_dims, dest_strides, base).unwrap();
-        run(&mut dest);
+        run(&mut dest, exec.reborrow());
 
         let mut storage = vec![MaybeUninit::new(-1i64); len];
         let mut dest = RawStridedMut::new(&mut storage, dest_dims, dest_strides, base).unwrap();
-        run_uninit(&mut dest);
+        run_uninit(&mut dest, exec.reborrow());
         // SAFETY: every slot was initialized to -1 before execution.
         let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
         (
@@ -181,8 +181,8 @@ fn slice_plan_serial_and_parallel_contexts_agree() {
             &dest_strides,
             &expected,
             &format!("slice {dims:?}"),
-            |dest| plan.execute(dest, &source).unwrap(),
-            |dest| plan.execute_uninit(dest, &source).unwrap(),
+            |dest, exec| plan.execute(dest, &source, exec).unwrap(),
+            |dest, exec| plan.execute_uninit(dest, &source, exec).unwrap(),
         );
     }
 }
@@ -228,8 +228,8 @@ fn reverse_plan_serial_and_parallel_contexts_agree() {
             &dest_strides,
             &expected,
             &format!("reverse {dims:?} axes {axes:?}"),
-            |dest| plan.execute(dest, &source).unwrap(),
-            |dest| plan.execute_uninit(dest, &source).unwrap(),
+            |dest, exec| plan.execute(dest, &source, exec).unwrap(),
+            |dest, exec| plan.execute_uninit(dest, &source, exec).unwrap(),
         );
     }
 }
@@ -319,8 +319,8 @@ fn concatenate_plan_serial_and_parallel_contexts_agree() {
             &dest_strides,
             &expected,
             &format!("concatenate {dest_dims:?} axis {axis}"),
-            |dest| plan.execute(dest, &inputs).unwrap(),
-            |dest| plan.execute_uninit(dest, &inputs).unwrap(),
+            |dest, exec| plan.execute(dest, &inputs, exec).unwrap(),
+            |dest, exec| plan.execute_uninit(dest, &inputs, exec).unwrap(),
         );
     }
 }
@@ -453,8 +453,8 @@ fn pad_plan_serial_and_parallel_contexts_agree() {
             &dest_strides,
             &expected,
             &format!("pad {dims:?} low {low:?}"),
-            |dest| plan.execute(dest, &source, fill).unwrap(),
-            |dest| plan.execute_uninit(dest, &source, fill).unwrap(),
+            |dest, exec| plan.execute(dest, &source, fill, exec).unwrap(),
+            |dest, exec| plan.execute_uninit(dest, &source, fill, exec).unwrap(),
         );
     }
 }
@@ -519,8 +519,8 @@ fn axis0_columns_single_pass_serial_and_parallel_contexts_agree() {
             &dest_strides,
             &expected,
             &format!("axis0 columns {dims:?} low {low:?}"),
-            |dest| plan.execute(dest, &source, fill).unwrap(),
-            |dest| plan.execute_uninit(dest, &source, fill).unwrap(),
+            |dest, exec| plan.execute(dest, &source, fill, exec).unwrap(),
+            |dest, exec| plan.execute_uninit(dest, &source, fill, exec).unwrap(),
         );
     }
 }

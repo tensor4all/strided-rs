@@ -8,12 +8,10 @@ use crate::hptt::macro_kernel::{
 };
 use crate::hptt::plan::{ExecMode, GroupedTilePlan, LoopLevel, PermutePlan};
 
-#[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use core::num::NonZeroUsize;
+use strided_exec::Exec;
 
-/// Minimum elements to justify multi-threaded execution.
-#[cfg(feature = "parallel")]
-const MINTHREADLENGTH: usize = 1 << 15; // 32768
+const ONE: NonZeroUsize = NonZeroUsize::MIN;
 
 /// The native float width `T` may be reinterpreted as, or `None` for the
 /// generic fallback.
@@ -46,17 +44,11 @@ fn native_float_kind<T: 'static>() -> Option<usize> {
     }
 }
 
-/// Execute the permutation plan (single-threaded).
+/// Execute the permutation plan on the calling thread.
 ///
 /// # Safety
-/// - `src` must be valid for reads at all offsets determined by dims/src_strides
-/// - `dst` must be valid for writes at all offsets determined by dims/dst_strides
-/// - src and dst must not overlap
-pub unsafe fn execute_permute_blocked<T: Copy + 'static>(
-    src: *const T,
-    dst: *mut T,
-    plan: &PermutePlan,
-) {
+/// Same requirements as [`execute_permute_blocked`].
+unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &PermutePlan) {
     match plan.mode {
         ExecMode::Scalar => {
             *dst = *src;
@@ -99,23 +91,28 @@ pub unsafe fn execute_permute_blocked<T: Copy + 'static>(
     }
 }
 
-/// Execute the permutation plan with Rayon parallelism.
+/// Execute the permutation plan within the budget of `exec`.
 ///
-/// Parallelizes over the outermost loop level.
-/// Falls back to single-threaded for small tensors.
+/// The outermost loop level is split into contiguous ranges, one per task; a
+/// plan without an enclosing loop splits its 2D tile grid or its single strided
+/// stream instead. The function uses exactly the budget it is given and never
+/// narrows it: callers that want small copies to stay on one thread pass a
+/// serial token or narrow it with [`Exec::limit`]. A serial token runs the whole
+/// plan on the calling thread.
 ///
 /// # Safety
-/// Same requirements as `execute_permute_blocked`.
-#[cfg(feature = "parallel")]
-pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
+/// - `src` must be valid for reads at all offsets determined by dims/src_strides
+/// - `dst` must be valid for writes at all offsets determined by dims/dst_strides
+/// - src and dst must not overlap
+/// - no other thread may access the destination range during the call
+pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
     src: *const T,
     dst: *mut T,
     plan: &PermutePlan,
+    exec: Exec<'_>,
 ) {
-    let total: usize = plan.fused_dims.iter().product();
-
-    if total < MINTHREADLENGTH || rayon::current_num_threads() <= 1 {
-        execute_permute_blocked(src, dst, plan);
+    if exec.is_serial() {
+        execute_serial(src, dst, plan);
         return;
     }
 
@@ -130,37 +127,28 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
                     plan.lda_inner,
                     plan.ldb_inner,
                     plan.block,
+                    exec,
                 );
             }
             ExecMode::ConstStride1 { inner_dim } => {
                 // One strided stream with no enclosing loop: split its
-                // elements across workers instead of running it on one.
+                // elements across the budget instead of running it on one task.
                 let count = plan.fused_dims[inner_dim];
                 let src_stride = plan.src_strides[inner_dim];
                 let dst_stride = plan.dst_strides[inner_dim];
-                let nthreads = rayon::current_num_threads().max(1);
-                let chunk = count.div_ceil(nthreads).max(1);
                 let src_addr = src as usize;
                 let dst_addr = dst as usize;
-                let chunks = count.div_ceil(chunk).max(1);
-                (0..chunks).into_par_iter().for_each(|c| {
-                    let start = c * chunk;
-                    if start >= count {
-                        return;
-                    }
-                    let len = chunk.min(count - start);
+                exec.for_ranges(count, ONE, |range| {
                     let s = (src_addr as isize
-                        + start as isize * src_stride * (std::mem::size_of::<T>() as isize))
+                        + range.start as isize * src_stride * (std::mem::size_of::<T>() as isize))
                         as *const T;
                     let d = (dst_addr as isize
-                        + start as isize * dst_stride * (std::mem::size_of::<T>() as isize))
+                        + range.start as isize * dst_stride * (std::mem::size_of::<T>() as isize))
                         as *mut T;
-                    unsafe { const_stride1_copy(s, d, len, src_stride, dst_stride) };
+                    unsafe { const_stride1_copy(s, d, range.len(), src_stride, dst_stride) };
                 });
             }
-            _ => {
-                execute_permute_blocked(src, dst, plan);
-            }
+            _ => execute_serial(src, dst, plan),
         }
         return;
     }
@@ -168,7 +156,7 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
     let root = &plan.levels[0];
     let outer_dim = root.end;
     if outer_dim <= 1 {
-        execute_permute_blocked(src, dst, plan);
+        execute_serial(src, dst, plan);
         return;
     }
 
@@ -178,6 +166,12 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
     let ldb_root = root.ldb;
     let elem_size = std::mem::size_of::<T>();
     let inner: &[LoopLevel] = &plan.levels[1..];
+    let at = |i: usize| {
+        (
+            (src_addr as isize + (i as isize) * lda_root * (elem_size as isize)) as *const T,
+            (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T,
+        )
+    };
 
     match plan.mode {
         ExecMode::Transpose { dim_a, dim_b } => {
@@ -187,17 +181,15 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
             let ldb = plan.ldb_inner;
             let block = plan.block;
 
-            (0..outer_dim).into_par_iter().for_each(|i| {
-                let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
-                    as *const T;
-                let d =
-                    (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
-
-                unsafe {
-                    if inner.is_empty() {
-                        dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
-                    } else {
-                        transpose_recursive(s, d, inner, size_a, size_b, lda, ldb, block);
+            exec.for_ranges(outer_dim, ONE, |range| {
+                for i in range {
+                    let (s, d) = at(i);
+                    unsafe {
+                        if inner.is_empty() {
+                            dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
+                        } else {
+                            transpose_recursive(s, d, inner, size_a, size_b, lda, ldb, block);
+                        }
                     }
                 }
             });
@@ -207,17 +199,15 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
             let src_stride = plan.src_strides[inner_dim];
             let dst_stride = plan.dst_strides[inner_dim];
 
-            (0..outer_dim).into_par_iter().for_each(|i| {
-                let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
-                    as *const T;
-                let d =
-                    (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
-
-                unsafe {
-                    if inner.is_empty() {
-                        const_stride1_copy(s, d, count, src_stride, dst_stride);
-                    } else {
-                        const_stride1_recursive(s, d, inner, count, src_stride, dst_stride);
+            exec.for_ranges(outer_dim, ONE, |range| {
+                for i in range {
+                    let (s, d) = at(i);
+                    unsafe {
+                        if inner.is_empty() {
+                            const_stride1_copy(s, d, count, src_stride, dst_stride);
+                        } else {
+                            const_stride1_recursive(s, d, inner, count, src_stride, dst_stride);
+                        }
                     }
                 }
             });
@@ -228,24 +218,20 @@ pub unsafe fn execute_permute_blocked_par<T: Copy + Send + Sync + 'static>(
                 .as_ref()
                 .expect("grouped transpose mode requires grouped tile plan");
 
-            (0..outer_dim).into_par_iter().for_each(|i| {
-                let s = (src_addr as isize + (i as isize) * lda_root * (elem_size as isize))
-                    as *const T;
-                let d =
-                    (dst_addr as isize + (i as isize) * ldb_root * (elem_size as isize)) as *mut T;
-
-                unsafe {
-                    if inner.is_empty() {
-                        grouped_tile_copy(s, d, grouped);
-                    } else {
-                        grouped_recursive(s, d, inner, grouped);
+            exec.for_ranges(outer_dim, ONE, |range| {
+                for i in range {
+                    let (s, d) = at(i);
+                    unsafe {
+                        if inner.is_empty() {
+                            grouped_tile_copy(s, d, grouped);
+                        } else {
+                            grouped_recursive(s, d, inner, grouped);
+                        }
                     }
                 }
             });
         }
-        ExecMode::Scalar => {
-            execute_permute_blocked(src, dst, plan);
-        }
+        ExecMode::Scalar => execute_serial(src, dst, plan),
     }
 }
 
@@ -461,19 +447,39 @@ unsafe fn blocked_transpose_2d_fallback<T: Copy>(
     }
 }
 
-#[cfg(feature = "parallel")]
 #[inline]
 fn transpose_tile_rows(size: usize, block: usize) -> usize {
     debug_assert!(block > 0);
-    if size == 0 {
-        0
-    } else {
-        (size + block - 1) / block
-    }
+    size.div_ceil(block)
 }
 
-#[cfg(feature = "parallel")]
+/// Runs `tile_kernel(ia, ba, ib, bb)` for every tile of the `size_a` x `size_b`
+/// grid within the budget of `exec`; `(ia, ib)` is the tile origin and
+/// `(ba, bb)` its extent.
+///
+/// Splits the whole row x column tile grid, not only the row tiles: a
+/// near-vector-shaped transpose (for example 3 x N) has a single row tile, so a
+/// row-only split would run the entire kernel on one task.
+fn for_each_tile_par(
+    exec: Exec<'_>,
+    size_a: usize,
+    size_b: usize,
+    block: usize,
+    tile_kernel: impl Fn(usize, usize, usize, usize) + Sync,
+) {
+    let row_tiles = transpose_tile_rows(size_a, block);
+    let col_tiles = transpose_tile_rows(size_b, block);
+    exec.for_ranges(row_tiles * col_tiles, ONE, |range| {
+        for tile in range {
+            let ia = (tile / col_tiles) * block;
+            let ib = (tile % col_tiles) * block;
+            tile_kernel(ia, block.min(size_a - ia), ib, block.min(size_b - ib));
+        }
+    });
+}
+
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     src: *const T,
     dst: *mut T,
@@ -482,151 +488,42 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     lda: isize,
     ldb: isize,
     block: usize,
+    exec: Exec<'_>,
 ) {
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
     match native_float_kind::<T>() {
-        Some(8) => parallel_blocked_transpose_2d_f64(
-            src as *const f64,
-            dst as *mut f64,
-            size_a,
-            size_b,
-            lda,
-            ldb,
-            block,
-        ),
-        Some(4) => parallel_blocked_transpose_2d_f32(
-            src as *const f32,
-            dst as *mut f32,
-            size_a,
-            size_b,
-            lda,
-            ldb,
-            block,
-        ),
-        _ => parallel_blocked_transpose_2d_fallback(src, dst, size_a, size_b, lda, ldb, block),
-    }
-}
-
-#[cfg(feature = "parallel")]
-#[inline]
-unsafe fn parallel_blocked_transpose_2d_f64(
-    src: *const f64,
-    dst: *mut f64,
-    size_a: usize,
-    size_b: usize,
-    lda: isize,
-    ldb: isize,
-    block: usize,
-) {
-    let row_tiles = transpose_tile_rows(size_a, block);
-    let col_tiles = transpose_tile_rows(size_b, block);
-    let src_addr = src as usize;
-    let dst_addr = dst as usize;
-
-    // Split the whole row x column tile grid, not only the row tiles. A
-    // near-vector-shaped transpose (for example 3 x N) has a single row tile, so
-    // a row-only split would run the entire kernel on one worker.
-    (0..row_tiles * col_tiles).into_par_iter().for_each(|tile| {
-        let tile_a = tile / col_tiles;
-        let tile_b = tile % col_tiles;
-        let ia = tile_a * block;
-        let ba = block.min(size_a - ia);
-        let ib = tile_b * block;
-        let bb = block.min(size_b - ib);
-        let src_base = src_addr as *const f64;
-        let dst_base = dst_addr as *mut f64;
-        unsafe {
+        Some(8) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_f64(
-                src_base.offset(ia as isize + ib as isize * lda),
+                (src_addr as *const f64).offset(ia as isize + ib as isize * lda),
                 lda,
                 ba,
-                dst_base.offset(ib as isize + ia as isize * ldb),
+                (dst_addr as *mut f64).offset(ib as isize + ia as isize * ldb),
                 ldb,
                 bb,
             );
-        }
-    });
-}
-
-#[cfg(feature = "parallel")]
-#[inline]
-unsafe fn parallel_blocked_transpose_2d_f32(
-    src: *const f32,
-    dst: *mut f32,
-    size_a: usize,
-    size_b: usize,
-    lda: isize,
-    ldb: isize,
-    block: usize,
-) {
-    let row_tiles = transpose_tile_rows(size_a, block);
-    let col_tiles = transpose_tile_rows(size_b, block);
-    let src_addr = src as usize;
-    let dst_addr = dst as usize;
-
-    // Split the whole row x column tile grid, not only the row tiles. A
-    // near-vector-shaped transpose (for example 3 x N) has a single row tile, so
-    // a row-only split would run the entire kernel on one worker.
-    (0..row_tiles * col_tiles).into_par_iter().for_each(|tile| {
-        let tile_a = tile / col_tiles;
-        let tile_b = tile % col_tiles;
-        let ia = tile_a * block;
-        let ba = block.min(size_a - ia);
-        let ib = tile_b * block;
-        let bb = block.min(size_b - ib);
-        let src_base = src_addr as *const f32;
-        let dst_base = dst_addr as *mut f32;
-        unsafe {
+        }),
+        Some(4) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_f32(
-                src_base.offset(ia as isize + ib as isize * lda),
+                (src_addr as *const f32).offset(ia as isize + ib as isize * lda),
                 lda,
                 ba,
-                dst_base.offset(ib as isize + ia as isize * ldb),
+                (dst_addr as *mut f32).offset(ib as isize + ia as isize * ldb),
                 ldb,
                 bb,
             );
-        }
-    });
-}
-
-#[cfg(feature = "parallel")]
-#[inline]
-unsafe fn parallel_blocked_transpose_2d_fallback<T: Copy + Send + Sync>(
-    src: *const T,
-    dst: *mut T,
-    size_a: usize,
-    size_b: usize,
-    lda: isize,
-    ldb: isize,
-    block: usize,
-) {
-    let row_tiles = transpose_tile_rows(size_a, block);
-    let col_tiles = transpose_tile_rows(size_b, block);
-    let src_addr = src as usize;
-    let dst_addr = dst as usize;
-
-    // Split the whole row x column tile grid, not only the row tiles. A
-    // near-vector-shaped transpose (for example 3 x N) has a single row tile, so
-    // a row-only split would run the entire kernel on one worker.
-    (0..row_tiles * col_tiles).into_par_iter().for_each(|tile| {
-        let tile_a = tile / col_tiles;
-        let tile_b = tile % col_tiles;
-        let ia = tile_a * block;
-        let ba = block.min(size_a - ia);
-        let ib = tile_b * block;
-        let bb = block.min(size_b - ib);
-        let src_base = src_addr as *const T;
-        let dst_base = dst_addr as *mut T;
-        unsafe {
+        }),
+        _ => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_fallback(
-                src_base.offset(ia as isize + ib as isize * lda),
+                (src_addr as *const T).offset(ia as isize + ib as isize * lda),
                 lda,
                 ba,
-                dst_base.offset(ib as isize + ia as isize * ldb),
+                (dst_addr as *mut T).offset(ib as isize + ia as isize * ldb),
                 ldb,
                 bb,
             );
-        }
-    });
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +571,7 @@ mod tests {
         let mut dst = vec![0.0f64; 6];
         let plan = build_permute_plan(&[2, 3], &[1, 2], &[1, 2], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
         assert_eq!(dst, src);
     }
@@ -689,7 +586,7 @@ mod tests {
         let mut dst = vec![0.0f64; 4];
         let plan = build_permute_plan(&[2, 2], &[1, 3], &[1, 2], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
         // dst(i, j) = src(i + 3j) in col-major dst: [1, 2, 4, 5].
         assert_eq!(dst, vec![1.0, 2.0, 4.0, 5.0]);
@@ -704,7 +601,7 @@ mod tests {
         let mut dst = vec![0.0f64; 6];
         let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
         // Expected: dst = [1, 4, 2, 5, 3, 6]
         assert_eq!(dst, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
@@ -721,7 +618,7 @@ mod tests {
         // Permuted: dims [4,2,3], strides [6,1,2], dst col-major [1,4,8]
         let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
 
         for k in 0..4 {
@@ -748,7 +645,7 @@ mod tests {
         // Permuted [3,1,0,2]: dims [5,3,2,4], strides [24,2,1,6], dst [1,5,15,30]
         let plan = build_permute_plan(&[5, 3, 2, 4], &[24, 2, 1, 6], &[1, 5, 15, 30], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
 
         for i0 in 0..5 {
@@ -778,7 +675,7 @@ mod tests {
         let plan =
             build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
 
         for i0 in 0..3 {
@@ -805,7 +702,7 @@ mod tests {
         let mut dst = vec![0.0f64];
         let plan = build_permute_plan(&[], &[], &[], 8).unwrap();
         unsafe {
-            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
         }
         assert_eq!(dst[0], 42.0);
     }
@@ -842,21 +739,33 @@ mod tests {
         assert_eq!(native_float_kind::<FourAlign1>(), None);
     }
 
-    #[cfg(feature = "parallel")]
+    fn pool(threads: usize) -> strided_exec::Pool {
+        strided_exec::Pool::builder()
+            .threads(threads)
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn test_execute_par_transpose_2d() {
+        let pool = pool(2);
         let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut dst = vec![0.0f64; 6];
         let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
         unsafe {
-            execute_permute_blocked_par(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+                &plan,
+                Exec::new(&pool, 2).unwrap(),
+            );
         }
         assert_eq!(dst, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 
-    #[cfg(feature = "parallel")]
     #[test]
     fn test_execute_par_large() {
+        let pool = pool(4);
         let n = 256;
         let total = n * n * n;
         let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
@@ -865,7 +774,12 @@ mod tests {
         // [256, 256, 256] col-major, transpose [2, 0, 1]
         let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8).unwrap();
         unsafe {
-            execute_permute_blocked_par(src.as_ptr(), dst.as_mut_ptr(), &plan);
+            execute_permute_blocked(
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+                &plan,
+                Exec::new(&pool, 4).unwrap(),
+            );
         }
 
         for i0 in [0, 1, 127, 255] {
@@ -882,7 +796,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "parallel")]
     #[test]
     fn test_transpose_tile_rows_cover_rootless_3d_transpose() {
         let n = 256;
@@ -899,27 +812,26 @@ mod tests {
         assert_eq!(transpose_tile_rows(plan.fused_dims[dim_b], plan.block), 16);
     }
 
-    #[cfg(feature = "parallel")]
     #[test]
-    fn test_execute_par_one_thread_pool_uses_serial_path() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        pool.install(|| {
-            let n = 128;
-            let total = n * n;
-            let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
-            let mut dst_par = vec![0.0f64; total];
-            let mut dst_serial = vec![0.0f64; total];
-            let plan = build_permute_plan(&[n, n], &[n as isize, 1], &[1, n as isize], 8).unwrap();
+    fn test_execute_budget_one_token_matches_serial_on_the_calling_thread() {
+        let pool = pool(4);
+        let n = 128;
+        let total = n * n;
+        let src: Vec<f64> = (0..total).map(|i| i as f64).collect();
+        let mut dst_one = vec![0.0f64; total];
+        let mut dst_serial = vec![0.0f64; total];
+        let plan = build_permute_plan(&[n, n], &[n as isize, 1], &[1, n as isize], 8).unwrap();
 
-            unsafe {
-                execute_permute_blocked_par(src.as_ptr(), dst_par.as_mut_ptr(), &plan);
-                execute_permute_blocked(src.as_ptr(), dst_serial.as_mut_ptr(), &plan);
-            }
+        unsafe {
+            execute_permute_blocked(
+                src.as_ptr(),
+                dst_one.as_mut_ptr(),
+                &plan,
+                Exec::new(&pool, 1).unwrap(),
+            );
+            execute_permute_blocked(src.as_ptr(), dst_serial.as_mut_ptr(), &plan, Exec::serial());
+        }
 
-            assert_eq!(dst_par, dst_serial);
-        });
+        assert_eq!(dst_one, dst_serial);
     }
 }

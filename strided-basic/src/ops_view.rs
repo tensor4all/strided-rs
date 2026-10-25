@@ -9,17 +9,15 @@ use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
-use crate::{Result, StridedError};
+use crate::{Exec, Result, StridedError};
 use num_traits::{One, Zero};
 use std::mem::MaybeUninit;
 use std::ops::{Add, Mul};
 use strided_view::{ElementOp, ElementOpApply};
 
-#[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
-#[cfg(feature = "parallel")]
 use crate::threading::{
-    for_each_inner_block_with_offsets, mapreduce_threaded, SendPtr, MINTHREADLENGTH,
+    for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded, SendPtr,
 };
 // ============================================================================
 // Stride-specialized inner loop helpers for ops_view
@@ -200,6 +198,7 @@ unsafe fn inner_loop_dot<
 pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -209,7 +208,7 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
         let len = total_len(dst_dims)?;
         if Op::IS_IDENTITY {
             debug_assert!(
@@ -238,7 +237,7 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
         return Ok(());
     }
 
-    map_into(dest, src, |x| x)
+    map_into(dest, src, |x| x, exec)
 }
 
 /// Copy initialized values into a potentially uninitialized destination.
@@ -247,7 +246,7 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 /// untouched. Accepts identity views; use `map_into` for element operations
 /// such as conjugation. Equal contiguous f32/f64 layouts and every other type
 /// keep the element map; a non-contiguous f32/f64 copy uses the permutation
-/// engine, serial or parallel, under the active execution policy.
+/// engine, split within the budget of `exec`.
 ///
 /// # Errors
 /// Returns a shape/rank error for mismatched views, `NonInjectiveOutputLayout`
@@ -256,12 +255,13 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 /// # Examples
 /// ```
 /// use std::mem::MaybeUninit;
-/// use strided_basic::{copy_into_uninit, StridedView, StridedViewMut};
+/// use strided_basic::{copy_into_uninit, Exec, StridedView, StridedViewMut};
 /// let src = [1.0_f64, 2.0];
 /// let mut dst = [MaybeUninit::uninit(); 2];
 /// copy_into_uninit(
 ///     &mut StridedViewMut::new(&mut dst, &[2], &[1], 0).unwrap(),
 ///     &StridedView::new(&src, &[2], &[1], 0).unwrap(),
+///     Exec::serial(),
 /// ).unwrap();
 /// // SAFETY: the successful copy initialized both destination elements.
 /// assert_eq!(unsafe { dst[1].assume_init() }, 2.0);
@@ -269,6 +269,7 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     dest: &mut StridedViewMut<MaybeUninit<T>>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
     if !crate::layout_check::is_injective_layout(dest.dims(), dest.strides()) {
@@ -294,17 +295,12 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
     if !native_float
         || same_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()]).is_some()
     {
-        return map_into(dest, src, MaybeUninit::new);
+        return map_into(dest, src, MaybeUninit::new, exec);
     }
-    #[cfg(feature = "parallel")]
-    {
-        // INVARIANT: the permutation engine selects its float paths by the
-        // source element type and only stores into the destination, so an
-        // uninitialized destination with an initialized source is valid.
-        return crate::threading::copy_permuted_uninit_with_active_policy(dest, src);
-    }
-    #[cfg(not(feature = "parallel"))]
-    crate::threading::copy_permuted_uninit_serial(dest, src)
+    // INVARIANT: the permutation engine selects its float paths by the
+    // source element type and only stores into the destination, so an
+    // uninitialized destination with an initialized source is valid.
+    crate::threading::copy_permuted_uninit(dest, src, exec)
 }
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
@@ -314,7 +310,7 @@ pub fn copy_into_col_major<T: Copy + MaybeSendSync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
-    crate::threading::copy_into_col_major(dst, src)
+    strided_perm::copy_into_col_major(dst, src, Exec::serial())
 }
 
 /// Element-wise addition: `dest[i] += src[i]`.
@@ -327,6 +323,7 @@ pub fn add<
 >(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -336,7 +333,7 @@ pub fn add<
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -358,48 +355,42 @@ pub fn add<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut S);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst_ptr);
+        let src_send = SendPtr(src_ptr as *mut S);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            unsafe {
-                                inner_loop_add::<D, S, Op>(
-                                    dst_send.as_ptr().offset(offsets[0]),
-                                    strides[0],
-                                    src_send.as_const().offset(offsets[1]),
-                                    strides[1],
-                                    len,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        unsafe {
+                            inner_loop_add::<D, S, Op>(
+                                dst_send.as_ptr().offset(offsets[0]),
+                                strides[0],
+                                src_send.as_const().offset(offsets[1]),
+                                strides[1],
+                                len,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -434,6 +425,7 @@ pub fn mul<
 >(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
 
@@ -443,7 +435,7 @@ pub fn mul<
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -465,48 +457,42 @@ pub fn mul<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut S);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst_ptr);
+        let src_send = SendPtr(src_ptr as *mut S);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            unsafe {
-                                inner_loop_mul::<D, S, Op>(
-                                    dst_send.as_ptr().offset(offsets[0]),
-                                    strides[0],
-                                    src_send.as_const().offset(offsets[1]),
-                                    strides[1],
-                                    len,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        unsafe {
+                            inner_loop_mul::<D, S, Op>(
+                                dst_send.as_ptr().offset(offsets[0]),
+                                strides[0],
+                                src_send.as_const().offset(offsets[1]),
+                                strides[1],
+                                len,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -538,6 +524,7 @@ pub fn axpy<D, S, A, Op>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
     alpha: A,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     A: Copy + Mul<S, Output = D> + MaybeSync,
@@ -553,7 +540,7 @@ where
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -575,49 +562,43 @@ where
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut S);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst_ptr);
+        let src_send = SendPtr(src_ptr as *mut S);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            unsafe {
-                                inner_loop_axpy::<D, S, A, Op>(
-                                    dst_send.as_ptr().offset(offsets[0]),
-                                    strides[0],
-                                    src_send.as_const().offset(offsets[1]),
-                                    strides[1],
-                                    len,
-                                    alpha,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        unsafe {
+                            inner_loop_axpy::<D, S, A, Op>(
+                                dst_send.as_ptr().offset(offsets[0]),
+                                strides[0],
+                                src_send.as_const().offset(offsets[1]),
+                                strides[1],
+                                len,
+                                alpha,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -650,6 +631,7 @@ pub fn fma<D, A, B, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     A: Copy + Mul<B, Output = D> + MaybeSendSync,
@@ -669,7 +651,9 @@ where
     let a_strides = a.strides();
     let b_strides = b.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
+        .is_some()
+    {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
@@ -694,51 +678,45 @@ where
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut A);
-            let b_send = SendPtr(b_ptr as *mut B);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst_ptr);
+        let a_send = SendPtr(a_ptr as *mut A);
+        let b_send = SendPtr(b_ptr as *mut B);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            unsafe {
-                                inner_loop_fma::<D, A, B, OpA, OpB>(
-                                    dst_send.as_ptr().offset(offsets[0]),
-                                    strides[0],
-                                    a_send.as_const().offset(offsets[1]),
-                                    strides[1],
-                                    b_send.as_const().offset(offsets[2]),
-                                    strides[2],
-                                    len,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        unsafe {
+                            inner_loop_fma::<D, A, B, OpA, OpB>(
+                                dst_send.as_ptr().offset(offsets[0]),
+                                strides[0],
+                                a_send.as_const().offset(offsets[1]),
+                                strides[1],
+                                b_send.as_const().offset(offsets[2]),
+                                strides[2],
+                                len,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -765,36 +743,15 @@ where
     )
 }
 
-#[cfg(feature = "parallel")]
-fn parallel_simd_sum<T: Copy + Zero + Add<Output = T> + simd::MaybeSimdOps + Send + Sync>(
-    src: &[T],
-) -> Option<T> {
-    // Check that T has SIMD support
-    if T::try_simd_sum(&[]).is_none() {
-        return None;
-    }
-    let nthreads = crate::execution_policy::rayon_threads();
-    let result = crate::threading::parallel_map_reduce(
-        0..src.len(),
-        nthreads,
-        &|range| T::try_simd_sum(&src[range]).unwrap(),
-        &|left, right| left + right,
-    );
-    Some(result)
-}
-
 /// Sum all elements: `sum(src)`.
 ///
 /// # Evaluation order
 ///
-/// The result is independent of the ambient pool width when the call runs under
-/// the sequential policy — [`ExecContext::serial`](crate::ExecContext::serial)
-/// or [`with_execution_policy`](crate::with_execution_policy) with
-/// [`ExecutionPolicy::Sequential`](crate::ExecutionPolicy::Sequential). Under a
-/// parallel policy a contiguous identity operand above the threading threshold
-/// is summed per worker and the partial sums are combined in a tree, so the
-/// result is repeatable for a fixed thread count but can differ between thread
-/// counts.
+/// The result is independent of the pool when the call runs with a serial
+/// token ([`Exec::serial`]) or a budget of one. With a larger budget a
+/// contiguous identity operand above the threading threshold is summed per
+/// task and the partial sums are combined in a tree, so the result is
+/// repeatable for a fixed budget but can differ between budgets.
 ///
 /// Neither path is a strict left to right sum: a contiguous run is folded with
 /// independent SIMD or scalar lanes (see [`reduce`] for the lane scheme of the
@@ -813,6 +770,7 @@ pub fn sum<
     Op: ElementOp<T>,
 >(
     src: &StridedView<T, Op>,
+    exec: Exec<'_>,
 ) -> Result<T> {
     // A zero-element sum is the additive identity. Return before any planning
     // so an empty view with an enormous stride never reaches block sizing.
@@ -825,11 +783,15 @@ pub fn sum<
             let len = total_len(src.dims())?;
             let src_slice = unsafe { std::slice::from_raw_parts(src.ptr(), len) };
 
-            #[cfg(feature = "parallel")]
-            if len > MINTHREADLENGTH {
-                if let Some(result) = parallel_simd_sum(src_slice) {
-                    return Ok(result);
-                }
+            // The partial sums of the halves are combined in a tree; a type
+            // without SIMD support takes the generic reduction below.
+            if is_parallel(len, &exec) && T::try_simd_sum(&[]).is_some() {
+                return Ok(crate::threading::parallel_map_reduce(
+                    0..len,
+                    exec,
+                    &|range| T::try_simd_sum(&src_slice[range]).unwrap(),
+                    &|left, right| left + right,
+                ));
             }
 
             if let Some(result) = T::try_simd_sum(src_slice) {
@@ -837,7 +799,7 @@ pub fn sum<
             }
         }
     }
-    reduce(src, |x| x, |a, b| a + b, T::zero())
+    reduce(src, |x| x, |a, b| a + b, T::zero(), exec)
 }
 
 /// Dot product: `sum(OpA::apply(a[i]) * OpB::apply(b[i]))`.
@@ -852,9 +814,8 @@ pub fn sum<
 ///
 /// # Evaluation order
 ///
-/// This entry takes no parallel branch, so its result does not depend on the
-/// ambient pool width at all: it is computed on the calling thread whatever the
-/// execution policy is. The homogeneous contiguous fast path folds with the SIMD
+/// This entry takes no parallel branch and no token, so its result does not
+/// depend on any pool: it is computed on the calling thread. The homogeneous contiguous fast path folds with the SIMD
 /// lane scheme of the element type; every other layout folds a single
 /// accumulator along the traversal order of the fused plan, which is left to
 /// right over each unit-stride run. Neither is guaranteed to be bitwise equal
@@ -953,7 +914,11 @@ where
 }
 
 /// Symmetrize a square matrix: `dest = (src + src^T) / 2`.
-pub fn symmetrize_into<T>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()>
+pub fn symmetrize_into<T>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+    exec: Exec<'_>,
+) -> Result<()>
 where
     T: Copy
         + Add<Output = T>
@@ -974,11 +939,15 @@ where
     let src_t = src.permute(&[1, 0])?;
     let half = T::from_f64(0.5).ok_or(StridedError::ScalarConversion)?;
 
-    zip_map2_into(dest, src, &src_t, |a, b| (a + b) * half)
+    zip_map2_into(dest, src, &src_t, |a, b| (a + b) * half, exec)
 }
 
 /// Conjugate-symmetrize a square matrix: `dest = (src + conj(src^T)) / 2`.
-pub fn symmetrize_conj_into<T>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()>
+pub fn symmetrize_conj_into<T>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+    exec: Exec<'_>,
+) -> Result<()>
 where
     T: Copy
         + ElementOpApply
@@ -1001,7 +970,7 @@ where
     let src_adj = src.adjoint_2d()?;
     let half = T::from_f64(0.5).ok_or(StridedError::ScalarConversion)?;
 
-    zip_map2_into(dest, src, &src_adj, |a, b| (a + b) * half)
+    zip_map2_into(dest, src, &src_adj, |a, b| (a + b) * half, exec)
 }
 
 /// Copy with scaling: `dest[i] = scale * src[i]`.
@@ -1011,6 +980,7 @@ pub fn copy_scale<D, S, A, Op>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
     scale: A,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     A: Copy + Mul<S, Output = D> + MaybeSync,
@@ -1018,16 +988,17 @@ where
     S: Copy + MaybeSendSync,
     Op: ElementOp<S>,
 {
-    map_into(dest, src, |x| scale * x)
+    map_into(dest, src, |x| scale * x, exec)
 }
 
 /// Copy with complex conjugation: `dest[i] = conj(src[i])`.
 pub fn copy_conj<T: Copy + ElementOpApply + MaybeSendSync>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     let src_conj = src.conj();
-    copy_into(dest, &src_conj)
+    copy_into(dest, &src_conj, exec)
 }
 
 #[inline]
@@ -1100,40 +1071,37 @@ unsafe fn fill_2d<T: Copy + MaybeSendSync>(
     dst_stride0: isize,
     dst_stride1: isize,
     value: T,
+    exec: Exec<'_>,
 ) {
-    #[cfg(feature = "parallel")]
-    {
-        let total = dim0.saturating_mul(dim1);
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst);
-            if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
-                crate::threading::parallel_for_each(0..dim1, nthreads, &|columns| {
-                    for j in columns {
-                        let dst = dst_send.as_ptr();
-                        unsafe {
-                            let base = j as isize * dst_stride1;
-                            for i in 0..dim0 {
-                                *dst.offset(base + i as isize * dst_stride0) = value;
-                            }
+    let total = dim0.saturating_mul(dim1);
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst);
+        if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
+            crate::threading::parallel_for_each(0..dim1, exec, &|columns| {
+                for j in columns {
+                    let dst = dst_send.as_ptr();
+                    unsafe {
+                        let base = j as isize * dst_stride1;
+                        for i in 0..dim0 {
+                            *dst.offset(base + i as isize * dst_stride0) = value;
                         }
                     }
-                });
-            } else {
-                crate::threading::parallel_for_each(0..dim0, nthreads, &|rows| {
-                    for i in rows {
-                        let dst = dst_send.as_ptr();
-                        unsafe {
-                            let base = i as isize * dst_stride0;
-                            for j in 0..dim1 {
-                                *dst.offset(base + j as isize * dst_stride1) = value;
-                            }
+                }
+            });
+        } else {
+            crate::threading::parallel_for_each(0..dim0, exec, &|rows| {
+                for i in rows {
+                    let dst = dst_send.as_ptr();
+                    unsafe {
+                        let base = i as isize * dst_stride0;
+                        for j in 0..dim1 {
+                            *dst.offset(base + j as isize * dst_stride1) = value;
                         }
                     }
-                });
-            }
-            return;
+                }
+            });
         }
+        return;
     }
 
     if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
@@ -1230,6 +1198,7 @@ unsafe fn transpose_scale_4x4_f64(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn copy_transpose_scale_2d_f64_tiled_raw(
     dst: *mut f64,
     dst_stride0: isize,
@@ -1240,60 +1209,57 @@ unsafe fn copy_transpose_scale_2d_f64_tiled_raw(
     src_rows: usize,
     src_cols: usize,
     scale: f64,
+    exec: Exec<'_>,
 ) {
     const TILE: usize = 4;
     let row_full = src_rows / TILE * TILE;
     let col_full = src_cols / TILE * TILE;
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = src_rows.saturating_mul(src_cols);
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst);
-            let src_send = SendPtr(src as *mut f64);
-            let row_tiles = row_full / TILE;
-            crate::threading::parallel_for_each(0..row_tiles, nthreads, &|tiles| {
-                for tile_i in tiles {
-                    let i = tile_i * TILE;
-                    let dst = dst_send.as_ptr();
-                    let src = src_send.as_const();
-                    unsafe {
-                        let mut j = 0;
-                        while j < col_full {
-                            transpose_scale_4x4_f64(
-                                dst,
-                                dst_stride0,
-                                dst_stride1,
-                                src,
-                                src_stride0,
-                                src_stride1,
-                                i,
-                                j,
-                                scale,
-                            );
-                            j += TILE;
-                        }
-                        for j in col_full..src_cols {
-                            for ii in i..i + TILE {
-                                *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
-                                    scale
-                                        * *src.offset(
-                                            ii as isize * src_stride0 + j as isize * src_stride1,
-                                        );
-                            }
+    let total = src_rows.saturating_mul(src_cols);
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst);
+        let src_send = SendPtr(src as *mut f64);
+        let row_tiles = row_full / TILE;
+        crate::threading::parallel_for_each(0..row_tiles, exec, &|tiles| {
+            for tile_i in tiles {
+                let i = tile_i * TILE;
+                let dst = dst_send.as_ptr();
+                let src = src_send.as_const();
+                unsafe {
+                    let mut j = 0;
+                    while j < col_full {
+                        transpose_scale_4x4_f64(
+                            dst,
+                            dst_stride0,
+                            dst_stride1,
+                            src,
+                            src_stride0,
+                            src_stride1,
+                            i,
+                            j,
+                            scale,
+                        );
+                        j += TILE;
+                    }
+                    for j in col_full..src_cols {
+                        for ii in i..i + TILE {
+                            *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                                scale
+                                    * *src.offset(
+                                        ii as isize * src_stride0 + j as isize * src_stride1,
+                                    );
                         }
                     }
                 }
-            });
-            for i in row_full..src_rows {
-                for j in 0..src_cols {
-                    *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
-                        scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
-                }
             }
-            return;
+        });
+        for i in row_full..src_rows {
+            for j in 0..src_cols {
+                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                    scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+            }
         }
+        return;
     }
 
     let mut i = 0;
@@ -1335,6 +1301,7 @@ unsafe fn try_copy_transpose_scale_2d_f64_tiled(
     dest: &mut StridedViewMut<f64>,
     src: &StridedView<f64>,
     scale: f64,
+    exec: Exec<'_>,
 ) -> bool {
     if src.ndim() != 2 || dest.ndim() != 2 {
         return false;
@@ -1357,6 +1324,7 @@ unsafe fn try_copy_transpose_scale_2d_f64_tiled(
         src_dims[0],
         src_dims[1],
         scale,
+        exec,
     );
     true
 }
@@ -1366,6 +1334,7 @@ unsafe fn try_copy_transpose_scale_2d_f64_tiled_typed<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
     scale: T,
+    exec: Exec<'_>,
 ) -> bool
 where
     T: Copy + 'static,
@@ -1396,6 +1365,7 @@ where
         src_dims[0],
         src_dims[1],
         scale,
+        exec,
     );
     true
 }
@@ -1465,6 +1435,7 @@ unsafe fn transpose_scale_4x4_identity<T>(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     dst: *mut T,
     dst_stride0: isize,
@@ -1475,6 +1446,7 @@ unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     src_rows: usize,
     src_cols: usize,
     scale: T,
+    exec: Exec<'_>,
 ) where
     T: Copy + Mul<Output = T> + MaybeSendSync,
 {
@@ -1482,55 +1454,51 @@ unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     let row_full = src_rows / TILE * TILE;
     let col_full = src_cols / TILE * TILE;
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = src_rows.saturating_mul(src_cols);
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst);
-            let src_send = SendPtr(src as *mut T);
-            let row_tiles = row_full / TILE;
-            crate::threading::parallel_for_each(0..row_tiles, nthreads, &|tiles| {
-                for tile_i in tiles {
-                    let i = tile_i * TILE;
-                    let dst = dst_send.as_ptr();
-                    let src = src_send.as_const();
-                    unsafe {
-                        let mut j = 0;
-                        while j < col_full {
-                            transpose_scale_4x4_identity(
-                                dst,
-                                dst_stride0,
-                                dst_stride1,
-                                src,
-                                src_stride0,
-                                src_stride1,
-                                i,
-                                j,
-                                scale,
-                            );
-                            j += TILE;
-                        }
-                        for j in col_full..src_cols {
-                            for ii in i..i + TILE {
-                                *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
-                                    scale
-                                        * *src.offset(
-                                            ii as isize * src_stride0 + j as isize * src_stride1,
-                                        );
-                            }
+    let total = src_rows.saturating_mul(src_cols);
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst);
+        let src_send = SendPtr(src as *mut T);
+        let row_tiles = row_full / TILE;
+        crate::threading::parallel_for_each(0..row_tiles, exec, &|tiles| {
+            for tile_i in tiles {
+                let i = tile_i * TILE;
+                let dst = dst_send.as_ptr();
+                let src = src_send.as_const();
+                unsafe {
+                    let mut j = 0;
+                    while j < col_full {
+                        transpose_scale_4x4_identity(
+                            dst,
+                            dst_stride0,
+                            dst_stride1,
+                            src,
+                            src_stride0,
+                            src_stride1,
+                            i,
+                            j,
+                            scale,
+                        );
+                        j += TILE;
+                    }
+                    for j in col_full..src_cols {
+                        for ii in i..i + TILE {
+                            *dst.offset(j as isize * dst_stride0 + ii as isize * dst_stride1) =
+                                scale
+                                    * *src.offset(
+                                        ii as isize * src_stride0 + j as isize * src_stride1,
+                                    );
                         }
                     }
                 }
-            });
-            for i in row_full..src_rows {
-                for j in 0..src_cols {
-                    *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
-                        scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
-                }
             }
-            return;
+        });
+        for i in row_full..src_rows {
+            for j in 0..src_cols {
+                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                    scale * *src.offset(i as isize * src_stride0 + j as isize * src_stride1);
+            }
         }
+        return;
     }
 
     let mut i = 0;
@@ -1571,6 +1539,7 @@ unsafe fn try_copy_transpose_scale_2d_identity_tiled<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
     scale: T,
+    exec: Exec<'_>,
 ) -> bool
 where
     T: Copy + Mul<Output = T> + MaybeSendSync,
@@ -1596,11 +1565,13 @@ where
         src_dims[0],
         src_dims[1],
         scale,
+        exec,
     );
     true
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn copy_transpose_scale_2d_loop<T>(
     dst: *mut T,
     dst_stride0: isize,
@@ -1611,51 +1582,48 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
     src_rows: usize,
     src_cols: usize,
     scale: T,
+    exec: Exec<'_>,
 ) where
     T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync,
 {
-    #[cfg(feature = "parallel")]
-    {
-        let total = src_rows.saturating_mul(src_cols);
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            let dst_send = SendPtr(dst);
-            let src_send = SendPtr(src as *mut T);
-            if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
-                crate::threading::parallel_for_each(0..src_rows, nthreads, &|rows| {
-                    for i in rows {
-                        let dst = dst_send.as_ptr();
-                        let src = src_send.as_const();
-                        unsafe {
-                            for j in 0..src_cols {
-                                let value = (*src
-                                    .offset(i as isize * src_stride0 + j as isize * src_stride1))
-                                .transpose();
-                                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
-                                    scale * value;
-                            }
+    let total = src_rows.saturating_mul(src_cols);
+    if is_parallel(total, &exec) {
+        let dst_send = SendPtr(dst);
+        let src_send = SendPtr(src as *mut T);
+        if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
+            crate::threading::parallel_for_each(0..src_rows, exec, &|rows| {
+                for i in rows {
+                    let dst = dst_send.as_ptr();
+                    let src = src_send.as_const();
+                    unsafe {
+                        for j in 0..src_cols {
+                            let value = (*src
+                                .offset(i as isize * src_stride0 + j as isize * src_stride1))
+                            .transpose();
+                            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                                scale * value;
                         }
                     }
-                });
-            } else {
-                crate::threading::parallel_for_each(0..src_cols, nthreads, &|columns| {
-                    for j in columns {
-                        let dst = dst_send.as_ptr();
-                        let src = src_send.as_const();
-                        unsafe {
-                            for i in 0..src_rows {
-                                let value = (*src
-                                    .offset(i as isize * src_stride0 + j as isize * src_stride1))
-                                .transpose();
-                                *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
-                                    scale * value;
-                            }
+                }
+            });
+        } else {
+            crate::threading::parallel_for_each(0..src_cols, exec, &|columns| {
+                for j in columns {
+                    let dst = dst_send.as_ptr();
+                    let src = src_send.as_const();
+                    unsafe {
+                        for i in 0..src_rows {
+                            let value = (*src
+                                .offset(i as isize * src_stride0 + j as isize * src_stride1))
+                            .transpose();
+                            *dst.offset(j as isize * dst_stride0 + i as isize * dst_stride1) =
+                                scale * value;
                         }
                     }
-                });
-            }
-            return;
+                }
+            });
         }
+        return;
     }
 
     if dst_stride0.unsigned_abs() <= dst_stride1.unsigned_abs() {
@@ -1682,10 +1650,12 @@ pub fn copy_transpose_scale_into<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
     scale: T,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: Copy + ElementOpApply + Mul<Output = T> + Zero + One + PartialEq + MaybeSendSync + 'static,
 {
+    let mut exec = exec;
     if src.ndim() != 2 || dest.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
     }
@@ -1709,6 +1679,7 @@ where
                     dest.strides()[0],
                     dest.strides()[1],
                     T::zero(),
+                    exec,
                 );
             }
         }
@@ -1718,22 +1689,21 @@ where
     let transpose_is_identity = element_transpose_is_identity::<T>();
 
     unsafe {
-        if transpose_is_identity && try_copy_transpose_scale_2d_f64_tiled_typed(dest, src, scale) {
+        if transpose_is_identity
+            && try_copy_transpose_scale_2d_f64_tiled_typed(dest, src, scale, exec.reborrow())
+        {
             return Ok(());
         }
-        if transpose_is_identity && try_copy_transpose_scale_2d_identity_tiled(dest, src, scale) {
+        if transpose_is_identity
+            && try_copy_transpose_scale_2d_identity_tiled(dest, src, scale, exec.reborrow())
+        {
             return Ok(());
         }
     }
 
     if scale == T::one() && transpose_is_identity {
         let src_t = src.permute(&[1, 0])?;
-        #[cfg(feature = "parallel")]
-        {
-            return crate::threading::copy_permuted_with_active_policy(dest, &src_t);
-        }
-        #[cfg(not(feature = "parallel"))]
-        return crate::threading::copy_permuted_serial(dest, &src_t);
+        return crate::threading::copy_permuted(dest, &src_t, exec);
     }
 
     unsafe {
@@ -1747,6 +1717,7 @@ where
             src_dims[0],
             src_dims[1],
             scale,
+            exec,
         );
     }
     Ok(())

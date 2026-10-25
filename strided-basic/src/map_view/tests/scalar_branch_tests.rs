@@ -12,7 +12,8 @@ fn raw_map_rejects_noninjective_destination_before_write() {
 
     let mut output = [7.0f64];
     let mut dest = RawStridedMut::new(&mut output, &dims, &dest_strides, 0).unwrap();
-    let error = map_raw_into::<f64, f64, Identity>(&mut dest, &lhs, |value| -value).unwrap_err();
+    let error = map_raw_into::<f64, f64, Identity>(&mut dest, &lhs, |value| -value, Exec::serial())
+        .unwrap_err();
     assert!(matches!(error, StridedError::NonInjectiveOutputLayout));
     assert_eq!(output, [7.0]);
 }
@@ -181,8 +182,15 @@ fn test_broadcast_mul_into_error_branches_and_non_identity_ops() {
     let rhs = StridedArray::<f64>::row_major(&[2, 3]);
     let mut out = StridedArray::<f64>::row_major(&[2, 3]);
 
-    let err = broadcast_mul_into(&mut out.view_mut(), &lhs.view(), &[0], &rhs.view(), &[0, 1])
-        .unwrap_err();
+    let err = broadcast_mul_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &[0],
+        &rhs.view(),
+        &[0, 1],
+        Exec::serial(),
+    )
+    .unwrap_err();
     assert!(matches!(err, StridedError::RankMismatch(2, 1)));
 
     let err = broadcast_mul_into(
@@ -191,6 +199,7 @@ fn test_broadcast_mul_into_error_branches_and_non_identity_ops() {
         &[0, 3],
         &rhs.view(),
         &[0, 1],
+        Exec::serial(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -204,6 +213,7 @@ fn test_broadcast_mul_into_error_branches_and_non_identity_ops() {
         &[0, 0],
         &rhs.view(),
         &[0, 1],
+        Exec::serial(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -218,6 +228,7 @@ fn test_broadcast_mul_into_error_branches_and_non_identity_ops() {
         &[0, 1],
         &rhs_bad.view(),
         &[0, 1],
+        Exec::serial(),
     )
     .unwrap_err();
     assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
@@ -229,6 +240,7 @@ fn test_broadcast_mul_into_error_branches_and_non_identity_ops() {
         &[0, 1],
         &rhs.view(),
         &[0, 1],
+        Exec::serial(),
     )
     .unwrap();
 }
@@ -358,7 +370,7 @@ fn test_mul_into_transposed_rhs_above_range_threshold_matches_reference() {
         let av = StridedView::<f64, Identity>::new(&a, &dims, &col, 0).unwrap();
         let bv = StridedView::<f64, Identity>::new(&b, &dims, &row, 0).unwrap();
         let mut dv = StridedViewMut::<f64>::new(&mut d, &dims, &col, 0).unwrap();
-        mul_into(&mut dv, &av, &bv).unwrap();
+        mul_into(&mut dv, &av, &bv, Exec::serial()).unwrap();
     }
 
     for j in 0..n {

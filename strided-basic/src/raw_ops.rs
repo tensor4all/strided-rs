@@ -122,7 +122,6 @@ impl PairTraversal {
     }
 
     /// The inline layout, or `None` when the traversal spilled.
-    #[cfg(any(test, feature = "parallel"))]
     #[inline]
     pub(crate) fn inline(&self) -> Option<&FusedPairLayout> {
         match self {

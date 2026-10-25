@@ -12,7 +12,7 @@ fn test_f64_tiled_transpose_scale_handles_remainders() {
     let used_tiled = {
         let src = a.view();
         let mut dst = out.view_mut();
-        unsafe { try_copy_transpose_scale_2d_f64_tiled(&mut dst, &src, 3.0) }
+        unsafe { try_copy_transpose_scale_2d_f64_tiled(&mut dst, &src, 3.0, Exec::serial()) }
     };
 
     assert!(used_tiled);
@@ -34,7 +34,7 @@ fn test_identity_tiled_transpose_scale_handles_integer_remainders() {
     let used_tiled = {
         let src = a.view();
         let mut dst = out.view_mut();
-        unsafe { try_copy_transpose_scale_2d_identity_tiled(&mut dst, &src, 2) }
+        unsafe { try_copy_transpose_scale_2d_identity_tiled(&mut dst, &src, 2, Exec::serial()) }
     };
 
     assert!(used_tiled);
@@ -48,7 +48,6 @@ fn test_identity_tiled_transpose_scale_handles_integer_remainders() {
 #[cfg(feature = "parallel")]
 #[test]
 fn test_bounded_identity_tiled_transpose_uses_two_partitions_exactly_once() {
-    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -128,26 +127,25 @@ fn test_bounded_identity_tiled_transpose_uses_two_partitions_exactly_once() {
         value: 3,
         state,
     };
-    let two = NonZeroUsize::new(2).unwrap();
+    let pool = crate::threading::test_pool(4);
+    let exec = Exec::new(&pool, 4)
+        .unwrap()
+        .limit(std::num::NonZeroUsize::new(2).unwrap());
 
-    crate::threading::test_pool(4).install(|| {
-        crate::with_execution_policy(
-            crate::ExecutionPolicy::Rayon { max_threads: two },
-            || unsafe {
-                copy_transpose_scale_2d_identity_tiled_raw(
-                    destination.as_mut_ptr(),
-                    1,
-                    COLS as isize,
-                    source.as_ptr(),
-                    1,
-                    ROWS as isize,
-                    ROWS,
-                    COLS,
-                    scale,
-                );
-            },
+    unsafe {
+        copy_transpose_scale_2d_identity_tiled_raw(
+            destination.as_mut_ptr(),
+            1,
+            COLS as isize,
+            source.as_ptr(),
+            1,
+            ROWS as isize,
+            ROWS,
+            COLS,
+            scale,
+            exec,
         );
-    });
+    }
 
     assert_eq!(state.max_active.load(Ordering::SeqCst), 2);
     for (index, count) in state.coverage.iter().enumerate() {
@@ -175,11 +173,26 @@ fn test_zero_scale_fills_non_contiguous_destination() {
     let mut out_base = StridedArray::<u64>::from_fn_col_major(&[rows, cols], |_| 99);
     let mut out_t = out_base.view_mut().permute(&[1, 0]).unwrap();
 
-    copy_transpose_scale_into(&mut out_t, &a.view(), 0).unwrap();
+    copy_transpose_scale_into(&mut out_t, &a.view(), 0, Exec::serial()).unwrap();
 
     for i in 0..cols {
         for j in 0..rows {
             assert_eq!(out_t.get(&[i, j]), 0);
+        }
+    }
+}
+
+#[test]
+fn copy_into_col_major_copies_from_non_col_major_source() {
+    let source =
+        StridedArray::<usize>::from_fn_row_major(&[3, 4], |index| index[0] * 10 + index[1]);
+    let mut destination = StridedArray::<usize>::col_major(&[3, 4]);
+
+    copy_into_col_major(&mut destination.view_mut(), &source.view()).unwrap();
+
+    for row in 0..3 {
+        for column in 0..4 {
+            assert_eq!(destination.get(&[row, column]), source.get(&[row, column]));
         }
     }
 }

@@ -1,10 +1,6 @@
 [package]
 name = "strided-basic"
-# Versioned per crate, not by the workspace: crates are released individually
-# when their library code changes. 0.6.3 adds strided-source variants of the
-# structural kernels (`triangular_mask_view_into_uninit`,
-# `embed_diagonal_view_into_uninit`).
-version = "0.6.4"
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,13 +17,13 @@ strided-view.workspace = true
 strided-perm.workspace = true
 num-traits.workspace = true
 num-complex.workspace = true
-rayon = { workspace = true, optional = true }
+strided-exec.workspace = true
 tinyvec.workspace = true
 pulp = { workspace = true, optional = true }
 
 [features]
 default = ["simd"]
-parallel = ["dep:rayon", "strided-perm/parallel"]
+parallel = ["strided-exec/parallel", "strided-perm/parallel"]
 simd = ["dep:pulp"]
 
 [dev-dependencies]
@@ -36,7 +32,7 @@ approx.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 num-complex.workspace = true
-rayon.workspace = true
+strided-exec = { workspace = true, features = ["ledger"] }
 
 [lib]
 bench = false

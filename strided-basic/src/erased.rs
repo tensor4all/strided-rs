@@ -89,26 +89,25 @@ impl ErasedCopyPlan {
     /// `dest = src` through a non-generic dtype-erased replay boundary.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         self.check_dtype(dest.dtype())?;
         self.check_dtype(src.dtype())?;
 
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_copy::<f32>(&self.plan, dest, src),
-            KernelDType::F64 => execute_copy::<f64>(&self.plan, dest, src),
-            KernelDType::I32 => execute_copy::<i32>(&self.plan, dest, src),
-            KernelDType::I64 => execute_copy::<i64>(&self.plan, dest, src),
-            KernelDType::Bool => execute_copy::<bool>(&self.plan, dest, src),
-            KernelDType::C32 => execute_copy::<Complex32>(&self.plan, dest, src),
-            KernelDType::C64 => execute_copy::<Complex64>(&self.plan, dest, src),
+        match self.dtype {
+            KernelDType::F32 => execute_copy::<f32>(&self.plan, dest, src, exec),
+            KernelDType::F64 => execute_copy::<f64>(&self.plan, dest, src, exec),
+            KernelDType::I32 => execute_copy::<i32>(&self.plan, dest, src, exec),
+            KernelDType::I64 => execute_copy::<i64>(&self.plan, dest, src, exec),
+            KernelDType::Bool => execute_copy::<bool>(&self.plan, dest, src, exec),
+            KernelDType::C32 => execute_copy::<Complex32>(&self.plan, dest, src, exec),
+            KernelDType::C64 => execute_copy::<Complex64>(&self.plan, dest, src, exec),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        result
+        }
     }
 
     fn check_dtype(&self, actual: KernelDType) -> Result<()> {
@@ -158,28 +157,27 @@ impl ErasedConcatenatePlan {
     /// Execute concatenate into an erased output descriptor.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         inputs: &[ErasedRawStridedRef<'_>],
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         for input in inputs {
             check_dtype(self.dtype, input.dtype())?;
         }
 
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs),
-            KernelDType::F64 => execute_concatenate::<f64>(&self.plan, dest, inputs),
-            KernelDType::I32 => execute_concatenate::<i32>(&self.plan, dest, inputs),
-            KernelDType::I64 => execute_concatenate::<i64>(&self.plan, dest, inputs),
-            KernelDType::Bool => execute_concatenate::<bool>(&self.plan, dest, inputs),
-            KernelDType::C32 => execute_concatenate::<Complex32>(&self.plan, dest, inputs),
-            KernelDType::C64 => execute_concatenate::<Complex64>(&self.plan, dest, inputs),
+        match self.dtype {
+            KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs, exec),
+            KernelDType::F64 => execute_concatenate::<f64>(&self.plan, dest, inputs, exec),
+            KernelDType::I32 => execute_concatenate::<i32>(&self.plan, dest, inputs, exec),
+            KernelDType::I64 => execute_concatenate::<i64>(&self.plan, dest, inputs, exec),
+            KernelDType::Bool => execute_concatenate::<bool>(&self.plan, dest, inputs, exec),
+            KernelDType::C32 => execute_concatenate::<Complex32>(&self.plan, dest, inputs, exec),
+            KernelDType::C64 => execute_concatenate::<Complex64>(&self.plan, dest, inputs, exec),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        result
+        }
     }
 
     /// Execute concatenate as a full overwrite of uninitialized output storage.
@@ -191,9 +189,9 @@ impl ErasedConcatenatePlan {
     /// reachable slots.
     pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         inputs: &[ErasedRawStridedPtr<'_>],
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         if inputs.len() != self.plan.input_count() {
@@ -213,18 +211,22 @@ impl ErasedConcatenatePlan {
             unsafe { input.try_as_ref_after_no_overlap() }?;
         }
 
-        ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_concatenate_uninit::<f32>(&self.plan, dest, inputs),
-            KernelDType::F64 => execute_concatenate_uninit::<f64>(&self.plan, dest, inputs),
-            KernelDType::I32 => execute_concatenate_uninit::<i32>(&self.plan, dest, inputs),
-            KernelDType::I64 => execute_concatenate_uninit::<i64>(&self.plan, dest, inputs),
-            KernelDType::Bool => execute_concatenate_uninit::<bool>(&self.plan, dest, inputs),
-            KernelDType::C32 => execute_concatenate_uninit::<Complex32>(&self.plan, dest, inputs),
-            KernelDType::C64 => execute_concatenate_uninit::<Complex64>(&self.plan, dest, inputs),
+        match self.dtype {
+            KernelDType::F32 => execute_concatenate_uninit::<f32>(&self.plan, dest, inputs, exec),
+            KernelDType::F64 => execute_concatenate_uninit::<f64>(&self.plan, dest, inputs, exec),
+            KernelDType::I32 => execute_concatenate_uninit::<i32>(&self.plan, dest, inputs, exec),
+            KernelDType::I64 => execute_concatenate_uninit::<i64>(&self.plan, dest, inputs, exec),
+            KernelDType::Bool => execute_concatenate_uninit::<bool>(&self.plan, dest, inputs, exec),
+            KernelDType::C32 => {
+                execute_concatenate_uninit::<Complex32>(&self.plan, dest, inputs, exec)
+            }
+            KernelDType::C64 => {
+                execute_concatenate_uninit::<Complex64>(&self.plan, dest, inputs, exec)
+            }
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        })
+        }
     }
 }
 
@@ -315,14 +317,14 @@ pub enum ReduceOp {
 ///   lane kernel (other unit stride runs) or an eight lane kernel (strided
 ///   runs), and runs are combined left to right. A dense column major
 ///   source therefore reduces exactly like one contiguous slice.
-/// * With a parallel context and more than `MINTHREADLENGTH` elements, a
+/// * With a budget above one and more than `MINTHREADLENGTH` elements, a
 ///   full reduction splits the traversal into one deterministic range per
-///   worker thread. Each range runs the same run kernel as the serial path and
+///   task. Each range runs the same run kernel as the serial path and
 ///   the partials are combined in a fixed tree. The result is bitwise
-///   repeatable for a fixed layout and thread count, but may differ between
-///   thread counts and from the serial result.
+///   repeatable for a fixed layout and budget, but may differ between
+///   budgets and from the serial result.
 /// * Axis reductions with kept axes compute every output independently, so
-///   the result never depends on the context or thread count. Each output
+///   the result never depends on the token or its budget. Each output
 ///   folds its reduced elements sequentially in caller reduced axis order,
 ///   except that a unit stride leading reduced run (after fusing adjacent
 ///   reduced axes) of length at least 16 is reduced by the contiguous run
@@ -542,9 +544,9 @@ impl ErasedReducePlan {
     /// Execute the reduction into an erased output descriptor.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -571,27 +573,27 @@ impl ErasedReducePlan {
         let result = match self.dtype {
             KernelDType::F32 => {
                 let mut writer = reduce_writer::<f32>(dest)?;
-                dispatch_reduce::<f32, _>(self.op, &self.layout, ctx, &mut writer, src)
+                dispatch_reduce::<f32, _>(self.op, &self.layout, &mut writer, src, exec)
             }
             KernelDType::F64 => {
                 let mut writer = reduce_writer::<f64>(dest)?;
-                dispatch_reduce::<f64, _>(self.op, &self.layout, ctx, &mut writer, src)
+                dispatch_reduce::<f64, _>(self.op, &self.layout, &mut writer, src, exec)
             }
             KernelDType::I32 => {
                 let mut writer = reduce_writer::<i32>(dest)?;
-                dispatch_reduce::<i32, _>(self.op, &self.layout, ctx, &mut writer, src)
+                dispatch_reduce::<i32, _>(self.op, &self.layout, &mut writer, src, exec)
             }
             KernelDType::I64 => {
                 let mut writer = reduce_writer::<i64>(dest)?;
-                dispatch_reduce::<i64, _>(self.op, &self.layout, ctx, &mut writer, src)
+                dispatch_reduce::<i64, _>(self.op, &self.layout, &mut writer, src, exec)
             }
             KernelDType::C32 => {
                 let mut writer = reduce_writer::<Complex32>(dest)?;
-                dispatch_reduce::<Complex32, _>(self.op, &self.layout, ctx, &mut writer, src)
+                dispatch_reduce::<Complex32, _>(self.op, &self.layout, &mut writer, src, exec)
             }
             KernelDType::C64 => {
                 let mut writer = reduce_writer::<Complex64>(dest)?;
-                dispatch_reduce::<Complex64, _>(self.op, &self.layout, ctx, &mut writer, src)
+                dispatch_reduce::<Complex64, _>(self.op, &self.layout, &mut writer, src, exec)
             }
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
@@ -608,9 +610,9 @@ impl ErasedReducePlan {
     /// reachable slots.
     pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         src: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -639,7 +641,7 @@ impl ErasedReducePlan {
         macro_rules! run {
             ($ty:ty) => {{
                 let mut writer = reduce_uninit_writer::<$ty>(dest)?;
-                dispatch_reduce::<$ty, _>(self.op, &self.layout, ctx, &mut writer, &src)
+                dispatch_reduce::<$ty, _>(self.op, &self.layout, &mut writer, &src, exec)
             }};
         }
         match self.dtype {
@@ -736,6 +738,7 @@ fn execute_copy<T>(
     plan: &CopyPlan,
     dest: &mut ErasedRawStridedMut<'_>,
     src: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: Copy + crate::MaybeSendSync + KernelStorageElement,
@@ -750,13 +753,14 @@ where
     };
     let mut dest =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest, &source)
+    plan.execute(&mut dest, &source, exec)
 }
 
 fn execute_concatenate<T>(
     plan: &ConcatenatePlan,
     dest: &mut ErasedRawStridedMut<'_>,
     inputs: &[ErasedRawStridedRef<'_>],
+    mut exec: Exec<'_>,
 ) -> Result<()>
 where
     T: Copy + crate::MaybeSendSync + KernelStorageElement,
@@ -780,7 +784,9 @@ where
         plan.check_input_layout(position, &input_ref)?;
         plan.segment_offset(position, dest_offset)?;
     }
-    if plan.prefers_whole_plan() && !inputs.is_empty() && inputs.len() <= crate::inline::OPERAND_CAP
+    if plan.prefers_whole_plan(&exec)
+        && !inputs.is_empty()
+        && inputs.len() <= crate::inline::OPERAND_CAP
     {
         // Build the typed descriptors on the stack: `RawStridedRef` is `Copy`,
         // so this stays allocation-free within the operand bound. The
@@ -807,14 +813,14 @@ where
                 )
             };
         }
-        return plan.execute(&mut dest_ref, &input_refs[..inputs.len()]);
+        return plan.execute(&mut dest_ref, &input_refs[..inputs.len()], exec);
     }
     for (position, input) in inputs.iter().enumerate() {
         let input_data = input.data_as::<T>()?;
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
-        plan.execute_segment(position, &mut dest_ref, &input_ref)?;
+        plan.execute_segment(position, &mut dest_ref, &input_ref, exec.reborrow())?;
     }
     Ok(())
 }
@@ -823,6 +829,7 @@ fn execute_concatenate_uninit<T>(
     plan: &ConcatenatePlan,
     dest: &mut ErasedRawStridedUninitMut<'_>,
     inputs: &[ErasedRawStridedPtr<'_>],
+    mut exec: Exec<'_>,
 ) -> Result<()>
 where
     T: Copy + crate::MaybeSendSync + KernelStorageElement,
@@ -845,7 +852,9 @@ where
         plan.check_input_layout(position, &input_ref)?;
         plan.segment_offset(position, dest_offset)?;
     }
-    if plan.prefers_whole_plan() && !inputs.is_empty() && inputs.len() <= crate::inline::OPERAND_CAP
+    if plan.prefers_whole_plan(&exec)
+        && !inputs.is_empty()
+        && inputs.len() <= crate::inline::OPERAND_CAP
     {
         // SAFETY: input/output overlap was rejected before forming references.
         let first_erased = unsafe { inputs[0].try_as_ref_after_no_overlap() }?;
@@ -875,7 +884,7 @@ where
                 )
             };
         }
-        return plan.execute_uninit(&mut dest_ref, &input_refs[..inputs.len()]);
+        return plan.execute_uninit(&mut dest_ref, &input_refs[..inputs.len()], exec);
     }
     for (position, input) in inputs.iter().enumerate() {
         // SAFETY: input/output overlap was rejected before forming references.
@@ -884,7 +893,7 @@ where
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
         };
-        plan.execute_segment_uninit(position, &mut dest_ref, &input_ref)?;
+        plan.execute_segment_uninit(position, &mut dest_ref, &input_ref, exec.reborrow())?;
     }
     Ok(())
 }
@@ -948,7 +957,7 @@ impl ErasedUpdatePlan {
     ///
     /// ```
     /// use strided_basic::{
-    ///     ErasedRawStridedMut, ErasedRawStridedRef, ErasedUpdatePlan, ExecContext, KernelDType,
+    ///     ErasedRawStridedMut, ErasedRawStridedRef, ErasedUpdatePlan, Exec, KernelDType,
     ///     UpdateOp,
     /// };
     ///
@@ -958,19 +967,19 @@ impl ErasedUpdatePlan {
     /// let src = ErasedRawStridedRef::from_slice(&src_data, &[2], &[1], 0).unwrap();
     /// let mut dst = ErasedRawStridedMut::from_slice_mut(&mut dst_data, &[2], &[1], 0).unwrap();
     /// // dst = 2 * src + 3 * dst
-    /// plan.execute(&ExecContext::serial(), &mut dst, &src, 2.0, 3.0, UpdateOp::Identity)
+    /// plan.execute(&mut dst, &src, 2.0, 3.0, UpdateOp::Identity, Exec::serial())
     ///     .unwrap();
     /// drop(dst);
     /// assert_eq!(dst_data, [32.0, 64.0]);
     /// ```
     pub fn execute<T>(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
         alpha: T,
         beta: T,
         op: UpdateOp,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy
@@ -989,23 +998,23 @@ impl ErasedUpdatePlan {
         let dest_dims = dest.dims();
         let dest_strides = dest.strides();
         let dest_offset = dest.offset();
-        ctx.run(|| {
-            let dest_data = dest.data_as_mut::<T>()?;
-            let source = unsafe {
-                RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
-            };
-            let mut dest_ref = unsafe {
-                RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
-            };
-            match op {
-                UpdateOp::Identity => self
-                    .plan
-                    .execute(&mut dest_ref, &source, alpha, beta, |x| x),
-                UpdateOp::Conj => self
-                    .plan
-                    .execute(&mut dest_ref, &source, alpha, beta, |x| x.conj()),
+        let dest_data = dest.data_as_mut::<T>()?;
+        let source = unsafe {
+            RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+        };
+        let mut dest_ref = unsafe {
+            RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
+        };
+        match op {
+            UpdateOp::Identity => {
+                self.plan
+                    .execute(&mut dest_ref, &source, alpha, beta, |x| x, exec)
             }
-        })
+            UpdateOp::Conj => {
+                self.plan
+                    .execute(&mut dest_ref, &source, alpha, beta, |x| x.conj(), exec)
+            }
+        }
     }
 
     /// `dest = alpha * op(src)` into an uninitialized erased destination.
@@ -1024,7 +1033,7 @@ impl ErasedUpdatePlan {
     /// use core::mem::MaybeUninit;
     /// use strided_basic::{
     ///     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedUpdatePlan,
-    ///     ExecContext, KernelDType, UpdateOp,
+    ///     Exec, KernelDType, UpdateOp,
     /// };
     ///
     /// let plan = ErasedUpdatePlan::compile(KernelDType::F64, &[2], &[1], &[1]).unwrap();
@@ -1035,7 +1044,7 @@ impl ErasedUpdatePlan {
     /// let mut dst =
     ///     ErasedRawStridedUninitMut::from_uninit_slice(&mut dst_data, &[2], &[1], 0).unwrap();
     /// // dst = 2 * src
-    /// plan.execute_uninit(&ExecContext::serial(), &mut dst, &src_ptr, 2.0, UpdateOp::Identity)
+    /// plan.execute_uninit(&mut dst, &src_ptr, 2.0, UpdateOp::Identity, Exec::serial())
     ///     .unwrap();
     /// let values: Vec<f64> = dst_data.iter().map(|v| unsafe { v.assume_init() }).collect();
     /// assert_eq!(values, [2.0, 4.0]);
@@ -1048,11 +1057,11 @@ impl ErasedUpdatePlan {
     /// overlaps the destination allocation, all before any destination write.
     pub fn execute_uninit<T>(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         src: &ErasedRawStridedPtr<'_>,
         alpha: T,
         op: UpdateOp,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy
@@ -1072,41 +1081,31 @@ impl ErasedUpdatePlan {
         let dest_dims = dest.dims();
         let dest_strides = dest.strides();
         let dest_offset = dest.offset();
-        ctx.run(|| {
-            let dest_data = dest.data_as_uninit_mut::<T>()?;
-            let source = unsafe {
-                RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
-            };
-            let mut dest_ref = unsafe {
-                RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
-            };
-            match op {
-                UpdateOp::Identity => {
-                    self.plan
-                        .execute_uninit(&mut dest_ref, &source, alpha, |x| x)
-                }
-                UpdateOp::Conj => self
-                    .plan
-                    .execute_uninit(&mut dest_ref, &source, alpha, |x| x.conj()),
+        let dest_data = dest.data_as_uninit_mut::<T>()?;
+        let source = unsafe {
+            RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+        };
+        let mut dest_ref = unsafe {
+            RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
+        };
+        match op {
+            UpdateOp::Identity => {
+                self.plan
+                    .execute_uninit(&mut dest_ref, &source, alpha, |x| x, exec)
             }
-        })
+            UpdateOp::Conj => {
+                self.plan
+                    .execute_uninit(&mut dest_ref, &source, alpha, |x| x.conj(), exec)
+            }
+        }
     }
 }
 
-/// Whether a reduction context runs on the caller thread without entering
-/// the scheduler.
-fn reduce_context_is_serial(ctx: &ExecContext) -> bool {
-    ctx.is_serial()
-        || ctx
-            .max_threads_limit()
-            .is_some_and(|max_threads| max_threads.get() == 1)
-}
-
 fn execute_reduce_full<T, W, K>(
-    ctx: &ExecContext,
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
     traversal: &FullTraversal,
+    exec: Exec<'_>,
 ) -> Result<bool>
 where
     T: ErasedReduceScalar,
@@ -1120,16 +1119,7 @@ where
         unsafe { dest.write_at(dest.offset(), K::finish(K::identity())) };
         return Ok(false);
     }
-    let acc = if reduce_context_is_serial(ctx) {
-        // INVARIANT: (1) FullTraversal::compile checked every step/reset of
-        // the source layout; (2) the raw source descriptor validated every
-        // reachable offset; (3) execute checked exact plan-layout equality.
-        // SAFETY: the three-link invariant proves every traversal offset is
-        // readable.
-        unsafe { reduce_full_range::<T, K>(source.as_ptr(), src.offset(), traversal, 0..total)? }
-    } else {
-        ctx.run(|| reduce_full_policy::<T, K>(source, src.offset(), traversal))?
-    };
+    let acc = reduce_full_split::<T, K>(source, src.offset(), traversal, exec)?;
 
     if K::needs_ordered_fallback(&acc) {
         // The caller re-runs this layout with `K::Fallback`; the destination is
@@ -1141,60 +1131,55 @@ where
     Ok(false)
 }
 
-fn reduce_full_policy<T, K>(
+/// Full reduction of `source` over the traversal, split across the budget of
+/// `exec` above the repository threshold.
+///
+/// Splitting reassociates one output element's factors across ranges, so only
+/// a kernel that may be reassociated takes it (tenferro-rs#2150). A stable
+/// accumulator that detects an unrepresentable factor sets the fallback flag,
+/// and the caller then recomputes the whole output in source order.
+fn reduce_full_split<T, K>(
     source: &[T],
     source_base: isize,
     traversal: &FullTraversal,
+    exec: Exec<'_>,
 ) -> Result<K::Acc>
 where
     T: ErasedReduceScalar,
     K: ReduceKernel<T>,
 {
     let total = traversal.total();
-    #[cfg(feature = "parallel")]
-    {
-        // Splitting reassociates one output element's factors across worker
-        // ranges, so only a kernel that may be reassociated takes it
-        // (tenferro-rs#2150). A stable accumulator that detects an
-        // unrepresentable factor sets the fallback flag, and the caller then
-        // recomputes the whole output in source order.
-        let nthreads = if K::reassociable() {
-            crate::threading::parallel_threads_for_len(total)
-        } else {
-            1
+    // INVARIANT: (1) FullTraversal::compile checked every step/reset of the
+    // source layout; (2) the raw source descriptor validated every reachable
+    // offset; (3) execute checked exact plan-layout equality.
+    if !K::reassociable() {
+        // SAFETY: the three-link invariant proves every traversal offset is
+        // readable.
+        return unsafe {
+            reduce_full_range::<T, K>(source.as_ptr(), source_base, traversal, 0..total)
         };
-        if nthreads > 1 {
-            let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
-            return crate::threading::parallel_map_reduce(
-                0..total,
-                nthreads,
-                &|range| {
-                    // SAFETY: same three-link invariant as the serial call in
-                    // `execute_reduce_full`; each worker range is non-empty.
-                    unsafe {
-                        reduce_full_range::<T, K>(
-                            source_ptr.as_const(),
-                            source_base,
-                            traversal,
-                            range,
-                        )
-                    }
-                },
-                &|left, right| Ok(K::combine(left?, right?)),
-            );
-        }
     }
-    // SAFETY: same three-link invariant as the serial call in
-    // `execute_reduce_full`.
-    unsafe { reduce_full_range::<T, K>(source.as_ptr(), source_base, traversal, 0..total) }
+    let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
+    crate::threading::parallel_map_reduce(
+        0..total,
+        crate::threading::for_len(exec, total),
+        &|range| {
+            // SAFETY: same three-link invariant as above; each range is
+            // non-empty.
+            unsafe {
+                reduce_full_range::<T, K>(source_ptr.as_const(), source_base, traversal, range)
+            }
+        },
+        &|left, right| Ok(K::combine(left?, right?)),
+    )
 }
 
 fn dispatch_reduce<T, W>(
     op: ReduceOp,
     layout: &ReduceLayout,
-    ctx: &ExecContext,
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
@@ -1203,26 +1188,26 @@ where
     // The op is matched once per execution; every loop below is generic over
     // the selected kernel type.
     match op {
-        ReduceOp::Sum => dispatch_reduce_kernel::<T, W, SumKernel>(layout, ctx, dest, src),
+        ReduceOp::Sum => dispatch_reduce_kernel::<T, W, SumKernel>(layout, dest, src, exec),
         ReduceOp::Product => {
-            dispatch_reduce_kernel::<T, W, ReassociatedProductKernel>(layout, ctx, dest, src)
+            dispatch_reduce_kernel::<T, W, ReassociatedProductKernel>(layout, dest, src, exec)
         }
         ReduceOp::StableProduct => {
-            dispatch_reduce_kernel::<T, W, StableProductKernel>(layout, ctx, dest, src)
+            dispatch_reduce_kernel::<T, W, StableProductKernel>(layout, dest, src, exec)
         }
         ReduceOp::SumSquares => {
-            dispatch_reduce_kernel::<T, W, SumSquaresKernel>(layout, ctx, dest, src)
+            dispatch_reduce_kernel::<T, W, SumSquaresKernel>(layout, dest, src, exec)
         }
-        ReduceOp::Max => dispatch_reduce_kernel::<T, W, MaxKernel>(layout, ctx, dest, src),
-        ReduceOp::Min => dispatch_reduce_kernel::<T, W, MinKernel>(layout, ctx, dest, src),
+        ReduceOp::Max => dispatch_reduce_kernel::<T, W, MaxKernel>(layout, dest, src, exec),
+        ReduceOp::Min => dispatch_reduce_kernel::<T, W, MinKernel>(layout, dest, src, exec),
     }
 }
 
 fn dispatch_reduce_kernel<T, W, K>(
     layout: &ReduceLayout,
-    ctx: &ExecContext,
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
+    mut exec: Exec<'_>,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
@@ -1231,7 +1216,7 @@ where
 {
     let fallback = match layout {
         ReduceLayout::Full { traversal, .. } => {
-            execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)?
+            execute_reduce_full::<T, W, K>(dest, src, traversal, exec.reborrow())?
         }
         ReduceLayout::Axes {
             outer_axes,
@@ -1248,12 +1233,14 @@ where
                 reduce_total: *reduce_total,
             };
             match full {
-                Some(traversal) => execute_reduce_full::<T, W, K>(ctx, dest, src, traversal)?,
+                Some(traversal) => {
+                    execute_reduce_full::<T, W, K>(dest, src, traversal, exec.reborrow())?
+                }
                 None => {
                     // An axis reduction falls back per output inside
                     // `reduce_axes_range`; it never asks for a layout-wide
                     // recompute.
-                    execute_reduce_axes::<T, W, K>(ctx, dest, src, axes)?;
+                    execute_reduce_axes::<T, W, K>(dest, src, axes, exec.reborrow())?;
                     false
                 }
             }
@@ -1264,16 +1251,16 @@ where
         // recompute; `K::Fallback` must not itself request a fallback, so this
         // recurses at most once. Scalar kernels use `Fallback = Self` and never
         // set the flag, so the branch is unreachable for them.
-        return dispatch_reduce_kernel::<T, W, K::Fallback>(layout, ctx, dest, src);
+        return dispatch_reduce_kernel::<T, W, K::Fallback>(layout, dest, src, exec);
     }
     Ok(())
 }
 
 fn execute_reduce_axes<T, W, K>(
-    ctx: &ExecContext,
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
     layout: AxesLayout<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
@@ -1285,23 +1272,17 @@ where
     }
 
     if layout.reduce_total == 0 {
-        if ctx.is_serial() {
-            execute_reduce_axes_identity_serial::<T, W, K>(dest, layout)
-        } else {
-            ctx.run(|| execute_reduce_axes_identity_policy::<T, W, K>(dest, layout))
-        }
-    } else if reduce_context_is_serial(ctx) {
-        execute_reduce_axes_policy::<T, W, K>(dest, src, layout, false)
+        execute_reduce_axes_identity::<T, W, K>(dest, layout, exec)
     } else {
-        ctx.run(|| execute_reduce_axes_policy::<T, W, K>(dest, src, layout, true))
+        execute_reduce_axes_split::<T, W, K>(dest, src, layout, exec)
     }
 }
 
-fn execute_reduce_axes_policy<T, W, K>(
+fn execute_reduce_axes_split<T, W, K>(
     dest: &mut W,
     src: &ErasedRawStridedRef<'_>,
     layout: AxesLayout<'_>,
-    allow_parallel: bool,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
@@ -1313,40 +1294,37 @@ where
     let dest_base = dest.offset();
     // SAFETY: the validated reduction writer owns the destination allocation.
     let dest_ptr = unsafe { dest.ptr() };
-    #[cfg(feature = "parallel")]
-    if allow_parallel {
-        // The threshold counts source elements read (outputs times reduced
-        // elements), as documented in docs/design/erased-execution-policy.md,
-        // so a few thousand outputs with long reductions still split. Worker
-        // ranges partition the independent outputs; with the output block
-        // kernel this splits along the contiguous kept axis.
-        let work = layout.dest_total.saturating_mul(layout.reduce_total);
-        let nthreads = crate::threading::parallel_threads_for_len(work).min(layout.dest_total);
-        if nthreads > 1 {
-            let dest_ptr = crate::threading::SendPtr(dest_ptr);
-            let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
-            return crate::threading::parallel_map_reduce(
-                0..layout.dest_total,
-                nthreads,
-                &|range| {
-                    let parts = AxesRange {
-                        source: source_ptr.as_const(),
-                        source_base,
-                        dest: dest_ptr.as_ptr(),
-                        dest_base,
-                        outer_axes: layout.outer_axes,
-                        inner_axes: layout.inner_axes,
-                        reduce_total: layout.reduce_total,
-                    };
-                    // SAFETY: see `execute_reduce_axes_policy` serial call.
-                    unsafe { reduce_axes_range::<T, K>(parts, range) }
-                },
-                &|left, right| left.and(right),
-            );
-        }
+    // The threshold counts source elements read (outputs times reduced
+    // elements), as documented in docs/design/erased-execution-policy.md,
+    // so a few thousand outputs with long reductions still split. Ranges
+    // partition the independent outputs; with the output block kernel this
+    // splits along the contiguous kept axis.
+    let work = layout.dest_total.saturating_mul(layout.reduce_total);
+    let exec = crate::threading::for_len(exec, work).limit(
+        core::num::NonZeroUsize::new(layout.dest_total).unwrap_or(core::num::NonZeroUsize::MIN),
+    );
+    if !exec.is_serial() {
+        let dest_ptr = crate::threading::SendPtr(dest_ptr);
+        let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
+        return crate::threading::parallel_map_reduce(
+            0..layout.dest_total,
+            exec,
+            &|range| {
+                let parts = AxesRange {
+                    source: source_ptr.as_const(),
+                    source_base,
+                    dest: dest_ptr.as_ptr(),
+                    dest_base,
+                    outer_axes: layout.outer_axes,
+                    inner_axes: layout.inner_axes,
+                    reduce_total: layout.reduce_total,
+                };
+                // SAFETY: see `execute_reduce_axes_split` serial call.
+                unsafe { reduce_axes_range::<T, K>(parts, range) }
+            },
+            &|left, right| left.and(right),
+        );
     }
-    #[cfg(not(feature = "parallel"))]
-    let _ = allow_parallel;
 
     let parts = AxesRange {
         source: source_data.as_ptr(),
@@ -1388,26 +1366,27 @@ where
     }
     Ok(())
 }
-fn execute_reduce_axes_identity_policy<T, W, K>(dest: &mut W, layout: AxesLayout<'_>) -> Result<()>
+fn execute_reduce_axes_identity<T, W, K>(
+    dest: &mut W,
+    layout: AxesLayout<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
 where
     T: ErasedReduceScalar,
     W: ReduceWriter<T>,
     K: ReduceKernel<T>,
 {
-    #[cfg(feature = "parallel")]
-    {
-        let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
-        if nthreads > 1 {
-            return execute_reduce_axes_identity_parallel::<T, W, K>(dest, layout, nthreads);
-        }
+    let exec = crate::threading::for_len(exec, layout.dest_total);
+    if !exec.is_serial() {
+        return execute_reduce_axes_identity_parallel::<T, W, K>(dest, layout, exec);
     }
     execute_reduce_axes_identity_serial::<T, W, K>(dest, layout)
 }
-#[cfg(feature = "parallel")]
+
 fn execute_reduce_axes_identity_parallel<T, W, K>(
     dest: &mut W,
     layout: AxesLayout<'_>,
-    nthreads: usize,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: ErasedReduceScalar,
@@ -1419,7 +1398,7 @@ where
     let dest_offset_base = dest.offset();
     crate::threading::parallel_map_reduce(
         0..layout.dest_total,
-        nthreads,
+        exec,
         &|range| {
             let range_end = range.end;
             let mut outer =

@@ -131,7 +131,7 @@ fn test_sequential_contiguous_layout_small_array() {
     let s1 = [4isize, 1];
     let s2 = [4isize, 1];
     assert_eq!(
-        sequential_contiguous_layout(&dims, &[&s1, &s2]).unwrap(),
+        sequential_contiguous_layout(&dims, &[&s1, &s2], &Exec::serial()).unwrap(),
         Some(ContiguousLayout::RowMajor)
     );
 }
@@ -142,7 +142,7 @@ fn test_sequential_contiguous_layout_noncontiguous() {
     let s1 = [4isize, 1];
     let s2 = [8isize, 2];
     assert_eq!(
-        sequential_contiguous_layout(&dims, &[&s1, &s2]).unwrap(),
+        sequential_contiguous_layout(&dims, &[&s1, &s2], &Exec::serial()).unwrap(),
         None
     );
 }
@@ -152,7 +152,7 @@ fn test_sequential_contiguous_layout_col_major() {
     let dims = [3usize, 4];
     let col = [1isize, 3];
     assert_eq!(
-        sequential_contiguous_layout(&dims, &[&col]).unwrap(),
+        sequential_contiguous_layout(&dims, &[&col], &Exec::serial()).unwrap(),
         Some(ContiguousLayout::ColMajor)
     );
 }

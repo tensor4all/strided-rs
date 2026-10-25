@@ -18,14 +18,13 @@ use core::mem::MaybeUninit;
 use std::ops::Mul;
 use strided_view::{ElementOp, Identity};
 
-#[cfg(feature = "parallel")]
 use crate::fuse::compute_costs;
-#[cfg(feature = "parallel")]
-use crate::threading::{for_each_inner_block_with_offsets, mapreduce_threaded, MINTHREADLENGTH};
+use crate::threading::{
+    for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded, MINTHREADLENGTH,
+};
+use crate::Exec;
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
-
-const CONTIGUOUS_RANGE_MIN_LEN: usize = 1 << 15;
 
 /// Largest fused inner:row aspect at which the tiled transposed-scalar kernel
 /// is selected.
@@ -817,7 +816,6 @@ unsafe fn run_contiguous_mul_row_block<
     }
 }
 
-#[cfg(feature = "parallel")]
 fn strided_offset_for_contiguous_linear_index(
     dims: &[usize],
     strides: &[isize],
@@ -837,6 +835,7 @@ fn strided_offset_for_contiguous_linear_index(
     offset
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_contiguous_range_mul<
     O: MulOutput<D>,
     D: Copy + MaybeSendSync + 'static,
@@ -850,6 +849,7 @@ fn try_contiguous_range_mul<
     a_strides: &[isize],
     b_ptr: *const B,
     b_strides: &[isize],
+    exec: Exec<'_>,
 ) -> bool {
     // An overflowing element count falls back to the general path, which
     // reports it as `OffsetOverflow`.
@@ -859,7 +859,7 @@ fn try_contiguous_range_mul<
     if total == 0 {
         return true;
     }
-    if total <= CONTIGUOUS_RANGE_MIN_LEN {
+    if total <= MINTHREADLENGTH {
         return false;
     }
 
@@ -875,114 +875,90 @@ fn try_contiguous_range_mul<
     let block_len = inner_len.saturating_mul(row_len).max(1);
     let outer_groups = total.div_ceil(block_len);
 
-    #[cfg(feature = "parallel")]
-    {
-        let nthreads = crate::execution_policy::rayon_threads();
-        if nthreads > 1 {
-            use crate::threading::{parallel_for_each, SendPtr};
+    let nthreads = exec.budget().get();
+    if nthreads > 1 {
+        use crate::threading::{parallel_for_each, SendPtr};
 
-            let dst = SendPtr(dst_ptr);
-            let a = SendPtr(a_ptr as *mut A);
-            let b = SendPtr(b_ptr as *mut B);
+        let dst = SendPtr(dst_ptr);
+        let a = SendPtr(a_ptr as *mut A);
+        let b = SendPtr(b_ptr as *mut B);
 
-            if outer_groups < nthreads {
-                let chunk_len = total.div_ceil(nthreads);
-                let nchunks = total.div_ceil(chunk_len);
+        if outer_groups < nthreads {
+            let chunk_len = total.div_ceil(nthreads);
+            let nchunks = total.div_ceil(chunk_len);
 
-                parallel_for_each(0..nchunks, nthreads, &|chunks| {
-                    for chunk in chunks {
-                        let start = chunk * chunk_len;
-                        let end = (start + chunk_len).min(total);
-                        let mut index = start;
-
-                        while index < end {
-                            let in_inner = index % inner_len;
-                            let len = (inner_len - in_inner).min(end - index);
-                            let a_offset = strided_offset_for_contiguous_linear_index(
-                                dims,
-                                a_strides,
-                                &plan.axis_order,
-                                index,
-                            );
-                            let b_offset = strided_offset_for_contiguous_linear_index(
-                                dims,
-                                b_strides,
-                                &plan.axis_order,
-                                index,
-                            );
-
-                            unsafe {
-                                inner_loop_mul2::<O, D, A, B>(
-                                    dst.as_ptr().add(index),
-                                    1,
-                                    a.as_const().offset(a_offset),
-                                    plan.a_fast_stride,
-                                    b.as_const().offset(b_offset),
-                                    plan.b_fast_stride,
-                                    len,
-                                );
-                            }
-                            index += len;
-                        }
-                    }
-                });
-
-                return true;
-            }
-
-            let groups_per_chunk = outer_groups.div_ceil(nthreads);
-            let nchunks = outer_groups.div_ceil(groups_per_chunk);
-
-            parallel_for_each(0..nchunks, nthreads, &|chunks| {
+            parallel_for_each(0..nchunks, exec, &|chunks| {
                 for chunk in chunks {
-                    let group_start = chunk * groups_per_chunk;
-                    let group_end = (group_start + groups_per_chunk).min(outer_groups);
-                    let mut cursor = ContiguousMulOuterCursor::new(
-                        dims,
-                        a_strides,
-                        b_strides,
-                        &plan,
-                        group_start,
-                    );
+                    let start = chunk * chunk_len;
+                    let end = (start + chunk_len).min(total);
+                    let mut index = start;
 
-                    for group in group_start..group_end {
-                        let index = group * block_len;
+                    while index < end {
+                        let in_inner = index % inner_len;
+                        let len = (inner_len - in_inner).min(end - index);
+                        let a_offset = strided_offset_for_contiguous_linear_index(
+                            dims,
+                            a_strides,
+                            &plan.axis_order,
+                            index,
+                        );
+                        let b_offset = strided_offset_for_contiguous_linear_index(
+                            dims,
+                            b_strides,
+                            &plan.axis_order,
+                            index,
+                        );
+
                         unsafe {
-                            run_contiguous_mul_row_block::<O, D, A, B>(
-                                dst.as_ptr(),
-                                a.as_const(),
-                                b.as_const(),
-                                &plan,
-                                index,
-                                total,
-                                cursor.a_offset,
-                                cursor.b_offset,
+                            inner_loop_mul2::<O, D, A, B>(
+                                dst.as_ptr().add(index),
+                                1,
+                                a.as_const().offset(a_offset),
+                                plan.a_fast_stride,
+                                b.as_const().offset(b_offset),
+                                plan.b_fast_stride,
+                                len,
                             );
                         }
-                        cursor.advance();
+                        index += len;
                     }
                 }
             });
 
-            true
-        } else {
-            run_contiguous_range_mul_single_thread::<O, D, A, B>(
-                dst_ptr,
-                dims,
-                a_ptr,
-                a_strides,
-                b_ptr,
-                b_strides,
-                &plan,
-                total,
-                block_len,
-                outer_groups,
-            )
+            return true;
         }
-    }
 
-    #[cfg(not(feature = "parallel"))]
-    {
+        let groups_per_chunk = outer_groups.div_ceil(nthreads);
+        let nchunks = outer_groups.div_ceil(groups_per_chunk);
+
+        parallel_for_each(0..nchunks, exec, &|chunks| {
+            for chunk in chunks {
+                let group_start = chunk * groups_per_chunk;
+                let group_end = (group_start + groups_per_chunk).min(outer_groups);
+                let mut cursor =
+                    ContiguousMulOuterCursor::new(dims, a_strides, b_strides, &plan, group_start);
+
+                for group in group_start..group_end {
+                    let index = group * block_len;
+                    unsafe {
+                        run_contiguous_mul_row_block::<O, D, A, B>(
+                            dst.as_ptr(),
+                            a.as_const(),
+                            b.as_const(),
+                            &plan,
+                            index,
+                            total,
+                            cursor.a_offset,
+                            cursor.b_offset,
+                        );
+                    }
+                    cursor.advance();
+                }
+            }
+        });
+
+        true
+    } else {
         run_contiguous_range_mul_single_thread::<O, D, A, B>(
             dst_ptr,
             dims,
@@ -1154,6 +1130,7 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
     f: impl Fn(A) -> D + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     map_parts_into::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
@@ -1164,6 +1141,7 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
         src.strides(),
         f,
         &NoKernel,
+        exec,
     )
 }
 
@@ -1176,6 +1154,7 @@ pub(crate) fn map_into_validated<
     src: &StridedView<A, Op>,
     f: impl Fn(A) -> D + MaybeSync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
     map_parts_into_validated::<D, A, Op, NoKernel>(
@@ -1187,6 +1166,7 @@ pub(crate) fn map_into_validated<
         f,
         &NoKernel,
         validated,
+        exec,
     )
 }
 
@@ -1197,8 +1177,8 @@ pub(crate) fn map_into_validated<
 /// buffer when the two views share a contiguous layout and the operation runs sequentially, and
 /// one block at a time on the parallel path. It must write every element of the run or write
 /// nothing — returning `false` makes that run fall back to `scalar`, element by element. Runs whose
-/// strides are not both 1 never reach it. It is called from whichever threads this crate's
-/// execution policy selected, so it must be `Sync`.
+/// strides are not both 1 never reach it. It is called from whichever tasks the budget of
+/// `exec` selected, so it must be `Sync`.
 ///
 /// The point of the entry point is that a caller which owns vector kernels — a SIMD math library,
 /// say — reuses this crate's layout logic and this crate's threading decision instead of
@@ -1208,7 +1188,7 @@ pub(crate) fn map_into_validated<
 /// # Examples
 /// ```
 /// use std::mem::MaybeUninit;
-/// use strided_basic::{map_into_uninit_with_kernel, StridedView, StridedViewMut};
+/// use strided_basic::{map_into_uninit_with_kernel, Exec, StridedView, StridedViewMut};
 ///
 /// let src = vec![1.0f64, 2.0, 3.0];
 /// let mut out = vec![MaybeUninit::<f64>::uninit(); 3];
@@ -1220,7 +1200,7 @@ pub(crate) fn map_into_validated<
 ///     }
 ///     true
 /// };
-/// map_into_uninit_with_kernel(&mut dest, &source, kernel, |x| x * 2.0).unwrap();
+/// map_into_uninit_with_kernel(&mut dest, &source, kernel, |x| x * 2.0, Exec::serial()).unwrap();
 /// // SAFETY: the kernel wrote every element.
 /// let values: Vec<f64> = out.into_iter().map(|x| unsafe { x.assume_init() }).collect();
 /// assert_eq!(values, [2.0, 4.0, 6.0]);
@@ -1235,6 +1215,7 @@ pub fn map_into_uninit_with_kernel<T: Copy + MaybeSendSync>(
     src: &StridedView<T>,
     kernel: impl Fn(&[T], &mut [MaybeUninit<T>]) -> bool + Sync,
     scalar: impl Fn(T) -> T + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     map_parts_into::<MaybeUninit<T>, T, Identity, _>(
         dest.as_mut_ptr(),
@@ -1245,6 +1226,7 @@ pub fn map_into_uninit_with_kernel<T: Copy + MaybeSendSync>(
         src.strides(),
         |value| MaybeUninit::new(scalar(value)),
         &SliceKernel(kernel),
+        exec,
     )
 }
 
@@ -1258,6 +1240,7 @@ pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op:
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
     f: impl Fn(A) -> D + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     map_parts_into::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
@@ -1268,6 +1251,7 @@ pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op:
         src.strides(),
         f,
         &NoKernel,
+        exec,
     )
 }
 
@@ -1280,6 +1264,7 @@ pub(crate) fn map_raw_into_validated<
     src: &crate::RawStridedRef<'_, A>,
     f: impl Fn(A) -> D + MaybeSync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
     map_parts_into_validated::<D, A, Op, NoKernel>(
@@ -1291,6 +1276,7 @@ pub(crate) fn map_raw_into_validated<
         f,
         &NoKernel,
         validated,
+        exec,
     )
 }
 
@@ -1309,6 +1295,7 @@ fn map_parts_into<
     src_strides: &[isize],
     f: impl Fn(A) -> D + MaybeSync,
     kernel: &K,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, src_dims)?;
     let validated = validate_destination_layout(dst_dims, dst_strides)?;
@@ -1321,6 +1308,7 @@ fn map_parts_into<
         f,
         kernel,
         validated,
+        exec,
     )
 }
 
@@ -1344,6 +1332,7 @@ fn map_contiguous<D: Copy, A: Copy, Op: ElementOp<A>>(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_parts_into_validated<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
@@ -1358,8 +1347,9 @@ fn map_parts_into_validated<
     f: impl Fn(A) -> D + MaybeSync,
     kernel: &K,
     _validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
         let len = total_len(dst_dims)?;
         // SAFETY: the contiguous-layout check proves that `dst` and `src` address `len` elements in
         // the same order starting at their base pointer, so each is exactly a flat run of `len`
@@ -1384,47 +1374,41 @@ fn map_parts_into_validated<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            use crate::threading::SendPtr;
-            let dst_send = SendPtr(dst_ptr);
-            let src_send = SendPtr(src_ptr as *mut A);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        use crate::threading::SendPtr;
+        let dst_send = SendPtr(dst_ptr);
+        let src_send = SendPtr(src_ptr as *mut A);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
-                            let sp = unsafe { src_send.as_const().offset(offsets[1]) };
-                            unsafe {
-                                inner_loop_map1::<D, A, Op, K>(
-                                    dp, strides[0], sp, strides[1], len, &f, kernel,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                        let sp = unsafe { src_send.as_const().offset(offsets[1]) };
+                        unsafe {
+                            inner_loop_map1::<D, A, Op, K>(
+                                dp, strides[0], sp, strides[1], len, &f, kernel,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -1460,6 +1444,7 @@ pub fn zip_map2_into<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
     f: impl Fn(A, B) -> D + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     zip_map2_parts_into::<D, A, B, OpA, OpB>(
         dest.as_mut_ptr(),
@@ -1472,6 +1457,7 @@ pub fn zip_map2_into<
         b.dims(),
         b.strides(),
         f,
+        exec,
     )
 }
 
@@ -1487,6 +1473,7 @@ pub(crate) fn zip_map2_into_validated<
     b: &StridedView<B, OpB>,
     f: impl Fn(A, B) -> D + MaybeSync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     zip_map2_parts_into_validated::<D, A, B, OpA, OpB>(
         dest.as_mut_ptr(),
@@ -1498,6 +1485,7 @@ pub(crate) fn zip_map2_into_validated<
         b.strides(),
         f,
         validated,
+        exec,
     )
 }
 
@@ -1527,6 +1515,7 @@ pub fn compare_into<T, OpA, OpB>(
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
     op: CompareOp,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: Copy + MaybeSendSync + PartialOrd,
@@ -1534,11 +1523,11 @@ where
     OpB: ElementOp<T>,
 {
     match op {
-        CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| lhs == rhs),
-        CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| lhs < rhs),
-        CompareOp::Le => zip_map2_into(dest, a, b, |lhs, rhs| lhs <= rhs),
-        CompareOp::Gt => zip_map2_into(dest, a, b, |lhs, rhs| lhs > rhs),
-        CompareOp::Ge => zip_map2_into(dest, a, b, |lhs, rhs| lhs >= rhs),
+        CompareOp::Eq => zip_map2_into(dest, a, b, |lhs, rhs| lhs == rhs, exec),
+        CompareOp::Lt => zip_map2_into(dest, a, b, |lhs, rhs| lhs < rhs, exec),
+        CompareOp::Le => zip_map2_into(dest, a, b, |lhs, rhs| lhs <= rhs, exec),
+        CompareOp::Gt => zip_map2_into(dest, a, b, |lhs, rhs| lhs > rhs, exec),
+        CompareOp::Ge => zip_map2_into(dest, a, b, |lhs, rhs| lhs >= rhs, exec),
     }
 }
 
@@ -1565,6 +1554,7 @@ pub fn compare_into_uninit<T, OpA, OpB>(
     a: &StridedView<T, OpA>,
     b: &StridedView<T, OpB>,
     op: CompareOp,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
     T: Copy + MaybeSendSync + PartialOrd,
@@ -1583,6 +1573,7 @@ where
             b,
             |lhs, rhs| MaybeUninit::new(lhs == rhs),
             validated,
+            exec,
         ),
         CompareOp::Lt => zip_map2_into_validated(
             dest,
@@ -1590,6 +1581,7 @@ where
             b,
             |lhs, rhs| MaybeUninit::new(lhs < rhs),
             validated,
+            exec,
         ),
         CompareOp::Le => zip_map2_into_validated(
             dest,
@@ -1597,6 +1589,7 @@ where
             b,
             |lhs, rhs| MaybeUninit::new(lhs <= rhs),
             validated,
+            exec,
         ),
         CompareOp::Gt => zip_map2_into_validated(
             dest,
@@ -1604,6 +1597,7 @@ where
             b,
             |lhs, rhs| MaybeUninit::new(lhs > rhs),
             validated,
+            exec,
         ),
         CompareOp::Ge => zip_map2_into_validated(
             dest,
@@ -1611,6 +1605,7 @@ where
             b,
             |lhs, rhs| MaybeUninit::new(lhs >= rhs),
             validated,
+            exec,
         ),
     }
 }
@@ -1627,6 +1622,7 @@ pub(crate) fn zip_map2_raw_into_validated<
     b: &crate::RawStridedRef<'_, B>,
     f: impl Fn(A, B) -> D + MaybeSync,
     validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -1640,6 +1636,7 @@ pub(crate) fn zip_map2_raw_into_validated<
         b.strides(),
         f,
         validated,
+        exec,
     )
 }
 
@@ -1661,6 +1658,7 @@ fn zip_map2_parts_into<
     b_dims: &[usize],
     b_strides: &[isize],
     f: impl Fn(A, B) -> D + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, a_dims)?;
     ensure_same_shape(dst_dims, b_dims)?;
@@ -1675,6 +1673,7 @@ fn zip_map2_parts_into<
         b_strides,
         f,
         validated,
+        exec,
     )
 }
 
@@ -1695,8 +1694,11 @@ fn zip_map2_parts_into_validated<
     b_strides: &[isize],
     f: impl Fn(A, B) -> D + MaybeSync,
     _validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
+        .is_some()
+    {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
@@ -1722,49 +1724,43 @@ fn zip_map2_parts_into_validated<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            use crate::threading::SendPtr;
-            let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut A);
-            let b_send = SendPtr(b_ptr as *mut B);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        use crate::threading::SendPtr;
+        let dst_send = SendPtr(dst_ptr);
+        let a_send = SendPtr(a_ptr as *mut A);
+        let b_send = SendPtr(b_ptr as *mut B);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
-                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
-                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
-                            unsafe {
-                                inner_loop_map2::<D, A, B, OpA, OpB>(
-                                    dp, strides[0], ap, strides[1], bp, strides[2], len, &f,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                        let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                        let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                        unsafe {
+                            inner_loop_map2::<D, A, B, OpA, OpB>(
+                                dp, strides[0], ap, strides[1], bp, strides[2], len, &f,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -1788,6 +1784,7 @@ fn zip_map2_parts_into_validated<
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mul_identity_into_raw<
     O: MulOutput<D>,
     D: Copy + MaybeSendSync + 'static,
@@ -1802,11 +1799,14 @@ fn mul_identity_into_raw<
     b_ptr: *const B,
     b_strides: &[isize],
     _validated: ValidatedDestinationLayout,
+    mut exec: Exec<'_>,
 ) -> Result<()> {
     debug_assert_eq!(dst_dims.len(), a_strides.len());
     debug_assert_eq!(dst_dims.len(), b_strides.len());
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides])?.is_some() {
+    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
+        .is_some()
+    {
         let len = total_len(dst_dims)?;
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
@@ -1833,6 +1833,7 @@ fn mul_identity_into_raw<
         a_strides,
         b_ptr,
         b_strides,
+        exec.reborrow(),
     ) {
         return Ok(());
     }
@@ -1843,49 +1844,43 @@ fn mul_identity_into_raw<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            use crate::threading::SendPtr;
-            let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut A);
-            let b_send = SendPtr(b_ptr as *mut B);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        use crate::threading::SendPtr;
+        let dst_send = SendPtr(dst_ptr);
+        let a_send = SendPtr(a_ptr as *mut A);
+        let b_send = SendPtr(b_ptr as *mut B);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
-                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
-                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
-                            unsafe {
-                                inner_loop_mul2::<O, D, A, B>(
-                                    dp, strides[0], ap, strides[1], bp, strides[2], len,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                        let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                        let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                        unsafe {
+                            inner_loop_mul2::<O, D, A, B>(
+                                dp, strides[0], ap, strides[1], bp, strides[2], len,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -1921,6 +1916,7 @@ pub fn mul_into<
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -1936,10 +1932,11 @@ pub fn mul_into<
             b.ptr(),
             b.strides(),
             validated,
+            exec,
         );
     }
 
-    zip_map2_into_validated(dest, a, b, multiply_value, validated)
+    zip_map2_into_validated(dest, a, b, multiply_value, validated, exec)
 }
 
 /// Multiply two views into a fully overwritten uninitialized output.
@@ -1970,6 +1967,7 @@ pub fn mul_into_uninit<
     dest: &mut StridedViewMut<MaybeUninit<D>>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -1987,6 +1985,7 @@ pub fn mul_into_uninit<
             b.ptr(),
             b.strides(),
             validated,
+            exec,
         );
     }
 
@@ -1996,6 +1995,7 @@ pub fn mul_into_uninit<
         b,
         |lhs, rhs| MaybeUninit::new(multiply_value(lhs, rhs)),
         validated,
+        exec,
     )
 }
 
@@ -2073,6 +2073,7 @@ pub fn broadcast_mul_into<
     a_axes: &[usize],
     b: &StridedView<B, OpB>,
     b_axes: &[usize],
+    exec: Exec<'_>,
 ) -> Result<()> {
     let validated = validate_destination_layout(dest.dims(), dest.strides())?;
     let a_strides = broadcast_strides_for_axes(a.dims(), a.strides(), dest.dims(), a_axes)?;
@@ -2088,12 +2089,13 @@ pub fn broadcast_mul_into<
             b.ptr(),
             &b_strides,
             validated,
+            exec,
         );
     }
 
     let a = broadcast_view_with_strides(a, dest.dims(), &a_strides);
     let b = broadcast_view_with_strides(b, dest.dims(), &b_strides);
-    zip_map2_into_validated(dest, &a, &b, multiply_value, validated)
+    zip_map2_into_validated(dest, &a, &b, multiply_value, validated, exec)
 }
 
 /// Broadcast and multiply into a fully overwritten uninitialized output.
@@ -2126,6 +2128,7 @@ pub fn broadcast_mul_into_uninit<
     a_axes: &[usize],
     b: &StridedView<B, OpB>,
     b_axes: &[usize],
+    exec: Exec<'_>,
 ) -> Result<()> {
     let validated = validate_destination_layout(dest.dims(), dest.strides())?;
     let a_strides = broadcast_strides_for_axes(a.dims(), a.strides(), dest.dims(), a_axes)?;
@@ -2143,6 +2146,7 @@ pub fn broadcast_mul_into_uninit<
             b.ptr(),
             &b_strides,
             validated,
+            exec,
         );
     }
 
@@ -2154,6 +2158,7 @@ pub fn broadcast_mul_into_uninit<
         &b,
         |lhs, rhs| MaybeUninit::new(multiply_value(lhs, rhs)),
         validated,
+        exec,
     )
 }
 
@@ -2172,12 +2177,13 @@ pub fn zip_map3_into<
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
     f: impl Fn(A, B, C) -> D + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
     let validated = validate_destination_layout(dest.dims(), dest.strides())?;
-    zip_map3_into_validated(dest, a, b, c, f, validated)
+    zip_map3_into_validated(dest, a, b, c, f, validated, exec)
 }
 
 pub(crate) fn zip_map3_into_validated<
@@ -2195,6 +2201,7 @@ pub(crate) fn zip_map3_into_validated<
     c: &StridedView<C, OpC>,
     f: impl Fn(A, B, C) -> D + MaybeSync,
     _validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -2210,6 +2217,7 @@ pub(crate) fn zip_map3_into_validated<
     if sequential_contiguous_layout(
         dst_dims,
         &[dst_strides, a.strides(), b.strides(), c.strides()],
+        &exec,
     )?
     .is_some()
     {
@@ -2240,52 +2248,46 @@ pub(crate) fn zip_map3_into_validated<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            use crate::threading::SendPtr;
-            let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut A);
-            let b_send = SendPtr(b_ptr as *mut B);
-            let c_send = SendPtr(c_ptr as *mut C);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        use crate::threading::SendPtr;
+        let dst_send = SendPtr(dst_ptr);
+        let a_send = SendPtr(a_ptr as *mut A);
+        let b_send = SendPtr(b_ptr as *mut B);
+        let c_send = SendPtr(c_ptr as *mut C);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
-                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
-                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
-                            let cp = unsafe { c_send.as_const().offset(offsets[3]) };
-                            unsafe {
-                                inner_loop_map3::<D, A, B, C, OpA, OpB, OpC>(
-                                    dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
-                                    len, &f,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                        let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                        let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                        let cp = unsafe { c_send.as_const().offset(offsets[3]) };
+                        unsafe {
+                            inner_loop_map3::<D, A, B, C, OpA, OpB, OpC>(
+                                dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
+                                len, &f,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -2328,15 +2330,17 @@ pub fn zip_map4_into<
     c: &StridedView<C, OpC>,
     e: &StridedView<E, OpE>,
     f: impl Fn(A, B, C, E) -> D + MaybeSync,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
     ensure_same_shape(dest.dims(), c.dims())?;
     ensure_same_shape(dest.dims(), e.dims())?;
     let validated = validate_destination_layout(dest.dims(), dest.strides())?;
-    zip_map4_into_validated(dest, a, b, c, e, f, validated)
+    zip_map4_into_validated(dest, a, b, c, e, f, validated, exec)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn zip_map4_into_validated<
     D: Copy + MaybeSendSync,
     A: Copy + MaybeSendSync,
@@ -2355,6 +2359,7 @@ pub(crate) fn zip_map4_into_validated<
     e: &StridedView<E, OpE>,
     f: impl Fn(A, B, C, E) -> D + MaybeSync,
     _validated: ValidatedDestinationLayout,
+    exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
@@ -2378,6 +2383,7 @@ pub(crate) fn zip_map4_into_validated<
             c.strides(),
             e.strides(),
         ],
+        &exec,
     )?
     .is_some()
     {
@@ -2421,54 +2427,48 @@ pub(crate) fn zip_map4_into_validated<
         build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
     };
 
-    #[cfg(feature = "parallel")]
-    {
-        let total = total_len(&fused_dims)?;
-        let nthreads = crate::execution_policy::rayon_threads();
-        if total > MINTHREADLENGTH && nthreads > 1 {
-            use crate::threading::SendPtr;
-            let dst_send = SendPtr(dst_ptr);
-            let a_send = SendPtr(a_ptr as *mut A);
-            let b_send = SendPtr(b_ptr as *mut B);
-            let c_send = SendPtr(c_ptr as *mut C);
-            let e_send = SendPtr(e_ptr as *mut E);
+    let total = total_len(&fused_dims)?;
+    if is_parallel(total, &exec) {
+        use crate::threading::SendPtr;
+        let dst_send = SendPtr(dst_ptr);
+        let a_send = SendPtr(a_ptr as *mut A);
+        let b_send = SendPtr(b_ptr as *mut B);
+        let c_send = SendPtr(c_ptr as *mut C);
+        let e_send = SendPtr(e_ptr as *mut E);
 
-            let costs = compute_costs(&ordered_strides);
-            let initial_offsets: crate::inline::OperandVec<isize> =
-                strides_list.iter().map(|_| 0isize).collect();
-            return mapreduce_threaded(
-                &fused_dims,
-                &plan.block,
-                &ordered_strides,
-                &initial_offsets,
-                &costs,
-                nthreads,
-                0,
-                1,
-                &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
-                        dims,
-                        blocks,
-                        strides_list,
-                        offsets,
-                        |offsets, len, strides| {
-                            let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
-                            let ap = unsafe { a_send.as_const().offset(offsets[1]) };
-                            let bp = unsafe { b_send.as_const().offset(offsets[2]) };
-                            let cp = unsafe { c_send.as_const().offset(offsets[3]) };
-                            let ep = unsafe { e_send.as_const().offset(offsets[4]) };
-                            unsafe {
-                                inner_loop_map4::<D, A, B, C, E, OpA, OpB, OpC, OpE>(
-                                    dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3],
-                                    ep, strides[4], len, &f,
-                                )
-                            };
-                            Ok(())
-                        },
-                    )
-                },
-            );
-        }
+        let costs = compute_costs(&ordered_strides);
+        let initial_offsets: crate::inline::OperandVec<isize> =
+            strides_list.iter().map(|_| 0isize).collect();
+        return mapreduce_threaded(
+            &fused_dims,
+            &plan.block,
+            &ordered_strides,
+            &initial_offsets,
+            &costs,
+            exec,
+            &|dims, blocks, strides_list, offsets| {
+                for_each_inner_block_with_offsets(
+                    dims,
+                    blocks,
+                    strides_list,
+                    offsets,
+                    |offsets, len, strides| {
+                        let dp = unsafe { dst_send.as_ptr().offset(offsets[0]) };
+                        let ap = unsafe { a_send.as_const().offset(offsets[1]) };
+                        let bp = unsafe { b_send.as_const().offset(offsets[2]) };
+                        let cp = unsafe { c_send.as_const().offset(offsets[3]) };
+                        let ep = unsafe { e_send.as_const().offset(offsets[4]) };
+                        unsafe {
+                            inner_loop_map4::<D, A, B, C, E, OpA, OpB, OpC, OpE>(
+                                dp, strides[0], ap, strides[1], bp, strides[2], cp, strides[3], ep,
+                                strides[4], len, &f,
+                            )
+                        };
+                        Ok(())
+                    },
+                )
+            },
+        );
     }
 
     let initial_offsets: crate::inline::OperandVec<isize> =
@@ -2499,6 +2499,6 @@ pub(crate) fn zip_map4_into_validated<
 #[path = "map_view/tests/scalar_branch_tests.rs"]
 mod scalar_branch_tests;
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 #[path = "map_view/tests/tests.rs"]
 mod tests;

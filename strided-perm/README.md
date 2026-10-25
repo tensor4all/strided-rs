@@ -6,9 +6,11 @@ Cache-efficient tensor permutation / transpose, inspired by
 ## Usage
 
 Copy from any `strided-view` source view into a mutable destination view with
-the same shape:
+the same shape. The last argument is a [`strided_exec::Exec`] placement token:
+the copy splits within that budget and never starts work of its own.
 
 ```rust
+use strided_exec::Exec;
 use strided_perm::copy_into;
 use strided_view::StridedArray;
 
@@ -18,32 +20,40 @@ let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| {
 let transposed = src.view().permute(&[1, 0]).unwrap();
 
 let mut dst = StridedArray::<f64>::col_major(transposed.dims());
-copy_into(&mut dst.view_mut(), &transposed).unwrap();
+copy_into(&mut dst.view_mut(), &transposed, Exec::serial()).unwrap();
 ```
 
 Use `copy_into_col_major` when the destination is known to be column-major and
 you want to make that layout contract explicit.
 
-`copy_into_uninit` (and `copy_into_uninit_par`) takes a `StridedViewMut<MaybeUninit<T>>`
+`copy_into_uninit` takes a `StridedViewMut<MaybeUninit<T>>`
 destination over fresh storage. It runs the same engine, selected on `T` rather than on
 `MaybeUninit<T>`, so the native `f32`/`f64` kernels still apply; every element the views
 describe is written exactly once, through raw pointers only.
 
-## Parallel Feature
+## Threading
 
-Enable the `parallel` feature to use Rayon-backed copy entry points:
+`Exec::serial()` runs the copy on the calling thread. A token minted from a
+`strided_exec::Pool` with `Exec::new(&pool, budget)` splits the permutation
+across `budget` tasks of that pool. The crate uses exactly the budget it is
+given: callers that want small copies to stay on one thread pass a serial token
+or narrow the token with `Exec::limit`. Without the `parallel` feature every
+token runs inline.
 
 ```toml
 [dependencies]
-strided-perm = { version = "0.4", features = ["parallel"] }
+strided-perm = { version = "0.7", features = ["parallel"] }
 ```
 
 ```rust
-# use strided_perm::copy_into_par;
-# use strided_view::StridedArray;
-# let src = StridedArray::<f64>::col_major(&[2, 3]);
-# let mut dst = StridedArray::<f64>::col_major(&[2, 3]);
-copy_into_par(&mut dst.view_mut(), &src.view()).unwrap();
+use strided_exec::{Exec, Pool};
+use strided_perm::copy_into;
+use strided_view::StridedArray;
+
+let pool = Pool::builder().threads(2).build().unwrap();
+let src = StridedArray::<f64>::col_major(&[2, 3]);
+let mut dst = StridedArray::<f64>::col_major(&[2, 3]);
+copy_into(&mut dst.view_mut(), &src.view(), Exec::new(&pool, 2).unwrap()).unwrap();
 ```
 
 Benchmarks live in

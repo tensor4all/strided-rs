@@ -1,6 +1,6 @@
 use super::*;
 use crate::ops_view::copy_scale;
-use crate::{StridedView, StridedViewMut};
+use crate::{Exec, StridedView, StridedViewMut};
 
 fn reference_copy_scale(
     dst: &mut [f64],
@@ -12,7 +12,7 @@ fn reference_copy_scale(
 ) {
     let mut dest_view = StridedViewMut::new(dst, dims, dst_strides, 0).unwrap();
     let src_view: StridedView<'_, f64> = StridedView::new(src, dims, src_strides, 0).unwrap();
-    copy_scale(&mut dest_view, &src_view, scale).unwrap();
+    copy_scale(&mut dest_view, &src_view, scale, Exec::serial()).unwrap();
 }
 
 #[test]

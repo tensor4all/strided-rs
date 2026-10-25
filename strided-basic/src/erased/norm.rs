@@ -216,7 +216,7 @@ impl NormSpec {
 ///
 /// ```
 /// use strided_basic::{
-///     ErasedNormPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType,
+///     Exec, ErasedNormPlan, ErasedRawStridedMut, ErasedRawStridedRef, KernelDType,
 ///     NormSpec,
 /// };
 ///
@@ -230,7 +230,7 @@ impl NormSpec {
 /// let x = ErasedRawStridedRef::from_slice(&x, &[2, 2], &[1, 2], 0).unwrap();
 /// let w = ErasedRawStridedRef::from_slice(&weight, &[2], &[1], 0).unwrap();
 /// let mut out = ErasedRawStridedMut::from_slice_mut(&mut y, &[2, 2], &[1, 2], 0).unwrap();
-/// plan.execute(&ExecContext::serial(), &mut out, &x, Some(&w), None).unwrap();
+/// plan.execute(&mut out, &x, Some(&w), None, Exec::serial()).unwrap();
 /// assert_eq!(y, [-2.0, 2.0, -2.0, 2.0]);
 /// ```
 #[derive(Clone, Debug)]
@@ -403,7 +403,7 @@ impl ErasedNormPlan {
     ///
     /// ```
     /// use strided_basic::{
-    ///     ErasedNormPlan, ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, KernelDType,
+    ///     Exec, ErasedNormPlan, ErasedRawStridedMut, ErasedRawStridedRef, KernelDType,
     ///     NormSpec,
     /// };
     /// let x = [3.0_f32, 4.0, 0.0, 0.0];
@@ -415,7 +415,7 @@ impl ErasedNormPlan {
     /// let x = ErasedRawStridedRef::from_slice(&x, &[2, 2], &[1, 2], 0).unwrap();
     /// let b = ErasedRawStridedRef::from_slice(&bias, &[2], &[1], 0).unwrap();
     /// let mut out = ErasedRawStridedMut::from_slice_mut(&mut y, &[2, 2], &[1, 2], 0).unwrap();
-    /// plan.execute(&ExecContext::serial(), &mut out, &x, None, Some(&b)).unwrap();
+    /// plan.execute(&mut out, &x, None, Some(&b), Exec::serial()).unwrap();
     /// // Row 0: rms = sqrt(12.5); the all-zero row 1 is 0 * inf = NaN with eps = 0.
     /// assert!((y[0] - (1.0 + 3.0 / 12.5f32.sqrt())).abs() < 1e-6);
     /// assert!(y[2].is_nan() && y[3].is_nan());
@@ -427,11 +427,11 @@ impl ErasedNormPlan {
     /// not match the plan, before any destination write.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         src: &ErasedRawStridedRef<'_>,
         weight: Option<&ErasedRawStridedRef<'_>>,
         bias: Option<&ErasedRawStridedRef<'_>>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -439,11 +439,11 @@ impl ErasedNormPlan {
         match self.dtype {
             KernelDType::F32 => {
                 let mut writer = reduce_writer::<f32>(dest)?;
-                self.dispatch::<f32, _>(ctx, &mut writer, src, weight, bias)
+                self.dispatch::<f32, _>(&mut writer, src, weight, bias, exec)
             }
             _ => {
                 let mut writer = reduce_writer::<f64>(dest)?;
-                self.dispatch::<f64, _>(ctx, &mut writer, src, weight, bias)
+                self.dispatch::<f64, _>(&mut writer, src, weight, bias, exec)
             }
         }
     }
@@ -459,8 +459,8 @@ impl ErasedNormPlan {
     /// ```
     /// use core::mem::MaybeUninit;
     /// use strided_basic::{
-    ///     ErasedNormPlan, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
-    ///     ExecContext, KernelDType, NormSpec,
+    ///     Exec, ErasedNormPlan, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
+    ///     KernelDType, NormSpec,
     /// };
     /// let x = [1.0_f64, 1.0, 1.0];
     /// let mut y = [MaybeUninit::<f64>::uninit(); 3];
@@ -471,7 +471,7 @@ impl ErasedNormPlan {
     /// let x = ErasedRawStridedRef::from_slice(&x, &[3], &[1], 0).unwrap();
     /// let x = ErasedRawStridedPtr::from_ref(&x);
     /// let mut out = ErasedRawStridedUninitMut::from_uninit_slice(&mut y, &[3], &[1], 0).unwrap();
-    /// plan.execute_uninit(&ExecContext::serial(), &mut out, &x, None, None).unwrap();
+    /// plan.execute_uninit(&mut out, &x, None, None, Exec::serial()).unwrap();
     /// // Zero variance with eps > 0 normalizes to exactly zero.
     /// assert!(y.iter().all(|v| unsafe { v.assume_init() } == 0.0));
     /// ```
@@ -482,11 +482,11 @@ impl ErasedNormPlan {
     /// (source), `1` (weight) or `2` (bias).
     pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedUninitMut<'_>,
         src: &ErasedRawStridedPtr<'_>,
         weight: Option<&ErasedRawStridedPtr<'_>>,
         bias: Option<&ErasedRawStridedPtr<'_>>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, src.dtype())?;
@@ -516,22 +516,22 @@ impl ErasedNormPlan {
         match self.dtype {
             KernelDType::F32 => {
                 let mut writer = reduce_uninit_writer::<f32>(dest)?;
-                self.dispatch::<f32, _>(ctx, &mut writer, &src, weight.as_ref(), bias.as_ref())
+                self.dispatch::<f32, _>(&mut writer, &src, weight.as_ref(), bias.as_ref(), exec)
             }
             _ => {
                 let mut writer = reduce_uninit_writer::<f64>(dest)?;
-                self.dispatch::<f64, _>(ctx, &mut writer, &src, weight.as_ref(), bias.as_ref())
+                self.dispatch::<f64, _>(&mut writer, &src, weight.as_ref(), bias.as_ref(), exec)
             }
         }
     }
 
     fn dispatch<T, W>(
         &self,
-        ctx: &ExecContext,
         dest: &mut W,
         src: &ErasedRawStridedRef<'_>,
         weight: Option<&ErasedRawStridedRef<'_>>,
         bias: Option<&ErasedRawStridedRef<'_>>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: NormScalar,
@@ -547,11 +547,11 @@ impl ErasedNormPlan {
             ($layer:literal) => {
                 match (weight.is_some(), bias.is_some()) {
                     (false, false) => {
-                        self.run::<T, W, $layer, false, false>(ctx, dest, src, affine)
+                        self.run::<T, W, $layer, false, false>(dest, src, affine, exec)
                     }
-                    (true, false) => self.run::<T, W, $layer, true, false>(ctx, dest, src, affine),
-                    (false, true) => self.run::<T, W, $layer, false, true>(ctx, dest, src, affine),
-                    (true, true) => self.run::<T, W, $layer, true, true>(ctx, dest, src, affine),
+                    (true, false) => self.run::<T, W, $layer, true, false>(dest, src, affine, exec),
+                    (false, true) => self.run::<T, W, $layer, false, true>(dest, src, affine, exec),
+                    (true, true) => self.run::<T, W, $layer, true, true>(dest, src, affine, exec),
                 }
             };
         }
@@ -563,10 +563,10 @@ impl ErasedNormPlan {
 
     fn run<T, W, const LAYER: bool, const WEIGHT: bool, const BIAS: bool>(
         &self,
-        ctx: &ExecContext,
         dest: &mut W,
         src: &ErasedRawStridedRef<'_>,
         affine: Affine<T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: NormScalar,
@@ -595,7 +595,7 @@ impl ErasedNormPlan {
         // exact plan-layout equality for all four descriptors. Units cover
         // disjoint lines, so their destination writes are disjoint.
         // SAFETY: the three-link invariant above.
-        unsafe { for_each_unit(ctx, layout, src.offset(), dest.offset(), kernel) }
+        unsafe { for_each_unit(layout, src.offset(), dest.offset(), kernel, exec) }
     }
 }
 

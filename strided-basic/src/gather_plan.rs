@@ -11,7 +11,7 @@ use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWr
 use crate::inline::InlineVec;
 use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
 use crate::{
-    MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
+    Exec, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
 };
 
 type AxisVec<T> = InlineVec<T>;
@@ -167,50 +167,6 @@ impl ScatterReplay {
             window,
             index_component_offsets,
         })
-    }
-
-    #[cfg(feature = "parallel")]
-    fn validate(
-        batch_shape: &[usize],
-        index_dims: &[usize],
-        index_strides: &[isize],
-        index_vector_dim: usize,
-        index_component_count: usize,
-        update_dims: &[usize],
-        update_strides: &[isize],
-        update_window_dims: &[usize],
-        is_update_window_dim: &[bool],
-        window_shape_updates: &[usize],
-        window_dims: &[usize],
-        dest_strides: &[isize],
-    ) -> Result<()> {
-        let (
-            batch_source_strides,
-            batch_dest_strides,
-            window_source_strides,
-            window_dest_strides,
-            vector_stride,
-        ) = scatter_replay_strides(
-            index_dims,
-            index_strides,
-            index_vector_dim,
-            update_dims,
-            update_strides,
-            update_window_dims,
-            is_update_window_dim,
-            window_dims,
-            dest_strides,
-        );
-        WindowReplay::compile(batch_shape, &batch_source_strides, &batch_dest_strides)?;
-        WindowReplay::compile(
-            window_shape_updates,
-            &window_source_strides,
-            &window_dest_strides,
-        )?;
-        for component in 0..index_component_count {
-            checked_offset_add(0, vector_stride, component)?;
-        }
-        Ok(())
     }
 }
 
@@ -389,7 +345,6 @@ pub struct DynamicSlicePlan {
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT), in which case
     /// `replay`/`execute_parallel` walk the window instead.
     window: Option<FusedPairLayout>,
-    #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
 }
 
@@ -415,7 +370,6 @@ pub struct DynamicUpdateSlicePlan {
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT), in which case
     /// `replay`/`execute_update_parallel` walk the window instead.
     window: Option<FusedPairLayout>,
-    #[cfg(not(feature = "parallel"))]
     replay: WindowReplay,
 }
 
@@ -435,19 +389,10 @@ pub struct ScatterPlan {
     dest_dims: AxisVec<usize>,
     dest_strides: AxisVec<isize>,
     spec: ScatterSpec,
-    #[cfg(feature = "parallel")]
-    batch_shape: AxisVec<usize>,
-    #[cfg(feature = "parallel")]
-    window_dims: AxisVec<usize>,
     window_shape: AxisVec<usize>,
-    #[cfg(feature = "parallel")]
-    window_shape_updates: AxisVec<usize>,
-    #[cfg(feature = "parallel")]
-    is_update_window_dim: AxisVec<bool>,
     batch_elems: usize,
     window_elems: usize,
     copy_plan: CopyPlan,
-    #[cfg(not(feature = "parallel"))]
     replay: ScatterReplay,
 }
 
@@ -636,12 +581,13 @@ impl GatherPlan {
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
-        self.execute_with_writer(dest, operand, start_indices)
+        self.execute_with_writer(dest, operand, start_indices, exec)
     }
 
     /// Execute the prepared gather into a destination whose reachable slots
@@ -651,12 +597,13 @@ impl GatherPlan {
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
-        self.execute_with_writer(dest, operand, start_indices)
+        self.execute_with_writer(dest, operand, start_indices, exec)
     }
 
     fn execute_with_writer<T, I, W>(
@@ -664,6 +611,7 @@ impl GatherPlan {
         dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -675,26 +623,20 @@ impl GatherPlan {
             return Ok(());
         }
         if self.uses_rank_one_scalar_take_path() {
-            #[cfg(feature = "parallel")]
-            {
-                let nthreads = crate::threading::parallel_threads_for_len(self.total);
-                if nthreads > 1 {
-                    return self.execute_rank_one_scalar_take_parallel(
-                        dest,
-                        operand,
-                        start_indices,
-                        nthreads,
-                    );
-                }
+            let exec = crate::threading::for_len(exec, self.total);
+            if !exec.is_serial() {
+                return self.execute_rank_one_scalar_take_parallel(
+                    dest,
+                    operand,
+                    start_indices,
+                    exec,
+                );
             }
             return self.execute_rank_one_scalar_take(dest, operand, start_indices);
         }
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads = crate::threading::parallel_threads_for_len(self.total);
-            if nthreads > 1 {
-                return self.execute_parallel(dest, operand, start_indices, nthreads);
-            }
+        let exec = crate::threading::for_len(exec, self.total);
+        if !exec.is_serial() {
+            return self.execute_parallel(dest, operand, start_indices, exec);
         }
 
         let mut state =
@@ -782,13 +724,12 @@ impl GatherPlan {
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     fn execute_rank_one_scalar_take_parallel<T, I, W>(
         &self,
         dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
-        nthreads: usize,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -805,7 +746,7 @@ impl GatherPlan {
 
         crate::threading::parallel_map_reduce(
             0..self.total,
-            nthreads,
+            exec,
             &|range| {
                 let dest_ptr = dest_ptr.as_ptr();
                 let operand_ptr = operand_ptr.as_const();
@@ -831,13 +772,12 @@ impl GatherPlan {
         )
     }
 
-    #[cfg(feature = "parallel")]
     fn execute_parallel<T, I, W>(
         &self,
         dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         start_indices: &RawStridedRef<'_, I>,
-        nthreads: usize,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -854,7 +794,7 @@ impl GatherPlan {
 
         crate::threading::parallel_map_reduce(
             0..self.total,
-            nthreads,
+            exec,
             &|range| {
                 let mut state = self.decode_replay_state(
                     range.start,
@@ -1025,9 +965,6 @@ impl DynamicSlicePlan {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
         validate_window_sizes(operand_dims, slice_sizes)?;
-        #[cfg(feature = "parallel")]
-        WindowReplay::compile(slice_sizes, operand_strides, dest_strides)?;
-        #[cfg(not(feature = "parallel"))]
         let replay = WindowReplay::compile(slice_sizes, operand_strides, dest_strides)?;
 
         Ok(Self {
@@ -1040,7 +977,6 @@ impl DynamicSlicePlan {
             slice_sizes: slice_sizes.into(),
             total,
             window: fuse_pair_layout(slice_sizes, dest_strides, operand_strides),
-            #[cfg(not(feature = "parallel"))]
             replay,
         })
     }
@@ -1051,12 +987,13 @@ impl DynamicSlicePlan {
         dest: &mut RawStridedMut<'_, T>,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
-        self.execute_with_writer(dest, operand, starts)
+        self.execute_with_writer(dest, operand, starts, exec)
     }
 
     pub(crate) fn execute_uninit<T, I>(
@@ -1064,12 +1001,13 @@ impl DynamicSlicePlan {
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
-        self.execute_with_writer(dest, operand, starts)
+        self.execute_with_writer(dest, operand, starts, exec)
     }
 
     fn execute_with_writer<T, I, W>(
@@ -1077,6 +1015,7 @@ impl DynamicSlicePlan {
         dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1088,22 +1027,15 @@ impl DynamicSlicePlan {
             return Ok(());
         }
         if self.uses_rank_one_contiguous_path() {
-            return self.execute_rank_one_contiguous(dest, operand, starts);
+            return self.execute_rank_one_contiguous(dest, operand, starts, exec);
         }
         if let Some(window) = &self.window {
-            return self.execute_fused_window(dest, operand, starts, window);
+            return self.execute_fused_window(dest, operand, starts, window, exec);
         }
-        #[cfg(feature = "parallel")]
-        let replay =
-            WindowReplay::compile(&self.slice_sizes, &self.operand_strides, &self.dest_strides)?;
-        #[cfg(not(feature = "parallel"))]
         let replay = &self.replay;
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads = crate::threading::parallel_threads_for_len(self.total);
-            if nthreads > 1 {
-                return self.execute_parallel(dest, operand, starts, nthreads, &replay);
-            }
+        let exec = crate::threading::for_len(exec, self.total);
+        if !exec.is_serial() {
+            return self.execute_parallel(dest, operand, starts, exec, replay);
         }
 
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
@@ -1144,6 +1076,7 @@ impl DynamicSlicePlan {
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
         window: &FusedPairLayout,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1181,6 +1114,7 @@ impl DynamicSlicePlan {
                 window,
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
                 |value: T| value,
+                exec,
             );
         }
         Ok(())
@@ -1196,6 +1130,7 @@ impl DynamicSlicePlan {
         dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1232,18 +1167,18 @@ impl DynamicSlicePlan {
                 source.as_ptr(),
                 dest_ptr.add(dest_start),
                 self.total,
+                exec,
             );
         }
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     fn execute_parallel<T, I, W>(
         &self,
         dest: &mut W,
         operand: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
-        nthreads: usize,
+        exec: Exec<'_>,
         replay: &WindowReplay,
     ) -> Result<()>
     where
@@ -1267,7 +1202,7 @@ impl DynamicSlicePlan {
 
         crate::threading::parallel_map_reduce(
             0..self.total,
-            nthreads,
+            exec,
             &|range| {
                 let mut state = replay.decode(range.start, source_base, dest_base)?;
                 let operand_ptr = operand_ptr.as_const();
@@ -1362,9 +1297,6 @@ impl DynamicUpdateSlicePlan {
         }
         validate_window_sizes(operand_dims, update_dims)?;
         let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
-        #[cfg(feature = "parallel")]
-        WindowReplay::compile(update_dims, update_strides, dest_strides)?;
-        #[cfg(not(feature = "parallel"))]
         let replay = WindowReplay::compile(update_dims, update_strides, dest_strides)?;
 
         Ok(Self {
@@ -1379,7 +1311,6 @@ impl DynamicUpdateSlicePlan {
             total,
             copy_plan,
             window: fuse_pair_layout(update_dims, dest_strides, update_strides),
-            #[cfg(not(feature = "parallel"))]
             replay,
         })
     }
@@ -1391,14 +1322,16 @@ impl DynamicUpdateSlicePlan {
         operand: &RawStridedRef<'_, T>,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
         I: GatherIndex,
     {
+        let mut exec = exec;
         self.check_call(dest, operand, update, starts)?;
-        self.copy_plan.execute(dest, operand)?;
-        self.execute_update_with_writer(dest, update, starts)
+        self.copy_plan.execute(dest, operand, exec.reborrow())?;
+        self.execute_update_with_writer(dest, update, starts, exec)
     }
 
     /// Execute dynamic update into a destination whose reachable slots may be
@@ -1409,6 +1342,7 @@ impl DynamicUpdateSlicePlan {
         operand: &RawStridedRef<'_, T>,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1416,8 +1350,8 @@ impl DynamicUpdateSlicePlan {
     {
         self.check_call(dest, operand, update, starts)?;
         self.copy_plan
-            .execute_uninit_then(dest, operand, |mut receipt| {
-                self.execute_update_with_writer(&mut receipt, update, starts)
+            .execute_uninit_then(dest, operand, exec, |mut receipt, exec| {
+                self.execute_update_with_writer(&mut receipt, update, starts, exec)
             })?
     }
 
@@ -1426,6 +1360,7 @@ impl DynamicUpdateSlicePlan {
         dest: &mut W,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1436,22 +1371,15 @@ impl DynamicUpdateSlicePlan {
             return Ok(());
         }
         if self.uses_rank_one_contiguous_path() {
-            return self.execute_rank_one_contiguous(dest, update, starts);
+            return self.execute_rank_one_contiguous(dest, update, starts, exec);
         }
         if let Some(window) = &self.window {
-            return self.execute_fused_window(dest, update, starts, window);
+            return self.execute_fused_window(dest, update, starts, window, exec);
         }
-        #[cfg(feature = "parallel")]
-        let replay =
-            WindowReplay::compile(&self.update_dims, &self.update_strides, &self.dest_strides)?;
-        #[cfg(not(feature = "parallel"))]
         let replay = &self.replay;
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads = crate::threading::parallel_threads_for_len(self.total);
-            if nthreads > 1 {
-                return self.execute_update_parallel(dest, update, starts, nthreads, &replay);
-            }
+        let exec = crate::threading::for_len(exec, self.total);
+        if !exec.is_serial() {
+            return self.execute_update_parallel(dest, update, starts, exec, replay);
         }
 
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
@@ -1489,6 +1417,7 @@ impl DynamicUpdateSlicePlan {
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
         window: &FusedPairLayout,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1522,6 +1451,7 @@ impl DynamicUpdateSlicePlan {
                 window,
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
                 |value: T| value,
+                exec,
             );
         }
         Ok(())
@@ -1540,6 +1470,7 @@ impl DynamicUpdateSlicePlan {
         dest: &mut W,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + MaybeSendSync,
@@ -1574,18 +1505,18 @@ impl DynamicUpdateSlicePlan {
                 update.as_ptr(),
                 dest_ptr.add(dest_start),
                 self.total,
+                exec,
             );
         }
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     fn execute_update_parallel<T, I, W>(
         &self,
         dest: &mut W,
         update: &RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
-        nthreads: usize,
+        exec: Exec<'_>,
         replay: &WindowReplay,
     ) -> Result<()>
     where
@@ -1608,7 +1539,7 @@ impl DynamicUpdateSlicePlan {
 
         crate::threading::parallel_map_reduce(
             0..self.total,
-            nthreads,
+            exec,
             &|range| {
                 let mut state = replay.decode(range.start, source_base, dest_base)?;
                 let update_ptr = update_ptr.as_const();
@@ -1768,22 +1699,6 @@ impl ScatterPlan {
         let batch_elems = checked_total_len(&batch_shape)?;
         let window_elems = checked_total_len(&window_shape_updates)?;
         let copy_plan = CopyPlan::compile(operand_dims, dest_strides, operand_strides)?;
-        #[cfg(feature = "parallel")]
-        ScatterReplay::validate(
-            &batch_shape,
-            index_dims,
-            index_strides,
-            spec.index_vector_dim,
-            spec.scatter_dims_to_operand_dims.len(),
-            update_dims,
-            update_strides,
-            &spec.update_window_dims,
-            &is_update_window_dim,
-            &window_shape_updates,
-            &window_dims,
-            dest_strides,
-        )?;
-        #[cfg(not(feature = "parallel"))]
         let replay = ScatterReplay::compile(
             &batch_shape,
             index_dims,
@@ -1809,19 +1724,10 @@ impl ScatterPlan {
             dest_dims: dest_dims.into(),
             dest_strides: dest_strides.into(),
             spec,
-            #[cfg(feature = "parallel")]
-            batch_shape,
-            #[cfg(feature = "parallel")]
-            window_dims,
             window_shape,
-            #[cfg(feature = "parallel")]
-            window_shape_updates,
-            #[cfg(feature = "parallel")]
-            is_update_window_dim,
             batch_elems,
             window_elems,
             copy_plan,
-            #[cfg(not(feature = "parallel"))]
             replay,
         })
     }
@@ -1834,13 +1740,14 @@ impl ScatterPlan {
         operand: &RawStridedRef<'_, T>,
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + Add<Output = T> + MaybeSendSync,
         I: GatherIndex,
     {
         self.check_call(dest, operand, scatter_indices, updates)?;
-        self.copy_plan.execute(dest, operand)?;
+        self.copy_plan.execute(dest, operand, exec)?;
         self.execute_updates(dest, scatter_indices, updates, |a, b| a + b)
     }
 
@@ -1853,6 +1760,7 @@ impl ScatterPlan {
         scatter_indices: &RawStridedRef<'_, I>,
         updates: &RawStridedRef<'_, T>,
         combine: fn(T, T) -> T,
+        exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + Add<Output = T> + MaybeSendSync,
@@ -1860,7 +1768,7 @@ impl ScatterPlan {
     {
         self.check_call(dest, operand, scatter_indices, updates)?;
         self.copy_plan
-            .execute_uninit_then(dest, operand, |mut receipt| {
+            .execute_uninit_then(dest, operand, exec, |mut receipt, _| {
                 self.execute_updates(&mut receipt, scatter_indices, updates, combine)
             })?
     }
@@ -1904,22 +1812,6 @@ impl ScatterPlan {
     {
         // Overlapping additive updates are order-sensitive, so this remains a
         // deterministic serial replay until a combine-aware parallel plan exists.
-        #[cfg(feature = "parallel")]
-        let replay = ScatterReplay::compile(
-            &self.batch_shape,
-            &self.index_dims,
-            &self.index_strides,
-            self.spec.index_vector_dim,
-            self.spec.scatter_dims_to_operand_dims.len(),
-            &self.update_dims,
-            &self.update_strides,
-            &self.spec.update_window_dims,
-            &self.is_update_window_dim,
-            &self.window_shape_updates,
-            &self.window_dims,
-            &self.dest_strides,
-        )?;
-        #[cfg(not(feature = "parallel"))]
         let replay = &self.replay;
 
         let mut operand_base_storage = CoordScratch::new(self.operand_dims.len());
@@ -2254,6 +2146,6 @@ impl CoordScratch {
 #[path = "gather_plan/tests/tests.rs"]
 mod tests;
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 #[path = "gather_plan/tests/parallel_tests.rs"]
 mod parallel_tests;

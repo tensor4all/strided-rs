@@ -19,7 +19,7 @@
 //! kernel, so a parallel chunk runs exactly the loop the serial path runs.
 
 use super::{checked_reduce_reset, compress_reduce_outer_axes, ReduceOuterAxis, ReduceOuterCursor};
-use crate::{ExecContext, Result, StridedError};
+use crate::{Exec, Result, StridedError};
 use core::ops::Range;
 
 /// Maximum number of adjacent lines processed together in panel mode.
@@ -44,7 +44,6 @@ pub(super) struct LineLayout {
     /// Extent of the panel axis, when panel mode is selected.
     panel_extent: Option<usize>,
     /// Number of source elements, the threading threshold domain.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     total: usize,
 }
 
@@ -212,11 +211,11 @@ pub(super) trait UnitKernel: Copy + crate::MaybeSendSync {
 /// source and destination descriptors against the layout), and that distinct
 /// units write disjoint destination elements.
 pub(super) unsafe fn for_each_unit<K: UnitKernel>(
-    ctx: &ExecContext,
     layout: &LineLayout,
     source_base: isize,
     dest_base: isize,
     kernel: K,
+    exec: Exec<'_>,
 ) -> Result<()> {
     if layout.is_empty() {
         return Ok(());
@@ -230,24 +229,10 @@ pub(super) unsafe fn for_each_unit<K: UnitKernel>(
             kernel,
         })
     };
-    if super::reduce_context_is_serial(ctx) {
-        return task(0..layout.units);
-    }
-    ctx.run(|| {
-        #[cfg(feature = "parallel")]
-        {
-            let nthreads =
-                crate::threading::parallel_threads_for_len(layout.total).min(layout.units);
-            if nthreads > 1 {
-                return crate::threading::parallel_map_reduce(
-                    0..layout.units,
-                    nthreads,
-                    &task,
-                    &|left, right| left.and(right),
-                );
-            }
-        }
-        task(0..layout.units)
+    let exec = crate::threading::for_len(exec, layout.total)
+        .limit(core::num::NonZeroUsize::new(layout.units).unwrap_or(core::num::NonZeroUsize::MIN));
+    crate::threading::parallel_map_reduce(0..layout.units, exec, &task, &|left, right| {
+        left.and(right)
     })
 }
 
@@ -335,6 +320,6 @@ impl<T> UnitPtr<T> {
     }
 }
 
-#[cfg(all(test, feature = "parallel"))]
+#[cfg(test)]
 #[path = "line/tests/tests.rs"]
 mod tests;

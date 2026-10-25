@@ -11,7 +11,7 @@ fn uninit_then_receipt_drops_after_panic() {
         let mut storage = vec![MaybeUninit::<i32>::uninit(); 3];
         let mut dest = RawStridedMut::new(&mut storage, &[2], &[1], 0).unwrap();
         let _: () = plan
-            .execute_uninit_then(&mut dest, &source, |_receipt| {
+            .execute_uninit_then(&mut dest, &source, Exec::serial(), |_receipt, _exec| {
                 panic!("post-copy update failure");
             })
             .unwrap();
@@ -46,7 +46,7 @@ where
     {
         let mut dest = RawStridedMut::new(&mut actual, dims, dst_strides, 0).unwrap();
         let source = RawStridedRef::new(src, dims, src_strides, 0).unwrap();
-        plan.execute(&mut dest, &source).unwrap();
+        plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     }
     assert_eq!(actual, expected);
 }
@@ -116,7 +116,7 @@ fn plan_copy_negative_stride_matches_view_kernel() {
     let mut actual = [0.0f64; 4];
     let mut dest = RawStridedMut::new(&mut actual, &dims, &dst_strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &src_strides, 3).unwrap();
-    plan.execute(&mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(actual, [4.0, 3.0, 2.0, 1.0]);
 }
 
@@ -135,14 +135,15 @@ fn plan_execute_scale_and_conj() {
     let mut scaled = [Complex64::default(); 4];
     let mut dest = RawStridedMut::new(&mut scaled, &dims, &strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
-    plan.execute_scale(&mut dest, &source, Complex64::new(2.0, 0.0))
+    plan.execute_scale(&mut dest, &source, Complex64::new(2.0, 0.0), Exec::serial())
         .unwrap();
     assert_eq!(scaled[1], Complex64::new(-6.0, 8.0));
 
     let mut conjugated = [Complex64::default(); 4];
     let mut dest = RawStridedMut::new(&mut conjugated, &dims, &strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
-    plan.execute_conj(&mut dest, &source).unwrap();
+    plan.execute_conj(&mut dest, &source, Exec::serial())
+        .unwrap();
     assert_eq!(conjugated[0], Complex64::new(1.0, -2.0));
     assert_eq!(conjugated[3], Complex64::new(2.0, 0.0));
 }
@@ -167,17 +168,19 @@ fn plan_rank_above_inline_limit_uses_spilled_fused_traversal() {
     let mut actual = vec![0.0f64; 512];
     let mut dest = RawStridedMut::new(&mut actual, &dims, &dst, 0).unwrap();
     let source = RawStridedRef::new(&source_data, &dims, &src, 0).unwrap();
-    plan.execute(&mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, Exec::serial()).unwrap();
     assert_eq!(actual, expected);
 
     // The spilled traversal also serves scale and conj.
     let mut scaled = vec![0.0f64; 512];
     let mut dest = RawStridedMut::new(&mut scaled, &dims, &dst, 0).unwrap();
-    plan.execute_scale(&mut dest, &source, 2.0).unwrap();
+    plan.execute_scale(&mut dest, &source, 2.0, Exec::serial())
+        .unwrap();
     assert_eq!(scaled[0], 2.0 * actual[0]);
     let mut conjugated = vec![0.0f64; 512];
     let mut dest = RawStridedMut::new(&mut conjugated, &dims, &dst, 0).unwrap();
-    plan.execute_conj(&mut dest, &source).unwrap();
+    plan.execute_conj(&mut dest, &source, Exec::serial())
+        .unwrap();
     assert_eq!(conjugated, actual);
 }
 
@@ -237,20 +240,26 @@ fn execute_rejects_layout_drift() {
     let other_strides = [2isize, 1];
     let mut dest = RawStridedMut::new(&mut dst, &other_dims, &other_strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &other_dims, &other_strides, 0).unwrap();
-    let err = plan.execute(&mut dest, &source).unwrap_err();
+    let err = plan
+        .execute(&mut dest, &source, Exec::serial())
+        .unwrap_err();
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
 
     // Same dims, different source strides.
     let column_major = [1isize, 2];
     let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &column_major, 0).unwrap();
-    let err = plan.execute_scale(&mut dest, &source, 1.0).unwrap_err();
+    let err = plan
+        .execute_scale(&mut dest, &source, 1.0, Exec::serial())
+        .unwrap_err();
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
 
     // Same dims, different destination strides.
     let mut dest = RawStridedMut::new(&mut dst, &dims, &column_major, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
-    let err = plan.execute_conj(&mut dest, &source).unwrap_err();
+    let err = plan
+        .execute_conj(&mut dest, &source, Exec::serial())
+        .unwrap_err();
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
 }
 
@@ -277,7 +286,7 @@ fn update_plan_computes_alpha_f_plus_beta_self_on_permuted_layout() {
     let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
     let mut dest = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
     // dst = 2 * (src + 1) + 3 * dst
-    plan.execute(&mut dest, &source, 2.0, 3.0, |x| x + 1.0)
+    plan.execute(&mut dest, &source, 2.0, 3.0, |x| x + 1.0, Exec::serial())
         .unwrap();
 
     // Logical (i, j): src offset i*3 + j, dst offset i + j*2. Every logical
@@ -305,7 +314,7 @@ fn update_plan_rejects_non_injective_destination_and_layout_drift() {
     let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
     let mut dest = RawStridedMut::new(&mut dst, &dims, &[2, 1], 0).unwrap();
     let err = plan
-        .execute(&mut dest, &source, 1.0, 1.0, |x| x)
+        .execute(&mut dest, &source, 1.0, 1.0, |x| x, Exec::serial())
         .unwrap_err();
     assert!(matches!(err, StridedError::PlanLayoutMismatch));
 }
@@ -363,7 +372,7 @@ fn assert_update_beta_zero_case<T>(
     {
         let source = RawStridedRef::new(src, dims, src_strides, 0).unwrap();
         let mut dest = RawStridedMut::new(&mut dst, dims, dst_strides, 0).unwrap();
-        plan.execute(&mut dest, &source, alpha, beta, |x| x)
+        plan.execute(&mut dest, &source, alpha, beta, |x| x, Exec::serial())
             .unwrap();
     }
     let mut expected = vec![poison; len];
@@ -397,7 +406,7 @@ fn assert_execute_uninit_case<T>(
     {
         let source = RawStridedRef::new(src, dims, src_strides, 0).unwrap();
         let mut dest = RawStridedMut::new(&mut storage, dims, dst_strides, 0).unwrap();
-        plan.execute_uninit(&mut dest, &source, alpha, |x| x)
+        plan.execute_uninit(&mut dest, &source, alpha, |x| x, Exec::serial())
             .unwrap();
     }
     let mut expected = vec![poison; len];
@@ -510,7 +519,7 @@ fn update_plan_beta_nonzero_reads_destination() {
     let mut dst = initial;
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
     let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
-    plan.execute(&mut dest, &source, 2.0, 0.5, |x| x + 1.0)
+    plan.execute(&mut dest, &source, 2.0, 0.5, |x| x + 1.0, Exec::serial())
         .unwrap();
     for index in 0..4 {
         assert_eq!(dst[index], 2.0 * (src[index] + 1.0) + 0.5 * initial[index]);
@@ -527,7 +536,7 @@ fn update_plan_nan_beta_reads_destination() {
     let mut dst = [3.0f64, 4.0];
     let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
     let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
-    plan.execute(&mut dest, &source, 1.0, f64::NAN, |x| x)
+    plan.execute(&mut dest, &source, 1.0, f64::NAN, |x| x, Exec::serial())
         .unwrap();
     assert!(dst.iter().all(|value| value.is_nan()));
 }
@@ -583,7 +592,8 @@ fn update_plan_execute_uninit_leaves_gapped_holes_untouched() {
     {
         let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
         let mut dest = RawStridedMut::new(&mut storage, &dims, &dst_strides, 0).unwrap();
-        plan.execute_uninit(&mut dest, &source, 1.0, |x| x).unwrap();
+        plan.execute_uninit(&mut dest, &source, 1.0, |x| x, Exec::serial())
+            .unwrap();
     }
     // SAFETY: every slot was initialized with NaN before the call.
     unsafe {

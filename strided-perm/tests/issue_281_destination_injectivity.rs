@@ -1,14 +1,13 @@
 //! Regression tests for tensor4all/strided-rs#281.
 //!
-//! `copy_into` / `copy_into_par` must reject a non-injective destination
-//! layout (overlapping writes, and an unsynchronized data race under
-//! `parallel`) before entering their unsafe write loops, while every layout
+//! `copy_into` must reject a non-injective destination
+//! layout (overlapping writes, and an unsynchronized data race when the
+//! token fans out) before entering their unsafe write loops, while every layout
 //! that is in fact injective stays accepted. The interleaved `[3, 1500]` /
 //! `[2000, 3]` case is accepted only by the allocating exact spill path of the
 //! validator.
 
-#[cfg(feature = "parallel")]
-use strided_perm::copy_into_par;
+use strided_exec::{Exec, Pool};
 use strided_perm::{copy_into, copy_into_col_major};
 use strided_view::{StridedError, StridedView, StridedViewMut};
 
@@ -24,7 +23,7 @@ fn interleaved_injective_destination_is_accepted() {
     let src = StridedView::new(&src_data, &dims, &[1, 3], 0).unwrap();
     let mut dst = StridedViewMut::new(&mut dst_data, &dims, &[2000, 3], 0).unwrap();
 
-    copy_into(&mut dst, &src).unwrap();
+    copy_into(&mut dst, &src, Exec::serial()).unwrap();
     for i in 0..3 {
         for j in 0..1500 {
             assert_eq!(dst_data[i * 2000 + j * 3], src_data[i + j * 3]);
@@ -45,20 +44,19 @@ fn overlapping_destination_is_rejected() {
     let mut dst = StridedViewMut::new(&mut dst_data, &dims, &[256, 256], 0).unwrap();
 
     assert!(matches!(
-        copy_into(&mut dst, &src),
+        copy_into(&mut dst, &src, Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
     assert!(matches!(
-        copy_into_col_major(&mut dst, &src),
+        copy_into_col_major(&mut dst, &src, Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
     drop(dst);
     assert!(dst_data.iter().all(|&value| value == 0.0));
 }
 
-/// The overlapping destination stays rejected under the parallel entry, where
-/// the collision would be an unsynchronized write.
-#[cfg(feature = "parallel")]
+/// The overlapping destination stays rejected for a pooled token, where the
+/// collision would be an unsynchronized write.
 #[test]
 fn overlapping_destination_is_rejected_parallel() {
     let dims = [256usize, 256];
@@ -67,11 +65,8 @@ fn overlapping_destination_is_rejected_parallel() {
     let src = StridedView::new(&src_data, &dims, &[1, 256], 0).unwrap();
     let mut dst = StridedViewMut::new(&mut dst_data, &dims, &[256, 256], 0).unwrap();
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
-    let result = pool.install(|| copy_into_par(&mut dst, &src));
+    let pool = Pool::builder().threads(2).build().unwrap();
+    let result = copy_into(&mut dst, &src, Exec::new(&pool, 2).unwrap());
     assert!(matches!(
         result,
         Err(StridedError::NonInjectiveOutputLayout)
@@ -91,7 +86,7 @@ fn collapsed_destination_axis_is_rejected() {
     let mut dst = StridedViewMut::new(&mut dst_data, &dims, &[1, 0], 0).unwrap();
 
     assert!(matches!(
-        copy_into(&mut dst, &src),
+        copy_into(&mut dst, &src, Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
 }
