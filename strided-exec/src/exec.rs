@@ -372,6 +372,9 @@ impl<'p> Exec<'p> {
     where
         F: Fn(usize) + Sync,
     {
+        if let Some(refused) = self.refusal() {
+            return Err(refused);
+        }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
             _ => {
@@ -380,12 +383,6 @@ impl<'p> Exec<'p> {
                 return Ok(());
             }
         };
-        if self.child {
-            return Err(Refused::ForkChild);
-        }
-        if sched::in_pool(pool) {
-            return Err(Refused::CallerInPool);
-        }
         let _released = self.track.release();
         #[cfg(feature = "parallel")]
         sched::broadcast(pool, &self.track, self.budget.get(), f);
@@ -395,6 +392,52 @@ impl<'p> Exec<'p> {
             f(0);
         }
         Ok(())
+    }
+
+    /// Whether [`broadcast`](Exec::broadcast) would run right now, without
+    /// consuming the token.
+    ///
+    /// True exactly when `broadcast` would not return [`Refused`]: the token is
+    /// not derived from [`fork`](Exec::fork) and the calling thread is not a
+    /// worker of its pool. A serial or budget-one token returns true, because
+    /// `broadcast` then runs `f(0)` inline. The answer depends on the calling
+    /// thread, so ask it on the thread that will broadcast.
+    ///
+    /// Use it before building an expensive setup that only a broadcast needs,
+    /// instead of paying for the setup and then being refused.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_exec::{Exec, Pool};
+    ///
+    /// let pool = Pool::builder().threads(2).build()?;
+    /// let exec = Exec::new(&pool, 2)?;
+    /// assert!(exec.can_broadcast());
+    /// exec.fork(1, |_, child| {
+    ///     let predicted = child.can_broadcast();
+    ///     assert_eq!(child.broadcast(|_| {}).is_ok(), predicted);
+    /// });
+    /// assert!(Exec::serial().can_broadcast());
+    /// # Ok::<(), strided_exec::Error>(())
+    /// ```
+    pub fn can_broadcast(&self) -> bool {
+        self.refusal().is_none()
+    }
+
+    /// The single refusal rule shared by `broadcast` and `can_broadcast`.
+    fn refusal(&self) -> Option<Refused> {
+        let pool = match self.pool {
+            Some(pool) if self.budget.get() > 1 => pool,
+            _ => return None,
+        };
+        if self.child {
+            return Some(Refused::ForkChild);
+        }
+        if sched::in_pool(pool) {
+            return Some(Refused::CallerInPool);
+        }
+        None
     }
 
     /// Hands the budget as a plain width to a library outside this stack.

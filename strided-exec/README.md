@@ -55,6 +55,7 @@ both go away when tcontract migrates to this crate.
 | `Exec::fork(jobs, f)` | `min(jobs, budget)` tasks; shares differ by at most one and sum to the budget; job `i` gets a child token |
 | `Exec::for_ranges(len, grain, f)` | at most `budget` tasks, ranges of at least `grain` except possibly the last |
 | `Exec::broadcast(f)` | `f(i)` for `i in 0..budget`, all concurrent, or `Err(Refused)` |
+| `Exec::can_broadcast()` | non-consuming: true exactly when `broadcast` would not refuse right now; ask before building an expensive setup |
 | `Exec::external(f)` | enter the pool once and hand the budget as a plain width to an outside library (faer, a vendor BLAS); how it divides the width is that library's concern |
 
 ## Contracts
@@ -77,6 +78,13 @@ both go away when tcontract migrates to this crate.
   barrier-free path. Concurrent broadcasts on one pool queue in the same order on every
   worker (no interleaving); participants are the pool's workers `0..budget`, so
   blocking work of another token on those workers delays the broadcast.
+  `can_broadcast` applies the same rule through one private helper, so the two
+  cannot disagree.
+* **Deterministic shutdown.** Dropping a `Pool` joins every worker thread: when
+  `drop` returns, all workers have exited and their thread-local destructors
+  (including state created in an `on_start` hook) have run. A pool dropped from
+  one of its own workers cannot join itself, so that drop only signals shutdown
+  and returns without joining. Without `parallel` there is nothing to join.
 * **No scheduler type is public.** There is no constructor from, and no accessor
   returning, a scheduler pool. `scripts/check-no-public-rayon.sh` runs
   `cargo public-api -p strided-exec` (when installed) and fails if `rayon::`

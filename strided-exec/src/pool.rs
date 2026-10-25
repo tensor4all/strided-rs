@@ -17,7 +17,16 @@ const DEFAULT_STACK_BYTES: usize = 16 << 20;
 /// external pool and no accessor returning one. The pool's owner keeps the
 /// `Pool` and mints tokens from it with [`Exec::new`](crate::Exec::new).
 ///
-/// Dropping a `Pool` shuts its workers down.
+/// Dropping a `Pool` shuts its workers down and joins them: when `drop`
+/// returns, every worker thread has exited, so the thread-local destructors of
+/// the workers (including state set up by an [`on_start`](PoolBuilder::on_start)
+/// hook) have already run. Without the `parallel` feature there are no workers
+/// and nothing is joined.
+///
+/// A pool dropped from one of its own workers cannot wait for itself: that drop
+/// signals shutdown and returns without joining, so the workers exit shortly
+/// after instead of before the return. Drop the pool from a plain thread when
+/// the guarantee matters.
 ///
 /// # Examples
 ///
@@ -29,8 +38,12 @@ const DEFAULT_STACK_BYTES: usize = 16 << 20;
 /// # Ok::<(), strided_exec::Error>(())
 /// ```
 pub struct Pool {
+    // Field order matters: `inner` is dropped (shutdown signalled) before
+    // `joiner` waits for the threads.
     #[cfg(feature = "parallel")]
     pub(crate) inner: rayon::ThreadPool,
+    #[cfg(feature = "parallel")]
+    _joiner: Joiner,
     pub(crate) width: NonZeroUsize,
 }
 
@@ -61,6 +74,31 @@ impl Pool {
     /// ```
     pub fn width(&self) -> NonZeroUsize {
         self.width
+    }
+}
+
+/// The worker threads of a pool, joined when it is dropped.
+#[cfg(feature = "parallel")]
+struct Joiner {
+    handles: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+#[cfg(feature = "parallel")]
+impl Drop for Joiner {
+    fn drop(&mut self) {
+        let handles = match self.handles.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        let me = std::thread::current().id();
+        // A worker of this pool cannot join itself: skip joining entirely.
+        if handles.iter().any(|h| h.thread().id() == me) {
+            return;
+        }
+        for handle in handles {
+            // A worker that panicked has still exited; nothing to report.
+            let _ = handle.join();
+        }
     }
 }
 
@@ -201,20 +239,48 @@ impl PoolBuilder {
         let n = self
             .threads
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
+        let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&handles);
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
-            .stack_size(self.stack_size);
+            .stack_size(self.stack_size)
+            .spawn_handler(move |thread| {
+                let mut b = std::thread::Builder::new();
+                if let Some(name) = thread.name() {
+                    b = b.name(name.to_owned());
+                }
+                if let Some(size) = thread.stack_size() {
+                    b = b.stack_size(size);
+                }
+                let handle = b.spawn(move || thread.run())?;
+                match sink.lock() {
+                    Ok(mut guard) => guard.push(handle),
+                    Err(poisoned) => poisoned.into_inner().push(handle),
+                }
+                Ok(())
+            });
         if let Some(name) = self.thread_name {
             builder = builder.thread_name(name);
         }
         if let Some(hook) = self.on_start {
             builder = builder.start_handler(hook);
         }
-        let inner = builder
-            .build()
-            .map_err(|e| Error::PoolBuild(e.to_string()))?;
+        // On failure `builder` drops its handler, but threads already started
+        // are signalled by rayon and detached; join them here for determinism.
+        let built = builder.build();
+        let inner = match built {
+            Ok(inner) => inner,
+            Err(e) => {
+                drop(Joiner { handles });
+                return Err(Error::PoolBuild(e.to_string()));
+            }
+        };
         let width = NonZeroUsize::new(inner.current_num_threads()).unwrap_or(NonZeroUsize::MIN);
-        Ok(Pool { inner, width })
+        Ok(Pool {
+            inner,
+            _joiner: Joiner { handles },
+            width,
+        })
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -231,5 +297,32 @@ impl fmt::Debug for PoolBuilder {
             .field("threads", &self.threads)
             .field("stack_size", &self.stack_size)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    /// The last reference is dropped on a worker of the pool itself: the drop
+    /// must not wait for its own thread.
+    #[test]
+    fn drop_from_a_worker_of_the_pool_does_not_hang() {
+        let pool = Arc::new(Pool::builder().threads(2).build().unwrap());
+        let last = Arc::clone(&pool);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        pool.inner.spawn(move || {
+            gate_rx.recv().unwrap();
+            drop(last); // the last reference: runs `Pool::drop` on this worker
+            done_tx.send(()).unwrap();
+        });
+        drop(pool);
+        gate_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("drop on a worker hung");
     }
 }

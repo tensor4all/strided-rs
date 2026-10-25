@@ -102,6 +102,8 @@ impl<'p> Exec<'p> {
     pub fn external<R: Send>(self, f: impl FnOnce(NonZeroUsize) -> R + Send) -> R;
     /// Co-scheduling for barrier-bearing kernels: all `budget` participants or refuse.
     pub fn broadcast(self, f: impl Fn(usize) + Sync) -> Result<(), Refused>;
+    /// Whether `broadcast` would run right now (non-consuming); same rule.
+    pub fn can_broadcast(&self) -> bool;
 }
 ```
 
@@ -139,7 +141,17 @@ siblings; a call from a worker of the same pool is refused with
 caller that receives `Refused` takes its barrier-free path. Participants are
 the pool's workers `0..budget`, entered through one Rayon broadcast; a long
 task of another token on one of those workers delays the broadcast but cannot
-deadlock it.
+deadlock it. `can_broadcast` reports, without consuming the token, whether
+`broadcast` would be accepted on the calling thread: both go through one private
+refusal rule, so they cannot disagree. A kernel asks it before building a setup
+that only a broadcast needs.
+
+Dropping a `Pool` is deterministic. The pool starts its workers through Rayon's
+`spawn_handler` with `std::thread::Builder` (same name and stack size) and keeps
+the join handles. `Drop` first drops the Rayon pool, which signals shutdown, and
+then joins every handle, so when it returns all workers have exited and their
+thread-local destructors have run. A pool dropped from one of its own workers
+cannot join itself: that drop skips joining. Steady-state entries are unaffected.
 
 A parent waiting for its children keeps no slot; Rayon may let the waiting
 thread run one of its children, which is one of the tasks already counted.
