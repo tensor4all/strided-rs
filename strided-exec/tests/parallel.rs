@@ -205,3 +205,41 @@ fn external_from_a_worker_of_the_pool_runs_in_place() {
         assert_eq!(inner, (2, caller));
     });
 }
+
+#[test]
+fn can_broadcast_agrees_with_broadcast_in_every_case() {
+    let pool = named("can", 4);
+    let agrees = |exec: Exec<'_>, expected: bool| {
+        // `can_broadcast` does not consume; `broadcast` then must match it.
+        assert_eq!(exec.can_broadcast(), expected);
+        assert_eq!(exec.broadcast(|_| {}).is_ok(), expected);
+    };
+    // Root, serial, budget one.
+    agrees(Exec::new(&pool, 4).unwrap(), true);
+    agrees(Exec::serial(), true);
+    agrees(Exec::new(&pool, 1).unwrap(), true);
+    // Reborrow and limit of a root.
+    let mut root = Exec::new(&pool, 4).unwrap();
+    agrees(root.reborrow(), true);
+    agrees(root.reborrow().limit(NonZeroUsize::new(2).unwrap()), true);
+    // Fork children: refused with a budget above one, inline with budget one.
+    root.fork(1, |_, mut child| {
+        agrees(child.reborrow(), false);
+        agrees(child.reborrow().limit(NonZeroUsize::new(2).unwrap()), false);
+        agrees(child, false);
+    });
+    Exec::new(&pool, 2).unwrap().fork(2, |_, child| {
+        assert_eq!(child.budget().get(), 1);
+        agrees(child, true);
+    });
+    // A worker of the same pool.
+    Exec::new(&pool, 2).unwrap().fork(2, |_, _| {
+        agrees(Exec::new(&pool, 2).unwrap(), false);
+        agrees(Exec::new(&pool, 1).unwrap(), true);
+    });
+    // A worker of another pool may broadcast on this one.
+    let other = named("can-other", 1);
+    Exec::new(&other, 1).unwrap().external(|_| {
+        agrees(Exec::new(&pool, 4).unwrap(), true);
+    });
+}
