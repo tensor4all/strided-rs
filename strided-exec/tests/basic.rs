@@ -128,3 +128,26 @@ fn limit_narrows_without_widening() {
     assert_eq!(exec.budget().get(), 2.min(w));
     assert!(Exec::serial().limit(nz(8)).is_serial());
 }
+
+#[test]
+fn builder_options_and_debug_output() {
+    let started = std::sync::Arc::new(AtomicUsize::new(0));
+    let hook = std::sync::Arc::clone(&started);
+    let builder = Pool::builder()
+        .threads(2)
+        .stack_size(4 << 20)
+        .on_start(move |_| {
+            hook.fetch_add(1, Ordering::SeqCst);
+        });
+    let rendered = format!("{builder:?}");
+    assert!(rendered.contains("threads") && rendered.contains("stack_size"));
+    let pool = builder.build().unwrap();
+    assert!(format!("{pool:?}").contains("width"));
+    // The hook runs only on pools that start workers.
+    Exec::new(&pool, 2).unwrap().fork(2, |_, _| {});
+    if cfg!(feature = "parallel") {
+        assert!(started.load(Ordering::SeqCst) >= 1);
+    } else {
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+}
