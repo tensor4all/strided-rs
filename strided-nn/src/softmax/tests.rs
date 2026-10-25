@@ -80,7 +80,7 @@ fn multi_worker_scratch_matches_the_serial_result() {
         },
         xs.len(),
     );
-    let pool = strided_exec::Pool::builder().threads(4).build().unwrap();
+    let pool = threadteam::Pool::builder().threads(4).build().unwrap();
     let got = run(
         |out| {
             let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 4)];

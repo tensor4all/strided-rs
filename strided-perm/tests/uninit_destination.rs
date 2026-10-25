@@ -2,9 +2,9 @@
 //! float path (the destination type no longer hides it) and on the generic one.
 
 use core::mem::MaybeUninit;
-use strided_exec::{Exec, Pool};
 use strided_perm::{copy_into, copy_into_uninit};
 use strided_view::{StridedView, StridedViewMut};
+use threadteam::{Exec, Pool};
 
 fn transpose_case<T: Copy + PartialEq + core::fmt::Debug + Send + Sync + 'static>(
     rows: usize,

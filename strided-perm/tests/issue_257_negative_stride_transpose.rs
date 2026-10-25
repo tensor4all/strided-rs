@@ -3,9 +3,9 @@
 //! Every case is checked against a naive coordinate walk, serially and through
 //! the parallel executor.
 
-use strided_exec::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::{StridedView, StridedViewMut};
+use threadteam::{Exec, Pool};
 
 fn expected_row_major(
     source: &[f64],

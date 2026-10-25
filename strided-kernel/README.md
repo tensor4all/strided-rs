@@ -116,7 +116,7 @@ The library automatically optimizes iteration order for cache efficiency:
 strided-kernel = { version = "0.4", features = ["parallel"] }
 ```
 
-Every operation that can fan out takes a `strided_exec::Exec` placement token as
+Every operation that can fan out takes a `threadteam::Exec` placement token as
 its last argument; `Exec`, `Pool` and `PoolBuilder` are re-exported from the
 crate root. The caller owns a pool, mints a token for a budget of its slots,
 and passes it by value. `Exec::serial()` runs inline on the calling thread.

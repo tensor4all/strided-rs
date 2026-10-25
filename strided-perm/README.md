@@ -6,11 +6,11 @@ Cache-efficient tensor permutation / transpose, inspired by
 ## Usage
 
 Copy from any `strided-view` source view into a mutable destination view with
-the same shape. The last argument is a [`strided_exec::Exec`] placement token:
+the same shape. The last argument is a [`threadteam::Exec`] placement token:
 the copy splits within that budget and never starts work of its own.
 
 ```rust
-use strided_exec::Exec;
+use threadteam::Exec;
 use strided_perm::copy_into;
 use strided_view::StridedArray;
 
@@ -34,7 +34,7 @@ describe is written exactly once, through raw pointers only.
 ## Threading
 
 `Exec::serial()` runs the copy on the calling thread. A token minted from a
-`strided_exec::Pool` with `Exec::new(&pool, budget)` splits the permutation
+`threadteam::Pool` with `Exec::new(&pool, budget)` splits the permutation
 across `budget` tasks of that pool. The crate uses exactly the budget it is
 given: callers that want small copies to stay on one thread pass a serial token
 or narrow the token with `Exec::limit`. Without the `parallel` feature every
@@ -46,7 +46,7 @@ strided-perm = { version = "0.7", features = ["parallel"] }
 ```
 
 ```rust
-use strided_exec::{Exec, Pool};
+use threadteam::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::StridedArray;
 

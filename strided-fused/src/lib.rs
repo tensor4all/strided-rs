@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-//! Runtime-DAG fused elementwise execution taking a `strided_exec::Exec` placement token.
+//! Runtime-DAG fused elementwise execution taking a `threadteam::Exec` placement token.
 use strided_basic::*;
 pub use strided_basic::{Result, StridedError, StridedView, StridedViewMut};
 mod erased;

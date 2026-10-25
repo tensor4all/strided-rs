@@ -189,5 +189,5 @@ fn large_permutation_respects_serial_and_bounded_budget() {
     let exec = Exec::new(&pool, 2).unwrap();
     let root = exec.ledger_root().unwrap();
     run(exec);
-    assert!(strided_exec::ledger::max_live(root) <= 2);
+    assert!(threadteam::ledger::max_live(root) <= 2);
 }

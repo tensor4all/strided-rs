@@ -446,7 +446,7 @@ mod parallel {
                 let actual = zip_reduce_sum(&case, exec);
                 assert_eq!(actual, reference, "{} width {width}", case.name);
                 assert!(
-                    strided_exec::ledger::max_live(root) <= width,
+                    threadteam::ledger::max_live(root) <= width,
                     "{} width {width} exceeded its slot budget",
                     case.name
                 );

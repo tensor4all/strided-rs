@@ -1,5 +1,5 @@
-# Only `strided-exec` starts tasks on a thread pool. Every other workspace crate
-# reaches parallelism through `strided_exec::Exec`, so a direct `rayon`
+# Only `threadteam` (an external crate, tensor4all/threadteam-rs) starts tasks on a thread pool. Every other workspace crate
+# reaches parallelism through `threadteam::Exec`, so a direct `rayon`
 # dependency (normal, dev or build) anywhere else is rejected; criterion is the
 # one third-party crate that brings rayon in itself. faer and
 # spindle are banned outright: `Exec::external` hands a plain width to such a
@@ -12,7 +12,7 @@ multiple-versions = "allow"
 wildcards = "allow"
 deny = [
     { crate = "rayon", wrappers = [
-        "strided-exec",
+        "threadteam",
         "criterion",
     ] },
     { crate = "rayon-core", wrappers = ["rayon"] },

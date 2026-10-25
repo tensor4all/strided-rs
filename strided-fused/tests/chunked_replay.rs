@@ -958,7 +958,7 @@ fn chunked_replay_parallel_pool_matches_reference() {
             .execute_outputs_uninit(&mut dests, &pointers, exec)
             .unwrap();
     }
-    assert!(strided_exec::ledger::max_live(root) <= 2);
+    assert!(threadteam::ledger::max_live(root) <= 2);
 
     for index in 0..len {
         // SAFETY: `execute_outputs_uninit` writes every reachable element.

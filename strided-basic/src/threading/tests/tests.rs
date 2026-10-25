@@ -1,8 +1,8 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use strided_exec::ledger;
+use threadteam::ledger;
 
-fn pooled(pool: &strided_exec::Pool, budget: usize) -> (Exec<'_>, u64) {
+fn pooled(pool: &threadteam::Pool, budget: usize) -> (Exec<'_>, u64) {
     let exec = Exec::new(pool, budget).unwrap();
     let root = exec.ledger_root().unwrap();
     (exec, root)

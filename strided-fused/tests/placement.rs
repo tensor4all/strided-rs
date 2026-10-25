@@ -14,8 +14,8 @@ use strided_basic::{
     reduce_axis, zip_map2_into, zip_map3_into, ElementOp, Exec, Identity, Pool, StridedArray,
     StridedView, StridedViewMut,
 };
-use strided_exec::ledger;
 use strided_fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, FusedScalar};
+use threadteam::ledger;
 
 const LARGE_LEN: usize = 1 << 17;
 const NON_DIVISIBLE_LEN: usize = (1 << 15) + 65;

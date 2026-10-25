@@ -2,8 +2,8 @@ use super::*;
 use crate::StridedArray;
 
 /// A pool of `threads` workers for unit tests.
-fn test_pool(threads: usize) -> strided_exec::Pool {
-    strided_exec::Pool::builder()
+fn test_pool(threads: usize) -> threadteam::Pool {
+    threadteam::Pool::builder()
         .threads(threads)
         .build()
         .unwrap()

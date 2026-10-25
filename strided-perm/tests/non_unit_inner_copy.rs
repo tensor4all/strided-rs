@@ -1,6 +1,6 @@
-use strided_exec::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::{StridedView, StridedViewMut};
+use threadteam::{Exec, Pool};
 
 fn check(dims: &[usize], strides: &[isize], offset: isize, source_len: usize) {
     let source: Vec<f64> = (0..source_len).map(|i| i as f64).collect();

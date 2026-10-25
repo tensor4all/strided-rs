@@ -2,7 +2,7 @@
 //!
 //! This lives in its own integration-test binary with a single `#[test]` so no
 //! other test can start the process-global pool first. The final check reads
-//! `strided_exec::ledger::global_pool_unstarted`.
+//! `threadteam::ledger::global_pool_unstarted`.
 
 #![cfg(feature = "parallel")]
 
@@ -66,7 +66,7 @@ fn pooled_work_never_initializes_the_global_pool() {
     }
 
     assert!(
-        strided_exec::ledger::global_pool_unstarted(),
+        threadteam::ledger::global_pool_unstarted(),
         "the private strided pool started the process-global pool"
     );
 }

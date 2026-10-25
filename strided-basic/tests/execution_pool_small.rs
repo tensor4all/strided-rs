@@ -56,7 +56,7 @@ fn small_operation_does_not_enter_the_target_pool() {
     // The small work ran on the caller and never installed into the pool.
     assert!(!left_caller.load(Ordering::SeqCst));
     assert!(!saw_pool_worker.load(Ordering::SeqCst));
-    assert_eq!(strided_exec::ledger::installs(root), 0);
+    assert_eq!(threadteam::ledger::installs(root), 0);
     for index in 0..64 {
         assert_eq!(destination.data()[index], index + 1);
     }
@@ -101,5 +101,5 @@ fn small_operation_inside_a_worker_of_the_target_pool_runs_in_place() {
     assert!(saw_worker.load(Ordering::SeqCst));
     assert!(!left_worker.load(Ordering::SeqCst));
     // The plain caller entered the pool once to run the two jobs.
-    assert_eq!(strided_exec::ledger::installs(root), 1);
+    assert_eq!(threadteam::ledger::installs(root), 1);
 }

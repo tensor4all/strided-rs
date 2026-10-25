@@ -134,7 +134,7 @@ fn erased_copy_plan_accepts_explicit_execution_contexts() {
 
     assert!(matches!(
         Exec::new(common::shared_pool(), 0).unwrap_err(),
-        strided_exec::Error::ZeroBudget
+        threadteam::Error::ZeroBudget
     ));
     assert_eq!(serial_dst, src);
     assert_eq!(bounded_dst, src);

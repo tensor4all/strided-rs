@@ -101,7 +101,7 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 
 ## CPU Threading Contract
 
-- Only `strided-exec` starts tasks. Every other crate fans out through the
+- Only `threadteam` starts tasks. Every other crate fans out through the
   `Exec` token it is handed (`fork`, `for_ranges`, `faer`, `broadcast`), takes
   it by value as the last parameter of each entry that can fan out, and never
   stores it. `cargo deny check bans` rejects a direct `rayon` dependency

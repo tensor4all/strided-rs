@@ -2,9 +2,9 @@
 //! fused extent overflows `usize` must return a typed error from the public
 //! permutation copy entry points instead of panicking inside the planner.
 
-use strided_exec::{Exec, Pool};
 use strided_perm::copy_into;
 use strided_view::{StridedError, StridedView, StridedViewMut};
+use threadteam::{Exec, Pool};
 
 const HUGE: usize = 1 << 40;
 

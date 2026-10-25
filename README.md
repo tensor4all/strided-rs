@@ -31,7 +31,7 @@ from the workspace after 0.4.4; their published releases remain on crates.io.
 - **Lazy element operations** (conjugate, transpose, adjoint) with type-level composition
 - **Zero-copy transformations**: permuting, transposing, broadcasting
 - **Cache-optimized iteration** with automatic blocking and loop reordering
-- **Optional multi-threading** through the explicit `Exec` placement token of `strided-exec` (`parallel` feature) with recursive dimension splitting
+- **Optional multi-threading** through the explicit `Exec` placement token of `threadteam` (`parallel` feature) with recursive dimension splitting
 
 ## Installation
 
