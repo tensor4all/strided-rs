@@ -126,3 +126,34 @@ pub fn live(root: u64) -> usize {
 pub fn installs(root: u64) -> usize {
     lookup(root).map_or(0, |c| c.installs.load(Ordering::SeqCst))
 }
+
+/// Whether the process-global Rayon pool is still unstarted.
+///
+/// Answers by starting it: the call installs a one-thread global pool, which
+/// succeeds only when nothing in the process has touched the global registry
+/// before. Call it once, at the end of a test binary that holds a single test,
+/// so that no other test in the process can start the global pool first.
+/// Without the `parallel` feature nothing can start a pool and it returns
+/// `true`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use strided_exec::{ledger, Exec};
+///
+/// Exec::serial().fork(4, |_, _| {});
+/// assert!(ledger::global_pool_unstarted());
+/// ```
+pub fn global_pool_unstarted() -> bool {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build_global()
+            .is_ok()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        true
+    }
+}

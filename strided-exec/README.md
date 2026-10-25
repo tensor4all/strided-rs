@@ -55,7 +55,7 @@ both go away when tcontract migrates to this crate.
 | `Exec::fork(jobs, f)` | `min(jobs, budget)` tasks; shares differ by at most one and sum to the budget; job `i` gets a child token |
 | `Exec::for_ranges(len, grain, f)` | at most `budget` tasks, ranges of at least `grain` except possibly the last |
 | `Exec::broadcast(f)` | `f(i)` for `i in 0..budget`, all concurrent, or `Err(Refused)` |
-| `Exec::faer(f)` (feature `faer`) | enter the pool once, hand faer a `Par` of the largest power of two not above the budget |
+| `Exec::external(f)` | enter the pool once and hand the budget as a plain width to an outside library (faer, a vendor BLAS); how it divides the width is that library's concern |
 
 ## Contracts
 
@@ -87,7 +87,6 @@ both go away when tcontract migrates to this crate.
 | Feature | Effect |
 | --- | --- |
 | `parallel` (default) | run on a private pool. Without it the same types exist, `PoolBuilder::build` returns a width-1 pool and every entry runs inline |
-| `faer` | `Exec::faer`; depends on `t4a-faer` (published under the name `faer`), mirroring tenferro-rs |
 | `ledger` | test support: `ledger::max_live(root)`, `live`, `installs`, and `Exec::ledger_root`. Records live tasks per root token and pool installs; compiled out when off |
 
 Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep

@@ -3,7 +3,7 @@
 //! `strided-exec` is the single place that starts tasks. Kernels never see a
 //! scheduler type: they take an [`Exec`], a token for `budget` slots of a
 //! [`Pool`], and split it with [`Exec::fork`], [`Exec::for_ranges`],
-//! [`Exec::broadcast`] or (feature `faer`) `Exec::faer`.
+//! [`Exec::broadcast`] or [`Exec::external`].
 //!
 //! * A [`Pool`] is built once by its owner with [`Pool::builder`].
 //! * [`Exec::new`] mints a token from a pool; [`Exec::serial`] needs none.
@@ -15,7 +15,6 @@
 //!
 //! * `parallel` (default): run on a private pool. Without it the same types
 //!   exist, every pool has width 1 and every entry runs inline.
-//! * `faer`: `Exec::faer`, handing faer a `Par` sized from the budget.
 //! * `ledger`: test support, see the [`ledger`] module.
 //!
 //! # Examples

@@ -51,7 +51,7 @@ pub(crate) fn run_tasks<F: Fn(usize) + Sync>(_pool: &Pool, tasks: usize, _track:
 }
 
 /// Runs `f` on a worker of `pool`, installing only when the caller is not one.
-#[cfg(all(feature = "parallel", feature = "faer"))]
+#[cfg(feature = "parallel")]
 pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R + Send) -> R {
     if in_pool(pool) {
         f()

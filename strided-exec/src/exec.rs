@@ -159,7 +159,7 @@ impl<'p> Exec<'p> {
     ///
     /// The result has budget `min(budget, max)` and the same pool; the dropped
     /// slots are simply not used, so slots are conserved. Callers narrow before
-    /// [`broadcast`](Exec::broadcast) or `Exec::faer` to match a team size chosen
+    /// [`broadcast`](Exec::broadcast) or [`external`](Exec::external) to match a team size chosen
     /// by their own work model. Co-scheduling eligibility is unchanged by
     /// `limit`: a root token stays eligible for `broadcast`, a child produced by
     /// [`fork`](Exec::fork) stays ineligible.
@@ -397,41 +397,35 @@ impl<'p> Exec<'p> {
         Ok(())
     }
 
-    /// Runs `f` with a [`faer::Par`] whose width follows the budget.
+    /// Hands the budget as a plain width to a library outside this stack.
     ///
-    /// This is the only place a bare width exists. The pool is entered once
-    /// (inline when the token is serial or the caller already is a worker of the
-    /// pool), so faer's own parallelism runs on this pool and never on an
-    /// ambient one. The width is the largest power of two not above the budget:
-    /// faer splits `n` threads as `n - n/2` per half, so other widths can reach
-    /// the next power of two in its leaves. A budget of one gives
-    /// [`faer::Par::Seq`]. Without the `parallel` feature the result is always
-    /// `Par::Seq`.
-    ///
-    /// Available with the `faer` cargo feature.
+    /// This is the only place a bare width exists. The token is consumed, the
+    /// pool is entered once (inline when the token is serial, has a budget of
+    /// one, or the caller already is a worker of the pool) and `f` receives the
+    /// budget, for example to build `faer::Par::rayon(width)` or to set a vendor
+    /// BLAS thread count. Whatever the library schedules with that width runs on
+    /// this pool, never on an ambient one. How the library divides the width is
+    /// its own responsibility. Without the `parallel` feature, `f` runs inline
+    /// and receives a width of one.
     ///
     /// # Examples
     ///
     /// ```
     /// use strided_exec::Exec;
     ///
-    /// let width = Exec::serial().faer(|par| match par {
-    ///     faer::Par::Seq => 1,
-    ///     faer::Par::Rayon(n) => n.get(),
-    /// });
+    /// let width = Exec::serial().external(|width| width.get());
     /// assert_eq!(width, 1);
     /// ```
-    #[cfg(feature = "faer")]
-    pub fn faer<R: Send>(self, f: impl FnOnce(faer::Par) -> R + Send) -> R {
+    pub fn external<R: Send>(self, f: impl FnOnce(NonZeroUsize) -> R + Send) -> R {
         #[cfg(feature = "parallel")]
         if let Some(pool) = self.pool {
             if self.budget.get() > 1 {
-                let width = 1usize << self.budget.get().ilog2();
+                let width = self.budget;
                 let _released = self.track.release();
-                return sched::enter(pool, &self.track, move || f(faer::Par::rayon(width)));
+                return sched::enter(pool, &self.track, move || f(width));
             }
         }
-        f(faer::Par::Seq)
+        f(NonZeroUsize::MIN)
     }
 
     /// Root id of this token in the [`ledger`](crate::ledger), if it has one.

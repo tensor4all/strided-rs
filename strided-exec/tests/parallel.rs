@@ -178,3 +178,30 @@ fn limit_keeps_broadcast_eligibility_of_roots_only() {
         assert_eq!(child.broadcast(|_| unreachable!()), Err(Refused::ForkChild));
     });
 }
+
+#[test]
+fn external_hands_the_budget_and_runs_on_the_pool() {
+    let pool = named("ext", 4);
+    for budget in 1..=6 {
+        let (width, name) = Exec::new(&pool, budget)
+            .unwrap()
+            .external(|width| (width.get(), current_name()));
+        assert_eq!(width, budget.min(4));
+        if budget > 1 {
+            assert!(name.starts_with("ext-"), "{name}");
+        }
+    }
+    assert_eq!(Exec::serial().external(|width| width.get()), 1);
+}
+
+#[test]
+fn external_from_a_worker_of_the_pool_runs_in_place() {
+    let pool = named("ext-in", 2);
+    Exec::new(&pool, 2).unwrap().fork(2, |_, _| {
+        let caller = current_name();
+        let inner = Exec::new(&pool, 2)
+            .unwrap()
+            .external(|width| (width.get(), current_name()));
+        assert_eq!(inner, (2, caller));
+    });
+}
