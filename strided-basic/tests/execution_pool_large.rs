@@ -61,7 +61,7 @@ fn large_operation_runs_on_target_pool_workers() {
     assert_eq!(destination.get(&[0]), 1);
     assert_eq!(destination.get(&[LEN - 1]), LEN);
     assert_eq!(
-        strided_exec::ledger::installs(root),
+        threadteam::ledger::installs(root),
         1,
         "the plain caller installed once"
     );
@@ -98,6 +98,6 @@ fn capped_target_pool_limits_concurrent_workers() {
 
     assert!(!wrong_pool.load(Ordering::SeqCst));
     assert!(max_active.load(Ordering::SeqCst) <= 2);
-    assert!(strided_exec::ledger::max_live(root) <= 2);
+    assert!(threadteam::ledger::max_live(root) <= 2);
     assert_eq!(destination.get(&[LEN - 1]), LEN - 1);
 }

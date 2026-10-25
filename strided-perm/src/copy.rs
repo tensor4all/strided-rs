@@ -2,8 +2,8 @@
 
 use crate::fuse::FusionPlanError;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
-use strided_exec::Exec;
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
+use threadteam::Exec;
 
 /// Map a permutation planning failure onto the shared view error vocabulary.
 ///
@@ -177,7 +177,7 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 /// # Examples
 ///
 /// ```
-/// use strided_exec::Exec;
+/// use threadteam::Exec;
 /// use strided_perm::copy_into;
 /// use strided_view::StridedArray;
 ///
@@ -433,7 +433,7 @@ mod tests {
         let data: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
         let src =
             StridedArray::<f64>::from_parts(data, &[rows, cols], &[cols as isize, 1], 0).unwrap();
-        let pool = strided_exec::Pool::builder().threads(2).build().unwrap();
+        let pool = threadteam::Pool::builder().threads(2).build().unwrap();
         let mut dst = StridedArray::<f64>::col_major(&[rows, cols]);
         let exec = Exec::new(&pool, 2).unwrap();
         copy_into(&mut dst.view_mut(), &src.view(), exec).unwrap();

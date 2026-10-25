@@ -10,7 +10,7 @@ use crate::hptt::plan::{ExecMode, GroupedTilePlan, LoopLevel, PermutePlan};
 
 use core::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use strided_exec::Exec;
+use threadteam::Exec;
 
 const ONE: NonZeroUsize = NonZeroUsize::MIN;
 
@@ -752,8 +752,8 @@ mod tests {
         assert_eq!(native_float_kind::<FourAlign1>(), None);
     }
 
-    fn pool(threads: usize) -> strided_exec::Pool {
-        strided_exec::Pool::builder()
+    fn pool(threads: usize) -> threadteam::Pool {
+        threadteam::Pool::builder()
             .threads(threads)
             .build()
             .unwrap()

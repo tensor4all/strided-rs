@@ -7,9 +7,9 @@
 //! `[2000, 3]` case is accepted only by the allocating exact spill path of the
 //! validator.
 
-use strided_exec::{Exec, Pool};
 use strided_perm::{copy_into, copy_into_col_major};
 use strided_view::{StridedError, StridedView, StridedViewMut};
+use threadteam::{Exec, Pool};
 
 /// The interleaved-but-injective case from the issue: `copy_into` must accept
 /// it (the allocation-free validator's pairwise budget is 4096 elements, so it

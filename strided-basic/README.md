@@ -18,7 +18,7 @@ assert_eq!(dst.get(&[1, 2]), 5.0);
 initializing the destination. Success initializes every logical element, not
 unreachable holes.
 
-Every operation that can fan out takes a `strided_exec::Exec` placement token
+Every operation that can fan out takes a `threadteam::Exec` placement token
 as its last parameter (re-exported as `strided_basic::Exec`, with `Pool`).
 `Exec::serial()` runs on the calling thread; `Exec::new(&pool, budget)` splits
 the work within `budget` slots of a pool the caller owns, and an operation below

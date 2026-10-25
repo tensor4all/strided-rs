@@ -6,9 +6,9 @@
 //! example an 8-byte / align-2 array) has to take the generic element-wise
 //! path instead of a misaligned float access.
 
-use strided_exec::Exec;
 use strided_perm::copy_into;
 use strided_view::{StridedView, StridedViewMut};
+use threadteam::Exec;
 
 /// A 4-byte type with alignment 1.
 #[repr(C)]

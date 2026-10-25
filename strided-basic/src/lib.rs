@@ -13,7 +13,7 @@
 //! - [`ElementOp`] trait and implementations ([`Identity`], [`Conj`], [`Transpose`], [`Adjoint`]):
 //!   Type-level element operations applied lazily on access
 //! - [`Exec`] / [`Pool`]: the placement token every fan-out entry takes as its
-//!   last parameter (re-exported from `strided-exec`)
+//!   last parameter (re-exported from `threadteam`)
 //!
 //! # Primary API (view-based, Julia-compatible)
 //!
@@ -126,9 +126,9 @@ pub use raw_ops::{
 };
 pub use reduce_view::{reduce, reduce_axis, reduce_axis_into, zip_reduce};
 pub use simd::MaybeSimdOps;
-pub use strided_exec::{Exec, Pool, PoolBuilder};
 pub use strided_view::view;
 pub use strided_view::*;
+pub use threadteam::{Exec, Pool, PoolBuilder};
 pub use update_view::{map_update_into, zip_update2_into, zip_update3_into};
 /// Block memory size for cache-optimized iteration (L1 cache target).
 ///

@@ -1,6 +1,6 @@
 [package]
 name = "strided-kernel"
-version.workspace = true
+version = "0.8.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -22,7 +22,7 @@ parallel = ["strided-basic/parallel", "strided-fused/parallel"]
 simd = ["strided-basic/simd", "strided-fused/simd"]
 
 [dev-dependencies]
-strided-exec = { workspace = true, features = ["ledger"] }
+threadteam = { workspace = true, features = ["ledger"] }
 num-traits.workspace = true
 criterion.workspace = true
 approx.workspace = true

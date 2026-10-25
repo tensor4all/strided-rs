@@ -13,7 +13,7 @@
 //!
 //! # Threading
 //!
-//! Every copy takes a [`strided_exec::Exec`] placement token as its last
+//! Every copy takes a [`threadteam::Exec`] placement token as its last
 //! parameter and splits the permutation within that budget. A copy of at most
 //! [`MINTHREADLENGTH`] elements runs on the calling thread whatever the budget,
 //! because a fan-out costs more than the copy. The crate never reaches a global

@@ -58,7 +58,7 @@ fn serial_exec_never_initializes_the_global_pool() {
     }
 
     assert!(
-        strided_exec::ledger::global_pool_unstarted(),
+        threadteam::ledger::global_pool_unstarted(),
         "the serial token started the process-global pool"
     );
 }

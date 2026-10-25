@@ -55,5 +55,5 @@ fn serial_and_pooled_work_leave_the_global_pool_unstarted() {
     fused_add(Exec::new(&pool, 4).unwrap());
     drop(pool);
 
-    assert!(strided_exec::ledger::global_pool_unstarted());
+    assert!(threadteam::ledger::global_pool_unstarted());
 }

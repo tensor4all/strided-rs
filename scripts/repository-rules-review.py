@@ -181,7 +181,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
         ),
     ),
     (
-        re.compile(r"threading|rayon|parallel|strided_exec|Exec::|thread_pool"),
+        re.compile(r"threading|rayon|parallel|threadteam|Exec::|thread_pool"),
         frozenset({"CPU Threading Contract"}),
     ),
     (

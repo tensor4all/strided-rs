@@ -2,7 +2,7 @@
 //!
 //! Faithfully ports Julia Strided.jl's `_mapreduce_threaded!` recursive
 //! dimension-splitting strategy. Every split goes through
-//! [`strided_exec::Exec::fork`] or [`strided_exec::Exec::for_ranges`]: the
+//! [`threadteam::Exec::fork`] or [`threadteam::Exec::for_ranges`]: the
 //! token carries the budget and the pool, so this module holds no placement
 //! state of its own.
 
@@ -11,7 +11,7 @@ use crate::kernel::for_each_inner_block_preordered;
 use crate::Result;
 use core::num::NonZeroUsize;
 use std::ops::Range;
-use strided_exec::Exec;
+use threadteam::Exec;
 
 /// Stack-allocated Vec for dims/offsets in recursive threading.
 /// 8 elements covers up to 8-dimensional arrays (after fusion, typically 2-4).
@@ -552,8 +552,8 @@ where
 
 /// A pool of `threads` workers for unit tests.
 #[cfg(test)]
-pub(crate) fn test_pool(threads: usize) -> strided_exec::Pool {
-    strided_exec::Pool::builder()
+pub(crate) fn test_pool(threads: usize) -> threadteam::Pool {
+    threadteam::Pool::builder()
         .threads(threads)
         .build()
         .unwrap()

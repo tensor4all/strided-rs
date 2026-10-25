@@ -22,11 +22,11 @@ use std::cell::Cell;
 #[cfg(feature = "parallel")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use strided_exec::Exec;
-#[cfg(feature = "parallel")]
-use strided_exec::Pool;
 use strided_perm::copy_into;
 use strided_view::{StridedArray, StridedViewMut, INLINE_RANK};
+use threadteam::Exec;
+#[cfg(feature = "parallel")]
+use threadteam::Pool;
 
 struct CountingAllocator;
 
