@@ -301,7 +301,6 @@ fn serial_broadcast_input_replay_does_not_allocate() {
 /// in steady state (the register files are per-thread scratch).
 #[cfg(feature = "parallel")]
 #[test]
-#[ignore = "pooled replay allocates 6-7 times per call since the Exec change (spawn path in strided-exec); assertion kept at 0"]
 fn two_worker_replay_does_not_allocate_above_threshold() {
     let pool = Pool::builder().threads(2).build().unwrap();
     let side = 40usize;

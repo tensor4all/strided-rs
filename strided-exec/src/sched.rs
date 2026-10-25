@@ -20,27 +20,36 @@ pub(crate) fn in_pool(_pool: &Pool) -> bool {
 
 /// Runs `task(0..tasks)` concurrently on `pool` and waits for all of them.
 ///
-/// * Caller is a worker of `pool`: tasks `1..tasks` are spawned into the
-///   current scope, task 0 runs on the caller. Nothing is installed.
+/// The tasks form a recursive binary `rayon::join` tree, whose jobs live on the
+/// stack, so a steady-state call allocates nothing.
+///
+/// * Caller is a worker of `pool`: the tree runs directly on the caller.
+///   Nothing is installed.
 /// * Caller is a plain thread or a worker of another pool: one
-///   `in_place_scope` entry; every task runs on a worker of `pool` and the
-///   caller waits.
+///   `ThreadPool::install` (a stack job) around the tree; every task runs on a
+///   worker of `pool` and the caller waits.
+///
+/// `rayon::join` is only reached on a worker of `pool` (inside `install`, or
+/// when the caller already is one), so it never touches the global registry.
 #[cfg(feature = "parallel")]
 pub(crate) fn run_tasks<F: Fn(usize) + Sync>(pool: &Pool, tasks: usize, track: &Track, task: F) {
-    let inside = in_pool(pool);
-    if !inside {
+    if in_pool(pool) {
+        join_tree(0, tasks, &task);
+    } else {
         track.note_install();
+        pool.inner.install(|| join_tree(0, tasks, &task));
     }
-    let task = &task;
-    pool.inner.in_place_scope(|scope| {
-        let first = usize::from(inside);
-        for k in first..tasks {
-            scope.spawn(move |_| task(k));
-        }
-        if inside {
-            task(0);
-        }
-    });
+}
+
+/// Runs `task(lo..hi)` as a balanced join tree. Must run on a pool worker.
+#[cfg(feature = "parallel")]
+fn join_tree<F: Fn(usize) + Sync>(lo: usize, hi: usize, task: &F) {
+    if hi - lo == 1 {
+        task(lo);
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        rayon::join(|| join_tree(lo, mid, task), || join_tree(mid, hi, task));
+    }
 }
 
 #[cfg(not(feature = "parallel"))]

@@ -11,7 +11,6 @@ use crate::kernel::for_each_inner_block_preordered;
 use crate::Result;
 use core::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::{Mutex, PoisonError};
 use strided_exec::Exec;
 
 /// Stack-allocated Vec for dims/offsets in recursive threading.
@@ -132,14 +131,21 @@ fn fork2<R: Send>(
     left: impl Fn(Exec<'_>) -> R + Sync,
     right: impl Fn(Exec<'_>) -> R + Sync,
 ) -> (R, R) {
-    let slots = [Mutex::new(None), Mutex::new(None)];
+    // Mutex-free result slots: a `Mutex` allocates its lock on first use on
+    // some platforms, which made every call allocate.
+    struct Slot<T>(core::cell::UnsafeCell<Option<T>>);
+    // SAFETY: job `i` is the only writer of slot `i`, and the slots are read only
+    // after `fork` has returned, which waits for every job.
+    unsafe impl<T: Send> Sync for Slot<T> {}
+    let slots = [Slot(Default::default()), Slot(Default::default())];
     exec.fork(2, |i, child| {
         let value = if i == 0 { left(child) } else { right(child) };
-        *slots[i].lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
+        // SAFETY: see `Slot`; each index is written by exactly one job.
+        unsafe { *slots[i].0.get() = Some(value) };
     });
     let [left, right] = slots.map(|slot| {
-        slot.into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
+        slot.0
+            .into_inner()
             .expect("every fork job stores its result")
     });
     (left, right)

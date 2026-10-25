@@ -108,8 +108,8 @@ pub fn live(root: u64) -> usize {
 /// Number of times an entry of `root` had to leave its calling thread to
 /// install work into the pool (a plain thread or a worker of another pool).
 ///
-/// Entries made from a worker of the target pool never count: they spawn into
-/// the current scope without installing. Inline entries never count either.
+/// Entries made from a worker of the target pool never count: they run on
+/// the caller's worker without installing. Inline entries never count either.
 ///
 /// # Examples
 ///

@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// Serial, budget one, or one task: the work runs inline on the calling thread
 /// and the scheduler is never called, so no global pool is started. The caller
-/// is a worker of the pool: tasks are spawned into the current scope, nothing is
+/// is a worker of the pool: the tasks run as a join tree on the caller, nothing is
 /// installed. The caller is a plain thread or a worker of a different pool: the
 /// pool is entered once and the caller waits; the tasks run on the target pool.
 /// No thread-local state is involved at any point.
