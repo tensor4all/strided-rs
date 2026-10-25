@@ -7,7 +7,7 @@ use super::{Exec, PadPlan, RawStridedMut, RawStridedRef};
 
 fn assert_contiguous_pad_matches_scalar<T>(operand_data: &[T], fill: T)
 where
-    T: Copy + Debug + PartialEq + super::MaybeSendSync,
+    T: Copy + Debug + PartialEq + Send + Sync,
 {
     let operand_dims = [3usize, 2];
     let operand_strides = [1isize, -3];

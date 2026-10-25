@@ -23,7 +23,6 @@ use crate::kernel::{
     sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
 use crate::layout_check::is_injective_layout;
-use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Exec, Result, StridedError};
@@ -273,11 +272,11 @@ unsafe fn inner_loop_update3<
 /// ```
 pub fn map_update_into<D, OpD>(
     dest: &mut StridedViewMut<D>,
-    f: impl Fn(D) -> D + MaybeSync,
+    f: impl Fn(D) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
     OpD: ElementOp<D>,
 {
     validate_destination(dest.dims(), dest.strides())?;
@@ -319,12 +318,12 @@ where
 pub fn zip_update2_into<D, A, OpD, OpA>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
-    f: impl Fn(D, A) -> D + MaybeSync,
+    f: impl Fn(D, A) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     OpD: ElementOp<D>,
     OpA: ElementOp<A>,
 {
@@ -380,13 +379,13 @@ pub fn zip_update3_into<D, A, B, OpD, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(D, A, B) -> D + MaybeSync,
+    f: impl Fn(D, A, B) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpD: ElementOp<D>,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,

@@ -7,7 +7,7 @@
 
 use core::mem::MaybeUninit;
 
-use crate::{CopyPlan, Exec, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError};
+use crate::{CopyPlan, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
 
@@ -206,7 +206,7 @@ impl SlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -232,7 +232,7 @@ impl SlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -380,7 +380,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let mut exec = exec;
         self.check_call(dest, operand)?;
@@ -406,7 +406,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let mut exec = exec;
         self.check_call(dest, operand)?;
@@ -425,7 +425,7 @@ impl PadPlan {
 
     fn fill_dest<T>(&self, dest: &mut RawStridedMut<'_, T>, fill: T, exec: Exec<'_>) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         if self.dest_total == 0 {
             return Ok(());
@@ -458,7 +458,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr();
@@ -476,7 +476,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr().cast::<T>();
@@ -494,7 +494,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr();
@@ -525,7 +525,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset = dest.offset();
         let dest_ptr = dest.data_mut().as_mut_ptr().cast::<T>();
@@ -575,7 +575,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let column_total = columns.column_total;
         if column_total == 0 {
@@ -659,7 +659,7 @@ impl PadPlan {
         mut exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         if count == 0 {
             return Ok(());
@@ -819,7 +819,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         if run.len == 0 {
             return Ok(());
@@ -892,7 +892,7 @@ impl PadPlan {
         mut exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let outer_dims = &self.operand_dims[1..];
         let operand_ptr = operand.data().as_ptr();
@@ -976,7 +976,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let dest_offset_base = dest.offset();
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
@@ -1014,7 +1014,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let exec = crate::threading::for_len(exec, self.generic_copy.total);
         if !exec.is_serial() {
@@ -1030,7 +1030,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let exec = crate::threading::for_len(exec, self.generic_copy.total);
         if !exec.is_serial() {
@@ -1082,7 +1082,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let operand_base = operand
             .offset()
@@ -1162,7 +1162,7 @@ impl PadPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let operand_base = operand
             .offset()
@@ -1319,7 +1319,7 @@ impl ConcatenatePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let mut exec = exec;
         self.check_dest_layout(dest)?;
@@ -1355,7 +1355,7 @@ impl ConcatenatePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let mut exec = exec;
         self.check_dest_layout(dest)?;
@@ -1403,9 +1403,9 @@ impl ConcatenatePlan {
         exec: Exec<'_>,
     ) -> Result<bool>
     where
-        D: Copy + MaybeSendSync,
-        T: Copy + MaybeSendSync,
-        Apply: Fn(&mut D, T) + MaybeSendSync,
+        D: Copy + Send + Sync,
+        T: Copy + Send + Sync,
+        Apply: Fn(&mut D, T) + Send + Sync,
     {
         let total = self.segment_starts[self.segment_starts.len() - 1];
         let exec = crate::threading::for_len(exec, total);
@@ -1516,7 +1516,7 @@ impl ConcatenatePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let segment_offset = self.segment_offset(position, dest.offset())?;
         let dest_data = dest.data_mut();
@@ -1539,7 +1539,7 @@ impl ConcatenatePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         let segment_offset = self.segment_offset(position, dest.offset())?;
         let dest_data = dest.data_mut();
@@ -1617,7 +1617,7 @@ impl ReversePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -1643,7 +1643,7 @@ impl ReversePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, operand)?;
         let source_offset = operand
@@ -1996,7 +1996,7 @@ fn compile_contiguous_pad_axis0_columns(
 ///
 /// `ptr..ptr + len` must be a writable destination span with no concurrent
 /// access from another worker.
-unsafe fn fill_raw_span<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: T, exec: Exec<'_>) {
+unsafe fn fill_raw_span<T: Copy + Send + Sync>(ptr: *mut T, len: usize, fill: T, exec: Exec<'_>) {
     if len == 0 {
         return;
     }
@@ -2012,7 +2012,7 @@ unsafe fn fill_raw_span<T: Copy + MaybeSendSync>(ptr: *mut T, len: usize, fill: 
 ///
 /// `ptr..ptr + len` must be a writable destination span with no concurrent
 /// access from another worker.
-unsafe fn fill_raw_span_uninit<T: Copy + MaybeSendSync>(
+unsafe fn fill_raw_span_uninit<T: Copy + Send + Sync>(
     ptr: *mut T,
     len: usize,
     fill: T,

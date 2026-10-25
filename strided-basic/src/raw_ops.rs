@@ -12,8 +12,6 @@
 use crate::{ElementOpApply, RawStridedMut, RawStridedRef, Result};
 use core::ops::{Add, Mul};
 
-use crate::maybe_sync::MaybeSendSync;
-
 /// Rank up to which a fused loop nest is stored inline.
 ///
 /// The stateless [`copy_scale_raw`] family and [`crate::CopyPlan`] fuse any rank:
@@ -621,7 +619,7 @@ pub fn copy_scale_raw<T>(
     scale: T,
 ) -> Result<()>
 where
-    T: Copy + Mul<T, Output = T> + ElementOpApply + MaybeSendSync,
+    T: Copy + Mul<T, Output = T> + ElementOpApply + Send + Sync,
 {
     ensure_same_dims(dest.dims(), src.dims())?;
     match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
@@ -650,7 +648,7 @@ pub fn copy_scale_conj_raw<T>(
     scale: T,
 ) -> Result<()>
 where
-    T: Copy + Mul<T, Output = T> + ElementOpApply + MaybeSendSync,
+    T: Copy + Mul<T, Output = T> + ElementOpApply + Send + Sync,
 {
     ensure_same_dims(dest.dims(), src.dims())?;
     match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
@@ -679,7 +677,7 @@ pub fn axpy_raw<T>(
     alpha: T,
 ) -> Result<()>
 where
-    T: Copy + Add<T, Output = T> + Mul<T, Output = T> + ElementOpApply + MaybeSendSync,
+    T: Copy + Add<T, Output = T> + Mul<T, Output = T> + ElementOpApply + Send + Sync,
 {
     ensure_same_dims(dest.dims(), src.dims())?;
     match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
@@ -708,7 +706,7 @@ pub fn axpy_conj_raw<T>(
     alpha: T,
 ) -> Result<()>
 where
-    T: Copy + Add<T, Output = T> + Mul<T, Output = T> + ElementOpApply + MaybeSendSync,
+    T: Copy + Add<T, Output = T> + Mul<T, Output = T> + ElementOpApply + Send + Sync,
 {
     ensure_same_dims(dest.dims(), src.dims())?;
     match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {

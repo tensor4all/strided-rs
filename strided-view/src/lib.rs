@@ -172,10 +172,6 @@ pub enum StridedError {
     #[error("invalid bool byte value {value}")]
     InvalidBoolByte { value: u8 },
 
-    /// An execution context requested an invalid worker-thread budget.
-    #[error("invalid thread budget {max_threads}")]
-    InvalidThreadBudget { max_threads: usize },
-
     /// The dtype is recognized but unsupported by the selected operation.
     #[error("unsupported dtype {dtype}")]
     UnsupportedDType { dtype: &'static str },

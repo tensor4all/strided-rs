@@ -8,7 +8,7 @@
 use core::mem::MaybeUninit;
 use core::ops::{Add, Mul};
 
-use crate::{Exec, MaybeSendSync, Result, StridedError, StridedView, StridedViewMut};
+use crate::{Exec, Result, StridedError, StridedView, StridedViewMut};
 
 fn same_len(actual: usize, expected: usize) -> Result<()> {
     if actual == expected {
@@ -27,7 +27,7 @@ fn product(shape: &[usize]) -> Result<usize> {
     })
 }
 
-fn for_each_chunk<T: MaybeSendSync, F: Fn(usize, &mut [T]) + crate::MaybeSync>(
+fn for_each_chunk<T: Send + Sync, F: Fn(usize, &mut [T]) + Sync>(
     output: &mut [T],
     operation: F,
     exec: Exec<'_>,
@@ -138,7 +138,7 @@ where
 /// # Errors
 /// Returns `RankMismatch`, `ShapeMismatch`, or `OffsetOverflow` for invalid
 /// shape/buffer lengths, before writing output.
-pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
+pub fn triangular_mask_into_uninit<T: Copy + Send + Sync>(
     output: &mut [MaybeUninit<T>],
     input: &[T],
     shape: &[usize],
@@ -163,7 +163,7 @@ pub fn triangular_mask_into_uninit<T: Copy + MaybeSendSync>(
 /// # Errors
 /// Returns `RankMismatch` or `ShapeMismatch` for invalid shapes and buffer
 /// lengths, and `OffsetOverflow` for unrepresentable layouts, before writing.
-pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
+pub fn triangular_mask_view_into_uninit<T: Copy + Send + Sync>(
     output: &mut [MaybeUninit<T>],
     src: &StridedView<'_, T>,
     k: i64,
@@ -251,7 +251,7 @@ pub fn triangular_mask_view_into_uninit<T: Copy + MaybeSendSync>(
 /// Returns `InvalidAxis`, `ShapeMismatch`, or `OffsetOverflow` for invalid
 /// axes, lengths or unrepresentable layouts. Destination layout validation
 /// may return `NonInjectiveOutputLayout` if injectivity cannot be established.
-pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
+pub fn embed_diagonal_into_uninit<T: Copy + Send + Sync + 'static>(
     output: &mut [MaybeUninit<T>],
     input: &[T],
     shape: &[usize],
@@ -290,7 +290,7 @@ pub fn embed_diagonal_into_uninit<T: Copy + MaybeSendSync + 'static>(
 /// Returns `InvalidAxis`, `ShapeMismatch`, or `OffsetOverflow` for invalid
 /// axes, lengths or unrepresentable layouts. Destination layout validation may
 /// return `NonInjectiveOutputLayout` if injectivity cannot be established.
-pub fn embed_diagonal_view_into_uninit<T: Copy + MaybeSendSync + 'static>(
+pub fn embed_diagonal_view_into_uninit<T: Copy + Send + Sync + 'static>(
     output: &mut [MaybeUninit<T>],
     src: &StridedView<'_, T>,
     axis: usize,

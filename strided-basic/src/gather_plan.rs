@@ -10,9 +10,7 @@ use core::{mem::MaybeUninit, ops::Add};
 use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
 use crate::inline::InlineVec;
 use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
-use crate::{
-    Exec, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT,
-};
+use crate::{Exec, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT};
 
 type AxisVec<T> = InlineVec<T>;
 
@@ -37,7 +35,7 @@ pub struct GatherSpec {
 }
 
 /// Index scalar types accepted by [`GatherPlan`].
-pub trait GatherIndex: Copy + MaybeSendSync {
+pub trait GatherIndex: Copy + Send + Sync {
     fn to_i64(self) -> i64;
 }
 
@@ -584,7 +582,7 @@ impl GatherPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.execute_with_writer(dest, operand, start_indices, exec)
@@ -600,7 +598,7 @@ impl GatherPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.execute_with_writer(dest, operand, start_indices, exec)
@@ -614,7 +612,7 @@ impl GatherPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -732,7 +730,7 @@ impl GatherPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -780,7 +778,7 @@ impl GatherPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -990,7 +988,7 @@ impl DynamicSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.execute_with_writer(dest, operand, starts, exec)
@@ -1004,7 +1002,7 @@ impl DynamicSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.execute_with_writer(dest, operand, starts, exec)
@@ -1018,7 +1016,7 @@ impl DynamicSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1079,7 +1077,7 @@ impl DynamicSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1133,7 +1131,7 @@ impl DynamicSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1182,7 +1180,7 @@ impl DynamicSlicePlan {
         replay: &WindowReplay,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1325,7 +1323,7 @@ impl DynamicUpdateSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         let mut exec = exec;
@@ -1345,7 +1343,7 @@ impl DynamicUpdateSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.check_call(dest, operand, update, starts)?;
@@ -1363,7 +1361,7 @@ impl DynamicUpdateSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1420,7 +1418,7 @@ impl DynamicUpdateSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1473,7 +1471,7 @@ impl DynamicUpdateSlicePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1520,7 +1518,7 @@ impl DynamicUpdateSlicePlan {
         replay: &WindowReplay,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
@@ -1743,7 +1741,7 @@ impl ScatterPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Add<Output = T> + MaybeSendSync,
+        T: Copy + Add<Output = T> + Send + Sync,
         I: GatherIndex,
     {
         self.check_call(dest, operand, scatter_indices, updates)?;
@@ -1763,7 +1761,7 @@ impl ScatterPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Add<Output = T> + MaybeSendSync,
+        T: Copy + Add<Output = T> + Send + Sync,
         I: GatherIndex,
     {
         self.check_call(dest, operand, scatter_indices, updates)?;
@@ -1782,7 +1780,7 @@ impl ScatterPlan {
         combine: F,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
         F: Fn(T, T) -> T + Copy,
@@ -1805,7 +1803,7 @@ impl ScatterPlan {
         combine: F,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
         W: ReadModifyWrite<T>,
         F: Fn(T, T) -> T + Copy,

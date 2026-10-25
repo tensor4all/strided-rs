@@ -4,7 +4,6 @@ use crate::kernel::{
     build_plan_fused, ensure_same_shape, for_each_inner_block_preordered, same_contiguous_layout,
     sequential_contiguous_layout, total_len,
 };
-use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{col_major_strides, StridedArray, StridedView, StridedViewMut};
 use crate::{Exec, Result, StridedError};
@@ -136,7 +135,7 @@ where
 /// select the dtype-specific SIMD kernels of [`crate::ErasedReducePlan`];
 /// callers that reduce with a known operation (sum, product, max, min) on a
 /// supported dtype can use that plan for the fastest path.
-pub fn reduce<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+pub fn reduce<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
@@ -144,14 +143,14 @@ pub fn reduce<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     exec: Exec<'_>,
 ) -> Result<U>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     reduce_impl(src, map_fn, reduce_fn, init, exec)
 }
 
-fn reduce_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+fn reduce_impl<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
     reduce_fn: R,
@@ -159,9 +158,9 @@ fn reduce_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     exec: Exec<'_>,
 ) -> Result<U>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let src_ptr = src.ptr();
     let src_dims = src.dims();
@@ -473,13 +472,13 @@ pub fn zip_reduce<A, B, OpA, OpB, M, R, U>(
     exec: Exec<'_>,
 ) -> Result<U>
 where
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
-    M: Fn(A, B) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(A, B) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     ensure_same_shape(a.dims(), b.dims())?;
 
@@ -633,7 +632,7 @@ where
 /// `exec` once the number of source elements read exceeds the threading
 /// threshold; each output is computed by one task, so the result does not
 /// depend on the budget.
-pub fn reduce_axis<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+pub fn reduce_axis<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     axis: usize,
     map_fn: M,
@@ -642,9 +641,9 @@ pub fn reduce_axis<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     exec: Exec<'_>,
 ) -> Result<StridedArray<U>>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     if axis >= rank {
@@ -709,7 +708,7 @@ where
 /// Validation runs here; [`reduce_axis_into_impl`] is the shared kernel. The
 /// array-returning wrapper owns a fresh column-major destination and calls the
 /// kernel directly, so the common path does not re-validate.
-pub fn reduce_axis_into<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+pub fn reduce_axis_into<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     dest: &mut StridedViewMut<U>,
     src: &StridedView<T, Op>,
     axis: usize,
@@ -719,9 +718,9 @@ pub fn reduce_axis_into<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     if axis >= rank {
@@ -771,7 +770,7 @@ where
 /// full reduction) and an injective layout; the public entry validates that,
 /// while the array-returning wrapper owns a freshly allocated column-major
 /// destination and can skip the re-validation.
-fn reduce_axis_into_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
+fn reduce_axis_into_impl<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     dest: &mut StridedViewMut<U>,
     src: &StridedView<T, Op>,
     axis: usize,
@@ -781,9 +780,9 @@ fn reduce_axis_into_impl<T: Copy + MaybeSendSync, Op: ElementOp<T>, M, R, U>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    M: Fn(T) -> U + MaybeSync,
-    R: Fn(U, U) -> U + MaybeSync,
-    U: Clone + MaybeSendSync,
+    M: Fn(T) -> U + Sync,
+    R: Fn(U, U) -> U + Sync,
+    U: Clone + Send + Sync,
 {
     let rank = src.ndim();
     let src_dims = src.dims();

@@ -13,14 +13,14 @@ keywords = ["tensor", "strided", "kernels", "softmax"]
 categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
-# The kernel fans out through strided-basic's policy-aware primitive; a serial
-# `ExecContext` still runs it inline without touching any pool.
+# The kernel fans out through strided-basic's budgeted primitive; a serial
+# `Exec` still runs it inline without touching any pool.
 strided-basic = { workspace = true, features = ["parallel"] }
 elem-simd-math.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-rayon.workspace = true
+strided-exec = { workspace = true, features = ["ledger"] }
 
 [lib]
 bench = false

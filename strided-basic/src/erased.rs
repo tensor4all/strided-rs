@@ -741,7 +741,7 @@ fn execute_copy<T>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     let source_data = src.data_as::<T>()?;
     let dest_dims = dest.dims();
@@ -763,7 +763,7 @@ fn execute_concatenate<T>(
     mut exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     if inputs.len() != plan.input_count() {
         return Err(StridedError::RankMismatch(inputs.len(), plan.input_count()));
@@ -832,7 +832,7 @@ fn execute_concatenate_uninit<T>(
     mut exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync + KernelStorageElement,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
@@ -983,7 +983,8 @@ impl ErasedUpdatePlan {
     ) -> Result<()>
     where
         T: Copy
-            + crate::MaybeSendSync
+            + Send
+            + Sync
             + KernelStorageElement
             + core::ops::Add<Output = T>
             + core::ops::Mul<Output = T>
@@ -1065,7 +1066,8 @@ impl ErasedUpdatePlan {
     ) -> Result<()>
     where
         T: Copy
-            + crate::MaybeSendSync
+            + Send
+            + Sync
             + KernelStorageElement
             + core::ops::Mul<Output = T>
             + One
@@ -1432,7 +1434,8 @@ trait ErasedReduceScalar:
     + Copy
     + One
     + Zero
-    + crate::MaybeSendSync
+    + Send
+    + Sync
     + crate::simd::MaybeSimdOps
     + crate::simd::MaybeSimdProduct
     + crate::simd::MaybeSimdSumSquares

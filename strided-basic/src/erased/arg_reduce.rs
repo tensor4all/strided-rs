@@ -436,7 +436,7 @@ impl ErasedArgReducePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: KernelStorageElement + MaybeSendSync,
+        T: KernelStorageElement + Send + Sync,
         I: ArgIndex,
         W: ReduceWriter<I>,
         F: KeyFn<T>,
@@ -485,7 +485,7 @@ impl<T, I, F, D> Copy for ArgUnit<T, I, F, D> {}
 
 impl<T, I, F, D> UnitKernel for ArgUnit<T, I, F, D>
 where
-    T: KernelStorageElement + MaybeSendSync,
+    T: KernelStorageElement + Send + Sync,
     I: ArgIndex,
     F: KeyFn<T>,
     D: Direction,
@@ -529,7 +529,7 @@ fn check_arg_dtype(dtype: KernelDType, op: ArgReduceOp) -> Result<()> {
 }
 
 /// Index element written to the destination.
-pub(super) trait ArgIndex: KernelStorageElement + MaybeSendSync {
+pub(super) trait ArgIndex: KernelStorageElement + Send + Sync {
     fn from_index(index: usize) -> Self;
 }
 

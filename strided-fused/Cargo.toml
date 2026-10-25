@@ -23,7 +23,7 @@ parallel = ["strided-basic/parallel"]
 simd = ["strided-basic/simd"]
 
 [dev-dependencies]
-rayon.workspace = true
+strided-exec = { workspace = true, features = ["ledger"] }
 elem-simd-math.workspace = true
 num-traits.workspace = true
 criterion.workspace = true

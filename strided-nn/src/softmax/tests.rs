@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
 
-use strided_basic::ExecContext;
+use strided_basic::Exec;
 
 use super::*;
 
@@ -40,7 +40,7 @@ fn columns_normalize_in_both_dtypes() {
     for (got, &want) in run(
         |out| {
             let mut scratch = vec![0.0f64; scratch_len::<f64>(3, xs.len(), 2)];
-            softmax_axis0_f64(ExecContext::serial(), 3, &xs, out, &mut scratch)
+            softmax_axis0_f64(3, &xs, out, &mut scratch, Exec::serial())
         },
         xs.len(),
     )
@@ -53,7 +53,7 @@ fn columns_normalize_in_both_dtypes() {
     let got = run(
         |out| {
             let mut scratch = vec![0.0f32; scratch_len::<f32>(3, xs32.len(), 2)];
-            softmax_axis0_f32(ExecContext::serial(), 3, &xs32, out, &mut scratch)
+            softmax_axis0_f32(3, &xs32, out, &mut scratch, Exec::serial())
         },
         xs32.len(),
     );
@@ -76,19 +76,20 @@ fn multi_worker_scratch_matches_the_serial_result() {
     let want = run(
         |out| {
             let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 1)];
-            softmax_axis0_f32(ExecContext::serial(), axis_len, &xs, out, &mut scratch)
+            softmax_axis0_f32(axis_len, &xs, out, &mut scratch, Exec::serial())
         },
         xs.len(),
     );
+    let pool = strided_exec::Pool::builder().threads(4).build().unwrap();
     let got = run(
         |out| {
             let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 4)];
             softmax_axis0_f32(
-                ExecContext::max_threads(4).unwrap(),
                 axis_len,
                 &xs,
                 out,
                 &mut scratch,
+                Exec::new(&pool, 4).unwrap(),
             )
         },
         xs.len(),
@@ -107,7 +108,7 @@ fn a_nan_column_stays_nan_and_leaves_the_others_alone() {
     let got = run(
         |out| {
             let mut scratch = vec![0.0f32; scratch_len::<f32>(axis_len, xs.len(), 1)];
-            softmax_axis0_f32(ExecContext::serial(), axis_len, &xs, out, &mut scratch)
+            softmax_axis0_f32(axis_len, &xs, out, &mut scratch, Exec::serial())
         },
         xs.len(),
     );
@@ -122,11 +123,11 @@ fn contract_violations_are_typed_errors() {
     let mut out = [MaybeUninit::<f32>::uninit(); 3];
     let mut scratch = vec![0.0f32; 1024];
     assert_eq!(
-        softmax_axis0_f32(ExecContext::serial(), 0, &xs, &mut out, &mut scratch),
+        softmax_axis0_f32(0, &xs, &mut out, &mut scratch, Exec::serial()),
         Err(SoftmaxError::EmptyAxis)
     );
     assert_eq!(
-        softmax_axis0_f32(ExecContext::serial(), 2, &xs, &mut out, &mut scratch),
+        softmax_axis0_f32(2, &xs, &mut out, &mut scratch, Exec::serial()),
         Err(SoftmaxError::UnevenColumns {
             len: 3,
             axis_len: 2
@@ -134,7 +135,7 @@ fn contract_violations_are_typed_errors() {
     );
     let mut short = [MaybeUninit::<f32>::uninit(); 2];
     assert_eq!(
-        softmax_axis0_f32(ExecContext::serial(), 3, &xs, &mut short, &mut scratch),
+        softmax_axis0_f32(3, &xs, &mut short, &mut scratch, Exec::serial()),
         Err(SoftmaxError::LengthMismatch {
             input: 3,
             output: 2
@@ -142,12 +143,12 @@ fn contract_violations_are_typed_errors() {
     );
     let mut empty: [f32; 0] = [];
     assert!(matches!(
-        softmax_axis0_f32(ExecContext::serial(), 3, &xs, &mut out, &mut empty),
+        softmax_axis0_f32(3, &xs, &mut out, &mut empty, Exec::serial()),
         Err(SoftmaxError::ScratchTooSmall { .. })
     ));
     // An empty input is a valid no-op, even without scratch.
     assert_eq!(
-        softmax_axis0_f32(ExecContext::serial(), 3, &[], &mut [], &mut empty),
+        softmax_axis0_f32(3, &[], &mut [], &mut empty, Exec::serial()),
         Ok(())
     );
 }

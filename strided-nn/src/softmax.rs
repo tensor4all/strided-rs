@@ -13,7 +13,7 @@
 use core::mem::MaybeUninit;
 
 use strided_basic::execution::SendPtr;
-use strided_basic::ExecContext;
+use strided_basic::Exec;
 
 use crate::error::SoftmaxError;
 #[cfg(target_arch = "x86_64")]
@@ -25,12 +25,12 @@ const GROUP_BYTES: usize = 32 * 1024;
 /// Minimum work, in bytes, that justifies one worker.
 const MIN_BYTES_PER_TASK: usize = 32 * 1024;
 
-/// Elements of caller scratch one softmax call needs for `len` elements and
-/// `workers` workers.
+/// Elements of caller scratch one softmax call needs for `len` elements when
+/// the call's [`Exec`] has the given `budget`.
 ///
 /// One task holds one cache-sized group of columns; the number of tasks is what
-/// `workers` and the work per task allow, not the thread count itself, so a wide
-/// pool on a short input does not reserve scratch for workers that never run.
+/// the budget and the work per task allow, not the budget itself, so a wide
+/// token on a short input does not reserve scratch for tasks that never run.
 /// The scratch also caps the fan-out: a region per task and no more.
 ///
 /// # Examples
@@ -42,21 +42,21 @@ const MIN_BYTES_PER_TASK: usize = 32 * 1024;
 /// // One column of one million elements is one task, so one group.
 /// assert_eq!(scratch_len::<f64>(1_000_000, 1_000_000, 64), 1_000_000);
 /// ```
-pub fn scratch_len<T>(axis_len: usize, len: usize, workers: usize) -> usize {
+pub fn scratch_len<T>(axis_len: usize, len: usize, budget: usize) -> usize {
     let element_size = core::mem::size_of::<T>();
     let group = group_elements(axis_len, element_size);
-    group.saturating_mul(tasks_for(len, group, element_size, workers))
+    group.saturating_mul(tasks_for(len, group, element_size, budget))
 }
 
-/// Tasks one call runs: capped by the scratch capacity, the worker budget and
+/// Tasks one call runs: capped by the scratch capacity, the token budget and
 /// the work per task.
-fn tasks_for(len: usize, group: usize, element_size: usize, workers: usize) -> usize {
+fn tasks_for(len: usize, group: usize, element_size: usize, budget: usize) -> usize {
     let groups = len.div_ceil(group).max(1);
     len.saturating_mul(element_size)
         .checked_div(MIN_BYTES_PER_TASK)
         .unwrap_or(0)
         .max(1)
-        .min(workers.max(1))
+        .min(budget.max(1))
         .min(groups)
 }
 
@@ -92,6 +92,7 @@ impl Plan {
         output_len: usize,
         scratch_len: usize,
         element_size: usize,
+        budget: usize,
     ) -> Result<Self, SoftmaxError> {
         if axis_len == 0 {
             return Err(SoftmaxError::EmptyAxis);
@@ -115,8 +116,7 @@ impl Plan {
             });
         }
         let group = group_elements(axis_len, element_size);
-        // The scratch capacity decides how many tasks may run at once; the policy
-        // in the `ExecContext` clamps that further.
+        // The scratch capacity and the token budget decide how many tasks run.
         let capacity = scratch_len / group;
         if capacity == 0 {
             return Err(SoftmaxError::ScratchTooSmall {
@@ -125,8 +125,8 @@ impl Plan {
             });
         }
         let groups = input_len.div_ceil(group);
-        let workers = tasks_for(input_len, group, element_size, capacity);
-        let groups_per_task = groups.div_ceil(workers).max(1);
+        let tasks = tasks_for(input_len, group, element_size, capacity.min(budget));
+        let groups_per_task = groups.div_ceil(tasks).max(1);
         let task = (group * groups_per_task).min(input_len).max(1);
         Ok(Self {
             axis_len,
@@ -138,12 +138,12 @@ impl Plan {
     }
 }
 
-/// Hand each task index to `body` on the context's pool within its budget, or
-/// inline on the calling thread under a serial context.
-fn fan_out<F: Fn(usize) + Sync>(tasks: usize, body: F) {
+/// Hand each task index to `body` within the budget of `exec`, inline on the
+/// calling thread for a serial token.
+fn fan_out<F: Fn(usize) + Sync>(tasks: usize, exec: Exec<'_>, body: F) {
     strided_basic::execution::parallel_map_reduce(
         0..tasks,
-        tasks,
+        exec,
         &|range| {
             for task in range {
                 body(task);
@@ -174,18 +174,25 @@ macro_rules! softmax_axis0 {
         /// cache-sized group.
         ///
         /// The scratch must hold at least one cache-sized group of columns;
-        /// [`scratch_len`] sizes it for a worker count.
+        /// [`scratch_len`] sizes it for the budget of `exec`.
         pub fn $name(
-            exec: ExecContext,
             axis_len: usize,
             input: &[$scalar],
             output: &mut [MaybeUninit<$scalar>],
             scratch: &mut [$scalar],
+            exec: Exec<'_>,
         ) -> Result<(), SoftmaxError> {
             if input.is_empty() {
                 return Ok(());
             }
-            let plan = Plan::new(axis_len, input.len(), output.len(), scratch.len(), $size)?;
+            let plan = Plan::new(
+                axis_len,
+                input.len(),
+                output.len(),
+                scratch.len(),
+                $size,
+                exec.budget().get(),
+            )?;
             let out_ptr = SendPtr(output.as_mut_ptr());
             let scratch_ptr = SendPtr(scratch.as_mut_ptr());
             let body = |task: usize| {
@@ -216,7 +223,7 @@ macro_rules! softmax_axis0 {
                     $scale(out_chunk, plan.axis_len);
                 }
             };
-            exec.run(|| fan_out(plan.tasks, &body));
+            fan_out(plan.tasks, exec, &body);
             Ok(())
         }
 

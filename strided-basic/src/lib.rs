@@ -91,7 +91,6 @@ mod inline;
 mod kernel;
 mod layout_check;
 mod map_view;
-mod maybe_sync;
 mod nan_select;
 mod ops_view;
 mod order;
@@ -117,7 +116,6 @@ pub use map_view::{
     map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
     zip_map4_into, CompareOp,
 };
-pub use maybe_sync::{MaybeSend, MaybeSendSync, MaybeSync};
 pub use nan_select::{nan_propagating_maximum, nan_propagating_minimum};
 pub use ops_view::{
     add, axpy, copy_conj, copy_into, copy_into_col_major, copy_into_uninit, copy_scale,

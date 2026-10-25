@@ -705,7 +705,8 @@ struct Line<T> {
 /// Floating element type supported by the norm plan.
 pub(super) trait NormScalar:
     KernelStorageElement
-    + MaybeSendSync
+    + Send
+    + Sync
     + PartialOrd
     + core::ops::Add<Output = Self>
     + core::ops::Sub<Output = Self>

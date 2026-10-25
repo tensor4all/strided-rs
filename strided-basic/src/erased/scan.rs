@@ -576,7 +576,7 @@ fn check_scan_dtype(dtype: KernelDType) -> Result<()> {
 }
 
 /// Element type supported by scans.
-pub(super) trait ScanScalar: KernelStorageElement + MaybeSendSync {
+pub(super) trait ScanScalar: KernelStorageElement + Send + Sync {
     fn zero() -> Self;
     fn one() -> Self;
     fn scan_add(lhs: Self, rhs: Self) -> Self;

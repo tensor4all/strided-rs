@@ -40,10 +40,7 @@ pub use crate::threading::{
     parallel_map_reduce, parallel_threads_for_len, SendPtr, MINTHREADLENGTH,
 };
 
-use crate::{
-    ElementOp, Exec, InlineVec, MaybeSendSync, MaybeSync, OperandVec, Result, StridedView,
-    StridedViewMut,
-};
+use crate::{ElementOp, Exec, InlineVec, OperandVec, Result, StridedView, StridedViewMut};
 
 /// Prevalidated build plan fused for kernel-family implementations.
 ///
@@ -174,14 +171,10 @@ where
 /// Forwards errors from the owning kernel or callback; callers must still
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
-pub unsafe fn map_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    Op: ElementOp<A>,
->(
+pub unsafe fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -215,16 +208,16 @@ pub unsafe fn map_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map2_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -258,10 +251,10 @@ pub unsafe fn zip_map2_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map3_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -270,7 +263,7 @@ pub unsafe fn zip_map3_into_validated<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
-    f: impl Fn(A, B, C) -> D + MaybeSync,
+    f: impl Fn(A, B, C) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -307,11 +300,11 @@ pub unsafe fn zip_map3_into_validated<
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn zip_map4_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
-    E: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
+    E: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -322,7 +315,7 @@ pub unsafe fn zip_map4_into_validated<
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
     e: &StridedView<E, OpE>,
-    f: impl Fn(A, B, C, E) -> D + MaybeSync,
+    f: impl Fn(A, B, C, E) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -360,13 +353,13 @@ pub unsafe fn zip_map4_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn map_raw_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     Op: ElementOp<A>,
 >(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -402,16 +395,16 @@ pub unsafe fn map_raw_into_validated<
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map2_raw_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut crate::RawStridedMut<'_, D>,
     a: &crate::RawStridedRef<'_, A>,
     b: &crate::RawStridedRef<'_, B>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -535,7 +528,7 @@ pub unsafe fn gather_into_uninit<T, I>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
     plan.execute_uninit(dest, operand, start_indices, exec)
@@ -578,7 +571,7 @@ pub unsafe fn dynamic_slice_into_uninit<T, I>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
     plan.execute_uninit(dest, operand, starts, exec)
@@ -624,7 +617,7 @@ pub unsafe fn dynamic_update_into_uninit<'a, T, I>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
     plan.execute_uninit(dest, operand, update, starts, exec)
@@ -672,7 +665,7 @@ pub unsafe fn scatter_into_uninit<'a, T, I>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + core::ops::Add<Output = T> + MaybeSendSync,
+    T: Copy + core::ops::Add<Output = T> + Send + Sync,
     I: crate::GatherIndex,
 {
     plan.execute_uninit(dest, operand, scatter_indices, updates, combine, exec)

@@ -29,7 +29,8 @@ where
         + Default
         + Mul<T, Output = T>
         + ElementOpApply
-        + MaybeSendSync
+        + Send
+        + Sync
         + num_traits::One,
 {
     let len = src.len();
@@ -360,7 +361,8 @@ fn assert_update_beta_zero_case<T>(
     T: Copy
         + PartialEq
         + core::fmt::Debug
-        + MaybeSendSync
+        + Send
+        + Sync
         + Add<Output = T>
         + Mul<Output = T>
         + num_traits::Zero
@@ -394,7 +396,8 @@ fn assert_execute_uninit_case<T>(
     T: Copy
         + PartialEq
         + core::fmt::Debug
-        + MaybeSendSync
+        + Send
+        + Sync
         + Add<Output = T>
         + Mul<Output = T>
         + num_traits::Zero

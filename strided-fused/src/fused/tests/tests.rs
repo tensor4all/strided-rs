@@ -1,5 +1,14 @@
 use super::*;
 use crate::StridedArray;
+
+/// A pool of `threads` workers for unit tests.
+fn test_pool(threads: usize) -> strided_exec::Pool {
+    strided_exec::Pool::builder()
+        .threads(threads)
+        .build()
+        .unwrap()
+}
+
 #[cfg(feature = "parallel")]
 use std::sync::Mutex;
 
@@ -124,7 +133,7 @@ fn run_interpreter(plan: &FusedPlan, arrays: &[StridedArray<f64>]) -> Vec<f64> {
     let mut out = StridedArray::<f64>::col_major(arrays[0].dims());
     {
         let mut dests = [out.view_mut()];
-        interpret_fused_elementwise_into(&mut dests, &inputs, plan).unwrap();
+        interpret_fused_elementwise_into(&mut dests, &inputs, plan, Exec::serial()).unwrap();
     }
     out.iter().copied().collect()
 }
@@ -161,8 +170,9 @@ fn assert_static_matches_interpreter_within(
     }
 }
 
-/// Replay one plan per static family through `ctx`, reporting each destination.
-fn replay_all_static_families(ctx: crate::ExecContext, mut collect: impl FnMut(&[f64])) {
+/// Replay one plan per static family through tokens from `mint`, reporting each
+/// destination.
+fn replay_all_static_families<'p>(mint: impl Fn() -> Exec<'p>, mut collect: impl FnMut(&[f64])) {
     let mut run = |plan: FusedPlan, arrays: &[StridedArray<f64>]| {
         let inputs: Vec<_> = arrays.iter().map(|array| array.view()).collect();
         let mut output = vec![MaybeUninit::uninit(); arrays[0].len()];
@@ -170,16 +180,7 @@ fn replay_all_static_families(ctx: crate::ExecContext, mut collect: impl FnMut(&
             let mut dest = StridedViewMut::new(&mut output, arrays[0].dims(), &[1], 0).unwrap();
             let validated =
                 validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
-            ctx.run(|| {
-                fused_elementwise_into_uninit(
-                    &mut dest,
-                    &inputs,
-                    &plan,
-                    ctx.is_serial(),
-                    validated,
-                )
-                .unwrap();
-            });
+            fused_elementwise_into_uninit(&mut dest, &inputs, &plan, validated, mint()).unwrap();
         }
         // SAFETY: every plan here has a single output and fully overwrites the destination.
         collect(
@@ -303,40 +304,38 @@ fn replay_all_static_families(ctx: crate::ExecContext, mut collect: impl FnMut(&
 
 #[test]
 fn uninitialized_nonserial_replay_selects_every_static_family() {
-    use crate::ExecContext;
+    let pool = test_pool(2);
 
     reset_uninitialized_static_family_hits();
-    replay_all_static_families(ExecContext::max_threads(2).unwrap(), |_| {});
+    replay_all_static_families(|| Exec::new(&pool, 2).unwrap(), |_| {});
     assert_eq!(uninitialized_static_family_hits(), [1; 7]);
 }
 
 #[test]
 fn uninitialized_serial_replay_selects_every_static_family() {
     reset_uninitialized_static_family_hits();
-    replay_all_static_families(crate::ExecContext::serial(), |_| {});
+    replay_all_static_families(Exec::serial, |_| {});
     assert_eq!(uninitialized_static_family_hits(), [1; 7]);
 }
 
 #[test]
 fn uninitialized_replay_agrees_between_serial_and_bounded_contexts() {
-    use crate::ExecContext;
+    let pool = test_pool(2);
 
     let mut serial = Vec::new();
-    replay_all_static_families(ExecContext::serial(), |values| serial.push(values.to_vec()));
+    replay_all_static_families(Exec::serial, |values| serial.push(values.to_vec()));
     let mut bounded = Vec::new();
-    replay_all_static_families(ExecContext::max_threads(2).unwrap(), |values| {
-        bounded.push(values.to_vec())
-    });
+    replay_all_static_families(
+        || Exec::new(&pool, 2).unwrap(),
+        |values| bounded.push(values.to_vec()),
+    );
     assert_eq!(serial, bounded);
 }
 
 #[cfg(feature = "parallel")]
 #[test]
 fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_threshold() {
-    use crate::{with_execution_policy, ExecContext, ExecutionPolicy};
-    use std::num::NonZeroUsize;
-
-    let len = MINTHREADLENGTH + 65;
+    let len = strided_basic::execution::MINTHREADLENGTH + 65;
     let lhs = vec![ThreadTracked(1); len];
     let rhs = vec![ThreadTracked(2); len];
     let dims = [len];
@@ -354,26 +353,22 @@ fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_thresho
         .into_iter()
         .collect(),
     };
-    let four = NonZeroUsize::new(4).unwrap();
+    let pool = test_pool(4);
 
     let caller = std::thread::current().id();
     let mut output = vec![MaybeUninit::uninit(); len];
     let mut dest = StridedViewMut::new(&mut output, &dims, &unit, 0).unwrap();
     let validated = validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
     UNINIT_WORKER_IDS.lock().unwrap().clear();
-    with_execution_policy(ExecutionPolicy::Rayon { max_threads: four }, || {
-        fused_elementwise_into_uninit(&mut dest, &inputs, &plan, true, validated).unwrap();
-    });
+    fused_elementwise_into_uninit(&mut dest, &inputs, &plan, validated, Exec::serial()).unwrap();
     assert_eq!(*UNINIT_WORKER_IDS.lock().unwrap(), vec![caller]);
 
     let mut output = vec![MaybeUninit::uninit(); len];
     let mut dest = StridedViewMut::new(&mut output, &dims, &unit, 0).unwrap();
     let validated = validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
     UNINIT_WORKER_IDS.lock().unwrap().clear();
-    let ctx = ExecContext::max_threads(2).unwrap();
-    ctx.run(|| {
-        fused_elementwise_into_uninit(&mut dest, &inputs, &plan, false, validated).unwrap();
-    });
+    let exec = Exec::new(&pool, 2).unwrap();
+    fused_elementwise_into_uninit(&mut dest, &inputs, &plan, validated, exec).unwrap();
     let workers = UNINIT_WORKER_IDS.lock().unwrap();
     assert!(
         workers.len() > 1,
@@ -572,7 +567,7 @@ fn specializes_every_op_over_complex() {
         let mut interp_out = StridedArray::<Complex64>::col_major(arrays[0].dims());
         {
             let mut dests = [interp_out.view_mut()];
-            interpret_fused_elementwise_into(&mut dests, &inputs, &plan).unwrap();
+            interpret_fused_elementwise_into(&mut dests, &inputs, &plan, Exec::serial()).unwrap();
         }
         assert!(used_static, "single-op plan should specialize");
         for (actual, expected) in static_out.iter().zip(interp_out.iter()) {
@@ -645,9 +640,7 @@ fn uninitialized_serial_replay_accepts_an_empty_destination() {
     let mut dest = StridedViewMut::new(&mut output, &dims, &strides, 0).unwrap();
     let validated = validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
     let plan = single_op(2, FusedOp::Add, vec![0, 1]);
-    crate::ExecContext::serial().run(|| {
-        fused_elementwise_into_uninit(&mut dest, &inputs, &plan, true, validated).unwrap();
-    });
+    fused_elementwise_into_uninit(&mut dest, &inputs, &plan, validated, Exec::serial()).unwrap();
 }
 
 #[test]
@@ -784,7 +777,7 @@ impl FusedScalar for BroadcastTracked {
 #[cfg(feature = "parallel")]
 #[test]
 fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
-    use crate::{ExecContext, StridedView, StridedViewMut};
+    use crate::{StridedView, StridedViewMut};
     use core::mem::MaybeUninit;
     use std::sync::atomic::Ordering;
 
@@ -815,24 +808,19 @@ fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
         .collect(),
     };
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
-    pool.install(|| {
+    let pool = test_pool(4);
+    {
         let a_view = StridedView::new(&a, &dims, &broadcast_strides, 0).unwrap();
         let b_view = StridedView::new(&b, &dims, &peer_strides, 0).unwrap();
         let inputs = [a_view, b_view];
-        let ctx = ExecContext::max_threads(4).unwrap();
 
         BROADCAST_WORKER_IDS.lock().unwrap().clear();
         BROADCAST_ADDS.store(0, Ordering::SeqCst);
         let mut output = vec![BroadcastTracked(0); len];
         {
             let dest = StridedViewMut::new(&mut output, &dims, &out_strides, 0).unwrap();
-            ctx.run(|| {
-                fused_elementwise_into(&mut [dest], &inputs, &plan).unwrap();
-            });
+            fused_elementwise_into(&mut [dest], &inputs, &plan, Exec::new(&pool, 4).unwrap())
+                .unwrap();
         }
         assert_eq!(
             BROADCAST_ADDS.load(Ordering::SeqCst),
@@ -852,9 +840,8 @@ fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
             let mut dest = StridedViewMut::new(&mut raw, &dims, &out_strides, 0).unwrap();
             let validated =
                 validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
-            ctx.run(|| {
-                fused_elementwise_into_uninit(&mut dest, &inputs, &plan, false, validated).unwrap();
-            });
+            let exec = Exec::new(&pool, 4).unwrap();
+            fused_elementwise_into_uninit(&mut dest, &inputs, &plan, validated, exec).unwrap();
         }
         assert_eq!(
             BROADCAST_ADDS.load(Ordering::SeqCst),
@@ -866,5 +853,5 @@ fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
             workers > 1,
             "uninitialized broadcast replay must split across workers, saw {workers}"
         );
-    });
+    }
 }

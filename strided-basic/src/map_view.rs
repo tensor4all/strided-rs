@@ -10,7 +10,6 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
 use crate::{Result, StridedError};
@@ -322,8 +321,8 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
 }
 
 /// Binary multiplication inner loop for identity element ops.
-trait MulOutput<D: Copy + 'static>: Copy + MaybeSendSync + 'static {
-    type Slot: Copy + MaybeSendSync + 'static;
+trait MulOutput<D: Copy + 'static>: Copy + Send + Sync + 'static {
+    type Slot: Copy + Send + Sync + 'static;
 
     unsafe fn write(dst: *mut Self::Slot, value: D);
 
@@ -338,7 +337,7 @@ trait MulOutput<D: Copy + 'static>: Copy + MaybeSendSync + 'static {
 #[derive(Clone, Copy)]
 struct InitializedOutput;
 
-impl<D: Copy + MaybeSendSync + 'static> MulOutput<D> for InitializedOutput {
+impl<D: Copy + Send + Sync + 'static> MulOutput<D> for InitializedOutput {
     type Slot = D;
 
     #[inline(always)]
@@ -360,7 +359,7 @@ impl<D: Copy + MaybeSendSync + 'static> MulOutput<D> for InitializedOutput {
 #[derive(Clone, Copy)]
 struct UninitializedOutput;
 
-impl<D: Copy + MaybeSendSync + 'static> MulOutput<D> for UninitializedOutput {
+impl<D: Copy + Send + Sync + 'static> MulOutput<D> for UninitializedOutput {
     type Slot = MaybeUninit<D>;
 
     #[inline(always)]
@@ -838,9 +837,9 @@ fn strided_offset_for_contiguous_linear_index(
 #[allow(clippy::too_many_arguments)]
 fn try_contiguous_range_mul<
     O: MulOutput<D>,
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Send + Sync + Mul<B, Output = D> + 'static,
+    B: Copy + Send + Sync + 'static,
 >(
     dst_ptr: *mut O::Slot,
     dims: &[usize],
@@ -976,9 +975,9 @@ fn try_contiguous_range_mul<
 
 fn run_contiguous_range_mul_single_thread<
     O: MulOutput<D>,
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Send + Sync + Mul<B, Output = D> + 'static,
+    B: Copy + Send + Sync + 'static,
 >(
     dst_ptr: *mut O::Slot,
     dims: &[usize],
@@ -1126,10 +1125,10 @@ unsafe fn inner_loop_map4<
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
 /// Source and destination may have different element types.
-pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     map_parts_into::<D, A, Op, NoKernel>(
@@ -1145,14 +1144,10 @@ pub fn map_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<
     )
 }
 
-pub(crate) fn map_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    Op: ElementOp<A>,
->(
+pub(crate) fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -1210,11 +1205,11 @@ pub(crate) fn map_into_validated<
 /// Returns [`StridedError::ShapeMismatch`] when the shapes differ and
 /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout cannot be proven
 /// injective.
-pub fn map_into_uninit_with_kernel<T: Copy + MaybeSendSync>(
+pub fn map_into_uninit_with_kernel<T: Copy + Send + Sync>(
     dest: &mut StridedViewMut<MaybeUninit<T>>,
     src: &StridedView<T>,
     kernel: impl Fn(&[T], &mut [MaybeUninit<T>]) -> bool + Sync,
-    scalar: impl Fn(T) -> T + MaybeSync,
+    scalar: impl Fn(T) -> T + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     map_parts_into::<MaybeUninit<T>, T, Identity, _>(
@@ -1236,10 +1231,10 @@ pub fn map_into_uninit_with_kernel<T: Copy + MaybeSendSync>(
 /// callers either go through the fused traversal (raw ops, `CopyPlan`) or
 /// [`map_raw_into_validated`].
 #[cfg(test)]
-pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op: ElementOp<A>>(
+pub(crate) fn map_raw_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     map_parts_into::<D, A, Op, NoKernel>(
@@ -1256,13 +1251,13 @@ pub(crate) fn map_raw_into<D: Copy + MaybeSendSync, A: Copy + MaybeSendSync, Op:
 }
 
 pub(crate) fn map_raw_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     Op: ElementOp<A>,
 >(
     dest: &mut crate::RawStridedMut<'_, D>,
     src: &crate::RawStridedRef<'_, A>,
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -1282,8 +1277,8 @@ pub(crate) fn map_raw_into_validated<
 
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     Op: ElementOp<A>,
     K: MapKernel<A, D> + Sync,
 >(
@@ -1293,7 +1288,7 @@ fn map_parts_into<
     src_ptr: *const A,
     src_dims: &[usize],
     src_strides: &[isize],
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     kernel: &K,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -1334,8 +1329,8 @@ fn map_contiguous<D: Copy, A: Copy, Op: ElementOp<A>>(
 
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
     Op: ElementOp<A>,
     K: MapKernel<A, D> + Sync,
 >(
@@ -1344,7 +1339,7 @@ fn map_parts_into_validated<
     dst_strides: &[isize],
     src_ptr: *const A,
     src_strides: &[isize],
-    f: impl Fn(A) -> D + MaybeSync,
+    f: impl Fn(A) -> D + Sync,
     kernel: &K,
     _validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
@@ -1434,16 +1429,16 @@ fn map_parts_into_validated<
 /// Source operands `a` and `b` may have different element types from each other
 /// and from `dest`. The closure `f` handles per-element type conversion.
 pub fn zip_map2_into<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     zip_map2_parts_into::<D, A, B, OpA, OpB>(
@@ -1462,16 +1457,16 @@ pub fn zip_map2_into<
 }
 
 pub(crate) fn zip_map2_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -1518,7 +1513,7 @@ pub fn compare_into<T, OpA, OpB>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync + PartialOrd,
+    T: Copy + Send + Sync + PartialOrd,
     OpA: ElementOp<T>,
     OpB: ElementOp<T>,
 {
@@ -1557,7 +1552,7 @@ pub fn compare_into_uninit<T, OpA, OpB>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + MaybeSendSync + PartialOrd,
+    T: Copy + Send + Sync + PartialOrd,
     OpA: ElementOp<T>,
     OpB: ElementOp<T>,
 {
@@ -1611,16 +1606,16 @@ where
 }
 
 pub(crate) fn zip_map2_raw_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
     dest: &mut crate::RawStridedMut<'_, D>,
     a: &crate::RawStridedRef<'_, A>,
     b: &crate::RawStridedRef<'_, B>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -1642,9 +1637,9 @@ pub(crate) fn zip_map2_raw_into_validated<
 
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
@@ -1657,7 +1652,7 @@ fn zip_map2_parts_into<
     b_ptr: *const B,
     b_dims: &[usize],
     b_strides: &[isize],
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, a_dims)?;
@@ -1679,9 +1674,9 @@ fn zip_map2_parts_into<
 
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
@@ -1692,7 +1687,7 @@ fn zip_map2_parts_into_validated<
     a_strides: &[isize],
     b_ptr: *const B,
     b_strides: &[isize],
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Sync,
     _validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -1787,9 +1782,9 @@ fn zip_map2_parts_into_validated<
 #[allow(clippy::too_many_arguments)]
 fn mul_identity_into_raw<
     O: MulOutput<D>,
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + MaybeSendSync + Mul<B, Output = D> + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Send + Sync + Mul<B, Output = D> + 'static,
+    B: Copy + Send + Sync + 'static,
 >(
     dst_ptr: *mut O::Slot,
     dst_dims: &[usize],
@@ -1907,9 +1902,9 @@ fn mul_identity_into_raw<
 /// All views must have the same shape. Broadcast operands should be represented
 /// as stride-0 views before calling this function.
 pub fn mul_into<
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Mul<B, Output = D> + Send + Sync + 'static,
+    B: Copy + Send + Sync + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
@@ -1958,9 +1953,9 @@ pub fn mul_into<
 /// [`StridedError::OffsetOverflow`] when a reachable byte range is not
 /// representable.
 pub fn mul_into_uninit<
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Mul<B, Output = D> + Send + Sync + 'static,
+    B: Copy + Send + Sync + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
@@ -2062,9 +2057,9 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
 /// `a_axes` and `b_axes` map each source axis to an axis of `dest`. Output axes
 /// not referenced by a source operand are treated as stride-0 broadcast axes.
 pub fn broadcast_mul_into<
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Mul<B, Output = D> + Send + Sync + 'static,
+    B: Copy + Send + Sync + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
@@ -2117,9 +2112,9 @@ pub fn broadcast_mul_into<
 /// [`StridedError::OffsetOverflow`] when a reachable byte range is not
 /// representable.
 pub fn broadcast_mul_into_uninit<
-    D: Copy + MaybeSendSync + 'static,
-    A: Copy + Mul<B, Output = D> + MaybeSendSync + 'static,
-    B: Copy + MaybeSendSync + 'static,
+    D: Copy + Send + Sync + 'static,
+    A: Copy + Mul<B, Output = D> + Send + Sync + 'static,
+    B: Copy + Send + Sync + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 >(
@@ -2164,10 +2159,10 @@ pub fn broadcast_mul_into_uninit<
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
 pub fn zip_map3_into<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -2176,7 +2171,7 @@ pub fn zip_map3_into<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
-    f: impl Fn(A, B, C) -> D + MaybeSync,
+    f: impl Fn(A, B, C) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
@@ -2187,10 +2182,10 @@ pub fn zip_map3_into<
 }
 
 pub(crate) fn zip_map3_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -2199,7 +2194,7 @@ pub(crate) fn zip_map3_into_validated<
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
-    f: impl Fn(A, B, C) -> D + MaybeSync,
+    f: impl Fn(A, B, C) -> D + Sync,
     _validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -2314,11 +2309,11 @@ pub(crate) fn zip_map3_into_validated<
 
 /// Quaternary element-wise operation: `dest[i] = f(a[i], b[i], c[i], e[i])`.
 pub fn zip_map4_into<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
-    E: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
+    E: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -2329,7 +2324,7 @@ pub fn zip_map4_into<
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
     e: &StridedView<E, OpE>,
-    f: impl Fn(A, B, C, E) -> D + MaybeSync,
+    f: impl Fn(A, B, C, E) -> D + Sync,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), a.dims())?;
@@ -2342,11 +2337,11 @@ pub fn zip_map4_into<
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn zip_map4_into_validated<
-    D: Copy + MaybeSendSync,
-    A: Copy + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    C: Copy + MaybeSendSync,
-    E: Copy + MaybeSendSync,
+    D: Copy + Send + Sync,
+    A: Copy + Send + Sync,
+    B: Copy + Send + Sync,
+    C: Copy + Send + Sync,
+    E: Copy + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
     OpC: ElementOp<C>,
@@ -2357,7 +2352,7 @@ pub(crate) fn zip_map4_into_validated<
     b: &StridedView<B, OpB>,
     c: &StridedView<C, OpC>,
     e: &StridedView<E, OpE>,
-    f: impl Fn(A, B, C, E) -> D + MaybeSync,
+    f: impl Fn(A, B, C, E) -> D + Sync,
     _validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {

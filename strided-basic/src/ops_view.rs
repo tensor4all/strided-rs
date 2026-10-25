@@ -5,7 +5,6 @@ use crate::kernel::{
     same_contiguous_layout, sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
 use crate::map_view::{map_into, zip_map2_into};
-use crate::maybe_sync::{MaybeSendSync, MaybeSync};
 use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -195,7 +194,7 @@ unsafe fn inner_loop_dot<
 }
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
-pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
+pub fn copy_into<T: Copy + Send + Sync, Op: ElementOp<T>>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
     exec: Exec<'_>,
@@ -266,7 +265,7 @@ pub fn copy_into<T: Copy + MaybeSendSync, Op: ElementOp<T>>(
 /// // SAFETY: the successful copy initialized both destination elements.
 /// assert_eq!(unsafe { dst[1].assume_init() }, 2.0);
 /// ```
-pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
+pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     dest: &mut StridedViewMut<MaybeUninit<T>>,
     src: &StridedView<T>,
     exec: Exec<'_>,
@@ -306,7 +305,7 @@ pub fn copy_into_uninit<T: Copy + MaybeSendSync + 'static>(
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
 ///
 /// Delegates to the centralized permutation-copy dispatch for the actual work.
-pub fn copy_into_col_major<T: Copy + MaybeSendSync + 'static>(
+pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
 ) -> Result<()> {
@@ -316,11 +315,7 @@ pub fn copy_into_col_major<T: Copy + MaybeSendSync + 'static>(
 /// Element-wise addition: `dest[i] += src[i]`.
 ///
 /// Source may have a different element type from destination.
-pub fn add<
-    D: Copy + Add<S, Output = D> + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Op: ElementOp<S>,
->(
+pub fn add<D: Copy + Add<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op: ElementOp<S>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
     exec: Exec<'_>,
@@ -418,11 +413,7 @@ pub fn add<
 /// Element-wise multiplication: `dest[i] *= src[i]`.
 ///
 /// Source may have a different element type from destination.
-pub fn mul<
-    D: Copy + Mul<S, Output = D> + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Op: ElementOp<S>,
->(
+pub fn mul<D: Copy + Mul<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op: ElementOp<S>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
     exec: Exec<'_>,
@@ -527,9 +518,9 @@ pub fn axpy<D, S, A, Op>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    A: Copy + Mul<S, Output = D> + MaybeSync,
-    D: Copy + Add<D, Output = D> + MaybeSendSync,
-    S: Copy + MaybeSendSync,
+    A: Copy + Mul<S, Output = D> + Sync,
+    D: Copy + Add<D, Output = D> + Send + Sync,
+    S: Copy + Send + Sync,
     Op: ElementOp<S>,
 {
     ensure_same_shape(dest.dims(), src.dims())?;
@@ -634,9 +625,9 @@ pub fn fma<D, A, B, OpA, OpB>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    A: Copy + Mul<B, Output = D> + MaybeSendSync,
-    B: Copy + MaybeSendSync,
-    D: Copy + Add<D, Output = D> + MaybeSendSync,
+    A: Copy + Mul<B, Output = D> + Send + Sync,
+    B: Copy + Send + Sync,
+    D: Copy + Add<D, Output = D> + Send + Sync,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 {
@@ -766,7 +757,7 @@ where
 /// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
 /// the traversal plan are stored inline, so a call performs no heap allocation.
 pub fn sum<
-    T: Copy + Zero + Add<Output = T> + MaybeSendSync + simd::MaybeSimdOps,
+    T: Copy + Zero + Add<Output = T> + Send + Sync + simd::MaybeSimdOps,
     Op: ElementOp<T>,
 >(
     src: &StridedView<T, Op>,
@@ -827,9 +818,9 @@ pub fn sum<
 /// the traversal plan are stored inline, so a call performs no heap allocation.
 pub fn dot<A, B, R, OpA, OpB>(a: &StridedView<A, OpA>, b: &StridedView<B, OpB>) -> Result<R>
 where
-    A: Copy + Mul<B, Output = R> + MaybeSendSync + 'static,
-    B: Copy + MaybeSendSync + 'static,
-    R: Copy + Zero + Add<Output = R> + MaybeSendSync + simd::MaybeSimdOps + 'static,
+    A: Copy + Mul<B, Output = R> + Send + Sync + 'static,
+    B: Copy + Send + Sync + 'static,
+    R: Copy + Zero + Add<Output = R> + Send + Sync + simd::MaybeSimdOps + 'static,
     OpA: ElementOp<A>,
     OpB: ElementOp<B>,
 {
@@ -925,7 +916,8 @@ where
         + Mul<Output = T>
         + num_traits::FromPrimitive
         + std::ops::Div<Output = T>
-        + MaybeSendSync,
+        + Send
+        + Sync,
 {
     if src.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
@@ -955,7 +947,8 @@ where
         + Mul<Output = T>
         + num_traits::FromPrimitive
         + std::ops::Div<Output = T>
-        + MaybeSendSync,
+        + Send
+        + Sync,
 {
     if src.ndim() != 2 {
         return Err(StridedError::RankMismatch(src.ndim(), 2));
@@ -983,16 +976,16 @@ pub fn copy_scale<D, S, A, Op>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    A: Copy + Mul<S, Output = D> + MaybeSync,
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
+    A: Copy + Mul<S, Output = D> + Sync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
     Op: ElementOp<S>,
 {
     map_into(dest, src, |x| scale * x, exec)
 }
 
 /// Copy with complex conjugation: `dest[i] = conj(src[i])`.
-pub fn copy_conj<T: Copy + ElementOpApply + MaybeSendSync>(
+pub fn copy_conj<T: Copy + ElementOpApply + Send + Sync>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
     exec: Exec<'_>,
@@ -1064,7 +1057,7 @@ fn element_zero_is_all_bits_zero<T: 'static>() -> bool {
 }
 
 #[inline]
-unsafe fn fill_2d<T: Copy + MaybeSendSync>(
+unsafe fn fill_2d<T: Copy + Send + Sync>(
     dst: *mut T,
     dim0: usize,
     dim1: usize,
@@ -1124,7 +1117,7 @@ unsafe fn fill_2d<T: Copy + MaybeSendSync>(
 #[inline]
 unsafe fn fill_contiguous<T>(dst: *mut T, len: usize, value: T)
 where
-    T: Copy + Zero + PartialEq + MaybeSendSync + 'static,
+    T: Copy + Zero + PartialEq + Send + Sync + 'static,
 {
     if element_zero_is_all_bits_zero::<T>() && value == T::zero() {
         std::ptr::write_bytes(dst, 0, len);
@@ -1448,7 +1441,7 @@ unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     scale: T,
     exec: Exec<'_>,
 ) where
-    T: Copy + Mul<Output = T> + MaybeSendSync,
+    T: Copy + Mul<Output = T> + Send + Sync,
 {
     const TILE: usize = 4;
     let row_full = src_rows / TILE * TILE;
@@ -1542,7 +1535,7 @@ unsafe fn try_copy_transpose_scale_2d_identity_tiled<T>(
     exec: Exec<'_>,
 ) -> bool
 where
-    T: Copy + Mul<Output = T> + MaybeSendSync,
+    T: Copy + Mul<Output = T> + Send + Sync,
 {
     if src.ndim() != 2 || dest.ndim() != 2 {
         return false;
@@ -1584,7 +1577,7 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
     scale: T,
     exec: Exec<'_>,
 ) where
-    T: Copy + ElementOpApply + Mul<Output = T> + MaybeSendSync,
+    T: Copy + ElementOpApply + Mul<Output = T> + Send + Sync,
 {
     let total = src_rows.saturating_mul(src_cols);
     if is_parallel(total, &exec) {
@@ -1653,7 +1646,7 @@ pub fn copy_transpose_scale_into<T>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + ElementOpApply + Mul<Output = T> + Zero + One + PartialEq + MaybeSendSync + 'static,
+    T: Copy + ElementOpApply + Mul<Output = T> + Zero + One + PartialEq + Send + Sync + 'static,
 {
     let mut exec = exec;
     if src.ndim() != 2 || dest.ndim() != 2 {

@@ -187,7 +187,7 @@ impl LineLayout {
 
 /// The per-unit kernel of one plan execution, monomorphized for one dtype
 /// and operation.
-pub(super) trait UnitKernel: Copy + crate::MaybeSendSync {
+pub(super) trait UnitKernel: Copy + Send + Sync {
     /// Processes the unit whose first line starts at the given source and
     /// destination element offsets; `width` is 1 in line mode.
     ///

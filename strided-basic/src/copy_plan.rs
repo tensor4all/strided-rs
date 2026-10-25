@@ -21,9 +21,7 @@ use crate::raw_ops::{
     apply_fused_range, apply_spilled_range, fuse_pair_traversal, fused_total, FusedAxis,
     FusedPairLayout, PairTraversal,
 };
-use crate::{
-    ElementOpApply, Exec, MaybeSendSync, RawStridedMut, RawStridedRef, Result, StridedError,
-};
+use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 
 // Same pattern as map_view.rs / outer_product.rs: inline storage in both
 // feature configurations. Only `compile` touches these; `execute*` never
@@ -215,7 +213,7 @@ impl CopyPlan {
         f: impl for<'b, 'e> FnOnce(InitializedRawDest<'b, T>, Exec<'e>) -> R,
     ) -> Result<R>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.execute_uninit(dest, src, exec.reborrow())?;
         let data = dest.data_mut();
@@ -284,7 +282,7 @@ impl CopyPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -309,7 +307,7 @@ impl CopyPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync,
+        T: Copy + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -333,7 +331,7 @@ impl CopyPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Mul<T, Output = T> + MaybeSendSync,
+        T: Copy + Mul<T, Output = T> + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -356,7 +354,7 @@ impl CopyPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + ElementOpApply + MaybeSendSync,
+        T: Copy + ElementOpApply + Send + Sync,
     {
         self.check_call(dest, src)?;
         replay_fused(
@@ -488,8 +486,8 @@ impl UpdatePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
-        F: Fn(T) -> T + MaybeSendSync,
+        T: Copy + Send + Sync + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
+        F: Fn(T) -> T + Send + Sync,
     {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         if beta.is_zero() {
@@ -561,8 +559,8 @@ impl UpdatePlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + MaybeSendSync + Mul<Output = T> + One + PartialEq,
-        F: Fn(T) -> T + MaybeSendSync,
+        T: Copy + Send + Sync + Mul<Output = T> + One + PartialEq,
+        F: Fn(T) -> T + Send + Sync,
     {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         if alpha.is_one() {
@@ -609,10 +607,10 @@ fn replay_fused<D, S, Apply, Op>(
     op: Op,
     exec: Exec<'_>,
 ) where
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Apply: Fn(&mut D, S) + MaybeSendSync,
-    Op: Fn(S) -> S + MaybeSendSync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+    Op: Fn(S) -> S + Send + Sync,
 {
     let src_ptr = src.data().as_ptr();
     let src_base = src.offset();
@@ -662,10 +660,10 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
     op: Op,
     exec: Exec<'_>,
 ) where
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Apply: Fn(&mut D, S) + MaybeSendSync,
-    Op: Fn(S) -> S + MaybeSendSync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+    Op: Fn(S) -> S + Send + Sync,
 {
     let total = fused_total(layout);
     if total == 0 {
@@ -727,10 +725,10 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
     op: Op,
     exec: Exec<'_>,
 ) where
-    D: Copy + MaybeSendSync,
-    S: Copy + MaybeSendSync,
-    Apply: Fn(&mut D, S) + MaybeSendSync,
-    Op: Fn(S) -> S + MaybeSendSync,
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+    Op: Fn(S) -> S + Send + Sync,
 {
     let total = axes.iter().map(|axis| axis.dim).product::<usize>();
     if total == 0 {

@@ -213,7 +213,7 @@ where
 /// `src..src + len` must be readable and `dst..dst + len` writable for the
 /// whole call, the two ranges must not overlap, and no other thread may
 /// access the destination range concurrently.
-pub(crate) unsafe fn copy_contiguous<T: Copy + crate::MaybeSendSync>(
+pub(crate) unsafe fn copy_contiguous<T: Copy + Send + Sync>(
     src: *const T,
     dst: *mut T,
     len: usize,
@@ -242,11 +242,7 @@ pub(crate) unsafe fn copy_contiguous<T: Copy + crate::MaybeSendSync>(
 
 /// Fill a contiguous slice, chunked across the budget of `exec` above the
 /// repository threshold and as one serial `fill` otherwise.
-pub(crate) fn fill_contiguous<T: Copy + crate::MaybeSendSync>(
-    dst: &mut [T],
-    value: T,
-    exec: Exec<'_>,
-) {
+pub(crate) fn fill_contiguous<T: Copy + Send + Sync>(dst: &mut [T], value: T, exec: Exec<'_>) {
     let len = dst.len();
     if is_parallel(len, &exec) {
         let dst = SendPtr(dst.as_mut_ptr());
@@ -274,7 +270,7 @@ pub(crate) fn fill_contiguous<T: Copy + crate::MaybeSendSync>(
 ///
 /// `dst..dst + len` must be writable for the whole call and no other thread
 /// may access the destination range concurrently.
-pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + crate::MaybeSendSync>(
+pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + Send + Sync>(
     dst: *mut T,
     len: usize,
     value: T,
@@ -293,7 +289,7 @@ pub(crate) unsafe fn fill_contiguous_uninit<T: Copy + crate::MaybeSendSync>(
 /// The permutation engine honours the budget it is given, so this is the only
 /// route: a serial token (or a copy at or below the threshold) takes its
 /// calling-thread path.
-pub(crate) fn copy_permuted<T: Copy + crate::MaybeSendSync + 'static>(
+pub(crate) fn copy_permuted<T: Copy + Send + Sync + 'static>(
     dest: &mut crate::StridedViewMut<T>,
     src: &crate::StridedView<T>,
     exec: Exec<'_>,
@@ -308,7 +304,7 @@ pub(crate) fn copy_permuted<T: Copy + crate::MaybeSendSync + 'static>(
 /// native `f32`/`f64` paths apply: a destination reinterpreted as
 /// `MaybeUninit<T>` falls to the generic element path, measured 2.5x slower
 /// on a 4096x4096 `f64` transpose.
-pub(crate) fn copy_permuted_uninit<T: Copy + crate::MaybeSendSync + 'static>(
+pub(crate) fn copy_permuted_uninit<T: Copy + Send + Sync + 'static>(
     dest: &mut crate::StridedViewMut<core::mem::MaybeUninit<T>>,
     src: &crate::StridedView<T>,
     exec: Exec<'_>,
