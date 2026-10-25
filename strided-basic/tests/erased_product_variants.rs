@@ -7,10 +7,12 @@
 //! full-reduction and axis-reduction routes, in a serial context and a verified
 //! two-worker pool.
 
+mod common;
+use common::Budget;
 use num_complex::Complex64;
 use strided_basic::{
-    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ExecContext, KernelDType,
-    KernelStorageElement, ReduceOp,
+    ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, KernelDType, KernelStorageElement,
+    ReduceOp,
 };
 
 /// Largest tensor used per case; sized past `MINTHREADLENGTH` so the parallel
@@ -20,7 +22,7 @@ const LARGE_AXIS_OUTPUTS: usize = (1 << 15) + 37;
 fn run_full<T: KernelStorageElement + Default>(
     dtype: KernelDType,
     op: ReduceOp,
-    ctx: &ExecContext,
+    ctx: &Budget,
     data: &[T],
     dims: &[usize],
     strides: &[isize],
@@ -29,7 +31,7 @@ fn run_full<T: KernelStorageElement + Default>(
     let source = ErasedRawStridedRef::from_slice(data, dims, strides, 0).unwrap();
     let mut output = [T::default()];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut output, &[], &[], 0).unwrap();
-    plan.execute(ctx, &mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, ctx.exec()).unwrap();
     output[0]
 }
 
@@ -37,7 +39,7 @@ fn run_full<T: KernelStorageElement + Default>(
 fn run_axes<T: KernelStorageElement + Default>(
     dtype: KernelDType,
     op: ReduceOp,
-    ctx: &ExecContext,
+    ctx: &Budget,
     data: &[T],
     dims: &[usize],
     strides: &[isize],
@@ -52,7 +54,7 @@ fn run_axes<T: KernelStorageElement + Default>(
     let mut output = vec![T::default(); dest_dims.iter().product::<usize>().max(1)];
     let mut dest =
         ErasedRawStridedMut::from_slice_mut(&mut output, dest_dims, dest_strides, 0).unwrap();
-    plan.execute(ctx, &mut dest, &source).unwrap();
+    plan.execute(&mut dest, &source, ctx.exec()).unwrap();
     output
 }
 
@@ -207,17 +209,9 @@ fn wild_f32(state: &mut u64) -> f32 {
 /// Runs `f` in a pool holding exactly two workers and verifies both the pool
 /// and the context budget before executing.
 #[cfg(feature = "parallel")]
-fn with_two_workers<R: Send>(f: impl FnOnce(&ExecContext) -> R + Send) -> R {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
-    ExecContext::run_on(&pool, 2, |ctx| {
-        assert_eq!(rayon::current_num_threads(), 2);
-        assert_eq!(ctx.max_threads_limit().map(|value| value.get()), Some(2));
-        f(&ctx)
-    })
-    .unwrap()
+#[cfg(feature = "parallel")]
+fn with_two_workers<R: Send>(f: impl FnOnce(&Budget) -> R + Send) -> R {
+    f(&Budget::Pooled(2))
 }
 
 /// The #2150 shape: alternating `2.0`/`0.5`. The stable product must be exactly
@@ -235,7 +229,7 @@ fn stable_product_alternating_two_and_half_is_exactly_one() {
         let dims = [count];
         let strides = [1isize];
 
-        let serial = ExecContext::serial();
+        let serial = Budget::Serial;
         assert_eq!(
             run_full(
                 KernelDType::F64,
@@ -297,7 +291,7 @@ fn stable_product_extreme_exponents_match_reference() {
     let dims = [64usize, 32];
     let strides = [1isize, 64];
 
-    let check_f64 = |ctx: &ExecContext, label: &str| {
+    let check_f64 = |ctx: &Budget, label: &str| {
         let expected = reference_product_f64(&f64_input);
         let got = run_full(
             KernelDType::F64,
@@ -312,7 +306,7 @@ fn stable_product_extreme_exponents_match_reference() {
             "f64 full {label}: got {got:e}, reference {expected:e}"
         );
     };
-    let check_f32 = |ctx: &ExecContext, label: &str| {
+    let check_f32 = |ctx: &Budget, label: &str| {
         let expected = reference_product_f32(&f32_input);
         let got = run_full(
             KernelDType::F32,
@@ -328,8 +322,8 @@ fn stable_product_extreme_exponents_match_reference() {
         );
     };
 
-    check_f64(&ExecContext::serial(), "serial");
-    check_f32(&ExecContext::serial(), "serial");
+    check_f64(&Budget::Serial, "serial");
+    check_f32(&Budget::Serial, "serial");
     #[cfg(feature = "parallel")]
     with_two_workers(|ctx| {
         check_f64(ctx, "2T");
@@ -355,7 +349,7 @@ fn stable_product_extreme_exponents_match_reference() {
         let got = run_axes(
             KernelDType::F64,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             &matrix_f64,
             &mdims,
             &mstrides,
@@ -373,7 +367,7 @@ fn stable_product_extreme_exponents_match_reference() {
         let got32 = run_axes(
             KernelDType::F32,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             &matrix_f32,
             &mdims,
             &mstrides,
@@ -464,7 +458,7 @@ fn stable_product_strided_and_output_block_routes() {
     let got = run_full(
         KernelDType::F64,
         ReduceOp::StableProduct,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &storage,
         &dims,
         &strides,
@@ -589,7 +583,7 @@ fn stable_product_specials_match_ordered_fold() {
         let serial = run_full(
             KernelDType::F64,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             case,
             &dims,
             &strides,
@@ -630,7 +624,7 @@ fn stable_product_specials_match_ordered_fold() {
     let got = run_axes(
         KernelDType::F64,
         ReduceOp::StableProduct,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &data,
         &dims,
         &strides,
@@ -654,7 +648,7 @@ fn stable_product_specials_match_ordered_fold() {
         let got = run_full(
             KernelDType::F32,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             &case32,
             &dims,
             &strides,
@@ -669,7 +663,7 @@ fn stable_product_specials_match_ordered_fold() {
     let got32 = run_axes(
         KernelDType::F32,
         ReduceOp::StableProduct,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &data32,
         &dims,
         &strides,
@@ -708,7 +702,7 @@ fn stable_product_subnormals_match_ordered_fold() {
         let got = run_full(
             KernelDType::F64,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             case,
             &dims,
             &strides,
@@ -728,7 +722,7 @@ fn stable_product_subnormals_match_ordered_fold() {
     let got = run_full(
         KernelDType::F32,
         ReduceOp::StableProduct,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &case,
         &[case.len()],
         &[1isize],
@@ -760,7 +754,7 @@ fn reassociated_product_matches_ordered_fold_on_normals() {
     let got = run_full(
         KernelDType::F64,
         ReduceOp::Product,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &f64_input,
         &dims,
         &strides,
@@ -777,7 +771,7 @@ fn reassociated_product_matches_ordered_fold_on_normals() {
     let got32 = run_full(
         KernelDType::F32,
         ReduceOp::Product,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &f32_input,
         &dims,
         &strides,
@@ -794,7 +788,7 @@ fn reassociated_product_matches_ordered_fold_on_normals() {
     let got = run_axes(
         KernelDType::F64,
         ReduceOp::Product,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &f64_input,
         &mdims,
         &mstrides,
@@ -817,7 +811,7 @@ fn reassociated_product_matches_ordered_fold_on_normals() {
     let got = run_full(
         KernelDType::I64,
         ReduceOp::Product,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &integers,
         &[integers.len()],
         &[1isize],
@@ -826,7 +820,7 @@ fn reassociated_product_matches_ordered_fold_on_normals() {
     let got = run_full(
         KernelDType::F64,
         ReduceOp::Product,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &[] as &[f64],
         &[0usize],
         &[1isize],
@@ -854,7 +848,7 @@ fn stable_product_complex_is_source_order() {
     let got = run_full(
         KernelDType::C64,
         ReduceOp::StableProduct,
-        &ExecContext::serial(),
+        &Budget::Serial,
         &input,
         &[input.len()],
         &[1isize],
@@ -926,7 +920,7 @@ fn stable_product_axis_fallback_is_per_output() {
     let mut expected_blocks = vec![1.0f64; 64];
     expected_blocks[5] = 0.0;
 
-    let run = |ctx: &ExecContext, label: &str| {
+    let run = |ctx: &Budget, label: &str| {
         let got = run_axes(
             KernelDType::F64,
             ReduceOp::StableProduct,
@@ -967,7 +961,7 @@ fn stable_product_axis_fallback_is_per_output() {
         assert_eq!(got, expected_blocks, "output-blocks {label}");
     };
 
-    run(&ExecContext::serial(), "serial");
+    run(&Budget::Serial, "serial");
     #[cfg(feature = "parallel")]
     with_two_workers(|ctx| run(ctx, "2T"));
 }
@@ -987,7 +981,7 @@ fn stable_product_fixed_bit_rounding_boundaries() {
         run_full(
             KernelDType::F64,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             data,
             &[data.len()],
             &[1isize],
@@ -997,7 +991,7 @@ fn stable_product_fixed_bit_rounding_boundaries() {
         run_full(
             KernelDType::F32,
             ReduceOp::StableProduct,
-            &ExecContext::serial(),
+            &Budget::Serial,
             data,
             &[data.len()],
             &[1isize],

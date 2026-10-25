@@ -6,7 +6,7 @@
 //! normalization in `threading` opens the split; this bench reports the one and
 //! four worker rows so a regression is visible.
 //!
-//! Every row runs in an explicitly bounded Rayon pool whose width is asserted,
+//! Every row runs in an explicitly bounded strided pool whose width is asserted,
 //! so the number on a `SUMMARY` line always belongs to the configuration named
 //! there.
 //!
@@ -15,12 +15,10 @@
 //! ```
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use strided_basic::{
-    with_execution_policy, zip_map2_into, ExecutionPolicy, StridedView, StridedViewMut,
-};
+use strided_basic::{zip_map2_into, StridedView, StridedViewMut};
+use strided_basic::{Exec, Pool};
 
 const WARMUPS: usize = 4;
 const SAMPLES: usize = 15;
@@ -60,44 +58,38 @@ fn measure(label: &str, rows: usize, cols: usize, threads: usize) {
     let b: Vec<f64> = (0..len).map(|index| (index % 17) as f64 - 8.0).collect();
     let mut out = vec![0.0f64; len];
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .unwrap();
-    pool.install(|| {
-        assert_eq!(
-            rayon::current_num_threads(),
-            threads,
-            "the pool must actually hold the thread count the line reports"
-        );
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(threads).unwrap(),
-            },
-            || {
-                let repeats = repeats(len);
-                let mut run = || {
-                    let a_view = StridedView::<f64>::new(&a, &dims, &broadcast_strides, 0).unwrap();
-                    let b_view = StridedView::<f64>::new(&b, &dims, &peer_strides, 0).unwrap();
-                    let mut dest =
-                        StridedViewMut::<f64>::new(&mut out, &dims, &out_strides, 0).unwrap();
-                    zip_map2_into(&mut dest, &a_view, &b_view, |x, y| x + y).unwrap();
-                };
-                for _ in 0..WARMUPS {
-                    run();
-                }
-                let mut samples = Vec::with_capacity(SAMPLES);
-                for _ in 0..SAMPLES {
-                    samples.push(time_ms(repeats, &mut run));
-                }
-                let ms = median(&samples);
-                println!(
-                    "SUMMARY f64 {threads}T n={len:<9} {label:<18} ms={ms:>9.4} ns/el={:>7.3}",
-                    ms * 1e6 / len as f64,
-                );
-            },
-        );
-    });
+    let pool = Pool::builder().threads(threads).build().unwrap();
+    {
+        {
+            let repeats = repeats(len);
+            let mut run = || {
+                let a_view = StridedView::<f64>::new(&a, &dims, &broadcast_strides, 0).unwrap();
+                let b_view = StridedView::<f64>::new(&b, &dims, &peer_strides, 0).unwrap();
+                let mut dest =
+                    StridedViewMut::<f64>::new(&mut out, &dims, &out_strides, 0).unwrap();
+                zip_map2_into(
+                    &mut dest,
+                    &a_view,
+                    &b_view,
+                    |x, y| x + y,
+                    Exec::new(&pool, threads).unwrap(),
+                )
+                .unwrap();
+            };
+            for _ in 0..WARMUPS {
+                run();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                samples.push(time_ms(repeats, &mut run));
+            }
+            let ms = median(&samples);
+            println!(
+                "SUMMARY f64 {threads}T n={len:<9} {label:<18} ms={ms:>9.4} ns/el={:>7.3}",
+                ms * 1e6 / len as f64,
+            );
+        };
+    };
 }
 
 fn main() {

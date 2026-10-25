@@ -1,6 +1,7 @@
 #![cfg(feature = "simd")]
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
+use strided_basic::Exec;
 use strided_basic::{mul_into_uninit, StridedView, StridedViewMut};
 
 macro_rules! check {
@@ -22,7 +23,7 @@ macro_rules! check {
                     let av = StridedView::<$ty>::new(&a, &dims, &a_strides, 1).unwrap();
                     let bv = StridedView::<$ty>::new(&b, &dims, &unit, 1).unwrap();
                     let mut dst = StridedViewMut::new(&mut out, &dims, &unit, 1).unwrap();
-                    mul_into_uninit(&mut dst, &av, &bv).unwrap();
+                    mul_into_uninit(&mut dst, &av, &bv, Exec::serial()).unwrap();
                     // SAFETY: sentinels were written above; kernel success
                     // initializes only the requested interior view.
                     unsafe {
@@ -71,6 +72,7 @@ fn float_special_values() {
         &mut StridedViewMut::new(&mut out, &[7], &[1], 0).unwrap(),
         &StridedView::<f64>::new(&a, &[7], &[1], 0).unwrap(),
         &StridedView::<f64>::new(&b, &[7], &[1], 0).unwrap(),
+        Exec::serial(),
     )
     .unwrap();
     for i in 0..7 {

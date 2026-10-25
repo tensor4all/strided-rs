@@ -4,20 +4,20 @@
 //!
 //! The widening case is the reason the entry exists: `dot` pins the result type
 //! to `A * B`, so `f32` operands cannot accumulate in `f64` there. The
-//! determinism case pins the documented sequential policy: under
-//! `ExecContext::serial()` the result must be bitwise identical whatever the
-//! ambient Rayon pool width is, for inputs above the threading threshold on
+//! determinism case pins the serial token: its result must be bitwise
+//! identical whatever the pool width it runs inside, for inputs above the threading threshold on
 //! both the contiguous and the gapped layout. The empty-layout cases pin the
 //! identity return that keeps a zero-extent view with an arbitrary stride out
 //! of the block planner.
 
 use num_complex::Complex;
+use strided_basic::Exec;
 use strided_basic::{
     dot, reduce, sum, zip_reduce, Conj, ElementOp, Identity, StridedArray, StridedView,
 };
 
 /// Threading threshold of the crate (`threading::MINTHREADLENGTH`); inputs
-/// above it take the parallel branches under a parallel policy.
+/// above it take the parallel branches on a pooled token.
 #[cfg(feature = "parallel")]
 const THREADING_THRESHOLD: usize = 1 << 15;
 
@@ -93,6 +93,7 @@ fn widening_dot_accumulates_f32_operands_in_f64() {
         |x: f32, y: f32| x as f64 * y as f64,
         |x, y| x + y,
         0.0f64,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(wide, expected, "f64 accumulation must keep every unit term");
@@ -115,6 +116,7 @@ fn widening_dot_accumulates_f32_operands_in_f64() {
         |x: f32, y: f32| x as f64 * y as f64,
         |x, y| x + y,
         0.0f64,
+        Exec::serial(),
     )
     .unwrap();
     assert_eq!(permuted_wide, expected);
@@ -130,6 +132,7 @@ fn widening_dot_accumulates_f32_operands_in_f64() {
         |x: f32, y: f32| x as f64 * y as f64,
         |x, y| x + y,
         0.0f64,
+        Exec::serial(),
     )
     .unwrap();
     // Only the even indices of every contiguous block are visited.
@@ -194,7 +197,7 @@ fn matches_naive_reference_for_every_layout() {
         let a = StridedView::<i64, Identity>::new(&data_a, &dims, &strides_a, offset).unwrap();
         let b = StridedView::<i64, Identity>::new(&data_b, &dims, &strides_b, offset).unwrap();
         let expected = naive_reference(&a, &b, map, combine, 0i64);
-        let actual = zip_reduce(&a, &b, map, combine, 0i64).unwrap();
+        let actual = zip_reduce(&a, &b, map, combine, 0i64, Exec::serial()).unwrap();
         assert_eq!(actual, expected, "{name}");
     }
 }
@@ -216,12 +219,20 @@ fn honours_each_operand_element_op() {
     let combine = |x: Complex<f64>, y: Complex<f64>| x + y;
 
     let expected = naive_reference(&a, &b, map, combine, Complex::new(0.0, 0.0));
-    let actual = zip_reduce(&a, &b, map, combine, Complex::new(0.0, 0.0)).unwrap();
+    let actual = zip_reduce(&a, &b, map, combine, Complex::new(0.0, 0.0), Exec::serial()).unwrap();
     assert_eq!(actual, expected);
 
     // The conjugated left operand is really conjugated, not a copy of `a`.
     let plain_a = StridedView::<Complex<f64>, Identity>::new(&data_a, &dims, &strides, 0).unwrap();
-    let plain = zip_reduce(&plain_a, &b, map, combine, Complex::new(0.0, 0.0)).unwrap();
+    let plain = zip_reduce(
+        &plain_a,
+        &b,
+        map,
+        combine,
+        Complex::new(0.0, 0.0),
+        Exec::serial(),
+    )
+    .unwrap();
     assert_ne!(actual, plain);
 }
 
@@ -231,7 +242,15 @@ fn empty_operand_returns_init() {
     let dims = [0usize, 3];
     let a = StridedView::<f64, Identity>::new(&data_a, &dims, &[1, 1], 0).unwrap();
     let b = StridedView::<f64, Identity>::new(&data_a, &dims, &[1, 1], 0).unwrap();
-    let result = zip_reduce(&a, &b, |x: f64, y: f64| x * y, |x, y| x + y, 7.0).unwrap();
+    let result = zip_reduce(
+        &a,
+        &b,
+        |x: f64, y: f64| x * y,
+        |x, y| x + y,
+        7.0,
+        Exec::serial(),
+    )
+    .unwrap();
     assert_eq!(result, 7.0);
 }
 
@@ -242,10 +261,21 @@ fn empty_operand_returns_init() {
 fn empty_non_contiguous_view_returns_the_identity() {
     let data: [f64; 0] = [];
     let view = StridedView::<f64, Identity>::new(&data, &[0, 2], &[0, isize::MAX], 0).unwrap();
-    let zipped = zip_reduce(&view, &view, |x: f64, y: f64| x * y, |x, y| x + y, 7.0).unwrap();
+    let zipped = zip_reduce(
+        &view,
+        &view,
+        |x: f64, y: f64| x * y,
+        |x, y| x + y,
+        7.0,
+        Exec::serial(),
+    )
+    .unwrap();
     assert_eq!(zipped, 7.0);
-    assert_eq!(reduce(&view, |x| x, |x, y| x + y, 7.0).unwrap(), 7.0);
-    assert_eq!(sum(&view).unwrap(), 0.0);
+    assert_eq!(
+        reduce(&view, |x| x, |x, y| x + y, 7.0, Exec::serial()).unwrap(),
+        7.0
+    );
+    assert_eq!(sum(&view, Exec::serial()).unwrap(), 0.0);
     let dotted = dot::<f64, f64, f64, Identity, Identity>(&view, &view).unwrap();
     assert_eq!(dotted, 0.0);
 }
@@ -255,13 +285,27 @@ fn shape_mismatch_is_rejected() {
     let data_a = [1.0f64, 2.0, 3.0, 4.0];
     let a = StridedView::<f64, Identity>::new(&data_a, &[2, 2], &[1, 2], 0).unwrap();
     let same_rank = StridedView::<f64, Identity>::new(&data_a, &[4, 1], &[1, 1], 0).unwrap();
-    let error = zip_reduce(&a, &same_rank, |x: f64, y: f64| x * y, |x, y| x + y, 0.0);
+    let error = zip_reduce(
+        &a,
+        &same_rank,
+        |x: f64, y: f64| x * y,
+        |x, y| x + y,
+        0.0,
+        Exec::serial(),
+    );
     assert!(matches!(
         error,
         Err(strided_basic::StridedError::ShapeMismatch(_, _))
     ));
     let other_rank = StridedView::<f64, Identity>::new(&data_a, &[4], &[1], 0).unwrap();
-    let error = zip_reduce(&a, &other_rank, |x: f64, y: f64| x * y, |x, y| x + y, 0.0);
+    let error = zip_reduce(
+        &a,
+        &other_rank,
+        |x: f64, y: f64| x * y,
+        |x, y| x + y,
+        0.0,
+        Exec::serial(),
+    );
     assert!(matches!(
         error,
         Err(strided_basic::StridedError::RankMismatch(_, _))
@@ -314,19 +358,15 @@ fn threshold_cases(exact: bool) -> Vec<ThresholdCase> {
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use std::num::NonZeroUsize;
-    use strided_basic::{with_execution_policy, ExecContext, ExecutionPolicy};
+    use std::sync::Mutex;
+    use strided_basic::Pool;
 
-    fn pools() -> Vec<rayon::ThreadPool> {
-        [1usize, 2, 4]
-            .into_iter()
-            .map(|threads| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .unwrap()
-            })
-            .collect()
+    /// Pool widths the determinism tests run on. A fresh private pool per width
+    /// keeps every width's slots independent of the others.
+    const WIDTHS: [usize; 3] = [1, 2, 4];
+
+    fn pool_of(width: usize) -> Pool {
+        Pool::builder().threads(width).build().unwrap()
     }
 
     /// Positive control for the determinism tests: the inexact threshold data
@@ -339,7 +379,7 @@ mod parallel {
         // offset at the far corner visit the same elements in the opposite
         // order.
         let case = &threshold_cases(false)[1];
-        let forward = ExecContext::serial().run(|| zip_reduce_sum(case));
+        let forward = zip_reduce_sum(case, Exec::serial());
         let dims = [257usize, 128];
         let strides = [-1isize, -300];
         let offset = 256 + 127 * 300;
@@ -347,9 +387,15 @@ mod parallel {
             StridedView::<f64, Identity>::new(case.a.data(), &dims, &strides, offset).unwrap();
         let reversed_b =
             StridedView::<f64, Identity>::new(case.b.data(), &dims, &strides, offset).unwrap();
-        let reversed = ExecContext::serial().run(|| {
-            zip_reduce(&reversed_a, &reversed_b, |x, y| x * y, |x, y| x + y, 0.0f64).unwrap()
-        });
+        let reversed = zip_reduce(
+            &reversed_a,
+            &reversed_b,
+            |x, y| x * y,
+            |x, y| x + y,
+            0.0f64,
+            Exec::serial(),
+        )
+        .unwrap();
         let left_to_right = naive_reference(
             &case.a.view(),
             &case.b.view(),
@@ -365,13 +411,14 @@ mod parallel {
         assert_ne!(forward.to_bits(), left_to_right.to_bits());
     }
 
-    fn zip_reduce_sum(case: &ThresholdCase) -> f64 {
+    fn zip_reduce_sum(case: &ThresholdCase, exec: Exec<'_>) -> f64 {
         zip_reduce(
             &case.a.view(),
             &case.b.view(),
             |x, y| x * y,
             |x, y| x + y,
             0.0f64,
+            exec,
         )
         .unwrap()
     }
@@ -390,105 +437,73 @@ mod parallel {
                 |x, y| x + y,
                 0.0f64,
             );
-            let serial = ExecContext::serial().run(|| zip_reduce_sum(&case));
+            let serial = zip_reduce_sum(&case, Exec::serial());
             assert_eq!(serial, reference, "{} serial", case.name);
-            for pool in pools()
-                .into_iter()
-                .filter(|pool| pool.current_num_threads() > 1)
-            {
-                let width = pool.current_num_threads();
-                let policy = ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(width).unwrap(),
-                };
-                let actual =
-                    pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&case)));
+            for width in WIDTHS.into_iter().filter(|&width| width > 1) {
+                let pool = pool_of(width);
+                let exec = Exec::new(&pool, width).unwrap();
+                let root = exec.ledger_root().unwrap();
+                let actual = zip_reduce_sum(&case, exec);
                 assert_eq!(actual, reference, "{} width {width}", case.name);
+                assert!(
+                    strided_exec::ledger::max_live(root) <= width,
+                    "{} width {width} exceeded its slot budget",
+                    case.name
+                );
             }
         }
     }
 
-    /// The documented sequential policy route: `ExecContext::serial()` (which
-    /// is `ExecutionPolicy::Sequential`) must produce one bitwise result no
-    /// matter which pool the call runs inside.
+    /// The serial token must produce one bitwise result no matter which pool
+    /// the call runs inside: each job of a pooled fork runs the serial route on
+    /// a pool worker, and the result must equal the calling-thread reference.
     #[test]
-    fn serial_policy_result_is_pool_width_independent() {
+    fn serial_result_is_pool_width_independent() {
         for case in threshold_cases(false) {
             let a = &case.a;
             let b = &case.b;
-            // References run under the same sequential policy, outside any
-            // pool: the ambient policy would use the global pool and could
-            // split.
-            let pool_free = ExecContext::serial().run(|| zip_reduce_sum(&case));
+            let pool_free = zip_reduce_sum(&case, Exec::serial());
             let reference_reduce =
-                ExecContext::serial().run(|| reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64));
-            let reference_reduce = reference_reduce.unwrap();
-            let reference_sum = ExecContext::serial().run(|| sum(&a.view())).unwrap();
-            let reference_dot = ExecContext::serial()
-                .run(|| dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()))
-                .unwrap();
+                reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64, Exec::serial()).unwrap();
+            let reference_sum = sum(&a.view(), Exec::serial()).unwrap();
+            let reference_dot =
+                dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()).unwrap();
 
-            let mut seen = Vec::new();
-            for pool in pools() {
-                let width = pool.current_num_threads();
-                let (zipped, reduced, summed, dotted) = pool.install(|| {
-                    ExecContext::serial().run(|| {
-                        (
-                            zip_reduce_sum(&case),
-                            reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64).unwrap(),
-                            sum(&a.view()).unwrap(),
-                            dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()).unwrap(),
-                        )
-                    })
+            for width in WIDTHS {
+                let pool = pool_of(width);
+                let seen = Mutex::new(Vec::new());
+                Exec::new(&pool, width).unwrap().fork(2, |_job, _child| {
+                    let zipped = zip_reduce_sum(&case, Exec::serial());
+                    let reduced =
+                        reduce(&a.view(), |x| x, |x, y| x + y, 0.0f64, Exec::serial()).unwrap();
+                    let summed = sum(&a.view(), Exec::serial()).unwrap();
+                    let dotted =
+                        dot::<f64, f64, f64, Identity, Identity>(&a.view(), &b.view()).unwrap();
+                    seen.lock().unwrap().push((zipped, reduced, summed, dotted));
                 });
-                assert_eq!(
-                    zipped.to_bits(),
-                    pool_free.to_bits(),
-                    "{} zip_reduce differed inside a {width}-worker pool",
-                    case.name
-                );
-                assert_eq!(
-                    reduced.to_bits(),
-                    reference_reduce.to_bits(),
-                    "{} reduce differed inside a {width}-worker pool",
-                    case.name
-                );
-                assert_eq!(
-                    summed.to_bits(),
-                    reference_sum.to_bits(),
-                    "{} sum differed inside a {width}-worker pool",
-                    case.name
-                );
-                assert_eq!(
-                    dotted.to_bits(),
-                    reference_dot.to_bits(),
-                    "{} dot differed inside a {width}-worker pool",
-                    case.name
-                );
-                seen.push(width);
-            }
-            assert_eq!(seen, vec![1, 2, 4], "{}", case.name);
-        }
-    }
-
-    /// Under a parallel policy the result is repeatable for a fixed thread
-    /// count.
-    #[test]
-    fn parallel_policy_is_repeatable_for_a_fixed_thread_count() {
-        for case in threshold_cases(false) {
-            for pool in pools() {
-                let width = pool.current_num_threads();
-                let policy = ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(width).unwrap(),
-                };
-                let first =
-                    pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&case)));
-                for _ in 0..3 {
-                    let result =
-                        pool.install(|| with_execution_policy(policy, || zip_reduce_sum(&case)));
+                for (zipped, reduced, summed, dotted) in seen.into_inner().unwrap() {
                     assert_eq!(
-                        result.to_bits(),
-                        first.to_bits(),
-                        "{} width {width}",
+                        zipped.to_bits(),
+                        pool_free.to_bits(),
+                        "{} zip_reduce differed inside a {width}-worker pool",
+                        case.name
+                    );
+                    assert_eq!(
+                        reduced.to_bits(),
+                        reference_reduce.to_bits(),
+                        "{} reduce differed inside a {width}-worker pool",
+                        case.name
+                    );
+                    assert_eq!(
+                        summed.to_bits(),
+                        reference_sum.to_bits(),
+                        "{} sum differed inside a {width}-worker pool",
+                        case.name
+                    );
+                    assert_eq!(
+                        dotted.to_bits(),
+                        reference_dot.to_bits(),
+                        "{} dot differed inside a {width}-worker pool",
                         case.name
                     );
                 }

@@ -1,22 +1,33 @@
-//! A large operation inside a target-pool scope fans out on that pool's workers
-//! and never on the ambient one.
+//! A large operation handed a token minted from a target pool fans out on that
+//! pool's workers and never on the calling thread.
 
 #![cfg(feature = "parallel")]
 
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use strided_basic::{map_into, with_execution_pool, StridedArray};
+use strided_basic::{map_into, Exec, Pool, StridedArray};
 
 const LEN: usize = 1 << 17;
 const _: () = assert!(LEN > (1 << 15));
+const WORKER_PREFIX: &str = "strided-large-worker";
+
+fn named_pool() -> Pool {
+    Pool::builder()
+        .threads(4)
+        .thread_name(|i| format!("{WORKER_PREFIX}-{i}"))
+        .build()
+        .unwrap()
+}
+
+fn on_pool_worker() -> bool {
+    std::thread::current()
+        .name()
+        .is_some_and(|name| name.starts_with(WORKER_PREFIX))
+}
 
 #[test]
 fn large_operation_runs_on_target_pool_workers() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
+    let pool = named_pool();
     let source = StridedArray::<usize>::from_fn_col_major(&[LEN], |index| index[0]);
     let mut destination = StridedArray::<usize>::col_major(&[LEN]);
     let caller = std::thread::current().id();
@@ -25,9 +36,13 @@ fn large_operation_runs_on_target_pool_workers() {
     let ran_on_caller = AtomicBool::new(false);
     let visited = AtomicUsize::new(0);
 
-    with_execution_pool(&pool, NonZeroUsize::new(4).unwrap(), || {
-        map_into(&mut destination.view_mut(), &source.view(), |value| {
-            if pool.current_thread_index().is_some() {
+    let exec = Exec::new(&pool, 4).unwrap();
+    let root = exec.ledger_root().unwrap();
+    map_into(
+        &mut destination.view_mut(),
+        &source.view(),
+        |value| {
+            if on_pool_worker() {
                 saw_worker.store(true, Ordering::SeqCst);
             }
             if std::thread::current().id() == caller {
@@ -35,23 +50,26 @@ fn large_operation_runs_on_target_pool_workers() {
             }
             visited.fetch_add(1, Ordering::Relaxed);
             value + 1
-        })
-        .unwrap();
-    });
+        },
+        exec,
+    )
+    .unwrap();
 
     assert!(saw_worker.load(Ordering::SeqCst));
     assert!(!ran_on_caller.load(Ordering::SeqCst));
     assert_eq!(visited.load(Ordering::Relaxed), LEN);
     assert_eq!(destination.get(&[0]), 1);
     assert_eq!(destination.get(&[LEN - 1]), LEN);
+    assert_eq!(
+        strided_exec::ledger::installs(root),
+        1,
+        "the plain caller installed once"
+    );
 }
 
 #[test]
 fn capped_target_pool_limits_concurrent_workers() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
+    let pool = named_pool();
     let source = StridedArray::<usize>::from_fn_col_major(&[LEN], |index| index[0]);
     let mut destination = StridedArray::<usize>::col_major(&[LEN]);
 
@@ -59,9 +77,13 @@ fn capped_target_pool_limits_concurrent_workers() {
     let max_active = AtomicUsize::new(0);
     let wrong_pool = AtomicBool::new(false);
 
-    with_execution_pool(&pool, NonZeroUsize::new(2).unwrap(), || {
-        map_into(&mut destination.view_mut(), &source.view(), |value| {
-            if pool.current_thread_index().is_none() {
+    let exec = Exec::new(&pool, 2).unwrap();
+    let root = exec.ledger_root().unwrap();
+    map_into(
+        &mut destination.view_mut(),
+        &source.view(),
+        |value| {
+            if !on_pool_worker() {
                 wrong_pool.store(true, Ordering::SeqCst);
             }
             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -69,11 +91,13 @@ fn capped_target_pool_limits_concurrent_workers() {
             std::hint::spin_loop();
             active.fetch_sub(1, Ordering::SeqCst);
             value
-        })
-        .unwrap();
-    });
+        },
+        exec,
+    )
+    .unwrap();
 
     assert!(!wrong_pool.load(Ordering::SeqCst));
     assert!(max_active.load(Ordering::SeqCst) <= 2);
+    assert!(strided_exec::ledger::max_live(root) <= 2);
     assert_eq!(destination.get(&[LEN - 1]), LEN - 1);
 }

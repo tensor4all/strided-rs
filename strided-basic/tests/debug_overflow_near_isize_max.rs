@@ -6,6 +6,7 @@
 //! in debug builds (follow-up of issue #264).
 
 use std::ops::{Add, Mul};
+use strided_basic::Exec;
 use strided_basic::*;
 
 /// Zero-sized numeric element, so layouts can span close to `isize::MAX`.
@@ -95,15 +96,15 @@ fn typed_ops_on_near_max_layouts_do_not_overflow() {
         let src = || StridedView::new(&src_data, &c.dims, &c.src_strides, c.src_offset).unwrap();
         let mut dst =
             StridedViewMut::new(&mut dst_data, &c.dims, &c.dst_strides, c.dst_offset).unwrap();
-        copy_into(&mut dst, &src()).unwrap();
+        copy_into(&mut dst, &src(), Exec::serial()).unwrap();
         copy_into_col_major(&mut dst, &src()).unwrap();
-        map_into(&mut dst, &src(), |x| x).unwrap();
-        zip_map2_into(&mut dst, &src(), &src(), |x, y| x + y).unwrap();
-        add(&mut dst, &src()).unwrap();
-        axpy(&mut dst, &src(), Z).unwrap();
-        let count = reduce(&src(), |_| 1u64, |a, b| a + b, 0u64).unwrap();
+        map_into(&mut dst, &src(), |x| x, Exec::serial()).unwrap();
+        zip_map2_into(&mut dst, &src(), &src(), |x, y| x + y, Exec::serial()).unwrap();
+        add(&mut dst, &src(), Exec::serial()).unwrap();
+        axpy(&mut dst, &src(), Z, Exec::serial()).unwrap();
+        let count = reduce(&src(), |_| 1u64, |a, b| a + b, 0u64, Exec::serial()).unwrap();
         assert_eq!(count, element_count(&c.dims));
-        reduce_axis(&src(), 0, |_| 1u64, |a, b| a + b, 0u64).unwrap();
+        reduce_axis(&src(), 0, |_| 1u64, |a, b| a + b, 0u64, Exec::serial()).unwrap();
     }
 }
 
@@ -119,7 +120,7 @@ fn raw_ops_and_copy_plan_on_near_max_layouts_do_not_overflow() {
         axpy_raw(&mut dst, &src, Z).unwrap();
         CopyPlan::compile(&c.dims, &c.dst_strides, &c.src_strides)
             .unwrap()
-            .execute(&mut dst, &src)
+            .execute(&mut dst, &src, Exec::serial())
             .unwrap();
     }
 }

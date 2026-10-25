@@ -1,7 +1,27 @@
 use std::mem::MaybeUninit;
-use strided_basic::{copy_into_uninit, StridedError, StridedView, StridedViewMut};
+use strided_basic::{copy_into_uninit, Exec, StridedError, StridedView, StridedViewMut};
 
 fn check(
+    dims: &[usize],
+    source_strides: &[isize],
+    source_offset: isize,
+    dest_strides: &[isize],
+    dest_offset: isize,
+    extent: usize,
+) {
+    check_exec(
+        Exec::serial(),
+        dims,
+        source_strides,
+        source_offset,
+        dest_strides,
+        dest_offset,
+        extent,
+    );
+}
+
+fn check_exec(
+    exec: Exec<'_>,
     dims: &[usize],
     source_strides: &[isize],
     source_offset: isize,
@@ -27,6 +47,7 @@ fn check(
     copy_into_uninit(
         &mut StridedViewMut::new(&mut output, dims, dest_strides, dest_offset).unwrap(),
         &StridedView::new(&source, dims, source_strides, source_offset).unwrap(),
+        exec,
     )
     .unwrap();
     // SAFETY: all slots started initialized, including holes.
@@ -68,6 +89,7 @@ fn copy_preserves_complex_bits_and_initializes_all_slots() {
     copy_into_uninit(
         &mut StridedViewMut::new(&mut output, &[2], &[1], 0).unwrap(),
         &StridedView::new(&source, &[2], &[-1], 1).unwrap(),
+        Exec::serial(),
     )
     .unwrap();
     for (dst, src) in output.iter().zip(source.iter().rev()) {
@@ -85,6 +107,7 @@ fn invalid_destination_is_unchanged_and_zst_is_supported() {
     let err = copy_into_uninit(
         &mut StridedViewMut::new(&mut output, &[2, 2], &[0, 1], 0).unwrap(),
         &StridedView::new(&source, &[2, 2], &[1, 2], 0).unwrap(),
+        Exec::serial(),
     )
     .unwrap_err();
     assert!(matches!(err, StridedError::NonInjectiveOutputLayout));
@@ -95,6 +118,7 @@ fn invalid_destination_is_unchanged_and_zst_is_supported() {
     copy_into_uninit(
         &mut StridedViewMut::new(&mut zst, &[2, 3], &[1, 2], 0).unwrap(),
         &StridedView::new(&[(); 6], &[2, 3], &[3, 1], 0).unwrap(),
+        Exec::serial(),
     )
     .unwrap();
 }
@@ -109,6 +133,7 @@ fn tiled_float_copies_preserve_bits_and_padded_types_fall_back() {
             copy_into_uninit(
                 &mut StridedViewMut::new(&mut output, &[8, 9], &[1, 8], 0).unwrap(),
                 &StridedView::new(&source, &[8, 9], &[9, 1], 0).unwrap(),
+                Exec::serial(),
             )
             .unwrap();
             for col in 0..9 {
@@ -131,6 +156,7 @@ fn tiled_float_copies_preserve_bits_and_padded_types_fall_back() {
     copy_into_uninit(
         &mut StridedViewMut::new(&mut output, &[2, 2], &[1, 2], 0).unwrap(),
         &StridedView::new(&source, &[2, 2], &[2, 1], 0).unwrap(),
+        Exec::serial(),
     )
     .unwrap();
     for (i, expected) in [source[0], source[2], source[1], source[3]]
@@ -144,30 +170,24 @@ fn tiled_float_copies_preserve_bits_and_padded_types_fall_back() {
 
 #[cfg(feature = "parallel")]
 #[test]
-fn large_permutation_respects_sequential_and_bounded_policy() {
-    use std::num::NonZeroUsize;
-    use strided_basic::{with_execution_policy, ExecutionPolicy};
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap()
-        .install(|| {
-            for policy in [
-                ExecutionPolicy::Sequential,
-                ExecutionPolicy::Rayon {
-                    max_threads: NonZeroUsize::new(2).unwrap(),
-                },
-            ] {
-                with_execution_policy(policy, || {
-                    check(
-                        &[12, 12, 1100],
-                        &[1100, 13200, 1],
-                        0,
-                        &[1, 12, 144],
-                        0,
-                        158400,
-                    );
-                });
-            }
-        });
+fn large_permutation_respects_serial_and_bounded_budget() {
+    use strided_basic::{Exec, Pool};
+    let pool = Pool::builder().threads(4).build().unwrap();
+    let run = |exec: Exec<'_>| {
+        check_exec(
+            exec,
+            &[12, 12, 1100],
+            &[1100, 13200, 1],
+            0,
+            &[1, 12, 144],
+            0,
+            158400,
+        );
+    };
+    run(Exec::serial());
+
+    let exec = Exec::new(&pool, 2).unwrap();
+    let root = exec.ledger_root().unwrap();
+    run(exec);
+    assert!(strided_exec::ledger::max_live(root) <= 2);
 }

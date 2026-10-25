@@ -5,11 +5,14 @@
 //! a broadcast source axis, and a destination layout differing from the
 //! source), so the line, panel and strided fallback kernels are all reached.
 
+mod common;
+use common::Budget;
 use core::mem::MaybeUninit;
 use num_complex::{Complex32, Complex64};
+use strided_basic::Exec;
 use strided_basic::{
     ArgReduceOp, ErasedArgReducePlan, ErasedNormPlan, ErasedRawStridedMut, ErasedRawStridedPtr,
-    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScanPlan, ExecContext, KernelDType,
+    ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedScanPlan, KernelDType,
     KernelStorageElement, NormKind, NormSpec, ScanOp, ScanOptions, StridedError,
 };
 
@@ -249,8 +252,7 @@ fn check_scan<T: KernelStorageElement + core::fmt::Debug>(
             dest_layout.offset,
         )
         .unwrap();
-        plan.execute(&ExecContext::serial(), &mut dest, &src_ref)
-            .unwrap();
+        plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
     }
     let mut uninit = vec![MaybeUninit::new(fill); dest_layout.len];
     {
@@ -262,7 +264,7 @@ fn check_scan<T: KernelStorageElement + core::fmt::Debug>(
             dest_layout.offset,
         )
         .unwrap();
-        plan.execute_uninit(&ExecContext::ambient(), &mut dest, &src_ptr)
+        plan.execute_uninit(&mut dest, &src_ptr, Exec::serial())
             .unwrap();
     }
     let uninit: Vec<T> = uninit.iter().map(|v| unsafe { v.assume_init() }).collect();
@@ -473,8 +475,7 @@ fn scan_empty_axis_and_empty_lines_write_nothing() {
             let src = ErasedRawStridedRef::from_slice(&src, &dims, &[1, 3], 0).unwrap();
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &[1, 3], 0).unwrap();
-            plan.execute(&ExecContext::serial(), &mut dest, &src)
-                .unwrap();
+            plan.execute(&mut dest, &src, Exec::serial()).unwrap();
         }
     }
 }
@@ -573,13 +574,13 @@ fn scan_rejects_invalid_contracts() {
     let mut out = [5.0f64; 4];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[2], &[2], 0).unwrap();
     assert!(matches!(
-        plan.execute(&ExecContext::serial(), &mut dest, &src_ref),
+        plan.execute(&mut dest, &src_ref, Exec::serial()),
         Err(StridedError::PlanLayoutMismatch)
     ));
     let src32_ref = ErasedRawStridedRef::from_slice(&src32, &[2], &[1], 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[2], &[1], 0).unwrap();
     assert!(matches!(
-        plan.execute(&ExecContext::serial(), &mut dest, &src32_ref),
+        plan.execute(&mut dest, &src32_ref, Exec::serial()),
         Err(StridedError::DTypeMismatch { .. })
     ));
     assert_eq!(out, [5.0; 4]);
@@ -600,7 +601,7 @@ fn scan_rejects_invalid_contracts() {
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &[2], &[1], 2).unwrap();
     assert!(matches!(
-        plan.execute_uninit(&ExecContext::serial(), &mut dest, &src_ptr),
+        plan.execute_uninit(&mut dest, &src_ptr, Exec::serial()),
         Err(StridedError::OverlappingInputOutput { input: 0 })
     ));
 }
@@ -686,8 +687,7 @@ fn check_arg<T: KernelStorageElement>(
                 dest_layout.offset,
             )
             .unwrap();
-            plan.execute(&ExecContext::serial(), &mut dest, &src_ref)
-                .unwrap();
+            plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
             let mut uninit = vec![MaybeUninit::new(-1i64); dest_layout.len];
             let src_ptr = ErasedRawStridedPtr::from_ref(&src_ref);
             let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(
@@ -697,7 +697,7 @@ fn check_arg<T: KernelStorageElement>(
                 dest_layout.offset,
             )
             .unwrap();
-            plan.execute_uninit(&ExecContext::ambient(), &mut dest, &src_ptr)
+            plan.execute_uninit(&mut dest, &src_ptr, Exec::serial())
                 .unwrap();
             let uninit: Vec<i64> = uninit.iter().map(|v| unsafe { v.assume_init() }).collect();
             vec![out, uninit]
@@ -710,8 +710,7 @@ fn check_arg<T: KernelStorageElement>(
                 dest_layout.offset,
             )
             .unwrap();
-            plan.execute(&ExecContext::serial(), &mut dest, &src_ref)
-                .unwrap();
+            plan.execute(&mut dest, &src_ref, Exec::serial()).unwrap();
             vec![out.into_iter().map(i64::from).collect()]
         };
         for out in got {
@@ -845,8 +844,7 @@ fn argreduce_complex_magnitude_is_overflow_safe_and_nan_aware() {
         let src = ErasedRawStridedRef::from_slice(values, &dims, &[1], 0).unwrap();
         let mut out = [-1i64];
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[], &[], 0).unwrap();
-        plan.execute(&ExecContext::serial(), &mut dest, &src)
-            .unwrap();
+        plan.execute(&mut dest, &src, Exec::serial()).unwrap();
         assert_eq!(out[0], want, "{op:?} {values:?}");
     };
     check(ArgReduceOp::MaxAbs, 1, &values);
@@ -943,8 +941,7 @@ fn argreduce_rejects_invalid_contracts() {
     let mut out: [i64; 0] = [];
     let src = ErasedRawStridedRef::from_slice(&src, &[3, 0], &[1, 3], 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[0], &[1], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &src)
-        .unwrap();
+    plan.execute(&mut dest, &src, Exec::serial()).unwrap();
 
     let plan = ErasedArgReducePlan::compile(F64, I64, Max, &[2], &[1], &[], &[], 0).unwrap();
     let src = [1.0f64, 2.0];
@@ -952,14 +949,14 @@ fn argreduce_rejects_invalid_contracts() {
     let mut wrong_index = [0i32];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut wrong_index, &[], &[], 0).unwrap();
     assert!(matches!(
-        plan.execute(&ExecContext::serial(), &mut dest, &src_ref),
+        plan.execute(&mut dest, &src_ref, Exec::serial()),
         Err(StridedError::DTypeMismatch { .. })
     ));
     let reversed = ErasedRawStridedRef::from_slice(&src, &[2], &[-1], 1).unwrap();
     let mut out = [7i64];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &[], &[], 0).unwrap();
     assert!(matches!(
-        plan.execute(&ExecContext::serial(), &mut dest, &reversed),
+        plan.execute(&mut dest, &reversed, Exec::serial()),
         Err(StridedError::PlanLayoutMismatch)
     ));
     assert_eq!(out, [7]);
@@ -967,7 +964,7 @@ fn argreduce_rejects_invalid_contracts() {
     let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit, &[], &[], 0).unwrap();
     let reversed_ptr = ErasedRawStridedPtr::from_ref(&reversed);
     assert!(matches!(
-        plan.execute_uninit(&ExecContext::serial(), &mut dest, &reversed_ptr),
+        plan.execute_uninit(&mut dest, &reversed_ptr, Exec::serial()),
         Err(StridedError::PlanLayoutMismatch)
     ));
 }
@@ -1118,11 +1115,11 @@ fn check_norm<T: NormElem>(
         )
         .unwrap();
         plan.execute(
-            &ExecContext::serial(),
             &mut dest,
             &src_ref,
             w_ref.as_ref(),
             b_ref.as_ref(),
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -1139,11 +1136,11 @@ fn check_norm<T: NormElem>(
         )
         .unwrap();
         plan.execute_uninit(
-            &ExecContext::ambient(),
             &mut dest,
             &src_ptr,
             w_ptr.as_ref(),
             b_ptr.as_ref(),
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -1282,7 +1279,7 @@ fn norm_zero_variance_eps_and_nonfinite_lines() {
     let x_ref = ErasedRawStridedRef::from_slice(&x, &[3], &[1], 0).unwrap();
     let mut y = [1.0f64; 3];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut y, &[3], &[1], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &x_ref, None, None)
+    plan.execute(&mut dest, &x_ref, None, None, Exec::serial())
         .unwrap();
     assert_eq!(y, [0.0; 3]);
     let plan = ErasedNormPlan::compile(
@@ -1295,7 +1292,7 @@ fn norm_zero_variance_eps_and_nonfinite_lines() {
     )
     .unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut y, &[3], &[1], 0).unwrap();
-    plan.execute(&ExecContext::serial(), &mut dest, &x_ref, None, None)
+    plan.execute(&mut dest, &x_ref, None, None, Exec::serial())
         .unwrap();
     assert!(y.iter().all(|v| v.is_nan()));
 }
@@ -1316,7 +1313,7 @@ fn norm_empty_axis_and_empty_lines_write_nothing() {
                 .unwrap();
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &[1, 3], 0).unwrap();
-            plan.execute(&ExecContext::serial(), &mut dest, &src, Some(&w), None)
+            plan.execute(&mut dest, &src, Some(&w), None, Exec::serial())
                 .unwrap();
         }
     }
@@ -1381,21 +1378,21 @@ fn norm_rejects_invalid_contracts() {
     let w3_ref = ErasedRawStridedRef::from_slice(&w3, &[3], &[1], 0).unwrap();
     let mut y = [7.0f64; 2];
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut y, &[2], &[1], 0).unwrap();
-    let ctx = ExecContext::serial();
+    let ctx = Budget::Serial;
     assert!(matches!(
-        plan.execute(&ctx, &mut dest, &x_ref, None, None),
+        plan.execute(&mut dest, &x_ref, None, None, ctx.exec()),
         Err(StridedError::PlanLayoutMismatch)
     ));
     assert!(matches!(
-        plan.execute(&ctx, &mut dest, &x_ref, Some(&x_ref), Some(&x_ref)),
+        plan.execute(&mut dest, &x_ref, Some(&x_ref), Some(&x_ref), ctx.exec()),
         Err(StridedError::PlanLayoutMismatch)
     ));
     assert!(matches!(
-        plan.execute(&ctx, &mut dest, &x_ref, Some(&w32_ref), None),
+        plan.execute(&mut dest, &x_ref, Some(&w32_ref), None, ctx.exec()),
         Err(StridedError::DTypeMismatch { .. })
     ));
     assert!(matches!(
-        plan.execute(&ctx, &mut dest, &x_ref, Some(&w3_ref), None),
+        plan.execute(&mut dest, &x_ref, Some(&w3_ref), None, ctx.exec()),
         Err(StridedError::PlanLayoutMismatch)
     ));
     assert_eq!(y, [7.0; 2]);
@@ -1417,7 +1414,7 @@ fn norm_rejects_invalid_contracts() {
     let mut dest =
         ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &[2], &[1], 0).unwrap();
     assert!(matches!(
-        plan.execute_uninit(&ctx, &mut dest, &x_ptr, Some(&inside), None),
+        plan.execute_uninit(&mut dest, &x_ptr, Some(&inside), None, ctx.exec()),
         Err(StridedError::OverlappingInputOutput { input: 1 })
     ));
     let plan_b = ErasedNormPlan::compile(
@@ -1430,7 +1427,7 @@ fn norm_rejects_invalid_contracts() {
     )
     .unwrap();
     assert!(matches!(
-        plan_b.execute_uninit(&ctx, &mut dest, &x_ptr, None, Some(&inside)),
+        plan_b.execute_uninit(&mut dest, &x_ptr, None, Some(&inside), ctx.exec()),
         Err(StridedError::OverlappingInputOutput { input: 2 })
     ));
 }

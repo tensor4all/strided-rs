@@ -4,13 +4,18 @@
 //! the destination with NaN (or leave it uninitialized) and require the erased
 //! update to produce finite results anyway.
 
+#[cfg(feature = "parallel")]
+mod common;
+#[cfg(feature = "parallel")]
+use common::Budget;
 use core::mem::MaybeUninit;
 
 use num_complex::{Complex32, Complex64};
+use strided_basic::Exec;
 use strided_basic::{
     ElementOpApply, ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef,
-    ErasedRawStridedUninitMut, ErasedUpdatePlan, ExecContext, KernelDType, KernelStorageElement,
-    StridedError, UpdateOp,
+    ErasedRawStridedUninitMut, ErasedUpdatePlan, KernelDType, KernelStorageElement, StridedError,
+    UpdateOp,
 };
 
 /// Independent reference for `dst = alpha * src` over a logical layout.
@@ -55,7 +60,8 @@ fn assert_beta_zero_case<T>(
         + PartialEq
         + core::fmt::Debug
         + KernelStorageElement
-        + strided_basic::MaybeSendSync
+        + Send
+        + Sync
         + core::ops::Add<Output = T>
         + core::ops::Mul<Output = T>
         + num_traits::Zero
@@ -69,12 +75,12 @@ fn assert_beta_zero_case<T>(
         let source = ErasedRawStridedRef::from_slice(src, dims, src_strides, 0).unwrap();
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, dims, dst_strides, 0).unwrap();
         plan.execute(
-            &ExecContext::serial(),
             &mut dest,
             &source,
             alpha,
             beta,
             UpdateOp::Identity,
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -98,7 +104,8 @@ fn assert_uninit_case<T>(
         + PartialEq
         + core::fmt::Debug
         + KernelStorageElement
-        + strided_basic::MaybeSendSync
+        + Send
+        + Sync
         + core::ops::Mul<Output = T>
         + num_traits::One
         + ElementOpApply,
@@ -113,11 +120,11 @@ fn assert_uninit_case<T>(
             ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, dims, dst_strides, 0)
                 .unwrap();
         plan.execute_uninit(
-            &ExecContext::serial(),
             &mut dest,
             &source_ptr,
             alpha,
             UpdateOp::Identity,
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -234,12 +241,12 @@ fn erased_update_plan_conj_beta_zero_ignores_nan_destination() {
         let mut dest =
             ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &dst_strides, 0).unwrap();
         plan.execute(
-            &ExecContext::serial(),
             &mut dest,
             &source,
             Complex32::new(2.0, 0.0),
             Complex32::new(0.0, 0.0),
             UpdateOp::Conj,
+            Exec::serial(),
         )
         .unwrap();
     }
@@ -267,12 +274,12 @@ fn erased_update_plan_beta_nonzero_reads_destination() {
     let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut dest,
         &source,
         2.0,
         0.5,
         UpdateOp::Identity,
+        Exec::serial(),
     )
     .unwrap();
     for index in 0..4 {
@@ -290,12 +297,12 @@ fn erased_update_plan_nan_beta_reads_destination() {
     let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
     plan.execute(
-        &ExecContext::serial(),
         &mut dest,
         &source,
         1.0,
         f64::NAN,
         UpdateOp::Identity,
+        Exec::serial(),
     )
     .unwrap();
     assert!(dst.iter().all(|value| value.is_nan()));
@@ -385,12 +392,12 @@ fn erased_update_plan_rejects_before_any_write() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst32, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute(
-            &ExecContext::serial(),
             &mut dest,
             &source,
             1.0,
             0.0,
-            UpdateOp::Identity
+            UpdateOp::Identity,
+            Exec::serial()
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
@@ -400,11 +407,11 @@ fn erased_update_plan_rejects_before_any_write() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute_uninit(
-            &ExecContext::serial(),
             &mut uninit,
             &source_ptr,
             1.0,
-            UpdateOp::Identity
+            UpdateOp::Identity,
+            Exec::serial()
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
@@ -419,12 +426,12 @@ fn erased_update_plan_rejects_before_any_write() {
     let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &strides, 0).unwrap();
     assert!(matches!(
         plan.execute(
-            &ExecContext::serial(),
             &mut dest,
             &source_other,
             1.0,
             0.0,
-            UpdateOp::Identity
+            UpdateOp::Identity,
+            Exec::serial()
         ),
         Err(StridedError::PlanLayoutMismatch)
     ));
@@ -447,28 +454,20 @@ fn erased_update_plan_rejects_before_any_write() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &dims, &strides, 2).unwrap();
     assert!(matches!(
         plan.execute_uninit(
-            &ExecContext::serial(),
             &mut uninit,
             &raw_source,
             1.0,
-            UpdateOp::Identity
+            UpdateOp::Identity,
+            Exec::serial()
         ),
         Err(StridedError::OverlappingInputOutput { input: 0 })
     ));
 }
 
 #[cfg(feature = "parallel")]
-fn with_two_workers<R: Send>(f: impl FnOnce(&ExecContext) -> R + Send) -> R {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
-    ExecContext::run_on(&pool, 2, |ctx| {
-        assert_eq!(rayon::current_num_threads(), 2);
-        assert_eq!(ctx.max_threads_limit().map(|value| value.get()), Some(2));
-        f(&ctx)
-    })
-    .unwrap()
+#[cfg(feature = "parallel")]
+fn with_two_workers<R: Send>(f: impl FnOnce(&Budget) -> R + Send) -> R {
+    f(&Budget::Pooled(2))
 }
 
 #[cfg(feature = "parallel")]
@@ -480,21 +479,21 @@ fn erased_update_plan_two_worker_matches_serial() {
     let plan = ErasedUpdatePlan::compile(KernelDType::F64, &dims, &strides, &strides).unwrap();
     let src: Vec<f64> = (0..40_001).map(|value| value as f64).collect();
 
-    let execute = |ctx: &ExecContext| -> Vec<f64> {
+    let execute = |ctx: &Budget| -> Vec<f64> {
         let mut out = vec![f64::NAN; 40_001];
         let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
         let mut dest = ErasedRawStridedMut::from_slice_mut(&mut out, &dims, &strides, 0).unwrap();
-        plan.execute(ctx, &mut dest, &source, 2.0, 0.0, UpdateOp::Identity)
+        plan.execute(&mut dest, &source, 2.0, 0.0, UpdateOp::Identity, ctx.exec())
             .unwrap();
         out
     };
-    let execute_uninit = |ctx: &ExecContext| -> Vec<f64> {
+    let execute_uninit = |ctx: &Budget| -> Vec<f64> {
         let mut storage = vec![MaybeUninit::new(f64::NAN); 40_001];
         let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
         let source_ptr = ErasedRawStridedPtr::from_ref(&source);
         let mut dest =
             ErasedRawStridedUninitMut::from_uninit_slice(&mut storage, &dims, &strides, 0).unwrap();
-        plan.execute_uninit(ctx, &mut dest, &source_ptr, 2.0, UpdateOp::Identity)
+        plan.execute_uninit(&mut dest, &source_ptr, 2.0, UpdateOp::Identity, ctx.exec())
             .unwrap();
         storage
             .iter()
@@ -503,8 +502,8 @@ fn erased_update_plan_two_worker_matches_serial() {
     };
 
     let expected: Vec<f64> = (0..40_001).map(|value| 2.0 * value as f64).collect();
-    assert_eq!(execute(&ExecContext::serial()), expected);
+    assert_eq!(execute(&Budget::Serial), expected);
     assert_eq!(with_two_workers(execute), expected);
-    assert_eq!(execute_uninit(&ExecContext::serial()), expected);
+    assert_eq!(execute_uninit(&Budget::Serial), expected);
     assert_eq!(with_two_workers(execute_uninit), expected);
 }

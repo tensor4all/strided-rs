@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use strided_basic::execution::{is_injective_layout, validate_destination_layout_without_alloc};
+use strided_basic::Exec;
 use strided_basic::{map_into, StridedArray, StridedError, StridedViewMut};
 
 /// Brute-force oracle over every logical coordinate.
@@ -113,7 +114,8 @@ fn map_into_accepts_interleaved_injective_destination() {
     let mut buffer = vec![-1.0f64; 8498];
     {
         let mut dest = StridedViewMut::new(&mut buffer, &dims, &strides, 0).unwrap();
-        let result: Result<(), StridedError> = map_into(&mut dest, &src.view(), |x| x);
+        let result: Result<(), StridedError> =
+            map_into(&mut dest, &src.view(), |x| x, Exec::serial());
         result.unwrap();
     }
     for i in 0..3 {

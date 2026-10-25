@@ -1,16 +1,14 @@
+mod common;
 use approx::assert_relative_eq;
+use common::Budget;
 use num_complex::Complex64;
-#[cfg(feature = "parallel")]
-use std::num::NonZeroUsize;
+use strided_basic::Exec;
 use strided_basic::{
     add, axpy, batched_outer_product_into, broadcast_mul_into, copy_conj, copy_into, copy_scale,
     copy_transpose_scale_into, dot, fma, map_into, mul, mul_into, reduce, reduce_axis, sum,
     symmetrize_conj_into, symmetrize_into, zip_map2_into, zip_map3_into, zip_map4_into,
     StridedArray, StridedError,
 };
-#[cfg(feature = "parallel")]
-use strided_basic::{with_execution_policy, ExecutionPolicy};
-
 fn make_tensor(rows: usize, cols: usize) -> StridedArray<f64> {
     StridedArray::from_fn_row_major(&[rows, cols], |idx| (idx[0] * cols + idx[1]) as f64)
 }
@@ -22,7 +20,7 @@ fn test_map_into_transposed() {
     let a_t = a_view.permute(&[1, 0]).unwrap();
 
     let mut out = StridedArray::<f64>::row_major(&[5, 8]);
-    map_into(&mut out.view_mut(), &a_t, |x| x * 2.0).unwrap();
+    map_into(&mut out.view_mut(), &a_t, |x| x * 2.0, Exec::serial()).unwrap();
 
     for i in 0..5 {
         for j in 0..8 {
@@ -40,7 +38,7 @@ fn assert_map_arity_rejects_noninjective_destination(len: usize) {
     let mut dest =
         strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
-    let error = map_into(&mut dest, &source.view(), |x| x + 1.0);
+    let error = map_into(&mut dest, &source.view(), |x| x + 1.0, Exec::serial());
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [7.0]);
@@ -60,7 +58,13 @@ fn assert_zip_map2_arity_rejects_noninjective_destination(len: usize) {
     let mut dest =
         strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
-    let error = zip_map2_into(&mut dest, &a.view(), &b.view(), |x, y| x + y);
+    let error = zip_map2_into(
+        &mut dest,
+        &a.view(),
+        &b.view(),
+        |x, y| x + y,
+        Exec::serial(),
+    );
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [7.0]);
@@ -85,6 +89,7 @@ fn test_zip_map3_into_rejects_noninjective_destination_before_serial_write() {
         &sources[1].view(),
         &sources[2].view(),
         |x, y, z| x + y + z,
+        Exec::serial(),
     );
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
@@ -106,6 +111,7 @@ fn test_zip_map4_into_rejects_noninjective_destination_before_serial_write() {
         &sources[2].view(),
         &sources[3].view(),
         |w, x, y, z| w + x + y + z,
+        Exec::serial(),
     );
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
@@ -132,6 +138,7 @@ fn test_map_and_zip_reject_large_noninjective_destinations_before_parallel_write
         &sources[1].view(),
         &sources[2].view(),
         |x, y, z| x + y + z,
+        Exec::serial(),
     );
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [7.0]);
@@ -145,6 +152,7 @@ fn test_map_and_zip_reject_large_noninjective_destinations_before_parallel_write
         &sources[2].view(),
         &sources[3].view(),
         |w, x, y, z| w + x + y + z,
+        Exec::serial(),
     );
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [7.0]);
@@ -160,7 +168,14 @@ fn test_zip_map2_mixed_strides() {
     let b_t = b_view.permute(&[1, 0]).unwrap();
 
     let mut out = StridedArray::<f64>::row_major(&[4, 6]);
-    zip_map2_into(&mut out.view_mut(), &a_t, &b_t, |x, y| x + y).unwrap();
+    zip_map2_into(
+        &mut out.view_mut(),
+        &a_t,
+        &b_t,
+        |x, y| x + y,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..4 {
         for j in 0..6 {
@@ -176,7 +191,7 @@ fn test_mul_into_contiguous() {
     let b = StridedArray::<f64>::from_fn_row_major(&[4, 5], |idx| (1 + idx[0] + 2 * idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[4, 5]);
 
-    mul_into(&mut out.view_mut(), &a.view(), &b.view()).unwrap();
+    mul_into(&mut out.view_mut(), &a.view(), &b.view(), Exec::serial()).unwrap();
 
     for i in 0..4 {
         for j in 0..5 {
@@ -189,7 +204,7 @@ fn test_mul_into_contiguous() {
     }
 }
 
-fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
+fn assert_mul_identity_paths_reject_noninjective_destination(len: usize, budget: Budget) {
     let lhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 1.0);
     let rhs = StridedArray::<f64>::from_fn_col_major(&[len], |idx| idx[0] as f64 + 2.0);
     let mut output = [7.0_f64];
@@ -198,7 +213,7 @@ fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
     let mut dest =
         strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
-    let error = mul_into(&mut dest, &lhs.view(), &rhs.view());
+    let error = mul_into(&mut dest, &lhs.view(), &rhs.view(), budget.exec());
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [7.0]);
@@ -211,7 +226,14 @@ fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
     let mut dest =
         strided_basic::StridedViewMut::new(&mut output, &dims, &broadcast_stride, 0).unwrap();
 
-    let error = broadcast_mul_into(&mut dest, &lhs.view(), &[0], &rhs.view(), &[0]);
+    let error = broadcast_mul_into(
+        &mut dest,
+        &lhs.view(),
+        &[0],
+        &rhs.view(),
+        &[0],
+        budget.exec(),
+    );
 
     assert!(matches!(error, Err(StridedError::NonInjectiveOutputLayout)));
     assert_eq!(output, [7.0]);
@@ -219,19 +241,14 @@ fn assert_mul_identity_paths_reject_noninjective_destination(len: usize) {
 
 #[test]
 fn test_mul_identity_paths_reject_noninjective_destination_before_serial_write() {
-    assert_mul_identity_paths_reject_noninjective_destination(4);
+    assert_mul_identity_paths_reject_noninjective_destination(4, Budget::Serial);
 }
 
 #[cfg(feature = "parallel")]
 #[test]
 fn test_mul_identity_paths_reject_noninjective_destination_before_bounded_parallel_write() {
     const LEN: usize = 100_000;
-    with_execution_policy(
-        ExecutionPolicy::Rayon {
-            max_threads: NonZeroUsize::new(2).unwrap(),
-        },
-        || assert_mul_identity_paths_reject_noninjective_destination(LEN),
-    );
+    assert_mul_identity_paths_reject_noninjective_destination(LEN, Budget::Pooled(2));
 }
 
 #[test]
@@ -242,7 +259,13 @@ fn test_mul_into_broadcast_stride_zero() {
     let b_broadcast = b.view().broadcast(&[3, 4]).unwrap();
     let mut out = StridedArray::<f64>::row_major(&[3, 4]);
 
-    mul_into(&mut out.view_mut(), &a_broadcast, &b_broadcast).unwrap();
+    mul_into(
+        &mut out.view_mut(),
+        &a_broadcast,
+        &b_broadcast,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..3 {
         for j in 0..4 {
@@ -265,7 +288,7 @@ fn test_mul_into_permuted_noncompact() {
     let mut out_base = StridedArray::<f64>::row_major(&[5, 4]);
     let mut out_t = out_base.view_mut().permute(&[1, 0]).unwrap();
 
-    mul_into(&mut out_t, &a_t, &b_t).unwrap();
+    mul_into(&mut out_t, &a_t, &b_t, Exec::serial()).unwrap();
 
     for i in 0..4 {
         for j in 0..5 {
@@ -284,7 +307,7 @@ fn test_mul_into_rejects_shape_mismatch() {
     let b = StridedArray::<f64>::row_major(&[3, 2]);
     let mut out = StridedArray::<f64>::row_major(&[2, 3]);
 
-    let err = mul_into(&mut out.view_mut(), &a.view(), &b.view()).unwrap_err();
+    let err = mul_into(&mut out.view_mut(), &a.view(), &b.view(), Exec::serial()).unwrap_err();
 
     assert!(matches!(err, StridedError::ShapeMismatch(_, _)));
 }
@@ -303,6 +326,7 @@ fn test_broadcast_mul_into_maps_source_axes_without_copy() {
         &[0, 2],
         &rhs.view(),
         &[1, 2],
+        Exec::serial(),
     )
     .unwrap();
 
@@ -331,6 +355,7 @@ fn test_broadcast_mul_into_broadcasts_mapped_size_one_axes() {
         &[0, 1],
         &rhs.view(),
         &[0, 1],
+        Exec::serial(),
     )
     .unwrap();
 
@@ -351,8 +376,15 @@ fn test_broadcast_mul_into_rejects_invalid_axis_map() {
     let rhs = StridedArray::<f64>::row_major(&[4]);
     let mut out = StridedArray::<f64>::row_major(&[2, 4, 3]);
 
-    let err = broadcast_mul_into(&mut out.view_mut(), &lhs.view(), &[0, 3], &rhs.view(), &[1])
-        .unwrap_err();
+    let err = broadcast_mul_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &[0, 3],
+        &rhs.view(),
+        &[1],
+        Exec::serial(),
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
@@ -368,7 +400,15 @@ fn test_batched_outer_product_into_compact() {
         StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
     let mut out = StridedArray::<f64>::col_major(&[2, 4, 3]);
 
-    batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1).unwrap();
+    batched_outer_product_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &rhs.view(),
+        1,
+        1,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for j in 0..2 {
         for o in 0..4 {
@@ -392,7 +432,15 @@ fn test_batched_outer_product_into_mixed_types() {
         StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (2 + idx[0] + 20 * idx[1]) as f64);
     let mut out = StridedArray::<Complex64>::col_major(&[2, 4, 3]);
 
-    batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1).unwrap();
+    batched_outer_product_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &rhs.view(),
+        1,
+        1,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for j in 0..2 {
         for o in 0..4 {
@@ -416,7 +464,7 @@ fn test_batched_outer_product_into_noncompact() {
     let mut out_base = StridedArray::<f64>::col_major(&[3, 4, 2]);
     let mut out = out_base.view_mut().permute(&[2, 1, 0]).unwrap(); // [j,o,t]
 
-    batched_outer_product_into(&mut out, &lhs, &rhs, 1, 1).unwrap();
+    batched_outer_product_into(&mut out, &lhs, &rhs, 1, 1, Exec::serial()).unwrap();
 
     for j in 0..2 {
         for o in 0..4 {
@@ -442,13 +490,22 @@ fn test_batched_outer_product_into_matches_broadcast_mul_into() {
     let mut outer_out = StridedArray::<f64>::col_major(&[2, 3, 4, 5]);
     let mut broadcast_out = StridedArray::<f64>::col_major(&[2, 3, 4, 5]);
 
-    batched_outer_product_into(&mut outer_out.view_mut(), &lhs, &rhs.view(), 2, 1).unwrap();
+    batched_outer_product_into(
+        &mut outer_out.view_mut(),
+        &lhs,
+        &rhs.view(),
+        2,
+        1,
+        Exec::serial(),
+    )
+    .unwrap();
     broadcast_mul_into(
         &mut broadcast_out.view_mut(),
         &lhs,
         &[0, 1, 3],
         &rhs.view(),
         &[2, 3],
+        Exec::serial(),
     )
     .unwrap();
 
@@ -473,8 +530,15 @@ fn test_batched_outer_product_into_rejects_mismatched_batch_dims() {
     let rhs = StridedArray::<f64>::col_major(&[4, 5]);
     let mut out = StridedArray::<f64>::col_major(&[2, 4, 3]);
 
-    let err = batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 1, 1)
-        .unwrap_err();
+    let err = batched_outer_product_into(
+        &mut out.view_mut(),
+        &lhs.view(),
+        &rhs.view(),
+        1,
+        1,
+        Exec::serial(),
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
@@ -486,7 +550,7 @@ fn test_batched_outer_product_into_rejects_mismatched_batch_dims() {
 #[test]
 fn test_reduce_sum() {
     let a = make_tensor(10, 12);
-    let result = reduce(&a.view(), |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce(&a.view(), |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     let expected: f64 = a.iter().copied().sum();
     assert_relative_eq!(result, expected, epsilon = 1e-10);
 }
@@ -497,7 +561,7 @@ fn test_reduce_axis_sum() {
         (idx[0] + 2 * idx[1] + 3 * idx[2]) as f64
     });
 
-    let result = reduce_axis(&a.view(), 1, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a.view(), 1, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
 
     // Expected: sum along axis 1 (3 elements)
     // Result shape: [4, 2]
@@ -527,7 +591,7 @@ fn test_dot() {
 fn test_copy_into() {
     let a = make_tensor(4, 5);
     let mut out = StridedArray::<f64>::row_major(&[4, 5]);
-    copy_into(&mut out.view_mut(), &a.view()).unwrap();
+    copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
     for i in 0..4 {
         for j in 0..5 {
             assert_relative_eq!(out.get(&[i, j]), a.get(&[i, j]), epsilon = 1e-10);
@@ -539,7 +603,7 @@ fn test_copy_into() {
 fn test_copy_into_mixed_layouts() {
     let a = StridedArray::<f64>::from_fn_col_major(&[4, 5], |idx| (idx[0] * 10 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[4, 5]);
-    copy_into(&mut out.view_mut(), &a.view()).unwrap();
+    copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
     for i in 0..4 {
         for j in 0..5 {
             assert_relative_eq!(out.get(&[i, j]), a.get(&[i, j]), epsilon = 1e-10);
@@ -552,7 +616,7 @@ fn test_copy_transpose_scale_into() {
     let a = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[3, 2]);
 
-    copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 3.0).unwrap();
+    copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 3.0, Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..3 {
@@ -566,7 +630,7 @@ fn test_copy_transpose_scale_into_zero_does_not_read_source_values() {
     let a = StridedArray::<f64>::from_fn_col_major(&[2, 3], |_| f64::NAN);
     let mut out = StridedArray::<f64>::from_fn_col_major(&[3, 2], |_| 1.0);
 
-    copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 0.0).unwrap();
+    copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 0.0, Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..2 {
@@ -581,7 +645,7 @@ fn test_symmetrize_into() {
     let a = StridedArray::<f64>::from_fn_row_major(&[n, n], |idx| (idx[0] * 10 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[n, n]);
 
-    symmetrize_into(&mut out.view_mut(), &a.view()).unwrap();
+    symmetrize_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in 0..n {
         for j in 0..n {
@@ -606,6 +670,7 @@ fn test_zip_map4_into_contiguous() {
         &c.view(),
         &d.view(),
         |a, b, c, d| a + b + c + d,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -632,9 +697,15 @@ fn test_zip_map4_into_permuted() {
 
     let mut out = StridedArray::<f64>::row_major(&[size, size, size, size]);
 
-    zip_map4_into(&mut out.view_mut(), &p1, &p2, &p3, &p4, |a, b, c, d| {
-        a + b + c + d
-    })
+    zip_map4_into(
+        &mut out.view_mut(),
+        &p1,
+        &p2,
+        &p3,
+        &p4,
+        |a, b, c, d| a + b + c + d,
+        Exec::serial(),
+    )
     .unwrap();
 
     for i in 0..size {
@@ -678,7 +749,7 @@ fn test_strided_view_broadcast_and_copy() {
     let broad = row.broadcast(&[4, 3]).unwrap();
 
     let mut dest = StridedArray::<f64>::row_major(&[4, 3]);
-    copy_into(&mut dest.view_mut(), &broad).unwrap();
+    copy_into(&mut dest.view_mut(), &broad, Exec::serial()).unwrap();
 
     for i in 0..4 {
         assert_relative_eq!(dest.get(&[i, 0]), 1.0, epsilon = 1e-10);
@@ -702,7 +773,7 @@ fn test_large_map_into() {
     let a = make_large(n);
     let mut out = StridedArray::<f64>::col_major(&[n, n]);
 
-    map_into(&mut out.view_mut(), &a.view(), |x| x * 3.0).unwrap();
+    map_into(&mut out.view_mut(), &a.view(), |x| x * 3.0, Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -718,7 +789,7 @@ fn test_large_map_into_permuted() {
     let a_t = a.view().permute(&[1, 0]).unwrap();
     let mut out = StridedArray::<f64>::col_major(&[n, n]);
 
-    map_into(&mut out.view_mut(), &a_t, |x| x * 2.0).unwrap();
+    map_into(&mut out.view_mut(), &a_t, |x| x * 2.0, Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -734,7 +805,14 @@ fn test_large_zip_map2() {
     let b = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] + idx[1]) as f64);
     let mut out = StridedArray::<f64>::col_major(&[n, n]);
 
-    zip_map2_into(&mut out.view_mut(), &a.view(), &b.view(), |x, y| x + y).unwrap();
+    zip_map2_into(
+        &mut out.view_mut(),
+        &a.view(),
+        &b.view(),
+        |x, y| x + y,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -760,9 +838,15 @@ fn test_large_zip_map4_permuted() {
     let p4 = av.permute(&[3, 0, 1, 2]).unwrap();
 
     let mut out = StridedArray::<f64>::col_major(&[n, n, n, n]);
-    zip_map4_into(&mut out.view_mut(), &p1, &p2, &p3, &p4, |a, b, c, d| {
-        a + b + c + d
-    })
+    zip_map4_into(
+        &mut out.view_mut(),
+        &p1,
+        &p2,
+        &p3,
+        &p4,
+        |a, b, c, d| a + b + c + d,
+        Exec::serial(),
+    )
     .unwrap();
 
     for i in (0..n).step_by(3) {
@@ -784,7 +868,7 @@ fn test_large_zip_map4_permuted() {
 fn test_large_reduce() {
     let n = 200;
     let a = make_large(n);
-    let result = sum(&a.view()).unwrap();
+    let result = sum(&a.view(), Exec::serial()).unwrap();
     let expected: f64 = a.iter().copied().sum();
     assert_relative_eq!(result, expected, epsilon = 1e-6);
 }
@@ -796,7 +880,7 @@ fn test_large_add() {
     let mut dest = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * 3 + idx[1]) as f64);
     let expected_base = dest.iter().cloned().collect::<Vec<_>>();
 
-    add(&mut dest.view_mut(), &b.view()).unwrap();
+    add(&mut dest.view_mut(), &b.view(), Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -814,7 +898,7 @@ fn test_large_mul() {
     let mut dest = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * 2 + idx[1] + 1) as f64);
     let expected_base = dest.iter().cloned().collect::<Vec<_>>();
 
-    mul(&mut dest.view_mut(), &a.view()).unwrap();
+    mul(&mut dest.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -833,7 +917,7 @@ fn test_large_axpy() {
     let y_orig = y.iter().cloned().collect::<Vec<_>>();
     let alpha = 2.5;
 
-    axpy(&mut y.view_mut(), &x.view(), alpha).unwrap();
+    axpy(&mut y.view_mut(), &x.view(), alpha, Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -852,7 +936,7 @@ fn test_large_fma() {
     let mut dest = StridedArray::from_fn_col_major(&[n, n], |idx| (idx[0] * 3 + idx[1]) as f64);
     let dest_orig = dest.iter().cloned().collect::<Vec<_>>();
 
-    fma(&mut dest.view_mut(), &a.view(), &b.view()).unwrap();
+    fma(&mut dest.view_mut(), &a.view(), &b.view(), Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -879,7 +963,7 @@ fn test_large_symmetrize() {
     let a = make_large(n);
     let mut out = StridedArray::<f64>::col_major(&[n, n]);
 
-    symmetrize_into(&mut out.view_mut(), &a.view()).unwrap();
+    symmetrize_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -896,7 +980,7 @@ fn test_large_copy_into_permuted() {
     let a_t = a.view().permute(&[1, 0]).unwrap();
     let mut out = StridedArray::<f64>::col_major(&[n, n]);
 
-    copy_into(&mut out.view_mut(), &a_t).unwrap();
+    copy_into(&mut out.view_mut(), &a_t, Exec::serial()).unwrap();
 
     for i in (0..n).step_by(17) {
         for j in (0..n).step_by(19) {
@@ -928,7 +1012,7 @@ fn test_mul_permuted() {
     }
 
     let src_t = src.view().permute(&[1, 0]).unwrap(); // shape [cols, rows]
-    mul(&mut dest.view_mut(), &src_t).unwrap();
+    mul(&mut dest.view_mut(), &src_t, Exec::serial()).unwrap();
 
     for i in 0..cols {
         for j in 0..rows {
@@ -957,7 +1041,7 @@ fn test_axpy_permuted() {
     let alpha = 3.5;
 
     let x_t = x.view().permute(&[1, 0]).unwrap(); // shape [cols, rows]
-    axpy(&mut y.view_mut(), &x_t, alpha).unwrap();
+    axpy(&mut y.view_mut(), &x_t, alpha, Exec::serial()).unwrap();
 
     for i in 0..cols {
         for j in 0..rows {
@@ -988,7 +1072,7 @@ fn test_fma_permuted() {
 
     let a_t = a.view().permute(&[1, 0]).unwrap();
     let b_t = b.view().permute(&[1, 0]).unwrap();
-    fma(&mut dest.view_mut(), &a_t, &b_t).unwrap();
+    fma(&mut dest.view_mut(), &a_t, &b_t, Exec::serial()).unwrap();
 
     for i in 0..cols {
         for j in 0..rows {
@@ -1034,7 +1118,7 @@ fn test_sum_permuted() {
     });
     let a_t = a.view().permute(&[1, 0]).unwrap();
 
-    let result = sum(&a_t).unwrap();
+    let result = sum(&a_t, Exec::serial()).unwrap();
     let expected: f64 = a.iter().copied().sum();
     assert_relative_eq!(result, expected, epsilon = 1e-10);
 }
@@ -1048,7 +1132,7 @@ fn test_copy_into_conj_complex() {
     let mut out = StridedArray::<Complex64>::row_major(&[3, 4]);
 
     let a_conj = a.view().conj();
-    copy_into(&mut out.view_mut(), &a_conj).unwrap();
+    copy_into(&mut out.view_mut(), &a_conj, Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..4 {
@@ -1066,7 +1150,7 @@ fn test_copy_into_contiguous_identity() {
     let a = StridedArray::<f64>::from_fn_row_major(&[10, 12], |idx| (idx[0] * 12 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[10, 12]);
 
-    copy_into(&mut out.view_mut(), &a.view()).unwrap();
+    copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in 0..10 {
         for j in 0..12 {
@@ -1082,7 +1166,7 @@ fn test_copy_scale() {
     let mut out = StridedArray::<f64>::row_major(&[5, 6]);
     let scale = 2.5;
 
-    copy_scale(&mut out.view_mut(), &a.view(), scale).unwrap();
+    copy_scale(&mut out.view_mut(), &a.view(), scale, Exec::serial()).unwrap();
 
     for i in 0..5 {
         for j in 0..6 {
@@ -1100,7 +1184,7 @@ fn test_copy_conj_complex() {
     });
     let mut out = StridedArray::<Complex64>::row_major(&[4, 3]);
 
-    copy_conj(&mut out.view_mut(), &a.view()).unwrap();
+    copy_conj(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in 0..4 {
         for j in 0..3 {
@@ -1120,7 +1204,7 @@ fn test_symmetrize_conj_into_complex() {
     });
     let mut out = StridedArray::<Complex64>::row_major(&[n, n]);
 
-    symmetrize_conj_into(&mut out.view_mut(), &a.view()).unwrap();
+    symmetrize_conj_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in 0..n {
         for j in 0..n {
@@ -1140,7 +1224,7 @@ fn test_symmetrize_into_error_non_2d() {
     });
     let mut out = StridedArray::<f64>::row_major(&[3, 3, 3]);
 
-    let result = symmetrize_into(&mut out.view_mut(), &a.view());
+    let result = symmetrize_into(&mut out.view_mut(), &a.view(), Exec::serial());
     assert!(result.is_err());
     match result.unwrap_err() {
         StridedError::RankMismatch(ndim, 2) => assert_eq!(ndim, 3),
@@ -1153,7 +1237,7 @@ fn test_symmetrize_into_error_non_square() {
     let a = StridedArray::<f64>::from_fn_row_major(&[3, 5], |idx| (idx[0] * 5 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[3, 5]);
 
-    let result = symmetrize_into(&mut out.view_mut(), &a.view());
+    let result = symmetrize_into(&mut out.view_mut(), &a.view(), Exec::serial());
     assert!(result.is_err());
     match result.unwrap_err() {
         StridedError::NonSquare { rows, cols } => {
@@ -1172,7 +1256,7 @@ fn test_copy_transpose_scale_into_error_non_2d() {
     });
     let mut out = StridedArray::<f64>::row_major(&[2, 3, 4]);
 
-    let result = copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 2.0);
+    let result = copy_transpose_scale_into(&mut out.view_mut(), &a.view(), 2.0, Exec::serial());
     assert!(result.is_err());
     match result.unwrap_err() {
         StridedError::RankMismatch(ndim, 2) => assert_eq!(ndim, 3),
@@ -1188,7 +1272,7 @@ fn test_add_small_contiguous() {
         StridedArray::<f64>::from_fn_row_major(&[3, 4], |idx| (idx[0] * 4 + idx[1]) as f64);
     let dest_orig: Vec<f64> = dest.iter().copied().collect();
 
-    add(&mut dest.view_mut(), &src.view()).unwrap();
+    add(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..4 {
@@ -1207,7 +1291,7 @@ fn test_mul_small_contiguous() {
         StridedArray::<f64>::from_fn_row_major(&[3, 4], |idx| (idx[0] * 4 + idx[1] + 1) as f64);
     let dest_orig: Vec<f64> = dest.iter().copied().collect();
 
-    mul(&mut dest.view_mut(), &src.view()).unwrap();
+    mul(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..4 {
@@ -1226,7 +1310,7 @@ fn test_copy_scale_permuted() {
     let mut out = StridedArray::<f64>::row_major(&[7, 5]);
     let scale = -1.5;
 
-    copy_scale(&mut out.view_mut(), &a_t, scale).unwrap();
+    copy_scale(&mut out.view_mut(), &a_t, scale, Exec::serial()).unwrap();
 
     for i in 0..7 {
         for j in 0..5 {
@@ -1251,7 +1335,7 @@ fn test_add_mixed_layout() {
         StridedArray::<f64>::from_fn_row_major(&[m, n], |idx| (idx[0] * n + idx[1]) as f64);
     let dest_orig: Vec<f64> = dest.iter().copied().collect();
 
-    add(&mut dest.view_mut(), &src.view()).unwrap();
+    add(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..m {
         for j in 0..n {
@@ -1272,7 +1356,7 @@ fn test_mul_mixed_layout() {
         StridedArray::<f64>::from_fn_row_major(&[m, n], |idx| (idx[0] * n + idx[1] + 1) as f64);
     let dest_orig: Vec<f64> = dest.iter().copied().collect();
 
-    mul(&mut dest.view_mut(), &src.view()).unwrap();
+    mul(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..m {
         for j in 0..n {
@@ -1292,7 +1376,7 @@ fn test_axpy_mixed_layout() {
     let y_orig: Vec<f64> = y.iter().copied().collect();
     let alpha = 2.5;
 
-    axpy(&mut y.view_mut(), &x.view(), alpha).unwrap();
+    axpy(&mut y.view_mut(), &x.view(), alpha, Exec::serial()).unwrap();
 
     for i in 0..m {
         for j in 0..n {
@@ -1313,7 +1397,7 @@ fn test_fma_mixed_layout() {
         StridedArray::<f64>::from_fn_col_major(&[m, n], |idx| (idx[0] * 3 + idx[1]) as f64);
     let dest_orig: Vec<f64> = dest.iter().copied().collect();
 
-    fma(&mut dest.view_mut(), &a.view(), &b.view()).unwrap();
+    fma(&mut dest.view_mut(), &a.view(), &b.view(), Exec::serial()).unwrap();
 
     // dest is col-major, so iter() gives col-major order
     for i in 0..m {
@@ -1347,7 +1431,7 @@ fn test_dot_mixed_layout() {
 fn test_sum_col_major_small() {
     // col-major small array — exercises reduce non-SIMD path with non-row-major layout
     let a = StridedArray::<f64>::from_fn_col_major(&[3, 4], |idx| (idx[0] * 4 + idx[1]) as f64);
-    let result = sum(&a.view()).unwrap();
+    let result = sum(&a.view(), Exec::serial()).unwrap();
     let expected: f64 = (0..3)
         .flat_map(|i| (0..4).map(move |j| (i * 4 + j) as f64))
         .sum();
@@ -1358,7 +1442,7 @@ fn test_sum_col_major_small() {
 #[test]
 fn test_sum_f32_contiguous() {
     let a = StridedArray::<f32>::from_fn_row_major(&[100], |idx| (idx[0] + 1) as f32);
-    let result = sum(&a.view()).unwrap();
+    let result = sum(&a.view(), Exec::serial()).unwrap();
     let expected: f32 = (1..=100).map(|x| x as f32).sum();
     assert_relative_eq!(result, expected, epsilon = 1e-3);
 }
@@ -1381,7 +1465,7 @@ fn test_copy_into_conj_mixed_layout() {
     let mut out = StridedArray::<Complex64>::row_major(&[3, 4]);
 
     let a_conj = a.view().conj();
-    copy_into(&mut out.view_mut(), &a_conj).unwrap();
+    copy_into(&mut out.view_mut(), &a_conj, Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..4 {
@@ -1410,6 +1494,7 @@ fn test_zip_map3_into_contiguous() {
         &b.view(),
         &c.view(),
         |x, y, z| x + y * z,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -1441,7 +1526,15 @@ fn test_zip_map3_into_permuted() {
 
     let mut out = StridedArray::<f64>::row_major(&[cols, rows]);
 
-    zip_map3_into(&mut out.view_mut(), &a_t, &b_t, &c_t, |x, y, z| x * y + z).unwrap();
+    zip_map3_into(
+        &mut out.view_mut(),
+        &a_t,
+        &b_t,
+        &c_t,
+        |x, y, z| x * y + z,
+        Exec::serial(),
+    )
+    .unwrap();
 
     for i in 0..cols {
         for j in 0..rows {
@@ -1467,6 +1560,7 @@ fn test_zip_map3_into_mixed_strides() {
         &b.view(),
         &c_t,
         |x, y, z| x + y + z,
+        Exec::serial(),
     )
     .unwrap();
 
@@ -1491,7 +1585,7 @@ fn test_reduce_mixed_layout() {
     let a = StridedArray::<f64>::from_fn_col_major(&[m, n], |idx| (idx[0] * n + idx[1] + 1) as f64);
     let a_t = a.view().permute(&[1, 0]).unwrap(); // different stride order
 
-    let result = reduce(&a_t, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce(&a_t, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     let expected: f64 = (0..m)
         .flat_map(|i| (0..n).map(move |j| (i * n + j + 1) as f64))
         .sum();
@@ -1507,7 +1601,7 @@ fn test_reduce_product_permuted() {
     });
     let a_t = a.view().permute(&[1, 0]).unwrap();
 
-    let result = reduce(&a_t, |x| x, |a, b| a * b, 1.0).unwrap();
+    let result = reduce(&a_t, |x| x, |a, b| a * b, 1.0, Exec::serial()).unwrap();
     let expected: f64 = a.iter().copied().product();
     assert_relative_eq!(result, expected, epsilon = 1e-10);
 }
@@ -1518,7 +1612,7 @@ fn test_reduce_axis_invalid_axis() {
     let a =
         StridedArray::<f64>::from_fn_row_major(&[3, 4, 2], |idx| (idx[0] + idx[1] + idx[2]) as f64);
 
-    let result = reduce_axis(&a.view(), 3, |x| x, |a, b| a + b, 0.0);
+    let result = reduce_axis(&a.view(), 3, |x| x, |a, b| a + b, 0.0, Exec::serial());
     assert!(result.is_err());
     match result.unwrap_err() {
         StridedError::InvalidAxis { axis, rank } => {
@@ -1534,7 +1628,7 @@ fn test_reduce_axis_invalid_axis() {
 fn test_reduce_axis_1d_to_scalar() {
     let a = StridedArray::<f64>::from_fn_row_major(&[5], |idx| (idx[0] + 1) as f64);
 
-    let result = reduce_axis(&a.view(), 0, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a.view(), 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
 
     // 1 + 2 + 3 + 4 + 5 = 15
     assert_eq!(result.dims(), &[1]);
@@ -1548,7 +1642,7 @@ fn test_reduce_axis_permuted() {
     let a_t = a.view().permute(&[1, 0]).unwrap(); // shape [4, 3]
 
     // Reduce along axis 0 of the permuted view (axis 0 of transposed = axis 1 of original)
-    let result = reduce_axis(&a_t, 0, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a_t, 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     assert_eq!(result.dims(), &[3]);
 
     for j in 0..3 {
@@ -1570,7 +1664,7 @@ fn test_small_contiguous_map_into() {
     let a = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[2, 3]);
 
-    map_into(&mut out.view_mut(), &a.view(), |x| x * 5.0).unwrap();
+    map_into(&mut out.view_mut(), &a.view(), |x| x * 5.0, Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..3 {
@@ -1579,11 +1673,11 @@ fn test_small_contiguous_map_into() {
     }
 }
 
-// 25. Small contiguous sum (len = 6 < 64)
+// 25. Small contiguous sum (len = 6 < 64, Exec::serial())
 #[test]
 fn test_small_contiguous_sum() {
     let a = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1]) as f64);
-    let result = sum(&a.view()).unwrap();
+    let result = sum(&a.view(), Exec::serial()).unwrap();
     // 0 + 1 + 2 + 3 + 4 + 5 = 15
     assert_relative_eq!(result, 15.0, epsilon = 1e-10);
 }
@@ -1606,7 +1700,7 @@ fn test_small_contiguous_add() {
         StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] * 3 + idx[1]) as f64);
     let dest_orig: Vec<f64> = dest.iter().copied().collect();
 
-    add(&mut dest.view_mut(), &src.view()).unwrap();
+    add(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..3 {
@@ -1623,7 +1717,7 @@ fn test_small_contiguous_copy_into() {
     let a = StridedArray::<f64>::from_fn_row_major(&[2, 2], |idx| (idx[0] * 10 + idx[1]) as f64);
     let mut out = StridedArray::<f64>::row_major(&[2, 2]);
 
-    copy_into(&mut out.view_mut(), &a.view()).unwrap();
+    copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..2 {
@@ -1645,7 +1739,7 @@ fn test_reduce_3d_permuted_blocked() {
     });
     let a_perm = a.view().permute(&[2, 0, 1]).unwrap(); // shape [6,4,5], non-contiguous
 
-    let result = reduce(&a_perm, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce(&a_perm, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     let expected: f64 = a.iter().copied().sum();
     assert_relative_eq!(result, expected, epsilon = 1e-10);
 }
@@ -1656,7 +1750,7 @@ fn test_reduce_sum_of_squares_permuted() {
     let a = StridedArray::<f64>::from_fn_row_major(&[5, 7], |idx| (idx[0] * 7 + idx[1] + 1) as f64);
     let a_t = a.view().permute(&[1, 0]).unwrap(); // shape [7,5], non-contiguous
 
-    let result = reduce(&a_t, |x| x * x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce(&a_t, |x| x * x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     let expected: f64 = a.iter().copied().map(|x| x * x).sum();
     assert_relative_eq!(result, expected, epsilon = 1e-10);
 }
@@ -1672,6 +1766,7 @@ fn test_reduce_max_permuted() {
         |x| x,
         |a, b| if a > b { a } else { b },
         f64::NEG_INFINITY,
+        Exec::serial(),
     )
     .unwrap();
     let expected: f64 = a.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -1686,7 +1781,7 @@ fn test_reduce_col_major_3d() {
     });
     let a_perm = a.view().permute(&[1, 2, 0]).unwrap(); // shuffle strides
 
-    let result = reduce(&a_perm, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce(&a_perm, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     let mut expected = 0.0;
     for i in 0..3 {
         for j in 0..5 {
@@ -1712,7 +1807,7 @@ fn test_reduce_axis_3d_permuted_blocked() {
     let a_perm = a.view().permute(&[2, 0, 1]).unwrap(); // shape [5, 3, 4]
 
     // Reduce along axis 1 of the permuted view (axis 0 of original)
-    let result = reduce_axis(&a_perm, 1, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a_perm, 1, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     assert_eq!(result.dims(), &[5, 4]); // shape after removing axis 1
 
     for i in 0..5 {
@@ -1736,7 +1831,7 @@ fn test_reduce_axis_col_major_mixed() {
 
     // Reduce along axis 2 — the remaining dims [4,3] have col-major strides
     // while output will be col-major, but the source strides may differ
-    let result = reduce_axis(&a.view(), 2, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a.view(), 2, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     assert_eq!(result.dims(), &[4, 3]);
 
     for i in 0..4 {
@@ -1757,7 +1852,7 @@ fn test_reduce_axis_map_fn_permuted() {
     let a_t = a.view().permute(&[1, 0]).unwrap(); // shape [4, 3]
 
     // Reduce axis 1 of transposed with map_fn = |x| x * x
-    let result = reduce_axis(&a_t, 1, |x| x * x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a_t, 1, |x| x * x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     assert_eq!(result.dims(), &[4]);
 
     for i in 0..4 {
@@ -1779,7 +1874,7 @@ fn test_reduce_axis_4d_blocked() {
     let a_perm = a.view().permute(&[3, 1, 0, 2]).unwrap(); // shape [5, 3, 2, 4]
 
     // Reduce along axis 2 of permuted view
-    let result = reduce_axis(&a_perm, 2, |x| x, |a, b| a + b, 0.0).unwrap();
+    let result = reduce_axis(&a_perm, 2, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
     assert_eq!(result.dims(), &[5, 3, 4]); // shape after removing axis 2
 
     for i in 0..5 {
@@ -1811,9 +1906,12 @@ fn test_map_into_mixed_f64_to_c64() {
     let src = StridedArray::<f64>::from_fn_row_major(&[3, 4], |idx| (idx[0] * 4 + idx[1]) as f64);
     let mut dest = StridedArray::<Complex64>::row_major(&[3, 4]);
 
-    map_into(&mut dest.view_mut(), &src.view(), |x| {
-        Complex64::new(x, x * 2.0)
-    })
+    map_into(
+        &mut dest.view_mut(),
+        &src.view(),
+        |x| Complex64::new(x, x * 2.0),
+        Exec::serial(),
+    )
     .unwrap();
 
     for i in 0..3 {
@@ -1833,9 +1931,13 @@ fn test_zip_map2_into_mixed_f64_c64() {
     });
     let mut dest = StridedArray::<Complex64>::row_major(&[2, 3]);
 
-    zip_map2_into(&mut dest.view_mut(), &a.view(), &b.view(), |x, y| {
-        Complex64::new(x, 0.0) + y
-    })
+    zip_map2_into(
+        &mut dest.view_mut(),
+        &a.view(),
+        &b.view(),
+        |x, y| Complex64::new(x, 0.0) + y,
+        Exec::serial(),
+    )
     .unwrap();
 
     for i in 0..2 {
@@ -1857,7 +1959,7 @@ fn test_add_mixed_c64_plus_f64() {
         StridedArray::<f64>::from_fn_row_major(&[3, 3], |idx| (idx[0] * 3 + idx[1] + 1) as f64);
 
     let orig: Vec<Complex64> = dest.iter().copied().collect();
-    add(&mut dest.view_mut(), &src.view()).unwrap();
+    add(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..3 {
@@ -1877,7 +1979,7 @@ fn test_mul_mixed_c64_times_f64() {
     let src = StridedArray::<f64>::from_fn_row_major(&[2, 3], |idx| (idx[0] + idx[1] + 1) as f64);
 
     let orig: Vec<Complex64> = dest.iter().copied().collect();
-    mul(&mut dest.view_mut(), &src.view()).unwrap();
+    mul(&mut dest.view_mut(), &src.view(), Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..3 {
@@ -1904,7 +2006,7 @@ fn test_axpy_mixed() {
     // We need alpha: Complex64 to produce Complex64 output.
     // Let's use Complex64 alpha instead:
     let alpha_c = Complex64::new(alpha, 0.0);
-    axpy(&mut dest.view_mut(), &src.view(), alpha_c).unwrap();
+    axpy(&mut dest.view_mut(), &src.view(), alpha_c, Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..4 {
@@ -1925,7 +2027,7 @@ fn test_fma_mixed_f64_c64() {
         c(idx[0] as f64, idx[1] as f64)
     });
 
-    fma(&mut dest.view_mut(), &a.view(), &b.view()).unwrap();
+    fma(&mut dest.view_mut(), &a.view(), &b.view(), Exec::serial()).unwrap();
 
     for i in 0..3 {
         for j in 0..2 {
@@ -1945,7 +2047,7 @@ fn test_dot_mixed_f64_c64() {
 
     let result: Complex64 = dot(&a.view(), &b.view()).unwrap();
 
-    // Expected: sum(a[i] * b[i]) = 1*(0+i) + 2*(1+i) + 3*(2+i) + 4*(3+i)
+    // Expected: sum(a[i] * b[i], Exec::serial()) = 1*(0+i) + 2*(1+i) + 3*(2+i) + 4*(3+i)
     //         = (0+2+6+12) + (1+2+3+4)i = 20 + 10i
     assert_eq!(result, c(20.0, 10.0));
 }
@@ -1972,7 +2074,7 @@ fn test_copy_scale_mixed() {
     let mut dest = StridedArray::<Complex64>::row_major(&[2, 3]);
     let scale = c(0.0, 1.0); // multiply by i
 
-    copy_scale(&mut dest.view_mut(), &src.view(), scale).unwrap();
+    copy_scale(&mut dest.view_mut(), &src.view(), scale, Exec::serial()).unwrap();
 
     for i in 0..2 {
         for j in 0..3 {
@@ -1995,9 +2097,12 @@ fn test_custom_type_map_into_without_element_op_apply() {
     let mut dest = StridedArray::<Wrapper>::col_major(&[2, 2]);
 
     // map_into with Identity view on custom type
-    map_into(&mut dest.view_mut(), &src.view(), |Wrapper(x)| {
-        Wrapper(x * 2.0)
-    })
+    map_into(
+        &mut dest.view_mut(),
+        &src.view(),
+        |Wrapper(x)| Wrapper(x * 2.0),
+        Exec::serial(),
+    )
     .unwrap();
 
     assert_eq!(dest.get(&[0, 0]), Wrapper(2.0));

@@ -6,7 +6,7 @@
 //! the layouts where a flat run exists (the fast-path hit), and must not add overhead to the ones
 //! where none does (the miss), because on a miss it falls through to exactly that entry.
 //!
-//! Every case runs at one and four workers in an explicitly bounded Rayon pool whose thread count
+//! Every case runs at one and four workers in an explicitly bounded strided pool whose thread count
 //! is asserted, so the number on a `SUMMARY` line always belongs to the configuration named there.
 //! The kernel writes element by element on purpose: this measures the plumbing, not a SIMD math
 //! library, and the pair is reported as `kernel / typed`, so a value near 1.0 is the expected
@@ -18,13 +18,10 @@
 
 use core::mem::MaybeUninit;
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use strided_basic::{
-    map_into, map_into_uninit_with_kernel, with_execution_policy, ExecutionPolicy, Identity,
-    StridedView, StridedViewMut,
-};
+use strided_basic::{map_into, map_into_uninit_with_kernel, Identity, StridedView, StridedViewMut};
+use strided_basic::{Exec, Pool};
 
 const WARMUPS: usize = 4;
 const SAMPLES: usize = 15;
@@ -63,57 +60,43 @@ fn span(dims: &[usize], strides: &[isize]) -> usize {
 }
 
 /// Measures `typed` and `kernel` alternately under `threads` workers and prints the pair.
+/// Each closure receives the bench's pool and worker count and mints its own token.
 fn measure_pair(
     label: &str,
     dtype: &str,
     threads: usize,
     elements: usize,
-    mut typed: impl FnMut() + Send,
-    mut kernel: impl FnMut() + Send,
+    mut typed: impl FnMut(&Pool, usize) + Send,
+    mut kernel: impl FnMut(&Pool, usize) + Send,
 ) {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .unwrap();
-    pool.install(|| {
-        assert_eq!(
-            rayon::current_num_threads(),
-            threads,
-            "the pool must actually hold the thread count the line reports"
-        );
-        with_execution_policy(
-            ExecutionPolicy::Rayon {
-                max_threads: NonZeroUsize::new(threads).unwrap(),
-            },
-            || {
-                let repeats = repeats(elements);
-                for _ in 0..WARMUPS {
-                    typed();
-                    kernel();
-                }
-                let mut typed_samples = Vec::with_capacity(SAMPLES);
-                let mut kernel_samples = Vec::with_capacity(SAMPLES);
-                for sample in 0..SAMPLES {
-                    // Alternate the order so drift does not favour one side.
-                    if sample % 2 == 0 {
-                        typed_samples.push(time_ms(repeats, &mut typed));
-                        kernel_samples.push(time_ms(repeats, &mut kernel));
-                    } else {
-                        kernel_samples.push(time_ms(repeats, &mut kernel));
-                        typed_samples.push(time_ms(repeats, &mut typed));
-                    }
-                }
-                let (typed_ms, kernel_ms) = (median(&typed_samples), median(&kernel_samples));
-                println!(
-                    "SUMMARY {dtype:<3} {threads}T n={elements:<9} {label:<15} \
-                     typed={typed_ms:>9.4}ms kernel={kernel_ms:>9.4}ms ratio={:>6.3} \
-                     ns/el={:>7.3}",
-                    kernel_ms / typed_ms,
-                    kernel_ms * 1e6 / elements as f64,
-                );
-            },
-        );
-    });
+    let pool = Pool::builder().threads(threads).build().unwrap();
+    let mut typed_run = || typed(&pool, threads);
+    let mut kernel_run = || kernel(&pool, threads);
+    let repeats = repeats(elements);
+    for _ in 0..WARMUPS {
+        typed_run();
+        kernel_run();
+    }
+    let mut typed_samples = Vec::with_capacity(SAMPLES);
+    let mut kernel_samples = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        // Alternate the order so drift does not favour one side.
+        if sample % 2 == 0 {
+            typed_samples.push(time_ms(repeats, &mut typed_run));
+            kernel_samples.push(time_ms(repeats, &mut kernel_run));
+        } else {
+            kernel_samples.push(time_ms(repeats, &mut kernel_run));
+            typed_samples.push(time_ms(repeats, &mut typed_run));
+        }
+    }
+    let (typed_ms, kernel_ms) = (median(&typed_samples), median(&kernel_samples));
+    println!(
+        "SUMMARY {dtype:<3} {threads}T n={elements:<9} {label:<15} \
+         typed={typed_ms:>9.4}ms kernel={kernel_ms:>9.4}ms ratio={:>6.3} \
+         ns/el={:>7.3}",
+        kernel_ms / typed_ms,
+        kernel_ms * 1e6 / elements as f64,
+    );
 }
 
 /// The cases: `(label, dims, strides)`. A pair whose strides are contiguous in the same order is
@@ -159,13 +142,19 @@ macro_rules! run_dtype {
                 $name,
                 $threads,
                 elements,
-                || {
+                |pool, threads| {
                     let mut dest = StridedViewMut::new(&mut typed_out, &dims, &strides, 0).unwrap();
                     let view =
                         StridedView::<$dtype, Identity>::new(&source, &dims, &strides, 0).unwrap();
-                    map_into(&mut dest, &view, |x| x + x).unwrap();
+                    map_into(
+                        &mut dest,
+                        &view,
+                        |x| x + x,
+                        Exec::new(pool, threads).unwrap(),
+                    )
+                    .unwrap();
                 },
-                || {
+                |pool, threads| {
                     let mut dest =
                         StridedViewMut::new(&mut kernel_out, &dims, &strides, 0).unwrap();
                     let view =
@@ -180,6 +169,7 @@ macro_rules! run_dtype {
                             true
                         },
                         |x| x + x,
+                        Exec::new(pool, threads).unwrap(),
                     )
                     .unwrap();
                 },

@@ -1,6 +1,7 @@
 //! Regression test for issue #231: the contiguous fast path of `reduce_axis`
 //! overwrote the output with the first mapped element and dropped `init`.
 
+use strided_basic::Exec;
 use strided_basic::{reduce_axis, StridedArray};
 
 fn expected(dims: &[usize], f: impl Fn(&[usize]) -> f64, init: f64) -> Vec<f64> {
@@ -15,7 +16,7 @@ fn value(idx: &[usize]) -> f64 {
 }
 
 fn check(dims: &[usize], a: &StridedArray<f64>, init: f64) {
-    let out = reduce_axis(&a.view(), 0, |x| x, |x, y| x + y, init).unwrap();
+    let out = reduce_axis(&a.view(), 0, |x| x, |x, y| x + y, init, Exec::serial()).unwrap();
     let want = expected(dims, value, init);
     let got: Vec<f64> = (0..dims[1]).map(|j| out.get(&[j])).collect();
     assert_eq!(got, want, "dims={dims:?} init={init}");
@@ -45,7 +46,7 @@ fn issue_231_fast_path_non_additive_init() {
     // A max reduction with an init larger than every element must return init.
     let dims = [3usize, 8];
     let a = StridedArray::<f64>::from_fn_row_major(&dims, value);
-    let out = reduce_axis(&a.view(), 0, |x| x, f64::max, 1.0e9).unwrap();
+    let out = reduce_axis(&a.view(), 0, |x| x, f64::max, 1.0e9, Exec::serial()).unwrap();
     for j in 0..dims[1] {
         assert_eq!(out.get(&[j]), 1.0e9);
     }
