@@ -103,7 +103,7 @@ impl Plan {
                 output: output_len,
             });
         }
-        if input_len % axis_len != 0 {
+        if !input_len.is_multiple_of(axis_len) {
             return Err(SoftmaxError::UnevenColumns {
                 len: input_len,
                 axis_len,

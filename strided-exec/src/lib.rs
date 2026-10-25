@@ -15,7 +15,7 @@
 //!
 //! * `parallel` (default): run on a private pool. Without it the same types
 //!   exist, every pool has width 1 and every entry runs inline.
-//! * `ledger`: test support, see the [`ledger`] module.
+//! * `ledger`: test support, see the `ledger` module (compiled only with this feature).
 //!
 //! # Examples
 //!

@@ -705,7 +705,7 @@ where
 /// assert_eq!(out.get(&[0]), 1.0);
 /// ```
 ///
-/// Validation runs here; [`reduce_axis_into_impl`] is the shared kernel. The
+/// Validation runs here; `reduce_axis_into_impl` is the shared kernel. The
 /// array-returning wrapper owns a fresh column-major destination and calls the
 /// kernel directly, so the common path does not re-validate.
 pub fn reduce_axis_into<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(

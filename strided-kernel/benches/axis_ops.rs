@@ -314,13 +314,7 @@ fn bench_norm() {
             } else {
                 bounded(threads)
             };
-            let run = |f: &mut (dyn FnMut() + Send)| {
-                if threads == 1 {
-                    median_ms(len, f)
-                } else {
-                    median_ms(len, f)
-                }
-            };
+            let run = |f: &mut (dyn FnMut() + Send)| median_ms(len, f);
             let fused_ms = run(&mut || {
                 let x = ErasedRawStridedRef::from_slice(&x, &case.dims, &case.strides, 0).unwrap();
                 let w = ErasedRawStridedRef::from_slice(&weight, &d_dims, &[1], 0).unwrap();
@@ -409,13 +403,7 @@ fn bench_scan_and_arg() {
             } else {
                 bounded(threads)
             };
-            let run = |f: &mut (dyn FnMut() + Send)| {
-                if threads == 1 {
-                    median_ms(len, f)
-                } else {
-                    median_ms(len, f)
-                }
-            };
+            let run = |f: &mut (dyn FnMut() + Send)| median_ms(len, f);
             let scan_ms = run(&mut || {
                 let src = ErasedRawStridedRef::from_slice(&x, &dims, &st, 0).unwrap();
                 let mut dest =

@@ -93,7 +93,7 @@ fn scheduler_blocks(dims: &[usize], blocks: &[usize]) -> SVec<usize> {
 /// Number of tasks a loop of `len` elements may use out of `budget` slots.
 ///
 /// A pure function of its arguments: `1` up to [`MINTHREADLENGTH`] elements,
-/// `budget` above. Entries apply it with `Exec::limit` (see [`for_len`]).
+/// `budget` above. Entries apply it with `Exec::limit`.
 ///
 /// # Examples
 ///
