@@ -1141,6 +1141,31 @@ pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
         src.strides(),
         f,
         &NoKernel,
+        KernelClass::Map,
+        exec,
+    )
+}
+
+/// `map_into` for a pure copy: the same traversal, gated as [`KernelClass::Copy`].
+///
+/// A copy has no arithmetic per element, so a fork over it pays later than over
+/// a general element map; asking as `Map` forked it too early.
+pub(crate) fn copy_map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<A, Op>,
+    f: impl Fn(A) -> D + Sync,
+    exec: Exec<'_>,
+) -> Result<()> {
+    map_parts_into::<D, A, Op, NoKernel>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.dims(),
+        src.strides(),
+        f,
+        &NoKernel,
+        KernelClass::Copy,
         exec,
     )
 }
@@ -1162,6 +1187,7 @@ pub(crate) fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, O
         f,
         &NoKernel,
         validated,
+        KernelClass::Map,
         exec,
     )
 }
@@ -1222,6 +1248,7 @@ pub fn map_into_uninit_with_kernel<T: Copy + Send + Sync>(
         src.strides(),
         |value| MaybeUninit::new(scalar(value)),
         &SliceKernel(kernel),
+        KernelClass::Map,
         exec,
     )
 }
@@ -1247,6 +1274,7 @@ pub(crate) fn map_raw_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: Ele
         src.strides(),
         f,
         &NoKernel,
+        KernelClass::Map,
         exec,
     )
 }
@@ -1272,6 +1300,7 @@ pub(crate) fn map_raw_into_validated<
         f,
         &NoKernel,
         validated,
+        KernelClass::Map,
         exec,
     )
 }
@@ -1291,6 +1320,7 @@ fn map_parts_into<
     src_strides: &[isize],
     f: impl Fn(A) -> D + Sync,
     kernel: &K,
+    class: KernelClass,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, src_dims)?;
@@ -1304,6 +1334,7 @@ fn map_parts_into<
         f,
         kernel,
         validated,
+        class,
         exec,
     )
 }
@@ -1343,9 +1374,11 @@ fn map_parts_into_validated<
     f: impl Fn(A) -> D + Sync,
     kernel: &K,
     _validated: ValidatedDestinationLayout,
+    class: KernelClass,
     exec: Exec<'_>,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(class, dst_dims, &[dst_strides, src_strides], &exec)?.is_some()
+    {
         let len = total_len(dst_dims)?;
         // SAFETY: the contiguous-layout check proves that `dst` and `src` address `len` elements in
         // the same order starting at their base pointer, so each is exactly a flat run of `len`
@@ -1371,7 +1404,7 @@ fn map_parts_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(KernelClass::Map, total, &exec) {
+    if is_parallel(class, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let src_send = SendPtr(src_ptr as *mut A);
@@ -1385,7 +1418,7 @@ fn map_parts_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
-            KernelClass::Map,
+            class,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -1693,8 +1726,13 @@ fn zip_map2_parts_into_validated<
     _validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
-        .is_some()
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, a_strides, b_strides],
+        &exec,
+    )?
+    .is_some()
     {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
@@ -1802,8 +1840,13 @@ fn mul_identity_into_raw<
     debug_assert_eq!(dst_dims.len(), a_strides.len());
     debug_assert_eq!(dst_dims.len(), b_strides.len());
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
-        .is_some()
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, a_strides, b_strides],
+        &exec,
+    )?
+    .is_some()
     {
         let len = total_len(dst_dims)?;
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
@@ -2214,6 +2257,7 @@ pub(crate) fn zip_map3_into_validated<
     let dst_strides = dest.strides();
 
     if sequential_contiguous_layout(
+        KernelClass::Map,
         dst_dims,
         &[dst_strides, a.strides(), b.strides(), c.strides()],
         &exec,
@@ -2375,6 +2419,7 @@ pub(crate) fn zip_map4_into_validated<
     let dst_strides = dest.strides();
 
     if sequential_contiguous_layout(
+        KernelClass::Map,
         dst_dims,
         &[
             dst_strides,

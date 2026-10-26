@@ -174,7 +174,8 @@ where
         return Ok(init);
     }
 
-    let contiguous = sequential_contiguous_layout(src_dims, &[src_strides], &exec)?;
+    let contiguous =
+        sequential_contiguous_layout(KernelClass::Reduce, src_dims, &[src_strides], &exec)?;
     if contiguous.is_some() {
         let len = total_len(src_dims)?;
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -500,7 +501,9 @@ where
         return Ok(init);
     }
 
-    if sequential_contiguous_layout(dims, &[a_strides, b_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(KernelClass::Reduce, dims, &[a_strides, b_strides], &exec)?
+        .is_some()
+    {
         return Ok(simd::dispatch_if_large(total, || {
             // SAFETY: both operands prove `total` readable elements.
             let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };

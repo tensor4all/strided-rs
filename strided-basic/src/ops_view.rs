@@ -4,7 +4,7 @@ use crate::kernel::{
     build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
     same_contiguous_layout, sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
 };
-use crate::map_view::{map_into, zip_map2_into};
+use crate::map_view::{copy_map_into, map_into, zip_map2_into};
 use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -208,7 +208,14 @@ pub fn copy_into<T: Copy + Send + Sync, Op: ElementOp<T>>(
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(
+        KernelClass::Copy,
+        dst_dims,
+        &[dst_strides, src_strides],
+        &exec,
+    )?
+    .is_some()
+    {
         let len = total_len(dst_dims)?;
         if Op::IS_IDENTITY {
             debug_assert!(
@@ -237,7 +244,7 @@ pub fn copy_into<T: Copy + Send + Sync, Op: ElementOp<T>>(
         return Ok(());
     }
 
-    map_into(dest, src, |x| x, exec)
+    copy_map_into(dest, src, |x| x, exec)
 }
 
 /// Copy initialized values into a potentially uninitialized destination.
@@ -295,7 +302,7 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     if !native_float
         || same_contiguous_layout(dest.dims(), &[dest.strides(), src.strides()]).is_some()
     {
-        return map_into(dest, src, MaybeUninit::new, exec);
+        return copy_map_into(dest, src, MaybeUninit::new, exec);
     }
     // INVARIANT: the permutation engine selects its float paths by the
     // source element type and only stores into the destination, so an
@@ -329,7 +336,14 @@ pub fn add<D: Copy + Add<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, src_strides],
+        &exec,
+    )?
+    .is_some()
+    {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -428,7 +442,14 @@ pub fn mul<D: Copy + Mul<S, Output = D> + Send + Sync, S: Copy + Send + Sync, Op
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, src_strides],
+        &exec,
+    )?
+    .is_some()
+    {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -534,7 +555,14 @@ where
     let dst_strides = dest.strides();
     let src_strides = src.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, src_strides],
+        &exec,
+    )?
+    .is_some()
+    {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -646,8 +674,13 @@ where
     let a_strides = a.strides();
     let b_strides = b.strides();
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
-        .is_some()
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, a_strides, b_strides],
+        &exec,
+    )?
+    .is_some()
     {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };

@@ -88,7 +88,7 @@ fn run_update(
     // one unit-stride block replaces planning and blocking. The sequential
     // guard keeps the parallel branch reachable for large tensors (see
     // `use_sequential_fast_path`).
-    if sequential_contiguous_layout(dims, strides_list, &exec)?.is_some() {
+    if sequential_contiguous_layout(KernelClass::Map, dims, strides_list, &exec)?.is_some() {
         let zeros: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
         let ones: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 1isize).collect();
         body(&zeros, total, &ones);

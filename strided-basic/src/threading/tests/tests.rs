@@ -385,3 +385,66 @@ fn a_call_from_a_pool_worker_does_not_install() {
     assert_eq!(ledger::installs(root), 0);
     assert_transposed(&source, &destination);
 }
+
+/// A length where a fork pays for a map (3 sections * 100 ns / 0.100 ns = 3000
+/// elements) but not yet for a copy (3 * 100 / 0.090 = 3334 elements) on the
+/// test pools.
+#[cfg(feature = "parallel")]
+const MAP_PAYS_COPY_NOT: usize = 3200;
+
+#[cfg(feature = "parallel")]
+#[test]
+fn the_contiguous_gate_asks_with_the_class_of_the_caller() {
+    use crate::kernel::sequential_contiguous_layout;
+    let pool = test_pool(4);
+    let (exec, _) = pooled(&pool, 4);
+    let strides = [1isize];
+    let dims = [MAP_PAYS_COPY_NOT];
+    // The fork pays for a map, so the sequential shortcut is declined...
+    assert!(
+        sequential_contiguous_layout(KernelClass::Map, &dims, &[&strides, &strides], &exec)
+            .unwrap()
+            .is_none()
+    );
+    // ...and still taken for a copy and a reduction of the same length.
+    assert!(
+        sequential_contiguous_layout(KernelClass::Copy, &dims, &[&strides, &strides], &exec)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        sequential_contiguous_layout(KernelClass::Reduce, &dims, &[&strides], &exec)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// `copy_into` of a contiguous run the fork does not pay for as a copy stays on
+/// the calling thread; it used to ask the gate as `Map` and enter the pool.
+#[cfg(feature = "parallel")]
+#[test]
+fn contiguous_copy_into_is_gated_as_a_copy() {
+    let pool = test_pool(4);
+    let src: Vec<f64> = (0..MAP_PAYS_COPY_NOT).map(|i| i as f64).collect();
+    let mut dst = vec![0.0f64; MAP_PAYS_COPY_NOT];
+    let (exec, root) = pooled(&pool, 4);
+    crate::copy_into(
+        &mut crate::StridedViewMut::new(&mut dst, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
+        &crate::StridedView::<f64>::new(&src, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
+        exec,
+    )
+    .unwrap();
+    assert_eq!(dst, src);
+    assert_eq!(ledger::installs(root), 0);
+
+    // The same length as a map does fork, which pins the length to the window.
+    let (exec, root) = pooled(&pool, 4);
+    crate::map_into(
+        &mut crate::StridedViewMut::new(&mut dst, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
+        &crate::StridedView::<f64>::new(&src, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
+        |x| x,
+        exec,
+    )
+    .unwrap();
+    assert_eq!(ledger::installs(root), 1);
+}

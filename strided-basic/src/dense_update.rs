@@ -338,5 +338,5 @@ pub fn embed_diagonal_view_into_uninit<T: Copy + Send + Sync + 'static>(
         |_, chunk| chunk.fill(MaybeUninit::new(zero)),
         exec.reborrow(),
     );
-    crate::map_into(&mut dst, src, MaybeUninit::new, exec)
+    crate::map_view::copy_map_into(&mut dst, src, MaybeUninit::new, exec)
 }

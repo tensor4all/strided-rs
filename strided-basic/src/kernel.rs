@@ -727,17 +727,21 @@ pub(crate) fn same_contiguous_layout(
 }
 
 /// Returns the common contiguous layout only when the sequential fast path
-/// should be used (total elements <= threading threshold, or a serial token).
+/// should be used (a fork over the elements does not pay for `class`, or a serial token).
+///
+/// `class` is the cost class of the kernel the caller would otherwise fork:
+/// a copy asks as `Copy`, a reduction as `Reduce`, an element map as `Map`.
 ///
 /// Returns [`StridedError::OffsetOverflow`] when the element count of `dims`
 /// does not fit in `usize`.
 #[inline]
 pub(crate) fn sequential_contiguous_layout(
+    class: crate::cost::KernelClass,
     dims: &[usize],
     strides_list: &[&[isize]],
     exec: &Exec<'_>,
 ) -> Result<Option<ContiguousLayout>> {
-    if !use_sequential_fast_path(crate::cost::KernelClass::Map, total_len(dims)?, exec) {
+    if !use_sequential_fast_path(class, total_len(dims)?, exec) {
         return Ok(None);
     }
     Ok(same_contiguous_layout(dims, strides_list))
