@@ -25,9 +25,12 @@ there. This page records only what is specific to the strided crates.
 ## Thresholds
 
 - There is no element-count threshold. A kernel multiplies its element count by
-  the serial throughput of its class (`strided_basic::execution::KernelClass`:
-  copy 0.090, map 0.100, exp-like 1.38, reduce 0.081 ns per element, the table
-  lives in `strided-basic/src/cost.rs` and `strided_perm::COPY_NS_PER_ELEMENT`)
+  the serial throughput of its class on the host class
+  (`strided_basic::execution::KernelClass::ns_per_element`; `x86_64-avx512`: copy 0.171, map 0.173, exp-like 5.60,
+  reduce 0.104 ns per element; `aarch64-apple` and the `generic` row of every unmeasured class: 0.090, 0.100, 1.38,
+  0.081; the table, with its derivation, lives in `strided-basic/src/cost.rs` and
+  `strided_perm::copy_ns_per_element_of`; rates and the `threadteam` dispatch costs of a class come from the same
+  machine and clock state)
   and asks the token: `Exec::pays(estimate, sections, width)` for a gate and
   `Exec::width_for(estimate, sections)` for a width. A region runs in parallel
   when its serial time is at least `PAYS` times the dispatch cost of every

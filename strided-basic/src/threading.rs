@@ -538,7 +538,7 @@ pub(crate) fn test_pool(threads: usize) -> threadteam::Pool {
 pub(crate) fn test_dispatch_costs() -> threadteam::DispatchCosts {
     use threadteam::{DispatchKind, WidthCosts};
     let cheap = WidthCosts::flat(core::time::Duration::from_nanos(100));
-    threadteam::DispatchCosts::generic()
+    threadteam::DispatchCosts::for_class(threadteam::HostClass::Generic)
         .with(DispatchKind::Team, cheap)
         .with(DispatchKind::InPool, cheap)
         .with(DispatchKind::Outside, cheap)

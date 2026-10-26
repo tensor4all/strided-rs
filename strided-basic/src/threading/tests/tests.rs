@@ -386,11 +386,21 @@ fn a_call_from_a_pool_worker_does_not_install() {
     assert_transposed(&source, &destination);
 }
 
-/// A length where a fork pays for a map (3 sections * 100 ns / 0.100 ns = 3000
-/// elements) but not yet for a copy (3 * 100 / 0.090 = 3334 elements) on the
-/// test pools.
+/// A length where a fork pays for a map (3 sections * 100 ns / the map rate) but not yet for a
+/// copy (3 * 100 ns / the copy rate) on the test pools, in the middle of that window for the rates
+/// of this host class (about 3000 to 3334 elements on `aarch64-apple`, 1735 to 1754 on
+/// `x86_64-avx512`).
 #[cfg(feature = "parallel")]
-const MAP_PAYS_COPY_NOT: usize = 3200;
+fn map_pays_copy_not() -> usize {
+    let (map, copy) = (
+        KernelClass::Map.ns_per_element(),
+        KernelClass::Copy.ns_per_element(),
+    );
+    assert!(map > copy, "the window needs a map slower than a copy");
+    let n = (300.0 / map * 0.5 + 300.0 / copy * 0.5) as usize;
+    assert!(n as f64 * map >= 300.0 && (n as f64) * copy < 300.0);
+    n
+}
 
 #[cfg(feature = "parallel")]
 #[test]
@@ -398,8 +408,9 @@ fn the_contiguous_gate_asks_with_the_class_of_the_caller() {
     use crate::kernel::sequential_contiguous_layout;
     let pool = test_pool(4);
     let (exec, _) = pooled(&pool, 4);
+    let n = map_pays_copy_not();
     let strides = [1isize];
-    let dims = [MAP_PAYS_COPY_NOT];
+    let dims = [n];
     // The fork pays for a map, so the sequential shortcut is declined...
     assert!(
         sequential_contiguous_layout(KernelClass::Map, &dims, &[&strides, &strides], &exec)
@@ -425,12 +436,13 @@ fn the_contiguous_gate_asks_with_the_class_of_the_caller() {
 #[test]
 fn contiguous_copy_into_is_gated_as_a_copy() {
     let pool = test_pool(4);
-    let src: Vec<f64> = (0..MAP_PAYS_COPY_NOT).map(|i| i as f64).collect();
-    let mut dst = vec![0.0f64; MAP_PAYS_COPY_NOT];
+    let n = map_pays_copy_not();
+    let src: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let mut dst = vec![0.0f64; n];
     let (exec, root) = pooled(&pool, 4);
     crate::copy_into(
-        &mut crate::StridedViewMut::new(&mut dst, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
-        &crate::StridedView::<f64>::new(&src, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
+        &mut crate::StridedViewMut::new(&mut dst, &[n], &[1], 0).unwrap(),
+        &crate::StridedView::<f64>::new(&src, &[n], &[1], 0).unwrap(),
         exec,
     )
     .unwrap();
@@ -440,8 +452,8 @@ fn contiguous_copy_into_is_gated_as_a_copy() {
     // The same length as a map does fork, which pins the length to the window.
     let (exec, root) = pooled(&pool, 4);
     crate::map_into(
-        &mut crate::StridedViewMut::new(&mut dst, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
-        &crate::StridedView::<f64>::new(&src, &[MAP_PAYS_COPY_NOT], &[1], 0).unwrap(),
+        &mut crate::StridedViewMut::new(&mut dst, &[n], &[1], 0).unwrap(),
+        &crate::StridedView::<f64>::new(&src, &[n], &[1], 0).unwrap(),
         |x| x,
         exec,
     )

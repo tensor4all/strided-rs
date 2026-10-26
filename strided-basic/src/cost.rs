@@ -10,16 +10,39 @@
 //!
 //! # The class table
 //!
-//! This table is the only place the throughputs live. Every kernel of the
-//! workspace is one of four classes (measured serially on one Apple M5 Max
-//! core, `f64`, memory resident, see thresholds.md section 3.2):
+//! This table is the only place the throughputs live (the `Copy` row is owned by
+//! `strided-perm`, which sits below this crate). Every kernel of the workspace is
+//! one of four classes, and the rate of a class depends on the *host class*
+//! (`strided_perm::HostClass`, keyed by the kernel dispatch the machine takes,
+//! detected once at first use; the enum and `detect()` are kept in sync with
+//! `threadteam`'s). Serial, `f64`, in nanoseconds per element:
 //!
-//! | [`KernelClass`] | ns per element | kernels |
-//! | --- | --- | --- |
-//! | `Copy` | 0.090 | copies, fills, permutations, gathers, static indexing, transposes |
-//! | `Map` | 0.100 | element-wise map, zip, add, mul, axpy, fma, in-place update, fused arithmetic chains |
-//! | `Transcendental` | 1.38 | `exp`, `ln`, `tanh`, other libm-like functions (fused chains that contain one, softmax) |
-//! | `Reduce` | 0.081 | sum, dot, reduce, zip-reduce, axis reductions, norms, scans and arg-reductions |
+//! | [`KernelClass`] | `x86_64-avx512` | `aarch64-apple` | `generic` (every other class) | kernels |
+//! | --- | --- | --- | --- | --- |
+//! | `Copy` | 0.171 | 0.090 | 0.090 | copies, fills, permutations, gathers, static indexing, transposes |
+//! | `Map` | 0.173 | 0.100 | 0.100 | element-wise map, zip, add, mul, axpy, fma, in-place update, fused arithmetic chains |
+//! | `Transcendental` | 5.60 | 1.38 | 1.38 | `exp`, `ln`, `tanh`, other libm-like functions (fused chains that contain one, softmax) |
+//! | `Reduce` | 0.104 | 0.081 | 0.081 | sum, dot, reduce, zip-reduce, axis reductions, norms, scans and arg-reductions |
+//!
+//! * `aarch64-apple`: one Apple M5 Max core, memory resident (thresholds.md
+//!   section 3.2).
+//! * `x86_64-avx512`: an AMD Ryzen AI 9 HX 470 at 2.0 GHz (boost off), from the
+//!   `seq` column of the strided probes (`copy`, `map`, `exp`, `sum`) in
+//!   `faer-benchmark` `data/probes/20261026-awake-team-linux/tables-confirm-exec3.md`
+//!   (width 8 table): the median over the L2-resident sizes 16384, 32768 and
+//!   65536 elements of `seq us * 1000 / elements`. Copy 2.80, 4.29, 13.17 us give
+//!   0.171, 0.131, 0.201; map 2.84, 5.21, 15.39 us give 0.173, 0.159, 0.235; exp
+//!   91.77, 180, 419 us give 5.60, 5.49, 6.39; sum 1.71, 3.55, 6.65 us give 0.104,
+//!   0.108, 0.102.
+//! * `generic` (`x86_64-avx2`, `x86_64-scalar`, `aarch64`, `generic`: no
+//!   measurement): the fastest known value of each row, the minimum over the
+//!   measured classes. It is the conservative choice: a rate that is too small
+//!   keeps work serial.
+//!
+//! The rates of a class and the dispatch costs of the same class in `threadteam`
+//! come from the same machine in the same clock state: boost on or off moves both
+//! by about 1.66x and leaves their ratio stable within a few percent
+//! (`raw-exec3-boost`, `tables-*-exec3-boost.md`).
 //!
 //! A reduction counts the source elements it reads (outputs times reduced
 //! elements). A kernel with a cost not in the table is classified by the nearest
@@ -40,6 +63,7 @@
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
+use strided_perm::{copy_ns_per_element_of, HostClass};
 use threadteam::Exec;
 
 /// Serial cost class of a kernel; see the module documentation of `strided-basic/src/cost.rs` for the
@@ -51,7 +75,9 @@ use threadteam::Exec;
 /// use strided_basic::execution::KernelClass;
 ///
 /// assert!(KernelClass::Transcendental.ns_per_element() > KernelClass::Map.ns_per_element());
-/// assert_eq!(KernelClass::Map.estimate(1_000_000).as_micros(), 100);
+/// // 1e6 elements at the rate of this host's class.
+/// let ns = KernelClass::Map.ns_per_element() * 1e6;
+/// assert_eq!(KernelClass::Map.estimate(1_000_000).as_nanos() as f64, ns.round());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelClass {
@@ -66,13 +92,37 @@ pub enum KernelClass {
 }
 
 impl KernelClass {
-    /// Serial throughput of the class in nanoseconds per element.
-    pub const fn ns_per_element(self) -> f64 {
-        match self {
-            KernelClass::Copy => strided_perm::COPY_NS_PER_ELEMENT,
-            KernelClass::Map => 0.100,
-            KernelClass::Transcendental => 1.38,
-            KernelClass::Reduce => 0.081,
+    /// Serial throughput of the class in nanoseconds per element on this host
+    /// ([`ns_per_element_of`](Self::ns_per_element_of) of `HostClass::detect()`).
+    pub fn ns_per_element(self) -> f64 {
+        self.ns_per_element_of(HostClass::detect())
+    }
+
+    /// Serial throughput of the class in nanoseconds per element on a host class
+    /// (the table in the module documentation).
+    pub const fn ns_per_element_of(self, host: HostClass) -> f64 {
+        match host {
+            HostClass::X86_64Avx512 => match self {
+                KernelClass::Copy => copy_ns_per_element_of(host),
+                KernelClass::Map => 0.173,
+                KernelClass::Transcendental => 5.60,
+                KernelClass::Reduce => 0.104,
+            },
+            HostClass::Aarch64Apple => match self {
+                KernelClass::Copy => copy_ns_per_element_of(host),
+                KernelClass::Map => 0.100,
+                KernelClass::Transcendental => 1.38,
+                KernelClass::Reduce => 0.081,
+            },
+            HostClass::X86_64Avx2
+            | HostClass::X86_64Scalar
+            | HostClass::Aarch64
+            | HostClass::Generic => match self {
+                KernelClass::Copy => copy_ns_per_element_of(HostClass::Generic),
+                KernelClass::Map => 0.100,
+                KernelClass::Transcendental => 1.38,
+                KernelClass::Reduce => 0.081,
+            },
         }
     }
 

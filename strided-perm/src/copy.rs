@@ -127,7 +127,7 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     let exec = match raw.dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d)) {
         Some(n) => {
             let estimate =
-                std::time::Duration::from_secs_f64(n as f64 * crate::COPY_NS_PER_ELEMENT * 1e-9);
+                std::time::Duration::from_secs_f64(n as f64 * crate::copy_ns_per_element() * 1e-9);
             let width = exec.width_for(estimate, 1);
             exec.limit(width)
         }
@@ -167,7 +167,7 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 /// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
 /// cache-aware blocking, and optimal loop ordering. The permutation is split
 /// across the budget of `exec`, at the width the token's dispatch cost
-/// justifies for the copy ([`COPY_NS_PER_ELEMENT`](crate::COPY_NS_PER_ELEMENT)
+/// justifies for the copy ([`copy_ns_per_element`](crate::copy_ns_per_element)
 /// times its elements); a small copy stays on the calling thread. A caller that wants a large copy on one thread passes
 /// [`Exec::serial`] or narrows the token with [`Exec::limit`].
 /// A contiguous copy is a single `memcpy` on the calling thread.

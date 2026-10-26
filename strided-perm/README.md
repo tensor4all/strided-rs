@@ -36,7 +36,7 @@ describe is written exactly once, through raw pointers only.
 `Exec::serial()` runs the copy on the calling thread. A token minted from a
 `threadteam::Pool` with `Exec::new(&pool, budget)` splits the permutation
 across at most `budget` tasks of that pool. The width is the token's decision
-(`Exec::width_for`): the serial time of the copy, `COPY_NS_PER_ELEMENT` times
+(`Exec::width_for`): the serial time of the copy, `copy_ns_per_element()` (the rate of the detected `HostClass`) times
 its elements, against the dispatch cost of one section, so a small copy stays on
 the calling thread. A caller that wants a large copy on one thread passes a
 serial token or narrows the token with `Exec::limit`. Without the `parallel`
