@@ -173,7 +173,7 @@ where
 pub unsafe fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + Sync,
+    f: impl crate::MapFn<A, D>,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {

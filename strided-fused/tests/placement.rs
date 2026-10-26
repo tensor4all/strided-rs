@@ -808,7 +808,7 @@ fn nested_strided_operations_given_a_serial_token_stay_within_the_outer_budget()
                 map_into(
                     &mut nested_destination.view_mut(),
                     &nested_source.view(),
-                    |nested_index| {
+                    |nested_index: usize| {
                         let _nested_guard = active_threads.enter();
                         coverage[nested_operation * NESTED_LEN + nested_index]
                             .fetch_add(1, Ordering::SeqCst);
@@ -961,6 +961,36 @@ fn fused_add_runs_on_pool_workers() {
     assert_on_pool_workers(participants);
     assert_within_budget(root, 4);
     assert_eq!(output[LARGE_LEN - 1].value, LARGE_LEN as f64 + 1.0);
+}
+
+/// The static unary family states the class of its op: `exp` over a length where a
+/// fork pays for a transcendental (3 * 100 ns / 1.38 ns = 218 elements) but not for
+/// arithmetic (3000 elements) enters the pool, and `negate` of the same length stays
+/// on the calling thread.
+#[test]
+fn static_unary_exp_is_gated_as_transcendental() {
+    const MID_LEN: usize = 1000;
+    let pool = named_pool();
+    let source = StridedArray::<f64>::from_fn_col_major(&[MID_LEN], |index| index[0] as f64 * 1e-3);
+    let run = |op: FusedOp| {
+        let mut destination = StridedArray::<f64>::col_major(&[MID_LEN]);
+        let (exec, root) = pooled(&pool, 4);
+        let plan = FusedPlan {
+            input_count: 1,
+            outputs: vec![1].into_iter().collect(),
+            ops: vec![FusedInst {
+                op,
+                inputs: vec![0].into_iter().collect(),
+            }]
+            .into_iter()
+            .collect(),
+        };
+        fused_elementwise_into(&mut [destination.view_mut()], &[source.view()], &plan, exec)
+            .unwrap();
+        ledger::installs(root)
+    };
+    assert_eq!(run(FusedOp::Negate), 0);
+    assert!(run(FusedOp::Exp) >= 1);
 }
 
 /// A large non-contiguous copy that fans out through the map scheduler is

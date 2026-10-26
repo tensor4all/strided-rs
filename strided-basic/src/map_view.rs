@@ -1122,16 +1122,100 @@ unsafe fn inner_loop_map4<
     }
 }
 
+/// An element function that carries its [`KernelClass`].
+///
+/// [`map_into`] and its siblings gate their parallel fork on the serial time of the
+/// region, which is the element count times the throughput of the function's class.
+/// A plain closure or function item is a [`KernelClass::Map`] (a few arithmetic
+/// operations per element) through the blanket implementation, so existing callers
+/// are unchanged. A caller whose function is expensive declares it with
+/// [`Classed`], usually through [`KernelClass::with`], so a region too short to pay
+/// for a fork as arithmetic is still forked when each element costs a libm call.
+///
+/// The trait is implemented for every `Fn(A) -> D + Sync` and for [`Classed`]; it is
+/// not meant to be implemented by hand.
+///
+/// # Examples
+/// ```
+/// use strided_basic::execution::KernelClass;
+/// use strided_basic::{map_into, Exec, StridedView, StridedViewMut};
+///
+/// let src = vec![0.0f64, 1.0, 2.0];
+/// let mut out = vec![0.0f64; 3];
+/// let mut dest = StridedViewMut::new(&mut out, &[3], &[1], 0).unwrap();
+/// let source = StridedView::<f64>::new(&src, &[3], &[1], 0).unwrap();
+/// // `exp` costs about as much as ten arithmetic operations: say so.
+/// let exp = KernelClass::Transcendental.with(|x: f64| x.exp());
+/// map_into(&mut dest, &source, exp, Exec::serial()).unwrap();
+/// assert_eq!(out[0], 1.0);
+/// ```
+pub trait MapFn<A, D>: Sync {
+    /// Apply the function to one element.
+    fn call(&self, a: A) -> D;
+
+    /// Serial cost class the parallel gate charges per element; `Map` by default.
+    fn class(&self) -> KernelClass {
+        KernelClass::Map
+    }
+}
+
+impl<A, D, F: Fn(A) -> D + Sync> MapFn<A, D> for F {
+    #[inline(always)]
+    fn call(&self, a: A) -> D {
+        self(a)
+    }
+}
+
+/// An element function together with the [`KernelClass`] it is charged as.
+///
+/// Build one with [`Classed::new`] or [`KernelClass::with`]; see [`MapFn`].
+#[derive(Debug, Clone, Copy)]
+pub struct Classed<F> {
+    /// The element function.
+    pub f: F,
+    /// The class the parallel gate charges per element.
+    pub class: KernelClass,
+}
+
+impl<F> Classed<F> {
+    /// Declare `f` as a function of cost class `class`.
+    pub const fn new(class: KernelClass, f: F) -> Self {
+        Self { f, class }
+    }
+}
+
+impl KernelClass {
+    /// Declare an element function of this class, for [`map_into`] and its siblings.
+    pub const fn with<F>(self, f: F) -> Classed<F> {
+        Classed::new(self, f)
+    }
+}
+
+impl<A, D, F: Fn(A) -> D + Sync> MapFn<A, D> for Classed<F> {
+    #[inline(always)]
+    fn call(&self, a: A) -> D {
+        (self.f)(a)
+    }
+
+    fn class(&self) -> KernelClass {
+        self.class
+    }
+}
+
 /// Apply a function element-wise from source to destination.
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
 /// Source and destination may have different element types.
+///
+/// `f` is any `Fn(A) -> D + Sync`, gated as [`KernelClass::Map`], or a function declared
+/// with a class of its own (see [`MapFn`]), so an expensive element function forks sooner.
 pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + Sync,
+    f: impl MapFn<A, D>,
     exec: Exec<'_>,
 ) -> Result<()> {
+    let class = f.class();
     map_parts_into::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
@@ -1139,9 +1223,9 @@ pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
         src.ptr(),
         src.dims(),
         src.strides(),
-        f,
+        |a| f.call(a),
         &NoKernel,
-        KernelClass::Map,
+        class,
         exec,
     )
 }
@@ -1173,21 +1257,22 @@ pub(crate) fn copy_map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: El
 pub(crate) fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + Sync,
+    f: impl MapFn<A, D>,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
+    let class = f.class();
     map_parts_into_validated::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
         src.ptr(),
         src.strides(),
-        f,
+        |a| f.call(a),
         &NoKernel,
         validated,
-        KernelClass::Map,
+        class,
         exec,
     )
 }
@@ -1206,6 +1291,9 @@ pub(crate) fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, O
 /// say — reuses this crate's layout logic and this crate's threading decision instead of
 /// rebuilding either. `scalar` and `kernel` must agree up to the caller's own error bound; this
 /// crate only guarantees that every destination element is written exactly once.
+///
+/// `scalar` may carry a [`KernelClass`] (see [`MapFn`]); the gate charges the region as that
+/// class, so a transcendental `scalar` forks sooner.
 ///
 /// # Examples
 /// ```
@@ -1236,9 +1324,10 @@ pub fn map_into_uninit_with_kernel<T: Copy + Send + Sync>(
     dest: &mut StridedViewMut<MaybeUninit<T>>,
     src: &StridedView<T>,
     kernel: impl Fn(&[T], &mut [MaybeUninit<T>]) -> bool + Sync,
-    scalar: impl Fn(T) -> T + Sync,
+    scalar: impl MapFn<T, T>,
     exec: Exec<'_>,
 ) -> Result<()> {
+    let class = scalar.class();
     map_parts_into::<MaybeUninit<T>, T, Identity, _>(
         dest.as_mut_ptr(),
         dest.dims(),
@@ -1246,9 +1335,9 @@ pub fn map_into_uninit_with_kernel<T: Copy + Send + Sync>(
         src.ptr(),
         src.dims(),
         src.strides(),
-        |value| MaybeUninit::new(scalar(value)),
+        |value| MaybeUninit::new(scalar.call(value)),
         &SliceKernel(kernel),
-        KernelClass::Map,
+        class,
         exec,
     )
 }

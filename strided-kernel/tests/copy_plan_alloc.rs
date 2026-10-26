@@ -361,7 +361,13 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         Exec::serial(),
     )
     .unwrap();
-    map_into(&mut typed_dest, &lhs_view, |value| -value, Exec::serial()).unwrap();
+    map_into(
+        &mut typed_dest,
+        &lhs_view,
+        |value: f64| -value,
+        Exec::serial(),
+    )
+    .unwrap();
     erased_zip_into(
         KernelDType::F64,
         ErasedZipOp::Add,
@@ -389,7 +395,13 @@ fn execute_is_allocation_free_up_to_rank_limit() {
                 Exec::serial(),
             )
             .unwrap();
-            map_into(&mut typed_dest, &lhs_view, |value| -value, Exec::serial()).unwrap();
+            map_into(
+                &mut typed_dest,
+                &lhs_view,
+                |value: f64| -value,
+                Exec::serial(),
+            )
+            .unwrap();
         }
     });
     let allocations = count_allocations(|| {

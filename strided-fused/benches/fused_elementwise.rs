@@ -127,7 +127,7 @@ fn bench_broadcast_exp_mul_add(c: &mut Criterion) {
             map_into(
                 &mut out.view_mut(),
                 &tmp_add.view(),
-                |x| x.exp(),
+                |x: f64| x.exp(),
                 Exec::serial(),
             )
             .unwrap();
@@ -218,14 +218,14 @@ fn bench_long_chain(c: &mut Criterion) {
             map_into(
                 &mut tmp_sqrt.view_mut(),
                 &tmp_min.view(),
-                |x| x.sqrt(),
+                |x: f64| x.sqrt(),
                 Exec::serial(),
             )
             .unwrap();
             map_into(
                 &mut out.view_mut(),
                 &tmp_sqrt.view(),
-                |x| 1.0 / x.sqrt(),
+                |x: f64| 1.0 / x.sqrt(),
                 Exec::serial(),
             )
             .unwrap();
@@ -288,14 +288,14 @@ fn bench_interpreter_fallback(c: &mut Criterion) {
             map_into(
                 &mut tmp_neg.view_mut(),
                 &tmp_add.view(),
-                |x| -x,
+                |x: f64| -x,
                 Exec::serial(),
             )
             .unwrap();
             map_into(
                 &mut out.view_mut(),
                 &tmp_neg.view(),
-                |x| x.exp(),
+                |x: f64| x.exp(),
                 Exec::serial(),
             )
             .unwrap();

@@ -33,6 +33,10 @@ there. This page records only what is specific to the strided crates.
   when its serial time is at least `PAYS` times the dispatch cost of every
   section; the cost depends on the kind of token (team, plain token inside its
   pool, plain token outside it) and is read at call time.
+  The class of an element function rides with the function passed to `map_into`
+  and its siblings: a closure is a `Map`, and a caller declares an expensive one
+  with `KernelClass::Transcendental.with(f)` (`strided_basic::Classed`, trait
+  `MapFn`).
 - `sections` is the number of dispatches the entry performs: 1 for a flat entry
   (`for_ranges`: copies, fills, the permutation engine, axis-chunked kernels),
   `ceil(log2 width)` for a tree entry (`parallel_map_reduce`), and 1 per node for

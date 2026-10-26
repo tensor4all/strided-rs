@@ -448,3 +448,57 @@ fn contiguous_copy_into_is_gated_as_a_copy() {
     .unwrap();
     assert_eq!(ledger::installs(root), 1);
 }
+
+/// A length where a fork pays for a transcendental element function
+/// (3 * 100 ns / 1.38 ns = 218 elements) but not for a plain map (3000 elements)
+/// on the test pools.
+#[cfg(feature = "parallel")]
+const TRANSCENDENTAL_PAYS_MAP_NOT: usize = 1000;
+
+/// The class rides with the function passed to `map_into`: a closure is a `Map`
+/// and stays on the calling thread, the same closure declared `Transcendental`
+/// enters the pool, and one declared `Map` explicitly behaves as the bare closure.
+#[cfg(feature = "parallel")]
+#[test]
+fn map_into_gates_on_the_class_of_the_function() {
+    use crate::{Classed, MapFn};
+    let pool = test_pool(4);
+    let n = TRANSCENDENTAL_PAYS_MAP_NOT;
+    let src: Vec<f64> = (0..n).map(|i| i as f64 * 1e-3).collect();
+    let expected: Vec<f64> = src.iter().map(|x| x.exp()).collect();
+    let run = |f: &dyn Fn(&mut [f64], crate::Exec<'_>)| {
+        let mut dst = vec![0.0f64; n];
+        let (exec, root) = pooled(&pool, 4);
+        f(&mut dst, exec);
+        assert_eq!(dst, expected);
+        ledger::installs(root)
+    };
+    let view_src = || crate::StridedView::<f64>::new(&src, &[n], &[1], 0).unwrap();
+
+    let plain = run(&|dst, exec| {
+        let mut d = crate::StridedViewMut::new(dst, &[n], &[1], 0).unwrap();
+        crate::map_into(&mut d, &view_src(), |x: f64| x.exp(), exec).unwrap();
+    });
+    assert_eq!(plain, 0);
+
+    let map_class = run(&|dst, exec| {
+        let mut d = crate::StridedViewMut::new(dst, &[n], &[1], 0).unwrap();
+        let f = Classed::new(KernelClass::Map, |x: f64| x.exp());
+        crate::map_into(&mut d, &view_src(), f, exec).unwrap();
+    });
+    assert_eq!(map_class, 0);
+
+    let transcendental = run(&|dst, exec| {
+        let mut d = crate::StridedViewMut::new(dst, &[n], &[1], 0).unwrap();
+        let f = KernelClass::Transcendental.with(|x: f64| x.exp());
+        crate::map_into(&mut d, &view_src(), f, exec).unwrap();
+    });
+    assert_eq!(transcendental, 1);
+
+    // The class a function reports.
+    assert_eq!(MapFn::<f64, f64>::class(&|x: f64| x), KernelClass::Map);
+    assert_eq!(
+        MapFn::<f64, f64>::class(&KernelClass::Reduce.with(|x: f64| x)),
+        KernelClass::Reduce
+    );
+}

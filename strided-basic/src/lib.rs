@@ -117,7 +117,7 @@ pub use inline::{InlineVec, OperandVec, OPERAND_CAP};
 pub use map_view::{
     broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
     map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
-    zip_map4_into, CompareOp,
+    zip_map4_into, Classed, CompareOp, MapFn,
 };
 pub use nan_select::{nan_propagating_maximum, nan_propagating_minimum};
 pub use ops_view::{

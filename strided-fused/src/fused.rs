@@ -1102,7 +1102,7 @@ where
                         map_into_validated(
                             dest,
                             &inputs[a],
-                            |x| O::write($apply(x)),
+                            strided_basic::Classed::new(op_class(op), |x: T| O::write($apply(x))),
                             validated,
                             exec,
                         )
@@ -1517,20 +1517,31 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
 /// a libm-like function, `Map` for arithmetic chains (see
 /// `strided_basic::execution::KernelClass`).
 fn plan_class(plan: &FusedPlan) -> KernelClass {
-    let transcendental = plan.ops.iter().any(|inst| {
-        matches!(
-            inst.op,
-            FusedOp::Exp
-                | FusedOp::Log
-                | FusedOp::Sin
-                | FusedOp::Cos
-                | FusedOp::Tanh
-                | FusedOp::Pow
-                | FusedOp::Expm1
-                | FusedOp::Log1p
-        )
-    });
-    if transcendental {
+    if plan
+        .ops
+        .iter()
+        .any(|inst| op_class(inst.op) == KernelClass::Transcendental)
+    {
+        KernelClass::Transcendental
+    } else {
+        KernelClass::Map
+    }
+}
+
+/// Serial cost class of one fused instruction: `Transcendental` for a libm-like
+/// function, `Map` otherwise.
+fn op_class(op: FusedOp) -> KernelClass {
+    if matches!(
+        op,
+        FusedOp::Exp
+            | FusedOp::Log
+            | FusedOp::Sin
+            | FusedOp::Cos
+            | FusedOp::Tanh
+            | FusedOp::Pow
+            | FusedOp::Expm1
+            | FusedOp::Log1p
+    ) {
         KernelClass::Transcendental
     } else {
         KernelClass::Map
