@@ -25,7 +25,7 @@ strided-traits = { version = "0.7.0", path = "strided-traits" }
 strided-view = { version = "0.7.0", path = "strided-view" }
 strided-perm = { version = "0.8.0", path = "strided-perm" }
 strided-kernel = { version = "0.8.0", path = "strided-kernel" }
-threadteam = { git = "https://github.com/tensor4all/threadteam-rs", rev = "2024882b4ee759873a0b403a9c0a270361ae527a", version = "0.1.0", default-features = false }
+threadteam = { version = "0.1", default-features = false }
 
 approx = "0.5"
 criterion = "0.5"
