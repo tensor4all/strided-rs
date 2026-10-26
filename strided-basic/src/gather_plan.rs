@@ -8,6 +8,7 @@
 use core::{mem::MaybeUninit, ops::Add};
 
 use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
+use crate::cost::KernelClass;
 use crate::inline::InlineVec;
 use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
 use crate::{Exec, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT};
@@ -621,7 +622,7 @@ impl GatherPlan {
             return Ok(());
         }
         if self.uses_rank_one_scalar_take_path() {
-            let exec = crate::threading::for_len(exec, self.total);
+            let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.total);
             if !exec.is_serial() {
                 return self.execute_rank_one_scalar_take_parallel(
                     dest,
@@ -632,7 +633,7 @@ impl GatherPlan {
             }
             return self.execute_rank_one_scalar_take(dest, operand, start_indices);
         }
-        let exec = crate::threading::for_len(exec, self.total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.total);
         if !exec.is_serial() {
             return self.execute_parallel(dest, operand, start_indices, exec);
         }
@@ -1031,7 +1032,7 @@ impl DynamicSlicePlan {
             return self.execute_fused_window(dest, operand, starts, window, exec);
         }
         let replay = &self.replay;
-        let exec = crate::threading::for_len(exec, self.total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.total);
         if !exec.is_serial() {
             return self.execute_parallel(dest, operand, starts, exec, replay);
         }
@@ -1375,7 +1376,7 @@ impl DynamicUpdateSlicePlan {
             return self.execute_fused_window(dest, update, starts, window, exec);
         }
         let replay = &self.replay;
-        let exec = crate::threading::for_len(exec, self.total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.total);
         if !exec.is_serial() {
             return self.execute_update_parallel(dest, update, starts, exec, replay);
         }

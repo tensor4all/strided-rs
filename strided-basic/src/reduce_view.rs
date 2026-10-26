@@ -11,6 +11,7 @@ use core::num::NonZeroUsize;
 use std::ops::Range;
 use strided_view::ElementOp;
 
+use crate::cost::KernelClass;
 use crate::fuse::compute_costs;
 use crate::inline::InlineVec;
 use crate::threading::{
@@ -173,7 +174,8 @@ where
         return Ok(init);
     }
 
-    let contiguous = sequential_contiguous_layout(src_dims, &[src_strides], &exec)?;
+    let contiguous =
+        sequential_contiguous_layout(KernelClass::Reduce, src_dims, &[src_strides], &exec)?;
     if contiguous.is_some() {
         let len = total_len(src_dims)?;
         let src = unsafe { std::slice::from_raw_parts(src_ptr, len) };
@@ -186,11 +188,13 @@ where
     // This enables LLVM auto-vectorization on each chunk, unlike the general threaded path
     // which uses scalar pointer-offset loops.
     let total = total_len(src_dims)?;
-    if is_parallel(total, &exec) && same_contiguous_layout(src_dims, &[src_strides]).is_some() {
+    if is_parallel(KernelClass::Reduce, total, &exec)
+        && same_contiguous_layout(src_dims, &[src_strides]).is_some()
+    {
         let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total) };
         let result = crate::threading::parallel_map_reduce(
             0..total,
-            exec,
+            crate::cost::for_len_tree(exec, KernelClass::Reduce, total),
             &|range| {
                 simd::dispatch_if_large(range.len(), || {
                     fold_contiguous::<T, Op, M, R, U>(
@@ -212,7 +216,7 @@ where
         build_plan_fused(src_dims, &strides_list, None, std::mem::size_of::<T>());
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Reduce, total, &exec) {
         let src_send = SendPtr(src_ptr as *mut T);
         let costs = compute_costs(&ordered_strides);
         let initial_offsets: crate::inline::OperandVec<isize> =
@@ -228,6 +232,7 @@ where
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Reduce,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 let mut acc = init_ref.clone();
@@ -496,7 +501,9 @@ where
         return Ok(init);
     }
 
-    if sequential_contiguous_layout(dims, &[a_strides, b_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(KernelClass::Reduce, dims, &[a_strides, b_strides], &exec)?
+        .is_some()
+    {
         return Ok(simd::dispatch_if_large(total, || {
             // SAFETY: both operands prove `total` readable elements.
             let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };
@@ -507,14 +514,15 @@ where
 
     // Parallel contiguous fast path: split into scheduler chunks so each chunk
     // folds two contiguous slices, matching the serial contiguous kernel.
-    if is_parallel(total, &exec) && same_contiguous_layout(dims, &[a_strides, b_strides]).is_some()
+    if is_parallel(KernelClass::Reduce, total, &exec)
+        && same_contiguous_layout(dims, &[a_strides, b_strides]).is_some()
     {
         // SAFETY: both operands prove `total` readable elements.
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, total) };
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, total) };
         let result = crate::threading::parallel_map_reduce(
             0..total,
-            exec,
+            crate::cost::for_len_tree(exec, KernelClass::Reduce, total),
             &|range| {
                 let len = range.len();
                 simd::dispatch_if_large(len, || {
@@ -538,7 +546,7 @@ where
         build_plan_fused(dims, &strides_list, None, elem_size);
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Reduce, total, &exec) {
         let a_send = SendPtr(a_ptr as *mut A);
         let b_send = SendPtr(b_ptr as *mut B);
         let costs = compute_costs(&ordered_strides);
@@ -555,6 +563,7 @@ where
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Reduce,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 let mut acc = init_ref.clone();
@@ -850,7 +859,7 @@ where
     };
 
     let work = dest_len.saturating_mul(axis_len);
-    let exec = crate::threading::for_len(exec, work)
+    let exec = crate::cost::for_len(exec, KernelClass::Reduce, work)
         .limit(NonZeroUsize::new(dest_len).unwrap_or(NonZeroUsize::MIN));
     if !exec.is_serial() {
         let src_send = SendPtr(src_ptr as *mut T);

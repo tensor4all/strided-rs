@@ -27,6 +27,7 @@
 //! let marker = validate_destination_layout_without_alloc(&[2], &[1]).unwrap();
 //! map_into_validated(&mut dst.view_mut(), &src.view(), |x| x, marker, Exec::serial()).unwrap();
 //! ```
+pub use crate::cost::{parallel_width, tree_width, KernelClass};
 pub use crate::erased_common::{
     check_dtype, check_static_indexing_dtype, erased_view, validate_uninit_no_overlap,
 };
@@ -36,9 +37,7 @@ pub use crate::map_view::{
     validate_destination_layout, validate_destination_layout_without_alloc,
     ValidatedDestinationLayout,
 };
-pub use crate::threading::{
-    parallel_map_reduce, parallel_threads_for_len, SendPtr, MINTHREADLENGTH,
-};
+pub use crate::threading::{parallel_map_reduce, SendPtr};
 
 use crate::{ElementOp, Exec, InlineVec, OperandVec, Result, StridedView, StridedViewMut};
 
@@ -174,7 +173,7 @@ where
 pub unsafe fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + Sync,
+    f: impl crate::MapFn<A, D>,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -441,6 +440,10 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
 
 /// Prevalidated mapreduce threaded for kernel-family implementations.
 ///
+/// `class` is the serial cost class of the leaf (see [`KernelClass`]); every node
+/// of the split runs in parallel only when a fork of its region pays for that
+/// class.
+///
 /// # Safety
 /// All rank-indexed arrays must have matching lengths and a valid destination
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
@@ -457,7 +460,7 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
 /// // SAFETY: the example supplies matching bounded layouts and disjoint storage.
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// let count = AtomicUsize::new(0);
-/// unsafe { mapreduce_threaded(&[4], &[4], &[vec![1]], &[0], &[2], strided_basic::Exec::serial(), &|dims, _, _, _| { count.fetch_add(dims.iter().product::<usize>(), Ordering::Relaxed); Ok(()) }) }.unwrap();
+/// unsafe { mapreduce_threaded(&[4], &[4], &[vec![1]], &[0], &[2], KernelClass::Map, strided_basic::Exec::serial(), &|dims, _, _, _| { count.fetch_add(dims.iter().product::<usize>(), Ordering::Relaxed); Ok(()) }) }.unwrap();
 /// assert_eq!(count.load(Ordering::Relaxed), 4);
 /// ```
 ///
@@ -471,6 +474,7 @@ pub unsafe fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     strides_list: &[S],
     offsets: &[isize],
     costs: &[isize],
+    class: KernelClass,
     exec: Exec<'_>,
     f: &F,
 ) -> Result<()>
@@ -484,6 +488,7 @@ where
         strides_list,
         offsets,
         costs,
+        class,
         exec,
         f,
     )

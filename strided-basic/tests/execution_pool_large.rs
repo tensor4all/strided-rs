@@ -13,6 +13,7 @@ const WORKER_PREFIX: &str = "strided-large-worker";
 
 fn named_pool() -> Pool {
     Pool::builder()
+        .dispatch_costs(cheap_dispatch_costs())
         .threads(4)
         .thread_name(|i| format!("{WORKER_PREFIX}-{i}"))
         .build()
@@ -100,4 +101,16 @@ fn capped_target_pool_limits_concurrent_workers() {
     assert!(max_active.load(Ordering::SeqCst) <= 2);
     assert!(threadteam::ledger::max_live(root) <= 2);
     assert_eq!(destination.get(&[LEN - 1]), LEN - 1);
+}
+
+/// Dispatch costs of the test pools: 100 ns per section whatever the token, so that the
+/// regions of tens of thousands of elements these tests use open the parallel branches
+/// (the host default costs would keep them serial).
+fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
+    use threadteam::{DispatchKind, WidthCosts};
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    threadteam::DispatchCosts::for_class(threadteam::HostClass::Generic)
+        .with(DispatchKind::Team, cheap)
+        .with(DispatchKind::InPool, cheap)
+        .with(DispatchKind::Outside, cheap)
 }

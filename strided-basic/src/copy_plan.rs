@@ -17,6 +17,7 @@ use core::{
 
 use num_traits::{One, Zero};
 
+use crate::cost::KernelClass;
 use crate::raw_ops::{
     apply_fused_range, apply_spilled_range, fuse_pair_traversal, fused_total, FusedAxis,
     FusedPairLayout, PairTraversal,
@@ -669,7 +670,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
     if total == 0 {
         return;
     }
-    let exec = crate::threading::for_len(exec, total);
+    let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
     if !exec.is_serial() {
         let dst_ptr = crate::threading::SendPtr(dst_ptr);
         let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
@@ -734,7 +735,7 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
     if total == 0 {
         return;
     }
-    let exec = crate::threading::for_len(exec, total);
+    let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
     if !exec.is_serial() {
         let dst_ptr = crate::threading::SendPtr(dst_ptr);
         let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);

@@ -122,16 +122,17 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     exec: Exec<'_>,
 ) -> Result<()> {
     let dst_ptr = raw.dst.cast::<T>();
-    // A copy this small costs less than a fan-out: keep it on one task.
-    let exec = if raw
-        .dims
-        .iter()
-        .try_fold(1usize, |n, &d| n.checked_mul(d))
-        .is_some_and(|n| n <= crate::MINTHREADLENGTH)
-    {
-        exec.limit(std::num::NonZeroUsize::MIN)
-    } else {
-        exec
+    // The width is the token's decision: the serial time of the copy against the
+    // dispatch cost of the one section the engine opens (`for_ranges`).
+    let exec = match raw.dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d)) {
+        Some(n) => {
+            let estimate =
+                std::time::Duration::from_secs_f64(n as f64 * crate::copy_ns_per_element() * 1e-9);
+            let width = exec.width_for(estimate, 1);
+            exec.limit(width)
+        }
+        // An overflowing count is reported by planning below; run it serially.
+        None => exec.limit(std::num::NonZeroUsize::MIN),
     };
     // Fast path: both contiguous. A contiguous layout is injective by
     // construction, so it skips the validation below.
@@ -165,9 +166,9 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 ///
 /// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
 /// cache-aware blocking, and optimal loop ordering. The permutation is split
-/// across the budget of `exec`, except that a copy of at most
-/// [`MINTHREADLENGTH`](crate::MINTHREADLENGTH) elements stays on the calling
-/// thread. A caller that wants a large copy on one thread passes
+/// across the budget of `exec`, at the width the token's dispatch cost
+/// justifies for the copy ([`copy_ns_per_element`](crate::copy_ns_per_element)
+/// times its elements); a small copy stays on the calling thread. A caller that wants a large copy on one thread passes
 /// [`Exec::serial`] or narrows the token with [`Exec::limit`].
 /// A contiguous copy is a single `memcpy` on the calling thread.
 ///

@@ -17,10 +17,9 @@ use core::mem::MaybeUninit;
 use std::ops::Mul;
 use strided_view::{ElementOp, Identity};
 
+use crate::cost::{for_len, KernelClass};
 use crate::fuse::compute_costs;
-use crate::threading::{
-    for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded, MINTHREADLENGTH,
-};
+use crate::threading::{for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded};
 use crate::Exec;
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
@@ -858,7 +857,9 @@ fn try_contiguous_range_mul<
     if total == 0 {
         return true;
     }
-    if total <= MINTHREADLENGTH {
+    // One flat section over the chunks: the width is the token's decision.
+    let exec = for_len(exec, KernelClass::Map, total);
+    if exec.is_serial() {
         return false;
     }
 
@@ -1121,11 +1122,119 @@ unsafe fn inner_loop_map4<
     }
 }
 
+/// An element function that carries its [`KernelClass`].
+///
+/// [`map_into`] and its siblings gate their parallel fork on the serial time of the
+/// region, which is the element count times the throughput of the function's class.
+/// A plain closure or function item is a [`KernelClass::Map`] (a few arithmetic
+/// operations per element) through the blanket implementation, so existing callers
+/// are unchanged. A caller whose function is expensive declares it with
+/// [`Classed`], usually through [`KernelClass::with`], so a region too short to pay
+/// for a fork as arithmetic is still forked when each element costs a libm call.
+///
+/// The trait is implemented for every `Fn(A) -> D + Sync` and for [`Classed`]; it is
+/// not meant to be implemented by hand.
+///
+/// # Examples
+/// ```
+/// use strided_basic::execution::KernelClass;
+/// use strided_basic::{map_into, Exec, StridedView, StridedViewMut};
+///
+/// let src = vec![0.0f64, 1.0, 2.0];
+/// let mut out = vec![0.0f64; 3];
+/// let mut dest = StridedViewMut::new(&mut out, &[3], &[1], 0).unwrap();
+/// let source = StridedView::<f64>::new(&src, &[3], &[1], 0).unwrap();
+/// // `exp` costs about as much as ten arithmetic operations: say so.
+/// let exp = KernelClass::Transcendental.with(|x: f64| x.exp());
+/// map_into(&mut dest, &source, exp, Exec::serial()).unwrap();
+/// assert_eq!(out[0], 1.0);
+/// ```
+pub trait MapFn<A, D>: Sync {
+    /// Apply the function to one element.
+    fn call(&self, a: A) -> D;
+
+    /// Serial cost class the parallel gate charges per element; `Map` by default.
+    fn class(&self) -> KernelClass {
+        KernelClass::Map
+    }
+}
+
+impl<A, D, F: Fn(A) -> D + Sync> MapFn<A, D> for F {
+    #[inline(always)]
+    fn call(&self, a: A) -> D {
+        self(a)
+    }
+}
+
+/// An element function together with the [`KernelClass`] it is charged as.
+///
+/// Build one with [`Classed::new`] or [`KernelClass::with`]; see [`MapFn`].
+#[derive(Debug, Clone, Copy)]
+pub struct Classed<F> {
+    /// The element function.
+    pub f: F,
+    /// The class the parallel gate charges per element.
+    pub class: KernelClass,
+}
+
+impl<F> Classed<F> {
+    /// Declare `f` as a function of cost class `class`.
+    pub const fn new(class: KernelClass, f: F) -> Self {
+        Self { f, class }
+    }
+}
+
+impl KernelClass {
+    /// Declare an element function of this class, for [`map_into`] and its siblings.
+    pub const fn with<F>(self, f: F) -> Classed<F> {
+        Classed::new(self, f)
+    }
+}
+
+impl<A, D, F: Fn(A) -> D + Sync> MapFn<A, D> for Classed<F> {
+    #[inline(always)]
+    fn call(&self, a: A) -> D {
+        (self.f)(a)
+    }
+
+    fn class(&self) -> KernelClass {
+        self.class
+    }
+}
+
 /// Apply a function element-wise from source to destination.
 ///
 /// The element operation `Op` is applied lazily when reading from `src`.
 /// Source and destination may have different element types.
+///
+/// `f` is any `Fn(A) -> D + Sync`, gated as [`KernelClass::Map`], or a function declared
+/// with a class of its own (see [`MapFn`]), so an expensive element function forks sooner.
 pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
+    dest: &mut StridedViewMut<D>,
+    src: &StridedView<A, Op>,
+    f: impl MapFn<A, D>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    let class = f.class();
+    map_parts_into::<D, A, Op, NoKernel>(
+        dest.as_mut_ptr(),
+        dest.dims(),
+        dest.strides(),
+        src.ptr(),
+        src.dims(),
+        src.strides(),
+        |a| f.call(a),
+        &NoKernel,
+        class,
+        exec,
+    )
+}
+
+/// `map_into` for a pure copy: the same traversal, gated as [`KernelClass::Copy`].
+///
+/// A copy has no arithmetic per element, so a fork over it pays later than over
+/// a general element map; asking as `Map` forked it too early.
+pub(crate) fn copy_map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
     f: impl Fn(A) -> D + Sync,
@@ -1140,6 +1249,7 @@ pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
         src.strides(),
         f,
         &NoKernel,
+        KernelClass::Copy,
         exec,
     )
 }
@@ -1147,20 +1257,22 @@ pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
 pub(crate) fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
-    f: impl Fn(A) -> D + Sync,
+    f: impl MapFn<A, D>,
     validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
+    let class = f.class();
     map_parts_into_validated::<D, A, Op, NoKernel>(
         dest.as_mut_ptr(),
         dest.dims(),
         dest.strides(),
         src.ptr(),
         src.strides(),
-        f,
+        |a| f.call(a),
         &NoKernel,
         validated,
+        class,
         exec,
     )
 }
@@ -1179,6 +1291,9 @@ pub(crate) fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, O
 /// say — reuses this crate's layout logic and this crate's threading decision instead of
 /// rebuilding either. `scalar` and `kernel` must agree up to the caller's own error bound; this
 /// crate only guarantees that every destination element is written exactly once.
+///
+/// `scalar` may carry a [`KernelClass`] (see [`MapFn`]); the gate charges the region as that
+/// class, so a transcendental `scalar` forks sooner.
 ///
 /// # Examples
 /// ```
@@ -1209,9 +1324,10 @@ pub fn map_into_uninit_with_kernel<T: Copy + Send + Sync>(
     dest: &mut StridedViewMut<MaybeUninit<T>>,
     src: &StridedView<T>,
     kernel: impl Fn(&[T], &mut [MaybeUninit<T>]) -> bool + Sync,
-    scalar: impl Fn(T) -> T + Sync,
+    scalar: impl MapFn<T, T>,
     exec: Exec<'_>,
 ) -> Result<()> {
+    let class = scalar.class();
     map_parts_into::<MaybeUninit<T>, T, Identity, _>(
         dest.as_mut_ptr(),
         dest.dims(),
@@ -1219,8 +1335,9 @@ pub fn map_into_uninit_with_kernel<T: Copy + Send + Sync>(
         src.ptr(),
         src.dims(),
         src.strides(),
-        |value| MaybeUninit::new(scalar(value)),
+        |value| MaybeUninit::new(scalar.call(value)),
         &SliceKernel(kernel),
+        class,
         exec,
     )
 }
@@ -1246,6 +1363,7 @@ pub(crate) fn map_raw_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: Ele
         src.strides(),
         f,
         &NoKernel,
+        KernelClass::Map,
         exec,
     )
 }
@@ -1271,6 +1389,7 @@ pub(crate) fn map_raw_into_validated<
         f,
         &NoKernel,
         validated,
+        KernelClass::Map,
         exec,
     )
 }
@@ -1290,6 +1409,7 @@ fn map_parts_into<
     src_strides: &[isize],
     f: impl Fn(A) -> D + Sync,
     kernel: &K,
+    class: KernelClass,
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dst_dims, src_dims)?;
@@ -1303,6 +1423,7 @@ fn map_parts_into<
         f,
         kernel,
         validated,
+        class,
         exec,
     )
 }
@@ -1342,9 +1463,11 @@ fn map_parts_into_validated<
     f: impl Fn(A) -> D + Sync,
     kernel: &K,
     _validated: ValidatedDestinationLayout,
+    class: KernelClass,
     exec: Exec<'_>,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, src_strides], &exec)?.is_some() {
+    if sequential_contiguous_layout(class, dst_dims, &[dst_strides, src_strides], &exec)?.is_some()
+    {
         let len = total_len(dst_dims)?;
         // SAFETY: the contiguous-layout check proves that `dst` and `src` address `len` elements in
         // the same order starting at their base pointer, so each is exactly a flat run of `len`
@@ -1370,7 +1493,7 @@ fn map_parts_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(class, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let src_send = SendPtr(src_ptr as *mut A);
@@ -1384,6 +1507,7 @@ fn map_parts_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            class,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -1691,8 +1815,13 @@ fn zip_map2_parts_into_validated<
     _validated: ValidatedDestinationLayout,
     exec: Exec<'_>,
 ) -> Result<()> {
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
-        .is_some()
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, a_strides, b_strides],
+        &exec,
+    )?
+    .is_some()
     {
         let len = total_len(dst_dims)?;
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
@@ -1720,7 +1849,7 @@ fn zip_map2_parts_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -1735,6 +1864,7 @@ fn zip_map2_parts_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -1799,8 +1929,13 @@ fn mul_identity_into_raw<
     debug_assert_eq!(dst_dims.len(), a_strides.len());
     debug_assert_eq!(dst_dims.len(), b_strides.len());
 
-    if sequential_contiguous_layout(dst_dims, &[dst_strides, a_strides, b_strides], &exec)?
-        .is_some()
+    if sequential_contiguous_layout(
+        KernelClass::Map,
+        dst_dims,
+        &[dst_strides, a_strides, b_strides],
+        &exec,
+    )?
+    .is_some()
     {
         let len = total_len(dst_dims)?;
         let sa = unsafe { std::slice::from_raw_parts(a_ptr, len) };
@@ -1840,7 +1975,7 @@ fn mul_identity_into_raw<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -1855,6 +1990,7 @@ fn mul_identity_into_raw<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -2210,6 +2346,7 @@ pub(crate) fn zip_map3_into_validated<
     let dst_strides = dest.strides();
 
     if sequential_contiguous_layout(
+        KernelClass::Map,
         dst_dims,
         &[dst_strides, a.strides(), b.strides(), c.strides()],
         &exec,
@@ -2244,7 +2381,7 @@ pub(crate) fn zip_map3_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -2260,6 +2397,7 @@ pub(crate) fn zip_map3_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(
@@ -2370,6 +2508,7 @@ pub(crate) fn zip_map4_into_validated<
     let dst_strides = dest.strides();
 
     if sequential_contiguous_layout(
+        KernelClass::Map,
         dst_dims,
         &[
             dst_strides,
@@ -2423,7 +2562,7 @@ pub(crate) fn zip_map4_into_validated<
     };
 
     let total = total_len(&fused_dims)?;
-    if is_parallel(total, &exec) {
+    if is_parallel(KernelClass::Map, total, &exec) {
         use crate::threading::SendPtr;
         let dst_send = SendPtr(dst_ptr);
         let a_send = SendPtr(a_ptr as *mut A);
@@ -2440,6 +2579,7 @@ pub(crate) fn zip_map4_into_validated<
             &ordered_strides,
             &initial_offsets,
             &costs,
+            KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
                 for_each_inner_block_with_offsets(

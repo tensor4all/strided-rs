@@ -4,6 +4,7 @@ use crate::StridedArray;
 /// A pool of `threads` workers for unit tests.
 fn test_pool(threads: usize) -> threadteam::Pool {
     threadteam::Pool::builder()
+        .dispatch_costs(cheap_dispatch_costs())
         .threads(threads)
         .build()
         .unwrap()
@@ -335,7 +336,7 @@ fn uninitialized_replay_agrees_between_serial_and_bounded_contexts() {
 #[cfg(feature = "parallel")]
 #[test]
 fn uninitialized_fused_replay_respects_serial_and_bounded_contexts_above_threshold() {
-    let len = strided_basic::execution::MINTHREADLENGTH + 65;
+    let len = (1 << 16) + 65;
     let lhs = vec![ThreadTracked(1); len];
     let rhs = vec![ThreadTracked(2); len];
     let dims = [len];
@@ -854,4 +855,16 @@ fn broadcast_fused_replay_splits_and_covers_each_destination_once() {
             "uninitialized broadcast replay must split across workers, saw {workers}"
         );
     }
+}
+
+/// Dispatch costs of the test pools: 100 ns per section whatever the token, so that the
+/// regions of tens of thousands of elements these tests use open the parallel branches
+/// (the host default costs would keep them serial).
+fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
+    use threadteam::{DispatchKind, WidthCosts};
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    threadteam::DispatchCosts::for_class(threadteam::HostClass::Generic)
+        .with(DispatchKind::Team, cheap)
+        .with(DispatchKind::InPool, cheap)
+        .with(DispatchKind::Outside, cheap)
 }

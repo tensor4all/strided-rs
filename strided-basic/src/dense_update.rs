@@ -8,6 +8,7 @@
 use core::mem::MaybeUninit;
 use core::ops::{Add, Mul};
 
+use crate::cost::KernelClass;
 use crate::{Exec, Result, StridedError, StridedView, StridedViewMut};
 
 fn same_len(actual: usize, expected: usize) -> Result<()> {
@@ -32,7 +33,7 @@ fn for_each_chunk<T: Send + Sync, F: Fn(usize, &mut [T]) + Sync>(
     operation: F,
     exec: Exec<'_>,
 ) {
-    let exec = crate::threading::for_len(exec, output.len());
+    let exec = crate::cost::for_len(exec, KernelClass::Map, output.len());
     if !exec.is_serial() {
         let ptr = crate::threading::SendPtr(output.as_mut_ptr());
         crate::threading::parallel_for_each(0..output.len(), exec, &|range| {
@@ -337,5 +338,5 @@ pub fn embed_diagonal_view_into_uninit<T: Copy + Send + Sync + 'static>(
         |_, chunk| chunk.fill(MaybeUninit::new(zero)),
         exec.reborrow(),
     );
-    crate::map_into(&mut dst, src, MaybeUninit::new, exec)
+    crate::map_view::copy_map_into(&mut dst, src, MaybeUninit::new, exec)
 }

@@ -7,6 +7,7 @@
 
 use core::mem::MaybeUninit;
 
+use crate::cost::KernelClass;
 use crate::{CopyPlan, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
@@ -443,7 +444,7 @@ impl PadPlan {
             crate::threading::fill_contiguous(dest_slice, fill, exec);
             return Ok(());
         }
-        let exec = crate::threading::for_len(exec, self.dest_total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.dest_total);
         if !exec.is_serial() {
             return self.fill_dest_parallel(dest, fill, exec);
         }
@@ -581,7 +582,7 @@ impl PadPlan {
         if column_total == 0 {
             return Ok(());
         }
-        let exec = crate::threading::for_len(exec, self.dest_total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.dest_total);
         {
             if exec.budget().get() > 1 && column_total >= exec.budget().get() {
                 let dest_ptr = crate::threading::SendPtr(dest_ptr);
@@ -827,7 +828,7 @@ impl PadPlan {
         let outer_dims = &self.operand_dims[1..];
         let outer_total = checked_total_len(outer_dims)?;
         let copied = outer_total.saturating_mul(run.len);
-        let exec = crate::threading::for_len(exec, copied);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, copied);
         {
             if exec.budget().get() > 1 && outer_total >= exec.budget().get() {
                 let dest_ptr = crate::threading::SendPtr(dest_ptr);
@@ -1016,7 +1017,7 @@ impl PadPlan {
     where
         T: Copy + Send + Sync,
     {
-        let exec = crate::threading::for_len(exec, self.generic_copy.total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.generic_copy.total);
         if !exec.is_serial() {
             return self.copy_operand_parallel(dest, operand, exec);
         }
@@ -1032,7 +1033,7 @@ impl PadPlan {
     where
         T: Copy + Send + Sync,
     {
-        let exec = crate::threading::for_len(exec, self.generic_copy.total);
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.generic_copy.total);
         if !exec.is_serial() {
             return self.copy_operand_uninit_parallel(dest, operand, exec);
         }
@@ -1408,7 +1409,7 @@ impl ConcatenatePlan {
         Apply: Fn(&mut D, T) + Send + Sync,
     {
         let total = self.segment_starts[self.segment_starts.len() - 1];
-        let exec = crate::threading::for_len(exec, total);
+        let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
         if exec.is_serial() {
             return Ok(false);
         }
@@ -1499,7 +1500,7 @@ impl ConcatenatePlan {
     /// per-segment loop for serial execution.
     pub(crate) fn prefers_whole_plan(&self, exec: &Exec<'_>) -> bool {
         let total = self.segment_starts[self.segment_starts.len() - 1];
-        crate::threading::is_parallel(total, exec)
+        crate::threading::is_parallel(KernelClass::Copy, total, exec)
     }
 
     pub(crate) fn segment_offset(&self, position: usize, dest_offset: isize) -> Result<isize> {

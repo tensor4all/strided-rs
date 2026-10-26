@@ -1,3 +1,4 @@
+use crate::cost::KernelClass;
 use crate::erased_common::*;
 use crate::*;
 use core::mem::MaybeUninit;
@@ -317,7 +318,8 @@ pub enum ReduceOp {
 ///   lane kernel (other unit stride runs) or an eight lane kernel (strided
 ///   runs), and runs are combined left to right. A dense column major
 ///   source therefore reduces exactly like one contiguous slice.
-/// * With a budget above one and more than `MINTHREADLENGTH` elements, a
+/// * With a budget above one and a region whose serial time (the `Reduce`
+///   class of `execution::KernelClass`) repays the sections of a tree split, a
 ///   full reduction splits the traversal into one deterministic range per
 ///   task. Each range runs the same run kernel as the serial path and
 ///   the partials are combined in a fixed tree. The result is bitwise
@@ -1164,7 +1166,7 @@ where
     let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
     crate::threading::parallel_map_reduce(
         0..total,
-        crate::threading::for_len(exec, total),
+        crate::cost::for_len_tree(exec, KernelClass::Reduce, total),
         &|range| {
             // SAFETY: same three-link invariant as above; each range is
             // non-empty.
@@ -1302,7 +1304,7 @@ where
     // partition the independent outputs; with the output block kernel this
     // splits along the contiguous kept axis.
     let work = layout.dest_total.saturating_mul(layout.reduce_total);
-    let exec = crate::threading::for_len(exec, work).limit(
+    let exec = crate::cost::for_len_tree(exec, KernelClass::Reduce, work).limit(
         core::num::NonZeroUsize::new(layout.dest_total).unwrap_or(core::num::NonZeroUsize::MIN),
     );
     if !exec.is_serial() {
@@ -1378,7 +1380,7 @@ where
     W: ReduceWriter<T>,
     K: ReduceKernel<T>,
 {
-    let exec = crate::threading::for_len(exec, layout.dest_total);
+    let exec = crate::cost::for_len_tree(exec, KernelClass::Reduce, layout.dest_total);
     if !exec.is_serial() {
         return execute_reduce_axes_identity_parallel::<T, W, K>(dest, layout, exec);
     }

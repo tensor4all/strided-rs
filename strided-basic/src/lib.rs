@@ -43,10 +43,12 @@
 //!
 //! Every operation that can fan out takes `exec: Exec<'_>` by value as its last
 //! parameter. [`Exec::serial`] runs on the calling thread; a token minted from a
-//! [`Pool`] with [`Exec::new`] splits the work within its budget. Operations
-//! below the repository threshold (`execution::MINTHREADLENGTH` elements) stay on
-//! the calling thread whatever the budget. Without the `parallel` feature every
-//! token runs inline.
+//! [`Pool`] with [`Exec::new`] splits the work within its budget. Whether and how
+//! wide is decided by the token: the serial time of the region (elements times the
+//! throughput of its `execution::KernelClass`) against the dispatch cost of the
+//! sections it opens (`Exec::pays`, `Exec::width_for`), so a region too small to
+//! repay a fork stays on the calling thread whatever the budget. Without the
+//! `parallel` feature every token runs inline.
 //!
 //! ## Basic Operations
 //!
@@ -82,6 +84,7 @@
 mod block;
 mod complex_div;
 mod copy_plan;
+mod cost;
 mod dense_update;
 mod erased;
 mod erased_common;
@@ -114,7 +117,7 @@ pub use inline::{InlineVec, OperandVec, OPERAND_CAP};
 pub use map_view::{
     broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, map_into,
     map_into_uninit_with_kernel, mul_into, mul_into_uninit, zip_map2_into, zip_map3_into,
-    zip_map4_into, CompareOp,
+    zip_map4_into, Classed, CompareOp, MapFn,
 };
 pub use nan_select::{nan_propagating_maximum, nan_propagating_minimum};
 pub use ops_view::{

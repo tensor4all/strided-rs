@@ -899,7 +899,6 @@ fn chunked_replay_falls_back_for_differing_output_inner_strides() {
 #[cfg(feature = "parallel")]
 #[test]
 fn chunked_replay_parallel_pool_matches_reference() {
-    use strided_basic::execution::MINTHREADLENGTH;
     use strided_basic::{
         ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, KernelDType,
     };
@@ -907,9 +906,13 @@ fn chunked_replay_parallel_pool_matches_reference() {
 
     use strided_basic::Pool;
 
-    let pool = Pool::builder().threads(2).build().unwrap();
+    let pool = Pool::builder()
+        .dispatch_costs(cheap_dispatch_costs())
+        .threads(2)
+        .build()
+        .unwrap();
 
-    let len = MINTHREADLENGTH + 65;
+    let len = (1 << 16) + 65;
     let b: Vec<f64> = (0..len).map(|i| (i % 29) as f64 - 14.0).collect();
     let a = [2.5f64];
     let plan = FusedPlan {
@@ -968,4 +971,16 @@ fn chunked_replay_parallel_pool_matches_reference() {
         assert_eq!(pass, a[0], "pass-through element {index}");
         assert_eq!(value, a[0] * b[index], "product element {index}");
     }
+}
+
+/// Dispatch costs of the test pools: 100 ns per section whatever the token, so that the
+/// regions of tens of thousands of elements these tests use open the parallel branches
+/// (the host default costs would keep them serial).
+fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
+    use threadteam::{DispatchKind, WidthCosts};
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    threadteam::DispatchCosts::for_class(threadteam::HostClass::Generic)
+        .with(DispatchKind::Team, cheap)
+        .with(DispatchKind::InPool, cheap)
+        .with(DispatchKind::Outside, cheap)
 }

@@ -28,6 +28,7 @@ use crate::view::{StridedView, StridedViewMut};
 use crate::{Exec, Result, StridedError};
 use strided_view::ElementOp;
 
+use crate::cost::KernelClass;
 use crate::fuse::compute_costs;
 use crate::threading::{for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded};
 
@@ -87,7 +88,7 @@ fn run_update(
     // one unit-stride block replaces planning and blocking. The sequential
     // guard keeps the parallel branch reachable for large tensors (see
     // `use_sequential_fast_path`).
-    if sequential_contiguous_layout(dims, strides_list, &exec)?.is_some() {
+    if sequential_contiguous_layout(KernelClass::Map, dims, strides_list, &exec)?.is_some() {
         let zeros: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
         let ones: crate::inline::OperandVec<isize> = strides_list.iter().map(|_| 1isize).collect();
         body(&zeros, total, &ones);
@@ -108,7 +109,7 @@ fn run_update(
 
     {
         let total = total_len(&fused_dims)?;
-        if is_parallel(total, &exec) {
+        if is_parallel(KernelClass::Map, total, &exec) {
             let costs = compute_costs(&ordered_strides);
             let initial_offsets: crate::inline::OperandVec<isize> =
                 strides_list.iter().map(|_| 0isize).collect();
@@ -118,6 +119,7 @@ fn run_update(
                 &ordered_strides,
                 &initial_offsets,
                 &costs,
+                KernelClass::Map,
                 exec,
                 &|dims, blocks, strides_list, offsets| {
                     for_each_inner_block_with_offsets(

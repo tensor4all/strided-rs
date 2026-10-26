@@ -29,22 +29,39 @@ fn split_axis_declines_a_zero_cost_or_one_block_dimension() {
     assert_eq!(split_axis(&[1, 1, 1], &[1, 1, 1], &[1, 1, 1]), None);
 }
 
+/// A region length the test pools (100 ns per section) always open for.
+const LARGE: usize = 1 << 16;
+
 #[test]
-fn parallel_threads_for_len_is_a_pure_function_of_length_and_budget() {
-    assert_eq!(parallel_threads_for_len(MINTHREADLENGTH, 2), 1);
-    assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1, 2), 2);
-    assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1, 4), 4);
-    assert_eq!(parallel_threads_for_len(MINTHREADLENGTH + 1, 1), 1);
-    assert_eq!(parallel_threads_for_len(0, 8), 1);
+fn parallel_width_follows_the_serial_time_against_the_section_cost() {
+    use crate::cost::{parallel_width, tree_width};
+    let pool = test_pool(4);
+    let (exec, _) = pooled(&pool, 4);
+    // 100 ns sections: a copy pays at 3 * 100 ns / 0.09 ns = 3334 elements on two slots.
+    assert_eq!(parallel_width(&exec, KernelClass::Copy, 100).get(), 1);
+    assert_eq!(parallel_width(&exec, KernelClass::Copy, LARGE).get(), 4);
+    // A transcendental kernel pays at a much smaller length than a copy.
+    assert!(
+        parallel_width(&exec, KernelClass::Transcendental, 1000).get()
+            > parallel_width(&exec, KernelClass::Copy, 1000).get()
+    );
+    // A tree of width 4 holds two sections, so it needs twice the work of width 2.
+    assert_eq!(tree_width(&exec, KernelClass::Reduce, 100).get(), 1);
+    assert_eq!(tree_width(&exec, KernelClass::Reduce, LARGE).get(), 4);
+    // A serial token and a width one budget never fan out.
+    assert_eq!(
+        parallel_width(&Exec::serial(), KernelClass::Copy, usize::MAX >> 8).get(),
+        1
+    );
 }
 
 #[test]
-fn for_len_narrows_with_the_threshold_and_keeps_the_budget_above_it() {
+fn for_len_narrows_with_the_estimate_and_keeps_the_budget_above_it() {
     let pool = test_pool(4);
     let (exec, _) = pooled(&pool, 4);
-    assert!(for_len(exec, MINTHREADLENGTH).is_serial());
+    assert!(for_len(exec, KernelClass::Copy, 100).is_serial());
     let (exec, _) = pooled(&pool, 4);
-    let wide = for_len(exec, MINTHREADLENGTH + 1);
+    let wide = for_len(exec, KernelClass::Copy, LARGE);
     assert_eq!(wide.budget().get(), pool.width().get().min(4));
 }
 
@@ -64,6 +81,7 @@ fn test_mapreduce_threaded_single_slot() {
         &strides,
         &offsets,
         &costs,
+        KernelClass::Map,
         Exec::serial(),
         &|_dims, _blocks, _strides, _offsets| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -85,7 +103,7 @@ fn test_mapreduce_threaded_splits_cover_all_elements() {
     let strides = vec![vec![1isize, 256], vec![1, 256]];
     let offsets = vec![0isize, 0];
     let costs = vec![2, 512];
-    assert!(dims.iter().product::<usize>() > MINTHREADLENGTH);
+    assert!(dims.iter().product::<usize>() >= LARGE);
 
     let total_elements = AtomicUsize::new(0);
     mapreduce_threaded(
@@ -94,6 +112,7 @@ fn test_mapreduce_threaded_splits_cover_all_elements() {
         &strides,
         &offsets,
         &costs,
+        KernelClass::Map,
         exec,
         &|dims, _blocks, _strides, _offsets| {
             let n: usize = dims.iter().product();
@@ -125,6 +144,7 @@ fn mapreduce_threaded_leaves_never_exceed_the_budget() {
         &strides,
         &offsets,
         &costs,
+        KernelClass::Map,
         exec,
         &|dims, _blocks, _strides, _offsets| {
             leaves.fetch_add(1, Ordering::SeqCst);
@@ -146,7 +166,7 @@ fn mapreduce_threaded_leaves_never_exceed_the_budget() {
 #[test]
 fn parallel_map_reduce_matches_the_serial_sum() {
     let pool = test_pool(4);
-    let len = MINTHREADLENGTH * 2;
+    let len = LARGE * 2;
     let expected: usize = (0..len).sum();
     let serial = parallel_map_reduce(
         0..len,
@@ -211,7 +231,7 @@ fn budget_one_token_of_a_wide_pool_stays_on_the_calling_thread() {
     let off_caller = AtomicUsize::new(0);
 
     let sum = parallel_map_reduce(
-        0..(MINTHREADLENGTH * 2),
+        0..(LARGE * 2),
         exec,
         &|range| {
             if std::thread::current().id() != caller {
@@ -222,7 +242,7 @@ fn budget_one_token_of_a_wide_pool_stays_on_the_calling_thread() {
         &|left, right| left + right,
     );
 
-    assert_eq!(sum, (0..(MINTHREADLENGTH * 2)).sum::<usize>());
+    assert_eq!(sum, (0..(LARGE * 2)).sum::<usize>());
     assert_eq!(off_caller.load(Ordering::SeqCst), 0);
     assert_eq!(ledger::installs(root), 0);
 }
@@ -245,7 +265,7 @@ fn large_copy_runs_on_pool_workers_when_the_budget_allows() {
     let pool = test_pool(4);
     let (exec, root) = pooled(&pool, 4);
     let parallel = exec.budget().get() > 1;
-    let len = MINTHREADLENGTH * 2;
+    let len = LARGE * 2;
     let src: Vec<f64> = (0..len).map(|i| i as f64).collect();
     let mut dst = vec![0.0f64; len];
     // SAFETY: both buffers hold `len` elements and do not overlap.
@@ -260,7 +280,7 @@ fn large_copy_runs_on_pool_workers_when_the_budget_allows() {
 
 const ROWS: usize = 257;
 const COLS: usize = 129;
-const _: () = assert!(ROWS * COLS > MINTHREADLENGTH);
+const _: () = assert!(ROWS * COLS >= LARGE / 2);
 
 fn transposed_pair() -> (crate::StridedArray<f64>, crate::StridedArray<f64>) {
     let source = crate::StridedArray::<f64>::from_fn_col_major(&[ROWS, COLS], |index| {
@@ -364,4 +384,133 @@ fn a_call_from_a_pool_worker_does_not_install() {
     let root = inner_root.lock().unwrap().expect("the closure ran");
     assert_eq!(ledger::installs(root), 0);
     assert_transposed(&source, &destination);
+}
+
+/// A length where a fork pays for a map (3 sections * 100 ns / the map rate) but not yet for a
+/// copy (3 * 100 ns / the copy rate) on the test pools, in the middle of that window for the rates
+/// of this host class (about 3000 to 3334 elements on `aarch64-apple`, 1735 to 1754 on
+/// `x86_64-avx512`).
+#[cfg(feature = "parallel")]
+fn map_pays_copy_not() -> usize {
+    let (map, copy) = (
+        KernelClass::Map.ns_per_element(),
+        KernelClass::Copy.ns_per_element(),
+    );
+    assert!(map > copy, "the window needs a map slower than a copy");
+    let n = (300.0 / map * 0.5 + 300.0 / copy * 0.5) as usize;
+    assert!(n as f64 * map >= 300.0 && (n as f64) * copy < 300.0);
+    n
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn the_contiguous_gate_asks_with_the_class_of_the_caller() {
+    use crate::kernel::sequential_contiguous_layout;
+    let pool = test_pool(4);
+    let (exec, _) = pooled(&pool, 4);
+    let n = map_pays_copy_not();
+    let strides = [1isize];
+    let dims = [n];
+    // The fork pays for a map, so the sequential shortcut is declined...
+    assert!(
+        sequential_contiguous_layout(KernelClass::Map, &dims, &[&strides, &strides], &exec)
+            .unwrap()
+            .is_none()
+    );
+    // ...and still taken for a copy and a reduction of the same length.
+    assert!(
+        sequential_contiguous_layout(KernelClass::Copy, &dims, &[&strides, &strides], &exec)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        sequential_contiguous_layout(KernelClass::Reduce, &dims, &[&strides], &exec)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// `copy_into` of a contiguous run the fork does not pay for as a copy stays on
+/// the calling thread; it used to ask the gate as `Map` and enter the pool.
+#[cfg(feature = "parallel")]
+#[test]
+fn contiguous_copy_into_is_gated_as_a_copy() {
+    let pool = test_pool(4);
+    let n = map_pays_copy_not();
+    let src: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let mut dst = vec![0.0f64; n];
+    let (exec, root) = pooled(&pool, 4);
+    crate::copy_into(
+        &mut crate::StridedViewMut::new(&mut dst, &[n], &[1], 0).unwrap(),
+        &crate::StridedView::<f64>::new(&src, &[n], &[1], 0).unwrap(),
+        exec,
+    )
+    .unwrap();
+    assert_eq!(dst, src);
+    assert_eq!(ledger::installs(root), 0);
+
+    // The same length as a map does fork, which pins the length to the window.
+    let (exec, root) = pooled(&pool, 4);
+    crate::map_into(
+        &mut crate::StridedViewMut::new(&mut dst, &[n], &[1], 0).unwrap(),
+        &crate::StridedView::<f64>::new(&src, &[n], &[1], 0).unwrap(),
+        |x| x,
+        exec,
+    )
+    .unwrap();
+    assert_eq!(ledger::installs(root), 1);
+}
+
+/// A length where a fork pays for a transcendental element function
+/// (3 * 100 ns / 1.38 ns = 218 elements) but not for a plain map (3000 elements)
+/// on the test pools.
+#[cfg(feature = "parallel")]
+const TRANSCENDENTAL_PAYS_MAP_NOT: usize = 1000;
+
+/// The class rides with the function passed to `map_into`: a closure is a `Map`
+/// and stays on the calling thread, the same closure declared `Transcendental`
+/// enters the pool, and one declared `Map` explicitly behaves as the bare closure.
+#[cfg(feature = "parallel")]
+#[test]
+fn map_into_gates_on_the_class_of_the_function() {
+    use crate::{Classed, MapFn};
+    let pool = test_pool(4);
+    let n = TRANSCENDENTAL_PAYS_MAP_NOT;
+    let src: Vec<f64> = (0..n).map(|i| i as f64 * 1e-3).collect();
+    let expected: Vec<f64> = src.iter().map(|x| x.exp()).collect();
+    let run = |f: &dyn Fn(&mut [f64], crate::Exec<'_>)| {
+        let mut dst = vec![0.0f64; n];
+        let (exec, root) = pooled(&pool, 4);
+        f(&mut dst, exec);
+        assert_eq!(dst, expected);
+        ledger::installs(root)
+    };
+    let view_src = || crate::StridedView::<f64>::new(&src, &[n], &[1], 0).unwrap();
+
+    let plain = run(&|dst, exec| {
+        let mut d = crate::StridedViewMut::new(dst, &[n], &[1], 0).unwrap();
+        crate::map_into(&mut d, &view_src(), |x: f64| x.exp(), exec).unwrap();
+    });
+    assert_eq!(plain, 0);
+
+    let map_class = run(&|dst, exec| {
+        let mut d = crate::StridedViewMut::new(dst, &[n], &[1], 0).unwrap();
+        let f = Classed::new(KernelClass::Map, |x: f64| x.exp());
+        crate::map_into(&mut d, &view_src(), f, exec).unwrap();
+    });
+    assert_eq!(map_class, 0);
+
+    let transcendental = run(&|dst, exec| {
+        let mut d = crate::StridedViewMut::new(dst, &[n], &[1], 0).unwrap();
+        let f = KernelClass::Transcendental.with(|x: f64| x.exp());
+        crate::map_into(&mut d, &view_src(), f, exec).unwrap();
+    });
+    assert_eq!(transcendental, 1);
+
+    // The class a function reports.
+    assert_eq!(MapFn::<f64, f64>::class(&|x: f64| x), KernelClass::Map);
+    assert_eq!(
+        MapFn::<f64, f64>::class(&KernelClass::Reduce.with(|x: f64| x)),
+        KernelClass::Reduce
+    );
 }
