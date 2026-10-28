@@ -147,6 +147,122 @@ pub(super) unsafe fn replay_chunked<T: FusedScalar>(
     direct: &[bool],
     regs: &mut [T],
 ) {
+    // One runtime target-feature dispatch per block, outside the chunk and element
+    // loops (tensor4all/strided-rs#340).
+    #[cfg(feature = "simd")]
+    pulp::Arch::new().dispatch(ReplayBlock {
+        dst_ptrs,
+        input_ptrs,
+        plan,
+        offsets,
+        len,
+        strides,
+        direct,
+        regs,
+    });
+    // SAFETY: the caller upholds this function's contract, which the block body shares.
+    #[cfg(not(feature = "simd"))]
+    unsafe {
+        replay_block(
+            dst_ptrs, input_ptrs, plan, offsets, len, strides, direct, regs,
+        )
+    };
+}
+
+/// The arguments of one block replay, dispatched through pulp.
+///
+/// pulp compiles `with_simd` inside a function with the detected target features
+/// enabled. `with_simd`, the block body, `run_chunks`, the `chunk_*` kernels and
+/// the uninitialized store are `#[inline(always)]`, so the chunk loops compile for
+/// the host's AVX2 or AVX-512 level instead of the build target (the plain
+/// copies stay `memcpy`). A closure would not do: pulp calls a closure through a
+/// plain call, and the whole block body is too large to be inlined there, so it
+/// would stay at the build target.
+#[cfg(feature = "simd")]
+struct ReplayBlock<'a, T> {
+    dst_ptrs: &'a [*mut T],
+    input_ptrs: &'a [*const T],
+    plan: &'a FusedPlan,
+    offsets: &'a [isize],
+    len: usize,
+    strides: &'a [isize],
+    direct: &'a [bool],
+    regs: &'a mut [T],
+}
+
+#[cfg(feature = "simd")]
+impl<T: FusedScalar> pulp::WithSimd for ReplayBlock<'_, T> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, _simd: S) {
+        // SAFETY: built only by `replay_chunked`, whose caller upholds the contract.
+        unsafe {
+            replay_block(
+                self.dst_ptrs,
+                self.input_ptrs,
+                self.plan,
+                self.offsets,
+                self.len,
+                self.strides,
+                self.direct,
+                self.regs,
+            )
+        }
+    }
+}
+
+/// As [`ReplayBlock`], for uninitialized destinations.
+#[cfg(feature = "simd")]
+struct ReplayBlockUninit<'a, T> {
+    dst_ptrs: &'a [*mut MaybeUninit<T>],
+    input_ptrs: &'a [*const T],
+    plan: &'a FusedPlan,
+    offsets: &'a [isize],
+    len: usize,
+    strides: &'a [isize],
+    direct: &'a [bool],
+    regs: &'a mut [T],
+}
+
+#[cfg(feature = "simd")]
+impl<T: FusedScalar> pulp::WithSimd for ReplayBlockUninit<'_, T> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, _simd: S) {
+        // SAFETY: built only by `replay_chunked_uninit`, whose caller upholds the contract.
+        unsafe {
+            replay_block_uninit(
+                self.dst_ptrs,
+                self.input_ptrs,
+                self.plan,
+                self.offsets,
+                self.len,
+                self.strides,
+                self.direct,
+                self.regs,
+            )
+        }
+    }
+}
+
+/// The body of [`replay_chunked`], inlined into its dispatch.
+///
+/// # Safety
+/// As for [`replay_chunked`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn replay_block<T: FusedScalar>(
+    dst_ptrs: &[*mut T],
+    input_ptrs: &[*const T],
+    plan: &FusedPlan,
+    offsets: &[isize],
+    len: usize,
+    strides: &[isize],
+    direct: &[bool],
+    regs: &mut [T],
+) {
     let output_count = dst_ptrs.len();
     // SAFETY: the caller proved every operand addresses this block's `len`
     // contiguous elements, so the broadcast value is readable.
@@ -195,6 +311,44 @@ pub(super) unsafe fn replay_chunked<T: FusedScalar>(
 /// element is written.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn replay_chunked_uninit<T: FusedScalar>(
+    dst_ptrs: &[*mut MaybeUninit<T>],
+    input_ptrs: &[*const T],
+    plan: &FusedPlan,
+    offsets: &[isize],
+    len: usize,
+    strides: &[isize],
+    direct: &[bool],
+    regs: &mut [T],
+) {
+    // One runtime target-feature dispatch per block, outside the chunk and element
+    // loops (tensor4all/strided-rs#340).
+    #[cfg(feature = "simd")]
+    pulp::Arch::new().dispatch(ReplayBlockUninit {
+        dst_ptrs,
+        input_ptrs,
+        plan,
+        offsets,
+        len,
+        strides,
+        direct,
+        regs,
+    });
+    // SAFETY: the caller upholds this function's contract, which the block body shares.
+    #[cfg(not(feature = "simd"))]
+    unsafe {
+        replay_block_uninit(
+            dst_ptrs, input_ptrs, plan, offsets, len, strides, direct, regs,
+        )
+    };
+}
+
+/// The body of [`replay_chunked_uninit`], inlined into its dispatch.
+///
+/// # Safety
+/// As for [`replay_chunked_uninit`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn replay_block_uninit<T: FusedScalar>(
     dst_ptrs: &[*mut MaybeUninit<T>],
     input_ptrs: &[*const T],
     plan: &FusedPlan,
@@ -326,7 +480,7 @@ unsafe fn store_output_chunks<T: FusedScalar>(
 ///
 /// # Safety
 /// See [`replay_chunked_uninit`].
-#[inline]
+#[inline(always)]
 unsafe fn store_output_chunks_uninit<T: FusedScalar>(
     dst_ptrs: &[*mut MaybeUninit<T>],
     plan: &FusedPlan,
@@ -352,6 +506,7 @@ unsafe fn store_output_chunks_uninit<T: FusedScalar>(
 /// Instruction `k` reads registers below `input_count + k` and writes exactly
 /// `input_count + k`, which validation guarantees, so splitting the file at the
 /// output register keeps the borrows disjoint without raw pointers.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_chunks<T: FusedScalar>(
     plan: &FusedPlan,
@@ -390,6 +545,7 @@ unsafe fn run_chunks<T: FusedScalar>(
 }
 
 /// One unary instruction over a chunk.
+#[inline(always)]
 fn chunk_unary<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T]) {
     if try_analytic_unary_chunk(op, src, dst) {
         return;
@@ -432,6 +588,7 @@ fn chunk_unary<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T]) {
 }
 
 /// One binary instruction over a chunk.
+#[inline(always)]
 fn chunk_binary<T: FusedScalar>(op: FusedOp, a: &[T], b: &[T], dst: &mut [T]) {
     match op {
         FusedOp::Add => {
@@ -473,6 +630,7 @@ fn chunk_binary<T: FusedScalar>(op: FusedOp, a: &[T], b: &[T], dst: &mut [T]) {
 }
 
 /// The single ternary instruction over a chunk.
+#[inline(always)]
 fn chunk_ternary<T: FusedScalar>(op: FusedOp, a: &[T], b: &[T], c: &[T], dst: &mut [T]) {
     if op == FusedOp::Clamp {
         for (((slot, &x), &lo), &hi) in dst.iter_mut().zip(a).zip(b).zip(c) {

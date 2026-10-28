@@ -77,6 +77,7 @@ Design notes:
 - [CPU kernel boundaries](docs/design/cpu-kernel-boundaries.md) — generic code ownership, execution contracts and concrete dispatch
 
 Performance design notes:
+- [`runtime SIMD dispatch`](docs/design/runtime-simd-dispatch.md) — AVX2/AVX-512 selected at run time; distribution builds never use `-C target-cpu=native`
 - [`erased execution policy`](docs/design/erased-execution-policy.md) — serial/parallel thresholds, benchmark commands, and evidence flow
 - [`faer-kernel-writing-guide`](docs/faer-kernel-writing-guide.md) — practical rules for writing hot strided kernels based on faer
 - [`faer_design`](docs/faer_design.md) — SIMD design analysis and optimization plan

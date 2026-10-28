@@ -22,6 +22,7 @@ parallel = ["strided-basic/parallel", "strided-fused/parallel"]
 simd = ["strided-basic/simd", "strided-fused/simd"]
 
 [dev-dependencies]
+strided-nn.workspace = true
 threadteam = { workspace = true, features = ["ledger"] }
 num-traits.workspace = true
 criterion.workspace = true

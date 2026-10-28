@@ -33,3 +33,6 @@ plan
 
 # CodeGraph index
 /.codegraph/
+
+# Python bytecode from the maintenance scripts
+__pycache__/

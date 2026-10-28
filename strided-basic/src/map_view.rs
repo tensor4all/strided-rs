@@ -230,11 +230,13 @@ unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>, K: MapKernel<A, D>
     } else {
         let mut dp = dp;
         let mut sp = sp;
-        for _ in 0..len {
-            *dp = f(Op::apply(*sp));
-            dp = dp.wrapping_offset(ds);
-            sp = sp.wrapping_offset(ss);
-        }
+        simd::dispatch_if_large(len, || {
+            for _ in 0..len {
+                *dp = f(Op::apply(*sp));
+                dp = dp.wrapping_offset(ds);
+                sp = sp.wrapping_offset(ss);
+            }
+        });
     }
 }
 
@@ -310,12 +312,14 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
         let mut dp = dp;
         let mut ap = ap;
         let mut bp = bp;
-        for _ in 0..len {
-            *dp = f(OpA::apply(*ap), OpB::apply(*bp));
-            dp = dp.wrapping_offset(ds);
-            ap = ap.wrapping_offset(a_s);
-            bp = bp.wrapping_offset(b_s);
-        }
+        simd::dispatch_if_large(len, || {
+            for _ in 0..len {
+                *dp = f(OpA::apply(*ap), OpB::apply(*bp));
+                dp = dp.wrapping_offset(ds);
+                ap = ap.wrapping_offset(a_s);
+                bp = bp.wrapping_offset(b_s);
+            }
+        });
     }
 }
 
@@ -432,51 +436,65 @@ unsafe fn inner_loop_mul2<
         if len >= 64 && O::try_contiguous(dp, len, src_a, src_b) {
             return;
         }
-        for i in 0..len {
-            O::write(dp.add(i), multiply_value(src_a[i], src_b[i]));
-        }
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                O::write(dp.add(i), multiply_value(src_a[i], src_b[i]));
+            }
+        });
     } else if ds == 1 && a_s == 1 && b_s == 0 {
         let src_a = std::slice::from_raw_parts(ap, len);
         let b = *bp;
-        for i in 0..len {
-            O::write(dp.add(i), multiply_value(src_a[i], b));
-        }
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                O::write(dp.add(i), multiply_value(src_a[i], b));
+            }
+        });
     } else if ds == 1 && a_s == 0 && b_s == 1 {
         let a = *ap;
         let src_b = std::slice::from_raw_parts(bp, len);
-        for i in 0..len {
-            O::write(dp.add(i), multiply_value(a, src_b[i]));
-        }
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                O::write(dp.add(i), multiply_value(a, src_b[i]));
+            }
+        });
     } else if ds == 1 && a_s == 0 && b_s == 0 {
         let a = *ap;
         let b = *bp;
-        for i in 0..len {
-            O::write(dp.add(i), multiply_value(a, b));
-        }
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                O::write(dp.add(i), multiply_value(a, b));
+            }
+        });
     } else if ds == 1 && b_s == 0 {
         let b = *bp;
         let mut ap = ap;
-        for i in 0..len {
-            O::write(dp.add(i), multiply_value(*ap, b));
-            ap = ap.wrapping_offset(a_s);
-        }
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                O::write(dp.add(i), multiply_value(*ap, b));
+                ap = ap.wrapping_offset(a_s);
+            }
+        });
     } else if ds == 1 && a_s == 0 {
         let a = *ap;
         let mut bp = bp;
-        for i in 0..len {
-            O::write(dp.add(i), multiply_value(a, *bp));
-            bp = bp.wrapping_offset(b_s);
-        }
+        simd::dispatch_if_large(len, || {
+            for i in 0..len {
+                O::write(dp.add(i), multiply_value(a, *bp));
+                bp = bp.wrapping_offset(b_s);
+            }
+        });
     } else {
         let mut dp = dp;
         let mut ap = ap;
         let mut bp = bp;
-        for _ in 0..len {
-            O::write(dp, multiply_value(*ap, *bp));
-            dp = dp.wrapping_offset(ds);
-            ap = ap.wrapping_offset(a_s);
-            bp = bp.wrapping_offset(b_s);
-        }
+        simd::dispatch_if_large(len, || {
+            for _ in 0..len {
+                O::write(dp, multiply_value(*ap, *bp));
+                dp = dp.wrapping_offset(ds);
+                ap = ap.wrapping_offset(a_s);
+                bp = bp.wrapping_offset(b_s);
+            }
+        });
     }
 }
 
@@ -1048,13 +1066,15 @@ unsafe fn inner_loop_map3<
         let mut ap = ap;
         let mut bp = bp;
         let mut cp = cp;
-        for _ in 0..len {
-            *dp = f(OpA::apply(*ap), OpB::apply(*bp), OpC::apply(*cp));
-            dp = dp.wrapping_offset(ds);
-            ap = ap.wrapping_offset(a_s);
-            bp = bp.wrapping_offset(b_s);
-            cp = cp.wrapping_offset(c_s);
-        }
+        simd::dispatch_if_large(len, || {
+            for _ in 0..len {
+                *dp = f(OpA::apply(*ap), OpB::apply(*bp), OpC::apply(*cp));
+                dp = dp.wrapping_offset(ds);
+                ap = ap.wrapping_offset(a_s);
+                bp = bp.wrapping_offset(b_s);
+                cp = cp.wrapping_offset(c_s);
+            }
+        });
     }
 }
 
@@ -1090,14 +1110,14 @@ unsafe fn inner_loop_map4<
         let src_c = std::slice::from_raw_parts(cp, len);
         let src_e = std::slice::from_raw_parts(ep, len);
         let dst = std::slice::from_raw_parts_mut(dp, len);
+        // Zipped iterators keep the loop free of bounds checks, which keeps the
+        // dispatched closure small enough for pulp's target-feature function to
+        // inline (tensor4all/strided-rs#340).
         simd::dispatch_if_large(len, || {
-            for i in 0..len {
-                dst[i] = f(
-                    OpA::apply(src_a[i]),
-                    OpB::apply(src_b[i]),
-                    OpC::apply(src_c[i]),
-                    OpE::apply(src_e[i]),
-                );
+            for ((((d, &a), &b), &c), &e) in
+                dst.iter_mut().zip(src_a).zip(src_b).zip(src_c).zip(src_e)
+            {
+                *d = f(OpA::apply(a), OpB::apply(b), OpC::apply(c), OpE::apply(e));
             }
         });
     } else {
@@ -1106,19 +1126,21 @@ unsafe fn inner_loop_map4<
         let mut bp = bp;
         let mut cp = cp;
         let mut ep = ep;
-        for _ in 0..len {
-            *dp = f(
-                OpA::apply(*ap),
-                OpB::apply(*bp),
-                OpC::apply(*cp),
-                OpE::apply(*ep),
-            );
-            dp = dp.wrapping_offset(ds);
-            ap = ap.wrapping_offset(a_s);
-            bp = bp.wrapping_offset(b_s);
-            cp = cp.wrapping_offset(c_s);
-            ep = ep.wrapping_offset(e_s);
-        }
+        simd::dispatch_if_large(len, || {
+            for _ in 0..len {
+                *dp = f(
+                    OpA::apply(*ap),
+                    OpB::apply(*bp),
+                    OpC::apply(*cp),
+                    OpE::apply(*ep),
+                );
+                dp = dp.wrapping_offset(ds);
+                ap = ap.wrapping_offset(a_s);
+                bp = bp.wrapping_offset(b_s);
+                cp = cp.wrapping_offset(c_s);
+                ep = ep.wrapping_offset(e_s);
+            }
+        });
     }
 }
 
@@ -2527,14 +2549,11 @@ pub(crate) fn zip_map4_into_validated<
         let sb = unsafe { std::slice::from_raw_parts(b_ptr, len) };
         let sc = unsafe { std::slice::from_raw_parts(c_ptr, len) };
         let se = unsafe { std::slice::from_raw_parts(e_ptr, len) };
+        // As in `inner_loop_map4`: zipped iterators keep the dispatched closure
+        // small enough to inline (tensor4all/strided-rs#340).
         simd::dispatch_if_large(len, || {
-            for i in 0..len {
-                dst[i] = f(
-                    OpA::apply(sa[i]),
-                    OpB::apply(sb[i]),
-                    OpC::apply(sc[i]),
-                    OpE::apply(se[i]),
-                );
+            for ((((d, &a), &b), &c), &e) in dst.iter_mut().zip(sa).zip(sb).zip(sc).zip(se) {
+                *d = f(OpA::apply(a), OpB::apply(b), OpC::apply(c), OpE::apply(e));
             }
         });
         return Ok(());

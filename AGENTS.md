@@ -101,8 +101,14 @@ cargo test --workspace
 cargo test -p strided-perm             # single crate
 cargo test test_name                   # single test
 cargo bench                            # benchmarks
-RUSTFLAGS="-C target-cpu=native" cargo bench   # enable AVX2/NEON auto-vectorization
 ```
+
+SIMD levels are selected at run time (pulp dispatch, AVX2 and AVX-512 included),
+so a baseline build is the measured configuration. Distribution builds never use
+`-C target-cpu=native`; see
+[`docs/design/runtime-simd-dispatch.md`](docs/design/runtime-simd-dispatch.md),
+which also holds the baseline-vs-native comparison commands and the
+`scripts/check-runtime-simd-dispatch.py` regression check.
 
 ## Benchmarking Notes
 

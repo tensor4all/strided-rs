@@ -49,6 +49,10 @@ jobs:
           OVERHEAD_GATE=1 cargo bench --profile release -p strided-basic --bench overhead_smoke
           OVERHEAD_GATE=1 cargo bench --profile release -p strided-fused --bench overhead_smoke
 
+      - name: Runtime SIMD dispatch check (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/check-runtime-simd-dispatch.py
+
       - name: Report Cargo artifact usage
         if: always()
         run: |
@@ -72,6 +76,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test the repository-rules review script
         run: python3 scripts/test-repository-rules-review.py
+      - name: Test the runtime SIMD dispatch check script
+        run: python3 scripts/test-check-runtime-simd-dispatch.py
 
   coverage:
     name: coverage

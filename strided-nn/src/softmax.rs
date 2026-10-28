@@ -6,9 +6,9 @@
 //! task, which the caller provides.
 //!
 //! The pipeline shape follows PyTorch's `_vec_softmax_lastdim`; the vectorized
-//! `exp` comes from `elem-simd-math`, and the `f32` max/sum reductions use AVX2
-//! where the host has it, because LLVM does not vectorize a scalar `+=` fold
-//! without fast-math.
+//! `exp` comes from `elem-simd-math`, and the `f32` max/sum reductions run over
+//! pulp vectors at the host's runtime SIMD level, because LLVM does not
+//! vectorize a scalar `+=` fold without fast-math.
 
 use core::mem::MaybeUninit;
 
@@ -16,8 +16,7 @@ use strided_basic::execution::{tree_width, KernelClass, SendPtr};
 use strided_basic::Exec;
 
 use crate::error::SoftmaxError;
-#[cfg(target_arch = "x86_64")]
-use crate::simd;
+use crate::simd::{scale_group_f32, scale_group_f64, shift_group_f32, shift_group_f64};
 
 /// Bytes in one cache-sized group of columns.
 const GROUP_BYTES: usize = 32 * 1024;
@@ -247,8 +246,8 @@ softmax_axis0!(
     softmax_axis0_f32,
     f32,
     4,
-    shift_group_f32_best,
-    scale_group_f32_best,
+    shift_group_f32,
+    scale_group_f32,
     exp_into_f32,
     elem_simd_math::f32::exp
 );
@@ -263,77 +262,6 @@ softmax_axis0!(
     exp_into_f64,
     elem_simd_math::f64::exp
 );
-
-/// The AVX2 shift where the host has it, the scalar group function elsewhere.
-fn shift_group_f32_best(src: &[f32], dst: &mut [f32], axis_len: usize) {
-    #[cfg(target_arch = "x86_64")]
-    if simd::avx2_available() {
-        // SAFETY: the host reports AVX2, and the group function touches only the
-        // validated slices.
-        unsafe { simd::shift_group_f32_avx2(src, dst, axis_len) };
-        return;
-    }
-    shift_group_f32(src, dst, axis_len);
-}
-
-/// The AVX2 scale where the host has it, the scalar group function elsewhere.
-fn scale_group_f32_best(data: &mut [f32], axis_len: usize) {
-    #[cfg(target_arch = "x86_64")]
-    if simd::avx2_available() {
-        // SAFETY: as `shift_group_f32_best`.
-        unsafe { simd::scale_group_f32_avx2(data, axis_len) };
-        return;
-    }
-    scale_group_f32(data, axis_len);
-}
-
-fn shift_group_f32(src: &[f32], dst: &mut [f32], axis_len: usize) {
-    for (in_slice, out_slice) in src.chunks(axis_len).zip(dst.chunks_mut(axis_len)) {
-        let max = in_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let safe_max = if max.is_nan() { max } else { max.max(f32::MIN) };
-        for (out, &value) in out_slice.iter_mut().zip(in_slice) {
-            *out = value - safe_max;
-        }
-    }
-}
-
-fn scale_group_f32(data: &mut [f32], axis_len: usize) {
-    for slice in data.chunks_mut(axis_len) {
-        let sum: f32 = slice.iter().copied().sum();
-        let safe_sum = if sum.is_nan() {
-            sum
-        } else {
-            sum.max(f32::MIN_POSITIVE)
-        };
-        for value in slice.iter_mut() {
-            *value /= safe_sum;
-        }
-    }
-}
-
-fn shift_group_f64(src: &[f64], dst: &mut [f64], axis_len: usize) {
-    for (in_slice, out_slice) in src.chunks(axis_len).zip(dst.chunks_mut(axis_len)) {
-        let max = in_slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let safe_max = if max.is_nan() { max } else { max.max(f64::MIN) };
-        for (out, &value) in out_slice.iter_mut().zip(in_slice) {
-            *out = value - safe_max;
-        }
-    }
-}
-
-fn scale_group_f64(data: &mut [f64], axis_len: usize) {
-    for slice in data.chunks_mut(axis_len) {
-        let sum: f64 = slice.iter().copied().sum();
-        let safe_sum = if sum.is_nan() {
-            sum
-        } else {
-            sum.max(f64::MIN_POSITIVE)
-        };
-        for value in slice.iter_mut() {
-            *value /= safe_sum;
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests;

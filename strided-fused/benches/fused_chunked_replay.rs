@@ -39,6 +39,10 @@ use strided_fused::{
 enum Row {
     /// Ten `tanh` over one input.
     Tanh,
+    /// Ten `sqrt` over one input: the compile-target-sensitive chunk loop
+    /// (tensor4all/strided-rs#340). Negative inputs give NaN, which the vector
+    /// square root handles at the same cost.
+    Sqrt,
     /// Ten `mul` by a second input.
     Mul,
     /// Ten `mul` by a second input, with the first input broadcast on the
@@ -52,12 +56,16 @@ enum Row {
 impl Row {
     fn plan(self) -> FusedPlan {
         match self {
-            Self::Tanh => FusedPlan {
+            Self::Tanh | Self::Sqrt => FusedPlan {
                 input_count: 1,
                 outputs: vec![10].into_iter().collect(),
                 ops: (0..10)
                     .map(|index| FusedInst {
-                        op: FusedOp::Tanh,
+                        op: if matches!(self, Self::Tanh) {
+                            FusedOp::Tanh
+                        } else {
+                            FusedOp::Sqrt
+                        },
                         inputs: vec![index].into_iter().collect(),
                     })
                     .collect(),
@@ -99,6 +107,7 @@ impl Row {
     fn name(self) -> &'static str {
         match self {
             Self::Tanh => "ten_tanh",
+            Self::Sqrt => "ten_sqrt",
             Self::Mul => "ten_mul",
             Self::BroadcastMul => "ten_mul_broadcast",
             Self::TwoOutput => "ten_mul_add_two_output",
@@ -107,7 +116,7 @@ impl Row {
 
     fn inputs(self) -> usize {
         match self {
-            Self::Tanh => 1,
+            Self::Tanh | Self::Sqrt => 1,
             Self::Mul | Self::BroadcastMul | Self::TwoOutput => 2,
         }
     }
@@ -220,9 +229,13 @@ fn ping_pong_mul<T: BenchScalar>(
     }
 }
 
-/// Ten `tanh` passes over preallocated buffers, ping-ponging as
-/// [`ping_pong_mul`]. The result ends in `second`.
-fn ping_pong_tanh<T: BenchScalar>(
+/// Ten `tanh` (or `sqrt`) passes over preallocated buffers, ping-ponging as
+/// [`ping_pong_mul`]. The result ends in `second`. `tanh` goes through its
+/// vector kernel; `sqrt` has none and maps the scalar method, as tenferro's
+/// `sqrt` does.
+#[allow(clippy::too_many_arguments)]
+fn ping_pong_unary<T: BenchScalar>(
+    sqrt: bool,
     a_view: &StridedView<'_, T>,
     dims: &[usize],
     strides: &[isize],
@@ -237,10 +250,13 @@ fn ping_pong_tanh<T: BenchScalar>(
             &mut dest,
             src,
             |src: &[T], dst: &mut [MaybeUninit<T>]| {
+                if sqrt {
+                    return false;
+                }
                 T::tanh_slice(src, dst);
                 true
             },
-            |value| value,
+            |value: T| if sqrt { value.fused_sqrt() } else { value },
             place.exec(),
         )
         .unwrap();
@@ -286,7 +302,16 @@ fn per_instruction<T: BenchScalar>(
     let a_view = StridedView::<T>::new(a_data, dims, a_strides, 0).unwrap();
     let b_view = StridedView::<T>::new(b_data, dims, b_strides, 0).unwrap();
     match row {
-        Row::Tanh => ping_pong_tanh(&a_view, dims, b_strides, len, buffer0, buffer1, place),
+        Row::Tanh | Row::Sqrt => ping_pong_unary(
+            matches!(row, Row::Sqrt),
+            &a_view,
+            dims,
+            b_strides,
+            len,
+            buffer0,
+            buffer1,
+            place,
+        ),
         Row::Mul | Row::BroadcastMul => ping_pong_mul(
             &a_view, &b_view, dims, b_strides, len, buffer0, buffer1, place,
         ),
@@ -330,7 +355,13 @@ fn bench_size<T: BenchScalar>(
     let a_broadcast: Vec<T> = (0..cols).map(T::value).collect();
     let b: Vec<T> = (0..len).map(|index| T::value(index + 7)).collect();
 
-    for row in [Row::Tanh, Row::Mul, Row::BroadcastMul, Row::TwoOutput] {
+    for row in [
+        Row::Tanh,
+        Row::Sqrt,
+        Row::Mul,
+        Row::BroadcastMul,
+        Row::TwoOutput,
+    ] {
         let plan = row.plan();
         let group_name = format!("{label}_{}_{}x{}_{}t", row.name(), rows, cols, threads);
         let mut group = c.benchmark_group(group_name);

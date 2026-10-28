@@ -210,6 +210,7 @@ pub(crate) unsafe fn try_mul_contiguous_ptr<D: 'static, A: 'static, B: 'static>(
 
 const TRANSPOSE_TILE: usize = 8;
 
+#[inline(always)]
 unsafe fn mul_transposed_scalar_rhs_source_contiguous<T>(
     dst: *mut T,
     src: *const T,
@@ -247,6 +248,7 @@ unsafe fn mul_transposed_scalar_rhs_source_contiguous<T>(
     }
 }
 
+#[inline(always)]
 unsafe fn mul_transposed_scalar_lhs_source_contiguous<T>(
     dst: *mut T,
     scalar: T,
@@ -302,7 +304,8 @@ pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B:
                 && TypeId::of::<A>() == TypeId::of::<$ty>()
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
-                unsafe {
+                // One runtime target-feature dispatch per tile sweep (tensor4all/strided-rs#340).
+                dispatch_if_large(inner_len * row_len, || unsafe {
                     mul_transposed_scalar_rhs_source_contiguous(
                         dst.cast::<$ty>(),
                         src.cast::<$ty>(),
@@ -312,7 +315,7 @@ pub(crate) unsafe fn try_mul_transposed_scalar_rhs_2d<D: 'static, A: 'static, B:
                         src_fast_stride,
                         src_row_stride,
                     );
-                }
+                });
                 return true;
             }
         };
@@ -344,7 +347,8 @@ pub(crate) unsafe fn try_mul_transposed_scalar_lhs_2d<D: 'static, A: 'static, B:
                 && TypeId::of::<A>() == TypeId::of::<$ty>()
                 && TypeId::of::<B>() == TypeId::of::<$ty>()
             {
-                unsafe {
+                // One runtime target-feature dispatch per tile sweep (tensor4all/strided-rs#340).
+                dispatch_if_large(inner_len * row_len, || unsafe {
                     mul_transposed_scalar_lhs_source_contiguous(
                         dst.cast::<$ty>(),
                         *scalar.cast::<$ty>(),
@@ -354,7 +358,7 @@ pub(crate) unsafe fn try_mul_transposed_scalar_lhs_2d<D: 'static, A: 'static, B:
                         src_fast_stride,
                         src_row_stride,
                     );
-                }
+                });
                 return true;
             }
         };

@@ -732,6 +732,7 @@ dependencies = [
  "elem-simd-math",
  "num-complex",
  "num-traits",
+ "pulp",
  "rand",
  "rand_distr",
  "strided-basic",
@@ -750,6 +751,7 @@ dependencies = [
  "rand_distr",
  "strided-basic",
  "strided-fused",
+ "strided-nn",
  "threadteam",
 ]
 
@@ -758,6 +760,7 @@ name = "strided-nn"
 version = "0.8.0"
 dependencies = [
  "elem-simd-math",
+ "pulp",
  "strided-basic",
  "thiserror",
  "threadteam",
