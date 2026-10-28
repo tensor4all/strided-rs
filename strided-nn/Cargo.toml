@@ -17,6 +17,7 @@ categories = ["science", "mathematics", "algorithms"]
 # `Exec` still runs it inline without touching any pool.
 strided-basic = { workspace = true, features = ["parallel"] }
 elem-simd-math.workspace = true
+pulp.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

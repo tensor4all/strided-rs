@@ -172,9 +172,11 @@ fn scalar_combine_block<T: ErasedReduceScalar, K: ReduceKernel<T> + ?Sized>(
     acc: &mut [K::Acc],
     values: &[T],
 ) {
-    for (slot, &value) in acc.iter_mut().zip(values) {
-        *slot = K::combine(*slot, K::from_value(value));
-    }
+    crate::simd::dispatch_if_large(values.len(), || {
+        for (slot, &value) in acc.iter_mut().zip(values) {
+            *slot = K::combine(*slot, K::from_value(value));
+        }
+    });
 }
 
 pub(super) struct SumKernel;

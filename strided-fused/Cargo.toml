@@ -15,12 +15,13 @@ categories = ["science", "mathematics", "algorithms"]
 [dependencies]
 strided-basic.workspace = true
 elem-simd-math.workspace = true
+pulp = { workspace = true, optional = true }
 num-complex.workspace = true
 
 [features]
 default = ["simd"]
 parallel = ["strided-basic/parallel"]
-simd = ["strided-basic/simd"]
+simd = ["strided-basic/simd", "dep:pulp"]
 
 [dev-dependencies]
 threadteam = { workspace = true, features = ["ledger"] }
