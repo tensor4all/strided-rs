@@ -125,7 +125,7 @@ fn main() {
             map_into(
                 &mut b.view_mut(),
                 &a_view,
-                |x| x * (-2.0 * x).exp() + (x * x).sin(),
+                |x: f64| x * (-2.0 * x).exp() + (x * x).sin(),
                 Exec::new(&pool, nthreads).unwrap(),
             )
             .unwrap();

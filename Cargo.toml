@@ -18,14 +18,14 @@ authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/strided-rs"
 
 [workspace.dependencies]
-strided-basic = { version = "0.8.0", path = "strided-basic", default-features = false }
-strided-nn = { version = "0.8.0", path = "strided-nn", default-features = false }
-strided-fused = { version = "0.8.0", path = "strided-fused", default-features = false }
+strided-basic = { version = "0.9.0", path = "strided-basic", default-features = false }
+strided-nn = { version = "0.9.0", path = "strided-nn", default-features = false }
+strided-fused = { version = "0.9.0", path = "strided-fused", default-features = false }
 strided-traits = { version = "0.7.0", path = "strided-traits" }
 strided-view = { version = "0.7.0", path = "strided-view" }
-strided-perm = { version = "0.8.0", path = "strided-perm" }
-strided-kernel = { version = "0.8.0", path = "strided-kernel" }
-threadteam = { version = "0.1", default-features = false }
+strided-perm = { version = "0.9.0", path = "strided-perm" }
+strided-kernel = { version = "0.9.0", path = "strided-kernel" }
+threadteam = { version = "0.2", default-features = false }
 
 approx = "0.5"
 criterion = "0.5"
