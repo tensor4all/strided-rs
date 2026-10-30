@@ -137,6 +137,10 @@ pub enum StridedError {
     NonSquare { rows: usize, cols: usize },
 
     /// Mutable output layout maps multiple logical elements to the same memory offset.
+    ///
+    /// Raised when [`is_injective_layout`] returns `false`; see its
+    /// documentation for the one size-bounded residual it reports as `false`
+    /// without deciding.
     #[error("mutable output layout is not injective")]
     NonInjectiveOutputLayout,
 
