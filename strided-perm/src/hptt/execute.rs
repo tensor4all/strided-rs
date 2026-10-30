@@ -268,19 +268,52 @@ unsafe fn grouped_recursive<T: Copy>(
 unsafe fn grouped_tile_copy<T: Copy>(src: *const T, dst: *mut T, grouped: &GroupedTilePlan) {
     let group_a = &grouped.group_a;
     let group_b = &grouped.group_b;
-    // Borrow the offset tables once; indexing the `TinyVec` per access would
-    // pay its inline/heap match in the element-count loop.
+    // Borrow the offset tables once; indexing the `ArrayVec` per access would
+    // pay its length check in the element-count loop.
     let a_src = group_a.src_offsets.as_slice();
     let a_dst = group_a.dst_offsets.as_slice();
     let b_src = group_b.src_offsets.as_slice();
     let b_dst = group_b.dst_offsets.as_slice();
 
-    for a in 0..group_a.len {
-        let src_a = src.offset(a_src[a]);
-        let dst_a = dst.offset(a_dst[a]);
+    let copy_b = |src_a: *const T, dst_a: *mut T| {
         for b in 0..group_b.len {
             *dst_a.offset(b_dst[b]) = *src_a.offset(b_src[b]);
         }
+    };
+    if group_a.outer.is_empty() && group_b.outer.is_empty() {
+        // Both groups fit their tables: the plain two-table tile.
+        for a in 0..group_a.len {
+            copy_b(src.offset(a_src[a]), dst.offset(a_dst[a]));
+        }
+        return;
+    }
+    walk_outer(&group_a.outer, src, dst, &mut |src, dst| {
+        for a in 0..group_a.len {
+            let (src_a, dst_a) = (src.offset(a_src[a]), dst.offset(a_dst[a]));
+            walk_outer(&group_b.outer, src_a, dst_a, &mut |s, d| copy_b(s, d));
+        }
+    });
+}
+
+/// Visit every position of a group's outer axes, slowest axis outermost, so
+/// the tile keeps the group's flat order.
+unsafe fn walk_outer<T>(
+    outer: &[(usize, isize, isize)],
+    src: *const T,
+    dst: *mut T,
+    f: &mut impl FnMut(*const T, *mut T),
+) {
+    let Some((&(n, src_stride, dst_stride), rest)) = outer.split_last() else {
+        f(src, dst);
+        return;
+    };
+    let (mut s, mut d) = (src, dst);
+    for _ in 0..n {
+        walk_outer(rest, s, d, f);
+        // Last-iteration advance may leave the allocation; see
+        // `grouped_recursive`.
+        s = s.wrapping_offset(src_stride);
+        d = d.wrapping_offset(dst_stride);
     }
 }
 
