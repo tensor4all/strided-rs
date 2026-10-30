@@ -6,7 +6,7 @@
 use crate::fuse::{plan_bilateral_fusion, FusionPlanError};
 use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
 use strided_view::INLINE_RANK;
-use tinyvec::TinyVec;
+use tinyvec::{ArrayVec, TinyVec};
 
 /// Fused axis extents, inline up to [`INLINE_RANK`].
 pub(crate) type PlanDimVec = TinyVec<[usize; INLINE_RANK]>;
@@ -54,23 +54,37 @@ pub(crate) enum ExecMode {
 
 /// One virtual flattened tile group.
 ///
-/// The offset tables are products of extents, not rank, so they are held in a
-/// [`TinyVec`] with [`GROUP_OFFSETS_INLINE`] inline entries and spill to the
-/// heap above that bound. A rank `<= INLINE_RANK` plan therefore stays
-/// allocation-free while its grouped tiles fit the inline bound.
+/// The group's flat index is split into an inner part held as offset tables
+/// and an outer part walked as plain strided loops. The tables cover the
+/// leading group axes up to [`GROUP_OFFSETS_INLINE`] entries; an axis that
+/// does not fit is divided at its largest divisor that does, and the rest of
+/// the group goes to `outer`. The tables are therefore always inline, and a
+/// rank `<= INLINE_RANK` plan is allocation-free whatever its tile extents
+/// (tensor4all/strided-rs#337).
 #[derive(Debug, Clone)]
 pub(crate) struct OffsetGroup {
-    pub(crate) src_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]>,
-    pub(crate) dst_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]>,
+    pub(crate) src_offsets: ArrayVec<[isize; GROUP_OFFSETS_INLINE]>,
+    pub(crate) dst_offsets: ArrayVec<[isize; GROUP_OFFSETS_INLINE]>,
+    /// Number of table entries (the inner part of the group).
     pub(crate) len: usize,
+    /// Outer group axes as `(extent, src_stride, dst_stride)`, fastest first.
+    pub(crate) outer: TinyVec<[(usize, isize, isize); INLINE_RANK]>,
+}
+
+impl OffsetGroup {
+    /// Number of group elements: the table length times the outer extents.
+    #[cfg(test)]
+    pub(crate) fn total_len(&self) -> usize {
+        self.outer.iter().map(|&(n, _, _)| n).product::<usize>() * self.len
+    }
 }
 
 /// Inline capacity of a grouped-tile offset table.
 ///
-/// The tables are sized by the product of a tile's extents, so they are not
-/// bounded by rank. This is the inline bound only: a larger grouped tile
-/// spills its tables to the heap (P1/P4 allow allocation above the bound), it
-/// does not change which tiles the planner selects.
+/// INVARIANT: bounds the inner part of every grouped tile, so the tables
+/// never leave the plan's inline storage; the planner's group size is set by
+/// the cache-tile rule in `select_contiguous_group`, not by this bound, and
+/// the part of a group above it is walked as outer loops.
 pub(crate) const GROUP_OFFSETS_INLINE: usize = 64;
 
 /// Offset-table tile plan for high-rank scattered permutations.
@@ -310,8 +324,8 @@ fn try_build_grouped_tile_plan(
 ///
 /// The group size is driven by `target` and the bounded-multiple growth rule,
 /// not by the offset-table capacity: a group larger than
-/// [`GROUP_OFFSETS_INLINE`] still builds, and `build_offset_group` lets its
-/// table spill to the heap.
+/// [`GROUP_OFFSETS_INLINE`] still builds, and `build_offset_group` walks the
+/// part above the table bound as outer loops.
 fn select_contiguous_group(
     dims: &[usize],
     strides: &[isize],
@@ -396,21 +410,41 @@ fn build_offset_group(
     dst_strides: &[isize],
     group: &[usize],
 ) -> OffsetGroup {
-    let len = group_len(dims, group);
-    // Reserve the exact table size so the heap spill is a single allocation
-    // instead of a geometric regrowth above the inline bound.
-    let mut src_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]> = TinyVec::with_capacity(len);
-    let mut dst_offsets: TinyVec<[isize; GROUP_OFFSETS_INLINE]> = TinyVec::with_capacity(len);
+    // Split the group, fastest axis first, into table axes and outer axes.
+    let mut inner: TinyVec<[(usize, isize, isize); INLINE_RANK]> = TinyVec::new();
+    let mut outer: TinyVec<[(usize, isize, isize); INLINE_RANK]> = TinyVec::new();
+    let mut len = 1usize;
+    for &d in group {
+        let (n, s, t) = (dims[d], src_strides[d], dst_strides[d]);
+        if !outer.is_empty() {
+            outer.push((n, s, t));
+        } else if len * n <= GROUP_OFFSETS_INLINE {
+            inner.push((n, s, t));
+            len *= n;
+        } else {
+            // Divide the axis as `c` table steps times `n / c` outer steps of
+            // stride `c * stride`; `c == 1` leaves the whole axis outer.
+            let cap = GROUP_OFFSETS_INLINE / len;
+            let c = (1..=cap).rev().find(|&c| n % c == 0).unwrap_or(1);
+            if c > 1 {
+                inner.push((c, s, t));
+                len *= c;
+            }
+            outer.push((n / c, s * c as isize, t * c as isize));
+        }
+    }
 
+    let mut src_offsets = ArrayVec::new();
+    let mut dst_offsets = ArrayVec::new();
     for flat in 0..len {
         let mut rem = flat;
         let mut src_offset = 0isize;
         let mut dst_offset = 0isize;
-        for &d in group {
-            let coord = rem % dims[d];
-            rem /= dims[d];
-            src_offset += coord as isize * src_strides[d];
-            dst_offset += coord as isize * dst_strides[d];
+        for &(n, s, t) in &inner {
+            let coord = (rem % n) as isize;
+            rem /= n;
+            src_offset += coord * s;
+            dst_offset += coord * t;
         }
         src_offsets.push(src_offset);
         dst_offsets.push(dst_offset);
@@ -420,6 +454,7 @@ fn build_offset_group(
         src_offsets,
         dst_offsets,
         len,
+        outer,
     }
 }
 
@@ -596,9 +631,9 @@ mod tests {
 
         assert!(matches!(plan.mode, ExecMode::GroupedTranspose));
         let grouped = plan.grouped_tile.as_ref().expect("grouped tile plan");
-        assert!(grouped.group_a.len >= 16);
-        assert!(grouped.group_b.len >= 16);
-        assert!(grouped.group_a.len * grouped.group_b.len >= 256);
+        assert!(grouped.group_a.total_len() >= 16);
+        assert!(grouped.group_b.total_len() >= 16);
+        assert!(grouped.group_a.total_len() * grouped.group_b.total_len() >= 256);
     }
 
     #[test]
@@ -614,10 +649,61 @@ mod tests {
 
         assert!(matches!(plan.mode, ExecMode::GroupedTranspose));
         let grouped = plan.grouped_tile.as_ref().expect("grouped tile plan");
-        assert!(grouped.group_a.len <= GROUP_OFFSETS_INLINE);
-        assert!(grouped.group_b.len <= GROUP_OFFSETS_INLINE);
+        assert!(grouped.group_a.outer.is_empty() && grouped.group_b.outer.is_empty());
         assert!(grouped.group_a.len >= 4 && grouped.group_b.len >= 4);
         assert!(!plan.levels.is_empty());
+    }
+
+    #[test]
+    fn test_build_plan_splits_groups_above_the_table_bound() {
+        // tensor4all/strided-rs#337: groups of 100 and 120 elements keep
+        // tables of at most GROUP_OFFSETS_INLINE entries and cover the rest
+        // with outer loops; the group as a whole is unchanged.
+        let cases: [([usize; 8], [isize; 8], [isize; 8]); 3] = [
+            (
+                [101, 2, 2, 2, 2, 2, 2, 2],
+                [1, 102, 1000, 1001, 1002, 1003, 1004, 1005],
+                [128, 1, 2, 4, 8, 16, 32, 64],
+            ),
+            (
+                [100, 2, 2, 2, 2, 2, 2, 2],
+                [1, 101, 1000, 1001, 1002, 1003, 1004, 1005],
+                [128, 1, 2, 4, 8, 16, 32, 64],
+            ),
+            (
+                [2, 3, 4, 5, 6, 7, 8, 9],
+                [40320, 2, 6, 24, 120, 720, 5040, 1],
+                [1, 2, 6, 24, 120, 720, 5040, 40320],
+            ),
+        ];
+        for (dims, src_strides, dst_strides) in cases {
+            let plan = build_permute_plan(&dims, &src_strides, &dst_strides, 8).unwrap();
+            assert!(matches!(plan.mode, ExecMode::GroupedTranspose), "{dims:?}");
+            let grouped = plan.grouped_tile.as_ref().expect("grouped tile plan");
+            let groups = [&grouped.group_a, &grouped.group_b];
+            assert!(groups.iter().any(|g| !g.outer.is_empty()), "{dims:?}");
+            for group in groups {
+                assert!(group.len <= GROUP_OFFSETS_INLINE);
+                assert_eq!(group.src_offsets.len(), group.len);
+            }
+        }
+        // A prime 101-element axis has no table divisor and is walked whole;
+        // the 100-element axis is divided as 50 table steps times 2.
+        let group_a = |case: usize| {
+            let (dims, src, dst) = &cases[case];
+            let plan = build_permute_plan(dims, src, dst, 8).unwrap();
+            plan.grouped_tile.unwrap().group_a
+        };
+        let prime = group_a(0);
+        assert_eq!(
+            (prime.len, prime.outer.as_slice()),
+            (1, &[(101, 1, 128)][..])
+        );
+        let split = group_a(1);
+        assert_eq!(
+            (split.len, split.outer.as_slice()),
+            (50, &[(2, 50, 6400)][..])
+        );
     }
 
     #[test]

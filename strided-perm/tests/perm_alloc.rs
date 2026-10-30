@@ -4,11 +4,11 @@
 //! `copy_into` builds their `PermutePlan` (fused metadata,
 //! flattened loop levels, grouped-tile offset tables) per call. The plan
 //! metadata is inline up to [`INLINE_RANK`], so a rank-≤ 8 plan allocates
-//! nothing. The grouped-tile offset tables are sized by the product of a
-//! tile's extents, not by rank: they are inline up to `GROUP_OFFSETS_INLINE`
-//! and spill to the heap above it (P1/P4 allow allocation above the bound).
-//! The arms below cover the inline case at rank 1..=8 and record the rank-8
-//! grouped cases whose tables spill.
+//! nothing. The grouped-tile offset tables are inline up to
+//! `GROUP_OFFSETS_INLINE` entries; a larger group walks its remaining axes as
+//! outer loops instead of growing the table, so a grouped plan allocates
+//! nothing either (#337). The arms below cover rank 1..=8, including rank-8
+//! grouped tiles larger than the table bound.
 //!
 //! This lives in its own integration-test binary because it installs a
 //! counting global allocator. Serial windows read the calling thread's counter
@@ -180,34 +180,32 @@ fn check_serial_contract() {
         "rank 9 must spill"
     );
 
-    // A grouped tile whose offset table is larger than the inline bound spills
-    // that table to the heap. The tile algorithm is unchanged: the long
-    // source-contiguous group is still selected, it just needs a heap table.
-    // Source group along the 100-element first axis (100 > 64 inline), while
-    // the destination keeps a 32-element contiguous group.
+    // A grouped tile larger than the inline offset-table bound keeps its
+    // table inline and walks the rest of the group as outer loops
+    // (tensor4all/strided-rs#337). Source group along the 100-element first
+    // axis (100 > 64 inline), while the destination keeps a 32-element
+    // contiguous group.
     let dims = [100usize, 2, 2, 2, 2, 2, 2, 2];
     let src_strides = [1isize, 101, 1000, 1001, 1002, 1003, 1004, 1005];
     let dst_strides = [128isize, 1, 2, 4, 8, 16, 32, 64];
-    let allocations = serial_allocations(&dims, &src_strides, &dst_strides);
-    assert!(
-        allocations > 0,
-        "a 100-entry grouped table must spill, got {allocations}"
+    assert_eq!(
+        serial_allocations(&dims, &src_strides, &dst_strides),
+        0,
+        "a 100-entry grouped tile allocated"
     );
-    println!("spill case [100,2x7] allocations = {allocations}");
 
     // A rank-8 mixed-extent scattered layout whose destination-contiguous
     // group reaches 120 elements (> 64) after the planner has selected the
-    // grouped tile; its table spills too.
+    // grouped tile.
     let dims = [2usize, 3, 4, 5, 6, 7, 8, 9];
     let dst_strides = col_major_strides(&dims);
     let mut src_strides = dst_strides.clone();
     src_strides.swap(0, 7);
-    let allocations = serial_allocations(&dims, &src_strides, &dst_strides);
-    assert!(
-        allocations > 0,
-        "a 120-entry grouped table must spill, got {allocations}"
+    assert_eq!(
+        serial_allocations(&dims, &src_strides, &dst_strides),
+        0,
+        "a 120-entry grouped tile allocated"
     );
-    println!("spill case [2,3,..,9] swapped allocations = {allocations}");
 }
 
 /// Pooled windows. The process-wide counter sees every worker, so a per-call
