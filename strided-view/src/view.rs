@@ -529,69 +529,83 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
 
     /// Create a diagonal view by fusing repeated axis pairs via stride trick (zero-copy).
     ///
-    /// For each pair `(a, b)`:
-    /// - New stride = `strides[a] + strides[b]`
-    /// - New dim = `min(dims[a], dims[b])`
-    /// - The higher-numbered axis is removed
-    /// - Pairs use **original** axis numbering
+    /// Each pair `(a, b)` ties axes `a` and `b` to one index. Pairs that share
+    /// an axis chain into one class (`[(0, 1), (1, 2)]` and `[(0, 1), (0, 2)]`
+    /// both tie axes 0, 1 and 2), and each class becomes one axis:
+    /// - New stride = the sum of the strides of the axes in the class
+    /// - New dim = the minimum of their dims
+    /// - The class sits at its lowest-numbered axis; the others are removed
+    /// - Pairs use **original** axis numbering; their order does not matter,
+    ///   and repeating a pair has no further effect
     ///
     /// # Errors
     ///
     /// Returns [`StridedError::InvalidAxis`] when a pair names an axis outside
     /// the rank or names the same axis twice, and
     /// [`StridedError::OffsetOverflow`] when a fused stride does not fit
-    /// `isize` or the fused layout reaches past the backing allocation. Two
-    /// pairs may share an axis (`A[i,i,i]` is `[(0, 1), (0, 2)]`), but a pair
-    /// pattern that folds one axis into itself or into both ends of another
-    /// pair can address elements outside the backing data and is rejected.
+    /// `isize` or the fused layout reaches past the backing allocation.
     ///
     /// # Example
     /// `A[i,i,j]` shape=`[n,n,m]` strides=`[s0,s1,s2]` -> shape=`[n,m]` strides=`[s0+s1, s2]`
     pub fn diagonal_view(&self, axis_pairs: &[(usize, usize)]) -> Result<StridedView<'a, T, Op>> {
         let ndim = self.ndim();
-        let mut dims: AxisVec = AxisVec::new();
-        dims.extend_from_slice(self.dims());
-        let mut strides: StrideVec = StrideVec::new();
-        strides.extend_from_slice(self.strides());
-
-        let mut axes_to_remove: tinyvec::TinyVec<[usize; INLINE_RANK]> = tinyvec::TinyVec::new();
+        // Each pair ties two axes to one index, so the pairs partition the
+        // axes into classes. Track each class's root as its lowest axis; the
+        // result is then independent of pair order and of how pairs chain
+        // (tensor4all/strided-rs#329).
+        let mut root: tinyvec::TinyVec<[usize; INLINE_RANK]> = (0..ndim).collect();
+        fn find(root: &mut [usize], mut ax: usize) -> usize {
+            while root[ax] != ax {
+                root[ax] = root[root[ax]];
+                ax = root[ax];
+            }
+            ax
+        }
         for &(a, b) in axis_pairs {
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            let hi = a.max(b);
             if hi >= ndim {
                 return Err(StridedError::InvalidAxis {
                     axis: hi,
                     rank: ndim,
                 });
             }
-            if lo == hi {
+            if a == b {
                 return Err(StridedError::InvalidAxis {
-                    axis: lo,
+                    axis: a,
                     rank: ndim,
                 });
             }
-            strides[lo] = strides[lo]
-                .checked_add(strides[hi])
-                .ok_or(StridedError::OffsetOverflow)?;
-            dims[lo] = dims[lo].min(dims[hi]);
-            // Insert each removal axis once. Pairs may share an axis, so a
-            // duplicate would otherwise grow the list past the rank bound and
-            // spill the inline vector for an otherwise in-bounds view.
-            if !axes_to_remove.contains(&hi) {
-                axes_to_remove.push(hi);
+            let (ra, rb) = (find(&mut root, a), find(&mut root, b));
+            root[ra.max(rb)] = ra.min(rb);
+        }
+
+        // Every class collapses onto its root: the root's stride sums the
+        // strides of all axes in the class and its dim is their minimum. A
+        // root is lower than every other axis of its class, so it has already
+        // been kept when a later member folds into it.
+        let mut dims: AxisVec = AxisVec::new();
+        let mut strides: StrideVec = StrideVec::new();
+        let mut position: tinyvec::TinyVec<[usize; INLINE_RANK]> =
+            tinyvec::TinyVec::with_capacity(ndim);
+        for ax in 0..ndim {
+            let r = find(&mut root, ax);
+            if r == ax {
+                position.push(dims.len());
+                dims.push(self.dims()[ax]);
+                strides.push(self.strides()[ax]);
+            } else {
+                position.push(usize::MAX);
+                let p = position[r];
+                strides[p] = strides[p]
+                    .checked_add(self.strides()[ax])
+                    .ok_or(StridedError::OffsetOverflow)?;
+                dims[p] = dims[p].min(self.dims()[ax]);
             }
         }
 
-        // Remove in descending order so the lower indices stay valid. The list
-        // is already unique, so no deduplication pass is needed.
-        axes_to_remove.sort_unstable();
-        for &ax in axes_to_remove.iter().rev() {
-            dims.remove(ax);
-            strides.remove(ax);
-        }
-
-        // The fusion re-uses an already updated stride when a pair shares an
-        // axis with an earlier pair, so the result carries no bound proof of
-        // its own and is validated here instead (tensor4all/strided-rs#204).
+        // A fused stride sums several input strides, so the result carries no
+        // bound proof of its own and is validated here instead
+        // (tensor4all/strided-rs#204).
         validate_bounds(self.data().len(), &dims, &strides, self.offset())?;
 
         Ok(from_meta(self.data(), &dims, &strides, self.offset()))
@@ -1629,14 +1643,66 @@ mod tests {
     }
 
     #[test]
-    fn test_diagonal_view_rejects_pairs_that_leave_the_backing() {
+    fn test_diagonal_view_pairs_sharing_a_high_axis_fuse_all_three() {
+        // Axis 2 is tied to both axis 0 and axis 1, so all three axes are one
+        // diagonal: A[i,i,i] with stride 4 + 2 + 1. Folding axis 2 into both
+        // survivors separately would reach offset 8 of a length-8 backing.
         let data: Vec<f64> = (0..8).map(|x| x as f64).collect();
         let view = StridedView::<f64>::new(&data, &[2, 2, 2], &[4, 2, 1], 0).unwrap();
-        // Axis 2 is folded into both axis 0 and axis 1, so the result reaches
-        // offset 8 of a length-8 backing.
-        assert!(view.diagonal_view(&[(0, 2), (1, 2)]).is_err());
-        // The same pair twice doubles one axis's stride contribution.
-        assert!(view.diagonal_view(&[(0, 1), (0, 1)]).is_err());
+        let diag = view.diagonal_view(&[(0, 2), (1, 2)]).unwrap();
+        assert_eq!(diag.dims(), &[2]);
+        assert_eq!(diag.strides(), &[7]);
+        assert_eq!(diag.get(&[1]), 7.0);
+    }
+
+    #[test]
+    fn test_diagonal_view_repeated_pair_is_idempotent() {
+        // Tying the same two axes twice is the same constraint as once; the
+        // stride contribution must not be counted twice.
+        let data: Vec<f64> = (0..8).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[2, 2, 2], &[4, 2, 1], 0).unwrap();
+        let once = view.diagonal_view(&[(0, 1)]).unwrap();
+        let twice = view.diagonal_view(&[(0, 1), (1, 0)]).unwrap();
+        assert_eq!(twice.dims(), once.dims());
+        assert_eq!(twice.strides(), once.strides());
+        assert_eq!(twice.strides(), &[6, 1]);
+    }
+
+    #[test]
+    fn test_diagonal_view_chained_pairs_are_order_independent() {
+        // tensor4all/strided-rs#329: [(0, 1), (1, 2)] and [(1, 2), (0, 1)]
+        // both describe A[i,i,i]. The second pair's low axis is the first
+        // pair's removed axis, and its contribution must still reach axis 0.
+        let data: Vec<f64> = (0..27).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &[3, 3, 3], &[1, 3, 9], 0).unwrap();
+        for pairs in [
+            [(0, 1), (1, 2)],
+            [(1, 2), (0, 1)],
+            [(2, 1), (1, 0)],
+            [(0, 2), (2, 1)],
+        ] {
+            let diag = view.diagonal_view(&pairs).unwrap();
+            assert_eq!(diag.dims(), &[3], "{pairs:?}");
+            assert_eq!(diag.strides(), &[13], "{pairs:?}");
+            assert_eq!(diag.get(&[2]), 26.0, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn test_diagonal_view_chained_pairs_keep_free_axes_in_order() {
+        // A[i,j,i,i] with a chain through axis 2: the free axis j stays second
+        // and the fused dim is the minimum over the whole class.
+        let dims = [3usize, 4, 2, 3];
+        let strides = [1isize, 3, 12, 24];
+        let data: Vec<f64> = (0..72).map(|x| x as f64).collect();
+        let view = StridedView::<f64>::new(&data, &dims, &strides, 0).unwrap();
+        let a = view.diagonal_view(&[(2, 3), (0, 2)]).unwrap();
+        let b = view.diagonal_view(&[(0, 2), (2, 3)]).unwrap();
+        for diag in [a, b] {
+            assert_eq!(diag.dims(), &[2, 4]);
+            assert_eq!(diag.strides(), &[37, 3]);
+            assert_eq!(diag.get(&[1, 2]), 43.0);
+        }
     }
 
     #[test]
