@@ -255,10 +255,75 @@ fn indexed_offset(dims: &[usize], strides: &[isize], indices: &[usize], base: is
     offset
 }
 
+/// Number of elements of `dims`: the checked product of the extents.
+///
+/// A zero extent wins before the product, so a zero-sized shape is empty even
+/// when its other extents would overflow. Returns
+/// [`StridedError::OffsetOverflow`] when the product does not fit `usize`
+/// (tensor4all/strided-rs#205).
+#[inline]
+fn checked_element_count(dims: &[usize]) -> Result<usize> {
+    if dims.contains(&0) {
+        return Ok(0);
+    }
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)
+}
+
+/// [`checked_element_count`] for the infallible `len` accessors.
+///
+/// # Panics
+///
+/// Panics when the element count does not fit `usize`, which only a
+/// broadcast (stride-0) layout can reach.
+#[inline]
+fn element_count(dims: &[usize]) -> usize {
+    checked_element_count(dims).expect("element count overflows usize")
+}
+
+/// Dense strides of `dims` with the axes visited fastest first in `order`.
+///
+/// Each stride is the product of the extents of the faster axes and must fit
+/// `isize`; otherwise [`StridedError::OffsetOverflow`]. A zero-sized shape is
+/// never dereferenced, so its strides saturate instead of failing: an empty
+/// array with huge extents stays constructible.
+fn checked_dense_strides(dims: &[usize], order: impl Iterator<Item = usize>) -> Result<StrideVec> {
+    let empty = dims.contains(&0);
+    let mut strides = StrideVec::new();
+    strides.resize(dims.len(), 0isize);
+    let mut step = 1isize;
+    for axis in order {
+        strides[axis] = step;
+        let dim = isize::try_from(dims[axis]).ok();
+        step = match dim.and_then(|dim| step.checked_mul(dim)) {
+            Some(next) => next,
+            None if empty => isize::MAX,
+            // The last axis's step is never stored, but it is the element
+            // count, which must also fit for the allocation and the offsets.
+            None => return Err(StridedError::OffsetOverflow),
+        };
+    }
+    Ok(strides)
+}
+
+fn checked_col_major_strides(dims: &[usize]) -> Result<StrideVec> {
+    checked_dense_strides(dims, 0..dims.len())
+}
+
+fn checked_row_major_strides(dims: &[usize]) -> Result<StrideVec> {
+    checked_dense_strides(dims, (0..dims.len()).rev())
+}
+
 /// Compute column-major strides (Julia default: first index varies fastest).
 ///
 /// Returns an inline [`StrideVec`]: the result does not allocate at rank
 /// `<= INLINE_RANK` and spills above it.
+///
+/// # Panics
+///
+/// Panics when a stride or the element count of a non-empty shape does not
+/// fit `isize`. A shape with a zero extent never panics.
 ///
 /// # Examples
 ///
@@ -270,22 +335,18 @@ fn indexed_offset(dims: &[usize], strides: &[isize], indices: &[usize], base: is
 /// ```
 #[inline]
 pub fn col_major_strides(dims: &[usize]) -> StrideVec {
-    let rank = dims.len();
-    if rank == 0 {
-        return StrideVec::new();
-    }
-    let mut strides = StrideVec::new();
-    strides.resize(rank, 1isize);
-    for i in 1..rank {
-        strides[i] = strides[i - 1] * dims[i - 1] as isize;
-    }
-    strides
+    checked_col_major_strides(dims).expect("column-major strides overflow isize")
 }
 
 /// Compute row-major strides (C default: last index varies fastest).
 ///
 /// Returns an inline [`StrideVec`]: the result does not allocate at rank
 /// `<= INLINE_RANK` and spills above it.
+///
+/// # Panics
+///
+/// Panics when a stride or the element count of a non-empty shape does not
+/// fit `isize`. A shape with a zero extent never panics.
 ///
 /// # Examples
 ///
@@ -297,16 +358,7 @@ pub fn col_major_strides(dims: &[usize]) -> StrideVec {
 /// ```
 #[inline]
 pub fn row_major_strides(dims: &[usize]) -> StrideVec {
-    let rank = dims.len();
-    if rank == 0 {
-        return StrideVec::new();
-    }
-    let mut strides = StrideVec::new();
-    strides.resize(rank, 1isize);
-    for i in (0..rank - 1).rev() {
-        strides[i] = strides[i + 1] * dims[i + 1] as isize;
-    }
-    strides
+    checked_row_major_strides(dims).expect("row-major strides overflow isize")
 }
 
 // ============================================================================
@@ -482,9 +534,14 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     }
 
     /// Returns the total number of elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count does not fit `usize`, which only a
+    /// broadcast (stride-0) layout can reach.
     #[inline]
     pub fn len(&self) -> usize {
-        self.dims().iter().product()
+        element_count(self.dims())
     }
 
     /// Returns `true` if any dimension is zero.
@@ -832,9 +889,14 @@ impl<'a, T> StridedViewMut<'a, T> {
     }
 
     /// Returns the total number of elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count does not fit `usize`, which only a
+    /// broadcast (stride-0) layout can reach.
     #[inline]
     pub fn len(&self) -> usize {
-        self.dims().iter().product()
+        element_count(self.dims())
     }
 
     /// Returns `true` if any dimension is zero.
@@ -999,15 +1061,41 @@ impl<T: Clone + Default> StridedArray<T> {
     /// assert_eq!(a.dims(), &[2, 3]);
     /// assert_eq!(a.strides(), &[1, 2]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_col_major`] to get [`StridedError::OffsetOverflow`] instead.
     pub fn col_major(dims: &[usize]) -> Self {
-        let total: usize = dims.iter().product();
-        let data = vec![T::default(); total];
-        let strides = col_major_strides(dims);
-        Self {
-            data,
+        Self::try_col_major(dims).expect("col_major: shape overflows isize")
+    }
+
+    /// Fallible [`Self::col_major`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_view::{StridedArray, StridedError};
+    ///
+    /// assert_eq!(StridedArray::<f64>::try_col_major(&[2, 3]).unwrap().strides(), &[1, 2]);
+    /// assert!(matches!(
+    ///     StridedArray::<f64>::try_col_major(&[1 << 62, 4]),
+    ///     Err(StridedError::OffsetOverflow)
+    /// ));
+    /// ```
+    pub fn try_col_major(dims: &[usize]) -> Result<Self> {
+        let strides = checked_col_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
+        Ok(Self {
+            data: vec![T::default(); total],
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 
     /// Create a row-major (C default) tensor filled with Default values.
@@ -1024,23 +1112,52 @@ impl<T: Clone + Default> StridedArray<T> {
     /// assert_eq!(a.dims(), &[2, 3]);
     /// assert_eq!(a.strides(), &[3, 1]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_row_major`] to get [`StridedError::OffsetOverflow`] instead.
     pub fn row_major(dims: &[usize]) -> Self {
-        let total: usize = dims.iter().product();
-        let data = vec![T::default(); total];
-        let strides = row_major_strides(dims);
-        Self {
-            data,
+        Self::try_row_major(dims).expect("row_major: shape overflows isize")
+    }
+
+    /// Fallible [`Self::row_major`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    pub fn try_row_major(dims: &[usize]) -> Result<Self> {
+        let strides = checked_row_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
+        Ok(Self {
+            data: vec![T::default(); total],
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 
     /// Create a column-major tensor with values produced by a function.
     ///
     /// The function is called with indices in column-major iteration order.
-    pub fn from_fn_col_major(dims: &[usize], mut f: impl FnMut(&[usize]) -> T) -> Self {
-        let total: usize = dims.iter().product();
-        let strides = col_major_strides(dims);
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_from_fn_col_major`] to get [`StridedError::OffsetOverflow`] instead.
+    pub fn from_fn_col_major(dims: &[usize], f: impl FnMut(&[usize]) -> T) -> Self {
+        Self::try_from_fn_col_major(dims, f).expect("from_fn_col_major: shape overflows isize")
+    }
+
+    /// Fallible [`Self::from_fn_col_major`]; `f` is not called on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    pub fn try_from_fn_col_major(dims: &[usize], mut f: impl FnMut(&[usize]) -> T) -> Result<Self> {
+        let strides = checked_col_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
         let rank = dims.len();
         let mut data = Vec::with_capacity(total);
         let mut idx: AxisVec = AxisVec::new();
@@ -1058,19 +1175,34 @@ impl<T: Clone + Default> StridedArray<T> {
                 idx[d] = 0;
             }
         }
-        Self {
+        Ok(Self {
             data,
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 
     /// Create a row-major tensor with values produced by a function.
     ///
     /// The function is called with indices in row-major iteration order.
-    pub fn from_fn_row_major(dims: &[usize], mut f: impl FnMut(&[usize]) -> T) -> Self {
-        let total: usize = dims.iter().product();
-        let strides = row_major_strides(dims);
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_from_fn_row_major`] to get [`StridedError::OffsetOverflow`] instead.
+    pub fn from_fn_row_major(dims: &[usize], f: impl FnMut(&[usize]) -> T) -> Self {
+        Self::try_from_fn_row_major(dims, f).expect("from_fn_row_major: shape overflows isize")
+    }
+
+    /// Fallible [`Self::from_fn_row_major`]; `f` is not called on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    pub fn try_from_fn_row_major(dims: &[usize], mut f: impl FnMut(&[usize]) -> T) -> Result<Self> {
+        let strides = checked_row_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
         let rank = dims.len();
         let mut data = Vec::with_capacity(total);
         let mut idx: AxisVec = AxisVec::new();
@@ -1087,11 +1219,11 @@ impl<T: Clone + Default> StridedArray<T> {
                 idx[d] = 0;
             }
         }
-        Self {
+        Ok(Self {
             data,
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 }
 
@@ -1130,9 +1262,14 @@ impl<T> StridedArray<T> {
     }
 
     /// Returns the total number of elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count does not fit `usize`, which only a
+    /// broadcast (stride-0) layout can reach.
     #[inline]
     pub fn len(&self) -> usize {
-        self.dims().iter().product()
+        element_count(self.dims())
     }
 
     /// Returns `true` if any dimension is zero.
@@ -1236,8 +1373,26 @@ impl<T: Default> StridedArray<T> {
     ///
     /// If `buf` has at least `product(dims)` elements, it is truncated and
     /// zeroed.  Otherwise a fresh buffer is allocated.
-    pub fn col_major_from_buffer(mut buf: Vec<T>, dims: &[usize]) -> Self {
-        let total: usize = dims.iter().product();
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_col_major_from_buffer`] to get
+    /// [`StridedError::OffsetOverflow`] instead.
+    pub fn col_major_from_buffer(buf: Vec<T>, dims: &[usize]) -> Self {
+        Self::try_col_major_from_buffer(buf, dims)
+            .expect("col_major_from_buffer: shape overflows isize")
+    }
+
+    /// Fallible [`Self::col_major_from_buffer`]; `buf` is dropped on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    pub fn try_col_major_from_buffer(mut buf: Vec<T>, dims: &[usize]) -> Result<Self> {
+        let strides = checked_col_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
         if buf.len() >= total {
             buf.truncate(total);
         } else {
@@ -1247,12 +1402,11 @@ impl<T: Default> StridedArray<T> {
         for v in buf.iter_mut() {
             *v = T::default();
         }
-        let strides = col_major_strides(dims);
-        Self {
+        Ok(Self {
             data: buf,
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 }
 
@@ -1261,34 +1415,77 @@ impl<T: Copy> StridedArray<T> {
     ///
     /// # Safety
     /// Caller must write every element before reading.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_col_major_uninit`] to get [`StridedError::OffsetOverflow`]
+    /// instead.
     pub unsafe fn col_major_uninit(dims: &[usize]) -> Self {
-        let total: usize = dims.iter().product();
+        Self::try_col_major_uninit(dims).expect("col_major_uninit: shape overflows isize")
+    }
+
+    /// Fallible [`Self::col_major_uninit`].
+    ///
+    /// # Safety
+    /// Caller must write every element before reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    pub unsafe fn try_col_major_uninit(dims: &[usize]) -> Result<Self> {
+        let strides = checked_col_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
         let mut data = Vec::with_capacity(total);
         data.set_len(total);
-        let strides = col_major_strides(dims);
-        Self {
+        Ok(Self {
             data,
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 
     /// Reuse an existing buffer as a column-major tensor **without zeroing**.
     ///
     /// # Safety
     /// Caller must write every element before reading.
-    pub unsafe fn col_major_from_buffer_uninit(mut buf: Vec<T>, dims: &[usize]) -> Self {
-        let total: usize = dims.iter().product();
+    ///
+    /// # Panics
+    ///
+    /// Panics when the element count or a stride does not fit `isize`; use
+    /// [`Self::try_col_major_from_buffer_uninit`] to get
+    /// [`StridedError::OffsetOverflow`] instead.
+    pub unsafe fn col_major_from_buffer_uninit(buf: Vec<T>, dims: &[usize]) -> Self {
+        Self::try_col_major_from_buffer_uninit(buf, dims)
+            .expect("col_major_from_buffer_uninit: shape overflows isize")
+    }
+
+    /// Fallible [`Self::col_major_from_buffer_uninit`]; `buf` is dropped on
+    /// error.
+    ///
+    /// # Safety
+    /// Caller must write every element before reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::OffsetOverflow`] when the element count or a
+    /// stride does not fit `isize`.
+    pub unsafe fn try_col_major_from_buffer_uninit(
+        mut buf: Vec<T>,
+        dims: &[usize],
+    ) -> Result<Self> {
+        let strides = checked_col_major_strides(dims)?;
+        let total = checked_element_count(dims)?;
         if buf.capacity() < total {
             buf.reserve(total - buf.len());
         }
         buf.set_len(total);
-        let strides = col_major_strides(dims);
-        Self {
+        Ok(Self {
             data: buf,
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
-        }
+        })
     }
 }
 
@@ -1585,6 +1782,111 @@ mod tests {
         assert_eq!(t.get(&[0, 1, 0]), 10.0);
         assert_eq!(t.get(&[0, 0, 1]), 1.0);
         assert_eq!(t.get(&[1, 2, 3]), 123.0);
+    }
+
+    // tensor4all/strided-rs#205: shape products and dense strides are checked.
+    const HUGE: usize = 1 << 62;
+
+    fn assert_overflow<T: std::fmt::Debug>(result: Result<T>) {
+        assert!(
+            matches!(result, Err(StridedError::OffsetOverflow)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_try_constructors_reject_overflowing_shapes() {
+        // [1 << 62, 4] wraps to 0 elements unchecked; [1 << 62, 2] overflows
+        // only isize; the single extent above isize::MAX overflows the
+        // stride conversion.
+        for dims in [
+            &[HUGE, 4][..],
+            &[HUGE, 2],
+            &[2, HUGE],
+            &[isize::MAX as usize + 2, 1],
+            &[usize::MAX, usize::MAX],
+        ] {
+            assert_overflow(StridedArray::<f64>::try_col_major(dims));
+            assert_overflow(StridedArray::<f64>::try_row_major(dims));
+            assert_overflow(StridedArray::<f64>::try_from_fn_col_major(dims, |_| {
+                unreachable!("f is not called on error")
+            }));
+            assert_overflow(StridedArray::<f64>::try_from_fn_row_major(dims, |_| {
+                unreachable!("f is not called on error")
+            }));
+            assert_overflow(StridedArray::<f64>::try_col_major_from_buffer(
+                vec![1.0; 3],
+                dims,
+            ));
+            assert_overflow(unsafe { StridedArray::<f64>::try_col_major_uninit(dims) });
+            assert_overflow(unsafe {
+                StridedArray::<f64>::try_col_major_from_buffer_uninit(vec![1.0; 3], dims)
+            });
+        }
+    }
+
+    #[test]
+    fn test_try_constructors_accept_valid_and_empty_shapes() {
+        let a = StridedArray::<f64>::try_col_major(&[2, 3]).unwrap();
+        assert_eq!((a.strides(), a.len()), (&[1isize, 2][..], 6));
+        let a = StridedArray::<f64>::try_row_major(&[2, 3]).unwrap();
+        assert_eq!(a.strides(), &[3, 1]);
+        let a =
+            StridedArray::<usize>::try_from_fn_row_major(&[2, 3], |i| 10 * i[0] + i[1]).unwrap();
+        assert_eq!(a.get(&[1, 2]), 12);
+        // A zero extent makes the array empty whatever the other extents.
+        for dims in [&[HUGE, 4, 0][..], &[0, usize::MAX, usize::MAX]] {
+            let a = StridedArray::<f64>::try_col_major(dims).unwrap();
+            assert_eq!((a.len(), a.data().len()), (0, 0));
+            assert!(a.is_empty());
+            let a = StridedArray::<f64>::try_row_major(dims).unwrap();
+            assert_eq!(a.len(), 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "col_major: shape overflows isize")]
+    fn test_col_major_panics_instead_of_wrapping() {
+        // Unchecked, release builds wrapped the product to 0 and returned an
+        // empty buffer behind a [1 << 62, 4] view.
+        let _ = StridedArray::<f64>::col_major(&[HUGE, 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "column-major strides overflow isize")]
+    fn test_col_major_strides_panic_on_overflow() {
+        let _ = col_major_strides(&[HUGE, 4]);
+    }
+
+    #[test]
+    fn test_dense_strides_of_an_empty_shape_do_not_panic() {
+        assert_eq!(col_major_strides(&[3, 0, 5]).as_slice(), &[1, 3, 0]);
+        assert_eq!(row_major_strides(&[3, 0, 5]).as_slice(), &[0, 5, 1]);
+        // The overflowing step of an empty shape saturates.
+        assert_eq!(
+            col_major_strides(&[HUGE, 4, 0]).as_slice(),
+            &[1, HUGE as isize, isize::MAX]
+        );
+        assert_eq!(
+            row_major_strides(&[0, 4, HUGE]).as_slice(),
+            &[isize::MAX, HUGE as isize, 1]
+        );
+    }
+
+    #[test]
+    fn test_len_of_a_zero_sized_broadcast_view_is_zero() {
+        // A zero extent wins before the product of the others.
+        let data = [0.0f64; 1];
+        let view = StridedView::<f64>::new(&data, &[usize::MAX, 2, 0], &[0, 0, 0], 0).unwrap();
+        assert_eq!(view.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "element count overflows usize")]
+    fn test_len_of_an_overflowing_broadcast_view_panics() {
+        let data = [0.0f64; 1];
+        let view = StridedView::<f64>::new(&data, &[HUGE, 4], &[0, 0], 0).unwrap();
+        let _ = view.len();
     }
 
     #[test]
