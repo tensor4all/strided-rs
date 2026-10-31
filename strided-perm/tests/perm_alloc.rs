@@ -262,6 +262,17 @@ fn check_parallel_contract() {
         }
     }
 
+    // Large contiguous copies must split without adding kernel allocations (#347).
+    let dims = [1usize << 22];
+    let src = source_array(&dims, &[1]);
+    let mut dst_data = vec![0.0f64; dims[0]];
+    let mut dst = StridedViewMut::new(&mut dst_data, &dims, &[1], 0).unwrap();
+    let src_view = src.view();
+    copy_into(&mut dst, &src_view, Exec::new(&pool, 2).unwrap()).unwrap();
+    let (inline, pooled) = pooled_extra(&mut dst, &src_view);
+    assert_eq!(inline, 0, "inline contiguous copy");
+    assert_eq!(pooled, 0, "pooled contiguous copy");
+
     // A layout large enough to split, with a transposing source so the plan is
     // non-trivial.
     let dims = [32usize, 32, 32];
