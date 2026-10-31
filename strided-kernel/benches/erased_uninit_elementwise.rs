@@ -10,7 +10,8 @@
 //! cost more than the select itself, and a NaN test per `clamp` step doubled
 //! its time, and neither showed up in any binary row.
 //!
-//! `RAYON_NUM_THREADS=1 cargo bench -p strided-kernel --bench erased_uninit_elementwise`
+//! `cargo bench -p strided-kernel --bench erased_uninit_elementwise` (the rows run on
+//! `Exec::serial()`)
 //!
 //! Each `SUMMARY` line reports the typed and erased medians in milliseconds, the
 //! paired geometric-mean ratio `erased / typed`, and its upper 95% bound.

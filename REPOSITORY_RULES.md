@@ -111,7 +111,7 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
   thresholds for similar kernels.
 - If the active thread count is one, call the serial kernel directly rather
   than entering Rayon/OpenMP parallel machinery. Avoid thread startup and
-  scheduler overhead for `RAYON_NUM_THREADS=1` or single-thread pools.
+  scheduler overhead for `Exec::serial()` or single-thread pools.
 - If a tensor-sized CPU operation remains a dedicated sequential loop because no
   strided/backend-native parallel primitive fits the indexing pattern yet, add
   a nearby comment naming that rationale.

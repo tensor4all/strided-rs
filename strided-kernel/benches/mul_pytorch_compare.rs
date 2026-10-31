@@ -1,12 +1,13 @@
 use std::env;
 use std::hint::black_box;
 use std::ops::Mul;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use strided_kernel::Exec;
 use strided_kernel::{
     batched_outer_product_into, broadcast_mul_into, mul_into, StridedArray, StridedViewMut,
 };
+use strided_kernel::{Exec, Pool};
 
 const DEFAULT_WARMUPS: usize = 3;
 const DEFAULT_RUNS: usize = 15;
@@ -124,6 +125,39 @@ fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(default)
+}
+
+/// The width this run must use: `STRIDED_KERNEL_BENCH_THREADS` when set, the
+/// parallelism of the machine otherwise.
+fn requested_threads() -> usize {
+    std::env::var("STRIDED_KERNEL_BENCH_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// The pool the measured rows run on, built once at the requested width.
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        Pool::builder()
+            .threads(requested_threads())
+            .build()
+            .unwrap()
+    })
+}
+
+/// A token of the requested width. The run fails at startup when the pool or
+/// the token does not carry that width.
+fn exec() -> Exec<'static> {
+    let exec = Exec::new(pool(), requested_threads()).unwrap();
+    assert_eq!(
+        exec.budget().get(),
+        requested_threads(),
+        "the exec budget does not match the requested thread count"
+    );
+    exec
 }
 
 fn profile_cases() -> Vec<BenchCase> {
@@ -369,13 +403,7 @@ fn run_elementwise<T: BenchScalar>(n: usize) -> (f64, f64) {
     let rhs = make_col_major::<T>(&[n, n], 2);
     let mut out = StridedArray::<T>::col_major(&[n, n]);
     measure(|| {
-        mul_into(
-            &mut out.view_mut(),
-            &lhs.view(),
-            &rhs.view(),
-            Exec::serial(),
-        )
-        .unwrap();
+        mul_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), exec()).unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -391,7 +419,7 @@ fn run_outer_product<T: BenchScalar>(n: usize) -> (f64, f64) {
             &[0],
             &rhs.view(),
             &[1],
-            Exec::serial(),
+            exec(),
         )
         .unwrap();
         black_box(out.data().as_ptr());
@@ -403,15 +431,8 @@ fn run_batched_outer_compact<T: BenchScalar>(j: usize, k: usize, o: usize, t: us
     let rhs = make_col_major::<T>(&[o, t], 6);
     let mut out = StridedArray::<T>::col_major(&[j, k, o, t]);
     measure(|| {
-        batched_outer_product_into(
-            &mut out.view_mut(),
-            &lhs.view(),
-            &rhs.view(),
-            2,
-            1,
-            Exec::serial(),
-        )
-        .unwrap();
+        batched_outer_product_into(&mut out.view_mut(), &lhs.view(), &rhs.view(), 2, 1, exec())
+            .unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -427,8 +448,7 @@ fn run_batched_outer_noncompact<T: BenchScalar>(
     let rhs = make_col_major::<T>(&[o, t], 8);
     let mut out = StridedArray::<T>::col_major(&[j, k, o, t]);
     measure(|| {
-        batched_outer_product_into(&mut out.view_mut(), &lhs, &rhs.view(), 2, 1, Exec::serial())
-            .unwrap();
+        batched_outer_product_into(&mut out.view_mut(), &lhs, &rhs.view(), 2, 1, exec()).unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -447,7 +467,7 @@ fn run_batched_outer_noncompact_torchlike_output<T: BenchScalar>(
     let out_dims = [j, k, o, t];
     let mut out_view = StridedViewMut::new(out.data_mut(), &out_dims, &out_strides, 0).unwrap();
     measure(|| {
-        batched_outer_product_into(&mut out_view, &lhs, &rhs.view(), 2, 1, Exec::serial()).unwrap();
+        batched_outer_product_into(&mut out_view, &lhs, &rhs.view(), 2, 1, exec()).unwrap();
         black_box(out_view.as_mut_ptr());
     })
 }
@@ -471,7 +491,7 @@ fn run_batched_outer_noncompact_lhs_scalar<T: BenchScalar>(
             &[2, 3],
             &rhs,
             &[0, 1, 3],
-            Exec::serial(),
+            exec(),
         )
         .unwrap();
         black_box(out.data().as_ptr());
@@ -494,7 +514,7 @@ fn run_permuted_elementwise<T: BenchScalar>(rank: usize, extent: usize) -> (f64,
     let rhs = rhs_base.view().permute(&rhs_perm).unwrap();
     let mut out = StridedArray::<T>::col_major(&dims);
     measure(|| {
-        mul_into(&mut out.view_mut(), &lhs.view(), &rhs, Exec::serial()).unwrap();
+        mul_into(&mut out.view_mut(), &lhs.view(), &rhs, exec()).unwrap();
         black_box(out.data().as_ptr());
     })
 }
@@ -530,10 +550,9 @@ fn run_case_for_dtype(dtype: BenchDType, case: BenchCase) -> (f64, f64) {
     }
 }
 
+/// The effective width of the measured rows, not a requested one.
 fn threads_label() -> String {
-    env::var("RAYON_NUM_THREADS")
-        .or_else(|_| env::var("OMP_NUM_THREADS"))
-        .unwrap_or_else(|_| "unset".to_string())
+    exec().budget().to_string()
 }
 
 fn main() {
