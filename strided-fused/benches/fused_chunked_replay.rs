@@ -12,8 +12,13 @@
 //! Run it as:
 //!
 //! ```text
-//! RAYON_NUM_THREADS=8 cargo bench -p strided-fused --features parallel --bench fused_chunked_replay
+//! cargo bench -p strided-fused --features parallel --bench fused_chunked_replay
 //! ```
+//!
+//! The harness builds its own `Pool` for each width it reports (one and four
+//! workers with `parallel`, one otherwise) and asserts the effective budget, so
+//! it reads no ambient thread variable and there is nothing to pin from the
+//! shell. The workspace has no Rayon dependency.
 //!
 //! The harness asserts the worker count it reports and owns every buffer, view
 //! and plan, so the timed region holds only the operation itself (plus whatever

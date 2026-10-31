@@ -53,18 +53,25 @@ should get a probe call and a `CHECKS` entry.
 ## Baseline vs native comparison (evo)
 
 This is not measured on shared machines. On an AVX2 host and an AVX-512 host, follow the campaign
-protocol (boost off, pinned threads). Build the same rows twice in separate target directories and
-compare the rows within the noise band:
+protocol: boost and frequency scaling off, one run at a time, nothing else on the measured cores.
+Build the same rows twice in separate target directories and compare the rows within the noise band:
 
 ```bash
 for mode in baseline native; do
   if [ "$mode" = native ]; then flags="-C target-cpu=native"; else flags=""; fi
-  RUSTFLAGS="$flags" CARGO_TARGET_DIR=target/simd-$mode RAYON_NUM_THREADS=1 \
+  RUSTFLAGS="$flags" CARGO_TARGET_DIR=target/simd-$mode \
     cargo bench -p strided-kernel --bench erased_uninit_elementwise | tee simd-$mode-kernel.csv
   RUSTFLAGS="$flags" CARGO_TARGET_DIR=target/simd-$mode \
     cargo bench -p strided-fused --bench fused_chunked_replay | tee simd-$mode-fused.txt
 done
 ```
+
+Neither command needs a thread pin, and neither reads an ambient thread variable. The kernel
+benchmark runs every measured call on `Exec::serial()` and prints `context=serial` in its `CONFIG`
+line, so the harness fixes the width. The fused benchmark builds its own `Pool` at the fixed widths
+it reports (one and four workers with `parallel`, one otherwise) and asserts the effective budget on
+each row, so it ignores the shell as well. The workspace has no Rayon dependency:
+`RAYON_NUM_THREADS` would select nothing even if it were set.
 
 The kernel rows cover contiguous map/zip, select and clamp. The fused rows cover the chunk replay,
 including `ten_sqrt` (the scalar-method `sqrt` that tenferro's `sqrt`/`rsqrt` reach through
