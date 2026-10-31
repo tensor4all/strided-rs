@@ -138,7 +138,24 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     // construction, so it skips the validation below.
     if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
         let len = total_len(raw.dims);
-        unsafe { std::ptr::copy_nonoverlapping(raw.src, dst_ptr, len) };
+        if exec.is_serial() {
+            // SAFETY: the validated contiguous ranges are live and non-overlapping.
+            unsafe { std::ptr::copy_nonoverlapping(raw.src, dst_ptr, len) };
+        } else {
+            let src_addr = raw.src as usize;
+            let dst_addr = dst_ptr as usize;
+            exec.for_ranges(len, std::num::NonZeroUsize::MIN, |range| {
+                // SAFETY: `for_ranges` joins disjoint subranges of the validated
+                // contiguous buffers; raw stores also support uninitialized output.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (src_addr as *const T).add(range.start),
+                        (dst_addr as *mut T).add(range.start),
+                        range.len(),
+                    );
+                }
+            });
+        }
         return Ok(());
     }
 
@@ -170,7 +187,8 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 /// justifies for the copy ([`copy_ns_per_element`](crate::copy_ns_per_element)
 /// times its elements); a small copy stays on the calling thread. A caller that wants a large copy on one thread passes
 /// [`Exec::serial`] or narrows the token with [`Exec::limit`].
-/// A contiguous copy is a single `memcpy` on the calling thread.
+/// A contiguous copy uses one `memcpy` per range of the narrowed token, or a
+/// single `memcpy` on the calling thread when that token is serial.
 ///
 /// This is a simple copy without ElementOp support. For copies with
 /// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
