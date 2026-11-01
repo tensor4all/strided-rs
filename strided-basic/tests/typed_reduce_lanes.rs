@@ -318,3 +318,150 @@ fn typed_reduce_axis_column_sweep_is_thread_count_independent() {
         assert!(same, "threads {threads}");
     }
 }
+
+fn nan_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Reference for the documented lane assignment of the contiguous fold: `init`
+/// is combined once before lane 0, lane `i` is seeded from element `i` and then
+/// folds element `i + 16 k` for increasing `k`, the remainder goes to the first
+/// lanes, and the lanes are combined left to right. `values` is in fold order.
+fn lane_order_fold(values: &[f64], init: f64, reduce: fn(f64, f64) -> f64) -> f64 {
+    const LANES: usize = 16;
+    if values.len() < 2 * LANES {
+        return values.iter().fold(init, |acc, &v| reduce(acc, v));
+    }
+    let (head, rest) = values.split_at(LANES);
+    let mut lanes = head.to_vec();
+    for (i, &v) in rest.iter().enumerate() {
+        let lane = i % LANES;
+        lanes[lane] = reduce(lanes[lane], v);
+    }
+    lanes.into_iter().fold(init, |acc, lane| reduce(acc, lane))
+}
+
+/// Magnitudes whose fold order is visible in the result value.
+fn value_probe_data(len: usize) -> Vec<f64> {
+    (0..len)
+        .map(|i| match i % 5 {
+            0 => 2.5,
+            1 => -2.5,
+            2 => 1.5,
+            3 => -1.5,
+            _ => ((i % 11) as f64 - 5.0) * 0.5,
+        })
+        .collect()
+}
+
+/// All values are `0.0` or `-0.0`, so the result bit is the sign of the element
+/// the fold reaches first: `max`/`min` keep the earlier operand on a tie. Lane 0
+/// holds `+0.0, +0.0, +0.0, -0.0` and lane 15 holds `-0.0`, so reseeding from
+/// another element, folding a lane in reverse, or combining the lanes in another
+/// order changes the result bit.
+fn signed_zero_probe_data(len: usize) -> Vec<f64> {
+    (0..len)
+        .map(|i| match i % 11 {
+            4 => -0.0,
+            _ => 0.0,
+        })
+        .collect()
+}
+
+/// Pins the exact output bits of contiguous `max`/`min` on `f64` for lengths
+/// with and without a lane remainder: the outlined lane combination must not
+/// reseed, reorder or re-apply `init`, and must keep the NaN and signed-zero
+/// behavior of the documented fold order.
+#[test]
+fn typed_contiguous_fold_keeps_lane_order_bits() {
+    let serial = Budget::Serial;
+    for data_of in [value_probe_data, signed_zero_probe_data] {
+        for len in [0usize, 1, 15, 16, 31, 32, 33, 47, 48, 63, 64, 65, 1001] {
+            for poisoned in [false, true] {
+                let mut data = data_of(len);
+                if poisoned {
+                    // A NaN in a lane seed and in two remainders of a chunk.
+                    for &index in &[16usize, 33, 47] {
+                        if index < len {
+                            data[index] = f64::NAN;
+                        }
+                    }
+                }
+                // Contiguous column-major `[len]` and `[len, 2]`: the whole
+                // buffer is one unit-stride fold, and axis 0 is one unit-stride
+                // run per output.
+                for outputs in [1usize, 2] {
+                    let full_data: Vec<f64> = if outputs == 1 {
+                        data.clone()
+                    } else {
+                        let mut flat: Vec<f64> = data.clone();
+                        flat.extend_from_slice(&data);
+                        flat
+                    };
+                    let dims = [len, outputs];
+                    let strides = [1isize, len as isize];
+                    let view = StridedView::<f64>::new(&full_data, &dims, &strides, 0).unwrap();
+                    for (reduce_fn, init) in [
+                        (nan_max as fn(f64, f64) -> f64, f64::NEG_INFINITY),
+                        (nan_min as fn(f64, f64) -> f64, f64::INFINITY),
+                    ] {
+                        let want = lane_order_fold(&full_data, init, reduce_fn);
+                        let got = { reduce(&view, |x| x, reduce_fn, init, serial.exec()).unwrap() };
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "full len {len} outputs {outputs} poisoned {poisoned}: {got} vs {want}"
+                        );
+                        if len == 0 {
+                            continue;
+                        }
+                        let want_axis = lane_order_fold(&data, init, reduce_fn);
+                        let got_axis = {
+                            reduce_axis(&view, 0, |x| x, reduce_fn, init, serial.exec()).unwrap()
+                        };
+                        for (o, got) in got_axis.data().iter().enumerate() {
+                            assert_eq!(
+                                got.to_bits(),
+                                want_axis.to_bits(),
+                                "axis0 len {len} outputs {outputs} out {o} poisoned {poisoned}: {got} vs {want_axis}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The lane assignment itself, in bits: with cancellation-sensitive data a plain
+/// source-order fold gives a different `f64` than the lane fold, so this pins the
+/// sixteen-lane schedule and not only the result value.
+#[test]
+fn typed_contiguous_fold_lane_order_is_bit_visible_in_float_sums() {
+    let len = 4096;
+    let data: Vec<f64> = (0..len)
+        .map(|i| match i % 16 {
+            0 => 1e16,
+            _ => 1.0 + (i % 7) as f64,
+        })
+        .collect();
+    let add = |a: f64, b: f64| a + b;
+    let lanes = lane_order_fold(&data, 0.0, add);
+    let source_order = data.iter().fold(0.0, |acc, &x| acc + x);
+    assert_ne!(
+        lanes.to_bits(),
+        source_order.to_bits(),
+        "probe data must separate the lane order from the source order"
+    );
+    let view = StridedView::<f64>::new(&data, &[len], &[1isize], 0).unwrap();
+    for budget in [Budget::Serial] {
+        let got = { reduce(&view, |x| x, add, 0.0, budget.exec()).unwrap() };
+        assert_eq!(got.to_bits(), lanes.to_bits(), "{budget:?}");
+    }
+}
