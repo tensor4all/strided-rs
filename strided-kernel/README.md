@@ -13,7 +13,8 @@ depend on one another.
   `argmin` (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm`
   (`ErasedNormPlan`); their tie, NaN and rounding contracts are in the rustdoc
 - Utility ops (`copy_into`, `add`, `dot`, `sum`, `symmetrize_into`)
-- Optional parallel execution via `parallel` feature (Rayon)
+- Optional parallel execution through `threadteam::Exec` placement tokens
+  (`parallel` feature)
 
 ## Quick Example
 
@@ -113,7 +114,7 @@ The library automatically optimizes iteration order for cache efficiency:
 
 ```toml
 [dependencies]
-strided-kernel = { version = "0.4", features = ["parallel"] }
+strided-kernel = { version = "0.10", features = ["parallel"] }
 ```
 
 Every operation that can fan out takes a `threadteam::Exec` placement token as
@@ -139,7 +140,10 @@ assert_eq!(destination.into_data(), vec![1.0, 2.0, 3.0, 4.0]);
 ```
 
 The token carries the budget and the pool, so no thread-local placement state
-exists and nested operations split the budget they were given.
+exists and nested operations split the budget they were given. `simd` is
+enabled by default; `parallel` lets pooled tokens run on a private `threadteam`
+pool, and without it every token runs inline. Features select implementation
+capabilities, not operation families.
 
 ## Benchmarks
 
@@ -205,7 +209,7 @@ The key architectural differences are:
 |---------|-------|------|
 | **Kernel generation** | `@generated` unrolls loops per (rank, num\_arrays) at compile time | Handwritten 1D/2D/3D/4D specializations + generic N-D fallback |
 | **Inner-loop SIMD** | Explicit `@simd` pragma on innermost loop | Stride-specialized inner loops: slice-based when stride=1, raw pointer otherwise; LLVM auto-vectorizes them at the SIMD level pulp selects at run time |
-| **Threading** | Recursive dimension-splitting via `Threads.@spawn` | Recursive dimension-splitting via `rayon::join`; order-before-fuse pipeline enables layout-agnostic parallelization |
+| **Threading** | Recursive dimension-splitting via `Threads.@spawn` | Recursive dimension-splitting via `threadteam::Exec::fork`, one child token per half; order-before-fuse pipeline enables layout-agnostic parallelization |
 
 > **Note: Strided.jl threading bug for non-column-major views.**
 > Julia's pipeline fuses before ordering (`fuse → order → block`), so
