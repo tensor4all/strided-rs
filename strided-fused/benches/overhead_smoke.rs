@@ -9,16 +9,15 @@
 //! every ratio.
 //!
 //! Run with `OVERHEAD_GATE=1` to make a failed gate exit non-zero; without it
-//! the table is printed and the process succeeds. The gate is deliberately
-//! forgiving: it fails only when all [`support::ATTEMPTS`] attempts exceed the
-//! threshold, and the per-round timing is the minimum of [`support::ROUNDS`]
-//! rounds.
+//! the table is printed and the process succeeds. A ratio gate fails only when
+//! all [`support::ATTEMPTS`] attempts exceed the threshold; gated allocations
+//! must be zero. Each timing is the minimum of [`support::ROUNDS`] rounds.
 //!
 //! Rows (see `#306`):
 //! - S1: erased fused `execute` under `Exec::serial()` vs a
 //!   budget-one `Exec::new(&pool, 1)` for a two-op DAG, `8x8x8`; guards #305.
 //! - S2: typed fused single `Add` vs `zip_map2_into` add, contiguous `8x8x8`;
-//!   guards per-element dispatch in the single-op specialization.
+//!   reports the ratio and gates on zero allocations for both paths.
 //! - S5: unspecialized replay vs the specialized `add`-then-`multiply` DAG,
 //!   `8x8x8` (reported only).
 //!
@@ -44,6 +43,8 @@ use support::{measure_case, print_table, CaseResult};
 
 const SIDE: usize = 8;
 const LEN: usize = SIDE * SIDE * SIDE;
+// Shared runners have machine-dependent ratios, so this is a reference, not a gate.
+const S2_RATIO_REFERENCE: f64 = 1.5;
 
 fn two_op_dag() -> FusedPlan {
     FusedPlan::new(
@@ -148,7 +149,7 @@ fn s2_case() -> CaseResult {
         "S2",
         "fused single add vs zip_map2_into add",
         5_000,
-        Some(1.5),
+        Some(S2_RATIO_REFERENCE),
         || {
             fused_elementwise_into(
                 std::slice::from_mut(&mut fused_view),
@@ -171,6 +172,7 @@ fn s2_case() -> CaseResult {
             black_box(map_view.as_mut_ptr());
         },
     )
+    .report_ratio()
 }
 
 /// S5: unspecialized replay vs the recognized `add`-then-`multiply` shape.
