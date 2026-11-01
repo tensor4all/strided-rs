@@ -34,7 +34,7 @@ configure_cpu_thread_env() {
     export OMP_NUM_THREADS="$threads"
     export OMP_THREAD_LIMIT="$threads"
     export OMP_DYNAMIC=FALSE
-    export RAYON_NUM_THREADS="$threads"
+    export STRIDED_KERNEL_BENCH_THREADS="$threads"
     export OPENBLAS_NUM_THREADS="$threads"
     export GOTO_NUM_THREADS="$threads"
     export MKL_NUM_THREADS="$threads"

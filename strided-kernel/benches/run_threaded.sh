@@ -16,7 +16,7 @@ for T in $THREADS; do
     echo "============================================================"
 
     echo "--- Rust (strided-rs, parallel feature) ---"
-    RAYON_NUM_THREADS=$T cargo bench --features parallel --bench threaded_compare \
+    STRIDED_KERNEL_BENCH_THREADS=$T cargo bench --features parallel --bench threaded_compare \
         --manifest-path "$PROJECT_DIR/Cargo.toml" 2>&1 \
         | grep -v "^$\|Compiling\|Finished\|Running\|Benchmarking"
     echo ""

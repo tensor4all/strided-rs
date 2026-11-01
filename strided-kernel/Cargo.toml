@@ -1,6 +1,6 @@
 [package]
 name = "strided-kernel"
-version = "0.9.0"
+version = "0.10.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -41,6 +41,7 @@ harness = false
 [[bench]]
 name = "scaling_compare"
 harness = false
+required-features = ["parallel"]
 
 [[bench]]
 name = "threaded_compare"
@@ -58,6 +59,7 @@ harness = false
 [[bench]]
 name = "mul_pytorch_compare"
 harness = false
+required-features = ["parallel"]
 
 [[bench]]
 name = "erased_policy_thresholds"

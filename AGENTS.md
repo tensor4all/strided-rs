@@ -121,8 +121,9 @@ which also holds the baseline-vs-native comparison commands and the
 - Naive baselines must be credible: pointer-based loops with precomputed
   strides, not per-element high-level indexing.
 - Keep setup out of timed regions; use `black_box`.
-- For parity with Julia, pin threads (`RAYON_NUM_THREADS=1`,
+- For parity with Julia, pin threads (`STRIDED_KERNEL_BENCH_THREADS=1`,
   `JULIA_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`) unless testing threading.
+  There is no Rayon dependency: `RAYON_NUM_THREADS` pins nothing.
 
 ## Key Constants
 

@@ -39,11 +39,36 @@ fn make_random_4d(n: usize, seed: u64) -> StridedArray<f64> {
     StridedArray::<f64>::from_fn_col_major(&[n, n, n, n], |_| rng.sample(StandardNormal))
 }
 
+/// The width this run must use: `STRIDED_KERNEL_BENCH_THREADS` when set, the
+/// parallelism of the machine otherwise. A requested width is never replaced
+/// silently: the run asserts the pool and the token carry it.
+fn requested_threads() -> usize {
+    std::env::var("STRIDED_KERNEL_BENCH_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 fn main() {
-    let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let nthreads = requested_threads();
     let pool = Pool::builder().threads(nthreads).build().unwrap();
+    assert_eq!(
+        pool.width().get(),
+        nthreads,
+        "the pool width does not match the requested thread count"
+    );
+    assert_eq!(
+        Exec::new(&pool, nthreads).unwrap().budget().get(),
+        nthreads,
+        "the exec budget does not match the requested thread count"
+    );
     println!("Rust threaded runner: benches/threaded_compare.rs");
-    println!("Pool threads: {nthreads}");
+    println!(
+        "Requested threads: {nthreads}  pool width: {}  exec budget: {}",
+        pool.width(),
+        Exec::new(&pool, nthreads).unwrap().budget()
+    );
     println!();
 
     // 1) symmetrize_4000

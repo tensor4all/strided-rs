@@ -160,7 +160,10 @@ cargo bench --bench rust_compare --manifest-path strided-kernel/Cargo.toml
 JULIA_NUM_THREADS=1 julia --project=strided-kernel/benches strided-kernel/benches/julia_compare.jl
 
 # Multi-threaded Rust (N threads)
-RAYON_NUM_THREADS=N cargo bench --features parallel --bench threaded_compare --manifest-path strided-kernel/Cargo.toml
+# The multi-threaded harnesses read STRIDED_KERNEL_BENCH_THREADS, build a pool of
+# exactly that width and assert the effective budget; the workspace has no Rayon
+# dependency, so RAYON_NUM_THREADS does nothing here.
+STRIDED_KERNEL_BENCH_THREADS=N cargo bench --features parallel --bench threaded_compare --manifest-path strided-kernel/Cargo.toml
 
 # Multi-threaded comparison script
 bash strided-kernel/benches/run_threaded.sh 1 2 4
@@ -170,7 +173,7 @@ bash strided-kernel/benches/run_scaling.sh
 bash strided-kernel/benches/run_scaling.sh 1 2 4 8  # custom thread counts
 
 # Rank-25 tensor permutation (quantum circuit simulation workload)
-RAYON_NUM_THREADS=1 cargo bench --bench rank25_permute --manifest-path strided-kernel/Cargo.toml
+cargo bench --bench rank25_permute --manifest-path strided-kernel/Cargo.toml
 
 # Rank-25 Julia comparison
 JULIA_NUM_THREADS=1 julia --project=strided-kernel/benches strided-kernel/benches/julia_rank25_compare.jl

@@ -10,8 +10,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-use strided_kernel::Exec;
-use strided_kernel::{copy_into, sum, StridedArray};
+use strided_kernel::{copy_into, sum, Exec, Pool, StridedArray};
 
 fn median(durations: &mut [Duration]) -> Duration {
     durations.sort();
@@ -67,7 +66,7 @@ fn make_random_4d(s: usize, seed: u64) -> StridedArray<f64> {
     StridedArray::<f64>::from_fn_col_major(&[s, s, s, s], |_| rng.sample(StandardNormal))
 }
 
-fn benchmark_sum() {
+fn benchmark_sum(pool: &Pool, threads: usize) {
     println!("=== benchmark_sum (1D) ===");
     println!(
         "{:>10} {:>12} {:>12} {:>8}",
@@ -91,7 +90,7 @@ fn benchmark_sum() {
         // Strided sum
         let a_view = a.view();
         let t_strided = bench_adaptive(|| {
-            let r = sum(&a_view, Exec::serial()).unwrap();
+            let r = sum(&a_view, Exec::new(pool, threads).unwrap()).unwrap();
             black_box(r);
         });
 
@@ -107,7 +106,7 @@ fn benchmark_sum() {
     println!();
 }
 
-fn benchmark_permute(perm: &[usize], label: &str) {
+fn benchmark_permute(perm: &[usize], label: &str, pool: &Pool, threads: usize) {
     println!("=== benchmark_permute {} ===", label);
     println!(
         "{:>6} {:>10} {:>12} {:>12} {:>12} {:>8}",
@@ -168,7 +167,12 @@ fn benchmark_permute(perm: &[usize], label: &str) {
         let a_view = a.view();
         let a_perm = a_view.permute(perm).unwrap();
         let t_strided = bench_adaptive(|| {
-            copy_into(&mut b.view_mut(), &a_perm, Exec::serial()).unwrap();
+            copy_into(
+                &mut b.view_mut(),
+                &a_perm,
+                Exec::new(pool, threads).unwrap(),
+            )
+            .unwrap();
             black_box(b_ptr);
         });
 
@@ -186,13 +190,41 @@ fn benchmark_permute(perm: &[usize], label: &str) {
     println!();
 }
 
+/// The width this run must use: `STRIDED_KERNEL_BENCH_THREADS` when set, the
+/// parallelism of the machine otherwise. A requested width is never replaced
+/// silently: the run asserts the pool and the token carry it.
+fn requested_threads() -> usize {
+    std::env::var("STRIDED_KERNEL_BENCH_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 fn main() {
+    let requested = requested_threads();
+    let pool = Pool::builder().threads(requested).build().unwrap();
+    assert_eq!(
+        pool.width().get(),
+        requested,
+        "the pool width does not match the requested thread count"
+    );
+    assert_eq!(
+        Exec::new(&pool, requested).unwrap().budget().get(),
+        requested,
+        "the exec budget does not match the requested thread count"
+    );
     println!("Scaling benchmarks (cf. Strided.jl benchtests.jl)");
     println!("Column-major layout. Median timing.");
+    println!(
+        "Requested threads: {requested}  pool width: {}  exec budget: {}",
+        pool.width(),
+        Exec::new(&pool, requested).unwrap().budget()
+    );
     println!();
 
-    benchmark_sum();
-    benchmark_permute(&[3, 2, 1, 0], "(4,3,2,1)");
-    benchmark_permute(&[1, 2, 3, 0], "(2,3,4,1)");
-    benchmark_permute(&[2, 3, 0, 1], "(3,4,1,2)");
+    benchmark_sum(&pool, requested);
+    benchmark_permute(&[3, 2, 1, 0], "(4,3,2,1)", &pool, requested);
+    benchmark_permute(&[1, 2, 3, 0], "(2,3,4,1)", &pool, requested);
+    benchmark_permute(&[2, 3, 0, 1], "(3,4,1,2)", &pool, requested);
 }
