@@ -708,7 +708,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "strided-basic"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "approx",
  "criterion",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "strided-fused"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "approx",
  "criterion",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "strided-kernel"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "approx",
  "criterion",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "strided-nn"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "elem-simd-math",
  "pulp",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "strided-perm"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "strided-view",
  "thiserror",
@@ -848,9 +848,9 @@ dependencies = [
 
 [[package]]
 name = "threadteam"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23210e76b7702020e91c6b39b1ea83e3e207153d866b261f354eed71f5dcefa3"
+checksum = "d5dd6b40e18f897d036c79963512a194e6f8dbe76e29386ca4ccf6c9d1663f5c"
 dependencies = [
  "libc",
  "loom",
