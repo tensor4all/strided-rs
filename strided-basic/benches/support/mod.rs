@@ -73,13 +73,23 @@ pub struct CaseResult {
     b_allocs: f64,
     threshold: Option<f64>,
     attempts_exceeded: usize,
+    report_ratio: bool,
 }
 
 impl CaseResult {
+    /// Report the ratio but retain the allocation gate.
+    #[allow(dead_code)] // Used by the fused bench, not the basic bench.
+    pub fn report_ratio(mut self) -> Self {
+        self.report_ratio = true;
+        self
+    }
+
     fn failed(&self) -> bool {
         match self.threshold {
             Some(_) => {
-                self.attempts_exceeded == ATTEMPTS || self.a_allocs > 0.0 || self.b_allocs > 0.0
+                (!self.report_ratio && self.attempts_exceeded == ATTEMPTS)
+                    || self.a_allocs > 0.0
+                    || self.b_allocs > 0.0
             }
             None => false,
         }
@@ -145,6 +155,7 @@ pub fn measure_case(
         b_allocs: max_b_allocs,
         threshold,
         attempts_exceeded,
+        report_ratio: false,
     }
 }
 
@@ -157,6 +168,8 @@ pub fn print_table(cases: &[CaseResult], title: &str) {
         .push_str("|----|------|--------:|--------:|------:|------------:|------------:|------|\n");
     for case in cases {
         let gate = match case.threshold {
+            Some(_) if case.report_ratio && case.failed() => "FAIL (alloc)".to_string(),
+            Some(threshold) if case.report_ratio => format!("report (ref {threshold}; alloc=0)"),
             Some(threshold) if case.failed() => format!("FAIL (>{threshold})"),
             Some(threshold) => format!("<= {threshold}"),
             None => "report".to_string(),
@@ -189,5 +202,37 @@ pub fn exit_if_failed(cases: &[CaseResult]) {
     if failed && std::env::var_os("OVERHEAD_GATE").is_some() {
         eprintln!("overhead smoke gate failed (see table above)");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)] // The harness-free bench enables cfg(test) without running tests.
+    use super::*;
+
+    #[test]
+    fn ratio_report_still_gates_allocations() {
+        let mut case = CaseResult {
+            id: "S2",
+            description: "test",
+            a_ns: 2.0,
+            b_ns: 1.0,
+            ratio: 2.0,
+            a_allocs: 0.0,
+            b_allocs: 0.0,
+            threshold: Some(1.5),
+            attempts_exceeded: ATTEMPTS,
+            report_ratio: false,
+        };
+        assert!(case.failed());
+        case = case.report_ratio();
+        assert!(!case.failed());
+        case.a_allocs = 1.0 / ALLOC_ITERS as f64;
+        assert!(case.failed());
+        case.a_allocs = 0.0;
+        case.b_allocs = 1.0 / ALLOC_ITERS as f64;
+        assert!(case.failed());
+        case.threshold = None;
+        assert!(!case.failed());
     }
 }
