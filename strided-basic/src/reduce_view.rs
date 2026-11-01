@@ -28,15 +28,29 @@ const AXIS_SWEEP_MIN_LEN: usize = 16;
 /// Byte budget of one output block of the column sweep of [`reduce_axis`].
 const AXIS_SWEEP_BLOCK_BYTES: usize = 64 * 1024;
 
+/// Combines the lanes of [`fold_contiguous`] left to right, after `init`.
+///
+/// Not inlined on purpose: the lane array crosses the call by memory, which
+/// keeps the lanes of the surrounding loop in vector registers. Inlined, the
+/// final fold makes the loop half-extract and re-insert every lane (on x86-64
+/// AVX2 `f64` max: 18 shuffles per 16 elements) although it runs once.
+#[inline(never)]
+fn fold_lanes<U, R>(lanes: [U; FOLD_LANES], init: U, reduce_fn: &R) -> U
+where
+    R: Fn(U, U) -> U,
+{
+    lanes.into_iter().fold(init, reduce_fn)
+}
+
 /// Folds a contiguous run with [`FOLD_LANES`] independent accumulators.
 ///
 /// Lane `i` starts from element `i` and folds elements `i + FOLD_LANES`,
 /// `i + 2 * FOLD_LANES`, ... in order; the remainder is folded into the first
 /// lanes. `init` is combined exactly once, before lane 0, and the lanes are
-/// then combined left to right. Independent lanes let the compiler keep
-/// several vector accumulators in flight instead of one serial dependency
-/// chain, which is what makes a closure-based sum or max approach the speed
-/// of a hand written lane loop.
+/// then combined left to right by [`fold_lanes`]. Independent lanes let the
+/// compiler keep several vector accumulators in flight instead of one serial
+/// dependency chain, which is what makes a closure-based sum or max approach
+/// the speed of a hand written lane loop.
 #[inline(always)]
 fn fold_contiguous<T, Op, M, R, U>(src: &[T], init: U, map_fn: &M, reduce_fn: &R) -> U
 where
@@ -64,7 +78,7 @@ where
     for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
         *lane = reduce_fn(lane.clone(), map_fn(Op::apply(value)));
     }
-    lanes.into_iter().fold(init, reduce_fn)
+    fold_lanes(lanes, init, reduce_fn)
 }
 
 /// Folds `len` elements starting at `ptr` with step `stride`.
