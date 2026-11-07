@@ -40,9 +40,6 @@ jobs:
       - name: Run tests
         run: cargo test --profile ci
 
-      - name: Run parallel feature tests
-        run: cargo test --profile ci -p strided-basic -p strided-kernel -p strided-fused --features parallel
-
       - name: Overhead smoke gates (ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -58,6 +55,32 @@ jobs:
         run: |
           du -sh target
           df -h target
+
+  # Feature lanes, one job per lane so a lane cannot leak an activated feature
+  # into another. The `default` lane is the `cargo test --profile ci` step of the
+  # `test` job above; these are the lanes that need their own build.
+  # `parallel-no-simd` is the intersection: the parallel token is on, pulp is off.
+  features:
+    name: feature lanes (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: parallel
+            flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+          - lane: no-default-features
+            flags: --no-default-features
+          - lane: parallel-no-simd
+            flags: --no-default-features --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: features-${{ matrix.lane }}
+      - name: Run tests (${{ matrix.lane }})
+        run: cargo test --profile ci --workspace ${{ matrix.flags }}
 
   placement:
     name: placement rules
@@ -99,6 +122,8 @@ jobs:
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
