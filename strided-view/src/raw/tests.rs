@@ -137,3 +137,38 @@ fn raw_mut_can_reborrow_as_view() {
     let view_mut = raw.as_view_mut();
     assert_eq!(view_mut.get(&[1, 1]), 4);
 }
+
+#[test]
+fn raw_descriptors_debug_print_layout_without_the_buffer() {
+    let dims = [64usize];
+    let strides = [1isize];
+    let values = [1.5f64; 64];
+    let reference = ErasedRawStridedRef::from_slice(&values, &dims, &strides, 0).unwrap();
+    let typed = RawStridedRef::new(&values, &dims, &strides, 0).unwrap();
+
+    let mut mutable_values = [1.5f64; 64];
+    let mutable =
+        ErasedRawStridedMut::from_slice_mut(&mut mutable_values, &dims, &strides, 0).unwrap();
+    let mut typed_values = [1.5f64; 64];
+    let typed_mut = RawStridedMut::new(&mut typed_values, &dims, &strides, 0).unwrap();
+
+    let mut uninit_values = [MaybeUninit::<f64>::uninit(); 64];
+    let uninit_mut =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit_values, &dims, &strides, 0)
+            .unwrap();
+
+    for text in [
+        format!("{reference:?}"),
+        format!("{mutable:?}"),
+        format!("{uninit_mut:?}"),
+    ] {
+        assert!(text.contains("dims: [64]"), "{text}");
+        assert!(text.contains("byte_len: 512"), "{text}");
+        assert!(!text.contains("1.5"), "{text}");
+    }
+    for text in [format!("{typed:?}"), format!("{typed_mut:?}")] {
+        assert!(text.contains("dims: [64]"), "{text}");
+        assert!(text.contains("data_len: 64"), "{text}");
+        assert!(!text.contains("1.5"), "{text}");
+    }
+}

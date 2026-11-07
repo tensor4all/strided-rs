@@ -314,13 +314,27 @@ impl<'a> ErasedRawStridedPtr<'a> {
 /// Borrowed dtype-erased raw strided input layout.
 ///
 /// `dims`, `strides`, and `offset` are expressed in dtype elements, not bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ErasedRawStridedRef<'a> {
     dtype: KernelDType,
     data: &'a [u8],
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
+}
+
+// A derived `Debug` would print every byte of the backing buffer; the layout
+// metadata is what a reader wants.
+impl core::fmt::Debug for ErasedRawStridedRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ErasedRawStridedRef")
+            .field("dtype", &self.dtype)
+            .field("byte_len", &self.data.len())
+            .field("dims", &self.dims)
+            .field("strides", &self.strides)
+            .field("offset", &self.offset)
+            .finish()
+    }
 }
 
 impl<'a> ErasedRawStridedRef<'a> {
@@ -417,13 +431,26 @@ impl<'a> ErasedRawStridedRef<'a> {
 /// Borrowed dtype-erased raw strided output layout.
 ///
 /// `dims`, `strides`, and `offset` are expressed in dtype elements, not bytes.
-#[derive(Debug)]
 pub struct ErasedRawStridedMut<'a> {
     dtype: KernelDType,
     data: &'a mut [u8],
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
+}
+
+// A derived `Debug` would print every byte of the backing buffer; the layout
+// metadata is what a reader wants.
+impl core::fmt::Debug for ErasedRawStridedMut<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ErasedRawStridedMut")
+            .field("dtype", &self.dtype)
+            .field("byte_len", &self.data.len())
+            .field("dims", &self.dims)
+            .field("strides", &self.strides)
+            .field("offset", &self.offset)
+            .finish()
+    }
 }
 
 impl<'a> ErasedRawStridedMut<'a> {
@@ -542,13 +569,26 @@ impl<'a> ErasedRawStridedMut<'a> {
 /// This descriptor is only accepted by operations that prove and perform a
 /// full overwrite of every reachable logical destination element. The backing
 /// allocation may contain non-reachable holes, which remain uninitialized.
-#[derive(Debug)]
 pub struct ErasedRawStridedUninitMut<'a> {
     dtype: KernelDType,
     data: &'a mut [MaybeUninit<u8>],
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
+}
+
+// A derived `Debug` would print one entry per byte of the backing buffer; the
+// layout metadata is what a reader wants.
+impl core::fmt::Debug for ErasedRawStridedUninitMut<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ErasedRawStridedUninitMut")
+            .field("dtype", &self.dtype)
+            .field("byte_len", &self.data.len())
+            .field("dims", &self.dims)
+            .field("strides", &self.strides)
+            .field("offset", &self.offset)
+            .finish()
+    }
 }
 
 impl<'a> ErasedRawStridedUninitMut<'a> {
@@ -663,12 +703,25 @@ fn ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) ->
 /// Use [`RawStridedRef::new`] for checked construction, or
 /// [`RawStridedRef::new_unchecked`] when a higher-level compiled plan has
 /// already validated bounds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct RawStridedRef<'a, T> {
     data: &'a [T],
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
+}
+
+// A derived `Debug` would print every element of the backing buffer; the layout
+// metadata is what a reader wants.
+impl<T: core::fmt::Debug> core::fmt::Debug for RawStridedRef<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawStridedRef")
+            .field("data_len", &self.data.len())
+            .field("dims", &self.dims)
+            .field("strides", &self.strides)
+            .field("offset", &self.offset)
+            .finish()
+    }
 }
 
 impl<'a, T> RawStridedRef<'a, T> {
@@ -750,12 +803,24 @@ impl<'a, T> RawStridedRef<'a, T> {
 ///
 /// This is the mutable counterpart to [`RawStridedRef`]. It avoids allocating
 /// owned shape/stride metadata in prepared replay paths.
-#[derive(Debug)]
 pub struct RawStridedMut<'a, T> {
     data: &'a mut [T],
     dims: &'a [usize],
     strides: &'a [isize],
     offset: isize,
+}
+
+// A derived `Debug` would print every element of the backing buffer; the layout
+// metadata is what a reader wants.
+impl<T: core::fmt::Debug> core::fmt::Debug for RawStridedMut<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawStridedMut")
+            .field("data_len", &self.data.len())
+            .field("dims", &self.dims)
+            .field("strides", &self.strides)
+            .field("offset", &self.offset)
+            .finish()
+    }
 }
 
 impl<'a, T> RawStridedMut<'a, T> {
