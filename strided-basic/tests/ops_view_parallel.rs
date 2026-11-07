@@ -1,4 +1,5 @@
-//! The parallel branches of the strided element-wise entries (`add`, `mul`, `axpy`, `fma`,
+//! The parallel branches of the strided element-wise entries (`add_acc`, `mul_acc`, `axpy_acc`,
+//! `fma_acc`,
 //! `sum`, `copy_transpose_scale_into`) agree with the serial ones. The pool of
 //! `common::shared_pool` has 100 ns dispatch costs, so regions of tens of thousands of
 //! elements open the parallel branches.
@@ -7,7 +8,7 @@ mod common;
 
 use common::Budget;
 use strided_basic::{
-    add, axpy, copy_transpose_scale_into, fma, mul, sum, StridedArray, StridedView,
+    add_acc, axpy_acc, copy_transpose_scale_into, fma_acc, mul_acc, sum, StridedArray, StridedView,
 };
 
 const R: usize = 300;
@@ -58,10 +59,10 @@ fn add_mul_axpy_fma_match_the_serial_result() {
         let b = src_f64(!src_row_major);
         // A source whose layout differs from the destination's takes the strided path.
         let (av, bv): (StridedView<f64>, StridedView<f64>) = (a.view(), b.view());
-        same_result(|d, bud| add(&mut d.view_mut(), &av, bud.exec()).unwrap());
-        same_result(|d, bud| mul(&mut d.view_mut(), &av, bud.exec()).unwrap());
-        same_result(|d, bud| axpy(&mut d.view_mut(), &av, 1.5, bud.exec()).unwrap());
-        same_result(|d, bud| fma(&mut d.view_mut(), &av, &bv, bud.exec()).unwrap());
+        same_result(|d, bud| add_acc(&mut d.view_mut(), &av, bud.exec()).unwrap());
+        same_result(|d, bud| mul_acc(&mut d.view_mut(), &av, bud.exec()).unwrap());
+        same_result(|d, bud| axpy_acc(&mut d.view_mut(), &av, 1.5, bud.exec()).unwrap());
+        same_result(|d, bud| fma_acc(&mut d.view_mut(), &av, &bv, bud.exec()).unwrap());
     }
 }
 

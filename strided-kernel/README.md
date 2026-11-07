@@ -12,7 +12,7 @@ depend on one another.
 - Single-axis erased plans: cumulative scans (`ErasedScanPlan`), `argmax` /
   `argmin` (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm`
   (`ErasedNormPlan`); their tie, NaN and rounding contracts are in the rustdoc
-- Utility ops (`copy_into`, `add`, `dot`, `sum`, `symmetrize_into`)
+- Utility ops (`copy_into`, `add_acc`, `dot`, `sum`, `symmetrize_into`)
 - Optional parallel execution through `threadteam::Exec` placement tokens
   (`parallel` feature)
 
@@ -83,7 +83,7 @@ narrower, explicit determinism contract than the generic closure-based
 ## High-Level Operations
 
 ```rust
-use strided_kernel::{Exec, StridedArray, copy_into, add, dot, symmetrize_into};
+use strided_kernel::{Exec, StridedArray, copy_into, add_acc, dot, symmetrize_into};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
 let mut out = StridedArray::<f64>::row_major(&[4, 4]);
@@ -91,8 +91,8 @@ let mut out = StridedArray::<f64>::row_major(&[4, 4]);
 // Copy
 copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
-// Element-wise add: dest[i] += src[i]
-add(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
+// Accumulating element-wise add: dest[i] += src[i]
+add_acc(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
 // Dot product
 let d = dot(&a.view(), &a.view()).unwrap();

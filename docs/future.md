@@ -227,7 +227,7 @@ These are straightforward to add once the building blocks exist.
 | `conj!(a)` | In-place conjugation | `map_into(a, a, conj)` |
 | `adjoint!(dst, src)` | `copy!(dst, adjoint(src))` | `src.adjoint_2d()` + `copy_into` |
 | `permutedims!(dst, src, p)` | `copy!(dst, permutedims(src, p))` | `src.permute(p)` + `copy_into` |
-| `mul!(dst, α, src)` | `dst = α * src` (with `α==1` fast path) | `copy_into` / `copy_scale` |
+| `mul!(dst, α, src)` | `dst = α * src` (with `α==1` fast path) | `copy_into` / `copy_scale_into` |
 
 ---
 

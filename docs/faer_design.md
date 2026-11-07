@@ -10,7 +10,7 @@ Analysis of SIMD optimization techniques used in `extern/faer`, and a concrete p
 - **Zero-copy conjugation** (PR #21): `Conj`/`Adjoint` ElementOps are passed as conjugation flags to the GEMM kernel, avoiding materialization (allocate + copy).
 - **Crate rename** (PR #22): `stridedview` → `strided-view`, `strided` → `strided-kernel` for naming consistency.
 
-**Remaining:** The `strided-kernel` crate's element-wise and reduction kernels (`map_into`, `reduce`, `sum`, `copy_into`, `add`, `axpy`, `dot`, etc.) still rely on LLVM auto-vectorization via generic closures. This document analyzes the performance gap and proposes improvements.
+**Remaining:** The `strided-kernel` crate's element-wise and reduction kernels (`map_into`, `reduce`, `sum`, `copy_into`, `add_acc`, `axpy_acc`, `dot`, etc.) still rely on LLVM auto-vectorization via generic closures. This document analyzes the performance gap and proposes improvements.
 
 ## SIMD Abstraction Architecture
 
@@ -179,7 +179,7 @@ pub enum SimdCapabilities {
 | Head/body/tail + masked load/store | Contiguous innermost loop remainder handling | High |
 | Multiple accumulators (4×) | ILP in `reduce` / `sum` kernels | High |
 | `pulp` runtime dispatch | Use AVX2/AVX-512 without `target-cpu=native` | High |
-| FMA via `simd.mul_add` | `axpy`, `fma`, `dot` kernels | High |
+| FMA via `simd.mul_add` | `axpy_acc`, `fma_acc`, `dot` kernels | High |
 | Pairwise summation | Precision for large reductions | Medium |
 | Complex→real reinterpretation | When adding `Complex` support | Low |
 | Register tiling (MR×NR) | Not directly applicable (strided-rs is not matmul-focused) | Low |
@@ -265,7 +265,7 @@ This is the **correct approach for generic `map_into`** — arbitrary closures (
 
 1. **Reductions** (`sum`, `dot`, `reduce`): `acc = reduce_fn(acc, val)` has a loop-carried dependency. Even with perfect inlining, LLVM will not break the dependency chain because it cannot assume floating-point associativity. Manual multi-accumulator unrolling is required.
 
-2. **Fixed operations** (`copy_into`, `add`, `axpy`): these are known at compile time and can bypass the closure entirely, using hand-written SIMD kernels or `memcpy`.
+2. **Fixed operations** (`copy_into`, `add_acc`, `axpy_acc`): these are known at compile time and can bypass the closure entirely, using hand-written SIMD kernels or `memcpy`.
 
 ## Improvement Plan for strided-kernel
 
@@ -348,7 +348,7 @@ This is orthogonal to the other improvements and benefits every contiguous opera
 
 ### Priority 4 (Medium Impact): dedicated SIMD kernels for fixed ops
 
-For `add`, `axpy`, `fma`, `dot` — bypass the generic closure path with hand-written SIMD kernels using `pulp`. These operations are simple enough (add, mul-add) that explicit SIMD is straightforward.
+For `add_acc`, `axpy_acc`, `fma_acc`, `dot` — bypass the generic closure path with hand-written SIMD kernels using `pulp`. These operations are simple enough (add, mul-add) that explicit SIMD is straightforward.
 
 ```rust
 // Instead of: map_into(dst, src, |x| x)        → copy_into with memcpy
@@ -397,7 +397,7 @@ For large contiguous reductions (> 128 elements), recursively split in half befo
 | 1 | SIMD reduce (pulp, 4 accumulators) | 1D sum, dot, norm | 2-4x | strided-kernel |
 | 2 | `memcpy` for contiguous copy | copy_into | 10x+ | strided-kernel |
 | 3 | `pulp` runtime dispatch | all contiguous ops | 1.5-3x (default build) | strided-kernel |
-| 4 | Dedicated SIMD for add/axpy/fma | add, axpy, fma | 1.5-2x | strided-kernel |
+| 4 | Dedicated SIMD for add_acc/axpy_acc/fma_acc | add_acc, axpy_acc, fma_acc | 1.5-2x | strided-kernel |
 | 5 | Remove Option in reduce loop | non-contiguous reduce | 1.1-1.3x | strided-kernel |
 | 6 | SmallVec for plan allocation | small arrays (s≤8) | 2-5x | strided-kernel |
 | 7 | Pairwise summation | precision (speed-neutral) | — | strided-kernel |

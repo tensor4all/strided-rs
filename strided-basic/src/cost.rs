@@ -20,7 +20,7 @@
 //! | [`KernelClass`] | `x86_64-avx512` | `aarch64-apple` | `generic` (every other class) | kernels |
 //! | --- | --- | --- | --- | --- |
 //! | `Copy` | 0.171 | 0.090 | 0.090 | copies, fills, permutations, gathers, static indexing, transposes |
-//! | `Map` | 0.173 | 0.100 | 0.100 | element-wise map, zip, add, mul, axpy, fma, in-place update, fused arithmetic chains |
+//! | `Map` | 0.173 | 0.100 | 0.100 | element-wise map, zip, add_acc, mul_acc, axpy_acc, fma_acc, in-place update, fused arithmetic chains |
 //! | `Transcendental` | 5.60 | 1.38 | 1.38 | `exp`, `ln`, `tanh`, other libm-like functions (fused chains that contain one, softmax) |
 //! | `Reduce` | 0.104 | 0.081 | 0.081 | sum, dot, reduce, zip-reduce, axis reductions, norms, scans and arg-reductions |
 //!

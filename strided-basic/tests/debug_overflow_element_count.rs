@@ -48,8 +48,8 @@ fn broadcast_updates_with_overflowing_count_return_error() {
     let mut buf = [0.0f64; 4];
     let mut dst = StridedViewMut::new(&mut buf, dims, strides, 0).unwrap();
     assert!(copy_into(&mut dst, &src(dims, strides), Exec::serial()).is_err());
-    assert!(copy_conj(&mut dst, &src(dims, strides), Exec::serial()).is_err());
-    assert!(copy_scale(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
+    assert!(copy_conj_into(&mut dst, &src(dims, strides), Exec::serial()).is_err());
+    assert!(copy_scale_into(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
     assert!(copy_into_col_major(&mut dst, &src(dims, strides)).is_err());
     assert!(copy_transpose_scale_into(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
     assert!(map_into(&mut dst, &src(dims, strides), |x| x, Exec::serial()).is_err());
@@ -61,10 +61,10 @@ fn broadcast_updates_with_overflowing_count_return_error() {
         Exec::serial()
     )
     .is_err());
-    assert!(add(&mut dst, &src(dims, strides), Exec::serial()).is_err());
-    assert!(mul(&mut dst, &src(dims, strides), Exec::serial()).is_err());
-    assert!(axpy(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
-    assert!(fma(
+    assert!(add_acc(&mut dst, &src(dims, strides), Exec::serial()).is_err());
+    assert!(mul_acc(&mut dst, &src(dims, strides), Exec::serial()).is_err());
+    assert!(axpy_acc(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
+    assert!(fma_acc(
         &mut dst,
         &src(dims, strides),
         &src(dims, strides),
@@ -87,8 +87,8 @@ fn empty_layouts_with_overflowing_extents_are_noops() {
         let mut buf = [0.0f64; 4];
         let mut dst = StridedViewMut::new(&mut buf, dims, dst_strides, 0).unwrap();
         copy_into(&mut dst, &s(), Exec::serial()).unwrap();
-        copy_conj(&mut dst, &s(), Exec::serial()).unwrap();
-        copy_scale(&mut dst, &s(), 2.0, Exec::serial()).unwrap();
+        copy_conj_into(&mut dst, &s(), Exec::serial()).unwrap();
+        copy_scale_into(&mut dst, &s(), 2.0, Exec::serial()).unwrap();
         copy_into_col_major(&mut dst, &s()).unwrap();
         map_into(&mut dst, &s(), |x| x, Exec::serial()).unwrap();
         zip_map2_into(&mut dst, &s(), &s(), |x, y| x + y, Exec::serial()).unwrap();
@@ -102,10 +102,10 @@ fn empty_layouts_with_overflowing_extents_are_noops() {
         )
         .unwrap();
         mul_into(&mut dst, &s(), &s(), Exec::serial()).unwrap();
-        add(&mut dst, &s(), Exec::serial()).unwrap();
-        mul(&mut dst, &s(), Exec::serial()).unwrap();
-        axpy(&mut dst, &s(), 2.0, Exec::serial()).unwrap();
-        fma(&mut dst, &s(), &s(), Exec::serial()).unwrap();
+        add_acc(&mut dst, &s(), Exec::serial()).unwrap();
+        mul_acc(&mut dst, &s(), Exec::serial()).unwrap();
+        axpy_acc(&mut dst, &s(), 2.0, Exec::serial()).unwrap();
+        fma_acc(&mut dst, &s(), &s(), Exec::serial()).unwrap();
         assert_eq!(buf, [0.0; 4]);
 
         let mut ubuf = [MaybeUninit::<f64>::uninit(); 4];
