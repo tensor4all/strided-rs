@@ -9,12 +9,39 @@ depend on one another.
 
 - Unary/Binary/N-ary map kernels (`map_into`, `zip_map*_into`)
 - Reductions (`reduce`, `reduce_axis`)
-- Single-axis erased plans: cumulative scans (`ErasedScanPlan`), `argmax` /
-  `argmin` (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm`
-  (`ErasedNormPlan`); their tie, NaN and rounding contracts are in the rustdoc
+- Prepared plans: `compile` validates the layout once and returns a handle whose
+  `execute` reuses that work.
+  - Copy and update: `CopyPlan`, `UpdatePlan`
+  - Structural: `SlicePlan`, `ReversePlan`, `PadPlan`, `ConcatenatePlan`
+  - Gather family: `GatherSpec` / `GatherPlan`, `ScatterSpec` / `ScatterPlan`,
+    `DynamicSlicePlan`, `DynamicUpdateSlicePlan`
+- Dtype-erased replays of the plans above: `ErasedCopyPlan`, `ErasedUpdatePlan`,
+  `ErasedConcatenatePlan`, `ErasedSlicePlan`, `ErasedReversePlan`,
+  `ErasedPadPlan`, `ErasedGatherPlan`, `ErasedScatterPlan`,
+  `ErasedDynamicSlicePlan`, `ErasedDynamicUpdateSlicePlan`. Each resolves the
+  runtime dtype, plus the family's runtime operation where it has one, once per
+  call and then runs a loop monomorphized for both
+- Single-axis and full erased reductions: `ErasedReducePlan` (full and
+  axis reductions), cumulative scans (`ErasedScanPlan`), `argmax` / `argmin`
+  (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm` (`ErasedNormPlan`);
+  their tie, NaN and rounding contracts are in the rustdoc
+- Batched outer product (`batched_outer_product_into`,
+  `plan_lazy_outer_product` / `LazyOuterProductLayout`)
+- Runtime-selected one-shot entries for callers that have no plan to reuse:
+  `erased_map_into`, `erased_zip_into`, `erased_broadcast_mul_into_uninit`,
+  `erased_select_into_uninit`, `erased_clamp_into_uninit`,
+  `erased_compare_into_uninit`
 - Utility ops (`copy_into`, `add`, `dot`, `sum`, `symmetrize_into`)
 - Optional parallel execution through `threadteam::Exec` placement tokens
   (`parallel` feature)
+
+`fused_elementwise_into` and the runtime-DAG types stay re-exported from
+`strided-fused`, so those names keep resolving for code written against the 0.4
+line. The calls are not source compatible: 0.4 took three arguments, and 0.12
+requires a `threadteam::Exec` placement token as the fourth
+(`strided-fused/src/fused.rs:1855`), so a 0.4 call site fails to compile. New
+code imports them from `strided-fused`; the re-exports are scheduled for removal
+in the next breaking release.
 
 ## Quick Example
 
@@ -114,7 +141,7 @@ The library automatically optimizes iteration order for cache efficiency:
 
 ```toml
 [dependencies]
-strided-kernel = { version = "0.10", features = ["parallel"] }
+strided-kernel = { version = "0.12", features = ["parallel"] }
 ```
 
 Every operation that can fan out takes a `threadteam::Exec` placement token as
