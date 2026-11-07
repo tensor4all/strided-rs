@@ -114,7 +114,9 @@ The library automatically optimizes iteration order for cache efficiency:
 
 ```toml
 [dependencies]
-strided-kernel = { version = "0.10", features = ["parallel"] }
+# The published releases predate the `*_acc` / `*_into` names this tree uses, and the
+# next version is not out yet: depend on the repository.
+strided-kernel = { git = "https://github.com/tensor4all/strided-rs", features = ["parallel"] }
 ```
 
 Every operation that can fan out takes a `threadteam::Exec` placement token as
