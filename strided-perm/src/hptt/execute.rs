@@ -106,6 +106,11 @@ unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &P
 /// - `dst` must be valid for writes at all offsets determined by dims/dst_strides
 /// - src and dst must not overlap
 /// - no other thread may access the destination range during the call
+/// - when `exec` runs more than one task, distinct logical positions must map to
+///   distinct destination offsets. The partitions opened below are disjoint in
+///   logical index space, and that alone does not keep two workers off one byte
+///   when `dst_strides` is not injective. The crate's public entry proves this
+///   with `is_injective_layout` at `copy.rs:184` before calling here.
 pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
     src: *const T,
     dst: *mut T,
@@ -150,7 +155,11 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // `count`/`src_stride`/`dst_stride` are the plan's inner extent
                     // and strides, so `s`/`d` span exactly the reachable elements
                     // whose validity the caller proved under this function's
-                    // `# Safety` (execute.rs:104). Disjoint ranges never overlap.
+                    // `# Safety` (execute.rs:109). Range disjointness is logical
+                    // only: two ranges land on distinct destination offsets solely
+                    // because the caller supplied an injective destination, proved
+                    // with `is_injective_layout` at `copy.rs:184`, not because the
+                    // split itself separates them.
                     unsafe { const_stride1_copy(s, d, range.len(), src_stride, dst_stride) };
                 });
             }
@@ -191,7 +200,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                 for i in range {
                     let (s, d) = at(i);
                     // SAFETY: `i` comes from a disjoint subrange of `0..outer_dim`,
-                    // and `at` (execute.rs:175) advances `src`/`dst` by the plan's
+                    // and `at` (execute.rs:184) advances `src`/`dst` by the plan's
                     // own `lda_root`/`ldb_root` for that axis, so `s`/`d` and the
                     // tile `dispatch_blocked_2d`/`transpose_recursive` write stay
                     // inside the buffers the caller proved valid under this
@@ -570,11 +579,14 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     let src_addr = src as usize;
     let dst_addr = dst as usize;
     match native_float_kind::<T>() {
-        // SAFETY: `for_each_tile_par` (execute.rs:523) hands out tile origins in
+        // SAFETY: `for_each_tile_par` (execute.rs:532) hands out tile origins in
         // `0..size_a` x `0..size_b` with extents clamped to the grid, so each
         // sub-tile stays inside the `size_a` x `size_b` region whose validity the
         // caller proved under `execute_permute_blocked`'s `# Safety`
-        // (execute.rs:104). Tiles are disjoint, so no two workers write one offset.
+        // (execute.rs:109). Tiles are disjoint as logical index sets; that they
+        // reach distinct destination offsets, and so that no two workers write one
+        // offset, rests on the caller's injective destination (established at
+        // `copy.rs:184`), not on the tile partition.
         Some(8) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_f64(
                 (src_addr as *const f64).offset(ia as isize + ib as isize * lda),
