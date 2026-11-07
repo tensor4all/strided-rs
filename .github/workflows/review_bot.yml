@@ -27,7 +27,6 @@ jobs:
   review-bot:
     name: repository rules review
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
       !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') &&
       !contains(github.event.pull_request.labels.*.name, 'rules-review:no-llm')
     runs-on: ubuntu-latest
@@ -88,7 +87,6 @@ jobs:
   review-bot-no-llm:
     name: repository rules review (LLM skipped)
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
       !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') &&
       contains(github.event.pull_request.labels.*.name, 'rules-review:no-llm')
     runs-on: ubuntu-latest
@@ -145,7 +143,6 @@ jobs:
   review-bot-waived:
     name: repository rules review (waived)
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
       contains(github.event.pull_request.labels.*.name, 'rules-review:waive')
     runs-on: ubuntu-latest
     permissions:
@@ -209,13 +206,25 @@ jobs:
           REVIEW_RESULT: ${{ needs.review-bot.result }}
           NO_LLM_RESULT: ${{ needs.review-bot-no-llm.result }}
           WAIVED_RESULT: ${{ needs.review-bot-waived.result }}
-          IS_EXTERNAL_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
           REVIEW_WAIVE_LABEL: ${{ env.REVIEW_WAIVE_LABEL }}
           REVIEW_NO_LLM_LABEL: ${{ env.REVIEW_NO_LLM_LABEL }}
         run: |
           set -euo pipefail
-          if [ "${IS_EXTERNAL_PR}" = "true" ]; then
-            echo "External PRs are not accepted for repository rules review."
+          # This used to reject every fork PR, because the three review jobs above were gated on
+          # `head.repo == github.repository`. They do not need to be: each one checks out the
+          # *base* revision, fetches the PR head for the diff only, and runs the base tree's
+          # `scripts/repository-rules-review.py --dry-run` with no secrets. So a fork PR is reviewed
+          # from the same trusted code as an in-repo one, and refusing forks only meant members who
+          # work from a fork (Ryo-wtnb11/strided-rs#369) could never satisfy a required check.
+          #
+          # What is still worth failing on is the case that produced the old message: a fork PR for
+          # which no review job produced a verdict at all.
+          if [ "${IS_FORK_PR}" = "true" ] &&
+             [ "${REVIEW_RESULT}" = "skipped" ] &&
+             [ "${NO_LLM_RESULT}" = "skipped" ] &&
+             [ "${WAIVED_RESULT}" = "skipped" ]; then
+            echo "Fork PR with no review verdict: all three review jobs were skipped, so there is nothing to gate on. Check that the workflow on the base branch still runs them for forks."
             exit 1
           fi
           if [ "${WAIVED_RESULT}" = "success" ]; then
