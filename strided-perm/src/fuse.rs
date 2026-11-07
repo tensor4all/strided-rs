@@ -112,13 +112,9 @@ pub fn compute_importance(
     }
 
     // Add contributions from remaining arrays
-    // INVARIANT: `k` selects a row of the 2-D `index_orders` table while the body
-    // accumulates into `importance`, so an iterator borrowed from either array
-    // cannot express the loop; the index is not a redundant range over one slice.
-    #[allow(clippy::needless_range_loop)]
-    for k in 1..m {
-        for i in 0..n {
-            let shift = g * (n - index_orders[k][i]) as u64;
+    for row in &index_orders[1..m] {
+        for (i, &order) in row.iter().enumerate() {
+            let shift = g * (n - order) as u64;
             importance[i] += 1u64 << shift;
         }
     }

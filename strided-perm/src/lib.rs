@@ -28,10 +28,6 @@ mod fuse;
 mod host;
 mod hptt;
 #[cfg(test)]
-// INVARIANT: test-only support module, so the whole file is dead in a release
-// build; its helpers are each used by a different test file and no single test
-// build exercises all of them, which is why the blanket dead-code allow stays.
-#[allow(dead_code)]
 mod kernel;
 #[cfg(test)]
 mod order;
