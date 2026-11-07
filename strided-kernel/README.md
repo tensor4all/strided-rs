@@ -9,12 +9,39 @@ depend on one another.
 
 - Unary/Binary/N-ary map kernels (`map_into`, `zip_map*_into`)
 - Reductions (`reduce`, `reduce_axis`)
-- Single-axis erased plans: cumulative scans (`ErasedScanPlan`), `argmax` /
-  `argmin` (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm`
-  (`ErasedNormPlan`); their tie, NaN and rounding contracts are in the rustdoc
+- Prepared plans: `compile` validates the layout once and returns a handle whose
+  `execute` reuses that work.
+  - Copy and update: `CopyPlan`, `UpdatePlan`
+  - Structural: `SlicePlan`, `ReversePlan`, `PadPlan`, `ConcatenatePlan`
+  - Gather family: `GatherSpec` / `GatherPlan`, `ScatterSpec` / `ScatterPlan`,
+    `DynamicSlicePlan`, `DynamicUpdateSlicePlan`
+- Dtype-erased replays of the plans above: `ErasedCopyPlan`, `ErasedUpdatePlan`,
+  `ErasedConcatenatePlan`, `ErasedSlicePlan`, `ErasedReversePlan`,
+  `ErasedPadPlan`, `ErasedGatherPlan`, `ErasedScatterPlan`,
+  `ErasedDynamicSlicePlan`, `ErasedDynamicUpdateSlicePlan`. Each resolves the
+  runtime dtype, plus the family's runtime operation where it has one, once per
+  call and then runs a loop monomorphized for both
+- Single-axis and full erased reductions: `ErasedReducePlan` (full and
+  axis reductions), cumulative scans (`ErasedScanPlan`), `argmax` / `argmin`
+  (`ErasedArgReducePlan`) and fused `layer_norm` / `rms_norm` (`ErasedNormPlan`);
+  their tie, NaN and rounding contracts are in the rustdoc
+- Batched outer product (`batched_outer_product_into`,
+  `plan_lazy_outer_product` / `LazyOuterProductLayout`)
+- Runtime-selected one-shot entries for callers that have no plan to reuse:
+  `erased_map_into`, `erased_zip_into`, `erased_broadcast_mul_into_uninit`,
+  `erased_select_into_uninit`, `erased_clamp_into_uninit`,
+  `erased_compare_into_uninit`
 - Utility ops (`copy_into`, `add_acc`, `dot`, `sum`, `symmetrize_into`)
 - Optional parallel execution through `threadteam::Exec` placement tokens
   (`parallel` feature)
+
+`fused_elementwise_into` and the runtime-DAG types stay re-exported from
+`strided-fused`, so those names keep resolving for code written against the 0.4
+line. The calls are not source compatible: 0.4 took three arguments, and 0.12
+requires a `threadteam::Exec` placement token as the fourth
+(`strided-fused/src/fused.rs:1855`), so a 0.4 call site fails to compile. New
+code imports them from `strided-fused`; the re-exports are scheduled for removal
+in the next breaking release.
 
 ## Quick Example
 
@@ -83,7 +110,7 @@ narrower, explicit determinism contract than the generic closure-based
 ## High-Level Operations
 
 ```rust
-use strided_kernel::{Exec, StridedArray, copy_into, add_acc, dot, symmetrize_into};
+use strided_kernel::{Exec, StridedArray, copy_into, add, dot, symmetrize_into};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
 let mut out = StridedArray::<f64>::row_major(&[4, 4]);
@@ -91,8 +118,8 @@ let mut out = StridedArray::<f64>::row_major(&[4, 4]);
 // Copy
 copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
-// Accumulating element-wise add: dest[i] += src[i]
-add_acc(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
+// Element-wise add: dest[i] += src[i]
+add(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
 // Dot product
 let d = dot(&a.view(), &a.view()).unwrap();
@@ -114,8 +141,8 @@ The library automatically optimizes iteration order for cache efficiency:
 
 ```toml
 [dependencies]
-# The published releases predate the `*_acc` / `*_into` names this tree uses, and the
-# next version is not out yet: depend on the repository.
+# 0.12 (the published version) predates the `*_acc` / `*_into` names used here; they
+# arrive with the next release, so depend on the repository until then.
 strided-kernel = { git = "https://github.com/tensor4all/strided-rs", features = ["parallel"] }
 ```
 
