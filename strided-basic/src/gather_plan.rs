@@ -1112,7 +1112,6 @@ impl DynamicSlicePlan {
                 source_base,
                 window,
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
-                |value: T| value,
                 exec,
             );
         }
@@ -1449,7 +1448,6 @@ impl DynamicUpdateSlicePlan {
                 update.offset(),
                 window,
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
-                |value: T| value,
                 exec,
             );
         }

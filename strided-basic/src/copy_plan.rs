@@ -272,6 +272,28 @@ impl CopyPlan {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)
     }
 
+    /// Check the per-call facts, then replay the compiled traversal.
+    fn replay<D, S, Apply>(
+        &self,
+        dest: &mut RawStridedMut<'_, D>,
+        src: &RawStridedRef<'_, S>,
+        apply: Apply,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        D: Copy + Send + Sync,
+        S: Copy + Send + Sync,
+        Apply: Fn(&mut D, S) + Sync,
+    {
+        self.check_call(dest, src)?;
+        // SAFETY: `check_call` proved both views carry exactly the compiled
+        // layout, and `fused` is the fusion of that layout (only `compile`
+        // and `Default`, the rank-zero layout, build it). `compile` checked
+        // the element count and proved the destination injective.
+        unsafe { replay_fused(dest, src, &self.fused, apply, exec) };
+        Ok(())
+    }
+
     /// `dest = src` into a potentially uninitialized destination.
     ///
     /// On success every reachable logical destination element is initialized.
@@ -285,18 +307,14 @@ impl CopyPlan {
     where
         T: Copy + Send + Sync,
     {
-        self.check_call(dest, src)?;
-        replay_fused(
+        self.replay(
             dest,
             src,
-            &self.fused,
-            |dst, value| {
+            |dst: &mut MaybeUninit<T>, value: T| {
                 dst.write(value);
             },
-            |value| value,
             exec,
-        );
-        Ok(())
+        )
     }
 
     /// `dest = src`. Allocation-free for fused ranks at most
@@ -310,16 +328,7 @@ impl CopyPlan {
     where
         T: Copy + Send + Sync,
     {
-        self.check_call(dest, src)?;
-        replay_fused(
-            dest,
-            src,
-            &self.fused,
-            |dst, value| *dst = value,
-            |value: T| value,
-            exec,
-        );
-        Ok(())
+        self.replay(dest, src, |dst: &mut T, value: T| *dst = value, exec)
     }
 
     /// `dest = scale * src`. Allocation-free for fused ranks at most
@@ -334,16 +343,12 @@ impl CopyPlan {
     where
         T: Copy + Mul<T, Output = T> + Send + Sync,
     {
-        self.check_call(dest, src)?;
-        replay_fused(
+        self.replay(
             dest,
             src,
-            &self.fused,
-            |dst, value| *dst = value,
-            |value: T| scale * value,
+            |dst: &mut T, value: T| *dst = scale * value,
             exec,
-        );
-        Ok(())
+        )
     }
 
     /// `dest = conj(src)`. Allocation-free for fused ranks at most
@@ -357,16 +362,7 @@ impl CopyPlan {
     where
         T: Copy + ElementOpApply + Send + Sync,
     {
-        self.check_call(dest, src)?;
-        replay_fused(
-            dest,
-            src,
-            &self.fused,
-            |dst, value| *dst = value,
-            |value: T| value.conj(),
-            exec,
-        );
-        Ok(())
+        self.replay(dest, src, |dst: &mut T, value: T| *dst = value.conj(), exec)
     }
 }
 
@@ -463,6 +459,27 @@ impl UpdatePlan {
         })
     }
 
+    /// Check the per-call facts, then replay the compiled traversal.
+    fn replay<D, S, Apply>(
+        &self,
+        dest: &mut RawStridedMut<'_, D>,
+        src: &RawStridedRef<'_, S>,
+        apply: Apply,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        D: Copy + Send + Sync,
+        S: Copy + Send + Sync,
+        Apply: Fn(&mut D, S) + Sync,
+    {
+        check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
+        // SAFETY: as in `CopyPlan::replay`: the views carry the compiled
+        // layout, `fused` is its fusion (built only by `compile`), and
+        // `compile` checked the count and destination injectivity.
+        unsafe { replay_fused(dest, src, &self.fused, apply, exec) };
+        Ok(())
+    }
+
     /// `dest = alpha * f(src) + beta * dest`.
     ///
     /// `f` is applied to the source element before scaling. When `beta` is
@@ -490,32 +507,26 @@ impl UpdatePlan {
         T: Copy + Send + Sync + Add<Output = T> + Mul<Output = T> + Zero + One + PartialEq,
         F: Fn(T) -> T + Send + Sync,
     {
-        check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         if beta.is_zero() {
             // Write-only: never form a read of the old destination.
             if alpha.is_one() {
-                replay_fused(dest, src, &self.fused, |dst, value| *dst = value, f, exec);
+                self.replay(dest, src, |dst: &mut T, value: T| *dst = f(value), exec)
             } else {
-                replay_fused(
+                self.replay(
                     dest,
                     src,
-                    &self.fused,
-                    |dst, value| *dst = alpha * value,
-                    f,
+                    |dst: &mut T, value: T| *dst = alpha * f(value),
                     exec,
-                );
+                )
             }
         } else {
-            replay_fused(
+            self.replay(
                 dest,
                 src,
-                &self.fused,
-                |dst, value| *dst = alpha * value + beta * *dst,
-                f,
+                |dst: &mut T, value: T| *dst = alpha * f(value) + beta * *dst,
                 exec,
-            );
+            )
         }
-        Ok(())
     }
 
     /// `dest = alpha * f(src)` into a potentially uninitialized destination.
@@ -563,81 +574,81 @@ impl UpdatePlan {
         T: Copy + Send + Sync + Mul<Output = T> + One + PartialEq,
         F: Fn(T) -> T + Send + Sync,
     {
-        check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         if alpha.is_one() {
-            replay_fused(
+            self.replay(
                 dest,
                 src,
-                &self.fused,
-                |dst, value| {
-                    dst.write(value);
+                |dst: &mut MaybeUninit<T>, value: T| {
+                    dst.write(f(value));
                 },
-                f,
                 exec,
-            );
+            )
         } else {
-            replay_fused(
+            self.replay(
                 dest,
                 src,
-                &self.fused,
-                |dst, value| {
-                    dst.write(alpha * value);
+                |dst: &mut MaybeUninit<T>, value: T| {
+                    dst.write(alpha * f(value));
                 },
-                f,
                 exec,
-            );
+            )
         }
-        Ok(())
     }
 }
 
-/// Replay a compiled fused layout, splitting it across the budget of `exec`
-/// when the repository threshold allows it.
+/// Replay `traversal` over a pair of raw views, splitting it across the budget
+/// of `exec` when the repository threshold allows it.
 ///
-/// Parallel replay is sound only because [`CopyPlan::compile`] proved the
-/// destination layout injective: disjoint logical ranges then write disjoint
-/// destination slots. The logical index space `0..total` (column-major over
-/// the fused axes) is split into contiguous worker ranges, which divides the
-/// outer fused axes and, when there are fewer outer positions than workers,
-/// also chunks long inner runs (for example a rank-1 contiguous copy).
-fn replay_fused<D, S, Apply, Op>(
+/// The logical index space `0..total` (column-major over the traversal axes)
+/// is split into contiguous worker ranges, which divides the outer axes and,
+/// when there are fewer outer positions than workers, also chunks long inner
+/// runs (for example a rank-1 contiguous copy).
+///
+/// # Safety
+///
+/// - `traversal` must replay exactly the logical index space of the two
+///   views: either their dims and strides fused by `fuse_pair_traversal`, or
+///   built from them by `PairTraversal::given`. The views' own bounds proofs
+///   ([`RawStridedRef::new`], [`RawStridedMut::new`], or the caller of their
+///   `new_unchecked`) then make every replayed offset in-bounds.
+/// - The product of the traversal extents must not overflow `usize` (a
+///   checked count, zero included).
+/// - Unless `exec.is_serial()`, the destination strides must be injective
+///   over the traversal.
+/// - The destination and source must not overlap.
+pub(crate) unsafe fn replay_fused<D, S, Apply>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
     traversal: &PairTraversal,
     apply: Apply,
-    op: Op,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
     S: Copy + Send + Sync,
-    Apply: Fn(&mut D, S) + Send + Sync,
-    Op: Fn(S) -> S + Send + Sync,
+    Apply: Fn(&mut D, S) + Sync,
 {
     let src_ptr = src.data().as_ptr();
     let src_base = src.offset();
     let dst_base = dest.offset();
     let dst_ptr = dest.data_mut().as_mut_ptr();
-    // SAFETY: `check_call` proved both views carry exactly the compiled
-    // layout, and `RawStridedRef`/`RawStridedMut` guarantee every offset
-    // reachable through that layout lies inside their data. `traversal` is the
-    // fusion of that layout, so every logical index in `0..total` is an
-    // in-bounds slot of both. The compiled destination layout is injective
-    // and the exclusive destination borrow cannot overlap the shared source
-    // borrow.
+    // SAFETY: forwarded caller contract: every logical index of `traversal`
+    // maps to in-bounds slots of both views, injectivity holds whenever the
+    // token can fan out, and the borrows do not overlap.
     unsafe {
         match traversal {
-            PairTraversal::Inline(layout) => replay_fused_raw(
-                dst_ptr, dst_base, src_ptr, src_base, layout, apply, op, exec,
-            ),
+            PairTraversal::Inline(layout) => {
+                replay_fused_raw(dst_ptr, dst_base, src_ptr, src_base, layout, apply, exec)
+            }
             PairTraversal::Spilled(axes) => {
-                replay_spilled_raw(dst_ptr, dst_base, src_ptr, src_base, axes, apply, op, exec)
+                replay_spilled_raw(dst_ptr, dst_base, src_ptr, src_base, axes, apply, exec)
             }
         }
     }
 }
 
-/// Pointer-level fused replay shared by [`CopyPlan`] and the dynamic slice
-/// plans, which replay a fused window layout at a runtime base offset.
+/// Pointer-level fused replay shared by [`CopyPlan`], [`UpdatePlan`], the
+/// plan-free `replay_*_raw` entries and the dynamic slice plans, which replay
+/// a fused window layout at a runtime base offset.
 ///
 /// Splits `0..total` across the budget of `exec` when the repository threshold
 /// allows more than one slot, otherwise runs the serial kernel directly.
@@ -646,25 +657,24 @@ fn replay_fused<D, S, Apply, Op>(
 ///
 /// Every logical index of `layout`, mapped through its destination strides
 /// from `dst_base` and its source strides from `src_base`, must be an
-/// in-bounds slot of the destination and source allocations. The
-/// destination strides must be injective over `layout`, the destination
+/// in-bounds slot of the destination and source allocations, and the product
+/// of its extents must not overflow `usize`. Unless `exec.is_serial()`, the
+/// destination strides must be injective over `layout`; a serial replay
+/// updates a repeated slot once per logical index, in order. The destination
 /// must not overlap the source, and nothing else may access the destination
 /// slots during the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
+pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
     dst_ptr: *mut D,
     dst_base: isize,
     src_ptr: *const S,
     src_base: isize,
     layout: &FusedPairLayout,
     apply: Apply,
-    op: Op,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
     S: Copy + Send + Sync,
-    Apply: Fn(&mut D, S) + Send + Sync,
-    Op: Fn(S) -> S + Send + Sync,
+    Apply: Fn(&mut D, S) + Sync,
 {
     let total = fused_total(layout);
     if total == 0 {
@@ -676,9 +686,9 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
         let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
         crate::threading::parallel_for_each(0..total, exec, &|range| {
             // SAFETY: the caller contract makes every index in bounds; the
-            // worker ranges are disjoint and the destination strides
-            // injective, so no two workers write the same slot, and the
-            // source is only read.
+            // token is not serial, so the destination strides are injective
+            // and the disjoint worker ranges write disjoint slots; the source
+            // is only read.
             unsafe {
                 apply_fused_range(
                     dst_ptr.as_ptr(),
@@ -689,16 +699,16 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
                     range.start,
                     range.len(),
                     &apply,
-                    &op,
                 );
             }
         });
         return;
     }
-    // SAFETY: forwarded caller contract over the full range `0..total`.
+    // SAFETY: forwarded caller contract over the full range `0..total`; one
+    // sequential walk needs no injectivity.
     unsafe {
         apply_fused_range(
-            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply, &op,
+            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply,
         );
     }
 }
@@ -710,26 +720,19 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply, Op>(
 ///
 /// # Safety
 ///
-/// Every logical index of `axes`, mapped through its destination strides from
-/// `dst_base` and its source strides from `src_base`, must be an in-bounds slot
-/// of the destination and source allocations. The destination strides must be
-/// injective over `axes`, the destination must not overlap the source, and
-/// nothing else may access the destination slots during the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
+/// The [`replay_fused_raw`] contract, for `axes`.
+pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
     dst_ptr: *mut D,
     dst_base: isize,
     src_ptr: *const S,
     src_base: isize,
     axes: &[FusedAxis],
     apply: Apply,
-    op: Op,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
     S: Copy + Send + Sync,
-    Apply: Fn(&mut D, S) + Send + Sync,
-    Op: Fn(S) -> S + Send + Sync,
+    Apply: Fn(&mut D, S) + Sync,
 {
     let total = axes.iter().map(|axis| axis.dim).product::<usize>();
     if total == 0 {
@@ -740,10 +743,8 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
         let dst_ptr = crate::threading::SendPtr(dst_ptr);
         let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
         crate::threading::parallel_for_each(0..total, exec, &|range| {
-            // SAFETY: the caller contract makes every index in bounds; the
-            // worker ranges are disjoint and the destination strides
-            // injective, so no two workers write the same slot, and the
-            // source is only read.
+            // SAFETY: as in `replay_fused_raw`: in-bounds indices, injective
+            // destination for a non-serial token, disjoint worker ranges.
             unsafe {
                 apply_spilled_range(
                     dst_ptr.as_ptr(),
@@ -754,17 +755,15 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply, Op>(
                     range.start,
                     range.len(),
                     &apply,
-                    &op,
                 );
             }
         });
         return;
     }
-    // SAFETY: forwarded caller contract over the full range `0..total`.
+    // SAFETY: forwarded caller contract over the full range `0..total`; one
+    // sequential walk needs no injectivity.
     unsafe {
-        apply_spilled_range(
-            dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &apply, &op,
-        );
+        apply_spilled_range(dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &apply);
     }
 }
 

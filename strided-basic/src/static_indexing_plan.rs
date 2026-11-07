@@ -1461,7 +1461,6 @@ impl ConcatenatePlan {
                         local_start,
                         local_end - local_start,
                         &apply,
-                        &|value| value,
                     );
                 }
                 position += 1;
