@@ -79,6 +79,15 @@ jobs:
       LANE_PACKAGES: >-
         -p strided-traits -p strided-view -p strided-basic -p strided-perm
         -p strided-kernel -p strided-fused
+      # `strided-kernel` is deliberately absent: its dev-dependency `strided-nn`
+      # requires `strided-basic/parallel` and `pulp` unconditionally, and cargo
+      # unifies features across the whole invocation, so any `cargo test` that
+      # includes `strided-kernel` re-enables parallelism for every crate in the
+      # graph. Its library is still proven below; its tests run in the `test`
+      # job and the `parallel` lanes, where those requirements are on anyway.
+      LANE_TEST_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-fused
     strategy:
       fail-fast: false
       matrix:
@@ -86,21 +95,25 @@ jobs:
           - lane: parallel
             os: ubuntu-latest
             flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
             basic: default parallel simd
             pulp: yes
           - lane: parallel
             os: macos-latest
             flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
             basic: default parallel simd
             pulp: yes
           - lane: no-default-features
             os: ubuntu-latest
             flags: --no-default-features
+            test_flags: --no-default-features
             basic: ""
             pulp: no
           - lane: parallel-no-simd
             os: ubuntu-latest
             flags: --no-default-features --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --no-default-features --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
             basic: parallel
             pulp: no
     steps:
@@ -111,35 +124,28 @@ jobs:
           shared-key: features-${{ matrix.lane }}-${{ matrix.os }}
 
       # A lane that compiles something other than its name is worse than no lane:
-      # this reads the enabled feature list of the `strided-basic` unit cargo
-      # built, and whether `pulp` was built at all.
-      - name: Assert the lane's feature set
+      # this reads the enabled feature list of every `strided-basic` unit cargo
+      # built, and whether `pulp` was built at all. The library graph and the test
+      # graph are asserted separately: they are not the same graph, and only the
+      # test graph is what the tests actually run against.
+      - name: Assert the lane's feature set (library graph)
+        env:
+          WANT_BASIC: ${{ matrix.basic }}
+          WANT_PULP: ${{ matrix.pulp }}
         run: |
           cargo build --profile ci $LANE_PACKAGES ${{ matrix.flags }} --message-format=json \
-            | python3 -c 'import json, sys
-          want_basic = set(sys.argv[1].split())
-          want_pulp = sys.argv[2] == "yes"
-          basic, pulp = None, False
-          for line in sys.stdin:
-              try:
-                  message = json.loads(line)
-              except ValueError:
-                  continue
-              if message.get("reason") != "compiler-artifact":
-                  continue
-              name = message["target"]["name"]
-              if name == "strided_basic":
-                  basic = set(message["features"])
-              elif name == "pulp":
-                  pulp = True
-          print(f"strided-basic {sorted(basic or [])}, pulp built: {pulp}")
-          if basic != want_basic or pulp != want_pulp:
-              print(f"::error::lane built strided-basic {sorted(basic or [])} with pulp={pulp}; "
-                    f"expected {sorted(want_basic)} with pulp={want_pulp}")
-              sys.exit(1)' "${{ matrix.basic }}" "${{ matrix.pulp }}"
+            | python3 scripts/assert-lane-features.py
+
+      - name: Assert the lane's feature set (test graph)
+        env:
+          WANT_BASIC: ${{ matrix.basic }}
+          WANT_PULP: ${{ matrix.pulp }}
+        run: |
+          cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }} --no-run --message-format=json \
+            | python3 scripts/assert-lane-features.py
 
       - name: Run tests (${{ matrix.lane }})
-        run: cargo test --profile ci $LANE_PACKAGES ${{ matrix.flags }}
+        run: cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }}
 
   placement:
     name: placement rules
