@@ -1,0 +1,23 @@
+diff --git a/deprecated/strided-legacy/src/layout.rs b/deprecated/strided-legacy/src/layout.rs
+deleted file mode 100644
+index 118f733..0000000
+--- a/deprecated/strided-legacy/src/layout.rs
++++ /dev/null
+@@ -1,8 +0,0 @@
+-pub fn shape_stride(shape: &[usize], stride: &[isize]) -> usize {
+-    let mut total = 0;
+-    for (dim, step) in shape.iter().zip(stride.iter()) {
+-        total += dim * step.unsigned_abs();
+-    }
+-    let value = 1;
+-    value + total
+-}
+diff --git a/strided-view/src/fresh.rs b/strided-view/src/fresh.rs
+new file mode 100644
+index 0000000..03f5f02
+--- /dev/null
++++ b/strided-view/src/fresh.rs
+@@ -0,0 +1,3 @@
++pub fn fresh() -> u8 {
++    9
++}
