@@ -188,6 +188,65 @@ fn assert_entry<'p>(
     }
 }
 
+/// The plan-free `replay_*_raw` entries replay borrowed raw views without
+/// compiling anything: no allocation on a successful warm call, serial or on
+/// a pooled token, for every source layout (the callbacks allocate nothing).
+fn run_replay_entries(dims: &[usize], pool: &Pool) {
+    use strided_basic::{
+        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit,
+        RawStridedMut, RawStridedRef,
+    };
+    let layouts = [
+        strides_for(dims, LayoutKind::Contiguous),
+        strides_for(dims, LayoutKind::Permuted),
+        strides_for(dims, LayoutKind::Broadcast),
+    ];
+    let len = layouts
+        .iter()
+        .map(|strides| required_len(dims, strides))
+        .max()
+        .unwrap_or(0)
+        .max(total(dims));
+    let src: Vec<f64> = (0..len).map(|v| v as f64 + 1.0).collect();
+    let mut out = vec![0.0f64; len];
+    let mut uninit = vec![MaybeUninit::<f64>::uninit(); len];
+    let kinds = [
+        LayoutKind::Contiguous,
+        LayoutKind::Permuted,
+        LayoutKind::Broadcast,
+    ];
+    let dst_layouts = [LayoutKind::Contiguous, LayoutKind::Permuted];
+    for dst_kind in dst_layouts {
+        let dst_strides = strides_for(dims, dst_kind);
+        assert_entry("replay_copy_raw", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+            replay_copy_raw(&mut dest, &source, exec).unwrap();
+        });
+        assert_entry("replay_map_raw", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+            replay_map_raw(&mut dest, &source, |d: &mut f64, s| *d += s, exec).unwrap();
+        });
+        assert_entry(
+            "replay_copy_raw_uninit",
+            pool,
+            dims,
+            &kinds,
+            |kind, exec| {
+                let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+                let mut dest = RawStridedMut::new(&mut uninit, dims, &dst_strides, 0).unwrap();
+                replay_copy_raw_uninit(&mut dest, &source, exec).unwrap();
+            },
+        );
+        assert_entry("replay_map_raw_uninit", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut uninit, dims, &dst_strides, 0).unwrap();
+            replay_map_raw_uninit(&mut dest, &source, |s| 2.0 * s, exec).unwrap();
+        });
+    }
+}
+
 fn run_map_entries(dims: &[usize], pool: &Pool) {
     let layouts = [
         strides_for(dims, LayoutKind::Contiguous),
@@ -434,6 +493,7 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
 
         for dims in [&small, &large] {
             run_map_entries(dims, &pool);
+            run_replay_entries(dims, &pool);
         }
     }
 
@@ -443,6 +503,7 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
     check_full_reduction(&pool);
     check_plans(&pool);
     record_rank9_spill(&pool);
+    check_replay_rank9_spill_is_bounded();
 }
 
 /// Tensor-sized cases above the 32768-element threading threshold, so the
@@ -460,6 +521,7 @@ fn check_parallel_threshold(pool: &Pool) {
             "threshold case {dims:?} is not tensor-sized"
         );
         run_map_entries(dims, pool);
+        run_replay_entries(dims, pool);
     }
 }
 
@@ -872,4 +934,27 @@ fn record_rank9_spill(pool: &Pool) {
         })
     });
     eprintln!("rank-9 permuted map_into spill: serial={serial}, parallel={parallel}");
+}
+
+/// Above the inline rank the plan-free replay spills its axis list and range
+/// cursors by contract; the count is bounded by the rank, so it must not grow
+/// from one warm call to the next.
+fn check_replay_rank9_spill_is_bounded() {
+    use strided_basic::{replay_copy_raw, RawStridedMut, RawStridedRef};
+    let dims = vec![2usize; 9];
+    let len = total(&dims);
+    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    let mut out = vec![0.0f64; len];
+    let dest_strides = strides_for(&dims, LayoutKind::Contiguous);
+    let src_strides = strides_for(&dims, LayoutKind::Permuted);
+    let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
+    replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap();
+    let mut call = || {
+        count_thread_allocations(|| replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap())
+    };
+    let first = call();
+    let second = call();
+    assert!(first <= 2, "rank-9 replay allocated {first} times");
+    assert_eq!(first, second, "rank-9 replay allocations grew");
 }

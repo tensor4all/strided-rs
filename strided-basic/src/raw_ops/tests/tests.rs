@@ -146,7 +146,7 @@ fn fused_range_replay_matches_reference_for_every_split() {
             let mut dest =
                 RawStridedMut::new(&mut serial, &dims, &dst_strides, dst_offset).unwrap();
             let source = RawStridedRef::new(&src, &dims, &src_strides, src_offset).unwrap();
-            apply_fused_pair(&mut dest, &source, &layout, |d, v| *d = v, |v| v);
+            apply_fused_pair(&mut dest, &source, &layout, |d: &mut i64, v| *d = v);
         }
         assert_eq!(serial, expected, "serial replay for dims {dims:?}");
 
@@ -166,7 +166,6 @@ fn fused_range_replay_matches_reference_for_every_split() {
                             start,
                             end - start,
                             &|d: &mut i64, v| *d = v,
-                            &|v| v,
                         );
                     }
                 }
@@ -517,7 +516,7 @@ fn spilled_range_replay_matches_reference_for_every_split() {
     {
         let mut dest = RawStridedMut::new(&mut serial, &dims, &dst_strides, 0).unwrap();
         let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
-        apply_spilled_pair(&mut dest, &source, axes, |d, v| *d = v, |v| v);
+        apply_spilled_pair(&mut dest, &source, axes, |d: &mut i64, v| *d = v);
     }
     assert_eq!(serial, expected, "serial spilled replay");
 
@@ -539,7 +538,6 @@ fn spilled_range_replay_matches_reference_for_every_split() {
                         start,
                         end - start,
                         &|d: &mut i64, v| *d = v,
-                        &|v| v,
                     );
                 }
             }
@@ -558,13 +556,9 @@ fn first_callback_of_long_run<D: Copy, S: Copy>(
 ) -> Option<String> {
     let layout = fuse_pair_layout(dest.dims(), dest.strides(), src.strides()).expect("rank one");
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_fused_pair(
-            dest,
-            src,
-            &layout,
-            |_: &mut D, _: S| panic!("first element reached"),
-            |v| v,
-        )
+        apply_fused_pair(dest, src, &layout, |_: &mut D, _: S| {
+            panic!("first element reached")
+        })
     }));
     outcome
         .err()
