@@ -157,18 +157,25 @@ fn raw_descriptors_debug_print_layout_without_the_buffer() {
         ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit_values, &dims, &strides, 0)
             .unwrap();
 
-    for text in [
+    // Exact strings, so a summary that grows a `data` field fails here.
+    assert_eq!(
         format!("{reference:?}"),
+        "ErasedRawStridedRef { dtype: F64, byte_len: 512, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
         format!("{mutable:?}"),
+        "ErasedRawStridedMut { dtype: F64, byte_len: 512, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
         format!("{uninit_mut:?}"),
-    ] {
-        assert!(text.contains("dims: [64]"), "{text}");
-        assert!(text.contains("byte_len: 512"), "{text}");
-        assert!(!text.contains("1.5"), "{text}");
-    }
-    for text in [format!("{typed:?}"), format!("{typed_mut:?}")] {
-        assert!(text.contains("dims: [64]"), "{text}");
-        assert!(text.contains("data_len: 64"), "{text}");
-        assert!(!text.contains("1.5"), "{text}");
-    }
+        "ErasedRawStridedUninitMut { dtype: F64, byte_len: 512, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
+        format!("{typed:?}"),
+        "RawStridedRef { data_len: 64, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
+        format!("{typed_mut:?}"),
+        "RawStridedMut { data_len: 64, dims: [64], strides: [1], offset: 0 }"
+    );
 }
