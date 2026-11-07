@@ -39,8 +39,8 @@ Add the crates you use from crates.io, for example:
 
 ```toml
 [dependencies]
-strided-view = "0.4"
-strided-kernel = "0.4"
+strided-view = "0.7"
+strided-kernel = "0.12"
 ```
 
 ## Documentation
