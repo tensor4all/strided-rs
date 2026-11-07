@@ -18,7 +18,9 @@
 //! unsafe { map_into_validated(&mut dst.view_mut(), &src.view(), |x| x, marker, Exec::serial()) }.unwrap();
 //! ```
 //!
-//! A marker alone does not make the prevalidated entry safe to call:
+//! A marker alone does not make the prevalidated entry safe to call, which is
+//! why every prevalidated entry is `unsafe`: the compiler rejects a call that
+//! does not acknowledge the caller's obligation.
 //!
 //! ```compile_fail,E0133
 //! use strided_basic::{Exec, StridedArray, execution::*};

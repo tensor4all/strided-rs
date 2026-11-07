@@ -1855,15 +1855,17 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
 ///
 /// # Errors
 ///
-/// Returns [`StridedError::RankMismatch`] when `inputs.len()` or `dests.len()`
-/// disagrees with the plan, [`StridedError::InvalidAxis`] when an instruction
-/// or output references a value the plan has not defined yet,
-/// [`StridedError::UnsupportedOp`] when `T` cannot evaluate an instruction,
-/// [`StridedError::ShapeMismatch`] when an input or destination does not have
-/// the destination shape, and [`StridedError::NonInjectiveOutputLayout`] when a
-/// destination layout cannot be proven injective (aliasing elements, or a span
-/// the check cannot represent). Every check
-/// runs before the first destination store.
+/// [`StridedError::RankMismatch`] reports a disagreement about counts or ranks:
+/// `inputs.len()` or `dests.len()` against the plan, the operand count of an
+/// instruction against its op's arity, or the rank of an input or destination
+/// against the destination rank. [`StridedError::ShapeMismatch`] reports an
+/// operand or destination whose rank matches but whose extents differ.
+/// [`StridedError::InvalidAxis`] reports an instruction
+/// or output referencing a value the plan has not defined yet,
+/// [`StridedError::UnsupportedOp`] reports an instruction `T` cannot evaluate,
+/// and [`StridedError::NonInjectiveOutputLayout`] a destination layout that
+/// cannot be proven injective (aliasing elements, or a span the check cannot
+/// represent). Every check runs before the first destination store.
 pub fn fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],

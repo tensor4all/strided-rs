@@ -466,9 +466,10 @@ impl UpdatePlan {
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
     /// `dst_strides`, and `src_strides` do not all have the same length,
     /// [`StridedError::OffsetOverflow`] when the total element count does not
-    /// fit `usize`, and [`StridedError::NonInjectiveOutputLayout`] when two
-    /// logical indices name one destination slot, so a parallel replay would
-    /// write that slot once per index.
+    /// fit `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective: two logical indices name
+    /// one slot (so a parallel replay would write that slot once per index), or
+    /// the offset span cannot be represented, leaving injectivity undecided.
     pub fn compile(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> Result<Self> {
         if dims.len() != dst_strides.len() || dims.len() != src_strides.len() {
             return Err(StridedError::StrideLengthMismatch);
