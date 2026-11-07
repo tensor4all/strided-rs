@@ -93,10 +93,17 @@ initop logic.
 
 **Problem:** Julia's `mul!(C, A, B, α, β)` implements `C = α*A*B + β*C` with two paths.
 
+**Threading is already decided for this route:** placement is opt-in, serial by
+default, and the caller's choice is forwarded to the GEMM provider unchanged.
+See [`threading-contract.md`](threading-contract.md) (issue #6, decision (a)).
+The rest of this section is the original design exploration and keeps its wording;
+where it disagrees with that contract (a direct `Par` parameter, a vendored
+`extern/faer`), the contract wins.
+
 ### Path 1: faer GEMM (replaces Julia's BLAS path)
 
 Instead of Julia's `BLAS.gemm!` path, use `faer`'s pure-Rust SIMD matmul.
-faer is already available in `extern/faer` and uses rayon for parallelism.
+faer uses rayon for parallelism.
 
 **faer's matmul dispatch chain:**
 ```
@@ -232,6 +239,11 @@ These are straightforward to add once the building blocks exist.
 ---
 
 ## 6. Nested Parallelism Strategy (Issue #6)
+
+The decision on this issue is **opt-in only** — serial by default, fan-out only
+when the caller passes an `Exec` token, and the caller owns every foreign thread
+pool. [`threading-contract.md`](threading-contract.md) records it; the text below
+is the original design exploration and keeps the `Par` wording it was written in.
 
 ### The problem
 
