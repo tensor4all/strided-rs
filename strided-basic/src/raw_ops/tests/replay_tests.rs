@@ -28,6 +28,7 @@ fn fan_out_token(team: &Team, n: usize) -> (Exec<'_>, u64) {
     let exec = team.exec(4);
     assert!(exec.carries_team());
     let root = exec.ledger_root().expect("unit-test pools keep a ledger");
+    crate::threading::take_dispatched_chunks();
     #[cfg(feature = "parallel")]
     assert!(
         crate::cost::parallel_width(&exec, KernelClass::Copy, n).get() > 1,
@@ -39,11 +40,16 @@ fn fan_out_token(team: &Team, n: usize) -> (Exec<'_>, u64) {
 }
 
 /// The tasks a fan-out replay keeps live stay within the team's four slots,
-/// and, with the `parallel` feature, more than one of them really ran.
+/// and, with the `parallel` feature, the replay was split into more than one
+/// chunk. The chunk count, not `max_live`, proves the split: a chunk may finish
+/// before the next one starts, so the live high-water mark can stay at one.
 fn assert_fanned_out(root: u64) {
     assert!(ledger::max_live(root) <= 4);
+    let chunks = crate::threading::take_dispatched_chunks();
     #[cfg(feature = "parallel")]
-    assert!(ledger::max_live(root) >= 2, "the replay did not fan out");
+    assert!(chunks >= 2, "the replay did not fan out ({chunks} chunks)");
+    #[cfg(not(feature = "parallel"))]
+    let _ = chunks;
 }
 
 /// Smallest backing length covering every reachable offset from `offset`.
