@@ -547,3 +547,61 @@ fn spilled_range_replay_matches_reference_for_every_split() {
         }
     }
 }
+
+/// Replays a run of `isize::MAX + 1` elements through `apply_fused_pair` with
+/// a callback that panics on its first call, and returns the panic message.
+/// A loop that skips the run returns normally instead; a wrapped offset
+/// computation panics with a different message.
+fn first_callback_of_long_run<D: Copy, S: Copy>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+) -> Option<String> {
+    let layout = fuse_pair_layout(dest.dims(), dest.strides(), src.strides()).expect("rank one");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_fused_pair(
+            dest,
+            src,
+            &layout,
+            |_: &mut D, _: S| panic!("first element reached"),
+            |v| v,
+        )
+    }));
+    outcome
+        .err()
+        .map(|payload| match payload.downcast::<&str>() {
+            Ok(message) => (*message).to_string(),
+            Err(payload) => payload
+                .downcast::<String>()
+                .map(|message| *message)
+                .unwrap_or_default(),
+        })
+}
+
+#[test]
+fn run_longer_than_isize_max_reaches_its_first_element() {
+    let n = isize::MAX as usize + 1;
+    let dims = [n];
+
+    // Generic arm: a broadcast run over one-element buffers.
+    let zero = [0isize];
+    let src = [7.0f64];
+    let mut dst = [0.0f64];
+    let source = RawStridedRef::new(&src, &dims, &zero, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &zero, 0).unwrap();
+    assert_eq!(
+        first_callback_of_long_run(&mut dest, &source).as_deref(),
+        Some("first element reached")
+    );
+
+    // Reversed-source arm: zero-sized elements make the full extent addressable.
+    let src = vec![(); n];
+    let mut dst = vec![(); n];
+    let unit = [1isize];
+    let reversed = [-1isize];
+    let source = RawStridedRef::new(&src, &dims, &reversed, isize::MAX).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &unit, 0).unwrap();
+    assert_eq!(
+        first_callback_of_long_run(&mut dest, &source).as_deref(),
+        Some("first element reached")
+    );
+}

@@ -566,12 +566,15 @@ unsafe fn apply_run<D, S, Apply, Op>(
             -1 => {
                 // SAFETY: the run reads `src_offset - (len - 1) ..= src_offset`,
                 // all in-bounds; the lowest one is the run's last source slot.
-                let src_run = unsafe {
-                    core::slice::from_raw_parts(
-                        src_ptr.offset(src_offset - (len as isize - 1)),
-                        len,
-                    )
-                };
+                // INVARIANT: the range walks never pass an empty run, and both
+                // strides are nonzero, so the validated reach `len - 1` fits
+                // `isize`; casting `len` itself would wrap for a run of
+                // `isize::MAX + 1` elements. (A `saturating_sub` here measurably
+                // slowed short unit-stride runs by changing the code layout of
+                // the whole inlined walk.)
+                let last = (len - 1) as isize;
+                let src_run =
+                    unsafe { core::slice::from_raw_parts(src_ptr.offset(src_offset - last), len) };
                 for (dst, &value) in dst_run.iter_mut().zip(src_run.iter().rev()) {
                     apply(dst, op(value));
                 }
@@ -590,7 +593,13 @@ unsafe fn apply_run<D, S, Apply, Op>(
     // SAFETY: the run start is an in-bounds slot of each allocation.
     let dst_start = unsafe { dst_ptr.offset(dst_offset) };
     let src_start = unsafe { src_ptr.offset(src_offset) };
-    for position in 0..len as isize {
+    // The bound stays `usize`: a checked broadcast run may hold more than
+    // `isize::MAX` elements, and `len as isize` would wrap to an empty loop.
+    for position in 0..len {
+        // INVARIANT: a nonzero stride bounds the run by its validated reach,
+        // so `position` fits `isize` exactly; a longer run is possible only
+        // along a zero stride, where the wrapped cast is multiplied by zero.
+        let position = position as isize;
         // SAFETY: `position < len`, so both are slots of this run.
         unsafe {
             let value = *src_start.offset(position * src_stride);
