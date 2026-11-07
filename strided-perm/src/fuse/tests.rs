@@ -73,3 +73,47 @@ fn test_compute_costs() {
     let costs = compute_costs(&all_strides);
     assert_eq!(costs, vec![2, 2, 1]);
 }
+
+/// Pins the row-wise `compute_importance` loop against the reviewer's vector
+/// from strided-rs#377: two contributing arrays with opposite axis orders must
+/// weight both dimensions by their own shift.
+#[test]
+fn test_compute_importance_uses_each_array_row() {
+    let dims = [2, 3];
+    let strides0 = [1isize, 2];
+    let strides1 = [2isize, 1];
+    let all_strides: Vec<&[isize]> = vec![&strides0, &strides1];
+    let index_orders = vec![vec![0usize, 1], vec![1, 0]];
+
+    assert_eq!(
+        compute_importance(&dims, &all_strides, &index_orders),
+        vec![36, 24]
+    );
+}
+
+/// A third array must contribute too, so the `&index_orders[1..m]` slice bound
+/// is exercised past the first contributing row. `m` is `all_strides.len()`, so
+/// the two inputs have to stay in lockstep, as the only caller keeps them.
+///
+/// The scores are pinned exactly rather than compared across `m`: `g` is the bit
+/// length of `m + 1`, so dropping a row changes every shift as well as the sum.
+/// A `[1..2]` bound scores `[192, 24]` here, which an ordering check on
+/// the two-array result would accept.
+#[test]
+fn test_compute_importance_accumulates_every_array() {
+    let dims = [2, 2];
+    let strides = [1isize, 2];
+    let two_strides: Vec<&[isize]> = vec![&strides, &strides];
+    let three_strides: Vec<&[isize]> = vec![&strides, &strides, &strides];
+    let with_two = vec![vec![0usize, 1], vec![0, 1]];
+    let with_three = vec![vec![0usize, 1], vec![0, 1], vec![0, 1]];
+
+    assert_eq!(
+        compute_importance(&dims, &two_strides, &with_two),
+        vec![48, 12]
+    );
+    assert_eq!(
+        compute_importance(&dims, &three_strides, &with_three),
+        vec![256, 32]
+    );
+}
