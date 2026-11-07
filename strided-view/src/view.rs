@@ -404,7 +404,14 @@ pub struct StridedView<'a, T, Op = Identity> {
     _op: PhantomData<Op>,
 }
 
+// SAFETY: `StridedView` owns no `T`. It holds `&'a [T]` and a `*const T`
+// derived from it, so moving the view moves a shared borrow, which is `Send`
+// exactly when `T: Sync`. `Op` appears only in `PhantomData`, and `ViewMeta` is
+// owned metadata (an inline `tinyvec::ArrayVec` plus an optional box).
 unsafe impl<T: Sync, Op: Send> Send for StridedView<'_, T, Op> {}
+// SAFETY: a shared `&StridedView` hands out only `&T` (`get`, `ptr`, the
+// `ElementOp` read path) and never `&mut T`, so sharing is sound when `T: Sync`.
+// `Op` is `Sync` and appears only in `PhantomData`.
 unsafe impl<T: Sync, Op: Sync> Sync for StridedView<'_, T, Op> {}
 
 impl<T, Op> Clone for StridedView<'_, T, Op> {
@@ -439,6 +446,14 @@ fn base_ptr<T>(data: &[T], dims: &[usize], offset: isize) -> *const T {
     if empty_layout(dims) {
         empty_const_ptr()
     } else {
+        // SAFETY: every caller reaches `base_ptr` from `from_meta`, whose
+        // `dims`/`strides`/`offset` were either accepted by `validate_bounds`
+        // (view.rs:186) — `StridedView::new`, `StridedViewMut::new`, the
+        // re-validated diagonal path, or a metadata transform that only reorders
+        // axes or zeroes strides and therefore cannot enlarge the reachable
+        // offset set — or were supplied under the `new_unchecked` contract. The
+        // empty-layout branch above excludes the case where `offset` may point
+        // past `data`.
         unsafe { data.as_ptr().offset(offset) }
     }
 }
@@ -782,6 +797,10 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        // SAFETY: `indexed_offset` (view.rs:239) asserts the index count and
+        // `index < dims[i]`, so the offset it returns lies within the reachable
+        // extent that `validate_bounds` (view.rs:186) proved stays inside
+        // `data` for this view's construction.
         Op::apply(unsafe { *self.ptr.offset(offset) })
     }
 
@@ -830,6 +849,9 @@ pub struct StridedViewMut<'a, T> {
     _marker: PhantomData<&'a mut [T]>,
 }
 
+// SAFETY: `StridedViewMut` uniquely owns its `&'a mut [T]` plus a `*mut T`
+// derived from it, and there is no `Sync` impl for it, so sending it moves that
+// exclusive borrow; `T: Send` is the bound `&mut [T]: Send` requires.
 unsafe impl<T: Send> Send for StridedViewMut<'_, T> {}
 
 impl<T: std::fmt::Debug> std::fmt::Debug for StridedViewMut<'_, T> {
@@ -852,6 +874,12 @@ impl<'a, T> StridedViewMut<'a, T> {
         let ptr = if empty_layout(meta.dims()) {
             empty_mut_ptr()
         } else {
+            // SAFETY: as `base_ptr` above — `offset` was accepted by
+            // `validate_bounds` (view.rs:186) in `StridedViewMut::new`, or by a
+            // metadata transform that only reorders axes or zeroes strides, or
+            // came from the `new_unchecked` contract. `base` is this view's own
+            // live handle on `data` and the empty-layout branch above excludes
+            // the case where `offset` may point past it.
             unsafe { base.offset(offset) }
         };
         Self {
@@ -1047,8 +1075,12 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// ```
     #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
-        // Derive both the slice and the pointer the immutable view caches from
-        // the same handle, so neither can outlive the storage it points into.
+        // SAFETY: `data()` re-derives the slice from this view's own handle
+        // (`base` + `src_len`), and `ptr` is `base + offset` for the same
+        // `offset`, so the immutable view points at the same storage the mutable
+        // view owns. `&self` keeps that storage exclusively borrowed for the
+        // returned view's lifetime, so the shared view can only read it, and `T`
+        // is initialized across the whole slice.
         unsafe { StridedView::new_unchecked(self.data(), self.dims(), self.strides(), self.offset) }
     }
 }
@@ -1062,6 +1094,9 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        // SAFETY: `indexed_offset` (view.rs:239) asserts the index count and
+        // `index < dims[i]`, so the offset stays inside the reachable extent
+        // that `validate_bounds` (view.rs:186) accepted for this view.
         unsafe { *self.ptr.offset(offset) }
     }
 
@@ -1073,6 +1108,9 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn set(&mut self, indices: &[usize], value: T) {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        // SAFETY: as `get` above — `indexed_offset` (view.rs:239) bounds-checks
+        // every index, and `&mut self` keeps this store the only access to the
+        // reachable extent during the call.
         unsafe {
             *self.ptr.offset(offset) = value;
         }
@@ -1372,6 +1410,11 @@ impl<T> StridedArray<T> {
         let ptr = if self.is_empty() {
             empty_const_ptr()
         } else {
+            // SAFETY: `offset` is either 0 from a constructor or was accepted by
+            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1275), so
+            // `data.as_ptr() + offset` stays inside `data`. The empty branch
+            // above excludes a zero-sized layout, whose offset need not be
+            // reachable.
             unsafe { self.data.as_ptr().offset(self.offset) }
         };
         StridedView {
@@ -1391,6 +1434,11 @@ impl<T> StridedArray<T> {
         let ptr = if self.is_empty() {
             empty_mut_ptr()
         } else {
+            // SAFETY: as `view` above — `self.offset` is either 0 from a
+            // constructor or was accepted by `validate_bounds` in
+            // `StridedArray::from_parts` (view.rs:1275), and `&mut self` keeps
+            // this reborrow exclusive. The empty branch above excludes a
+            // zero-sized layout, whose offset need not be reachable.
             unsafe { base.offset(self.offset) }
         };
         StridedViewMut {

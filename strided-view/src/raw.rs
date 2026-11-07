@@ -404,6 +404,11 @@ impl<'a> ErasedRawStridedRef<'a> {
             .len()
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `data` is a live `&[T]` and `byte_len` is
+        // `data.len() * size_of::<T>()` from the `checked_mul` above, so the
+        // `u8` view spans exactly that initialized allocation for `data`'s
+        // lifetime. `u8` has no invalid bit patterns, and the resulting length
+        // is re-checked by `validate_erased_buffer_extent` (raw.rs:121).
         let bytes = unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_len) };
         let element_count = validate_erased_buffer_extent(dtype, bytes)?;
         validate_bounds(element_count, dims, strides, offset)?;
@@ -474,6 +479,11 @@ impl<'a> ErasedRawStridedRef<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: the dtype check above proves the stored dtype is `T`, and the
+        // constructor ran `validate_erased_buffer_extent` (raw.rs:121) /
+        // `validate_erased_buffer_layout` (raw.rs:161): the byte length is a
+        // whole multiple of `size_of::<T>()` and the base is `T`-aligned, so
+        // `len / size_of::<T>()` initialized `T` values are in bounds.
         Ok(unsafe {
             core::slice::from_raw_parts(
                 self.data.as_ptr().cast::<T>(),
@@ -553,6 +563,11 @@ impl<'a> ErasedRawStridedMut<'a> {
             .len()
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `data` is a live, exclusively borrowed `&mut [T]` and
+        // `byte_len` is `data.len() * size_of::<T>()` from the `checked_mul`
+        // above, so the `u8` view spans exactly that initialized allocation for
+        // `'a`. `u8` has no invalid bit patterns, and the resulting length is
+        // re-checked by `validate_erased_buffer_extent` (raw.rs:121).
         let data =
             unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), byte_len) };
         let element_count = validate_erased_buffer_extent(dtype, data)?;
@@ -626,6 +641,11 @@ impl<'a> ErasedRawStridedMut<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: the dtype check above proves the stored dtype is `T`, and the
+        // constructor ran `validate_erased_buffer_extent` (raw.rs:121) /
+        // `validate_erased_buffer_layout` (raw.rs:161): the byte length is a
+        // whole multiple of `size_of::<T>()` and the base is `T`-aligned, so
+        // `len / size_of::<T>()` initialized `T` values are in bounds.
         Ok(unsafe {
             core::slice::from_raw_parts(
                 self.data.as_ptr().cast::<T>(),
@@ -647,6 +667,10 @@ impl<'a> ErasedRawStridedMut<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: as `data_as` (raw.rs:386) — the dtype check proves `T`, and
+        // `validate_erased_buffer_layout` (raw.rs:161) proved the base is
+        // `T`-aligned with a whole multiple of `size_of::<T>()` bytes. `&mut
+        // self` keeps this reborrow exclusive for its own lifetime.
         Ok(unsafe {
             core::slice::from_raw_parts_mut(
                 self.data.as_mut_ptr().cast::<T>(),
@@ -729,6 +753,11 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
             .len()
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `data` is a live, exclusively borrowed `&mut
+        // [MaybeUninit<T>]` and `byte_len` is `data.len() * size_of::<T>()` from
+        // the `checked_mul` above, so the view spans exactly that allocation for
+        // `'a`. `MaybeUninit<u8>` accepts every bit pattern, so no
+        // initialization is asserted here.
         let data = unsafe {
             core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<MaybeUninit<u8>>(), byte_len)
         };
@@ -803,6 +832,11 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: the dtype check proves `T`, and
+        // `validate_erased_buffer_layout` (raw.rs:161) proved the base is
+        // `T`-aligned with a whole multiple of `size_of::<T>()` bytes.
+        // `MaybeUninit<T>` accepts every bit pattern, so the partially
+        // initialized extent is not read as `T` here.
         Ok(unsafe {
             core::slice::from_raw_parts_mut(
                 self.data.as_mut_ptr().cast::<MaybeUninit<T>>(),
@@ -939,6 +973,12 @@ impl<'a, T> RawStridedRef<'a, T> {
         if self.dims.iter().any(|&dim| dim == 0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
+            // SAFETY: `offset` was accepted by `validate_bounds`
+            // (strided-view/src/view.rs:186) in `RawStridedRef::new`, or by the
+            // caller contract of `new_unchecked`, so `data.as_ptr() + offset`
+            // stays inside `data`. The empty-layout branch above returns a
+            // dangling pointer instead of offsetting a pointer no element
+            // reaches.
             unsafe { self.data.as_ptr().offset(self.offset) }
         }
     }
@@ -949,6 +989,10 @@ impl<'a, T> RawStridedRef<'a, T> {
     /// accessors directly all the same.
     #[inline]
     pub fn as_view(&self) -> StridedView<'a, T, Identity> {
+        // SAFETY: `new_unchecked` requires every reachable index to stay inside
+        // `data`; this descriptor's `offset`/`dims`/`strides` came from
+        // `validate_bounds` (strided-view/src/view.rs:186) in `RawStridedRef::new`,
+        // or from the same contract on `new_unchecked`.
         unsafe { StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 }
@@ -1053,6 +1097,12 @@ impl<'a, T> RawStridedMut<'a, T> {
         if self.dims.iter().any(|&dim| dim == 0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
+            // SAFETY: `offset` was accepted by `validate_bounds`
+            // (strided-view/src/view.rs:186) in `RawStridedMut::new`, or by the
+            // caller contract of `new_unchecked`, so `data.as_ptr() + offset`
+            // stays inside `data`. The empty-layout branch above returns a
+            // dangling pointer instead of offsetting a pointer no element
+            // reaches.
             unsafe { self.data.as_ptr().offset(self.offset) }
         }
     }
@@ -1062,6 +1112,10 @@ impl<'a, T> RawStridedMut<'a, T> {
         if self.dims.iter().any(|&dim| dim == 0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
+            // SAFETY: as `ptr` above — `offset` was accepted by
+            // `validate_bounds` (strided-view/src/view.rs:186) in
+            // `RawStridedMut::new` or by the `new_unchecked` contract, and
+            // `&mut self` keeps the write provenance exclusive.
             unsafe { self.data.as_mut_ptr().offset(self.offset) }
         }
     }
@@ -1072,6 +1126,10 @@ impl<'a, T> RawStridedMut<'a, T> {
     /// accessors directly all the same.
     #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
+        // SAFETY: `new_unchecked` requires every reachable index to stay inside
+        // `data`; this descriptor's metadata came from `validate_bounds`
+        // (strided-view/src/view.rs:186) in `RawStridedMut::new`, or from the
+        // same contract on `new_unchecked`.
         unsafe { StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 
@@ -1081,6 +1139,8 @@ impl<'a, T> RawStridedMut<'a, T> {
     /// accessors directly all the same.
     #[inline]
     pub fn as_view_mut(&mut self) -> StridedViewMut<'_, T> {
+        // SAFETY: as `as_view` above, and `&mut self` keeps the mutable borrow
+        // exclusive to the returned view, which `new_unchecked` requires.
         unsafe { StridedViewMut::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 }
