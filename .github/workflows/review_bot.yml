@@ -235,7 +235,7 @@ jobs:
             exit 1
           fi
           if [ "${WAIVED_RESULT}" = "success" ]; then
-            echo "Review waived via label ${REVIEW_WAIVE_LABEL}."
+            echo "Review waived: a maintainer comment names the current head ($REVIEW_WAIVE_LABEL)."
             exit 0
           fi
           if [ "${NO_LLM_RESULT}" = "success" ]; then
