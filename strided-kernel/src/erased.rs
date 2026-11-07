@@ -67,8 +67,17 @@ impl ErasedZipOp {
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
-/// or unsupported dtype/op contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `input` or `dest` does not
+/// carry the dtype that `input_dtype` and `op` imply,
+/// [`StridedError::UnsupportedOp`] for a `bool` input with any op other than
+/// [`ErasedMapOp::Conj`], [`StridedError::OverlappingInputOutput`] when the
+/// input allocation overlaps the destination,
+/// [`StridedError::InvalidBoolByte`] when a `bool` input holds a byte other
+/// than 0 or 1, [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven to place logical elements on distinct
+/// offsets, and [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from the
+/// input dims. Validation completes before any write.
 pub fn erased_map_into(
     input_dtype: KernelDType,
     op: ErasedMapOp,
@@ -111,8 +120,18 @@ pub fn erased_map_into(
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
-/// or unsupported dtype/op contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `dest`, `lhs`, or `rhs` does
+/// not carry `dtype`, [`StridedError::UnsupportedOp`] for `bool` operands or
+/// for a complex remainder/maximum/minimum,
+/// [`StridedError::OverlappingInputOutput`] when either input allocation
+/// overlaps the destination, [`StridedError::InvalidBoolByte`] when an input
+/// holds a `bool` byte other than 0 or 1,
+/// [`StridedError::IntegerDivisionByZero`] when an integer divide or
+/// remainder finds a zero divisor, [`StridedError::NonInjectiveOutputLayout`]
+/// when the destination layout cannot be proven to place logical elements on
+/// distinct offsets, and [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from
+/// either input's dims. Validation completes before any write.
 pub fn erased_zip_into(
     dtype: KernelDType,
     op: ErasedZipOp,
@@ -168,6 +187,19 @@ pub struct ErasedPadPlan {
 
 impl ErasedSlicePlan {
     /// Validate and store a static slice plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination layout lengths differ from the operand rank,
+    /// [`StridedError::RankMismatch`] when `starts`, `limits`, or
+    /// `slice_strides` differ from it, [`StridedError::InvalidAxis`] for a
+    /// window with `start > limit`, a `limit` beyond the operand extent, or a
+    /// zero slice stride, [`StridedError::ShapeMismatch`] when `dest_dims` is
+    /// not the sliced extents, [`StridedError::NonInjectiveOutputLayout`]
+    /// when the destination layout cannot be proven injective, and
+    /// [`StridedError::OffsetOverflow`] when an element count, a scaled
+    /// source stride, or the source offset delta overflows.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -205,6 +237,17 @@ impl ErasedSlicePlan {
     }
 
     /// Execute a static slice into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows, which an empty operand view whose offset the descriptor
+    /// contract does not bound can reach. Nothing is written unless every
+    /// check succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -235,6 +278,19 @@ impl ErasedSlicePlan {
     /// may leave a partially initialized `MaybeUninit` destination, which is
     /// still safely droppable; no readable value is promised for unwritten
     /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::OverlappingInputOutput`] when the input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` input holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows. Every rejection above is returned before any destination
+    /// write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -264,6 +320,16 @@ impl ErasedSlicePlan {
 
 impl ErasedReversePlan {
     /// Validate and store a reverse plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination stride list does not match the operand rank,
+    /// [`StridedError::InvalidAxis`] when a listed axis is out of range,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, and [`StridedError::OffsetOverflow`] when
+    /// an element count, a negated source stride, or the source offset delta
+    /// overflows.
     pub fn compile(
         dtype: KernelDType,
         operand_dims: &[usize],
@@ -289,6 +355,17 @@ impl ErasedReversePlan {
     }
 
     /// Execute a reverse into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows, which an empty operand view whose offset the descriptor
+    /// contract does not bound can reach. Nothing is written unless every
+    /// check succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -319,6 +396,19 @@ impl ErasedReversePlan {
     /// may leave a partially initialized `MaybeUninit` destination, which is
     /// still safely droppable; no readable value is promised for unwritten
     /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::OverlappingInputOutput`] when the input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` input holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows. Every rejection above is returned before any destination
+    /// write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -352,6 +442,19 @@ impl ErasedReversePlan {
 
 impl ErasedPadPlan {
     /// Validate and store a pad plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination layout lengths differ from the operand rank,
+    /// [`StridedError::RankMismatch`] when the edge or interior padding
+    /// lengths differ from it, [`StridedError::InvalidAxis`] for a negative
+    /// interior padding or a padded extent that does not fit `usize`,
+    /// [`StridedError::ShapeMismatch`] when `dest_dims` is not the padded
+    /// extents, [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective, and
+    /// [`StridedError::OffsetOverflow`] when an element count, a padded
+    /// extent, or a cursor stride computation overflows.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -389,6 +492,17 @@ impl ErasedPadPlan {
     }
 
     /// Execute pad into an erased output descriptor using one dtype scalar as fill.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::ByteLengthMismatch`] when `fill` is not exactly one
+    /// element wide, [`StridedError::InvalidBoolByte`] when a `bool` fill
+    /// holds a byte other than 0 or 1, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Nothing is written unless every check
+    /// succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -421,6 +535,19 @@ impl ErasedPadPlan {
     /// may leave a partially initialized `MaybeUninit` destination, which is
     /// still safely droppable; no readable value is promised for unwritten
     /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::ByteLengthMismatch`] when `fill` is not exactly one
+    /// element wide, [`StridedError::InvalidBoolByte`] when a `bool` fill or
+    /// a `bool` operand holds a byte other than 0 or 1,
+    /// [`StridedError::OverlappingInputOutput`] when the input allocation
+    /// overlaps the destination, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Every rejection above is returned before
+    /// any destination write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -491,6 +618,22 @@ pub struct ErasedScatterPlan {
 
 impl ErasedGatherPlan {
     /// Validate and store a gather plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, [`StridedError::StrideLengthMismatch`] when a stride list
+    /// does not match its dimension list, [`StridedError::OffsetOverflow`]
+    /// when an element count or a layout span does not fit `usize`/`isize`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, [`StridedError::RankMismatch`] when
+    /// `spec.slice_sizes` or `spec.offset_dims` has the wrong length or an
+    /// index vector does not match `spec.start_index_map`,
+    /// [`StridedError::InvalidAxis`] for a listed axis outside its rank, a
+    /// repeating axis, an `index_vector_dim` beyond the index rank, a slice
+    /// size beyond its operand extent, or a collapsed axis whose slice size
+    /// is not one, and [`StridedError::ShapeMismatch`] when `dest_dims` is
+    /// not the gathered window/batch shape.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -536,6 +679,15 @@ impl ErasedGatherPlan {
     }
 
     /// Execute an indexed read into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `start_indices` does not carry its compiled dtype, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Start indices are clamped into the
+    /// operand window, so an out-of-range index is not an error. Nothing is
+    /// written unless every check succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -618,6 +770,17 @@ impl ErasedGatherPlan {
     /// may leave a partially initialized `MaybeUninit` destination, which is
     /// still safely droppable; no readable value is promised for unwritten
     /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `start_indices` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` operand holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Every rejection above is returned before
+    /// any destination write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -700,6 +863,20 @@ impl ErasedGatherPlan {
 
 impl ErasedDynamicSlicePlan {
     /// Validate and store a dynamic-slice plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, [`StridedError::StrideLengthMismatch`] when a stride list
+    /// does not match its dimension list, [`StridedError::RankMismatch`] when
+    /// `slice_sizes` differs from the operand rank, or the start layout is
+    /// not a rank-1 vector of that same length,
+    /// [`StridedError::OffsetOverflow`] when an element count or a layout
+    /// span does not fit `usize`/`isize`, [`StridedError::ShapeMismatch`]
+    /// when `dest_dims` differs from `slice_sizes`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, and [`StridedError::InvalidAxis`] when a
+    /// slice size exceeds its operand extent.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -745,6 +922,15 @@ impl ErasedDynamicSlicePlan {
     }
 
     /// Execute a fixed-window dynamic slice into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `starts` does not carry its compiled dtype, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Starts are clamped to `operand_dims -
+    /// slice_sizes`, so an out-of-range start is not an error, and nothing is
+    /// written unless every check succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -826,6 +1012,17 @@ impl ErasedDynamicSlicePlan {
     /// are returned before any destination write. A panic during execution may
     /// leave reachable slots partially initialized, but the `MaybeUninit`
     /// destination remains safely droppable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `starts` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` operand holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Every rejection above is returned before
+    /// any destination write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -908,6 +1105,20 @@ impl ErasedDynamicSlicePlan {
 
 impl ErasedDynamicUpdateSlicePlan {
     /// Validate and store a dynamic-update-slice plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, [`StridedError::StrideLengthMismatch`] when a stride list
+    /// does not match its dimension list, [`StridedError::RankMismatch`]
+    /// when `update_dims` differs from the operand rank, or the start layout
+    /// is not a rank-1 vector of that same length,
+    /// [`StridedError::OffsetOverflow`] when an element count or a layout
+    /// span does not fit `usize`/`isize`, [`StridedError::ShapeMismatch`]
+    /// when `dest_dims` differs from `operand_dims`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, and [`StridedError::InvalidAxis`] when
+    /// an update extent exceeds its operand extent.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -955,6 +1166,15 @@ impl ErasedDynamicUpdateSlicePlan {
     }
 
     /// Execute a dynamic update slice into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `update`, or `starts` does not carry its compiled dtype, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Starts are clamped to
+    /// `operand_dims - update_dims`, so an out-of-range start is not an
+    /// error, and the operand copy rejects everything above before it runs.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -1044,6 +1264,17 @@ impl ErasedDynamicUpdateSlicePlan {
     /// destination untouched; an error or panic after the copy may leave a
     /// mixture of old and new reachable values, all initialized and safely
     /// droppable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `update`, or `starts` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` operand or update holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Every rejection above is returned before
+    /// the operand copy runs.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -1138,6 +1369,24 @@ impl ErasedDynamicUpdateSlicePlan {
 
 impl ErasedScatterPlan {
     /// Validate and store an additive scatter plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, or `dtype` is `bool`,
+    /// [`StridedError::StrideLengthMismatch`] when a stride list does not
+    /// match its dimension list, [`StridedError::OffsetOverflow`] when an
+    /// element count or a layout span does not fit `usize`/`isize`,
+    /// [`StridedError::ShapeMismatch`] when `dest_dims` differs from
+    /// `operand_dims` or an update batch extent differs from the index batch
+    /// shape, [`StridedError::NonInjectiveOutputLayout`] when the destination
+    /// layout cannot be proven injective, [`StridedError::InvalidAxis`] for a
+    /// listed axis outside its rank, a repeating axis, an `index_vector_dim`
+    /// beyond the index rank, or an update window extent exceeding its
+    /// operand extent, and [`StridedError::RankMismatch`] for an index vector
+    /// that does not match `spec.scatter_dims_to_operand_dims`, a
+    /// wrong-length `spec.update_window_dims`, or an update batch rank that
+    /// disagrees with the index batch shape.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -1187,6 +1436,15 @@ impl ErasedScatterPlan {
     }
 
     /// Execute additive scatter into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `scatter_indices`, or `updates` does not carry its compiled dtype,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Scatter indices are clamped into the
+    /// operand window, so an out-of-range index is not an error, and the
+    /// operand copy rejects everything above before it runs.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -1267,6 +1525,15 @@ impl ErasedScatterPlan {
     /// destination untouched; an error or panic after the copy may leave a
     /// mixture of old and new reachable values, all initialized and safely
     /// droppable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `scatter_indices`, or `updates` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, and [`StridedError::PlanLayoutMismatch`]
+    /// when a view does not carry its compiled extents and strides. Every
+    /// rejection above is returned before the operand copy runs.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,

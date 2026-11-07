@@ -613,6 +613,12 @@ fn ensure_same_dims(dst: &[usize], src: &[usize]) -> Result<()> {
 }
 
 /// `dest = scale * src` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
 pub fn copy_scale_raw<T>(
     dest: &mut RawStridedMut<'_, T>,
     src: &RawStridedRef<'_, T>,
@@ -642,6 +648,12 @@ where
 }
 
 /// `dest = scale * conj(src)` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
 pub fn copy_scale_conj_raw<T>(
     dest: &mut RawStridedMut<'_, T>,
     src: &RawStridedRef<'_, T>,
@@ -671,6 +683,12 @@ where
 }
 
 /// `dest = alpha * src + dest` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
 pub fn axpy_raw<T>(
     dest: &mut RawStridedMut<'_, T>,
     src: &RawStridedRef<'_, T>,
@@ -700,6 +718,12 @@ where
 }
 
 /// `dest = alpha * conj(src) + dest` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
 pub fn axpy_conj_raw<T>(
     dest: &mut RawStridedMut<'_, T>,
     src: &RawStridedRef<'_, T>,

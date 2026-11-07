@@ -70,6 +70,16 @@ pub struct ErasedConcatenatePlan {
 
 impl ErasedCopyPlan {
     /// Compile a copy plan for one dtype and layout pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
+    /// `dst_strides`, and `src_strides` do not all have the same length,
+    /// [`StridedError::OffsetOverflow`] when the element count does not fit
+    /// `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent). The dtype
+    /// is only stored here; [`execute`](Self::execute) checks it.
     pub fn compile(
         dtype: KernelDType,
         dims: &[usize],
@@ -88,6 +98,14 @@ impl ErasedCopyPlan {
     }
 
     /// `dest = src` through a non-generic dtype-erased replay boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `src` carries a
+    /// different dtype than the plan, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Nothing is written unless every check
+    /// succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -124,6 +142,22 @@ impl ErasedCopyPlan {
 
 impl ErasedConcatenatePlan {
     /// Validate and store a concatenate plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedArity`] when no input is given,
+    /// [`StridedError::RankMismatch`] when
+    /// `input_dims` and `input_strides` list different numbers of layouts or
+    /// an input rank differs from the first input's rank,
+    /// [`StridedError::StrideLengthMismatch`] when a stride list does not
+    /// match its dimension list, [`StridedError::InvalidAxis`] when `axis` is
+    /// outside the rank, [`StridedError::ShapeMismatch`] when a
+    /// non-concatenated extent differs or the destination is not the
+    /// concatenation of the inputs,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// maps two logical indices onto one offset, and
+    /// [`StridedError::OffsetOverflow`] when a segment length or base offset
+    /// cannot be represented.
     pub fn compile(
         dtype: KernelDType,
         input_dims: &[&[usize]],
@@ -156,6 +190,17 @@ impl ErasedConcatenatePlan {
     }
 
     /// Execute concatenate into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when the destination or any
+    /// input carries a different dtype than the plan,
+    /// [`StridedError::RankMismatch`] when the number of inputs differs from
+    /// the compiled one, [`StridedError::PlanLayoutMismatch`] when the
+    /// destination or an input does not carry its compiled extents and
+    /// strides, and [`StridedError::OffsetOverflow`] when a segment's
+    /// destination offset cannot be expressed in `isize`. Every check runs
+    /// before the first segment is written.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -188,6 +233,20 @@ impl ErasedConcatenatePlan {
     /// may leave a partially initialized `MaybeUninit` destination, which is
     /// still safely droppable; no readable value is promised for unwritten
     /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when the destination or any
+    /// input carries a different dtype than the plan,
+    /// [`StridedError::RankMismatch`] when the number of inputs differs from
+    /// the compiled one, [`StridedError::OverlappingInputOutput`] when an
+    /// input allocation overlaps the destination,
+    /// [`StridedError::InvalidBoolByte`] when `bool` input bytes are not 0 or
+    /// 1, [`StridedError::PlanLayoutMismatch`] when the destination or an
+    /// input does not carry its compiled extents and strides, and
+    /// [`StridedError::OffsetOverflow`] when a segment's destination offset
+    /// cannot be expressed in `isize`. Everything above is returned before any
+    /// destination write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -409,6 +468,17 @@ struct AxesLayout<'a> {
 
 impl ErasedReducePlan {
     /// Validate and store a full-reduction plan for one dtype and source layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `op` has no identity
+    /// in `dtype`: [`ReduceOp::SumSquares`] outside `f32`/`f64`,
+    /// [`ReduceOp::Max`] or [`ReduceOp::Min`] for a complex or `bool` dtype,
+    /// and every op for `bool`. Returns
+    /// [`StridedError::StrideLengthMismatch`] when `dims` and `src_strides`
+    /// have different lengths, and [`StridedError::OffsetOverflow`] when the
+    /// element count overflows `usize` or the fused traversal arithmetic
+    /// (extents, steps, and negated resets) does not fit `isize`.
     pub fn compile(
         dtype: KernelDType,
         op: ReduceOp,
@@ -437,6 +507,21 @@ impl ErasedReducePlan {
     /// `axes` names the source axes reduced away. Output dimensions must be the
     /// remaining source dimensions in source-axis order. When all axes are
     /// reduced, any output layout with exactly one reachable element is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `op` has no identity
+    /// in `dtype` (see [`Self::compile`]),
+    /// [`StridedError::StrideLengthMismatch`] when a stride list does not
+    /// match its dimension list, [`StridedError::OffsetOverflow`] when an
+    /// element count, a layout span, a reset or a fused extent does not fit
+    /// `usize`/`isize`, [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent),
+    /// [`StridedError::InvalidAxis`] when `axes` repeats an axis or names one
+    /// outside the source rank, and [`StridedError::ShapeMismatch`] when
+    /// `dest_dims` is not the kept source extents in source-axis order (or,
+    /// when every axis is reduced, does not hold exactly one element).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_axes(
         dtype: KernelDType,
@@ -544,6 +629,18 @@ impl ErasedReducePlan {
     }
 
     /// Execute the reduction into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `src` carries a
+    /// different dtype than the plan,
+    /// [`StridedError::PlanLayoutMismatch`] when the source layout or the
+    /// axis-reduction destination layout does not match the compiled one,
+    /// [`StridedError::RankMismatch`] when a full reduction gets a
+    /// destination that does not hold exactly one element,
+    /// [`StridedError::OffsetOverflow`] when that destination's extents
+    /// multiply beyond `usize`. All are returned before the first destination
+    /// write.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -610,6 +707,16 @@ impl ErasedReducePlan {
     /// may leave a partially initialized `MaybeUninit` destination, which is
     /// still safely droppable; no readable value is promised for unwritten
     /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `src` carries a
+    /// different dtype than the plan,
+    /// [`StridedError::OverlappingInputOutput`] when the source allocation
+    /// overlaps the destination, [`StridedError::PlanLayoutMismatch`],
+    /// [`StridedError::RankMismatch`], and [`StridedError::OffsetOverflow`]
+    /// exactly as [`Self::execute`] does. All are returned before the first
+    /// destination write.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -926,6 +1033,15 @@ pub struct ErasedUpdatePlan {
 
 impl ErasedUpdatePlan {
     /// Compile an update plan for one dtype and layout pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
+    /// `dst_strides`, and `src_strides` do not all have the same length,
+    /// [`StridedError::OffsetOverflow`] when the element count does not fit
+    /// `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent).
     pub fn compile(
         dtype: KernelDType,
         dims: &[usize],
@@ -954,6 +1070,14 @@ impl ErasedUpdatePlan {
     ///
     /// `alpha`, `beta`, and `op` are resolved once per call; the layout check
     /// and replay are the same allocation-free [`UpdatePlan`] path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `src`, or the
+    /// scalar type `T` carries a different dtype than the plan, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Both are returned before any destination
+    /// write.
     ///
     /// # Examples
     ///

@@ -397,6 +397,23 @@ pub struct ScatterPlan {
 
 impl GatherPlan {
     /// Compile a gather plan for fixed operand, index, and destination layouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when a stride list does
+    /// not match its dimension list, [`StridedError::OffsetOverflow`] when an
+    /// element count or a layout span does not fit `usize`/`isize`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// maps two logical indices onto one offset.
+    /// [`StridedError::RankMismatch`] reports `spec.slice_sizes` or
+    /// `spec.offset_dims` of the wrong length, or an index vector that does not
+    /// match `spec.start_index_map`;
+    /// [`StridedError::InvalidAxis`] reports `collapsed_slice_dims`,
+    /// `start_index_map`, or `offset_dims` that repeat or exceed their rank,
+    /// `index_vector_dim` beyond the index rank, a slice size beyond its
+    /// operand extent, or a collapsed axis whose slice size is not one; and
+    /// [`StridedError::ShapeMismatch`] reports a `dest_dims` that is not the
+    /// gathered window/batch shape.
     pub fn compile(
         operand_dims: &[usize],
         operand_strides: &[isize],
@@ -575,6 +592,14 @@ impl GatherPlan {
     }
 
     /// Execute the prepared gather traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, index,
+    /// or destination view does not carry its compiled extents and strides,
+    /// before any destination write. That is the only rejection: start
+    /// indices are clamped into the operand window, so an out-of-range index
+    /// is not an error.
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -926,6 +951,20 @@ impl DynamicSlicePlan {
     ///
     /// `start_*` describes a rank-1 index vector whose length equals the
     /// operand rank. `dest_dims` must equal `slice_sizes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when a stride list does
+    /// not match its dimension list, [`StridedError::RankMismatch`] when
+    /// `slice_sizes` differs from the operand rank or the start layout is not a
+    /// rank-1 vector of that same length,
+    /// [`StridedError::OffsetOverflow`] when an element count or layout span
+    /// does not fit `usize`/`isize`, [`StridedError::ShapeMismatch`] when
+    /// `dest_dims` differs from `slice_sizes` in extent or rank,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// maps two logical indices onto one offset, and
+    /// [`StridedError::InvalidAxis`] when a slice size exceeds its operand
+    /// extent.
     pub fn compile(
         operand_dims: &[usize],
         operand_strides: &[isize],
@@ -981,6 +1020,14 @@ impl DynamicSlicePlan {
     }
 
     /// Execute the prepared dynamic-slice traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, start,
+    /// or destination view does not carry its compiled extents and strides,
+    /// before any destination write. Start values are clamped to
+    /// `operand_dims - slice_sizes`, so an out-of-range start is not an
+    /// error.
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1253,6 +1300,20 @@ impl DynamicUpdateSlicePlan {
     ///
     /// `dest_dims` must match `operand_dims`; execution materializes
     /// `dest = operand` and then overwrites the clamped update window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when a stride list does
+    /// not match its dimension list, [`StridedError::RankMismatch`] when
+    /// `update_dims` differs from the operand rank or the start layout is not a
+    /// rank-1 vector of that same length,
+    /// [`StridedError::OffsetOverflow`] when an element count or layout span
+    /// does not fit `usize`/`isize`, [`StridedError::ShapeMismatch`] when
+    /// `dest_dims` differs from `operand_dims` in extent or rank,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// maps two logical indices onto one offset, and
+    /// [`StridedError::InvalidAxis`] when an update extent exceeds its
+    /// operand extent.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -1315,6 +1376,14 @@ impl DynamicUpdateSlicePlan {
     }
 
     /// Execute the prepared dynamic-update-slice traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, update,
+    /// start, or destination view does not carry its compiled extents and
+    /// strides, before the operand copy runs. Start values are clamped to
+    /// `operand_dims - update_dims`, so an out-of-range start is not an
+    /// error.
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1590,6 +1659,25 @@ impl DynamicUpdateSlicePlan {
 
 impl ScatterPlan {
     /// Compile an additive scatter traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when a stride list does
+    /// not match its dimension list, [`StridedError::OffsetOverflow`] when an
+    /// element count or layout span does not fit `usize`/`isize`,
+    /// [`StridedError::ShapeMismatch`] when `dest_dims` differs from
+    /// `operand_dims` or an update batch extent differs from the index batch
+    /// shape, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent).
+    /// [`StridedError::InvalidAxis`] reports `inserted_window_dims`,
+    /// `scatter_dims_to_operand_dims`, or `update_window_dims` that repeat or
+    /// exceed their rank, `index_vector_dim` beyond the index rank, or an
+    /// update window extent beyond its operand extent; and
+    /// [`StridedError::RankMismatch`] reports an index vector that does not
+    /// match `scatter_dims_to_operand_dims`, a wrong-length
+    /// `update_window_dims`, or an update batch rank that disagrees with the
+    /// index batch shape.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -1732,6 +1820,13 @@ impl ScatterPlan {
     }
 
     /// Execute the prepared additive scatter traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, index,
+    /// update, or destination view does not carry its compiled extents and
+    /// strides, before the operand copy runs. Start values are clamped into
+    /// the operand window, so an out-of-range scatter index is not an error.
     #[inline(always)]
     pub fn execute<T, I>(
         &self,

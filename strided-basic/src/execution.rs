@@ -122,7 +122,9 @@ pub unsafe fn build_plan_fused_small(
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
+///
+/// Performs no validation of its own, so the only error it can return is the
+/// one `f` returns; the block walk itself cannot fail. Callers must still
 /// satisfy the safety contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn for_each_inner_block_preordered<S: AsRef<[isize]>, F>(
@@ -167,8 +169,14 @@ where
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::RankMismatch` or `StridedError::ShapeMismatch`
+/// when the source view does not have the destination's ranks and extents,
+/// the only checks the entry keeps. The destination layout is not
+/// re-validated: `validated` is taken as proof of injectivity, and a marker
+/// for this geometry also excludes an unrepresentable element count.
+/// Callers must still satisfy the safety contract before invoking this
+/// prevalidated entry.
 #[inline]
 pub unsafe fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
@@ -203,8 +211,13 @@ pub unsafe fn map_into_validated<D: Copy + Send + Sync, A: Copy + Send + Sync, O
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Performs no shape or destination-layout check of its own and returns
+/// `Ok(())` for every call that satisfies the safety contract: matching
+/// source extents come from that contract, destination injectivity from
+/// `validated`, and a marker for this geometry also excludes an
+/// unrepresentable element count. Callers must still satisfy the safety
+/// contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn zip_map2_into_validated<
     D: Copy + Send + Sync,
@@ -246,8 +259,14 @@ pub unsafe fn zip_map2_into_validated<
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::RankMismatch` or `StridedError::ShapeMismatch`
+/// when any source view does not have the destination's ranks and extents,
+/// the only checks the entry keeps. The destination layout is not
+/// re-validated: `validated` is taken as proof of injectivity, and a marker
+/// for this geometry also excludes an unrepresentable element count.
+/// Callers must still satisfy the safety contract before invoking this
+/// prevalidated entry.
 #[inline]
 pub unsafe fn zip_map3_into_validated<
     D: Copy + Send + Sync,
@@ -294,8 +313,14 @@ pub unsafe fn zip_map3_into_validated<
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::RankMismatch` or `StridedError::ShapeMismatch`
+/// when any source view does not have the destination's ranks and extents,
+/// the only checks the entry keeps. The destination layout is not
+/// re-validated: `validated` is taken as proof of injectivity, and a marker
+/// for this geometry also excludes an unrepresentable element count.
+/// Callers must still satisfy the safety contract before invoking this
+/// prevalidated entry.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn zip_map4_into_validated<
@@ -348,8 +373,14 @@ pub unsafe fn zip_map4_into_validated<
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::RankMismatch` or `StridedError::ShapeMismatch`
+/// when the source does not have the destination's ranks and extents, the
+/// only checks the entry keeps. The destination layout is not re-validated:
+/// `validated` is taken as proof of injectivity, and a marker for this
+/// geometry also excludes an unrepresentable element count. Callers must
+/// still satisfy the safety contract before invoking this prevalidated
+/// entry.
 #[inline]
 pub unsafe fn map_raw_into_validated<
     D: Copy + Send + Sync,
@@ -390,8 +421,14 @@ pub unsafe fn map_raw_into_validated<
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::RankMismatch` or `StridedError::ShapeMismatch`
+/// when either source does not have the destination's ranks and extents,
+/// the only checks the entry keeps. The destination layout is not
+/// re-validated: `validated` is taken as proof of injectivity, and a marker
+/// for this geometry also excludes an unrepresentable element count.
+/// Callers must still satisfy the safety contract before invoking this
+/// prevalidated entry.
 #[inline]
 pub unsafe fn zip_map2_raw_into_validated<
     D: Copy + Send + Sync,
@@ -465,8 +502,11 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::OffsetOverflow` when the element count of `dims`
+/// cannot be represented, and otherwise only the error `f` returns; the
+/// splitter itself cannot fail. Callers must still satisfy the safety
+/// contract before invoking this prevalidated entry.
 #[inline]
 pub unsafe fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     dims: &[usize],
@@ -523,7 +563,12 @@ where
 /// ```
 ///
 /// # Errors
-/// Forwards the plan layout/index validation errors before successful overwrite.
+///
+/// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
+/// or start-index view does not carry the plan's compiled extents and
+/// strides, before any destination write, and
+/// `StridedError::OffsetOverflow` when a replay offset cannot be
+/// represented. Out-of-range start indices are clamped, not rejected.
 #[inline]
 pub unsafe fn gather_into_uninit<T, I>(
     plan: &crate::GatherPlan,
@@ -565,8 +610,12 @@ where
 /// ```
 ///
 /// # Errors
-/// Forwards errors from the owning kernel or callback; callers must still
-/// satisfy the safety contract before invoking this prevalidated entry.
+///
+/// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
+/// or start view does not carry the plan's compiled extents and strides,
+/// before any destination write, and `StridedError::OffsetOverflow` when a
+/// replay offset, source span, or element count cannot be represented.
+/// Out-of-range start values are clamped, not rejected.
 #[inline]
 pub unsafe fn dynamic_slice_into_uninit<T, I>(
     plan: &crate::DynamicSlicePlan,
@@ -611,7 +660,13 @@ where
 /// ```
 ///
 /// # Errors
-/// Forwards the plan layout/index validation errors.
+///
+/// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
+/// update, or start view does not carry the plan's compiled extents and
+/// strides, before any destination write, and
+/// `StridedError::OffsetOverflow` when a replay offset, source span, or
+/// element count cannot be represented. Out-of-range start values are
+/// clamped, not rejected.
 #[inline]
 pub unsafe fn dynamic_update_into_uninit<'a, T, I>(
     plan: &crate::DynamicUpdateSlicePlan,
@@ -658,7 +713,13 @@ where
 /// ```
 ///
 /// # Errors
-/// Forwards the plan layout/index validation errors.
+///
+/// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
+/// scatter-index, or update view does not carry the plan's compiled extents
+/// and strides, before any destination write, and
+/// `StridedError::OffsetOverflow` when a replay offset or index component
+/// offset cannot be represented. Out-of-range scatter indices are clamped,
+/// not rejected.
 #[inline]
 pub unsafe fn scatter_into_uninit<'a, T, I>(
     plan: &crate::ScatterPlan,

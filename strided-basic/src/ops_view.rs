@@ -195,6 +195,17 @@ unsafe fn inner_loop_dot<
 }
 
 /// Copy elements from source to destination: `dest[i] = src[i]`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, and [`StridedError::OffsetOverflow`] when the element count of
+/// the shape does not fit in `usize`. The generic element path also returns
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the address span is too large to represent. Nothing is
+/// written unless validation succeeds.
 pub fn copy_into<T: Copy + Send + Sync, Op: ElementOp<T>>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T, Op>,
@@ -313,6 +324,16 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
 ///
 /// Delegates to the centralized permutation-copy dispatch for the actual work.
+///
+/// # Errors
+///
+/// The rejection set of that dispatch: [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, [`StridedError::OffsetOverflow`] when the layout cannot be
+/// expressed in `isize` stride arithmetic or a fused extent overflows, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective. Nothing is written unless
+/// validation succeeds.
 pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
@@ -323,6 +344,14 @@ pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
 /// Accumulating element-wise addition: `dest[i] += src[i]`.
 ///
 /// Source may have a different element type from destination.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, and [`StridedError::OffsetOverflow`] when the element count of
+/// the shape does not fit in `usize`. Every check runs before the first
+/// write, so a rejected call leaves `dest` untouched.
 pub fn add_acc<
     D: Copy + Add<S, Output = D> + Send + Sync,
     S: Copy + Send + Sync,
@@ -433,6 +462,14 @@ pub fn add_acc<
 /// Accumulating element-wise multiplication: `dest[i] *= src[i]`.
 ///
 /// Source may have a different element type from destination.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, and [`StridedError::OffsetOverflow`] when the element count of
+/// the shape does not fit in `usize`. Every check runs before the first
+/// write, so a rejected call leaves `dest` untouched.
 pub fn mul_acc<
     D: Copy + Mul<S, Output = D> + Send + Sync,
     S: Copy + Send + Sync,
@@ -543,6 +580,14 @@ pub fn mul_acc<
 /// Accumulating AXPY: `dest[i] = alpha * src[i] + dest[i]`.
 ///
 /// Alpha, source, and destination may have different element types.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, and [`StridedError::OffsetOverflow`] when the element count of
+/// the shape does not fit in `usize`. Every check runs before the first
+/// write, so a rejected call leaves `dest` untouched.
 pub fn axpy_acc<D, S, A, Op>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
@@ -658,6 +703,14 @@ where
 /// Accumulating fused multiply-add: `dest[i] += OpA::apply(a[i]) * OpB::apply(b[i])`.
 ///
 /// Operands may have different element types. Element operations are applied lazily.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when `dest` and an operand describe
+/// different extents, and [`StridedError::OffsetOverflow`] when the element
+/// count of the shape does not fit in `usize`. Every check runs before the
+/// first write, so a rejected call leaves `dest` untouched.
 pub fn fma_acc<D, A, B, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
@@ -802,6 +855,12 @@ where
 ///
 /// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
 /// the traversal plan are stored inline, so a call performs no heap allocation.
+///
+/// # Errors
+///
+/// Returns [`StridedError::OffsetOverflow`] when the element count of the
+/// view's shape does not fit in `usize`, the only failure this entry can
+/// produce. That check runs first, before any planning or read.
 pub fn sum<
     T: Copy + Zero + Add<Output = T> + Send + Sync + simd::MaybeSimdOps,
     Op: ElementOp<T>,
@@ -862,6 +921,13 @@ pub fn sum<
 ///
 /// At rank ≤ [`INLINE_RANK`](strided_view::INLINE_RANK) the view metadata and
 /// the traversal plan are stored inline, so a call performs no heap allocation.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the two operands describe different
+/// extents, and [`StridedError::OffsetOverflow`] when the element count of
+/// their shape does not fit in `usize`.
 pub fn dot<A, B, R, OpA, OpB>(a: &StridedView<A, OpA>, b: &StridedView<B, OpB>) -> Result<R>
 where
     A: Copy + Mul<B, Output = R> + Send + Sync + 'static,
@@ -951,6 +1017,19 @@ where
 }
 
 /// Symmetrize a square matrix: `dest = (src + src^T) / 2`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] when `src` is not rank 2,
+/// [`StridedError::NonSquare`] when its two extents differ, and
+/// [`StridedError::ScalarConversion`] when `T` cannot represent `0.5`.
+/// Writing through [`zip_map2_into`](crate::zip_map2_into) adds
+/// [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`] when
+/// `dest` and the transposed `src` describe different extents, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn symmetrize_into<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
@@ -981,6 +1060,19 @@ where
 }
 
 /// Conjugate-symmetrize a square matrix: `dest = (src + conj(src^T)) / 2`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] when `src` is not rank 2,
+/// [`StridedError::NonSquare`] when its two extents differ, and
+/// [`StridedError::ScalarConversion`] when `T` cannot represent `0.5`.
+/// Writing through [`zip_map2_into`](crate::zip_map2_into) adds
+/// [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`] when
+/// `dest` and the adjoint of `src` describe different extents, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn symmetrize_conj_into<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
@@ -1015,6 +1107,15 @@ where
 /// Overwriting copy with scaling: `dest[i] = scale * src[i]`.
 ///
 /// Scale, source, and destination may have different element types.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, and [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven representable and injective: two
+/// logical indices name one offset, or the element count or address span is
+/// too large to represent. Nothing is written unless validation succeeds.
 pub fn copy_scale_into<D, S, A, Op>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
@@ -1031,6 +1132,16 @@ where
 }
 
 /// Overwriting copy with complex conjugation: `dest[i] = conj(src[i])`.
+///
+/// # Errors
+///
+/// The rejection set of [`copy_into`]: [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views describe different
+/// extents, [`StridedError::OffsetOverflow`] when the element count of the
+/// shape does not fit in `usize`, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective. Nothing is written unless
+/// validation succeeds.
 pub fn copy_conj_into<T: Copy + ElementOpApply + Send + Sync>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
@@ -1689,6 +1800,17 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
 }
 
 /// Copy with transpose and scaling: `dest[j,i] = scale * src[i,j]`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] when `src` or `dest` is not rank
+/// 2, [`StridedError::ShapeMismatch`] when `dest` does not have the
+/// transposed extents of `src`, and
+/// [`StridedError::OffsetOverflow`] when the element count does not fit in
+/// `usize`. When `scale` is one and `T`'s transpose is the identity, the
+/// permutation path also returns
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective.
 pub fn copy_transpose_scale_into<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,

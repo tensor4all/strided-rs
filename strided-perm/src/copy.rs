@@ -193,6 +193,16 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 /// This is a simple copy without ElementOp support. For copies with
 /// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
 ///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`]
+/// when the views describe different extents,
+/// [`StridedError::OffsetOverflow`] when the layout cannot be expressed in
+/// `isize` stride arithmetic or a fused extent overflows, and
+/// [`StridedError::NonInjectiveOutputLayout`] when two destination elements
+/// map onto the same memory offset, or the layout span is not representable.
+/// Nothing is written unless validation succeeds.
+///
 /// # Examples
 ///
 /// ```
@@ -227,6 +237,13 @@ pub fn copy_into<T: Copy + Send + Sync + 'static>(
 /// 4096x4096 `f64` transpose). Every destination element the views describe
 /// is written exactly once; the stores go through raw pointers only, so no
 /// reference to uninitialized storage is formed.
+///
+/// # Errors
+///
+/// Same rejection set as [`copy_into`]: [`StridedError::RankMismatch`],
+/// [`StridedError::ShapeMismatch`], [`StridedError::OffsetOverflow`] and
+/// [`StridedError::NonInjectiveOutputLayout`]. Nothing is written unless
+/// validation succeeds.
 pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
     src: &StridedView<T>,
@@ -245,6 +262,12 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
 /// This delegates to the same HPTT-inspired blocked permutation as
 /// [`copy_into`]. The HPTT planner handles the col-major destination case
 /// optimally.
+///
+/// # Errors
+///
+/// The errors of [`copy_into`]: [`StridedError::RankMismatch`],
+/// [`StridedError::ShapeMismatch`], [`StridedError::OffsetOverflow`] and
+/// [`StridedError::NonInjectiveOutputLayout`].
 pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
