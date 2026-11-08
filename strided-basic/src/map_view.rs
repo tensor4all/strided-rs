@@ -859,7 +859,10 @@ fn strided_offset_for_contiguous_linear_index(
     offset
 }
 
-// Raw parts leaf: base pointers and layout metadata of both operands, called per range.
+// Raw parts entry for the whole contiguous product: the three base pointers, the
+// dims and strides of both operands and the executor. The argument list is wide
+// because this function splits the work itself (`parallel_for_each` below) from
+// exactly these values; nothing calls it once per worker range.
 #[allow(clippy::too_many_arguments)]
 fn try_contiguous_range_mul<
     O: MulOutput<D>,
@@ -1967,7 +1970,8 @@ fn zip_map2_parts_into_validated<
 }
 
 // Raw parts for the whole multiplication: it takes the contiguous fast path when the three
-// layouts agree, and otherwise walks the strided one. The operands are the operation's, not a block's.
+// layouts agree, and otherwise walks the strided one. The operands here are the
+// operation's, not a block's.
 #[allow(clippy::too_many_arguments)]
 fn mul_identity_into_raw<
     O: MulOutput<D>,
