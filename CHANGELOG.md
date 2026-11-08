@@ -12,10 +12,10 @@ downstream that runs `cargo update` without a version constraint change.
 
 Bumped to 0.13.0: `strided-basic`, `strided-perm`, `strided-kernel`,
 `strided-fused`, `strided-nn`. `strided-traits` keeps 0.7.0 (nothing in it changed).
-`strided-view` goes to **0.7.2**: the published 0.7.1 multiplies strides with wrapping
-`isize` arithmetic, while this tree uses `checked_col_major_strides` /
-`checked_row_major_strides` and refuses a stride product that does not fit (see the
-migration note at the end).
+`strided-view` goes to **0.7.2** so that the checked dense-stride helpers this tree
+carries (`checked_col_major_strides` / `checked_row_major_strides`) can be published;
+the published 0.7.1 does not contain them. The acceptance rules and the panic set are
+documented on `checked_dense_strides` and pinned by its tests.
 
 ### Breaking changes
 
@@ -55,13 +55,10 @@ cargo add strided-basic@0.13 strided-perm@0.13 strided-kernel@0.13 strided-fused
 cargo build   # then fix the remaining call sites the compiler names
 ```
 
-Code that only calls `strided-traits` / `strided-view` needs no source change.
-`strided-view` 0.7.2 replaces unchecked dense-stride arithmetic with the checked
-`checked_col_major_strides` / `checked_row_major_strides`: a stride product that does
-not fit `isize` now panics (or returns `Err(OffsetOverflow)` from the checked helper)
-where the published 0.7.1 wrapped. Shapes at or beyond the `isize` limit used to be
-constructible with a wrapped stride; they are now rejected, so any caller relying on
-the wrapped value will see a panic or an error instead.
+Code that only calls `strided-traits` / `strided-view` needs no source change. The
+public `col_major_strides` / `row_major_strides` now forward the checked helpers, so a
+shape they accept is one the helpers accept; see `checked_dense_strides` for what that
+means at the `isize` boundary.
 
 ### Additive
 
