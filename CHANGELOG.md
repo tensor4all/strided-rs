@@ -11,8 +11,10 @@ crates.io with the old names: renaming inside a patch version would break every
 downstream that runs `cargo update` without a version constraint change.
 
 Bumped to 0.13.0: `strided-basic`, `strided-perm`, `strided-kernel`,
-`strided-fused`, `strided-nn`. `strided-traits` (0.7.0) and `strided-view`
-(0.7.1) keep their versions; nothing in them changed.
+`strided-fused`, `strided-nn`. `strided-traits` keeps 0.7.0 (nothing in it changed).
+`strided-view` goes to **0.7.2**: the published 0.7.1 still multiplies strides with
+wrapping `isize` arithmetic, while this tree panics where the product would overflow
+(a zero-extent shape still saturates at `isize::MAX` instead of panicking).
 
 ### Breaking changes
 
@@ -46,11 +48,15 @@ Listed for completeness, not a downstream change: `strided-perm`'s own copy of
 
 ```
 cargo add strided-basic@0.13 strided-perm@0.13 strided-kernel@0.13 strided-fused@0.13 strided-nn@0.13
-sed -i -E 's/\b(add|mul|fma|axpy)\(/\1_acc(/g; s/\bcopy_(scale|conj)\(/copy_\1_into(/g' $(git ls-files '*.rs')
+# then rename the resolved calls: `add`→`add_acc`, `mul`→`mul_acc`, `fma`→`fma_acc`,
+# `axpy`→`axpy_acc`, `copy_scale`→`copy_scale_into`, `copy_conj`→`copy_conj_into`
+# (unqualified matching is unsafe: `ptr.add(1)` and `impl Add` are not these calls)
+
 cargo build   # then fix the remaining call sites the compiler names
 ```
 
-Code that only calls `strided-traits` / `strided-view` needs no change.
+Code that only calls `strided-traits` / `strided-view` needs no source change;
+`strided-view` 0.7.2 only replaces a silently wrapping stride with a panic.
 
 ### Additive
 
