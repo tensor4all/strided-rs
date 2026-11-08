@@ -16,11 +16,16 @@ env:
   CARGO_TERM_COLOR: always
   MIRIFLAGS: -Zmiri-disable-isolation
 
+# 同じ target を 2 本同時に走らせない（「既存 issue なし」を両方が読んで二重起票する競合を消す）。
+concurrency:
+  group: miri-${{ matrix.target }}
+  cancel-in-progress: false
+
 jobs:
   miri:
     name: cargo miri (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -45,11 +50,15 @@ jobs:
 
       - name: cargo miri test
         id: run
+        # ジョブ全体(120)より短くし、ハングしても通知ステップに必ず到達させる
+        timeout-minutes: 60
         continue-on-error: true
         run: cargo miri test ${{ matrix.args }}
 
+      # `steps.run.outcome` だけでなく **job の失敗全般**を拾う（setup 失敗・timeout でも起票する）。
+      # main 以外（作業ブランチでの workflow_dispatch）では起票しない。
       - name: File an issue when Miri fails
-        if: steps.run.outcome == 'failure'
+        if: failure() && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
@@ -59,10 +68,11 @@ jobs:
         run: |
           set -euo pipefail
           MARK="<!-- miri-failure:${TARGET} -->"
-          # 同じ target の open issue があればコメントで積む（毎週 issue を増やさない）。
-          # GitHub の検索は HTML コメントを索引しないことがあるので、open を取って本文で照合する。
-          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --json number,body --limit 100 \
-            --jq "[.[] | select(.body | contains(\"${MARK}\"))] | .[0].number // empty")
+          # 既存 issue の検索は **タイトル**で絞る（open を 100 件取る方式は、issue が増えると
+          # 既存を見落として重複起票する）。HTML コメントは GitHub の検索に索引されない。
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open \
+            --search 'miri in:title' --json number,title --limit 50 \
+            --jq "[.[] | select(.title == \"miri: ${ARGS} fails on main\")] | .[0].number // empty")
           body=$(mktemp)
           {
             echo "$MARK"
@@ -78,9 +88,10 @@ jobs:
             gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file "$body"
             echo "commented on #${existing}"
           else
+            # 失敗を握り潰さない: 起票できなければ **この step を赤くする**（通知が消えるのを防ぐ）
             gh issue create -R "$GITHUB_REPOSITORY" \
               --title "miri: ${ARGS} fails on main" \
-              --body-file "$body" || true
+              --body-file "$body"
           fi
           rm -f "$body"
 
