@@ -67,15 +67,15 @@ owner's call, not taken here.
 
 **The width must come from the run being judged, not from a constant baked in
 from history.** Calibrating a constant from the same 5 `main` runs gives
-median 0.976, MAD 0.016, so the 15% floor dominates and the gate is **1.415**;
-including the 1.504 observation instead gives **1.441**; over all 17 samples,
-**1.377**. MAD has a 50% breakdown point, so one outlier barely moves it, and
+median 0.976, MAD 0.016, so the 15% floor dominates and the gate is **1.439**;
+including the 1.504 observation instead gives **1.447**; over all 17 samples,
+**1.428**. MAD has a 50% breakdown point, so one outlier barely moves it, and
 every such constant is *tighter* than the 1.5 that already flaked. A constant
 would therefore re-fail the event this issue exists for. Computing the width
 from the run's own samples is the only form that adapts to a noisy runner.
 
 Locally (not evidence, just confirming the arithmetic and that the row passes):
-S1 ratio 0.998, MAD 0.0218, width 0.1496 (floor), gate 1.447.
+S1 ratio 0.998, MAD 0.0218, width 0.1497 (floor), gate 1.449.
 
 ## 3. What is *not* claimed
 
@@ -105,6 +105,27 @@ A is shipped because it is the form the ruling specifies (`0.15 * median`) with
 the anchor the review required; B is a one-line change (`GATE_FLOOR_FRACTION *
 PARITY_ANCHOR`) if the owner prefers no relaxation at all; C keeps the old
 threshold and bets on the statistic alone.
+
+**Decision (owner, 2026-11-08): A.** A is the ruling's `max(1.4826 * MAD,
+0.15 * median)` as written; B is a different rule that pins the median term to the
+constant 1.0, and C is the fixed 1.5 the ruling already rejected.
+
+**Follow-up condition for B, recorded so it is not lost.** The only reason A
+tolerates a steady band up to 1.82x is that the 1.504 run's within-run MAD is
+unknown: the old harness kept only the minimum of five rounds, so nothing says
+whether that run was noisy (a wide width, which is the intended behaviour) or
+quiet (a genuine 1.5x cost, which A would let through). This change is what makes
+the question answerable, because the table now prints `median`, `MAD`, `p95` and
+`width` per run. Read the **next 5 runs** after this lands and take B
+(`GATE_FLOOR_FRACTION * PARITY_ANCHOR` in `parity_width`, plus this table) if the
+floor is what dominates in those runs — i.e. if `1.4826 * MAD < 0.15 * median` in
+all five, which every run measured so far satisfies (MAD 0.0009–0.049, so
+`1.4826 * MAD` = 0.001–0.073 against a floor of 0.143–0.152). Taking B snaps the
+zero-MAD bound back to 1.45 and fails a steady 1.5x, at the cost of re-failing a
+repeat of the 1.504 event. If instead one of the five shows `1.4826 * MAD` at or
+above the floor, the width is doing real work and A is the right rule to keep.
+Do not switch on a single run: the condition is about which term dominates,
+observed over five.
 
 ## 4. The hang
 
