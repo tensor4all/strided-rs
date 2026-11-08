@@ -71,9 +71,11 @@ The policy-aware parallel replay currently covers:
 
 Additive scatter remains serial because repeated indices are order-sensitive.
 It must preserve deterministic column-major update order unless a future API
-provides a separately validated non-overlap contract. Raw `CopyPlan` replay
-also remains serial: the initial range-partitioned implementation regressed
-large contiguous copies. Both remain benchmark targets.
+provides a separately validated non-overlap contract; it remains a benchmark
+target. Raw `CopyPlan` / `UpdatePlan` replay and the plan-free `replay_*_raw`
+entries split their logical index range across the token's budget under the
+same copy-class rule, on a destination proven injective; the plan-free entries
+replay any other destination serially in column-major order.
 
 ### Reduction evaluation order and the deterministic route
 
