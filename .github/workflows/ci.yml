@@ -78,6 +78,8 @@ jobs:
         run: python3 scripts/test-repository-rules-review.py
       - name: Test the runtime SIMD dispatch check script
         run: python3 scripts/test-check-runtime-simd-dispatch.py
+      - name: Test the review waiver script
+        run: node --test scripts/test-review-waiver.js
 
   coverage:
     name: coverage

@@ -7,8 +7,8 @@ It is inspired by Julia's [Strided.jl](https://github.com/Jutho/Strided.jl),
 
 Depend on the individual crates you need, for example `strided-view` for the
 view types, `strided-perm` for permutation and `strided-kernel` for
-arithmetic. All workspace crates listed below are maintained. The new basic/fused packages
-are currently available from this workspace checkout, not yet from crates.io.
+arithmetic. All workspace crates listed below are maintained and published on
+crates.io.
 
 ## Workspace Layout
 
@@ -39,8 +39,8 @@ Add the crates you use from crates.io, for example:
 
 ```toml
 [dependencies]
-strided-view = "0.4"
-strided-kernel = "0.4"
+strided-view = "0.7"
+strided-kernel = "0.12"
 ```
 
 ## Documentation

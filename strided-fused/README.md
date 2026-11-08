@@ -25,4 +25,5 @@ crate with its existing context and output storage; users need not select plans
 manually when their runtime already performs that planning.
 
 See [kernel boundaries](../docs/design/cpu-kernel-boundaries.md) and the packaged
-license notices. This new package has not yet been published.
+license notices. Published on crates.io as `strided-fused`; pin the version
+that matches the other crates you use.

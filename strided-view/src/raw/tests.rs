@@ -137,3 +137,45 @@ fn raw_mut_can_reborrow_as_view() {
     let view_mut = raw.as_view_mut();
     assert_eq!(view_mut.get(&[1, 1]), 4);
 }
+
+#[test]
+fn raw_descriptors_debug_print_layout_without_the_buffer() {
+    let dims = [64usize];
+    let strides = [1isize];
+    let values = [1.5f64; 64];
+    let reference = ErasedRawStridedRef::from_slice(&values, &dims, &strides, 0).unwrap();
+    let typed = RawStridedRef::new(&values, &dims, &strides, 0).unwrap();
+
+    let mut mutable_values = [1.5f64; 64];
+    let mutable =
+        ErasedRawStridedMut::from_slice_mut(&mut mutable_values, &dims, &strides, 0).unwrap();
+    let mut typed_values = [1.5f64; 64];
+    let typed_mut = RawStridedMut::new(&mut typed_values, &dims, &strides, 0).unwrap();
+
+    let mut uninit_values = [MaybeUninit::<f64>::uninit(); 64];
+    let uninit_mut =
+        ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit_values, &dims, &strides, 0)
+            .unwrap();
+
+    // Exact strings, so a summary that grows a `data` field fails here.
+    assert_eq!(
+        format!("{reference:?}"),
+        "ErasedRawStridedRef { dtype: F64, byte_len: 512, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
+        format!("{mutable:?}"),
+        "ErasedRawStridedMut { dtype: F64, byte_len: 512, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
+        format!("{uninit_mut:?}"),
+        "ErasedRawStridedUninitMut { dtype: F64, byte_len: 512, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
+        format!("{typed:?}"),
+        "RawStridedRef { data_len: 64, dims: [64], strides: [1], offset: 0 }"
+    );
+    assert_eq!(
+        format!("{typed_mut:?}"),
+        "RawStridedMut { data_len: 64, dims: [64], strides: [1], offset: 0 }"
+    );
+}

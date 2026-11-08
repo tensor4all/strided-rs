@@ -26,8 +26,22 @@ env:
 jobs:
   review-bot:
     name: repository rules review
+    # Deterministic review only: the external LLM pass is permanently disabled
+    # (`--llm-skipped-reason` on the review step below), so this job executes the
+    # base tree's `scripts/repository-rules-review.py --dry-run` after checking out
+    # the base revision and fetching the PR head for `git diff` only. Nothing from
+    # the PR branch runs and no secret is read, which is why fork and in-repo PRs
+    # are reviewed by the same trusted code.
+    #
+    # The author's association was nevertheless required here, and that is exactly
+    # what the comments on `review-bot-no-llm` and on the gate below deny: both say
+    # a fork PR is evaluated from the base revision with no secret. Keeping the
+    # condition made the workflow contradict itself: a fork PR had every review
+    # job skipped and the required gate failed by construction, which is #2510,
+    # ported from tensor4all/tenferro-rs#2510. With the LLM pass gone the
+    # condition guarded nothing, so it is dropped and the labels are the only
+    # remaining switch.
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
       !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') &&
       !contains(github.event.pull_request.labels.*.name, 'rules-review:no-llm')
     runs-on: ubuntu-latest
@@ -87,8 +101,14 @@ jobs:
 
   review-bot-no-llm:
     name: repository rules review (LLM skipped)
+    # Deterministic pass only: base revision checkout, PR head fetched for the diff
+    # only, base tree's review script, no secret. The author's association is not a
+    # trust boundary here either, and gating on it left every fork PR without a
+    # verdict (#2510, ported from tensor4all/tenferro-rs). This job is now the
+    # legacied escape hatch: it runs only when a maintainer applies the no-LLM
+    # label and leaves the head-sha waiver comment the verify step below requires.
+    # The default path for any PR, fork or in-repo, is `review-bot` above.
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
       !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') &&
       contains(github.event.pull_request.labels.*.name, 'rules-review:no-llm')
     runs-on: ubuntu-latest
@@ -209,17 +229,30 @@ jobs:
           REVIEW_RESULT: ${{ needs.review-bot.result }}
           NO_LLM_RESULT: ${{ needs.review-bot-no-llm.result }}
           WAIVED_RESULT: ${{ needs.review-bot-waived.result }}
-          IS_EXTERNAL_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
           REVIEW_WAIVE_LABEL: ${{ env.REVIEW_WAIVE_LABEL }}
           REVIEW_NO_LLM_LABEL: ${{ env.REVIEW_NO_LLM_LABEL }}
         run: |
           set -euo pipefail
-          if [ "${IS_EXTERNAL_PR}" = "true" ]; then
-            echo "External PRs are not accepted for repository rules review."
+          # This used to reject every fork PR, because the three review jobs above were gated on
+          # `head.repo == github.repository`, and `review-bot` additionally on the author's
+          # association. None of them needs those conditions: each one checks out the *base*
+          # revision, fetches the PR head for the diff only, and runs the base tree's
+          # `scripts/repository-rules-review.py --dry-run` with no secrets. So a fork PR is reviewed
+          # from the same trusted code as an in-repo one, and refusing forks only meant members who
+          # work from a fork (Ryo-wtnb11/strided-rs#369) could never satisfy a required check.
+          #
+          # What is still worth failing on is the case that produced the old message: a fork PR for
+          # which no review job produced a verdict at all.
+          if [ "${IS_FORK_PR}" = "true" ] &&
+             [ "${REVIEW_RESULT}" = "skipped" ] &&
+             [ "${NO_LLM_RESULT}" = "skipped" ] &&
+             [ "${WAIVED_RESULT}" = "skipped" ]; then
+            echo "Fork PR with no review verdict: all three review jobs were skipped, so there is nothing to gate on. Check that the workflow on the base branch still runs them for forks."
             exit 1
           fi
           if [ "${WAIVED_RESULT}" = "success" ]; then
-            echo "Review waived via label ${REVIEW_WAIVE_LABEL}."
+            echo "Review waived: a maintainer comment names the current head ($REVIEW_WAIVE_LABEL)."
             exit 0
           fi
           if [ "${NO_LLM_RESULT}" = "success" ]; then

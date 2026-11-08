@@ -49,4 +49,5 @@ their requirements. Application code should use the checked root APIs.
 See [kernel boundaries](../docs/design/cpu-kernel-boundaries.md) and the packaged
 `NOTICE` / `THIRD-PARTY-LICENSES` for the Strided.jl lineage.
 
-This new package has not yet been published; use the matching workspace checkout.
+Published on crates.io as `strided-basic`; pin the version that matches the
+other crates you use.

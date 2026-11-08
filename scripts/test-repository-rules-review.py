@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import re
 import sys
 
 
@@ -1100,6 +1101,406 @@ def test_format_report_lists_findings_with_location() -> None:
     )
     assert "[block] x (Public Boundary Safety) strided-view/src/view.rs:42" in report
     assert "detail line" in report
+
+
+# --- hunk-aware diff parsing (tensor4all-meta#88) ----------------------------
+#
+# `git diff` is a state machine: `@@ -a,b +c,d @@` opens a hunk whose body is
+# exactly `b` old-side and `d` new-side lines, and `+++ ` is a file header only
+# while no body is outstanding. The fixtures below are network-free and shared
+# with the pre-fix loops kept here, so the defect stays pinned even after the
+# fix.
+
+REVIEW_GATE_FIXTURES = ROOT / "scripts" / "fixtures" / "review-gate"
+FROZEN_FILE = "deprecated/strided-legacy/src/layout.rs"
+FORGED_FILE = "review.txt"
+
+
+def review_gate_fixture(name: str) -> str:
+    return (REVIEW_GATE_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def legacy_added_lines_with_text(diff_text: str) -> dict[str, list[tuple[int, str]]]:
+    """The pre-fix loop, verbatim from this script before the #88 fix.
+
+    Kept so the vulnerability stays pinned: if an edit reintroduces "a file
+    header is any line starting with `+++ `", this records exactly what that
+    buys an attacker instead of letting the regression pass silently.
+    """
+
+    result: dict[str, list[tuple[int, str]]] = {}
+    current_file: str | None = None
+    new_line = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line.removeprefix("+++ b/").removeprefix("+++ ")
+            current_file = None if raw == "/dev/null" else raw
+            if current_file is not None:
+                result.setdefault(current_file, [])
+            continue
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)", line)
+            new_line = int(match.group(1)) if match else 0
+            continue
+        if current_file is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            result[current_file].append((new_line, line[1:]))
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            continue
+        elif line.startswith(" "):
+            new_line += 1
+
+    return result
+
+
+def legacy_files_with_deleted_lines(diff_text: str) -> set[str]:
+    """The pre-fix deletion collector, verbatim from before the #88 fix."""
+
+    result: set[str] = set()
+    current_file: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line.removeprefix("+++ b/").removeprefix("+++ ")
+            current_file = None if raw == "/dev/null" else raw
+            continue
+        if line.startswith("--- ") or line.startswith("@@"):
+            continue
+        if current_file and line.startswith("-") and not line.startswith("---"):
+            result.add(current_file)
+    return result
+
+
+def test_the_pre_fix_parser_really_was_forgeable() -> None:
+    """Pin the defect: the old loop did believe the payload."""
+
+    legacy = legacy_added_lines_with_text(review_gate_fixture("forged-header.diff"))
+
+    assert FORGED_FILE in legacy, "fixture no longer exercises the forged header"
+    # The payload line was consumed as a file header, so it is not an addition
+    # anywhere; everything after it landed on the author's chosen path.
+    assert legacy[FROZEN_FILE] == [(6, "    /*")]
+    assert legacy[FORGED_FILE] == [(7, "*/")]
+
+
+def test_a_hunk_body_line_cannot_reassign_the_file() -> None:
+    mod = load_module()
+
+    added = mod.added_lines_with_text(review_gate_fixture("forged-header.diff"))
+
+    assert FORGED_FILE not in added
+    assert sorted(added) == [FROZEN_FILE]
+
+
+def test_every_addition_stays_with_the_real_file() -> None:
+    mod = load_module()
+
+    added = mod.added_lines_with_text(review_gate_fixture("forged-header.diff"))
+
+    assert added[FROZEN_FILE] == [
+        (6, "    /*"),
+        (7, "++ b/review.txt"),
+        (8, "*/"),
+    ]
+
+
+def test_added_line_numbers_stay_with_the_real_file() -> None:
+    mod = load_module()
+
+    added = mod.added_line_numbers(
+        mod.added_lines_with_text(review_gate_fixture("forged-header.diff"))
+    )
+
+    assert added == {FROZEN_FILE: {6, 7, 8}}
+
+
+def test_a_forged_payload_cannot_take_over_a_deletion() -> None:
+    """The deletion collector read the same forged `+++ ` header."""
+
+    mod = load_module()
+    diff = "\n".join(
+        [
+            f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}",
+            f"--- a/{FROZEN_FILE}",
+            f"+++ b/{FROZEN_FILE}",
+            "@@ -1,4 +1,4 @@",
+            " keep",
+            "+++ b/review.txt",
+            "-removed",
+            "+added",
+        ]
+    )
+
+    assert legacy_files_with_deleted_lines(diff) == {FORGED_FILE}, (
+        "fixture no longer exercises the forged header"
+    )
+    assert mod.files_with_deleted_lines(diff) == {FROZEN_FILE}
+    assert mod.files_with_deleted_lines(
+        review_gate_fixture("forged-header.diff")
+    ) == {FROZEN_FILE}
+
+
+def test_a_sensitive_line_that_renders_as_a_header_is_still_inspected() -> None:
+    """The same missing state hid a secret from the upload guard."""
+
+    mod = load_module()
+    # Assembled at runtime: this file must not contain a secret-shaped literal.
+    payload = "++ " + PAT
+    # The pre-fix loop's first test was `line.startswith("+++ ")` and it
+    # `continue`d on a match, so this line never reached the secret patterns.
+    assert ("+" + payload).startswith("+++ ")
+
+    diff = "\n".join(
+        [
+            f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}",
+            f"--- a/{FROZEN_FILE}",
+            f"+++ b/{FROZEN_FILE}",
+            "@@ -1,2 +1,3 @@",
+            " fn main() {}",
+            "+" + payload,
+        ]
+    )
+
+    assert mod.sensitive_diff_location(diff) == (FROZEN_FILE, 2)
+
+
+def test_the_deprecated_freeze_cannot_be_escaped_by_a_forged_header() -> None:
+    """The end-to-end consequence: the frozen tree was the file that mattered."""
+
+    mod = load_module()
+    fixture = review_gate_fixture("forged-header.diff")
+
+    # Pre-fix, the additions after the payload were attributed to review.txt, so
+    # the freeze never looked at the deprecated tree at all.
+    assert mod.deprecated_tree_freeze_violations(
+        legacy_added_lines_with_text(fixture)
+    ) == []
+
+    violations = mod.deprecated_tree_freeze_violations(
+        mod.added_lines_with_text(fixture)
+    )
+    assert violations == [f"{FROZEN_FILE}:7: ++ b/review.txt"], violations
+
+
+def test_an_honest_diff_keeps_its_attribution() -> None:
+    mod = load_module()
+
+    added = mod.added_lines_with_text(review_gate_fixture("normal.diff"))
+
+    assert added == {
+        FROZEN_FILE: [
+            (6, "    let added_marker = total * 2;"),
+            (7, "    added_marker"),
+        ]
+    }
+    assert mod.added_line_numbers(
+        mod.added_lines_with_text(review_gate_fixture("normal.diff"))
+    ) == {FROZEN_FILE: {6, 7}}
+    assert mod.changed_paths(review_gate_fixture("normal.diff")) == {FROZEN_FILE}
+
+
+def test_dev_null_handling_is_unchanged() -> None:
+    """A create and a delete keep the meaning the call sites already rely on."""
+
+    mod = load_module()
+    diff = review_gate_fixture("devnull.diff")
+    fresh = "strided-view/src/fresh.rs"
+
+    # The new side of a delete is `/dev/null`, so there is no new-side path and
+    # no bucket -- exactly what the pre-fix helpers reported.
+    assert mod.added_lines_with_text(diff) == {
+        fresh: [
+            (1, "pub fn fresh() -> u8 {"),
+            (2, "    9"),
+            (3, "}"),
+        ]
+    }
+    assert mod.added_line_numbers(mod.added_lines_with_text(diff)) == {fresh: {1, 2, 3}}
+    assert mod.files_with_deleted_lines(diff) == set()
+
+
+def test_a_real_header_after_a_spent_hunk_is_honoured_again() -> None:
+    """Do not over-correct: headers resume once the hunk budget is spent."""
+
+    mod = load_module()
+    other = "strided-view/src/other.rs"
+    combined = (
+        review_gate_fixture("forged-header.diff")
+        + f"diff --git a/{other} b/{other}\n"
+        f"--- a/{other}\n"
+        f"+++ b/{other}\n"
+        "@@ -1 +1,2 @@\n"
+        " fn other() {}\n"
+        "+fn added() {}\n"
+    )
+
+    added = mod.added_lines_with_text(combined)
+
+    assert sorted(added) == sorted([FROZEN_FILE, other])
+    assert added[other] == [(2, "fn added() {}")]
+    assert mod.changed_paths(combined) == {FROZEN_FILE, other}
+
+
+def test_omitted_counts_and_the_no_newline_marker() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/x.rs b/x.rs",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+            "\\ No newline at end of file",
+        ]
+    )
+
+    assert mod.added_lines_with_text(diff) == {"x.rs": [(1, "new")]}
+
+
+def test_a_rename_reports_both_paths() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/old.rs b/new.rs",
+            "similarity index 100%",
+            "rename from old.rs",
+            "rename to new.rs",
+        ]
+    )
+
+    assert sorted(mod.changed_paths(diff)) == ["new.rs", "old.rs"]
+    assert mod.paths_consistent(diff, "R100\0old.rs\0new.rs\0").ok
+
+
+def test_name_status_cross_check_flags_a_path_git_does_not_list() -> None:
+    """Second layer: a diff naming a path git does not list must fail closed."""
+
+    mod = load_module()
+    forged_as_headers = "".join(
+        [
+            f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}\n",
+            f"--- a/{FROZEN_FILE}\n",
+            f"+++ b/{FORGED_FILE}\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        ]
+    )
+
+    consistency = mod.paths_consistent(forged_as_headers, f"M\0{FROZEN_FILE}\0")
+
+    assert not consistency.ok
+    assert consistency.unexpected == (FORGED_FILE,)
+    assert consistency.missing == ()
+
+
+def test_name_status_cross_check_accepts_an_honest_diff() -> None:
+    mod = load_module()
+
+    for name in ("forged-header.diff", "normal.diff"):
+        consistency = mod.paths_consistent(
+            review_gate_fixture(name), f"M\0{FROZEN_FILE}\0"
+        )
+        assert consistency.ok, (name, consistency)
+
+
+def test_name_status_cross_check_understands_deletes() -> None:
+    mod = load_module()
+    diff = review_gate_fixture("devnull.diff")
+    name_status = f"D\0{FROZEN_FILE}\0A\0strided-view/src/fresh.rs\0"
+
+    consistency = mod.paths_consistent(diff, name_status)
+
+    assert consistency.ok, consistency
+
+
+def test_path_consistency_finding_blocks_only_on_a_mismatch() -> None:
+    mod = load_module()
+
+    honest = mod.path_consistency_finding(
+        review_gate_fixture("normal.diff"), f"M\0{FROZEN_FILE}\0"
+    )
+    assert honest is None
+
+    mismatch = mod.path_consistency_finding(
+        f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}\n"
+        f"--- a/{FROZEN_FILE}\n"
+        f"+++ b/{FORGED_FILE}\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n",
+        f"M\0{FROZEN_FILE}\0",
+    )
+    assert mismatch is not None
+    assert mismatch.severity == "block"
+    assert FORGED_FILE in mismatch.detail
+
+
+def test_binary_mode_and_quoted_paths_do_not_look_like_tampering() -> None:
+    """Fail-closed must not fire on the shapes git itself emits."""
+
+    mod = load_module()
+    quoted = "strided-view/src/\u00fc\u00f1\u00ee/na\u00efve file.rs"
+    diff = "\n".join(
+        [
+            "diff --git a/blob.bin b/blob.bin",
+            "index 5d27a55..1f09903 100644",
+            "Binary files a/blob.bin and b/blob.bin differ",
+            "diff --git a/mode.sh b/mode.sh",
+            "old mode 100644",
+            "new mode 100755",
+            "index 587be6b..975fbec",
+            "--- a/mode.sh",
+            "+++ b/mode.sh",
+            "@@ -1 +1 @@",
+            "-x",
+            "+y",
+            f"diff --git a/{quoted} b/{quoted}",
+            "index 7898192..422c2b7 100644",
+            f"--- a/{quoted}\t",
+            f"+++ b/{quoted}\t",
+            "@@ -1 +1,2 @@",
+            " a",
+            "+b",
+        ]
+    )
+    name_status = f"M\0blob.bin\0M\0mode.sh\0M\0{quoted}\0"
+
+    assert mod.paths_consistent(diff, name_status).ok
+    assert mod.added_line_numbers(mod.added_lines_with_text(diff)) == {
+        # A binary or mode-only file names its path but adds no line; the empty
+        # bucket is inert at every call site (`if not touched: continue`).
+        "blob.bin": set(),
+        "mode.sh": {1},
+        quoted: {2},
+    }
+
+
+def test_split_large_file_diff_keeps_body_lines_out_of_the_header_split() -> None:
+    """A body line can never open a hunk, whatever text it happens to carry."""
+
+    mod = load_module()
+    body = ["diff --git a/big.rs b/big.rs", "--- a/big.rs", "+++ b/big.rs"]
+    body.append("@@ -1,300 +1,300 @@")
+    for index in range(260):
+        body.append(f"+// filler {index} " + "x" * 180)
+        if index == 30:
+            # Added content that renders with a `+++ ` prefix: a header
+            # lookalike that must stay body text.
+            body.append("+++ b/review.txt")
+    assert len("\n".join(body)) > mod.MAX_FILE_DIFF_CHARS
+
+    chunks = mod.split_large_file_diff("\n".join(body))
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert "+++ b/big.rs" in chunk
+        # Only the one chunk that holds the lookalike may mention it, and it
+        # must appear as body text rather than as a rewrite of the header.
+        assert "\n+++ b/review.txt" in chunk or "review.txt" not in chunk
 
 
 # --- prompt and rules files --------------------------------------------------
