@@ -90,10 +90,10 @@ A caller that wants its own thread budget builds a `Pool`, mints
     `batched_outer_product_into_uninit`;
   - in-place update: `map_update_into`, `zip_update2_into`, `zip_update3_into`;
   - reduction: `reduce`, `zip_reduce`, `reduce_axis`, `reduce_axis_into`, `sum`;
-  - copy and scale: `copy_into`, `copy_into_uninit`, `copy_scale`, `copy_conj`,
+  - copy and scale: `copy_into`, `copy_into_uninit`, `copy_scale_into`, `copy_conj_into`,
     `copy_transpose_scale_into`, and `strided-perm`'s `copy_into`,
     `copy_into_uninit`, `copy_into_col_major`;
-  - arithmetic and layout: `add`, `mul`, `axpy`, `fma`, `axpby_accum`,
+  - arithmetic and layout: `add_acc`, `mul_acc`, `axpy_acc`, `fma_acc`, `axpby_accum`,
     `symmetrize_into`, `symmetrize_conj_into`, `triangular_mask_into_uninit`,
     `triangular_mask_view_into_uninit`, `embed_diagonal_into_uninit`,
     `embed_diagonal_view_into_uninit`;

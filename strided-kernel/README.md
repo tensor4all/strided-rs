@@ -31,7 +31,7 @@ depend on one another.
   `erased_map_into`, `erased_zip_into`, `erased_broadcast_mul_into_uninit`,
   `erased_select_into_uninit`, `erased_clamp_into_uninit`,
   `erased_compare_into_uninit`
-- Utility ops (`copy_into`, `add`, `dot`, `sum`, `symmetrize_into`)
+- Utility ops (`copy_into`, `add_acc`, `dot`, `sum`, `symmetrize_into`)
 - Optional parallel execution through `threadteam::Exec` placement tokens
   (`parallel` feature)
 
@@ -110,7 +110,7 @@ narrower, explicit determinism contract than the generic closure-based
 ## High-Level Operations
 
 ```rust
-use strided_kernel::{Exec, StridedArray, copy_into, add, dot, symmetrize_into};
+use strided_kernel::{Exec, StridedArray, copy_into, add_acc, dot, symmetrize_into};
 
 let a = StridedArray::<f64>::from_fn_row_major(&[4, 4], |idx| (idx[0] * 10 + idx[1]) as f64);
 let mut out = StridedArray::<f64>::row_major(&[4, 4]);
@@ -118,8 +118,8 @@ let mut out = StridedArray::<f64>::row_major(&[4, 4]);
 // Copy
 copy_into(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
-// Element-wise add: dest[i] += src[i]
-add(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
+// Accumulating element-wise add: dest[i] += src[i]
+add_acc(&mut out.view_mut(), &a.view(), Exec::serial()).unwrap();
 
 // Dot product
 let d = dot(&a.view(), &a.view()).unwrap();
@@ -141,7 +141,9 @@ The library automatically optimizes iteration order for cache efficiency:
 
 ```toml
 [dependencies]
-strided-kernel = { version = "0.12", features = ["parallel"] }
+# 0.12 (the published version) predates the `*_acc` / `*_into` names used here; they
+# arrive with the next release, so depend on the repository until then.
+strided-kernel = { git = "https://github.com/tensor4all/strided-rs", features = ["parallel"] }
 ```
 
 Every operation that can fan out takes a `threadteam::Exec` placement token as

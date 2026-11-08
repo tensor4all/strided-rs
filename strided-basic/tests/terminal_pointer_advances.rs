@@ -2,9 +2,9 @@ use std::mem::MaybeUninit;
 
 use strided_basic::Exec;
 use strided_basic::{
-    add, axpy, dot, fma, map_into, map_update_into, mul, mul_into, mul_into_uninit, zip_map2_into,
-    zip_map3_into, zip_map4_into, zip_update2_into, zip_update3_into, Identity, StridedView,
-    StridedViewMut,
+    add_acc, axpy_acc, dot, fma_acc, map_into, map_update_into, mul_acc, mul_into, mul_into_uninit,
+    zip_map2_into, zip_map3_into, zip_map4_into, zip_update2_into, zip_update3_into, Identity,
+    StridedView, StridedViewMut,
 };
 
 fn values(output: &[MaybeUninit<f64>], indices: &[usize]) -> Vec<f64> {
@@ -81,22 +81,22 @@ fn pointwise_leaves_may_advance_past_the_owned_storage() {
     // Update siblings use the same non-contiguous pointwise leaves.
     let mut add_data = [1.0, 2.0, 3.0];
     let mut add_view = StridedViewMut::new(&mut add_data, &[3], &[-1], 2).unwrap();
-    add(&mut add_view, &one, Exec::serial()).unwrap();
+    add_acc(&mut add_view, &one, Exec::serial()).unwrap();
     assert_eq!(add_data, [2.0, 4.0, 6.0]);
 
     let mut mul_data = [2.0, 3.0, 4.0];
     let mut mul_view = StridedViewMut::new(&mut mul_data, &[3], &[-1], 2).unwrap();
-    mul(&mut mul_view, &two, Exec::serial()).unwrap();
+    mul_acc(&mut mul_view, &two, Exec::serial()).unwrap();
     assert_eq!(mul_data, [8.0, 15.0, 24.0]);
 
     let mut axpy_data = [1.0, 1.0, 1.0];
     let mut axpy_view = StridedViewMut::new(&mut axpy_data, &[3], &[-1], 2).unwrap();
-    axpy(&mut axpy_view, &three, 2.0, Exec::serial()).unwrap();
+    axpy_acc(&mut axpy_view, &three, 2.0, Exec::serial()).unwrap();
     assert_eq!(axpy_data, [15.0, 17.0, 19.0]);
 
     let mut fma_data = [1.0, 1.0, 1.0];
     let mut fma_view = StridedViewMut::new(&mut fma_data, &[3], &[-1], 2).unwrap();
-    fma(&mut fma_view, &one, &two, Exec::serial()).unwrap();
+    fma_acc(&mut fma_view, &one, &two, Exec::serial()).unwrap();
     assert_eq!(fma_data, [5.0, 11.0, 19.0]);
     assert_eq!(dot(&one, &two).unwrap(), 32.0);
 

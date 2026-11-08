@@ -27,8 +27,8 @@ Analysis of SIMD optimization techniques used in `extern/faer`, and a concrete p
   undispatchsed loops; the exceptions are listed under Priority 3.
 - **Hand-written `pulp` SIMD leaves** (`strided-basic/src/simd.rs`): sum,
   product, dot, sum-of-squares and the add/mul block folds for `f32`/`f64`.
-  This covers Priority 1 and the block-fold part of Priority 4; `add`, `axpy`
-  and `fma` still run dispatched scalar loop bodies.
+  This covers Priority 1 and the block-fold part of Priority 4; `add_acc`, `axpy_acc`
+  and `fma_acc` still run dispatched scalar loop bodies.
 - **Contiguous identity `memcpy` fast path** in `copy_into`
   (`strided-basic/src/ops_view.rs`), closing Gap 4.
 - **The per-element `Option` accumulator this document criticizes is gone**
@@ -42,7 +42,7 @@ association instead; see the reduction-order contract in the `strided-kernel`
 README.
 
 **Remaining:** explicit SIMD specialization of the map/update loop bodies
-(`map_into`, `add`, `axpy`, `fma`). They already reach `pulp` runtime dispatch,
+(`map_into`, `add_acc`, `axpy_acc`, `fma_acc`). They already reach `pulp` runtime dispatch,
 so what is left is the vectorized body itself, which is still LLVM's
 auto-vectorization inside the dispatched ISA.
 
@@ -213,7 +213,7 @@ pub enum SimdCapabilities {
 | Head/body/tail + masked load/store | Contiguous innermost loop remainder handling | High |
 | Multiple accumulators (4×) | ILP in `reduce` / `sum` kernels | High |
 | `pulp` runtime dispatch | Use AVX2/AVX-512 without `target-cpu=native` | High |
-| FMA via `simd.mul_add` | `axpy`, `fma`, `dot` kernels | High |
+| FMA via `simd.mul_add` | `axpy_acc`, `fma_acc`, `dot` kernels | High |
 | Pairwise summation | Precision for large reductions | Medium |
 | Complex→real reinterpretation | When adding `Complex` support | Low |
 | Register tiling (MR×NR) | Not directly applicable (strided-rs is not matmul-focused) | Low |
@@ -306,7 +306,7 @@ This is the **correct approach for generic `map_into`** — arbitrary closures (
 
 1. **Reductions** (`sum`, `dot`, `reduce`): `acc = reduce_fn(acc, val)` has a loop-carried dependency. Even with perfect inlining, LLVM will not break the dependency chain because it cannot assume floating-point associativity. Manual multi-accumulator unrolling is required.
 
-2. **Fixed operations** (`copy_into`, `add`, `axpy`): these are known at compile time and can bypass the closure entirely, using hand-written SIMD kernels or `memcpy`.
+2. **Fixed operations** (`copy_into`, `add_acc`, `axpy_acc`): these are known at compile time and can bypass the closure entirely, using hand-written SIMD kernels or `memcpy`.
 
 ## Improvement Plan for strided-kernel
 
@@ -412,10 +412,10 @@ This is orthogonal to the other improvements and benefits every dispatched opera
 
 ### Priority 4 (Medium Impact): dedicated SIMD kernels for fixed ops — block folds shipped
 
-For `add`, `axpy`, `fma`, `dot` — bypass the generic closure path with hand-written SIMD kernels using `pulp`. These operations are simple enough (add, mul-add) that explicit SIMD is straightforward.
+For `add_acc`, `axpy_acc`, `fma_acc`, `dot` — bypass the generic closure path with hand-written SIMD kernels using `pulp`. These operations are simple enough (add, mul-add) that explicit SIMD is straightforward.
 
-The add/mul block folds are implemented in `strided-basic/src/simd.rs`; `add`,
-`axpy` and `fma` still run dispatched scalar loop bodies.
+The add/mul block folds are implemented in `strided-basic/src/simd.rs`; `add_acc`,
+`axpy_acc` and `fma_acc` still run dispatched scalar loop bodies.
 
 ```rust
 // Instead of: map_into(dst, src, |x| x)        → copy_into with memcpy
