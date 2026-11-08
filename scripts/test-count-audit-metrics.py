@@ -742,6 +742,110 @@ def test_a_trailing_doc_comment_is_not_an_ordinary_comment() -> None:
     assert counts["invariant"] == 0, counts
 
 
+def test_an_inline_module_path_moves_its_child() -> None:
+    """`#[path]` on an inline module moves the directory its children resolve in.
+
+    rustc resolves `#[path = "elsewhere"] mod checks { mod child; }` to
+    `src/elsewhere/child.rs`; naming the child after the module would leave the
+    test-only file in the production count.
+    """
+    counts = count_sources(
+        {
+            "lib.rs": '#[cfg(test)]\n#[path = "elsewhere"]\nmod checks {\n    mod child;\n}\n',
+            "elsewhere/child.rs": "pub fn f() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_an_explicit_path_inside_an_inline_module_keeps_the_file_module_dir() -> None:
+    """An inline module in `foo.rs` resolves its explicit path under `foo/`.
+
+    rustc loads `mod inner { #[path = "helper.rs"] mod checks; }` in `src/foo.rs`
+    from `src/foo/inner/helper.rs`, not from `src/inner/helper.rs`.
+    """
+    counts = count_sources(
+        {
+            "lib.rs": "mod foo;\nmod live;\n",
+            "foo.rs": '#[cfg(test)]\nmod inner {\n    #[path = "helper.rs"]\n    mod checks;\n}\n',
+            "foo/inner/helper.rs": "pub fn t() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+            "live.rs": (
+                "pub fn a() -> Result<(), ()> {\n    unsafe {}\n    unsafe {}\n    Ok(())\n}\n"
+            ),
+        }
+    )
+    assert counts["unsafe"] == 2, counts
+    assert counts["pub_result"] == 1, counts
+
+
+def test_docs_of_a_removed_test_module_do_not_credit_a_function_after_a_blank_line() -> None:
+    """A blank line between the docs and `#[cfg(test)]` does not separate them."""
+    counts = count_sources(
+        {
+            "lib.rs": (
+                "/// # Errors\n"
+                "/// These docs belong to the test module.\n"
+                "\n"
+                "#[cfg(test)]\n"
+                "mod checks {}\n"
+                "pub fn undocumented() -> Result<(), ()> { Ok(()) }\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    assert counts["with_errors"] == 0, counts
+
+
+def test_docs_of_a_removed_test_module_do_not_credit_a_function_after_a_multiline_attribute() -> (
+    None
+):
+    """A multi-line attribute still belongs to the test module it precedes."""
+    counts = count_sources(
+        {
+            "lib.rs": (
+                "/// # Errors\n"
+                "/// These docs belong to the test module.\n"
+                "#[allow(\n    dead_code\n)]\n"
+                "#[cfg(test)]\n"
+                "mod checks {}\n"
+                "pub fn undocumented() -> Result<(), ()> { Ok(()) }\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    assert counts["with_errors"] == 0, counts
+
+
+def test_a_test_only_alias_does_not_drop_a_production_file() -> None:
+    """A file loaded with and without `#[cfg(test)]` is production."""
+    counts = count_sources(
+        {
+            "lib.rs": (
+                '#[path = "shared.rs"]\nmod live;\n'
+                '#[cfg(test)]\n#[path = "shared.rs"]\nmod checks;\n'
+            ),
+            "shared.rs": "pub fn f() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 1, counts
+    assert counts["pub_result"] == 1, counts
+
+
+def test_a_heading_that_merely_starts_with_errors_is_not_the_section() -> None:
+    """`# ErrorsAreNotDocumented` is a different heading, not `# Errors`."""
+    counts = count_sources(
+        {
+            "lib.rs": (
+                "/// # ErrorsAreNotDocumented\n"
+                "pub fn f() -> Result<(), ()> { Ok(()) }\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    assert counts["with_errors"] == 0, counts
+
+
 def main() -> int:
     tests = [
         value

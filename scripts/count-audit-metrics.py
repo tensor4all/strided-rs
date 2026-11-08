@@ -2,16 +2,18 @@
 """Approximate the strided-rs audit baseline rows with a line-oriented scan.
 
 Rows, as printed (production scope = `strided-*/src/**/*.rs`, minus a `tests/`
-component, a `tests.rs` file and every file a `#[cfg(test)] mod name;`
-declaration makes test-only, with inline `#[cfg(test)] mod name { .. }` bodies
-skipped):
+component, a `tests.rs` file and every file only test-only `mod name;`
+declarations load -- a file a production declaration loads too stays in -- with
+inline `#[cfg(test)] mod name { .. }` bodies skipped):
 
   invariant               `//` line comments containing the marker
   safety                  the same for `// SAFETY:`; an independent total, not paired with `unsafe`
   unsafe                  occurrences of `unsafe` + `{` in the scanned text
   pub_result / with_errors a `pub` `fn` whose signature (to the first `{` or `;` outside
                           brackets) returns `Result<`, and how many of those carry a
-                          `/// # Errors` line
+                          `# Errors` heading (a heading that merely starts with
+                          `Errors`, such as `# ErrorsAreNotDocumented`, is another
+                          section)
   inline_mods             `#[cfg(test)] mod name { .. }` blocks (a `mod name;` declaration is 0)
   files_over_1000         logical lines (`str.splitlines()`) over `strided-*/**/*.rs`
 
@@ -49,6 +51,9 @@ none", not "none exists".
   comparison operator reads to the wrong place.
 - A `mod NAME;` whose declaration is itself produced by a macro is not followed,
   and a `#[path = "..."]` given through a macro is not seen.
+- Module resolution follows the attribute and inline-module rules the fixtures in
+  `scripts/test-count-audit-metrics.py` pin; an exotic `#[path]` that climbs out
+  of the source tree with `..` is normalized, not rejected.
 - A nested block-comment opener (`/*a/*b*/c*/`) is consumed without keeping its
   columns, so each nesting level shortens the returned line by two characters and
   the columns after it shift. No production source in this repository hits it.
@@ -77,6 +82,10 @@ RAW_STRING_PREFIX_RE = re.compile(r"\b(?:br|cr|r)(#*)\"")
 # A lifetime (`'a`) has no closing quote and does not match.
 CHAR_LITERAL_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'])'")
 UNSAFE_RE = re.compile(r"\bunsafe\s*\{")
+# A `# Errors` heading; `# ErrorsAreNotDocumented` is a different heading, and a
+# `## Errors` subheading is not the section. Trailing prose is allowed because
+# Markdown treats `# Errors are returned` as a heading that also says "Errors".
+ERRORS_HEADING_RE = re.compile(r"///\s*# Errors(?:\s|$)")
 
 
 def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
@@ -255,6 +264,32 @@ def scan_file(text: str) -> list[dict[str, object]]:
     return rows
 
 
+def attribute_row_set(rows: list[dict[str, object]]) -> set[int]:
+    """Rows that belong to an attribute, including its continuation lines.
+
+    `#[allow(` / `dead_code` / `)]` is one attribute on three rows; the closing row
+    does not start with `#[`, so a backward walk needs this map to recognize it.
+    """
+    covered: set[int] = set()
+    i = 0
+    while i < len(rows):
+        stripped = str(rows[i]["code"]).strip()
+        if not stripped.startswith("#["):
+            i += 1
+            continue
+        balance = stripped.count("[") + stripped.count("(")
+        balance -= stripped.count("]") + stripped.count(")")
+        covered.add(i)
+        i += 1
+        while balance > 0 and i < len(rows):
+            continuation = str(rows[i]["code"]).strip()
+            balance += continuation.count("[") + continuation.count("(")
+            balance -= continuation.count("]") + continuation.count(")")
+            covered.add(i)
+            i += 1
+    return covered
+
+
 def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Remove `#[cfg(test)] mod name { .. }` bodies and the documentation they own.
 
@@ -264,6 +299,7 @@ def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     dropped with it -- otherwise the module's `# Errors` would be credited to the
     next production `fn`.
     """
+    attribute_rows = attribute_row_set(rows)
     dropped: set[int] = set()
     i = 0
     while i < len(rows):
@@ -287,10 +323,18 @@ def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             if depth <= 0 and "}" in str(rows[k - 1]["code"]):
                 break
         start = i
-        while start > 0 and (
-            rows[start - 1]["doc"] or str(rows[start - 1]["code"]).strip().startswith("#[")
-        ):
-            start -= 1
+        while start > 0:
+            previous = rows[start - 1]
+            if (
+                previous["doc"]
+                or not str(previous["code"]).strip()
+                or (start - 1) in attribute_rows
+            ):
+                # Blank lines do not end an attribute list in Rust, and a
+                # multi-line attribute belongs to the item it precedes.
+                start -= 1
+                continue
+            break
         dropped.update(range(start, k))
         i = k
     return [row for index, row in enumerate(rows) if index not in dropped]
@@ -424,16 +468,29 @@ def attribute_block(
 
 def module_declarations(
     rows: list[dict[str, object]],
-) -> list[tuple[tuple[str, ...], str, str | None, bool]]:
-    """Every `mod NAME;` of a file as (inline prefix, name, `#[path]` value, test-only).
+) -> list[tuple[str, tuple[str, ...], str, bool, bool]]:
+    """Every `mod NAME;` of a file as (base, directory, leaf, explicit, test-only).
 
-    The inline prefix is the chain of `mod X { .. }` blocks the declaration sits in,
-    because Rust resolves a declaration inside them as a subdirectory of the
-    declaring module's directory. `test-only` is true when the declaration carries
-    `#[cfg(test)]` or sits inside an inline module that does.
+    `directory` is the chain of inline `mod X { .. }` directories the declaration
+    sits in, and `base` says where that chain starts: `"file"` for the declaring
+    file's own directory, `"module"` for the directory Rust derives from the file
+    name (`src/foo.rs` owns `src/foo/`). Both follow Rust's own resolution:
+
+    * a plain `mod NAME;` resolves under the file's module directory plus the
+      inline names;
+    * an explicit `#[path]` at the top level resolves against the file's
+      directory;
+    * an explicit `#[path]` inside an inline module resolves against the
+      enclosing module's directory, which the inline chain has already moved.
+
+    A `#[path]` on an inline module moves the directory for its children to that
+    path, so the chain carries it instead of the module's name. Test-only means
+    the declaration carries `#[cfg(test)]` or sits inside an inline module that
+    does.
     """
-    declarations: list[tuple[tuple[str, ...], str, str | None, bool]] = []
-    stack: list[tuple[str, int, bool]] = []
+    declarations: list[tuple[str, tuple[str, ...], str, bool, bool]] = []
+    # (base kind, directory components, brace depth, test-only) per inline module.
+    stack: list[tuple[str, tuple[str, ...], int, bool]] = []
     depth = 0
     pending: tuple[bool, str | None] | None = None
     i = 0
@@ -448,18 +505,29 @@ def module_declarations(
             continue
         cfg_test, path_value = pending if pending is not None else (False, None)
         pending = None
-        prefix = tuple(name for name, _, _ in stack)
-        enclosing_test = any(test for _, _, test in stack)
+        enclosing_test = any(test for _, _, _, test in stack)
+        base, directory = (stack[-1][0], stack[-1][1]) if stack else ("module", ())
         inline = INLINE_TEST_MOD_RE.match(stripped)
         declaration = INLINE_TEST_DECL_RE.match(stripped)
         if inline:
-            stack.append((inline.group(1), depth, cfg_test or enclosing_test))
+            name = inline.group(1)
+            if path_value is None:
+                components = directory + (name,)
+                kind = base if stack else "module"
+            else:
+                components = directory + tuple(
+                    part for part in Path(path_value).parts if part not in {"", "."}
+                )
+                kind = base if stack else "file"
+            stack.append((kind, components, depth, cfg_test or enclosing_test))
         elif declaration:
-            declarations.append(
-                (prefix, declaration.group(1), path_value, cfg_test or enclosing_test)
-            )
+            name = declaration.group(1)
+            explicit = path_value is not None
+            kind = base if stack else ("file" if explicit else "module")
+            leaf = path_value if explicit else name
+            declarations.append((kind, directory, leaf, explicit, cfg_test or enclosing_test))
         depth += code.count("{") - code.count("}")
-        while stack and depth <= stack[-1][1]:
+        while stack and depth <= stack[-1][2]:
             stack.pop()
         i += 1
     return declarations
@@ -477,7 +545,7 @@ def declared_module_dir(path: Path) -> Path:
 
 
 def production_files(root: Path) -> list[Path]:
-    """Production sources, minus every file the test-only module graph owns.
+    """Production sources, minus every file only the test-only module graph owns.
 
     Test-only files seed the graph (`tests/` path components, `tests.rs`, and any
     target of a `#[cfg(test)] mod` declaration). A declaration inside a test-only
@@ -485,44 +553,88 @@ def production_files(root: Path) -> list[Path]:
     sources: a test module's ordinary children (`support.rs` declaring
     `mod child;`) and its explicitly pathed children follow it out of production.
     Declarations resolve relative to the declaring module's directory plus the
-    enclosing inline modules, and a `#[path = "..."]` resolves against the same
-    directory, which is how Rust resolves it.
+    enclosing inline modules, and a `#[path = "..."]` resolves the way Rust does
+    (see [`module_declarations`]), so a `#[path]` inside an inline module keeps
+    the containing file's module directory.
+
+    Two rules keep the production side from shrinking by accident:
+
+    * a file loaded by both a test-only and a production declaration stays in
+      production, so a test-only alias cannot erase code the baseline counts;
+    * a plain `mod NAME;` loads exactly `NAME.rs` or `NAME/mod.rs`, so its
+      directory only *excludes* the files nothing declares (the historical
+      module-subtree rule) and never claims a file an inline module's explicit
+      `#[path]` owns.
     """
     sources = [
         p for p in sorted(root.glob(ALL_SOURCE_GLOB)) if "target" not in relative_parts(p, root)
     ]
     parsed = {p: module_declarations(scan_file(p.read_text(encoding="utf-8"))) for p in sources}
-    test_only = {
-        p for p in sources if "tests" in relative_parts(p, root) or p.name == "tests.rs"
-    }
+    seeds = {p for p in sources if "tests" in relative_parts(p, root) or p.name == "tests.rs"}
     # A file loaded through `#[path]` resolves its own children beside itself, not
     # in a directory named after it.
     module_dirs: dict[Path, Path] = {}
+    test_only = set(seeds)
     changed = True
     while changed:
         changed = False
+        # (declaring file, loaded file, test-only edge)
+        edges: list[tuple[Path, Path, bool]] = []
+        # (module directory, declaring file, test-only declaration)
+        directories: list[tuple[Path, Path, bool]] = []
         for p in sources:
-            file_is_test_only = p in test_only
-            base = module_dirs.get(p, declared_module_dir(p))
-            for prefix, name, explicit, cfg_test in parsed[p]:
+            module_base = module_dirs.get(p, declared_module_dir(p))
+            for kind, directory, leaf, explicit, cfg_test in parsed[p]:
+                base = p.parent if kind == "file" else module_base
                 if explicit:
-                    # `#[path]` is relative to the containing file's directory plus
-                    # the enclosing inline modules, whatever the file is called.
-                    target = Path(os.path.normpath(p.parent.joinpath(*prefix) / explicit))
+                    target = Path(os.path.normpath(base.joinpath(*directory, leaf)))
                     owned = {target}
                     if module_dirs.get(target) != target.parent:
                         module_dirs[target] = target.parent
                         changed = True
                 else:
-                    module = base.joinpath(*prefix) / name
-                    owned = {module.with_name(f"{name}.rs")}
-                    owned.update(q for q in sources if module in q.parents)
-                if not (cfg_test or file_is_test_only):
+                    module = base.joinpath(*directory, leaf)
+                    owned = {
+                        module.with_name(f"{leaf}.rs"),
+                        module / "mod.rs",
+                    }
+                    directories.append((module, p, cfg_test))
+                edges.extend((p, q, cfg_test) for q in owned if q in sources)
+        # Greatest fixed point: a file is test-only when every declaration that
+        # loads it is, or, for a file no declaration loads, when every module
+        # directory that contains it belongs to a test-only declaration.
+        loaded = {target for _, target, _ in edges}
+        closure = set(seeds)
+        while True:
+            added: set[Path] = set()
+            for target in sources:
+                if target in closure:
                     continue
-                for q in owned:
-                    if q in sources and q not in test_only:
-                        test_only.add(q)
-                        changed = True
+                incoming = [
+                    (declarer, cfg_test)
+                    for declarer, loaded_file, cfg_test in edges
+                    if loaded_file == target
+                ]
+                if incoming:
+                    if all(cfg_test or declarer in closure for declarer, cfg_test in incoming):
+                        added.add(target)
+                    continue
+                if target not in loaded:
+                    containing = [
+                        (declarer, cfg_test)
+                        for module, declarer, cfg_test in directories
+                        if module in target.parents
+                    ]
+                    if containing and all(
+                        cfg_test or declarer in closure for declarer, cfg_test in containing
+                    ):
+                        added.add(target)
+            if not added:
+                break
+            closure |= added
+        if closure != test_only:
+            test_only = closure
+            changed = True
     return [
         p
         for p in sorted(root.glob(PRODUCTION_GLOB))
@@ -553,7 +665,7 @@ def count(root: Path) -> dict[str, int]:
         has_errors, attr_depth = False, 0
         for i, row in enumerate(rows[p]):
             if row["doc"]:
-                has_errors = has_errors or str(row["doc"]).lstrip().startswith("/// # Errors")
+                has_errors = has_errors or bool(ERRORS_HEADING_RE.match(str(row["doc"]).strip()))
                 continue
             code = str(row["code"])
             stripped = code.strip()
