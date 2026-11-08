@@ -171,8 +171,9 @@ regression test.
    (`strided-basic/src/execution.rs:132`). Attribute and blank lines are stepped
    over: the numerator went 138 → 186.
 3. **Comments and strings counted as code.** A file holding only
-   `/* unsafe {} // SAFETY: x */` reported `unsafe 1, safety 1, invariant 1`, and
-   the same text inside a line-spanning `r#"…"#` counted too. Block comments
+   `/* unsafe {} // SAFETY: x // INVARIANT: y */` reported
+   `unsafe 1, safety 1, invariant 1`, and the same text inside a line-spanning
+   `r#"…"#` counted too. Block comments
    (which nest in Rust), line-spanning raw strings and char literals are now
    tracked across lines: the totals dropped 332 → 302 and 598 → 534, and the
    two rows are now stated as independent totals instead of a ratio. Both are
