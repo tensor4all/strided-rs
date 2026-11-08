@@ -10,14 +10,17 @@
 //! identity return that keeps a zero-extent view with an arbitrary stride out
 //! of the block planner.
 
+mod common;
+
 use num_complex::Complex;
 use strided_basic::Exec;
 use strided_basic::{
     dot, reduce, sum, zip_reduce, Conj, ElementOp, Identity, StridedArray, StridedView,
 };
 
-/// Threading threshold of the crate (`threading::MINTHREADLENGTH`); inputs
-/// above it take the parallel branches on a pooled token.
+/// Large-layout size of the suite; a pooled call must match the serial
+/// reference bitwise. At this size the cost gate may keep the work on one
+/// worker, so the case asserts the result, not that a fork happened.
 #[cfg(feature = "parallel")]
 const THREADING_THRESHOLD: usize = 1 << 15;
 
@@ -361,6 +364,8 @@ mod parallel {
     use std::sync::Mutex;
     use strided_basic::Pool;
 
+    use super::common::shared_pool;
+
     /// Pool widths the determinism tests run on. A fresh private pool per width
     /// keeps every width's slots independent of the others.
     const WIDTHS: [usize; 3] = [1, 2, 4];
@@ -423,10 +428,38 @@ mod parallel {
         .unwrap()
     }
 
-    /// Above the threading threshold `zip_reduce` splits work across workers on
-    /// both the contiguous leaf path and the general fused plan; exact
-    /// integer-valued data makes every split order exact, so each parallel
-    /// branch must equal the naive reference bitwise.
+    /// The fan-out the tests above deliberately do not claim: their pools carry
+    /// the host's default dispatch costs, which keep this size on one worker. On
+    /// a pool whose sections cost 100 ns (`tests/common/mod.rs`) the gate opens,
+    /// the work leaves the calling thread, and the split result must still equal
+    /// the naive reference bitwise.
+    #[test]
+    fn a_cheap_section_cost_fans_the_large_layout_out() {
+        for case in threshold_cases(true) {
+            let reference = naive_reference(
+                &case.a.view(),
+                &case.b.view(),
+                |x: f64, y: f64| x * y,
+                |x, y| x + y,
+                0.0f64,
+            );
+            let exec = Exec::new(shared_pool(), 4).unwrap();
+            let root = exec.ledger_root().unwrap();
+            let actual = zip_reduce_sum(&case, exec);
+            assert_eq!(actual, reference, "{} cheap pool", case.name);
+            assert!(
+                threadteam::ledger::installs(root) > 0,
+                "{}: the gate opened but the work stayed on the calling thread",
+                case.name
+            );
+        }
+    }
+
+    /// An explicit pool is passed with each width, on both the contiguous leaf
+    /// path and the general fused plan; exact integer-valued data makes every
+    /// split order exact, so any result the split produces must equal the naive
+    /// reference bitwise. Whether a fork happens at these sizes is the cost
+    /// gate's decision and is not asserted here.
     #[test]
     fn parallel_branch_matches_the_naive_reference_above_the_threshold() {
         for case in threshold_cases(true) {

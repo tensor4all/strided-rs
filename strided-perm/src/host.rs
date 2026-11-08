@@ -1,82 +1,27 @@
 //! Host class and the serial copy rate of each class.
 //!
 //! The rates of the strided stack are keyed by the kernel dispatch the machine
-//! takes, not by the CPU model. `HostClass` and `HostClass::detect` are the same
-//! enum and the same detection as in `threadteam` (`threadteam::HostClass`), the
-//! `tcontract` and the `faer` cost tables, and are kept in sync with them by
-//! hand; this crate owns the copy of the strided workspace (`strided-basic`
-//! reuses it for its own table, which sits above this crate).
-
-use std::sync::OnceLock;
+//! takes, not by the CPU model. [`HostClass`] is [`threadteam::HostClass`]
+//! re-exported, so the class this crate reports is the one the placement token
+//! uses; only the copy rate below is local (`strided-basic` reuses it for its own
+//! table, which sits above this crate).
 
 /// The class of the machine, keyed by the kernel dispatch it will take.
 ///
-/// Kept in sync with `threadteam::HostClass`. Detected once per process by
-/// [`HostClass::detect`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HostClass {
-    /// `x86_64` with AVX-512F at run time (`x86_64-avx512`).
-    X86_64Avx512,
-    /// `x86_64` with AVX2 and FMA, without AVX-512F (`x86_64-avx2`).
-    X86_64Avx2,
-    /// Any other `x86_64` (`x86_64-scalar`).
-    X86_64Scalar,
-    /// `aarch64` on macOS (`aarch64-apple`).
-    Aarch64Apple,
-    /// Any other `aarch64` (`aarch64`).
-    Aarch64,
-    /// Everything else (`generic`).
-    Generic,
-}
-
-impl HostClass {
-    /// The class of this host, detected at the first call and cached
-    /// (`OnceLock`; `is_x86_feature_detected!` on x86_64).
-    pub fn detect() -> Self {
-        static CLASS: OnceLock<HostClass> = OnceLock::new();
-        *CLASS.get_or_init(Self::detect_uncached)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn detect_uncached() -> Self {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            HostClass::X86_64Avx512
-        } else if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
-        {
-            HostClass::X86_64Avx2
-        } else {
-            HostClass::X86_64Scalar
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    fn detect_uncached() -> Self {
-        HostClass::Aarch64Apple
-    }
-
-    #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
-    fn detect_uncached() -> Self {
-        HostClass::Aarch64
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn detect_uncached() -> Self {
-        HostClass::Generic
-    }
-
-    /// The class name used in the docs and the tables.
-    pub const fn name(self) -> &'static str {
-        match self {
-            HostClass::X86_64Avx512 => "x86_64-avx512",
-            HostClass::X86_64Avx2 => "x86_64-avx2",
-            HostClass::X86_64Scalar => "x86_64-scalar",
-            HostClass::Aarch64Apple => "aarch64-apple",
-            HostClass::Aarch64 => "aarch64",
-            HostClass::Generic => "generic",
-        }
-    }
-}
+/// [`threadteam::HostClass`] re-exported, so the enum and its `detect` are the
+/// ones the placement token uses and cannot drift from them. The upstream doc
+/// below still names `strided-rs` among the crates that keep a hand-synced copy;
+/// this crate no longer does.
+///
+/// # Compatibility
+///
+/// This is a **type-identity change**, not a rename: `strided_perm::HostClass`
+/// is now the same type as `threadteam::HostClass` instead of a distinct copy.
+/// A downstream crate that implemented its own trait for both types compiles
+/// against the old pair and fails with `E0119` (conflicting implementations)
+/// against this one. Code that names the type, compares it, or matches on its
+/// variants is unaffected.
+pub use threadteam::HostClass;
 
 /// Serial throughput of a copy in nanoseconds per element, of a host class.
 ///
