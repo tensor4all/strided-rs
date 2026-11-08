@@ -19,6 +19,7 @@
 //! `Option<Box<SpilledMeta>>` so the inline value has no drop glue.
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
 
 use tinyvec::ArrayVec;
@@ -1575,41 +1576,54 @@ impl<T: Default> StridedArray<T> {
 impl<T: Copy> StridedArray<T> {
     /// Create a column-major tensor with **uninitialized** data.
     ///
+    /// The element type of the returned array is [`MaybeUninit<T>`], so no slot
+    /// ever claims to hold a `T` before the caller wrote one — which is what
+    /// `bool`, `char` and reference elements need (#413).
+    ///
     /// # Safety
-    /// Caller must write every element before reading.
+    ///
+    /// This is the pre-#413 contract kept on the signature: a slot may be read
+    /// through [`MaybeUninit::assume_init`] only after it was written. Allocating
+    /// the slots carries no memory-safety precondition of its own; the per-slot
+    /// rule is the one [`MaybeUninit`] already states.
     ///
     /// # Panics
     ///
     /// Panics when the element count or a stride does not fit `isize`; use
     /// [`Self::try_col_major_uninit`] to get [`StridedError::OffsetOverflow`]
     /// instead.
-    pub unsafe fn col_major_uninit(dims: &[usize]) -> Self {
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::mem::MaybeUninit;
+    /// use strided_view::StridedArray;
+    ///
+    /// let mut a = unsafe { StridedArray::<bool>::col_major_uninit(&[2]) };
+    /// a.set(&[0], MaybeUninit::new(true));
+    /// a.set(&[1], MaybeUninit::new(false));
+    /// // SAFETY: both slots were written above.
+    /// assert!(unsafe { a.get(&[0]).assume_init() });
+    /// ```
+    pub unsafe fn col_major_uninit(dims: &[usize]) -> StridedArray<MaybeUninit<T>> {
         Self::try_col_major_uninit(dims).expect("col_major_uninit: shape overflows isize")
     }
 
     /// Fallible [`Self::col_major_uninit`].
     ///
     /// # Safety
-    /// Caller must write every element before reading.
+    ///
+    /// As [`Self::col_major_uninit`].
     ///
     /// # Errors
     ///
     /// Returns [`StridedError::OffsetOverflow`] when the element count or a
     /// stride does not fit `isize`.
-    pub unsafe fn try_col_major_uninit(dims: &[usize]) -> Result<Self> {
+    pub unsafe fn try_col_major_uninit(dims: &[usize]) -> Result<StridedArray<MaybeUninit<T>>> {
         let strides = checked_col_major_strides(dims)?;
         let total = checked_element_count(dims)?;
-        let mut data = Vec::with_capacity(total);
-        // The allow records the construction this `unsafe fn` has always used, not that
-        // it is sound: `set_len` over uninitialized slots breaks `Vec`'s contract for
-        // elements with invalid bit patterns (`bool`, `char`, references). Reworking the
-        // storage to `MaybeUninit` is tracked in #413 and removes this allow.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            data.set_len(total)
-        };
-        Ok(Self {
-            data,
+        Ok(StridedArray {
+            data: vec![MaybeUninit::uninit(); total],
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
         })
@@ -1617,15 +1631,24 @@ impl<T: Copy> StridedArray<T> {
 
     /// Reuse an existing buffer as a column-major tensor **without zeroing**.
     ///
+    /// The buffer is `Vec<MaybeUninit<T>>` for the same reason as
+    /// [`Self::col_major_uninit`]: a slot the caller has not written yet is not a
+    /// `T` (#413). Slots the buffer already holds are kept as they are.
+    ///
     /// # Safety
-    /// Caller must write every element before reading.
+    ///
+    /// As [`Self::col_major_uninit`]: read a slot with
+    /// [`MaybeUninit::assume_init`] only after it was written.
     ///
     /// # Panics
     ///
     /// Panics when the element count or a stride does not fit `isize`; use
     /// [`Self::try_col_major_from_buffer_uninit`] to get
     /// [`StridedError::OffsetOverflow`] instead.
-    pub unsafe fn col_major_from_buffer_uninit(buf: Vec<T>, dims: &[usize]) -> Self {
+    pub unsafe fn col_major_from_buffer_uninit(
+        buf: Vec<MaybeUninit<T>>,
+        dims: &[usize],
+    ) -> StridedArray<MaybeUninit<T>> {
         Self::try_col_major_from_buffer_uninit(buf, dims)
             .expect("col_major_from_buffer_uninit: shape overflows isize")
     }
@@ -1634,24 +1657,23 @@ impl<T: Copy> StridedArray<T> {
     /// error.
     ///
     /// # Safety
-    /// Caller must write every element before reading.
+    ///
+    /// As [`Self::col_major_uninit`].
     ///
     /// # Errors
     ///
     /// Returns [`StridedError::OffsetOverflow`] when the element count or a
     /// stride does not fit `isize`.
     pub unsafe fn try_col_major_from_buffer_uninit(
-        mut buf: Vec<T>,
+        mut buf: Vec<MaybeUninit<T>>,
         dims: &[usize],
-    ) -> Result<Self> {
+    ) -> Result<StridedArray<MaybeUninit<T>>> {
         let strides = checked_col_major_strides(dims)?;
         let total = checked_element_count(dims)?;
-        if buf.capacity() < total {
-            buf.reserve(total - buf.len());
-        }
-        // Same `Vec` contract question as `try_col_major_uninit` above (#413).
-        buf.set_len(total);
-        Ok(Self {
+        // Truncates or grows to the shape; the retained prefix keeps whatever the
+        // caller already put in it.
+        buf.resize(total, MaybeUninit::uninit());
+        Ok(StridedArray {
             data: buf,
             meta: ViewMeta::from_slices(dims, &strides),
             offset: 0,
