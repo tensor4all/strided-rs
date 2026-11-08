@@ -153,6 +153,8 @@ impl SlicePlan {
     /// not representable, and
     /// [`StridedError::OffsetOverflow`] when an element count, a scaled
     /// source stride, or the source offset delta overflows.
+    // The plan compile takes the operand and destination layouts plus the three
+    // slice vectors; splitting it would only move the argument list.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -236,6 +238,14 @@ impl SlicePlan {
             .offset()
             .checked_add(self.source_offset_delta)
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `SlicePlan::compile` (:159) rejected every window outside the
+        // operand (`start > limit || limit > operand_dims[axis]`, :191), built
+        // `source_strides`/`source_offset_delta` with checked arithmetic and required
+        // `dest_dims == span.div_ceil(stride)`, so each index this view can reach is
+        // an index the operand already reaches; `check_call` (:301) re-proved the
+        // operand carries the compiled layout, its offsets were validated by
+        // `validate_bounds` (strided-view/src/view.rs:186) in `RawStridedRef::new`
+        // (strided-view/src/raw.rs:917), and the delta sum above is checked.
         let source = unsafe {
             RawStridedRef::new_unchecked(
                 operand.data(),
@@ -269,6 +279,14 @@ impl SlicePlan {
             .offset()
             .checked_add(self.source_offset_delta)
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `SlicePlan::compile` (:159) rejected every window outside the
+        // operand (`start > limit || limit > operand_dims[axis]`, :191), built
+        // `source_strides`/`source_offset_delta` with checked arithmetic and required
+        // `dest_dims == span.div_ceil(stride)`, so each index this view can reach is
+        // an index the operand already reaches; `check_call` (:301) re-proved the
+        // operand carries the compiled layout, its offsets were validated by
+        // `validate_bounds` (strided-view/src/view.rs:186) in `RawStridedRef::new`
+        // (strided-view/src/raw.rs:917), and the delta sum above is checked.
         let source = unsafe {
             RawStridedRef::new_unchecked(
                 operand.data(),
@@ -313,6 +331,8 @@ impl PadPlan {
     /// Returns
     /// [`StridedError::OffsetOverflow`] when an element count, a padded
     /// extent or a cursor stride computation overflows.
+    // Same shape as `SlicePlan::compile`: two layouts plus the three padding
+    // vectors; a wrapper type would hide the layout contract at the call site.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -1124,6 +1144,15 @@ impl PadPlan {
             .ok_or(StridedError::OffsetOverflow)?;
         let mut cursor = PadCopyState::new(source_base, dest_base, &self.generic_copy);
         for _ in 0..self.generic_copy.total {
+            // SAFETY: `PadPlan::compile` (:337) proved the destination layout
+            // injective and `dest_dims` equal to the padded extents, and
+            // `compile_pad_copy_cursor` (:1883) clamped each copied operand interval
+            // to `[0, operand_dims[axis])` (`checked_pad_valid_interval`, :1955) while
+            // computing `source_base_delta`/`dest_base_delta` and both step sets with
+            // checked arithmetic and a checked offset span; `check_call` (:1300)
+            // re-proved both layouts equal to the compiled ones, and the bases above
+            // are re-checked against `isize`, so both cursor offsets stay inside the
+            // buffers `validate_bounds` accepted for `operand`/`dest`.
             unsafe {
                 // INVARIANT: compile-time checked copy spans/base deltas,
                 // validated raw descriptors, and exact plan-layout equality
@@ -1166,6 +1195,15 @@ impl PadPlan {
                 let dest_ptr = dest_ptr.as_ptr();
 
                 for _ in range {
+                    // SAFETY: `PadPlan::compile` (:337) proved the destination layout
+                    // injective and `dest_dims` equal to the padded extents, and
+                    // `compile_pad_copy_cursor` (:1883) clamped each copied operand interval
+                    // to `[0, operand_dims[axis])` (`checked_pad_valid_interval`, :1955) while
+                    // computing `source_base_delta`/`dest_base_delta` and both step sets with
+                    // checked arithmetic and a checked offset span; `check_call` (:1300)
+                    // re-proved both layouts equal to the compiled ones, and the bases above
+                    // are re-checked against `isize`, so both cursor offsets stay inside the
+                    // buffers `validate_bounds` accepted for `operand`/`dest`.
                     unsafe {
                         // INVARIANT: compile-time checked copy spans/base
                         // deltas, validated descriptors, exact layout equality,
