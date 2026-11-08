@@ -391,6 +391,19 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("not the file list Cargo shipped", out)
 
+    def test_long_member_name_checks_the_payload_offset(self) -> None:
+        # GPT review on #416 (round 3): a name longer than 100 bytes puts a pax
+        # extension in front of the header, and tarfile's `offset` points at
+        # that extension while `offset_data` points at the payload. Using
+        # `offset + 512` reads the extension as payload padding and rejects an
+        # unchanged archive.
+        self.fx.write("a" * 120 + ".txt", "x\n")
+        self.fx.commit("long file name")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
     def test_tree_member_size_field_lie_is_not_green(self) -> None:
         # GPT review on #416 (critical, third round): flip one bit of a tree
         # member's size field ('3' -> '2') and one of its UID ('0' -> '1'); the

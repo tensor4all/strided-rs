@@ -296,9 +296,12 @@ def crate_archive(blob: bytes, listed: bytes | None = None,
             # end-of-archive check (#416 review), and the real content leftover
             # bytes stay in the padding, so a nonzero leftover shows here; a
             # member that ends in zeros shows nothing, which is why member_bytes()
-            # does not rest on the padding.
-            pad_start = m.offset + 512 + m.size
-            pad_end = m.offset + 512 + -(-m.size // 512) * 512
+            # does not rest on the padding. The payload starts at `offset_data`,
+            # not at `offset + 512`: for a name longer than 100 bytes the
+            # header is preceded by a pax extension, and `offset` points at that
+            # extension.
+            pad_start = m.offset_data + m.size
+            pad_end = m.offset_data + -(-m.size // 512) * 512
             if any(raw[pad_start:pad_end]):
                 raise CheckError(
                     f"{m.name}: the bytes after the declared content are not"
