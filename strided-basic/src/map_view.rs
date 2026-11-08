@@ -2238,7 +2238,9 @@ fn broadcast_strides_for_axes(
 /// A view of `view`'s data with stride-0 broadcast axes.
 ///
 /// The metadata is computed for this call only; [`StridedView::new_unchecked`]
-/// copies it inline, so the view still borrows only the element data.
+/// copies it into owned metadata (inline up to [`INLINE_RANK`](crate::INLINE_RANK)
+/// axes, boxed above, so a rank-9 view allocates), and the view still borrows
+/// only the element data.
 fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     view: &StridedView<'a, T, Op>,
     target_dims: &[usize],
@@ -2251,7 +2253,10 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     // the offsets `view` reaches; `StridedView` construction (`new`,
     // strided-view/src/view.rs:508 via `validate_bounds`, :186) already proved those
     // in bounds, and `target_dims`/`strides` come from the caller's `dest.dims()`
-    // and that validation. The metadata is copied inline by `new_unchecked`.
+    // and that validation. `new_unchecked` copies the metadata into owned
+    // storage, not inline: `ViewMeta::from_slices` (strided-view/src/view.rs:128)
+    // keeps it inline up to `INLINE_RANK` = 8 and boxes it above (:140), which
+    // is why a rank-9 call allocates here.
     unsafe { StridedView::new_unchecked(view.data(), target_dims, strides, view.offset()) }
 }
 

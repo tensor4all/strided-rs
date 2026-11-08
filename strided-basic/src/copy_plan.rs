@@ -211,7 +211,12 @@ impl CopyPlan {
     /// [`Self::execute_uninit`] initializes every reachable logical destination
     /// element before `f` runs, so the [`InitializedRawDest`] receipt handed to `f`
     /// may read and overwrite exactly those offsets. Slots outside the plan's
-    /// reachable set stay uninitialized, which is why the receipt exposes
+    /// reachable set are not written by that copy and it makes no claim about
+    /// them: a caller that handed in a `MaybeUninit` array still owns those slots,
+    /// so they keep whatever initialization the caller left. With
+    /// `CopyPlan::compile(&[2], &[2], &[1])` the offset-1 hole keeps the caller's
+    /// value (measured `[7.0, 99.0, 8.0]` for `src = [7, 8]`) rather than
+    /// becoming uninitialized. That is why the receipt exposes
     /// `write_at`/`add_at` (copy_plan.rs:138, :150) instead of a typed slice: their
     /// contracts require an offset proven by this plan's layout. The receipt borrows
     /// the destination for `f`'s lifetime, so a read-modify-write consumer (the

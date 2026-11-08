@@ -1650,9 +1650,13 @@ impl DynamicUpdateSlicePlan {
         // `dest_dims == operand_dims` (:1414) and `validate_window_sizes`
         // (:1423), this rank-one path requires `dest_strides[0] == 1` (:1630),
         // and `check_call` (:1714) proved the writer carries exactly that
-        // layout, so `dest_start + total` cannot pass the reachable offset
-        // `RawStridedMut::new` validated (strided-view/src/raw.rs:1036,
-        // `validate_bounds` at :1042).
+        // layout. The last offset this run writes is `dest_start + total - 1`
+        // (`total >= 1` here: an empty window returns as `UpdateWindow::Empty`
+        // at :1508 and leaves at :1556), and that offset cannot pass the
+        // highest one `RawStridedMut::new` validated
+        // (strided-view/src/raw.rs:1036, `validate_bounds` at :1042). The
+        // exclusive end `dest_start + total` is one past the run's last
+        // element and may equal `max + 1`.
         unsafe {
             // Chunked across workers above the repository threshold; each
             // worker writes a disjoint chunk of the checked destination run.
