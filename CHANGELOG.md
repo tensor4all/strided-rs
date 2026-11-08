@@ -13,9 +13,9 @@ downstream that runs `cargo update` without a version constraint change.
 Bumped to 0.13.0: `strided-basic`, `strided-perm`, `strided-kernel`,
 `strided-fused`, `strided-nn`. `strided-traits` keeps 0.7.0 (nothing in it changed).
 `strided-view` goes to **0.7.2** so that the checked dense-stride helpers this tree
-carries (`checked_col_major_strides` / `checked_row_major_strides`) can be published;
-the published 0.7.1 does not contain them. The acceptance rules and the panic set are
-documented on `checked_dense_strides` and pinned by its tests.
+carries can be published; the published 0.7.1 does not contain them. The public
+`col_major_strides` / `row_major_strides` documentation is the contract: they panic
+when a stride *or the element count of a non-empty shape* does not fit `isize`.
 
 ### Breaking changes
 
@@ -55,10 +55,9 @@ cargo add strided-basic@0.13 strided-perm@0.13 strided-kernel@0.13 strided-fused
 cargo build   # then fix the remaining call sites the compiler names
 ```
 
-Code that only calls `strided-traits` / `strided-view` needs no source change. The
-public `col_major_strides` / `row_major_strides` now forward the checked helpers, so a
-shape they accept is one the helpers accept; see `checked_dense_strides` for what that
-means at the `isize` boundary.
+Code that only calls `strided-traits` / `strided-view` needs no source change; see the
+`# Panics` sections of `col_major_strides` / `row_major_strides` for the shapes that
+now panic instead of returning a stride computed with wrapping arithmetic.
 
 ### Additive
 
