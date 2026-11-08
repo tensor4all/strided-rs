@@ -64,11 +64,15 @@ class Fixture:
         sh(self.root, "cargo", "package", "-q", "-p", "demo", "--no-verify", "--offline")
         return (self.root / "target" / "package" / "demo-0.1.0.crate").read_bytes()
 
-    def run(self, ref: str, published=None) -> tuple[int, str]:
+    def run(self, ref: str, published=None, real_network: bool = False) -> tuple[int, str]:
+        """Run main(). `published()` is replaced unless `real_network` is set,
+        in which case the caller mocks the transport underneath it."""
         out = io.StringIO()
-        with mock.patch.object(pi, "published", published or (lambda n, v: None)), \
-                mock.patch("sys.argv", ["published_identity.py", str(self.root), "--ref", ref]), \
-                contextlib.redirect_stdout(out):
+        with contextlib.ExitStack() as stack:
+            if not real_network:
+                stack.enter_context(mock.patch.object(pi, "published", published or (lambda n, v: None)))
+            stack.enter_context(mock.patch("sys.argv", ["published_identity.py", str(self.root), "--ref", ref]))
+            stack.enter_context(contextlib.redirect_stdout(out))
             rc = pi.main()
         return rc, out.getvalue()
 
@@ -196,6 +200,42 @@ class PublishedIdentityTest(unittest.TestCase):
 
         rc, out = self.fx.run("HEAD", down)
         self.assertEqual(rc, 2, out)
+
+    def test_transport_failure_through_the_real_call_chain_is_not_green(self) -> None:
+        # GPT review on #411 (round 3): mock urlopen, not published()/fetch(),
+        # so that misclassifying a DNS outage as 404 would turn this test red.
+        import urllib.error
+
+        def outage(*args, **kwargs):
+            raise urllib.error.URLError("DNS outage")
+
+        with mock.patch.object(pi.urllib.request, "urlopen", outage):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn("unpublished", out)
+
+    def test_whitespace_in_a_shipped_name_is_kept(self) -> None:
+        # GPT review on #411 (round 3): "notes" and "notes " are two files.
+        self.fx.write("notes", "a\n")
+        self.fx.commit("notes")
+        blob = self.fx.package()
+        self.fx.write("notes ", "b\n")
+        self.fx.commit("second file whose name ends in a space")
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("only in", out)
+
+    def test_unchanged_external_readme_symlink_is_ok(self) -> None:
+        # GPT review on #411 (round 3): README.md -> GUIDE.md at the repo root;
+        # Cargo archives it as README.md.
+        (self.fx.root / "GUIDE.md").write_text("# guide\n")
+        (self.fx.root / "README.md").symlink_to("GUIDE.md")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("readme symlink outside the crate")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
 
     def test_only_404_means_unpublished(self) -> None:
         with mock.patch.object(pi, "fetch", lambda url: (404, b"")):

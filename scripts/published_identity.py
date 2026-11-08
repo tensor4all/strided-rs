@@ -104,9 +104,12 @@ def workspace_crates(repo: str, ref: str) -> list[dict]:
             v = p.get(key)
             if not v:
                 continue
-            src = pathlib.Path(os.path.realpath(man / v))
+            declared = man / v
+            src = pathlib.Path(os.path.realpath(declared))
             if man not in src.parents:
-                relocated[src.name] = str(src)
+                # Cargo archives it under the declared file name, not the name
+                # of whatever a symlink there points to.
+                relocated[declared.name] = str(src)
         crates.append({"name": p["name"], "version": p["version"], "dir": str(rel),
                        "relocated": relocated})
     return crates
@@ -160,12 +163,19 @@ def crate_files(blob: bytes) -> dict[str, str]:
 
 def shipped_paths(repo: str, crate: dict) -> set[str]:
     """The exact files `cargo package` would ship, honouring include/exclude."""
-    rc, out = run(["cargo", "package", "-p", crate["name"], "--list", "-q",
-                   "--manifest-path", f"{repo}/Cargo.toml"], timeout=300)
-    if rc != 0:
-        raise CheckError(f"cargo package --list failed for {crate['name']}: {out[:300]}")
-    return {line.strip() for line in out.splitlines()
-            if line.strip() and line.strip() not in SKIP_ALWAYS}
+    # stdout only (stderr may carry warnings), as bytes, so no newline
+    # translation or decoding touches a path.
+    r = subprocess.run(["cargo", "package", "-p", crate["name"], "--list", "-q",
+                        "--manifest-path", f"{repo}/Cargo.toml"],
+                       capture_output=True, timeout=300)
+    if r.returncode != 0:
+        raise CheckError(f"cargo package --list failed for {crate['name']}: "
+                         f"{r.stderr.decode(errors='replace')[:300]}")
+    out = r.stdout.decode("utf-8", "surrogateescape")
+    # One path per line, taken verbatim: stripping whitespace would rename a
+    # file such as "notes " and could merge two distinct shipped paths.
+    return {line for line in out.split("\n")
+            if line and line not in SKIP_ALWAYS}
 
 
 def tree_files(repo: str, crate: dict, wanted: set[str]) -> dict[str, str]:
