@@ -139,14 +139,23 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
         let len = total_len(raw.dims);
         if exec.is_serial() {
-            // SAFETY: the validated contiguous ranges are live and non-overlapping.
+            // SAFETY: `prepare` (copy.rs:85) proved `dims`, the strides and the two
+            // origins describe the same shape, and each view's constructor proved
+            // through `validate_bounds` (strided-view/src/view.rs:186) that its
+            // reachable offsets stay inside its own slice. A contiguous layout
+            // reaches exactly `total_len(dims)` consecutive elements from that
+            // origin, so both ranges are live for `len` elements; the caller holds
+            // `&mut StridedViewMut` against a shared `&StridedView`, so they do not
+            // overlap.
             unsafe { std::ptr::copy_nonoverlapping(raw.src, dst_ptr, len) };
         } else {
             let src_addr = raw.src as usize;
             let dst_addr = dst_ptr as usize;
             exec.for_ranges(len, std::num::NonZeroUsize::MIN, |range| {
-                // SAFETY: `for_ranges` joins disjoint subranges of the validated
-                // contiguous buffers; raw stores also support uninitialized output.
+                // SAFETY: `range` is a disjoint subrange of `0..len`, so both
+                // `.add(range.start)` pointers stay within the two live `len`-element
+                // contiguous ranges justified above; the subranges are disjoint, and
+                // raw stores are valid for the uninitialized `U` destination.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (src_addr as *const T).add(range.start),
@@ -221,8 +230,11 @@ pub fn copy_into<T: Copy + Send + Sync + 'static>(
     exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
-        // SAFETY: both views are validated layouts over live, non-overlapping
-        // storage (`StridedViewMut` is exclusive), and `prepare` matched them.
+        // SAFETY: `prepare` (copy.rs:85) rejected a rank or shape mismatch and a
+        // zero-sized copy, and each view's constructor proved its reachable offsets
+        // stay inside its slice through `validate_bounds`
+        // (strided-view/src/view.rs:186). `&mut StridedViewMut` excludes any other
+        // borrow of the destination, so the two raw extents cannot overlap.
         Some(raw) => unsafe { copy_raw(raw, exec) },
         None => Ok(()),
     }
@@ -250,8 +262,10 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
-        // SAFETY: as `copy_into`; `MaybeUninit<T>` has `T`'s layout and the
-        // engine only stores into the destination.
+        // SAFETY: as `copy_into` (copy.rs:227) — `prepare` matched the shapes and
+        // both views proved their bounds at construction. `MaybeUninit<T>` has `T`'s
+        // size and alignment, and the engine only stores into the destination, so
+        // the uninitialized extent is never read.
         Some(raw) => unsafe { copy_raw(raw, exec) },
         None => Ok(()),
     }

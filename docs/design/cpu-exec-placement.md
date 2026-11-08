@@ -15,8 +15,13 @@ there. This page records only what is specific to the strided crates.
 - `strided-basic` re-exports `Exec`, `Pool` and `PoolBuilder`, so a consumer that
   depends on `strided-basic` does not need its own `threadteam` dependency.
 - `strided-perm` and `strided-basic` never exceed the budget they are handed;
-  within it the width is the token's decision (see Thresholds). No thread-local
-  scope exists in any strided crate.
+  within it the width is the token's decision (see Thresholds). No strided crate
+  keeps placement state in a thread-local scope: the token carries the budget and
+  the pool (`strided-basic/src/threading.rs:5-7`). The `thread_local!` items that
+  do exist are per-thread scratch buffers
+  (`strided-basic/src/erased/reduce_kernel.rs:72`,
+  `strided-fused/src/fused/chunk.rs:102`) and a `#[cfg(test)]` hit counter
+  (`strided-fused/src/fused.rs:938`).
 - Only `threadteam` depends on `rayon` in this workspace; `deny.toml` rejects a
   direct `rayon` dependency elsewhere (`cargo deny check bans` in CI). The check
   that no `rayon::` path appears in `threadteam`'s public API lives in
@@ -24,9 +29,9 @@ there. This page records only what is specific to the strided crates.
 
 ## Thresholds
 
-- There is no element-count threshold. A kernel multiplies its element count by
-  the serial throughput of its class on the host class
-  (`strided_basic::execution::KernelClass::ns_per_element`; `x86_64-avx512`: copy 0.171, map 0.173, exp-like 5.60,
+- There is no element-count threshold on the decision to go parallel. A kernel
+  multiplies its element count by the serial throughput of its class on the host
+  class (`strided_basic::execution::KernelClass::ns_per_element`; `x86_64-avx512`: copy 0.171, map 0.173, exp-like 5.60,
   reduce 0.104 ns per element; `aarch64-apple` and the `generic` row of every unmeasured class: 0.090, 0.100, 1.38,
   0.081; the table, with its derivation, lives in `strided-basic/src/cost.rs` and
   `strided_perm::copy_ns_per_element_of`; rates and the `threadteam` dispatch costs of a class come from the same
@@ -39,7 +44,13 @@ there. This page records only what is specific to the strided crates.
   The class of an element function rides with the function passed to `map_into`
   and its siblings: a closure is a `Map`, and a caller declares an expensive one
   with `KernelClass::Transcendental.with(f)` (`strided_basic::Classed`, trait
-  `MapFn`).
+  `MapFn`). The plan and leaf-kernel minimums select a plan or a leaf kernel, not
+  a gate: `SMALL_TENSOR_THRESHOLD`
+  (`strided-basic/src/kernel.rs:13`, read at `strided-basic/src/map_view.rs:1528`)
+  picks the blocking plan, and the axis minimums (`AXIS_SWEEP_MIN_LEN`,
+  `strided-basic/src/reduce_view.rs:26`; `AXIS_RUN_KERNEL_MIN_LEN` and
+  `AXIS_OUTPUT_BLOCK_MIN_LEN`, `strided-basic/src/erased/reduce_kernel.rs:31,35`)
+  pick a leaf kernel.
 - `sections` is the number of dispatches the entry performs: 1 for a flat entry
   (`for_ranges`: copies, fills, the permutation engine, axis-chunked kernels),
   `ceil(log2 width)` for a tree entry (`parallel_map_reduce`), and 1 per node for

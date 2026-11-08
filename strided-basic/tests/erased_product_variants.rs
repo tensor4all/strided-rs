@@ -15,7 +15,7 @@ use strided_basic::{
     ReduceOp,
 };
 
-/// Largest tensor used per case; sized past `MINTHREADLENGTH` so the parallel
+/// Largest tensor used per case; sized past the cost gate so the parallel
 /// axis route really partitions outputs.
 const LARGE_AXIS_OUTPUTS: usize = (1 << 15) + 37;
 

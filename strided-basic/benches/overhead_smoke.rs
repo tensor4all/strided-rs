@@ -10,8 +10,8 @@
 //! Run with `OVERHEAD_GATE=1` to make a failed gate exit non-zero; without it
 //! the table is printed and the process succeeds, so local runs and first CI
 //! runs can collect numbers. The gate is deliberately forgiving: it fails only
-//! when all [`support::ATTEMPTS`] attempts exceed the threshold, and the
-//! per-round timing is the minimum of [`support::ROUNDS`] rounds.
+//! when all [`support::ATTEMPTS`] attempts exceed its bound, and each attempt's
+//! time is the median of [`support::REPS`] samples.
 //!
 //! Rows (see `#306`):
 //! - S3a/S3b: `map_into` replanning per call vs a compiled typed `UpdatePlan`
@@ -45,7 +45,7 @@ mod support;
 #[global_allocator]
 static GLOBAL: support::CountingAllocator = support::CountingAllocator;
 
-use support::{measure_case, print_table, CaseResult};
+use support::{measure_case, print_table, CaseResult, Gate};
 
 fn col_major_strides(dims: &[usize]) -> Vec<isize> {
     let mut strides = Vec::with_capacity(dims.len());
@@ -76,7 +76,7 @@ fn s3_case(
     label: &'static str,
     iterations: usize,
     baseline: S3Baseline,
-    threshold: Option<f64>,
+    gate: Gate,
 ) -> CaseResult {
     let len: usize = dims.iter().product();
     let src_data: Vec<f64> = (0..len).map(|value| value as f64 + 1.0).collect();
@@ -98,7 +98,7 @@ fn s3_case(
                 label,
                 "map_into per call vs compiled typed UpdatePlan",
                 iterations,
-                threshold,
+                gate,
                 || {
                     map_into(&mut dst_view, &src_view, |value| value, Exec::serial()).unwrap();
                     black_box(dst_view.as_mut_ptr());
@@ -128,7 +128,7 @@ fn s3_case(
                 label,
                 "map_into per call vs compiled ErasedUpdatePlan",
                 iterations,
-                threshold,
+                gate,
                 || {
                     map_into(&mut dst_view, &src_view, |value| value, Exec::serial()).unwrap();
                     black_box(dst_view.as_mut_ptr());
@@ -174,7 +174,7 @@ fn s4_case(
         label,
         "permuted copy_into vs contiguous copy_into",
         iterations,
-        None,
+        Gate::Report,
         || {
             copy_into(&mut permuted_out, &permuted_src, Exec::serial()).unwrap();
             black_box(permuted_out.as_mut_ptr());
@@ -192,23 +192,35 @@ fn main() {
     let cases = {
         vec![
             // Gated against the typed compiled plan (P4 per-call planning).
-            s3_case(&[16], "S3a", 20_000, S3Baseline::TypedUpdatePlan, Some(2.5)),
+            s3_case(
+                &[16],
+                "S3a",
+                20_000,
+                S3Baseline::TypedUpdatePlan,
+                Gate::Bound(2.5),
+            ),
             s3_case(
                 &[4, 4, 4],
                 "S3b",
                 10_000,
                 S3Baseline::TypedUpdatePlan,
-                Some(4.0),
+                Gate::Bound(4.0),
             ),
             // The erased compiled plan downstream actually replays: report
             // only, because the erased boundary adds its own overhead.
-            s3_case(&[16], "S3c", 20_000, S3Baseline::ErasedUpdatePlan, None),
+            s3_case(
+                &[16],
+                "S3c",
+                20_000,
+                S3Baseline::ErasedUpdatePlan,
+                Gate::Report,
+            ),
             s3_case(
                 &[4, 4, 4],
                 "S3d",
                 10_000,
                 S3Baseline::ErasedUpdatePlan,
-                None,
+                Gate::Report,
             ),
             s4_case(&[8, 8, 8], &[64, 8, 1], "S4a", 2_000),
             s4_case(&[32, 32, 32], &[1024, 32, 1], "S4b", 200),

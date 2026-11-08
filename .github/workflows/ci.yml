@@ -12,6 +12,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  workflow-lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # YAML の構文だけでなく「そのコンテキストがそこで使えるか」まで見る。
+      # 実例: workflow 階層の `concurrency.group` で `matrix` を参照しており、
+      # YAML としては正しいが GitHub が受け付けず、ワークフローが起動しなかった。
+      - uses: raven-actions/actionlint@v2
+        with:
+          # shellcheck も走るが、`ci.yml` には既存の SC2086 が 3 件ある（本 PR の範囲外）。
+          # 先に既存を直すまで shellcheck は切り、actionlint 本体（構文・コンテキスト）だけ強制する。
+          shellcheck: false
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -26,6 +40,11 @@ jobs:
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Backstop, measured on run 42451599046 (2026-11-08): this job takes 3m25s on
+    # ubuntu. 30 min still surfaces a hang as a failure instead of leaving the job
+    # `in_progress` (tensor4all/strided-rs#395), and it is far above the slowest
+    # legitimate run, including a cold cargo cache.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -40,8 +59,12 @@ jobs:
       - name: Run tests
         run: cargo test --profile ci
 
+      # The step carries its own, tighter budget: the hang in #395 is here, and a
+      # step timeout fails the job while still letting the `if: always()` step
+      # below run. Measured at 1m34s on run 42451599046; 15 min is ~10x that.
       - name: Overhead smoke gates (ubuntu)
         if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
         run: |
           OVERHEAD_GATE=1 cargo bench --profile release -p strided-basic --bench overhead_smoke
           OVERHEAD_GATE=1 cargo bench --profile release -p strided-fused --bench overhead_smoke

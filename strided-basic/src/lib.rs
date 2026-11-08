@@ -68,6 +68,18 @@
 //! - [`sum`], [`dot`]: Reductions
 //! - [`symmetrize_into`], [`symmetrize_conj_into`]: Matrix symmetrization
 //!
+//! ## Raw Strided Copies
+//!
+//! Over borrowed [`RawStridedRef`] / [`RawStridedMut`] layouts:
+//!
+//! - [`CopyPlan`], [`UpdatePlan`]: compile a layout pair once, replay it on
+//!   exactly that layout
+//! - [`replay_copy_raw`], [`replay_map_raw`] and their `_uninit` forms: replay
+//!   already-fused dims and strides as given, compiling nothing, serially or
+//!   across the token's budget
+//! - [`copy_scale_raw`], [`axpy_raw`] and their `conj` forms: serial copies
+//!   that fuse the layout on every call
+//!
 //! # Example
 //!
 //! ```rust
@@ -136,7 +148,8 @@ pub use ops_view::{
     symmetrize_into,
 };
 pub use raw_ops::{
-    axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, RAW_FUSED_RANK_LIMIT,
+    axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, replay_copy_raw,
+    replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit, RAW_FUSED_RANK_LIMIT,
 };
 pub use reduce_view::{reduce, reduce_axis, reduce_axis_into, zip_reduce};
 pub use simd::MaybeSimdOps;

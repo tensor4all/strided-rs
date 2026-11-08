@@ -28,7 +28,6 @@ mod fuse;
 mod host;
 mod hptt;
 #[cfg(test)]
-#[allow(dead_code)]
 mod kernel;
 #[cfg(test)]
 mod order;

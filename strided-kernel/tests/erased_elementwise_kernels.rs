@@ -29,7 +29,7 @@ use strided_kernel::{
     KernelDType, KernelStorageElement,
 };
 
-/// Larger than `MINTHREADLENGTH` so that parallel contexts split the work.
+/// The large regression size of the suite.
 const LARGE: usize = (1 << 15) + 65;
 const LENGTHS: [usize; 5] = [1, 7, 17, 67, LARGE];
 

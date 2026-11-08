@@ -408,7 +408,7 @@ fn erased_reduce_plan_full_stable_product_carries_one_accumulator_across_runs() 
 /// unit-stride runs: `[2^-600, fifteen ones]` and `[2^600, 2^600, fourteen
 /// ones]`. Scaling each run separately gives `2^-600 * inf = inf` with a raw
 /// product; the exact exponent sum is `2^600`. Both the serial and the
-/// two-worker dispatch (work `2048 * 32` exceeds `MINTHREADLENGTH`) must carry
+/// two-worker dispatch (work `2048 * 32` clears the cost gate) must carry
 /// the mantissa/exponent accumulator across the runs.
 #[test]
 fn erased_reduce_plan_axis_stable_product_carries_one_accumulator_across_runs() {

@@ -4,11 +4,7 @@ use crate::fuse::{compress_dims, fuse_dims};
 use crate::{block, order};
 use strided_view::Result;
 
-/// Maximum total elements for the small tensor fast path.
-pub const SMALL_TENSOR_THRESHOLD: usize = 1024;
-
 pub struct KernelPlan {
-    pub order: Vec<usize>,
     pub block: Vec<usize>,
 }
 
@@ -39,14 +35,7 @@ pub fn build_plan_fused(
     let identity: Vec<usize> = (0..compressed_dims.len()).collect();
     let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_size);
 
-    (
-        compressed_dims,
-        compressed_strides,
-        KernelPlan {
-            order: identity,
-            block,
-        },
-    )
+    (compressed_dims, compressed_strides, KernelPlan { block })
 }
 
 /// Simplified plan for small tensors that fit in L1 cache.
@@ -60,16 +49,8 @@ pub fn build_plan_fused_small(
     let (fused_dims, fused_strides) = compress_dims(&fused, &strides_owned);
 
     let block = fused_dims.clone();
-    let identity: Vec<usize> = (0..fused_dims.len()).collect();
 
-    (
-        fused_dims,
-        fused_strides,
-        KernelPlan {
-            order: identity,
-            block,
-        },
-    )
+    (fused_dims, fused_strides, KernelPlan { block })
 }
 
 // ============================================================================
