@@ -107,8 +107,9 @@ def test_inline_test_body_is_skipped_and_counted() -> None:
             "body.rs": (
                 "#[cfg(test)]\n"
                 "mod tests {\n"
-                "    fn inner() {\n"
+                "    pub fn inner() -> Result<(), ()> {\n"
                 "        unsafe {}\n"
+                "        Ok(())\n"
                 "    }\n"
                 "}\n"
                 "\n"
