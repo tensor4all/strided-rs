@@ -147,6 +147,7 @@ impl ErasedArgReducePlan {
     ///   `NonInjectiveOutputLayout` for inconsistent layouts;
     /// * `OffsetOverflow` when a layout's offsets are not representable, or
     ///   when the axis is too long for an `i32` index.
+    // Dtype pair, op, both layouts and the axis are the compile key; wrapping adds nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -772,6 +773,7 @@ where
 ///
 /// As [`arg_line`] for each line `j < width` with source base `so + j`, every
 /// destination offset must be writable, and `width <= PANEL`.
+// Panel leaf: both base/stride pairs plus the panel width, called once per panel.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn arg_panel<T, I, F, D>(

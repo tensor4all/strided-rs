@@ -161,6 +161,7 @@ impl Composed {
         }
     }
 
+    // Bench fixture: each operand buffer is its own argument so the row reads as the case.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,

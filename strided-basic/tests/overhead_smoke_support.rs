@@ -5,6 +5,7 @@
 //! file stays in the crate that owns `benches/support/mod.rs`: the check used to
 //! live in `strided-fused`, where it reached into `strided-basic/benches/` and so
 //! could not compile from the packaged `.crate` (tensor4all/strided-rs#399).
+// Only the bench plumbing's own tests run here; the bench entry points stay unused.
 #![allow(dead_code)]
 
 #[path = "../benches/support/mod.rs"]

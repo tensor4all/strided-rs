@@ -238,6 +238,7 @@ fn ping_pong_mul<T: BenchScalar>(
 /// [`ping_pong_mul`]. The result ends in `second`. `tanh` goes through its
 /// vector kernel; `sqrt` has none and maps the scalar method, as tenferro's
 /// `sqrt` does.
+// Bench fixture: the views, layouts, buffers and context are spelled out per row.
 #[allow(clippy::too_many_arguments)]
 fn ping_pong_unary<T: BenchScalar>(
     sqrt: bool,
@@ -291,6 +292,7 @@ fn ping_pong_unary<T: BenchScalar>(
 /// chain runs once; its buffer is both the first output and the input of the
 /// final `add(input0)` that produces the second output, and every op goes
 /// through a threaded kernel.
+// Bench fixture: both operands, their strides and the output buffers, per row.
 #[allow(clippy::too_many_arguments)]
 fn per_instruction<T: BenchScalar>(
     row: Row,

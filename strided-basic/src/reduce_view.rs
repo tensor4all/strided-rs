@@ -381,6 +381,7 @@ where
 /// `a_ptr.offset(i * a_stride)` and `b_ptr.offset(i * b_stride)` must be
 /// readable elements for every `i < len`.
 #[inline(always)]
+// Run leaf over two strided inputs: both pointers, strides, length and the folds.
 #[allow(clippy::too_many_arguments)]
 unsafe fn fold_run2<A, B, OpA, OpB, M, R, U>(
     a_ptr: *const A,

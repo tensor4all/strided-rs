@@ -859,6 +859,7 @@ fn strided_offset_for_contiguous_linear_index(
     offset
 }
 
+// Raw parts leaf: base pointers and layout metadata of both operands, called per range.
 #[allow(clippy::too_many_arguments)]
 fn try_contiguous_range_mul<
     O: MulOutput<D>,
@@ -1433,6 +1434,7 @@ pub(crate) fn map_raw_into_validated<
     )
 }
 
+// Raw parts: destination pointer/layout plus source pointer/layout, called per block.
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into<
     D: Copy + Send + Sync,
@@ -1487,6 +1489,7 @@ fn map_contiguous<D: Copy, A: Copy, Op: ElementOp<A>>(
     });
 }
 
+// Raw parts: destination and source pointer/layouts plus the `validated` marker.
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into_validated<
     D: Copy + Send + Sync,
@@ -1808,6 +1811,7 @@ pub(crate) fn zip_map2_raw_into_validated<
     )
 }
 
+// Raw parts: destination and both operand pointers with their layouts, per block.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into<
     D: Copy + Send + Sync,
@@ -1845,6 +1849,7 @@ fn zip_map2_parts_into<
     )
 }
 
+// Raw parts: the same three operands plus the `validated` marker, called per block.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into_validated<
     D: Copy + Send + Sync,
@@ -1958,6 +1963,7 @@ fn zip_map2_parts_into_validated<
     )
 }
 
+// Raw parts: destination and both operand pointers with their layouts, per block.
 #[allow(clippy::too_many_arguments)]
 fn mul_identity_into_raw<
     O: MulOutput<D>,
@@ -2563,6 +2569,7 @@ pub fn zip_map4_into<
     zip_map4_into_validated(dest, a, b, c, e, f, validated, exec)
 }
 
+// Four operand layout triples plus the destination and the token: the entry's shape.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn zip_map4_into_validated<
     D: Copy + Send + Sync,

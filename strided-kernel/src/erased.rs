@@ -200,6 +200,7 @@ impl ErasedSlicePlan {
     /// when the destination layout cannot be proven injective, and
     /// [`StridedError::OffsetOverflow`] when an element count, a scaled
     /// source stride, or the source offset delta overflows.
+    // Dtype plus operand/destination layouts and the three slice vectors: the plan key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -455,6 +456,7 @@ impl ErasedPadPlan {
     /// destination layout cannot be proven injective, and
     /// [`StridedError::OffsetOverflow`] when an element count, a padded
     /// extent, or a cursor stride computation overflows.
+    // Dtype plus both layouts and the three padding vectors: the compile key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -634,6 +636,7 @@ impl ErasedGatherPlan {
     /// size beyond its operand extent, or a collapsed axis whose slice size
     /// is not one, and [`StridedError::ShapeMismatch`] when `dest_dims` is
     /// not the gathered window/batch shape.
+    // Dtype pair plus the operand, index and destination layouts: the compile key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -882,6 +885,7 @@ impl ErasedDynamicSlicePlan {
     /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
     /// cannot be proven injective, and [`StridedError::InvalidAxis`] when a
     /// slice size exceeds its operand extent.
+    // Dtype pair plus the operand, start, destination and update layouts: the plan key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -1124,6 +1128,7 @@ impl ErasedDynamicUpdateSlicePlan {
     /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
     /// cannot be proven injective, and [`StridedError::InvalidAxis`] when
     /// an update extent exceeds its operand extent.
+    // Dtype pair plus the operand, start, update and destination layouts: the plan key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -1392,6 +1397,7 @@ impl ErasedScatterPlan {
     /// that does not match `spec.scatter_dims_to_operand_dims`, a
     /// wrong-length `spec.update_window_dims`, or an update batch rank that
     /// disagrees with the index batch shape.
+    // Dtype pair plus the operand, index, update and destination layouts: the plan key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,

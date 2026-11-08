@@ -177,6 +177,7 @@ pub fn compute_importance<I: AsRef<[usize]>>(
     }
 
     // Add contributions from remaining arrays
+    // `k` also indexes the per-array stride and order tables, not just the loop range.
     #[allow(clippy::needless_range_loop)]
     for k in 1..m {
         for i in 0..n {

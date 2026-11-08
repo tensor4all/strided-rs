@@ -514,6 +514,7 @@ fn clamp_uninit_propagates_nan_and_prefers_hi_when_bounds_cross() {
     ));
 }
 
+// Reference helper: both operand layouts and axes stay separate for readability.
 #[allow(clippy::too_many_arguments)]
 fn naive_broadcast_mul<T: Copy>(
     out_dims: &[usize],
@@ -548,6 +549,7 @@ fn naive_broadcast_mul<T: Copy>(
     out
 }
 
+// Wrapper helper: dtype, destination layout, both operand layouts and the axes.
 #[allow(clippy::too_many_arguments)]
 fn broadcast_mul<T: KernelStorageElement + Copy>(
     dtype: KernelDType,

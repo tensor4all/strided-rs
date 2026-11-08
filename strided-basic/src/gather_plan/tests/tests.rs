@@ -333,6 +333,7 @@ fn dynamic_slice_window_uses_fused_replay_only_when_it_fuses() {
 
 /// Reference for a full-rank dynamic update: copy the operand, then overwrite
 /// the clamped update window.
+// Test reference: the layouts stay separate so each call reads as the case it builds.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dynamic_update_reference(
     dims: &[usize],

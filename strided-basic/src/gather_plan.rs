@@ -1371,6 +1371,7 @@ impl DynamicUpdateSlicePlan {
     /// maps two logical indices onto one offset, and
     /// [`StridedError::InvalidAxis`] when an update extent exceeds its
     /// operand extent.
+    // Dtype plus the operand, start, update and destination layouts: the compile key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -1742,6 +1743,7 @@ impl ScatterPlan {
     /// match `scatter_dims_to_operand_dims`, a wrong-length
     /// `update_window_dims`, or an update batch rank that disagrees with the
     /// index batch shape.
+    // Dtype pair plus operand, index, update and destination layouts: the compile key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],

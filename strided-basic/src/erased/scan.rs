@@ -738,6 +738,7 @@ unsafe fn scan_line<T, K, const EXCLUSIVE: bool, const REVERSE: bool>(
 ///
 /// As [`scan_line`] for each line `j < width`, with source base `so + j` and
 /// destination base `d_o + j`; `width <= PANEL`.
+// Panel leaf: both base/stride pairs plus the panel bounds, called once per panel.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn scan_panel<T, K, const EXCLUSIVE: bool, const REVERSE: bool>(

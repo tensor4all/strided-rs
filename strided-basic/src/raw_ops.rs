@@ -378,6 +378,7 @@ pub(crate) fn apply_spilled_pair<D, S, Apply>(
 /// - No other thread may access the destination slots of this range while it
 ///   runs, and the source slots must not be written concurrently. Destination
 ///   and source slots must not overlap.
+// Range leaf: both bases, the layout and the range, called once per worker range.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
     dst_ptr: *mut D,
@@ -472,6 +473,7 @@ pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
 ///
 /// Kept out of line: inlining this second carry loop into the inline replay
 /// measurably slows that one down.
+// Same shape as `apply_fused_range` for the spilled layout, per worker range.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub(crate) unsafe fn apply_spilled_range<D, S, Apply>(
@@ -554,6 +556,7 @@ pub(crate) unsafe fn apply_spilled_range<D, S, Apply>(
 /// Every `dst_offset + k * dst_stride` and `src_offset + k * src_stride` for
 /// `k < len` must be an in-bounds slot as described in [`apply_fused_range`],
 /// with exclusive access to the destination slots.
+// Run leaf: both base/offset/stride triples, the length and the closure, per run.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn apply_run<D, S, Apply>(

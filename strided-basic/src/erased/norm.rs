@@ -916,6 +916,7 @@ unsafe fn norm_line<T: NormScalar, const LAYER: bool, const WEIGHT: bool, const 
 ///
 /// `src + k * ss`, `dst + k * ds`, and (when present) `w + k * ws` and
 /// `b + k * bs` are valid for `k < n`.
+// Line leaf over src, dst, weight and bias: four base/stride pairs plus the length.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn norm_output<T: NormScalar, const WEIGHT: bool, const BIAS: bool>(
@@ -954,6 +955,7 @@ unsafe fn norm_output<T: NormScalar, const WEIGHT: bool, const BIAS: bool>(
 ///
 /// As [`norm_line`] for each line `j < width` with source base `so + j` and
 /// destination base `d_o + j`; `width <= PANEL`.
+// Panel leaf: the same four base/stride pairs plus the panel bounds, once per panel.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn norm_panel<T: NormScalar, const LAYER: bool, const WEIGHT: bool, const BIAS: bool>(
