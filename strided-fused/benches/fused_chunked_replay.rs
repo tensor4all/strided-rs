@@ -201,6 +201,7 @@ impl BenchScalar for f32 {
 /// Ten multiplies over preallocated buffers, ping-ponging between `first` and
 /// `second`. The first pass reads `a_view` (which may be broadcast); pass `p`
 /// reads the buffer pass `p - 1` wrote. The result ends in `second`.
+#[allow(clippy::too_many_arguments)] // INVARIANT: the two operand views, the geometry, both ping-pong buffers and the token.
 fn ping_pong_mul<T: BenchScalar>(
     a_view: &StridedView<'_, T>,
     b_view: &StridedView<'_, T>,

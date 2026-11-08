@@ -37,6 +37,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
 
+  # `clippy` was installed in the `test` job (below) and never run, so lints
+  # accumulated unread (tensor4all/strided-rs#215). `-D warnings` turns both
+  # `clippy::all` and the rustc warnings into failures; a lint that is correct
+  # for a site is silenced there with `#[allow(...)]` plus a one-line reason,
+  # never by loosening this gate.
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint every target
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `--all-targets` cannot be combined with `parallel`: `strided-kernel/benches/
+      # axis_ops.rs` needs type annotations under that feature set and no CI job has
+      # ever built it (pre-existing, tracked separately). Every other target is
+      # linted, because the `#[cfg(feature = "parallel")]` test files are code the
+      # `parallel` lanes run and nothing else compiles.
+      - name: Lint the parallel feature
+        run: cargo clippy --workspace --features parallel --lib --tests --examples -- -D warnings
+
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -51,9 +77,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      # No `components: clippy`: clippy runs in its own job, and installing it here
+      # only made this job look like it linted.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
@@ -93,8 +119,9 @@ jobs:
   # The `default` lane is the `test` job's `cargo test --profile ci` step. The
   # `parallel` lane runs on both operating systems, because it is the only place
   # the `#[cfg(feature = "parallel")]` tests of `strided-fused`
-  # (strided-fused/src/fused/tests/tests.rs:336,778) run alongside the macOS
-  # host class.
+  # (strided-fused/src/fused/tests/tests.rs:336,778) and of `strided-kernel`
+  # (strided-kernel/tests/erased_policy_parallel.rs, 13 tests) run alongside the
+  # macOS host class.
   features:
     name: feature lanes (${{ matrix.lane }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -102,15 +129,20 @@ jobs:
       LANE_PACKAGES: >-
         -p strided-traits -p strided-view -p strided-basic -p strided-perm
         -p strided-kernel -p strided-fused
-      # `strided-kernel` is deliberately absent: its dev-dependency `strided-nn`
-      # requires `strided-basic/parallel` and `pulp` unconditionally, and cargo
-      # unifies features across the whole invocation, so any `cargo test` that
-      # includes `strided-kernel` re-enables parallelism for every crate in the
-      # graph. Its library is still proven below; its tests run in the `test`
-      # job and the `parallel` lanes, where those requirements are on anyway.
+      # `strided-kernel` is absent from `LANE_TEST_PACKAGES`: its dev-dependency
+      # `strided-nn` requires `strided-basic/parallel` and depends on `pulp`
+      # unconditionally, and cargo unifies features across the whole invocation, so
+      # any `cargo test` that includes `strided-kernel` re-enables parallelism and
+      # `pulp` for every crate in the graph — which is what the `no-default-features`
+      # and `parallel-no-simd` lanes exist to rule out. Its library is proven in all
+      # four lanes below; its tests join only where those two features are on
+      # anyway, through `LANE_TEST_EXTRA` (the two `parallel` rows). The `test` job
+      # does not cover them either: it never enables `strided-kernel/parallel`, so
+      # `tests/erased_policy_parallel.rs` is compiled nowhere else.
       LANE_TEST_PACKAGES: >-
         -p strided-traits -p strided-view -p strided-basic -p strided-perm
         -p strided-fused
+      LANE_TEST_EXTRA: ${{ matrix.test_extra }}
     strategy:
       fail-fast: false
       matrix:
@@ -118,25 +150,29 @@ jobs:
           - lane: parallel
             os: ubuntu-latest
             flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
-            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_extra: -p strided-kernel
             basic: default parallel simd
             pulp: yes
           - lane: parallel
             os: macos-latest
             flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
-            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_extra: -p strided-kernel
             basic: default parallel simd
             pulp: yes
           - lane: no-default-features
             os: ubuntu-latest
             flags: --no-default-features
             test_flags: --no-default-features
+            test_extra: ""
             basic: ""
             pulp: no
           - lane: parallel-no-simd
             os: ubuntu-latest
             flags: --no-default-features --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
             test_flags: --no-default-features --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            test_extra: ""
             basic: parallel
             pulp: no
     steps:
@@ -164,11 +200,11 @@ jobs:
           WANT_BASIC: ${{ matrix.basic }}
           WANT_PULP: ${{ matrix.pulp }}
         run: |
-          cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }} --no-run --message-format=json \
+          cargo test --profile ci $LANE_TEST_PACKAGES $LANE_TEST_EXTRA ${{ matrix.test_flags }} --no-run --message-format=json \
             | python3 scripts/assert-lane-features.py
 
       - name: Run tests (${{ matrix.lane }})
-        run: cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }}
+        run: cargo test --profile ci $LANE_TEST_PACKAGES $LANE_TEST_EXTRA ${{ matrix.test_flags }}
 
   placement:
     name: placement rules

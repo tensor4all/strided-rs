@@ -976,6 +976,7 @@ fn chunked_replay_parallel_pool_matches_reference() {
 /// Dispatch costs of the test pools: 100 ns per section whatever the token, so that the
 /// regions of tens of thousands of elements these tests use open the parallel branches
 /// (the host default costs would keep them serial).
+#[cfg(feature = "parallel")]
 fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
     use threadteam::{DispatchKind, WidthCosts};
     let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));

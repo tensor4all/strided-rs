@@ -26,11 +26,11 @@ fn test_macro_kernel_f64_with_remainder() {
     let lda = 20isize; // src leading dim
     let ldb = 18isize; // dst leading dim
 
-    let src: Vec<f64> = (0..(block_a as isize * 1 + (block_b - 1) as isize * lda + 1) as usize)
+    let src: Vec<f64> = (0..(block_a as isize + (block_b - 1) as isize * lda + 1) as usize)
         .map(|i| i as f64)
         .collect();
     let mut dst =
-        vec![0.0f64; ((block_b - 1) as isize * 1 + (block_a - 1) as isize * ldb + 1) as usize];
+        vec![0.0f64; ((block_b - 1) as isize + (block_a - 1) as isize * ldb + 1) as usize];
 
     unsafe {
         macro_kernel_f64(src.as_ptr(), lda, block_a, dst.as_mut_ptr(), ldb, block_b);
@@ -83,7 +83,7 @@ fn test_const_stride1_copy_contiguous() {
 
 #[test]
 fn test_const_stride1_copy_strided() {
-    let src = vec![1.0f64, 0.0, 2.0, 0.0, 3.0];
+    let src = [1.0f64, 0.0, 2.0, 0.0, 3.0];
     let mut dst = vec![0.0f64; 5];
     unsafe {
         const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 3, 2, 1);
@@ -99,7 +99,7 @@ fn const_stride1_leaf_advances_wrap_at_the_allocation_end() {
     // 4-element buffer; the copy's terminal advance would read offset 6.
     // The cursor is not dereferenced after the last copy, so the advance
     // must be a wrapping one; Miri flags the pre-fix `offset`.
-    let src = vec![1.0f64, 2.0, 3.0, 4.0];
+    let src = [1.0f64, 2.0, 3.0, 4.0];
     let mut dst = vec![0.0f64; 2];
     unsafe {
         const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 2, 3, 1);

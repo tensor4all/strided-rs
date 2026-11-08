@@ -46,6 +46,9 @@ fn reference_scale<T>(
 
 /// Poison the initialized destination, run the erased update, and require the
 /// write-only `alpha * src` result for a beta that is zero.
+// Test helper: dtype, both strides, source, poison and the three scalars each stay
+// separate so the call reads as the case it builds.
+#[allow(clippy::too_many_arguments)]
 fn assert_beta_zero_case<T>(
     dtype: KernelDType,
     dims: &[usize],
@@ -415,7 +418,6 @@ fn erased_update_plan_rejects_before_any_write() {
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
-    drop(uninit);
     // SAFETY: every slot was initialized with NaN before the failed call.
     assert!(unsafe { storage[0].assume_init() }.is_nan());
 

@@ -20,12 +20,7 @@ use strided_kernel::{
 };
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
+    unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), core::mem::size_of_val(data)) }
 }
 
 fn assume_init_vec<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
@@ -624,11 +619,10 @@ fn erased_pad_generic_cursor_matches_rank_scaling_ground_truth() {
         for (linear, &value) in operand.iter().enumerate() {
             let mut remainder = linear;
             let mut output_linear = 0usize;
-            for axis in 0..rank {
+            for (axis, &stride) in dest_strides.iter().enumerate() {
                 let coord = remainder % 2;
                 remainder /= 2;
-                output_linear +=
-                    coord * dest_strides[axis] as usize * if axis == 0 { 2 } else { 1 };
+                output_linear += coord * stride as usize * if axis == 0 { 2 } else { 1 };
             }
             expected[output_linear] = value;
         }

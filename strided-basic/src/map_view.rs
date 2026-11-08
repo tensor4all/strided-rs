@@ -249,6 +249,9 @@ unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>, K: MapKernel<A, D>
 }
 
 /// Binary inner loop: `dest[i] = f(OpA::apply(a[i]), OpB::apply(b[i]))`.
+// Two operand pointers with their strides, the destination, the length and the
+// element op: the call's inputs, not a block's.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: ElementOp<B>>(
     dp: *mut D,
@@ -453,6 +456,9 @@ unsafe fn inner_loop_mul2<
         let src_a = std::slice::from_raw_parts(ap, len);
         let b = *bp;
         simd::dispatch_if_large(len, || {
+            // The stride-dispatch branches below all walk `0..len` against the
+            // destination pointer; keep this one in the same shape.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..len {
                 O::write(dp.add(i), multiply_value(src_a[i], b));
             }
@@ -461,6 +467,9 @@ unsafe fn inner_loop_mul2<
         let a = *ap;
         let src_b = std::slice::from_raw_parts(bp, len);
         simd::dispatch_if_large(len, || {
+            // Same shape as the branch above, mirrored: the walk is over the
+            // destination pointer.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..len {
                 O::write(dp.add(i), multiply_value(a, src_b[i]));
             }
@@ -765,6 +774,9 @@ impl<'a> ContiguousMulOuterCursor<'a> {
     }
 }
 
+// Row block: both operand bases with their strides, the plan, the start index and
+// the element count.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn run_contiguous_mul_row_block<
     O: MulOutput<D>,
@@ -1004,6 +1016,9 @@ fn try_contiguous_range_mul<
     }
 }
 
+// Worker-range leaf of the contiguous multiply: both operand bases and stride
+// tables, the plan, the extents and the range.
+#[allow(clippy::too_many_arguments)]
 fn run_contiguous_range_mul_single_thread<
     O: MulOutput<D>,
     D: Copy + Send + Sync + 'static,
@@ -1042,6 +1057,9 @@ fn run_contiguous_range_mul_single_thread<
 }
 
 /// Ternary inner loop: `dest[i] = f(a[i], b[i], c[i])`.
+// Three operand pointers with their strides, the destination, the length and the
+// element op: the call's inputs, not a block's.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn inner_loop_map3<
     D: Copy,
@@ -1091,6 +1109,9 @@ unsafe fn inner_loop_map3<
 }
 
 /// Quaternary inner loop: `dest[i] = f(a[i], b[i], c[i], e[i])`.
+// Four operand pointers with their strides, the destination, the length and the
+// element op: the call's inputs, not a block's.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn inner_loop_map4<
     D: Copy,

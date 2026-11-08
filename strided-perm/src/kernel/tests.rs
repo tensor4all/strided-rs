@@ -51,7 +51,7 @@ fn test_build_plan_fused_multi_array() {
     // Conflicting strides means no fusion possible
     assert_eq!(fused_dims.len(), 2);
     assert_eq!(fused_strides.len(), 2);
-    assert!(plan.block.len() >= 1);
+    assert!(!plan.block.is_empty());
 }
 
 #[test]
@@ -101,8 +101,8 @@ fn count_elements(dims: &[usize], blocks: &[usize]) -> usize {
         let mut s = vec![vec![0isize; dims.len()]; n_arrays];
         let mut stride = 1isize;
         for d in 0..dims.len() {
-            for a in 0..n_arrays {
-                s[a][d] = stride;
+            for row in &mut s {
+                row[d] = stride;
             }
             stride *= dims[d] as isize;
         }

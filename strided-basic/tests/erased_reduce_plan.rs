@@ -103,13 +103,13 @@ fn erased_reduce_plan_integer_full_reductions_use_wrapping_arithmetic() {
 fn sixteen_lane_sum(values: &[f64]) -> f64 {
     const LANES: usize = 16;
     let mut lanes = [0.0f64; LANES];
-    let mut chunks = values.chunks_exact(LANES);
-    for chunk in chunks.by_ref() {
+    let (chunks, remainder) = values.as_chunks::<LANES>();
+    for chunk in chunks {
         for (lane, &value) in lanes.iter_mut().zip(chunk) {
             *lane += value;
         }
     }
-    for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+    for (lane, &value) in lanes.iter_mut().zip(remainder) {
         *lane += value;
     }
     lanes.into_iter().fold(0.0, |acc, lane| acc + lane)
@@ -724,7 +724,7 @@ fn erased_reduce_plan_partially_fused_inner_axes_preserve_order() {
     plan.execute(&mut dest, &source, Exec::serial()).unwrap();
 
     let mut expected = [0.0f64; 2];
-    for kept in 0..2 {
+    for (kept, slot) in expected.iter_mut().enumerate() {
         let mut acc = 0.0;
         for linear in 0..12 {
             let axis0 = linear % 2;
@@ -733,7 +733,7 @@ fn erased_reduce_plan_partially_fused_inner_axes_preserve_order() {
             let offset = axis0 + 2 * axis1 + 6 * kept + 12 * axis3;
             acc += input[offset];
         }
-        expected[kept] = acc;
+        *slot = acc;
     }
     assert_eq!(output.map(f64::to_bits), expected.map(f64::to_bits));
 }

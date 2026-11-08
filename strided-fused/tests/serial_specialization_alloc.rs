@@ -150,7 +150,7 @@ fn counted_allocations(side: usize, permuted_rhs: bool) -> [[usize; 2]; 2] {
 
     let lhs_ref = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &dims, &rhs_strides, 0).unwrap();
-    let inputs = [lhs_ref.clone(), rhs_ref.clone()];
+    let inputs = [lhs_ref, rhs_ref];
     let input_ptrs = [
         ErasedRawStridedPtr::from_ref(&lhs_ref),
         ErasedRawStridedPtr::from_ref(&rhs_ref),

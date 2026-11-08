@@ -90,10 +90,6 @@ fn layout_pairs(dims: &[usize; 3]) -> Vec<(Layout, Layout)> {
     ]
 }
 
-fn total(dims: &[usize]) -> usize {
-    dims.iter().product()
-}
-
 /// Calls `f` with every coordinate of `dims` in column-major order.
 fn for_each_coord(dims: &[usize], mut f: impl FnMut(&[usize])) {
     if dims.contains(&0) {
@@ -629,6 +625,9 @@ fn op_max(op: ArgReduceOp) -> bool {
 }
 
 /// Runs an arg-reduction through both entries and both index dtypes.
+// Test helper: dtype, op, layout, axis, destination order, value, fill and key each
+// stay separate so the call reads as the case it builds.
+#[allow(clippy::too_many_arguments)]
 fn check_arg<T: KernelStorageElement>(
     dtype: KernelDType,
     op: ArgReduceOp,

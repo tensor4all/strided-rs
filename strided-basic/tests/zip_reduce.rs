@@ -158,7 +158,10 @@ fn matches_naive_reference_for_every_layout() {
     let map = |x: i64, y: i64| x * y;
     let combine = |x: i64, y: i64| x + y;
 
-    let cases: [(&str, Vec<usize>, Vec<isize>, Vec<isize>, isize); 6] = [
+    // name, dims, first strides, second strides, offset.
+    type TestCase = (&'static str, Vec<usize>, Vec<isize>, Vec<isize>, isize);
+
+    let cases: [TestCase; 6] = [
         ("contiguous rank 2", vec![7, 13], vec![1, 7], vec![1, 7], 0),
         // Permuted operands: the second axis is contiguous.
         ("permuted rank 2", vec![13, 7], vec![1, 13], vec![1, 13], 0),

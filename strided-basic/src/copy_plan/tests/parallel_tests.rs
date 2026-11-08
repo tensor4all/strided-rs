@@ -6,7 +6,7 @@ use num_complex::Complex64;
 
 /// Smallest backing length covering every reachable offset from `offset`.
 fn span(dims: &[usize], strides: &[isize], offset: isize) -> usize {
-    if dims.iter().any(|&d| d == 0) {
+    if dims.contains(&0) {
         return 0;
     }
     let mut max = offset;
@@ -27,6 +27,9 @@ fn base_offset(dims: &[usize], strides: &[isize]) -> isize {
         .sum()
 }
 
+// Test reference: destination and source layout parts stay separate so each case
+// of the test reads as the layout it builds.
+#[allow(clippy::too_many_arguments)]
 fn reference<T: Copy>(
     dst: &mut [T],
     src: &[T],

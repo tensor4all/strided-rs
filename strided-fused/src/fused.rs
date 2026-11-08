@@ -111,8 +111,9 @@ fn operand_const_ptrs<T>(ptrs: &[OperandPtr<T>]) -> &[*const T] {
 }
 
 /// Runtime scalar operation for a fused elementwise plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FusedOp {
+    #[default]
     Add,
     Multiply,
     Negate,
@@ -185,12 +186,6 @@ impl FusedInst {
             op,
             inputs: inputs.into_iter().collect(),
         }
-    }
-}
-
-impl Default for FusedOp {
-    fn default() -> Self {
-        Self::Add
     }
 }
 

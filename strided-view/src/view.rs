@@ -164,7 +164,7 @@ impl ViewMeta {
 
 #[inline]
 fn empty_layout(dims: &[usize]) -> bool {
-    dims.iter().any(|&dim| dim == 0)
+    dims.contains(&0)
 }
 
 #[inline]
@@ -193,7 +193,7 @@ pub(crate) fn validate_bounds(
         return Err(StridedError::StrideLengthMismatch);
     }
     // Empty array - no access needed
-    if dims.iter().any(|&d| d == 0) {
+    if dims.contains(&0) {
         return Ok(());
     }
     // Compute min and max offsets
@@ -572,7 +572,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dims().iter().any(|&d| d == 0)
+        self.dims().contains(&0)
     }
 
     /// Returns a reference to the backing data slice.
@@ -991,7 +991,7 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dims().iter().any(|&d| d == 0)
+        self.dims().contains(&0)
     }
 
     /// Raw const pointer to element at the view's base offset.
@@ -1417,7 +1417,7 @@ impl<T> StridedArray<T> {
     /// Returns `true` if any dimension is zero.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dims().iter().any(|&d| d == 0)
+        self.dims().contains(&0)
     }
 
     /// Returns a reference to the backing data slice.
@@ -1600,7 +1600,14 @@ impl<T: Copy> StridedArray<T> {
         let strides = checked_col_major_strides(dims)?;
         let total = checked_element_count(dims)?;
         let mut data = Vec::with_capacity(total);
-        data.set_len(total);
+        // The allow records the construction this `unsafe fn` has always used, not that
+        // it is sound: `set_len` over uninitialized slots breaks `Vec`'s contract for
+        // elements with invalid bit patterns (`bool`, `char`, references). Reworking the
+        // storage to `MaybeUninit` is tracked in #413 and removes this allow.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            data.set_len(total)
+        };
         Ok(Self {
             data,
             meta: ViewMeta::from_slices(dims, &strides),
@@ -1642,6 +1649,7 @@ impl<T: Copy> StridedArray<T> {
         if buf.capacity() < total {
             buf.reserve(total - buf.len());
         }
+        // Same `Vec` contract question as `try_col_major_uninit` above (#413).
         buf.set_len(total);
         Ok(Self {
             data: buf,

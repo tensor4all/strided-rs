@@ -219,6 +219,9 @@ fn layout_span(dims: &[usize], strides: &[isize]) -> usize {
 
 /// Naive reference that walks the logical indices column-major and combines
 /// each source value into its destination slot.
+// Test reference: destination and source layout parts stay separate so each case
+// of the test reads as the layout it builds.
+#[allow(clippy::too_many_arguments)]
 fn reference_apply(
     dims: &[usize],
     dst_strides: &[isize],

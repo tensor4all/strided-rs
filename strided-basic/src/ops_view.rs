@@ -874,25 +874,23 @@ pub fn sum<
         return Ok(T::zero());
     }
     // SIMD fast path: contiguous Identity view with SIMD support
-    if Op::IS_IDENTITY {
-        if same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
-            let len = total_len(src.dims())?;
-            let src_slice = unsafe { std::slice::from_raw_parts(src.ptr(), len) };
+    if Op::IS_IDENTITY && same_contiguous_layout(src.dims(), &[src.strides()]).is_some() {
+        let len = total_len(src.dims())?;
+        let src_slice = unsafe { std::slice::from_raw_parts(src.ptr(), len) };
 
-            // The partial sums of the halves are combined in a tree; a type
-            // without SIMD support takes the generic reduction below.
-            if T::try_simd_sum(&[]).is_some() && is_parallel(KernelClass::Reduce, len, &exec) {
-                return Ok(crate::threading::parallel_map_reduce(
-                    0..len,
-                    crate::cost::for_len_tree(exec, KernelClass::Reduce, len),
-                    &|range| T::try_simd_sum(&src_slice[range]).unwrap(),
-                    &|left, right| left + right,
-                ));
-            }
+        // The partial sums of the halves are combined in a tree; a type
+        // without SIMD support takes the generic reduction below.
+        if T::try_simd_sum(&[]).is_some() && is_parallel(KernelClass::Reduce, len, &exec) {
+            return Ok(crate::threading::parallel_map_reduce(
+                0..len,
+                crate::cost::for_len_tree(exec, KernelClass::Reduce, len),
+                &|range| T::try_simd_sum(&src_slice[range]).unwrap(),
+                &|left, right| left + right,
+            ));
+        }
 
-            if let Some(result) = T::try_simd_sum(src_slice) {
-                return Ok(result);
-            }
+        if let Some(result) = T::try_simd_sum(src_slice) {
+            return Ok(result);
         }
     }
     reduce(src, |x| x, |a, b| a + b, T::zero(), exec)
@@ -1292,6 +1290,9 @@ where
     dst.fill(value);
 }
 
+// 4x4 transpose block: both base pointers with both strides, the block index and
+// the scale.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn transpose_scale_4x4_f64(
     dst: *mut f64,
@@ -1530,6 +1531,8 @@ where
     true
 }
 
+// Same 4x4 transpose block for the identity element op, which skips the op.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn transpose_scale_4x4_identity<T>(
     dst: *mut T,

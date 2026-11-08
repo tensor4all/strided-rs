@@ -75,9 +75,7 @@ fn with_axis_block_scratch<Acc: Copy, R>(
     }
     SCRATCH.with(|cell| {
         let mut buffer = cell.borrow_mut();
-        let bytes = len
-            .checked_mul(core::mem::size_of::<Acc>())
-            .unwrap_or(usize::MAX);
+        let bytes = len.saturating_mul(core::mem::size_of::<Acc>());
         let words = bytes.div_ceil(core::mem::size_of::<u128>());
         if buffer.len() < words {
             buffer.resize(words, core::mem::MaybeUninit::uninit());
@@ -487,13 +485,13 @@ pub(super) trait StableProductScalar: Copy + Send + Sync {
 #[inline(always)]
 fn stable_lanes<T: StableProductScalar>(values: &[T]) -> T::StableProductAcc {
     let mut lanes = [T::sp_identity(); CONTIGUOUS_REDUCE_LANES];
-    let mut chunks = values.chunks_exact(CONTIGUOUS_REDUCE_LANES);
-    for chunk in chunks.by_ref() {
+    let (chunks, remainder) = values.as_chunks::<CONTIGUOUS_REDUCE_LANES>();
+    for chunk in chunks {
         for (lane, &value) in lanes.iter_mut().zip(chunk) {
             *lane = T::sp_combine(*lane, T::sp_from_value(value));
         }
     }
-    for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+    for (lane, &value) in lanes.iter_mut().zip(remainder) {
         *lane = T::sp_combine(*lane, T::sp_from_value(value));
     }
     lanes.into_iter().fold(T::sp_identity(), T::sp_combine)
@@ -877,13 +875,13 @@ where
 {
     crate::simd::dispatch_if_large(values.len(), || {
         let mut lanes = [K::identity(); CONTIGUOUS_REDUCE_LANES];
-        let mut chunks = values.chunks_exact(CONTIGUOUS_REDUCE_LANES);
-        for chunk in chunks.by_ref() {
+        let (chunks, remainder) = values.as_chunks::<CONTIGUOUS_REDUCE_LANES>();
+        for chunk in chunks {
             for (lane, &value) in lanes.iter_mut().zip(chunk) {
                 *lane = K::combine(*lane, K::from_value(value));
             }
         }
-        for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+        for (lane, &value) in lanes.iter_mut().zip(remainder) {
             *lane = K::combine(*lane, K::from_value(value));
         }
         lanes.into_iter().fold(K::identity(), K::combine)
