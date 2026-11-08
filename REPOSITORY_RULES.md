@@ -128,10 +128,10 @@ Shared: [`rust/index.md` § Unsafe Code Boundary](https://github.com/tensor4all/
 - Erased and typed APIs mirror each other. Every `erased_*` entry and every
   `Erased*Plan` has a typed counterpart with the same operand order, `Exec`
   position, and output contract; adding one side of a pair alone is an
-  incomplete change, and the pair lives in the same module tree so they cannot
-  drift apart
-  (`strided-kernel/src/erased.rs:72` against `strided-basic`'s typed
-  `map_into`).
+  incomplete change. The pair spans two crates — the erased entry in
+  `strided-kernel/src/erased.rs` (`erased_map_into`, `:81`) and the typed one in
+  `strided-basic` (`map_into`, `strided-basic/src/map_view.rs:1251`) — so the
+  signature and the doc comment are what keep them in step, not co-location.
 - An erased entry must stay within 1.25x of the typed entry for the same
   operation, dtype, layout, and thread count. A larger gap is a defect, not an
   accepted cost of type erasure.
@@ -141,21 +141,19 @@ Shared: [`rust/index.md` § Unsafe Code Boundary](https://github.com/tensor4all/
 Shared: [`rust/performance.md` § Allocation And Copies](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/rust/performance.md#allocation-and-copies),
 [`rust/performance.md` § Uninitialized And Scratch Acquisition](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/rust/performance.md#uninitialized-and-scratch-acquisition).
 
-- Prefer metadata-only views and strided/backend-native operations over hidden
-  dense materialization.
-- Do not allocate dense temporary buffers whose memory or time scales with an
-  unconstrained tensor product unless the API explicitly documents that copy
-  boundary.
 - When a copy or materialization is required by an output contiguity contract or
   external ABI boundary, make that boundary explicit and benchmark it.
 - Metadata transformations (`permute`, `transpose_2d`, `adjoint_2d`, `conj`,
-  `broadcast`) change dims/strides/offset only, never element data, and stay
-  allocation-free up to `strided_view::INLINE_RANK`. Keep both halves of that
-  contract when adding one.
+  `broadcast`) never touch element data and stay allocation-free up to
+  `strided_view::INLINE_RANK`. They change dims/strides/offset, and `conj` and
+  `adjoint` additionally compose an `ElementOp` (`conj` returns
+  `StridedView<T, Op::ComposeConj>`), so the whole metadata contract is the half
+  that stays; keep it when adding one of them.
 - A method that could alias a mutable view takes `self` by value or returns a
   borrowing view so the borrow checker rejects the alias
-  (`strided-view/src/view.rs:935`). Do not answer a borrow-checker complaint
-  about a mutable view with a copy.
+  (`permute(self, ...)` at `strided-view/src/view.rs:1049`, `as_view(&self)` at
+  `:1090`). Do not answer a borrow-checker complaint about a mutable view with a
+  copy.
 
 ## Layout And Copy Semantics
 
@@ -267,9 +265,6 @@ Shared: [`common/performance.md` § General Checklist](https://github.com/tensor
   explicitly scope the claim and link a residual generic-path issue. Routine
   production kernel refactors without a performance claim have no benchmark
   obligation solely because they touch kernel code.
-- Benchmark scaling is measured across representative tensor sizes, shapes,
-  layouts, dtypes, and thread counts. A single fixed-size speedup is not enough
-  evidence for a performance-sensitive change.
 - Naive baselines must be credible. For contiguous hot loops, prefer raw
   pointer baselines over high-level indexing baselines.
 - Every public erased operation family (elementwise unary and binary ops,
@@ -297,5 +292,3 @@ Shared: [`common/performance.md` § General Checklist](https://github.com/tensor
 - A claim that a contiguous hot loop is vectorized or dispatch-free should be
   backed by codegen evidence (disassembly of the hot loop) in the PR, not only
   by a single timing.
-- Keep setup and allocation out of timed regions unless the benchmark name and
-  documentation explicitly say setup cost is included.

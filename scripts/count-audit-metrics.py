@@ -559,8 +559,11 @@ def production_files(root: Path) -> list[Path]:
 
     Two rules keep the production side from shrinking by accident:
 
-    * a file loaded by both a test-only and a production declaration stays in
-      production, so a test-only alias cannot erase code the baseline counts;
+    * a file that is *not* a named test path and is loaded by both a test-only and
+      a production declaration stays in production, so a test-only alias cannot
+      erase code the baseline counts. A named test path (`tests.rs`, a `tests/`
+      component) is seeded test-only and stays out even when a production
+      declaration loads it;
     * a plain `mod NAME;` loads exactly `NAME.rs` or `NAME/mod.rs`, so its
       directory only *excludes* the files nothing declares (the historical
       module-subtree rule) and never claims a file an inline module's explicit
