@@ -87,3 +87,16 @@ fn issue_383_reported_repro() {
     assert_eq!(v.get(&[0]), 7);
     assert_eq!(a, [7]);
 }
+
+/// A zero-extent shape does not shrink the backing slice: `data`/`data_mut`
+/// report the caller's buffer, which is a different thing from the shape.
+#[test]
+fn zero_element_shape_keeps_the_backing_slice() {
+    let mut a = [1i32, 2];
+    let mut v = StridedViewMut::new(&mut a, &[0], &[1], 0).unwrap();
+
+    assert_eq!(v.data(), &[1, 2]);
+    v.data_mut()[0] = 3;
+    assert_eq!(v.as_view().data(), &[3, 2]);
+    assert_eq!(a, [3, 2]);
+}

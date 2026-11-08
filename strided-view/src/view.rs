@@ -778,16 +778,22 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
 /// Always uses `Identity` element operation for write simplicity.
 /// Julia typically applies ops on the read side.
 pub struct StridedViewMut<'a, T> {
-    /// The only handle on the element storage: the backing slice base plus
-    /// `offset`, or a dangling pointer for an empty layout.
+    /// Element base: `base` plus `offset`, or a dangling pointer for an empty
+    /// layout. `get` and `set` go through it, so it stays cached.
     ///
-    /// `data` and `data_mut` re-derive the slice extent from this pointer
-    /// instead of reborrowing a stored `&mut [T]`. A stored slice reborrow
-    /// retags the storage handle and invalidates `ptr`, which made every later
-    /// `get`, `set`, and `as_view` access undefined behavior.
+    /// Nothing here reborrows the caller's `&mut [T]` any more: a stored slice
+    /// field was retagged at construction and by `data_mut`, which invalidated
+    /// this pointer and made every later `get`, `set`, and `as_view` access
+    /// undefined behavior.
     ptr: *mut T,
-    /// Length of the whole backing slice, needed to re-derive it from `ptr`.
-    data_len: usize,
+    /// Base of the whole backing slice.
+    ///
+    /// `base` with `src_len` is the handle `data` and `data_mut` re-derive the
+    /// slice from, so the backing extent stays independent of the shape (a
+    /// `[0]` shape still has a backing slice).
+    base: *mut T,
+    /// Length of the whole backing slice.
+    src_len: usize,
     meta: ViewMeta,
     offset: isize,
     /// The view borrows the caller's slice for `'a` without holding it.
@@ -811,15 +817,17 @@ impl<'a, T> StridedViewMut<'a, T> {
     #[inline]
     fn from_meta(data: &'a mut [T], dims: &[usize], strides: &[isize], offset: isize) -> Self {
         let meta = ViewMeta::from_slices(dims, strides);
-        let data_len = data.len();
+        let src_len = data.len();
+        let base = data.as_mut_ptr();
         let ptr = if empty_layout(meta.dims()) {
             empty_mut_ptr()
         } else {
-            unsafe { data.as_mut_ptr().offset(offset) }
+            unsafe { base.offset(offset) }
         };
         Self {
             ptr,
-            data_len,
+            base,
+            src_len,
             meta,
             offset,
             _marker: PhantomData,
@@ -931,32 +939,20 @@ impl<'a, T> StridedViewMut<'a, T> {
 
     /// Returns a reference to the backing data slice.
     ///
-    /// An empty layout keeps a dangling pointer, so it can only describe an
-    /// empty slice here.
+    /// The length is the backing slice's, not the shape's: a view whose shape
+    /// has a zero extent still reports the whole buffer.
     #[inline]
     pub fn data(&self) -> &[T] {
-        let (base, len) = self.data_extent();
-        unsafe { std::slice::from_raw_parts(base, len) }
+        unsafe { std::slice::from_raw_parts(self.base, self.src_len) }
     }
 
     /// Returns a mutable reference to the backing data slice.
     ///
-    /// The extent comes from the view's own pointer, so `ptr`, `get`, and
-    /// `set` stay valid after the returned borrow ends.
+    /// The slice is re-derived from the view's storage handle, so `ptr`, `get`,
+    /// and `set` stay valid after the returned borrow ends.
     #[inline]
     pub fn data_mut(&mut self) -> &mut [T] {
-        let (base, len) = self.data_extent();
-        unsafe { std::slice::from_raw_parts_mut(base, len) }
-    }
-
-    /// Backing slice base and length, re-derived from the cached pointer.
-    #[inline]
-    fn data_extent(&self) -> (*mut T, usize) {
-        if empty_layout(self.meta.dims()) {
-            (empty_mut_ptr(), 0)
-        } else {
-            (unsafe { self.ptr.offset(-self.offset) }, self.data_len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.src_len) }
     }
 
     /// Permute dimensions, consuming the mutable view.
@@ -1334,15 +1330,17 @@ impl<T> StridedArray<T> {
     /// Create a mutable view over this tensor.
     #[inline]
     pub fn view_mut(&mut self) -> StridedViewMut<'_, T> {
-        let data_len = self.data.len();
+        let src_len = self.data.len();
+        let base = self.data.as_mut_ptr();
         let ptr = if self.is_empty() {
             empty_mut_ptr()
         } else {
-            unsafe { self.data.as_mut_ptr().offset(self.offset) }
+            unsafe { base.offset(self.offset) }
         };
         StridedViewMut {
             ptr,
-            data_len,
+            base,
+            src_len,
             meta: self.meta.clone(),
             offset: self.offset,
             _marker: PhantomData,
