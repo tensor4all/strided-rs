@@ -615,9 +615,10 @@ where
 ///
 /// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
 /// or start view does not carry the plan's compiled extents and strides,
-/// before any destination write, and `StridedError::OffsetOverflow` when a
-/// replay offset, source span, or element count cannot be represented.
-/// Out-of-range start values are clamped, not rejected.
+/// before any destination write. That is the only rejection: an empty
+/// operand returns before any offset arithmetic, and a non-empty one carries
+/// the bounds its constructor validated, so the replay arithmetic cannot
+/// overflow. Out-of-range start values are clamped, not rejected.
 #[inline]
 pub unsafe fn dynamic_slice_into_uninit<T, I>(
     plan: &crate::DynamicSlicePlan,
@@ -665,10 +666,11 @@ where
 ///
 /// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
 /// update, or start view does not carry the plan's compiled extents and
-/// strides, before any destination write, and
-/// `StridedError::OffsetOverflow` when a replay offset, source span, or
-/// element count cannot be represented. Out-of-range start values are
-/// clamped, not rejected.
+/// strides, before any destination write. That is the only rejection: an
+/// empty destination returns before any offset arithmetic, and a non-empty
+/// one carries the bounds its constructor validated, so the replay
+/// arithmetic cannot overflow. Out-of-range start values are clamped, not
+/// rejected.
 #[inline]
 pub unsafe fn dynamic_update_into_uninit<'a, T, I>(
     plan: &crate::DynamicUpdateSlicePlan,
@@ -718,10 +720,10 @@ where
 ///
 /// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
 /// scatter-index, or update view does not carry the plan's compiled extents
-/// and strides, before any destination write, and
-/// `StridedError::OffsetOverflow` when a replay offset or index component
-/// offset cannot be represented. Out-of-range scatter indices are clamped,
-/// not rejected.
+/// and strides, before any destination write. That is the only rejection: an
+/// empty batch or window skips the replay entirely, so no offset arithmetic
+/// runs, and a non-empty one carries the bounds its constructor validated.
+/// Out-of-range scatter indices are clamped, not rejected.
 #[inline]
 pub unsafe fn scatter_into_uninit<'a, T, I>(
     plan: &crate::ScatterPlan,
