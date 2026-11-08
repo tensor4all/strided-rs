@@ -107,6 +107,8 @@ def test_inline_test_body_is_skipped_and_counted() -> None:
             "body.rs": (
                 "#[cfg(test)]\n"
                 "mod tests {\n"
+                "    /// # Errors\n"
+                "    /// Never fails.\n"
                 "    pub fn inner() -> Result<(), ()> {\n"
                 "        unsafe {}\n"
                 "        Ok(())\n"
@@ -123,6 +125,9 @@ def test_inline_test_body_is_skipped_and_counted() -> None:
     assert counts["inline_mods"] == 1, counts
     assert counts["unsafe"] == 1, counts
     assert counts["pub_result"] == 1, counts
+    # `inner` is documented with `# Errors`, but it is inside the test body: an
+    # unfiltered numerator would report 1 here.
+    assert counts["with_errors"] == 0, counts
 
 
 def test_extern_c_function_is_in_the_result_denominator() -> None:
