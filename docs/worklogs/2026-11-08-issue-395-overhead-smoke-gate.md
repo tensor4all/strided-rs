@@ -21,9 +21,15 @@ head `064283e`. Attempt 1 and attempt 2 are the **same commit**:
 | 2 | 297.2 | 297.9 | **0.998** | `<= 1.5` (green) |
 
 A 0.27% exceedance turned the job red, and a re-run of the same tree turned it
-green. The statistic was the minimum of 5 rounds per path, so the reported ratio
-was already the most favourable pairing available; the two paths of S1 are *meant*
-to cost the same and in fact do.
+green. The statistic was the minimum of 5 rounds of each path **independently**,
+which is not a paired statistic and is biased in neither direction reliably:
+with `A = [100, 100, 100, 100, 100]` and `B = [50, 100, 100, 100, 100]` the
+reported ratio is `min(A)/min(B) = 2.0` while the median paired ratio is `1.0`.
+An earlier draft of this worklog said the minimum-of-minimums was "the most
+favourable pairing available"; that is wrong and is retracted — a single fast
+sample on one side moves the ratio by 2x, which is exactly the kind of swing
+that decided #391's CI. The two paths of S1 are *meant* to cost the same and in
+fact do.
 
 S1 across the 15 most recent runs on 2026-11-08 (10 PR runs
 `42447660181 … 42451061414` plus the 5 consecutive `main` runs

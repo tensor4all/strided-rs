@@ -310,10 +310,27 @@ pub fn print_table(cases: &[CaseResult], title: &str) {
             Gate::Report => "report".to_string(),
             Gate::ReportGated if case.failed() => "FAIL (alloc)".to_string(),
             Gate::ReportGated => "report (alloc=0)".to_string(),
-            Gate::Parity if case.failed() => format!("FAIL (>{:.3})", bound.unwrap_or(0.0)),
-            Gate::Parity => format!("<= {:.3} (parity+3w)", bound.unwrap_or(0.0)),
-            Gate::Bound(_) if case.failed() => format!("FAIL (>{})", bound.unwrap_or(0.0)),
-            Gate::Bound(bound) => format!("<= {bound}"),
+            // Never print a bare `<= bound`: a row passes while fewer than
+            // ATTEMPTS attempts are over, so the reported ratio can sit above
+            // the bound and still pass (#396 review). Say both numbers.
+            Gate::Parity | Gate::Bound(_) if case.failed() => format!(
+                "FAIL (>{:.3}, {}/{} over)",
+                bound.unwrap_or(0.0),
+                case.attempts_exceeded,
+                ATTEMPTS
+            ),
+            Gate::Parity => format!(
+                "bound {:.3} (parity+3w), {}/{} over",
+                bound.unwrap_or(0.0),
+                case.attempts_exceeded,
+                ATTEMPTS
+            ),
+            Gate::Bound(bound) => {
+                format!(
+                    "bound {bound}, {}/{} over",
+                    case.attempts_exceeded, ATTEMPTS
+                )
+            }
         };
         table.push_str(&format!(
             "| {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.4} | {} | {} | {:.2} | {:.2} |\n",
@@ -453,6 +470,43 @@ mod tests {
         let mut parity = case(Gate::Parity, 2.4, ATTEMPTS);
         parity.tolerance = Some(parity_bound(1.0, 10.0));
         assert!(!parity.failed());
+    }
+
+    /// The only test that drives the real statistic-to-verdict path inside
+    /// [`measure_case`]. Without it, replacing the parity bound with
+    /// `f64::INFINITY` there leaves every other test green (#396 review).
+    ///
+    /// An 8:1 work ratio cannot be absorbed by any width the rule can produce: at
+    /// the measured median the bound is `1 + 3 * 0.15 * 8 = 4.6`, so the verdict
+    /// does not depend on this host being quiet.
+    #[test]
+    fn a_real_slowdown_fails_through_measure_case() {
+        fn work(n: u64) -> u64 {
+            let mut acc = 0u64;
+            for i in 0..n {
+                acc = acc.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(acc)
+        }
+
+        let slow = measure_case(
+            "T",
+            "eight times the work in path A",
+            1,
+            Gate::Parity,
+            || {
+                work(8_000);
+            },
+            || {
+                work(1_000);
+            },
+        );
+        assert!(
+            slow.failed(),
+            "an 8x slowdown passed: ratio {} against bound {:?}",
+            slow.ratio,
+            slow.tolerance
+        );
     }
 
     #[test]
