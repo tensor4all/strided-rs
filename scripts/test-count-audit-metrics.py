@@ -418,7 +418,9 @@ def test_a_test_only_module_directory_is_not_production() -> None:
     counts = count_sources(
         {
             "lib.rs": "#[cfg(test)]\nmod helpers;\n",
-            "helpers/mod.rs": "#[cfg(test)]\nmod deep;\n",
+            # Counted code in the module file itself, so only the directory
+            # exclusion can remove it.
+            "helpers/mod.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
             "helpers/deep.rs": "pub fn deep() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
         }
     )
