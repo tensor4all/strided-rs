@@ -2255,7 +2255,7 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     // in bounds, and `target_dims`/`strides` come from the caller's `dest.dims()`
     // and that validation. `new_unchecked` copies the metadata into owned
     // storage, not inline: `ViewMeta::from_slices` (strided-view/src/view.rs:128)
-    // keeps it inline up to `INLINE_RANK` = 8 and boxes it above (:140), which
+    // keeps it inline up to `INLINE_RANK` = 8 and boxes it above (strided-view/src/view.rs:140), which
     // is why a rank-9 call allocates here.
     unsafe { StridedView::new_unchecked(view.data(), target_dims, strides, view.offset()) }
 }
