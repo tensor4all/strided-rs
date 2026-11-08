@@ -393,14 +393,14 @@ fn empty_reduced_axis_spills_the_fill_cursor_above_inline_rank() {
 }
 
 // ============================================================================
-// Strided destination, parallel above the threading threshold
+// Strided destination, parallel above the cost gate
 // ============================================================================
 
 #[cfg(feature = "parallel")]
 #[test]
 fn strided_destination_splits_across_two_workers() {
-    // 32 * 32 outputs over a 64-element reduced axis exceeds MINTHREADLENGTH
-    // (1 << 15) by enough to open a second worker.
+    // 32 * 32 outputs over a 64-element reduced axis is enough work for the cost
+    // gate to open a second worker.
     let (n, m, k) = (32usize, 64usize, 32usize);
     let src = layout(&[n, m, k], &[1, n as isize, (n * m) as isize], 0, n * m * k);
     let dest = layout(

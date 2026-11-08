@@ -16,8 +16,8 @@ use strided_basic::{
     dot, reduce, sum, zip_reduce, Conj, ElementOp, Identity, StridedArray, StridedView,
 };
 
-/// Threading threshold of the crate (`threading::MINTHREADLENGTH`); inputs
-/// above it take the parallel branches on a pooled token.
+/// Large-layout size of the suite; the pooled branch must match the serial
+/// reference bitwise.
 #[cfg(feature = "parallel")]
 const THREADING_THRESHOLD: usize = 1 << 15;
 
