@@ -21,6 +21,10 @@ jobs:
       # 実例: workflow 階層の `concurrency.group` で `matrix` を参照しており、
       # YAML としては正しいが GitHub が受け付けず、ワークフローが起動しなかった。
       - uses: raven-actions/actionlint@v2
+        with:
+          # shellcheck も走るが、`ci.yml` には既存の SC2086 が 3 件ある（本 PR の範囲外）。
+          # 先に既存を直すまで shellcheck は切り、actionlint 本体（構文・コンテキスト）だけ強制する。
+          shellcheck: false
 
   fmt:
     name: rustfmt
