@@ -49,10 +49,15 @@ allocation and writes.
 
 ## Resources and features
 
-There is one execution-policy implementation in basic. Fused execution uses the
-same installed context, threshold and bounded worker policy; it does not create
-an independent pool. `parallel` and `simd` features propagate from each concrete
-owner to basic. No operation-family feature switches are added.
+There is one execution-policy implementation in basic
+(`strided_basic::execution`, built on `strided-basic/src/cost.rs` and
+`strided-basic/src/threading.rs`). Fused execution takes the same `Exec` token and
+the same cost gate: `strided-fused/src/fused.rs:13` imports `compute_costs`,
+`mapreduce_threaded`, `parallel_width` and `KernelClass` from
+`strided_basic::execution`, and `strided-fused/src/fused.rs:18` imports the token
+itself. It does not construct an independent pool. `parallel` and `simd` features
+propagate from each concrete owner to basic (`strided-fused/Cargo.toml:23-24`). No
+operation-family feature switches are added.
 
 An assembling tenferro CPU backend must keep its ordinary automatic-fusion hook
 and delegate using its existing context and buffers. This strided split does not
