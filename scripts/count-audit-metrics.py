@@ -37,6 +37,8 @@ none", not "none exists".
 - A `macro_rules!` template is scanned where it is written, so a template that
   spells `pub fn $name(..) -> Result<..>` counts once; its invocations are not
   expanded, so an item that only the expansion creates is never seen.
+- A string literal inside an attribute (`#[doc = "("]`) is blanked as a string,
+  so an item it decorates can read to the wrong place.
 - Braces inside a macro body that the scanner reads as code (not as a string)
   still move the `#[cfg(test)] mod` skip and the inline-module count.
 - `unsafe` is counted as the text `unsafe` + `{`, so `unsafe extern` blocks,

@@ -196,13 +196,17 @@ def test_path_exclusions_use_repo_relative_components() -> None:
         root = pathlib.Path(tmp) / "target" / "tests" / "checkout"
         src = root / "strided-x" / "src"
         src.mkdir(parents=True)
-        (src / "real.rs").write_text("pub fn f() {\n    unsafe {}\n}\n", encoding="utf-8")
+        # 1001 logical lines: an absolute-path filter would drop this file and
+        # report 0, and a constant-zero `files_over_1000` would too.
+        (src / "real.rs").write_text(
+            "pub fn f() {\n    unsafe {}\n}\n" + "// filler\n" * 999, encoding="utf-8"
+        )
         counts = mod.count(root)
     assert counts["unsafe"] == 1, counts
+    assert counts["files_over_1000"] == 1, counts
 
-    # A generated file below `strided-x/target/`: the all-source rows exclude it,
-    # so a filter that looked at absolute parts (where the root has no `target`)
-    # would count it here.
+    # A generated file below `strided-x/target/` is excluded from the all-source
+    # rows; this root has no `target` component of its own.
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp) / "checkout"
         src = root / "strided-x" / "src"
