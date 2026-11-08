@@ -20,14 +20,15 @@ use std::thread::ThreadId;
 use strided_basic::execution::{parallel_map_reduce, parallel_width, tree_width, KernelClass};
 use strided_basic::{
     add_acc, axpby_accum, axpy_acc, batched_outer_product_into, batched_outer_product_into_uninit,
-    broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, copy_conj_into,
-    copy_into, copy_into_uninit, copy_scale_into, copy_transpose_scale_into, embed_diagonal_into_uninit,
-    embed_diagonal_view_into_uninit, fma_acc, map_into, map_into_uninit_with_kernel, map_update_into,
-    mul_acc, mul_into, mul_into_uninit, reduce, reduce_axis, reduce_axis_into, sum,
-    symmetrize_conj_into, symmetrize_into, triangular_mask_into_uninit,
-    triangular_mask_view_into_uninit, zip_map2_into, zip_map3_into, zip_map4_into, zip_reduce,
-    zip_update2_into, zip_update3_into, CompareOp, CopyPlan, Exec, Identity, RawStridedMut,
-    RawStridedRef, Result, StridedArray, StridedView, StridedViewMut, UpdatePlan,
+    broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit,
+    copy_conj_into, copy_into, copy_into_uninit, copy_scale_into, copy_transpose_scale_into,
+    embed_diagonal_into_uninit, embed_diagonal_view_into_uninit, fma_acc, map_into,
+    map_into_uninit_with_kernel, map_update_into, mul_acc, mul_into, mul_into_uninit, reduce,
+    reduce_axis, reduce_axis_into, sum, symmetrize_conj_into, symmetrize_into,
+    triangular_mask_into_uninit, triangular_mask_view_into_uninit, zip_map2_into, zip_map3_into,
+    zip_map4_into, zip_reduce, zip_update2_into, zip_update3_into, CompareOp, CopyPlan, Exec,
+    Identity, RawStridedMut, RawStridedRef, Result, StridedArray, StridedView, StridedViewMut,
+    UpdatePlan,
 };
 use strided_perm::{
     copy_into as perm_copy_into, copy_into_col_major as perm_copy_into_col_major,
