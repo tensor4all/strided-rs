@@ -4,6 +4,27 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
+## 0.13.1 (unreleased)
+
+`strided-basic`, `strided-fused` and `strided-kernel` go to **0.13.1**: after
+0.13.0 was published from `25b6dad`, #405 added comments to their sources (a
+one-line rationale on each silenced lint), so the published 0.13.0 is not this
+tree. No code changed. `strided-nn` stays at 0.13.0.
+
+`strided-perm` goes to **0.13.1**, `strided-view` to **0.7.3** and
+`strided-traits` to **0.7.2**: #412 (`cargo clippy -D warnings`) rewrote code in
+their shipped sources under the published version numbers. The rewrites are
+equivalent (`iter().any(|&d| d == 0)` → `contains(&0)`, `x % n != 0` →
+`!x.is_multiple_of(n)`, index loops → `enumerate()`, `#[allow]` attributes with
+rationales, test-only edits); no public item changed. `strided-view` 0.7.3 now
+calls `usize::is_multiple_of`, so it needs **Rust 1.87 or newer** (no
+`rust-version` is declared).
+
+The `[workspace.dependencies]` requirements stay at `^0.13.0` / `^0.7.2` /
+`^0.7.0`, which accept these versions. Raising them before the new versions are
+on crates.io breaks `cargo package` for every dependent (`failed to select a
+version for the requirement strided-view = "^0.7.3"`).
+
 ## 0.13.0 (2026-11-08)
 
 This is a **minor** release, not a patch, because 0.12.0 already shipped on
