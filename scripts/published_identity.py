@@ -23,9 +23,13 @@ matches the published artefact, 1 = at least one mismatch, 2 = could not check
 (git, cargo, network or crates.io failure; never reported as green).
 
 Caveats, stated rather than hidden:
-  * Cargo.toml is excluded. `cargo package` rewrites it, so a byte comparison
-    would always differ. The version string selects which .crate is compared,
-    so it is not compared itself.
+  * The tree side is the .crate `cargo package --no-verify` builds from the
+    checked-out commit, so every packaging rule is Cargo's own. Packaging
+    resolves dependencies on crates.io; a published crate whose tree needs an
+    unpublished dependency version cannot be packaged and exits 2.
+  * Cargo.toml, Cargo.toml.orig, Cargo.lock and .cargo_vcs_info.json are
+    excluded: Cargo generates or rewrites them at package time. The version
+    string selects which .crate is compared, so it is not compared itself.
   * The comparison is byte-for-byte: a comment-only change under the same
     version is a MISMATCH. That is intended — the published source is what
     a user reads and builds.
@@ -50,10 +54,9 @@ import urllib.error
 import urllib.request
 
 UA = "tensor4all-published-identity/1.0 (maintainer check)"
-# Files worth comparing: what a user compiles. Manifest and lockfiles excluded.
-# The file set is taken from `cargo package --list`, which honours each crate's
-# `include` / `exclude`. Inventing a file set here produced false positives on
-# files a crate deliberately does not ship (#402 removed exactly such a test).
+# Both sides are .crate archives built by Cargo (the published one, and one
+# built from the tree with `cargo package`), so the file set is Cargo's. Only
+# the files Cargo generates or rewrites at package time are left out.
 SKIP_ALWAYS = {".cargo_vcs_info.json", "Cargo.lock", "Cargo.toml", "Cargo.toml.orig"}
 
 
@@ -61,9 +64,11 @@ class CheckError(Exception):
     """The check itself could not run (network, crates.io, git); exit 2, never green."""
 
 
-def run(cmd: list[str], cwd: str | None = None, timeout: int = 120) -> tuple[int, str]:
+def run(cmd: list[str], cwd: str | None = None, timeout: int = 120) -> tuple[int, str, str]:
+    """(returncode, stdout, stderr). The streams are kept apart: a warning on
+    stderr must never end up inside JSON or a path read from stdout."""
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout)
-    return r.returncode, (r.stdout + r.stderr)
+    return r.returncode, r.stdout, r.stderr
 
 
 def checkout_ref(repo: str, ref: str) -> tuple[str, str | None]:
@@ -72,46 +77,29 @@ def checkout_ref(repo: str, ref: str) -> tuple[str, str | None]:
     Reading the version from the working tree while reading the files from `ref`
     produced a false MISMATCH the first time this ran against a pull request
     (working tree said 0.7.0, the branch said 0.7.1). Both have to come from the
-    same commit, and `cargo package --list` also needs the real manifest, so the
-    ref is checked out rather than patched up in place.
+    same commit, and `cargo package` also needs the real manifest, so the ref is
+    checked out rather than patched up in place.
     """
     tmp = tempfile.mkdtemp(prefix="published-identity-")
     wt = pathlib.Path(tmp) / "wt"
-    rc, out = run(["git", "worktree", "add", "--detach", str(wt), ref], cwd=repo, timeout=300)
+    rc, _, _ = run(["git", "worktree", "add", "--detach", str(wt), ref], cwd=repo, timeout=300)
     if rc != 0:
         shutil.rmtree(tmp, ignore_errors=True)
         return repo, None
     return str(wt), tmp
 
 
-def workspace_crates(repo: str, ref: str) -> list[dict]:
-    rc, out = run(["cargo", "metadata", "--no-deps", "--format-version", "1",
-                   f"--manifest-path", f"{repo}/Cargo.toml"])
+def workspace_crates(repo: str) -> list[dict]:
+    rc, out, err = run(["cargo", "metadata", "--no-deps", "--format-version", "1",
+                        "--manifest-path", f"{repo}/Cargo.toml"], cwd=repo)
     if rc != 0:
-        raise CheckError(f"cargo metadata failed: {out[:300]}")
+        raise CheckError(f"cargo metadata failed: {err[:300]}")
     meta = json.loads(out)
     crates = []
     for p in meta["packages"]:
         if p.get("publish") == []:
             continue
-        man = pathlib.Path(os.path.realpath(p["manifest_path"])).parent
-        rel = man.relative_to(pathlib.Path(os.path.realpath(repo)))
-        # Files that live outside the crate directory but ship inside the
-        # .crate at the root under their own name (`readme = "../README.md"`,
-        # `license-file = "../LICENSE"`). Map the packaged name to the source.
-        relocated: dict[str, str] = {}
-        for key in ("readme", "license_file"):
-            v = p.get(key)
-            if not v:
-                continue
-            declared = man / v
-            src = pathlib.Path(os.path.realpath(declared))
-            if man not in src.parents:
-                # Cargo archives it under the declared file name, not the name
-                # of whatever a symlink there points to.
-                relocated[declared.name] = str(src)
-        crates.append({"name": p["name"], "version": p["version"], "dir": str(rel),
-                       "relocated": relocated})
+        crates.append({"name": p["name"], "version": p["version"]})
     return crates
 
 
@@ -161,54 +149,44 @@ def crate_files(blob: bytes) -> dict[str, str]:
     return out
 
 
-def shipped_paths(repo: str, crate: dict) -> set[str]:
-    """The exact files `cargo package` would ship, honouring include/exclude."""
-    # stdout only (stderr may carry warnings), as bytes, so no newline
-    # translation or decoding touches a path.
-    r = subprocess.run(["cargo", "package", "-p", crate["name"], "--list", "-q",
-                        "--manifest-path", f"{repo}/Cargo.toml"],
-                       capture_output=True, timeout=300)
-    if r.returncode != 0:
-        raise CheckError(f"cargo package --list failed for {crate['name']}: "
-                         f"{r.stderr.decode(errors='replace')[:300]}")
-    out = r.stdout.decode("utf-8", "surrogateescape")
-    # One path per line, taken verbatim: stripping whitespace would rename a
-    # file such as "notes " and could merge two distinct shipped paths.
-    return {line for line in out.split("\n")
-            if line and line not in SKIP_ALWAYS}
+def package_tree(repo: str, crate: dict, target_dir: str) -> bytes:
+    """The .crate that `cargo package` builds from the checked-out tree.
 
+    Comparing against Cargo's own archive, rather than re-deriving it from
+    `cargo package --list` plus the source files, leaves every packaging rule
+    to Cargo: include/exclude, symlinks (archived as their target's bytes), a
+    `readme` / `license-file` outside the crate directory (archived at the
+    package root under its declared name), and a collision between such a
+    file and a crate-local one. Re-implementing those rules produced false
+    results in review (#411).
 
-def tree_files(repo: str, crate: dict, wanted: set[str]) -> dict[str, str]:
-    """path-inside-crate -> sha256 of what `cargo package` would archive.
-
-    `repo` is a clean checkout of the resolved commit, so the files are read
-    from disk the way Cargo reads them: symlinks are followed (Cargo archives
-    the target's bytes, not the link text) and a readme / license file outside
-    the crate directory is read from where the manifest points. A shipped path
-    that cannot be read fails the check rather than dropping out of it.
+    Dependencies are resolved against crates.io as for a real publish, so a
+    tree that requires an unpublished dependency version cannot be packaged;
+    that is reported as "could not check" (exit 2), not as green.
     """
-    base = pathlib.Path(repo) / crate["dir"]
-    files: dict[str, str] = {}
-    for rel in wanted:
-        src = pathlib.Path(crate["relocated"].get(rel, base / rel))
-        try:
-            files[rel] = hashlib.sha256(src.read_bytes()).hexdigest()
-        except OSError as e:
-            raise CheckError(f"cannot read shipped file {crate['name']}/{rel}: {e}") from e
-    return files
+    name, ver = crate["name"], crate["version"]
+    rc, _, err = run(["cargo", "package", "-p", name, "--no-verify", "-q",
+                      "--manifest-path", f"{repo}/Cargo.toml",
+                      "--target-dir", target_dir], cwd=repo, timeout=600)
+    if rc != 0:
+        raise CheckError(f"cargo package failed for {name}: {err[:300]}")
+    path = pathlib.Path(target_dir) / "package" / f"{name}-{ver}.crate"
+    try:
+        return path.read_bytes()
+    except OSError as e:
+        raise CheckError(f"cargo package produced no {path.name}: {e}") from e
 
 
-def check_crate(repo: str, ref: str, crate: dict) -> tuple[str, list[str]]:
-    name, ver, cdir = crate["name"], crate["version"], crate["dir"]
+def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str, list[str]]:
+    name, ver = crate["name"], crate["version"]
     blob = published(name, ver)
     if blob is None:
         return "unpublished", [f"{name} {ver} is not on crates.io (release in progress?)"]
-    wanted = shipped_paths(repo, crate)
-    # The published side is NOT filtered by `wanted`: a file that shipped in
-    # the .crate but is gone from the tree (a deleted build.rs, say) changes
-    # what users build, and must show up as "only in published .crate".
+    # Both sides are complete archives; only the generated files in
+    # SKIP_ALWAYS are left out. A file that shipped but is gone from the tree
+    # (a deleted build.rs, say) shows as "only in published .crate".
     pub = crate_files(blob)
-    tree = tree_files(repo, crate, wanted)
+    tree = crate_files(package_tree(repo, crate, target_dir))
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
         if rel not in pub:
@@ -218,7 +196,7 @@ def check_crate(repo: str, ref: str, crate: dict) -> tuple[str, list[str]]:
         elif pub[rel] != tree[rel]:
             diffs.append(f"differs: {rel}")
     if diffs:
-        return "MISMATCH", [f"{name} {ver} ({cdir})"] + [f"    {d}" for d in diffs[:20]] + (
+        return "MISMATCH", [f"{name} {ver}"] + [f"    {d}" for d in diffs[:20]] + (
             [f"    ... and {len(diffs) - 20} more"] if len(diffs) > 20 else [])
     return "ok", []
 
@@ -233,9 +211,9 @@ def _main() -> int:
     # Resolve once, in the caller's repository, and use the commit SHA from
     # here on. A relative revision such as `HEAD~1` would otherwise name a
     # different commit inside the temporary worktree.
-    rc, out = run(["git", "rev-parse", "--verify", f"{a.ref}^{{commit}}"], cwd=a.repo)
+    rc, out, err = run(["git", "rev-parse", "--verify", f"{a.ref}^{{commit}}"], cwd=a.repo)
     if rc != 0:
-        print(f"cannot resolve {a.ref}: {out[:200]}")
+        print(f"cannot resolve {a.ref}: {err[:200]}")
         return 2
     ref = out.strip()
     tree, tmp = checkout_ref(a.repo, ref)
@@ -244,7 +222,7 @@ def _main() -> int:
         return 2
     try:
         try:
-            crates = workspace_crates(tree, ref)
+            crates = workspace_crates(tree)
         except CheckError as e:
             print(f"could not list crates: {e}")
             return 2
@@ -260,7 +238,7 @@ def _main() -> int:
         bad = 0
         for c in crates:
             try:
-                verdict, lines = check_crate(tree, ref, c)
+                verdict, lines = check_crate(tree, ref, c, os.path.join(tmp, "target"))
             except CheckError as e:
                 print(f"could not check {c['name']} {c['version']}: {e}")
                 return 2

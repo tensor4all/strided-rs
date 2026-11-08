@@ -126,20 +126,21 @@ class PublishedIdentityTest(unittest.TestCase):
         rc_rel, out_rel = self.fx.run("HEAD~1", lambda n, v: blob)
         self.assertEqual((rc_sha, rc_rel), (0, 0), out_sha + out_rel)
 
-    def test_failed_read_of_a_shipped_file_is_not_green(self) -> None:
-        # GPT review on #411 (round 1): a new shipped file whose read fails must
-        # not drop out of the comparison and leave the run green.
+    def test_failed_packaging_of_the_tree_is_not_green(self) -> None:
+        # GPT review on #411 (round 1, git-read case): if the tree side cannot
+        # be produced, the run must not be green. The tree side is now Cargo's
+        # own archive, so the failure point is `cargo package`.
         blob = self.fx.package()
         self.fx.write("src/new.rs", "pub fn extra() {}\n")
         self.fx.commit("new shipped file, same version")
-        real = pathlib.Path.read_bytes
+        real = subprocess.run
 
-        def flaky(path):
-            if str(path).endswith("src/new.rs"):
-                raise OSError("unable to read")
-            return real(path)
+        def broken(cmd, *args, **kwargs):
+            if cmd[:2] == ["cargo", "package"]:
+                return subprocess.CompletedProcess(cmd, 101, "", "error: failed to read\n")
+            return real(cmd, *args, **kwargs)
 
-        with mock.patch.object(pi.pathlib.Path, "read_bytes", flaky):
+        with mock.patch.object(pi.subprocess, "run", broken):
             rc, out = self.fx.run("HEAD", lambda n, v: blob)
         self.assertEqual(rc, 2, out)
 
@@ -165,6 +166,82 @@ class PublishedIdentityTest(unittest.TestCase):
         rc, out = self.fx.run("HEAD", lambda n, v: blob)
         self.assertEqual(rc, 1, out)
         self.assertIn("differs: README.md", out)
+
+    def test_changed_crate_local_readme_shadowing_an_external_one_is_red(self) -> None:
+        # GPT review on #411 (round 4): with both ../README.md and demo/README.md,
+        # Cargo archives the crate-local one; changing it must be a MISMATCH.
+        (self.fx.root / "README.md").write_text("# same\n")
+        self.fx.write("README.md", "# same\n")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("both readmes")
+        blob = self.fx.package()
+        self.fx.write("README.md", "# changed locally\n")
+        self.fx.commit("crate-local readme changed, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("README.md", out)
+
+    def test_unchanged_external_readme_symlink_into_the_crate_is_ok(self) -> None:
+        # GPT review on #411 (round 4): ../README.md -> demo/docs/GUIDE.md.
+        (self.fx.root / "demo" / "docs").mkdir()
+        self.fx.write("docs/GUIDE.md", "# guide\n")
+        (self.fx.root / "README.md").symlink_to("demo/docs/GUIDE.md")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("external readme symlink pointing into the crate")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_cargo_warning_on_stderr_does_not_break_the_check(self) -> None:
+        # GPT review on #411 (round 4): a legacy `.cargo/config` makes cargo
+        # warn on stderr while printing valid JSON on stdout.
+        (self.fx.root / ".cargo").mkdir()
+        (self.fx.root / ".cargo" / "config").write_text("[net]\noffline = true\n")
+        self.fx.commit("legacy cargo config")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def _docs_readme_symlink_fixture(self) -> None:
+        # demo/docs/README.md -> ../../GUIDE.md, readme = "docs/README.md",
+        # plus an unrelated root README.md and demo/README.md with other bytes.
+        (self.fx.root / "GUIDE.md").write_text("# guide\n")
+        (self.fx.root / "README.md").write_text("# unrelated root readme\n")
+        (self.fx.root / "demo" / "docs").mkdir()
+        (self.fx.root / "demo" / "docs" / "README.md").symlink_to("../../GUIDE.md")
+        self.fx.write("README.md", "# unrelated crate readme\n")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "docs/README.md"\n')
+        self.fx.commit("docs/README.md symlink to a root-level GUIDE.md")
+
+    def test_unchanged_readme_symlink_to_a_differently_named_target_is_ok(self) -> None:
+        # GPT review on #411 (18:10Z, case a): no false MISMATCH.
+        self._docs_readme_symlink_fixture()
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_changed_unrelated_crate_readme_next_to_a_readme_symlink_is_red(self) -> None:
+        # GPT review on #411 (18:10Z, case b): changing demo/README.md under the
+        # same version must be a MISMATCH.
+        self._docs_readme_symlink_fixture()
+        blob = self.fx.package()
+        self.fx.write("README.md", "# changed\n")
+        self.fx.commit("demo/README.md changed, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("differs: README.md", out)
+
+    def test_unchanged_file_with_a_newline_in_its_name_is_ok(self) -> None:
+        # GPT review on #411 (18:10Z, item 2): `notes\nmore` is one file.
+        self.fx.write("notes\nmore", "x\n")
+        self.fx.commit("file name with a newline")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
 
     def test_missing_cargo_is_not_a_mismatch(self) -> None:
         real = subprocess.run
