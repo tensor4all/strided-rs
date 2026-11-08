@@ -246,6 +246,7 @@ def test_doc_block_survives_attributes() -> None:
                 "pub fn documented() -> Result<(), ()> {\n"
                 "    Ok(())\n"
                 "}\n"
+                "/// A summary with no error section.\n"
                 "pub fn undocumented() -> Result<(), ()> {\n    Ok(())\n}\n"
             ),
         }

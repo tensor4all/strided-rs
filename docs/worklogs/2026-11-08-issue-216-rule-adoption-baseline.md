@@ -37,9 +37,9 @@ under the source revision alone. Record both, e.g.
 
 The counter is a line-oriented approximation, not a Rust parser. It is accurate
 enough for a trend, and it is not evidence that a file or a tree is clean: the
-script's docstring lists what it still mismatches (strings inside attributes and
-macro invocations, braces inside macro bodies, `unsafe extern`, macro-expanded
-`unsafe {`, `<`/`>` read as brackets, a macro-produced declaration). Where a row matters, measure the thing itself — `cargo test --doc`
+script's docstring lists what it still mismatches (a string inside an attribute,
+braces inside macro bodies, `unsafe extern`, macro-expanded `unsafe {`, `<`/`>`
+read as brackets, a macro-produced declaration). Where a row matters, measure the thing itself — `cargo test --doc`
 for the doctest row, a file read for a per-block `// SAFETY:` audit.
 
 | Metric | Count | #216's opening count |
