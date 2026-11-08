@@ -30,6 +30,39 @@ strided-rs workspace. Apply them in addition to the shared tensor4all rules.
 - When the public API changes, audit README, rustdoc, examples, and benchmark
   code for stale names, deleted paths, and stale capability claims.
 
+## Suffix Vocabulary
+
+Strided-specific naming rule from
+[#220](https://github.com/tensor4all/strided-rs/issues/220) (maintainer-ruled
+2026-11-08, kept as a strided rule by
+[#216](https://github.com/tensor4all/strided-rs/issues/216); not a copy of a
+shared tensor4all rule). Mutation semantics are visible in the name, and no two
+names may suggest the same operation. Pre-1.0, a rename deletes the old name
+outright: no compatibility shim, alias, or deprecated wrapper.
+
+| Suffix | Semantics | Names |
+|--------|-----------|-------|
+| `*_acc` | Read-modify-write: reads `dest[i]` and accumulates into it | `add_acc`, `mul_acc`, `axpy_acc`, `fma_acc` |
+| `*_into` | Overwrite: never reads the previous `dest[i]` | `copy_into`, `copy_scale_into`, `copy_conj_into`, `map_into`, `mul_into` |
+| `*_view` | Metadata-only: reads and writes no element | `diagonal_view` |
+
+- An accumulation must not be named `*_into`, and an overwrite must not be
+  named `*_acc`. A pair such as `mul` / `mul_into` that names two different
+  operations is a defect.
+- `*_into` means "overwrite" except in the update family, which reads the
+  previous `dest[i]` and updates it in place by definition: `map_update_into`,
+  `zip_update2_into`, `zip_update3_into`. Their rustdoc states the read.
+- A `*_view.rs` module name means "operates on views", not metadata-only; only
+  the `_view` suffix carries that meaning.
+- Residual names that do not follow the table yet are follow-ups, not
+  exemptions: `axpy_raw` / `axpy_conj_raw` read and accumulate into `dest`,
+  `axpby_accum` spells accumulation `_accum`, and `copy_scale_raw` /
+  `copy_scale_conj_raw` overwrite (`_raw` marks the borrowed-layout family,
+  not the mutation semantics).
+- The `_uninit` siblings are deferred to after v0.3.0 and are not part of this
+  rename: `map_into_uninit`, `zip_map*_into_uninit`, `copy_into_uninit`,
+  `reduce*_uninit`, `ErasedCopyPlan::execute_uninit`.
+
 ## Public Boundary Safety
 
 - User-reachable tensor/view/kernel APIs must validate rank, shape, dtype,

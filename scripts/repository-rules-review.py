@@ -198,6 +198,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
             {
                 "Performance And Benchmark Discipline",
                 "Layout And Copy Semantics",
+                "Suffix Vocabulary",
             }
         ),
     ),
@@ -207,6 +208,7 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
             {
                 "Materialization And Copies",
                 "Layout And Copy Semantics",
+                "Suffix Vocabulary",
             }
         ),
     ),
