@@ -262,7 +262,7 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
-        // SAFETY: as `copy_into` (copy.rs:217) — `prepare` matched the shapes and
+        // SAFETY: as `copy_into` (copy.rs:227) — `prepare` matched the shapes and
         // both views proved their bounds at construction. `MaybeUninit<T>` has `T`'s
         // size and alignment, and the engine only stores into the destination, so
         // the uninitialized extent is never read.

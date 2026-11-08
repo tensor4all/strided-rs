@@ -849,8 +849,9 @@ pub struct StridedViewMut<'a, T> {
     _marker: PhantomData<&'a mut [T]>,
 }
 
-// SAFETY: `StridedViewMut` uniquely owns its `&'a mut [T]` plus a `*mut T`
-// derived from it, and there is no `Sync` impl for it, so sending it moves that
+// SAFETY: `StridedViewMut` uniquely owns its `&'a mut [T]` (held as
+// `PhantomData<&'a mut [T]>` plus the two raw pointers `base` and `ptr` derived
+// from it), and there is no `Sync` impl for it, so sending it moves that
 // exclusive borrow; `T: Send` is the bound `&mut [T]: Send` requires.
 unsafe impl<T: Send> Send for StridedViewMut<'_, T> {}
 
@@ -1011,6 +1012,11 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// has a zero extent still reports the whole buffer.
     #[inline]
     pub fn data(&self) -> &[T] {
+        // SAFETY: `base` is the caller's `data.as_mut_ptr()` and `src_len` is
+        // that slice's length, both recorded at construction, so this rebuilds
+        // exactly the borrowed slice. No length is derived from the shape, which
+        // is why a zero-extent layout still reports the whole buffer. `T` is
+        // initialized across it, and `&self` restricts this to a shared borrow.
         unsafe { std::slice::from_raw_parts(self.base, self.src_len) }
     }
 
@@ -1020,6 +1026,13 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// and `set` stay valid after the returned borrow ends.
     #[inline]
     pub fn data_mut(&mut self) -> &mut [T] {
+        // SAFETY: as `data` above — the same `base`/`src_len` pair, so this
+        // rebuilds the caller's slice rather than a shape-sized one. `&mut self`
+        // keeps the returned slice the only reference into the view while it
+        // lives. In a non-empty layout `ptr` is `base + offset`, derived without
+        // a retag, so re-deriving the slice here does not invalidate it — the
+        // property `get`/`set` rely on; an empty layout caches a dangling `ptr`
+        // that no element access dereferences.
         unsafe { std::slice::from_raw_parts_mut(self.base, self.src_len) }
     }
 
@@ -1077,10 +1090,13 @@ impl<'a, T> StridedViewMut<'a, T> {
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
         // SAFETY: `data()` re-derives the slice from this view's own handle
         // (`base` + `src_len`), and `ptr` is `base + offset` for the same
-        // `offset`, so the immutable view points at the same storage the mutable
-        // view owns. `&self` keeps that storage exclusively borrowed for the
-        // returned view's lifetime, so the shared view can only read it, and `T`
-        // is initialized across the whole slice.
+        // `offset`, so the immutable view ends up pointing at the same storage
+        // the mutable view owns. A zero-extent layout yields a dangling pointer
+        // on both sides (`empty_mut_ptr` here, the `empty_layout` branch of
+        // `base_ptr` in the immutable view), so they agree there too. `&self`
+        // keeps that storage exclusively borrowed for the returned view's
+        // lifetime, so the shared view can only read it, and `T` is initialized
+        // across the whole slice.
         unsafe { StridedView::new_unchecked(self.data(), self.dims(), self.strides(), self.offset) }
     }
 }
@@ -1094,12 +1110,18 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
-        // SAFETY: `indexed_offset` (view.rs:239) asserts the index count and
-        // `index < dims[i]`, so the offset stays inside the reachable extent
-        // that `validate_bounds` (view.rs:186) accepted for this view. That is
-        // all this establishes: the cached `ptr` is invalidated by an earlier
-        // `data_mut` (view.rs:1001) reborrow, so reading through it afterwards is
-        // unsound and is tracked in tensor4all/strided-rs#383.
+        // SAFETY: in a non-empty layout `ptr` is `base + offset`, derived from
+        // the caller's `&'a mut [T]` through raw pointers only, so a reborrow of
+        // the backing slice does not invalidate it: `data_mut` re-derives that
+        // slice from `base` and never rewrites `ptr`, and offsetting a raw
+        // pointer keeps `base`'s provenance. (An empty layout caches a dangling
+        // `ptr`, but no index satisfies `index < dims[i]` there, so this access
+        // is unreachable.) `indexed_offset` (view.rs:239) asserts the index
+        // count and `index < dims[i]`, so the relative offset it returns keeps
+        // `ptr + offset` inside the extent `validate_bounds` (view.rs:186)
+        // proved reachable, i.e. inside `base..base + src_len`, where every
+        // element is initialized because the view borrows an initialized
+        // `&'a mut [T]` and no method shortens that borrow.
         unsafe { *self.ptr.offset(offset) }
     }
 
@@ -1111,13 +1133,12 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn set(&mut self, indices: &[usize], value: T) {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
-        // SAFETY: as `get` above — `indexed_offset` (view.rs:239) bounds-checks
-        // every index, so the store stays inside the extent the view was built
-        // for. `&mut self` rules out a concurrent `&mut self` access, but it does
-        // not refresh the cached `ptr`: a reborrow through `data_mut`
-        // (view.rs:1001) before this call invalidates it, so only the bound, not
-        // the pointer's validity, is established here
-        // (tensor4all/strided-rs#383).
+        // SAFETY: as `get` above — the same `ptr` survives an earlier `data_mut`
+        // reborrow, and `indexed_offset` (view.rs:239) bounds-checks every index,
+        // so the store lands inside `base..base + src_len`. `&mut self` makes
+        // this the only access through the view for the call, and the view holds
+        // the sole `&'a mut [T]` borrow of that storage, so nothing else can
+        // alias the written place.
         unsafe {
             *self.ptr.offset(offset) = value;
         }
@@ -1418,7 +1439,7 @@ impl<T> StridedArray<T> {
             empty_const_ptr()
         } else {
             // SAFETY: `offset` is either 0 from a constructor or was accepted by
-            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1341), so
+            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1374), so
             // `data.as_ptr() + offset` stays inside `data`. The empty branch
             // above excludes a zero-sized layout, whose offset need not be
             // reachable.
@@ -1443,7 +1464,7 @@ impl<T> StridedArray<T> {
         } else {
             // SAFETY: as `view` above — `self.offset` is either 0 from a
             // constructor or was accepted by `validate_bounds` in
-            // `StridedArray::from_parts` (view.rs:1275), and `&mut self` keeps
+            // `StridedArray::from_parts` (view.rs:1374), and `&mut self` keeps
             // this reborrow exclusive. The empty branch above excludes a
             // zero-sized layout, whose offset need not be reachable.
             unsafe { base.offset(self.offset) }
