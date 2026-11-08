@@ -33,8 +33,8 @@ for the doctest row, a file read for a per-block `// SAFETY:` audit.
 | Metric | Count | #216's opening count |
 |--------|-------|----------------------|
 | `// INVARIANT:` markers | 52 | 0 |
-| `// SAFETY:` comments | 303 | 29 |
-| production `unsafe {` occurrences | 561 | 418 |
+| `// SAFETY:` comments | 302 | 29 |
+| production `unsafe {` occurrences | 534 | 418 |
 | public `Result`-returning `fn` | 186 | 172 |
 | …of those with a `# Errors` section | 186 | 9 |
 | runnable doctests | 123 | 5 |
@@ -42,17 +42,19 @@ for the doctest row, a file read for a per-block `// SAFETY:` audit.
 | files over 1000 lines | 21 | 13 |
 
 Three of the rows are already at or near their target because the work landed
-between the issue's opening count and this baseline: the `# Errors` row is
-closed (the sweep of #381 left no public `Result`-returning `fn` without the
-section), the doctests are the same sweep, and the inline-test drop is the move
+between the issue's opening count and this baseline: the `# Errors` row reads
+186/186 (the sweep of #381 left no public `Result`-returning `fn` without the
+section — but the counter cannot see items a macro expands, so this is "no
+item the scan can read", not an exhaustive claim), the doctests are the same
+sweep, and the inline-test drop is the move
 of the inline unit test modules into `*/tests/` directories (#362) — every
 `src/` file now carries a `mod tests;` declaration, and the one remaining inline
 block with a body is `strided-basic/benches/support/mod.rs:208`. The gap the
 remediation issues should take next is `SAFETY` coverage, and 21 files are over
 1000 lines. Read the old numbers as history and these as the baseline.
 
-`SAFETY` is counted as two independent totals, not as a coverage ratio: 561
-production `unsafe` occurrences and 303 `// SAFETY:` comments. A ratio would
+`SAFETY` is counted as two independent totals, not as a coverage ratio: 534
+production `unsafe` occurrences and 302 `// SAFETY:` comments. A ratio would
 claim that each of those comments documents one of those occurrences, and this
 counter does not establish that pairing; the shared rule requires one comment
 per block, so the per-block audit is the next measurement, not this one.
@@ -93,10 +95,10 @@ tree (123 passed, 0 ignored).
 
 ### Counting defects found in review, and what each fix changed
 
-Five defects, all reproduced with a fixture before the fix and pinned by a test
+Nine defects, all reproduced with a fixture before the fix and pinned by a test
 after it. `scripts/test-count-audit-metrics.py` fails on the pre-fix counter for
-the first four; the fifth (`# Errors` across attributes) was already fixed by an
-earlier round and has its own test.
+every one of them except item 5 (`# Errors` across attributes), which an earlier
+round had already fixed and which keeps its own test.
 
 1. **The signature window.** The scan stopped after eight lines, so a `fn` whose
    return type sat past that window counted in neither the denominator nor the
@@ -110,15 +112,24 @@ earlier round and has its own test.
    `/* unsafe {} // SAFETY: x */` reported `unsafe 1, safety 1, invariant 1`, and
    the same text inside a line-spanning `r#"…"#` counted too. Block comments
    (which nest in Rust), line-spanning raw strings and char literals are now
-   tracked across lines: the totals dropped 332 → 303 and 598 → 561 before the
-   tree moved, and the two rows are now stated as independent totals instead of
-   a ratio. Both are still approximations — the remaining limits are listed in
-   the script's docstring, not claimed away.
-4. **`#[cfg(test)] mod tests;` swallowed the rest of the file.** The skip jumped
+   tracked across lines: the totals dropped 332 → 302 and 598 → 534, and the
+   two rows are now stated as independent totals instead of a ratio. Both are
+   still approximations — the remaining limits are listed in the script's
+   docstring, not claimed away.
+4. **Test-only files were counted as production.** The scope excluded a
+   `tests/` path component but not a `tests.rs` file, the target of a
+   `#[cfg(test)] mod tests;` declaration. Nineteen such files held 27 `unsafe`
+   blocks and one `SAFETY` comment, and the totals were 561/303 until they were
+   excluded. Counting braces over the string-blanked line, tracking an ordinary
+   `"` string left open across lines, and reading the item's own return type
+   instead of the first `->` in its signature (a callback parameter's) are the
+   other three cases the counters got wrong; `scripts/test-count-audit-metrics.py`
+   pins all four.
+5. **`#[cfg(test)] mod tests;` swallowed the rest of the file.** The skip jumped
    to the next `{`, so production code after a declaration disappeared: the
    fixture's `pub fn retained() -> Result<(), ()> { unsafe {} … }` counted as
    `pub_result 0, unsafe 0`. A `NAME;` declaration now skips nothing.
-5. **`pub extern "C" fn` fell out of the denominator.** Rebuilding the line from
+6. **`pub extern "C" fn` fell out of the denominator.** Rebuilding the line from
    the scanned fragments moved `pub` to column 0 only for plain items, so
    `pub extern "C" fn retained() -> Result<(), ()>` counted as `pub_result 0`.
    The cleaned line keeps its own columns, so the item is classified like any

@@ -233,6 +233,54 @@ def test_real_unsafe_blocks_and_comments_are_counted() -> None:
     assert counts["invariant"] == 1, counts
 
 
+def test_a_tests_rs_sibling_of_a_mod_declaration_is_test_only() -> None:
+    """`#[cfg(test)] mod tests;` moves the body to `tests.rs`; it is not production."""
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod tests;\n\npub fn live() {\n    unsafe {}\n}\n",
+            "tests.rs": "#[test]\nfn test_only() {\n    unsafe {}\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 1, counts
+
+
+def test_braces_inside_a_test_string_do_not_swallow_production() -> None:
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "#[cfg(test)]\n"
+                "mod tests {\n"
+                '    const S: &str = "{";\n'
+                "}\n"
+                "pub fn live() -> Result<(), ()> {\n"
+                "    unsafe {}\n"
+                "    Ok(())\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    assert counts["unsafe"] == 1, counts
+
+
+def test_line_spanning_ordinary_string_is_not_code() -> None:
+    counts = count_sources(
+        {"fixture.rs": 'const NOTE: &str = "\nunsafe {} // SAFETY: x // INVARIANT: y\n";\n'}
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["safety"] == 0, counts
+    assert counts["invariant"] == 0, counts
+
+
+def test_a_callback_return_type_is_not_the_items_return_type() -> None:
+    counts = count_sources(
+        {"fixture.rs": "pub fn accepts(f: fn() -> Result<(), ()>) {\n    let _ = f;\n}\n"}
+    )
+    assert counts["pub_result"] == 0, counts
+    counts = count_sources({"fixture.rs": "pub fn returns() -> Result<(), ()> {\n    Ok(())\n}\n"})
+    assert counts["pub_result"] == 1, counts
+
+
 def main() -> int:
     tests = [
         value

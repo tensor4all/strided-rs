@@ -2,7 +2,8 @@
 """Approximate the strided-rs audit baseline rows with a line-oriented scan.
 
 Rows, as printed (production scope = `strided-*/src/**/*.rs`, a `tests/`
-component excluded, inline `#[cfg(test)] mod name { .. }` bodies skipped):
+component and a `tests.rs` file excluded, inline `#[cfg(test)] mod name { .. }`
+bodies skipped):
 
   invariant               `//` line comments containing the marker
   safety                  the same for `// SAFETY:`; an independent total, not paired with `unsafe`
@@ -28,8 +29,8 @@ quote one as proof that a file or a tree is clean:
   have one, and the text is dropped from the code rows.
 - A string literal inside an attribute or a macro invocation is blanked as a
   string, so an item whose `pub` is produced by a macro is not seen at all.
-- Braces inside a macro body that the scanner reads as code still move the
-  `#[cfg(test)] mod` skip and the inline-module count.
+- Braces inside a macro body that the scanner reads as code (not as a string)
+  still move the `#[cfg(test)] mod` skip and the inline-module count.
 - `unsafe` is counted as the text `unsafe` + `{`, so `unsafe extern` blocks,
   `unsafe fn` bodies whose brace sits on another item, and a macro that expands
   to `unsafe {` are not distinguished.
@@ -70,7 +71,26 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
     i = 0
     depth = int(state["block_comment"])  # type: ignore[arg-type]
     raw_hashes = state["raw_string"]  # type: ignore[assignment]
+    plain_open = bool(state.get("plain_string"))
     while i < len(raw):
+        if plain_open:
+            # An ordinary `"` string left open on the previous line. Blank the
+            # text up to its closing quote, honouring `\` escapes.
+            end = i
+            while end < len(raw):
+                if raw[end] == "\\":
+                    end += 2
+                    continue
+                if raw[end] == '"':
+                    end += 1
+                    plain_open = False
+                    break
+                end += 1
+            end = min(end, len(raw))
+            no_comments.append(" " * (end - i))
+            no_strings.append(" " * (end - i))
+            i = end
+            continue
         if depth:
             if raw.startswith("/*", i):
                 depth += 1
@@ -129,14 +149,18 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
             continue
         if raw[i] == '"':
             j = i + 1
+            closed = False
             while j < len(raw):
                 if raw[j] == "\\":
                     j += 2
                     continue
                 if raw[j] == '"':
                     j += 1
+                    closed = True
                     break
                 j += 1
+            if not closed:
+                plain_open = True
             span = raw[i:j]
             no_comments.append(span)
             no_strings.append(" " * len(span))
@@ -152,12 +176,13 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
         i += 1
     state["block_comment"] = depth
     state["raw_string"] = raw_hashes
+    state["plain_string"] = plain_open
     return "".join(no_comments), "".join(no_strings), comment
 
 
 def scan_file(text: str) -> list[dict[str, object]]:
     """Split a file into rows of (code, code_without_strings, line_comment, doc_comment)."""
-    state: dict[str, object] = {"block_comment": 0, "raw_string": None}
+    state: dict[str, object] = {"block_comment": 0, "raw_string": None, "plain_string": False}
     rows: list[dict[str, object]] = []
     for raw in text.splitlines():
         head = raw.lstrip()
@@ -225,7 +250,8 @@ def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         depth = 0
         k = j
         while k < len(rows):
-            depth += str(rows[k]["code"]).count("{") - str(rows[k]["code"]).count("}")
+            text = str(rows[k]["code_no_strings"])
+            depth += text.count("{") - text.count("}")
             k += 1
             if depth <= 0 and "}" in str(rows[k - 1]["code"]):
                 break
@@ -260,6 +286,28 @@ def read_signature(rows: list[dict[str, object]], start: int) -> str:
     return " ".join(parts)
 
 
+def returns_result(flat: str) -> bool:
+    """True when the signature's own return type starts with `Result<`.
+
+    Every arrow inside the parameter list (a callback type such as
+    `fn() -> Result<..>`) sits at bracket depth >= 1, so only depth-zero arrows
+    are the item's return type.
+    """
+    depth = 0
+    index = 0
+    while index < len(flat):
+        char = flat[index]
+        if char in "([<":
+            depth += 1
+        elif char in ")]>":
+            depth = max(depth - 1, 0)
+        elif char == "-" and depth == 0 and flat.startswith("->", index):
+            rest = flat[index + 2 :].lstrip()
+            return rest.startswith("Result<")
+        index += 1
+    return False
+
+
 def relative_parts(path: Path, root: Path) -> tuple[str, ...]:
     """Repo-relative path components.
 
@@ -276,7 +324,7 @@ def count(root: Path) -> dict[str, int]:
     production = [
         p
         for p in sorted(root.glob(PRODUCTION_GLOB))
-        if "tests" not in relative_parts(p, root)
+        if "tests" not in relative_parts(p, root) and p.name != "tests.rs"
     ]
     all_source = [
         p for p in sorted(root.glob(ALL_SOURCE_GLOB)) if "target" not in relative_parts(p, root)
@@ -316,7 +364,7 @@ def count(root: Path) -> dict[str, int]:
                 continue
             if FUNCTION_RE.match(code):
                 flat = read_signature(rows[p], i)
-                if "->" in flat and "Result<" in flat.split("->", 1)[1]:
+                if returns_result(flat):
                     pub_result += 1
                     with_errors += has_errors
             has_errors = False
