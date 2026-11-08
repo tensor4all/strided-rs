@@ -312,6 +312,18 @@ def test_a_comment_shaped_line_inside_an_open_string_is_not_a_comment() -> None:
     assert counts["safety"] == 0, counts
     assert counts["invariant"] == 0, counts
     assert counts["unsafe"] == 1, counts
+    # A `///` closing line: taking it as a doc line loses the string's closing
+    # quote and swallows the production function after it.
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                'const NOTE: &str = "\n'
+                '/// ";\n'
+                "pub fn live() {\n    unsafe {}\n}\n"
+            )
+        }
+    )
+    assert counts["unsafe"] == 1, counts
 
 
 def test_a_callback_return_type_is_not_the_items_return_type() -> None:

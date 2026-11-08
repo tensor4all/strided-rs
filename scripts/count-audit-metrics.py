@@ -449,9 +449,10 @@ def production_files(root: Path) -> list[Path]:
     A path exclusion cannot see `#[cfg(test)] mod NAME;` in the declaring file, so
     the declaration is resolved the way Rust resolves it — relative to the
     declaring module's directory — and the whole subtree (`NAME.rs`, `NAME/mod.rs`
-    and anything below `NAME/`) is excluded. A declaration inside an excluded file
-    always names a path inside that same subtree, so one pass over the candidates
-    is enough.
+    and anything below `NAME/`) is excluded. A `#[path = "..."]` attribute instead
+    names its file relative to the declaring file's own directory, so it can point
+    outside that subtree. The exclusion set is collected from every candidate,
+    including candidates that are themselves excluded, so one pass is enough.
     """
     candidates = [
         p

@@ -61,9 +61,9 @@ literal around it, `scripts/count-audit-metrics.py:31-32`, so this is "no item
 the scan can read", not an exhaustive claim), the doctests are the same
 sweep, and the inline-test drop is the move
 of the inline unit test modules into `*/tests/` directories (#362) — the files
-that have unit tests carry a test-module declaration (30 of the 60 production
-files declare none; several of those name their module something other than
-`tests`), and the one remaining inline
+that have unit tests carry a test-module declaration (some name it something other
+than `tests`, so do not read the absence of `mod tests;` as the absence of unit
+tests), and the one remaining inline
 block with a body is `strided-basic/benches/support/mod.rs:208`. The gap the
 remediation issues should take next is `SAFETY` coverage, and 21 files are over
 1000 lines. Read the old numbers as history and these as the baseline.
@@ -81,19 +81,22 @@ per block, so the per-block audit is the next measurement, not this one.
 wrong:
 
 ```bash
-python3 scripts/test-count-audit-metrics.py     # 32 tests
+python3 scripts/test-count-audit-metrics.py     # prints its own test count
 ```
 
 Production scope is `strided-*/src/**/*.rs` with a `tests/` path component, a
 `tests.rs` file, and the module subtree of every test-only declaration excluded —
 `#[cfg(test)] mod NAME;` excludes `NAME.rs`, `NAME/mod.rs` and everything below
 `NAME/`, an inline `#[cfg(test)] mod NAME { .. }` excludes `NAME/` as well, and a
-`#[path = "..."]` attribute names its file directly. Declarations resolve in the
-declaring module's directory (`foo/` for `foo.rs`, the containing directory for
-`lib.rs`/`mod.rs`), one pass over the candidates is enough because a declaration
-inside an excluded file always names a path inside that same subtree, and inline
-`#[cfg(test)] mod NAME { .. }` bodies are skipped for the first five rows; the doc-comment, inline-module and
-file rows scan all of `strided-*/**/*.rs` with a `target/` component excluded.
+`#[path = "..."]` attribute names its file directly. Ordinary declarations resolve
+in the declaring module's directory (`foo/` for `foo.rs`, the containing directory
+for `lib.rs`/`mod.rs`); an explicit path resolves against the declaring file's own
+directory, so it may point outside the module subtree. The exclusion set is built
+from every candidate file, including ones that are themselves excluded, which is
+why one pass is enough. Inline `#[cfg(test)] mod NAME { .. }` bodies are skipped
+for the first five rows; the `# Errors` row uses the same production files as the
+`Result` row, and the inline-module and file rows scan all of `strided-*/**/*.rs`
+with a `target/` component excluded.
 Both exclusions compare repo-relative path components. The scanner blanks block
 comments (nested), line comments, char literals (including escaped ones such as
 `'\"'` and `'\u{1F600}'`) and string literals — including line-spanning
@@ -149,7 +152,7 @@ Consequences for reading a row:
 
 ### Counting defects found in review, and what each fix changed
 
-Eighteen findings. Items 1-9 and 11-15 are scanner defects, each reproduced with
+Fifteen findings. Items 1-9 and 11-15 are scanner defects, each reproduced with
 a fixture before the fix and pinned by a test after it; the suite fails on the
 pre-fix counter for every one of them except item 2 (`# Errors` across
 attributes), which an earlier round had already fixed and which keeps its own
