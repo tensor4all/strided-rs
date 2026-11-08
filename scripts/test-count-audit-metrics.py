@@ -182,8 +182,16 @@ def test_blank_line_between_cfg_test_and_mod_is_an_inline_block() -> None:
 
 
 def test_path_exclusions_use_repo_relative_components() -> None:
-    """A checkout under a directory named `target` or `tests` still counts its files."""
+    """A checkout under a directory named `target` or `tests` still counts its files.
+
+    Both path exclusions are repo-relative: an absolute-path comparison would drop
+    every file here, and a `target/` filter that looked at absolute parts would
+    count the generated file below.
+    """
     mod = load_module()
+    # A checkout whose own path contains `target` and `tests`: an absolute-path
+    # comparison would drop every file, so `unsafe == 1` pins that the comparison
+    # is repo-relative.
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp) / "target" / "tests" / "checkout"
         src = root / "strided-x" / "src"
@@ -191,6 +199,21 @@ def test_path_exclusions_use_repo_relative_components() -> None:
         (src / "real.rs").write_text("pub fn f() {\n    unsafe {}\n}\n", encoding="utf-8")
         counts = mod.count(root)
     assert counts["unsafe"] == 1, counts
+
+    # A generated file below `strided-x/target/`: the all-source rows exclude it,
+    # so a filter that looked at absolute parts (where the root has no `target`)
+    # would count it here.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "checkout"
+        src = root / "strided-x" / "src"
+        src.mkdir(parents=True)
+        (src / "real.rs").write_text("pub fn f() {\n    unsafe {}\n}\n", encoding="utf-8")
+        generated = root / "strided-x" / "target" / "generated.rs"
+        generated.parent.mkdir(parents=True)
+        generated.write_text("// filler\n" * 1001, encoding="utf-8")
+        counts = mod.count(root)
+    assert counts["unsafe"] == 1, counts
+    assert counts["files_over_1000"] == 0, counts
 
 
 def test_doc_block_survives_attributes() -> None:

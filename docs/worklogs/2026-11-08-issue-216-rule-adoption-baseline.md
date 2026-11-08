@@ -115,7 +115,7 @@ the command's own output at this tree (123 passed, 0 ignored).
 | `# Errors` | the doc block nearest above such a `fn` contains a `/// # Errors` line; attribute lines (`#[inline]`, `#[must_use]`, `#[allow(..)]`, including multi-line ones) and blank lines between the doc block and the `fn` do not break the association |
 | runnable doctests | `cargo test --doc` pass count at the repository root, not a fence count |
 | inline test modules | `#[cfg(test)]` (optionally with further attributes) followed by `mod NAME { .. }`; a `mod NAME;` declaration counts 0, because its body lives in another file and moving the body is exactly what this row is meant to move |
-| files over 1000 lines | logical lines (`str.splitlines()`) over `strided-*/**/*.rs`, so a file with 1000 newline characters and no final newline counts 1000, not 1001 |
+| files over 1000 lines | logical lines (`str.splitlines()`) over `strided-*/**/*.rs`, which is one more than `wc -l` for a file without a final newline |
 
 ### Known limits: the counts are a lower bound
 
