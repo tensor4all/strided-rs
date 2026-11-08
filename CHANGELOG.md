@@ -35,8 +35,12 @@ safe constructors from the start.
 
 Callers that do not need an uninitialised buffer should use the safe constructors and are unaffected.
 
-`strided-basic` and `strided-perm` move their `strided-view` requirement to `^0.8` in the same release; their own versions
-stay on the 0.13.x line because their public API is unchanged.
+**`strided-basic` and `strided-kernel` break too**, and this is the part that is easy to miss: `strided-basic/src/lib.rs:157`
+does `pub use strided_view::*;` and `strided-kernel/src/lib.rs:5` does `pub use strided_basic::*;`, so the changed
+constructor signatures are part of *their* public APIs as well. They go to **0.14.0** and **0.14.0** respectively.
+
+`strided-perm`, `strided-fused` and `strided-nn` stay on the 0.13.x line: none of them re-exports the affected types, and
+none has an affected type in a public signature (`grep -rn 'pub fn .*StridedArray'` finds none in the three).
 
 ## 0.13.1 (unreleased)
 
