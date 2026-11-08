@@ -124,8 +124,10 @@ The counter is not a Rust parser. It blanks block comments (nested), line
 comments, char literals and string literals, and is line-oriented everywhere
 else. These cases are known to be miscounted, and they are **not** fixed here:
 
-- An item whose `pub` is produced by a macro invocation is not seen at all: the
-  string literal around it is blanked with the macro's tokens.
+- A `macro_rules!` template is scanned where it is written: a template spelling
+  `pub fn $name(..) -> Result<..>` counts once (`strided-nn/src/softmax.rs:179`),
+  and its invocations are not expanded, so an item only the expansion creates is
+  never seen.
 - Braces inside a macro body that the scanner reads as code still move the
   `#[cfg(test)] mod` skip and the inline-module count.
 - `unsafe` is counted as the text `unsafe` + `{`, so `unsafe extern` blocks, an

@@ -373,7 +373,7 @@ def test_a_differently_named_test_only_module_is_not_production() -> None:
 
 
 def test_a_test_only_module_directory_is_not_production() -> None:
-    """The target may be `NAME/mod.rs`, and a dropped file's own test-only mods follow."""
+    """The target may be `NAME/mod.rs`; a declaration inside an excluded file still counts."""
     counts = count_sources(
         {
             "lib.rs": "#[cfg(test)]\nmod helpers;\n",
@@ -430,6 +430,17 @@ def test_test_only_exclusion_covers_the_module_subtree() -> None:
             "lib.rs": "#[cfg(test)]\nmod helpers;\n",
             "helpers/mod.rs": "mod deep;\n",
             "helpers/deep.rs": "pub fn deep() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+    # A declaration inside an already-excluded file still contributes its target,
+    # and an explicit path may point outside the excluded subtree.
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod helpers;\n",
+            "helpers.rs": '#[cfg(test)]\n#[path = "outside.rs"]\nmod nested;\n',
+            "outside.rs": "pub fn outside() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
         }
     )
     assert counts["unsafe"] == 0, counts
