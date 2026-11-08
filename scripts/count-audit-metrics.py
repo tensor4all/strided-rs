@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Approximate the strided-rs audit baseline rows with a line-oriented scan.
 
-Rows, as printed (production scope = `strided-*/src/**/*.rs`, a `tests/`
-component and a `tests.rs` file excluded, inline `#[cfg(test)] mod name { .. }`
-bodies skipped):
+Rows, as printed (production scope = `strided-*/src/**/*.rs`, minus a `tests/`
+component, a `tests.rs` file and every file a `#[cfg(test)] mod name;`
+declaration makes test-only, with inline `#[cfg(test)] mod name { .. }` bodies
+skipped):
 
   invariant               `//` line comments containing the marker
   safety                  the same for `// SAFETY:`; an independent total, not paired with `unsafe`
@@ -17,12 +18,20 @@ bodies skipped):
 Run it as `python3 scripts/count-audit-metrics.py .` from the repository root;
 `scripts/test-count-audit-metrics.py` pins the cases a plain line scan gets wrong.
 
-# This is an approximation, not a Rust parser
+# Known limits: an approximation, not a Rust parser
 
 The scanner tracks `/* */` (nested), line comments, char literals and string
 literals including `r#"…"#` and ordinary `"…"` across lines. Everything else is
-line-oriented, and the following are known to be miscounted. Do not read a row as exact, and do not
-quote one as proof that a file or a tree is clean:
+line-oriented, and the following are known to be miscounted. Do not read a row as
+exact, and do not quote one as proof that a file or a tree is clean.
+
+The `unsafe`, `// SAFETY:` and `// INVARIANT:` rows are a **lower bound**: text the
+scanner mistakes for a comment or a string is dropped from the code rows and never
+invented, so the true count is at least what is printed. The `Result` row is a
+lower bound in the same way, except that a `<` or `>` used as a comparison
+operator inside a signature can also misplace the signature's end (see the last
+limit below). A count of zero therefore means "the scan found none", not "none
+exists".
 
 - `///` at the start of a line inside a block comment or a line-spanning
   `r#"…"#` starts a *doc* line for this scanner, so a following `# Errors` can be
@@ -54,8 +63,11 @@ ALL_SOURCE_GLOB = "strided-*/**/*.rs"
 
 FUNCTION_RE = re.compile(r'\s*pub (?:[\w"\']+ )*fn ')
 INLINE_TEST_MOD_RE = re.compile(r"(?:pub\s+)?mod\s+\w+\s*\{")
-INLINE_TEST_DECL_RE = re.compile(r"(?:pub\s+)?mod\s+\w+\s*;")
+INLINE_TEST_DECL_RE = re.compile(r"(?:pub\s+)?mod\s+(\w+)\s*;")
 RAW_STRING_PREFIX_RE = re.compile(r"\b(?:br|r)(#*)\"")
+# A char literal, including the escaped forms `'\"'`, `'\\'` and `'\u{1F600}'`.
+# A lifetime (`'a`) has no closing quote and does not match.
+CHAR_LITERAL_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'])'")
 UNSAFE_RE = re.compile(r"\bunsafe\s*\{")
 
 
@@ -167,10 +179,12 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
             no_strings.append(" " * len(span))
             i = j
             continue
-        if raw[i] == "'" and i + 2 < len(raw) and raw[i + 1] != "\\" and raw[i + 2] == "'":
-            no_comments.append("'''")
-            no_strings.append("   ")
-            i += 3
+        literal = CHAR_LITERAL_RE.match(raw, i)
+        if literal:
+            span = literal.group(0)
+            no_comments.append(span)
+            no_strings.append(" " * len(span))
+            i = literal.end()
             continue
         no_comments.append(raw[i])
         no_strings.append(raw[i])
@@ -270,24 +284,30 @@ def read_signature(rows: list[dict[str, object]], start: int) -> str:
 
     A `;` inside `[u8; 4]`, a generic parameter list or a `where`-clause
     lifetime is not the end of the item; only a `;` at bracket depth zero is.
+    An arrow is skipped as one token, so the `>` of a callback's `->` cannot
+    close a bracket the parameter list opened.
     """
     depth = 0
     parts: list[str] = []
     for row in rows[start:]:
         code = str(row["code"])
-        for index, char in enumerate(code):
+        index = 0
+        while index < len(code):
+            if code.startswith("->", index):
+                index += 2
+                continue
+            char = code[index]
             if char in "([<{":
                 if char == "{" and depth == 0:
                     parts.append(code[:index])
                     return " ".join(parts)
                 depth += 1
-                continue
-            if char in ")]>}":
+            elif char in ")]>}":
                 depth = max(depth - 1, 0)
-                continue
-            if char == ";" and depth == 0:
+            elif char == ";" and depth == 0:
                 parts.append(code[:index])
                 return " ".join(parts)
+            index += 1
         parts.append(code)
     return " ".join(parts)
 
@@ -297,19 +317,24 @@ def returns_result(flat: str) -> bool:
 
     Every arrow inside the parameter list (a callback type such as
     `fn() -> Result<..>`) sits at bracket depth >= 1, so only depth-zero arrows
-    are the item's return type.
+    are the item's return type. An arrow is consumed as one token: counting its
+    `>` as a closer would drop the depth of the enclosing parameter list and
+    expose a callback's arrow as if it were the item's.
     """
     depth = 0
     index = 0
     while index < len(flat):
+        if flat.startswith("->", index):
+            if depth == 0:
+                rest = flat[index + 2 :].lstrip()
+                return rest.startswith("Result<")
+            index += 2
+            continue
         char = flat[index]
         if char in "([<":
             depth += 1
         elif char in ")]>":
             depth = max(depth - 1, 0)
-        elif char == "-" and depth == 0 and flat.startswith("->", index):
-            rest = flat[index + 2 :].lstrip()
-            return rest.startswith("Result<")
         index += 1
     return False
 
@@ -326,12 +351,59 @@ def relative_parts(path: Path, root: Path) -> tuple[str, ...]:
         return path.parts
 
 
-def count(root: Path) -> dict[str, int]:
-    production = [
+def test_only_module_names(rows: list[dict[str, object]]) -> set[str]:
+    """Module names a `#[cfg(test)] mod NAME;` declaration moves to another file.
+
+    Further attributes may sit between the `#[cfg(test)]` line and the
+    declaration, as in `strided-perm/src/lib.rs`'s `mod kernel;`.
+    """
+    names: set[str] = set()
+    i = 0
+    while i < len(rows):
+        if str(rows[i]["code"]).strip() != "#[cfg(test)]":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(rows) and (
+            not str(rows[j]["code"]).strip()
+            or str(rows[j]["code"]).strip().startswith("#[")
+        ):
+            j += 1
+        if j < len(rows):
+            match = INLINE_TEST_DECL_RE.match(str(rows[j]["code"]).strip())
+            if match:
+                names.add(match.group(1))
+        i += 1
+    return names
+
+
+def production_files(root: Path) -> list[Path]:
+    """Production sources, minus the files a test-only `mod NAME;` owns.
+
+    A path exclusion cannot see `#[cfg(test)] mod NAME;` in the declaring file,
+    so the files it names (`NAME.rs`, `NAME/mod.rs`) are removed here and the
+    scan repeats until no kept file declares another one.
+    """
+    kept = [
         p
         for p in sorted(root.glob(PRODUCTION_GLOB))
         if "tests" not in relative_parts(p, root) and p.name != "tests.rs"
     ]
+    while True:
+        dropped = {
+            target
+            for p in kept
+            for name in test_only_module_names(scan_file(p.read_text(encoding="utf-8")))
+            for target in (p.parent / f"{name}.rs", p.parent / name / "mod.rs")
+            if target in kept
+        }
+        if not dropped:
+            return kept
+        kept = [p for p in kept if p not in dropped]
+
+
+def count(root: Path) -> dict[str, int]:
+    production = production_files(root)
     all_source = [
         p for p in sorted(root.glob(ALL_SOURCE_GLOB)) if "target" not in relative_parts(p, root)
     ]

@@ -7,20 +7,33 @@ repository-neutral rules out of `REPOSITORY_RULES.md` and into references to
 `tensor4all/tensor4all-agent-rules`. The second half of the issue is the audit
 baseline: the gap counts the rule-remediation issues check themselves against.
 
-Measured on commit `ac8f744` of this branch over the maintained crates
-(`strided-traits`, `strided-view`, `strided-basic`, `strided-kernel`,
-`strided-fused`, `strided-nn`, `strided-perm`):
+Measured over the maintained crates (`strided-traits`, `strided-view`,
+`strided-basic`, `strided-kernel`, `strided-fused`, `strided-nn`,
+`strided-perm`) on the Rust sources this branch was rebased onto (`f7f9c5b`,
+#386) — unchanged from `ac8f744` through this head, `git diff ac8f744 HEAD --
+'strided-*/**/*.rs'` is empty — **with the counter at this branch's head**:
 
 ```bash
 python3 scripts/count-audit-metrics.py .   # the seven source rows
 cargo test --doc --workspace               # the doctest row, 123 passed, 0 ignored
 ```
 
-`ac8f744` is a document-and-scripts commit; the Rust sources in it are the ones
-this branch was rebased onto (`f7f9c5b`, #386). The counter only reads
-`strided-*/**/*.rs`, so editing this file after that commit does not move any
-row: a recount at a later commit of the same branch differs only if Rust source
-changed.
+```
+invariant 52
+safety 302
+unsafe 534
+pub_result 185 with_errors 185
+inline_mods 1
+files_over_1000 21
+```
+
+**The counter's revision is part of the measurement.** A row is only reproducible
+with the pair (Rust sources, counter), because scanner fixes move the counts
+without any Rust change: the counter at `ac8f744` prints `safety 303, unsafe 561`
+on these same sources, and the earlier table in this file quoted those values
+under the source revision alone. Record both, e.g.
+`git log -1 --format=%h -- scripts/count-audit-metrics.py` for the counter and
+`git diff ac8f744 HEAD -- 'strided-*/**/*.rs'` to show the sources did not move.
 
 The counter is a line-oriented approximation, not a Rust parser. It is accurate
 enough for a trend, and it is not evidence that a file or a tree is clean: the
@@ -35,15 +48,15 @@ for the doctest row, a file read for a per-block `// SAFETY:` audit.
 | `// INVARIANT:` markers | 52 | 0 |
 | `// SAFETY:` comments | 302 | 29 |
 | production `unsafe {` occurrences | 534 | 418 |
-| public `Result`-returning `fn` | 186 | 172 |
-| …of those with a `# Errors` section | 186 | 9 |
+| public `Result`-returning `fn` | 185 | 172 |
+| …of those with a `# Errors` section | 185 | 9 |
 | runnable doctests | 123 | 5 |
 | inline `#[cfg(test)] mod` blocks with a body | 1 | 53 |
 | files over 1000 lines | 21 | 13 |
 
 Three of the rows are already at or near their target because the work landed
 between the issue's opening count and this baseline: the `# Errors` row reads
-186/186 (the sweep of #381 left no public `Result`-returning `fn` without the
+185/185 (the sweep of #381 left no public `Result`-returning `fn` without the
 section — but an item whose `pub` a macro produces is dropped with the string
 literal around it, `scripts/count-audit-metrics.py:31-32`, so this is "no item
 the scan can read", not an exhaustive claim), the doctests are the same
@@ -67,39 +80,75 @@ per block, so the per-block audit is the next measurement, not this one.
 wrong:
 
 ```bash
-python3 scripts/test-count-audit-metrics.py     # 17 tests
+python3 scripts/test-count-audit-metrics.py     # 21 tests
 ```
 
-Production scope is `strided-*/src/**/*.rs` with a `tests/` path component and
-inline `#[cfg(test)] mod NAME { .. }` bodies skipped for the first five rows;
-the doc-comment, inline-module and file rows scan all of `strided-*/**/*.rs`
-with a `target/` component excluded. Both exclusions compare repo-relative path
-components. The scanner blanks block comments (nested), line comments, char
-literals and string literals — including line-spanning `r#"…"#` — before
-counting, which is the cheapest useful reading of `rules/rust/index.md:23` ("skip
-`// SAFETY:` comments, doc comments, string literals, tests"); it is an
-approximation with the limits listed in `scripts/count-audit-metrics.py`. The
-doctest row is not in the counter: it is `cargo test --doc`, which is the
-definition of "runnable"; the recorded value is the command's own output at this
-tree (123 passed, 0 ignored).
+Production scope is `strided-*/src/**/*.rs` with a `tests/` path component, a
+`tests.rs` file, and every file a `#[cfg(test)] mod NAME;` declaration makes
+test-only (`NAME.rs` or `NAME/mod.rs`, applied to a fixed point so a dropped
+file's own test-only modules follow) excluded, and inline `#[cfg(test)] mod NAME
+{ .. }` bodies skipped for the first five rows; the doc-comment, inline-module and
+file rows scan all of `strided-*/**/*.rs` with a `target/` component excluded.
+Both exclusions compare repo-relative path components. The scanner blanks block
+comments (nested), line comments, char literals (including escaped ones such as
+`'\"'` and `'\u{1F600}'`) and string literals — including line-spanning
+`r#"…"#` and ordinary `"…"` — before counting, which is the cheapest useful
+reading of `rules/rust/index.md:23` ("skip `// SAFETY:` comments, doc comments,
+string literals, tests"); it is an approximation with the limits listed in
+`scripts/count-audit-metrics.py`. The doctest row is not in the counter: it is
+`cargo test --doc`, which is the definition of "runnable"; the recorded value is
+the command's own output at this tree (123 passed, 0 ignored).
 
 | Row | Rule |
 |-----|------|
 | `// INVARIANT:` | `//` line comments (doc comments excluded, block comments excluded) containing the marker |
 | `// SAFETY:` | the same for `// SAFETY:`; an independent total, not paired with the row below |
 | `unsafe {` | occurrences of `unsafe` + `{` in the scanned text, comments and string literals blanked first, `unsafe` and `{` allowed on different lines; an independent total, not paired with the row above, and subject to the limits above |
-| public `Result` `fn` | a `pub` (or `pub unsafe` / `pub const` / `pub extern "C"`) `fn` whose signature, read to the first `{` or `;`, has a `Result<` after its `->`; the line's own columns are preserved, so an `extern "C"` item is classified like any other |
+| public `Result` `fn` | a `pub` (or `pub unsafe` / `pub const` / `pub extern "C"`) `fn` whose signature, read to the first `{` or `;`, has a `Result<` after its own `->`; the line's own columns are preserved, so an `extern "C"` item is classified like any other; an arrow is consumed as one token, so a callback parameter's `-> Result<…>` is never read as the item's return type |
 | `# Errors` | the doc block nearest above such a `fn` contains a `/// # Errors` line; attribute lines (`#[inline]`, `#[must_use]`, `#[allow(..)]`, including multi-line ones) and blank lines between the doc block and the `fn` do not break the association |
 | runnable doctests | `cargo test --doc` pass count at the repository root, not a fence count |
 | inline test modules | `#[cfg(test)]` (optionally with further attributes) followed by `mod NAME { .. }`; a `mod NAME;` declaration counts 0, because its body lives in another file and moving the body is exactly what this row is meant to move |
 | files over 1000 lines | `wc -l` over `strided-*/**/*.rs` |
 
+### Known limits: the counts are a lower bound
+
+The counter is not a Rust parser. It blanks block comments (nested), line
+comments, char literals and string literals, and is line-oriented everywhere
+else. These cases are known to be miscounted, and they are **not** fixed here:
+
+- A `///` line inside a block comment or a line-spanning `r#"…"#` starts a *doc*
+  line, so a following `# Errors` can be credited to an item that does not have
+  one.
+- An item whose `pub` is produced by a macro invocation is not seen at all: the
+  string literal around it is blanked with the macro's tokens.
+- Braces inside a macro body that the scanner reads as code still move the
+  `#[cfg(test)] mod` skip and the inline-module count.
+- `unsafe` is counted as the text `unsafe` + `{`, so `unsafe extern` blocks, an
+  `unsafe fn` whose brace belongs to another item, and a macro that expands to
+  `unsafe {` are not distinguished.
+- A `<` or `>` used as a comparison operator inside a signature can misplace the
+  signature's end; arrows are handled, comparison operators are not.
+- A `mod NAME;` whose declaration is itself produced by a macro is not followed.
+
+Consequences for reading a row:
+
+- The `// INVARIANT:`, `// SAFETY:` and `unsafe {` rows are a **lower bound**: text
+  the scanner mistakes for a comment or a string is dropped from the code rows and
+  never invented, so the true count is at least the printed one.
+- The `Result` rows are a lower bound in the same way, except that the
+  comparison-operator limit above can also hide or add one item.
+- A zero means "the scan found none", not "none exists". Where a row matters,
+  measure the thing itself: `cargo test --doc` for the doctest row, a per-block
+  read for a `// SAFETY:` audit.
+
 ### Counting defects found in review, and what each fix changed
 
-Nine defects, all reproduced with a fixture before the fix and pinned by a test
-after it. `scripts/test-count-audit-metrics.py` fails on the pre-fix counter for
-every one of them except item 5 (`# Errors` across attributes), which an earlier
-round had already fixed and which keeps its own test.
+Thirteen defects, all reproduced with a fixture before the fix and pinned by a
+test after it. `scripts/test-count-audit-metrics.py` fails on the pre-fix counter
+for every one of them except item 5 (`# Errors` across attributes), which an
+earlier round had already fixed and which keeps its own test. Items 1-6 came from
+the first review round; items 7-10 from the second (`2026-11-08T05:25Z`, head
+`96dc462`), where item 10 is an attribution error rather than a scanner defect.
 
 1. **The signature window.** The scan stopped after eight lines, so a `fn` whose
    return type sat past that window counted in neither the denominator nor the
@@ -136,3 +185,34 @@ round had already fixed and which keeps its own test.
    `pub extern "C" fn retained() -> Result<(), ()>` counted as `pub_result 0`.
    The cleaned line keeps its own columns, so the item is classified like any
    other `pub fn`.
+7. **A test-only module with any name stayed production.** The scope dropped a
+   file named `tests.rs` but did not read the declaration that makes a file
+   test-only: `strided-perm/src/lib.rs`'s `#[cfg(test)] mod block;`, `mod kernel;`
+   and `mod order;` kept `strided-perm/src/{block,kernel,order}.rs` in the totals.
+   The fixture `#[cfg(test)] mod helpers;` plus `helpers.rs` reported
+   `unsafe 1, pub_result 1` where production holds neither. The declaration is now
+   followed (`NAME.rs` and `NAME/mod.rs`, to a fixed point): three files left the
+   scope and the `Result` denominator went 186 → 185. No `unsafe` or `SAFETY`
+   occurrence moved, so those rows stay 534/302.
+8. **Two callback arrows moved the item's return type.** `read_signature` and
+   `returns_result` counted the `>` of `->` as a closing bracket, so the first
+   callback's arrow closed the parameter list and the second one stood where the
+   item's own arrow belongs. `pub fn accepts(f: fn() -> (), g: fn() -> Result<(), ()>)`
+   counted as `pub_result 1` (expected 0) and
+   `pub fn returns(f: fn() -> (), g: fn() -> ()) -> Result<(), ()>` as `0`
+   (expected 1). Both fixtures compile with `rustc`; an arrow is now consumed as
+   one token in both functions.
+9. **An escaped character literal opened a fictitious string.** The scanner only
+   recognized `'x'`, so the double quote in `const QUOTE: char = '\"';` started a
+   string and swallowed the rest of the file: a following
+   `pub fn live() -> Result<(), ()> { unsafe {} Ok(()) }` counted as
+   `unsafe 0, pub_result 0` instead of `1, 1`. Char literals are now matched as
+   `'(\\.|[^\\'])'` together with the `\u{…}` form, which covers `'\"'`,
+   `'\\''` and `'\u{1F600}'`.
+10. **The table quoted the counter's numbers under the source revision alone.**
+    The baseline above said "measured on `ac8f744`" and that a later recount
+    differs only when Rust changes, but the counter itself changed afterwards: the
+    counter at `ac8f744` prints `safety 303, unsafe 561` on the very sources that
+    print `302, 534` here. Both revisions are now recorded, and the earlier
+    `561/303` under `ac8f744` is what finding 4 of the previous round had already
+    removed.

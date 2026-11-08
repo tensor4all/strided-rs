@@ -38,7 +38,9 @@ def count_sources(files: dict[str, str]) -> dict[str, int]:
         src = pathlib.Path(tmp) / "strided-x" / "src"
         src.mkdir(parents=True)
         for name, body in files.items():
-            (src / name).write_text(body, encoding="utf-8")
+            target = src / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
         return mod.count(pathlib.Path(tmp))
 
 
@@ -297,6 +299,71 @@ def test_a_callback_return_type_is_not_the_items_return_type() -> None:
     assert counts["pub_result"] == 0, counts
     counts = count_sources({"fixture.rs": "pub fn returns() -> Result<(), ()> {\n    Ok(())\n}\n"})
     assert counts["pub_result"] == 1, counts
+
+
+def test_two_callback_arrows_do_not_move_the_items_return_type() -> None:
+    """Two callback parameters: the first arrow's `>` must not close the parameter list."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "pub fn returns(f: fn() -> (), g: fn() -> ()) -> Result<(), ()> {\n"
+                "    let _ = (f, g);\n"
+                "    Ok(())\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "pub fn accepts(f: fn() -> (), g: fn() -> Result<(), ()>) {\n"
+                "    let _ = (f, g);\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_differently_named_test_only_module_is_not_production() -> None:
+    """`#[cfg(test)] mod helpers;` puts `helpers.rs` out of the production scope."""
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod helpers;\n",
+            "helpers.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_test_only_module_directory_is_not_production() -> None:
+    """The target may be `NAME/mod.rs`, and a dropped file's own test-only mods follow."""
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod helpers;\n",
+            "helpers/mod.rs": "#[cfg(test)]\nmod deep;\n",
+            "helpers/deep.rs": "pub fn deep() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_an_escaped_char_literal_does_not_open_a_string() -> None:
+    r"""`'\"'`, `'\\''` and `'\u{1F600}'` are char literals, not the start of a string."""
+    for literal in ("'\\\"'", "'\\\\''", "'\\u{1F600}'"):
+        counts = count_sources(
+            {
+                "fixture.rs": (
+                    f"const C: char = {literal};\n"
+                    "pub fn live() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n"
+                )
+            }
+        )
+        assert counts["unsafe"] == 1, (literal, counts)
+        assert counts["pub_result"] == 1, (literal, counts)
 
 
 def main() -> int:
