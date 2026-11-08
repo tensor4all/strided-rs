@@ -52,11 +52,11 @@
 //!
 //! ## Suffix Vocabulary
 //!
-//! Mutation semantics are visible in the name, and no two names may suggest the
-//! same operation: `*_acc` reads `dest[i]` and accumulates into it, `*_into`
-//! overwrites it without reading the previous value, and `*_view` returns
-//! metadata only. Pre-1.0, a rename deletes the old name outright: no alias, no
-//! deprecated wrapper.
+//! Accumulation is `*_acc`, overwrite is `*_into`, and `*_view` returns metadata
+//! only; the table and the names still outside it are in `REPOSITORY_RULES.md`
+//! ("Suffix Vocabulary"). `*_into` never reads the previous `dest[i]`, except
+//! the update family ([`map_update_into`], [`zip_update2_into`],
+//! [`zip_update3_into`]), which updates `dest[i]` in place from its old value.
 //!
 //! ## Basic Operations
 //!
