@@ -4,6 +4,13 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
+## 0.13.1 (unreleased)
+
+`strided-basic`, `strided-fused` and `strided-kernel` go to **0.13.1**: after
+0.13.0 was published from `25b6dad`, #405 and `68562d1` added comments to their
+sources (lint rationales and `unsafe` safety notes), so the published 0.13.0 is
+not this tree. No code changed. `strided-perm` and `strided-nn` stay at 0.13.0.
+
 ## 0.13.0 (2026-11-08)
 
 This is a **minor** release, not a patch, because 0.12.0 already shipped on
