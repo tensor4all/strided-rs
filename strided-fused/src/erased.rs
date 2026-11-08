@@ -28,9 +28,14 @@ impl ErasedFusedPlan {
     ///
     /// # Errors
     ///
-    /// Returns an unsupported dtype, an input arity outside `1..=4`, a
-    /// zero-output plan, a malformed SSA DAG, or an operation the dtype does
-    /// not support.
+    /// Returns [`StridedError::UnsupportedArity`] when `plan.input_count` is
+    /// outside `1..=4`,
+    /// [`StridedError::RankMismatch`] when the plan names no output or an
+    /// instruction is given a different operand count than it consumes,
+    /// [`StridedError::InvalidAxis`] when an instruction input or a named
+    /// output is not a value id defined before it, and
+    /// [`StridedError::UnsupportedOp`] when the dtype cannot evaluate a
+    /// planned operation.
     pub fn compile(dtype: KernelDType, plan: FusedPlan) -> Result<Self> {
         check_fused_dtype(dtype)?;
         if plan.input_count == 0 || plan.input_count > ERASED_FUSED_INPUT_LIMIT {
@@ -60,8 +65,15 @@ impl ErasedFusedPlan {
     ///
     /// # Errors
     ///
-    /// Returns a typed dtype, input-count, shape, destination injectivity, or
-    /// unsupported-operation error before any destination is written.
+    /// Returns [`StridedError::RankMismatch`] when the input count or the
+    /// output count disagrees with the plan or the plan does not name exactly
+    /// one output, [`StridedError::DTypeMismatch`] when a descriptor does not
+    /// carry the plan dtype, [`StridedError::ShapeMismatch`] or
+    /// [`StridedError::RankMismatch`] when a destination or input does not
+    /// have the shape of `dests[0]`, and
+    /// [`StridedError::NonInjectiveOutputLayout`] when a destination layout
+    /// maps two logical elements onto one offset. Nothing is written unless
+    /// every check succeeds.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -81,8 +93,14 @@ impl ErasedFusedPlan {
     ///
     /// # Errors
     ///
-    /// Returns a typed dtype, input-count, destination-count, shape,
-    /// destination injectivity, or unsupported-operation error before any
+    /// Returns [`StridedError::RankMismatch`] when `inputs.len()` or
+    /// `dests.len()` disagrees with the plan,
+    /// [`StridedError::DTypeMismatch`] when a descriptor does not carry the
+    /// plan dtype, [`StridedError::ShapeMismatch`] or
+    /// [`StridedError::RankMismatch`] when a destination or input does not
+    /// have the shape of `dests[0]`, and
+    /// [`StridedError::NonInjectiveOutputLayout`] when a destination layout
+    /// maps two logical elements onto one offset. Every check runs before any
     /// destination is written.
     ///
     /// # Examples
@@ -173,9 +191,18 @@ impl ErasedFusedPlan {
     ///
     /// # Errors
     ///
-    /// Returns a typed dtype, input-count, shape, bounds, destination
-    /// injectivity, unsupported-operation, or input/output-overlap error before
-    /// any destination is written.
+    /// Returns [`StridedError::RankMismatch`] when the input count or the
+    /// output count disagrees with the plan or the plan does not name exactly
+    /// one output, [`StridedError::DTypeMismatch`] when a descriptor does not
+    /// carry the plan dtype, [`StridedError::ShapeMismatch`] or
+    /// [`StridedError::RankMismatch`] when a destination or input does not
+    /// have the shape of `dests[0]`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when a destination layout
+    /// maps two logical elements onto one offset,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps a destination, and [`StridedError::InvalidBoolByte`] when a
+    /// `bool` input holds a byte other than 0 or 1. Every rejection is
+    /// returned before any destination is written.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -198,9 +225,18 @@ impl ErasedFusedPlan {
     ///
     /// # Errors
     ///
-    /// Returns a typed dtype, input-count, destination-count, shape, bounds,
-    /// destination injectivity, unsupported-operation, or input/output-overlap
-    /// error. All error-producing validation completes before execution starts.
+    /// Returns [`StridedError::RankMismatch`] when `inputs.len()` or
+    /// `dests.len()` disagrees with the plan,
+    /// [`StridedError::DTypeMismatch`] when a descriptor does not carry the
+    /// plan dtype, [`StridedError::ShapeMismatch`] or
+    /// [`StridedError::RankMismatch`] when a destination or input does not
+    /// have the shape of `dests[0]`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when a destination layout
+    /// maps two logical elements onto one offset,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps a destination, and [`StridedError::InvalidBoolByte`] when a
+    /// `bool` input holds a byte other than 0 or 1. All error-producing
+    /// validation completes before execution starts.
     ///
     /// # Examples
     ///

@@ -469,6 +469,16 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// need to outlive the view and no heap allocation happens at rank
     /// `<= INLINE_RANK`. The view's lifetime is tied to `data` only.
     ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
+    ///
     /// # Examples
     ///
     /// ```
@@ -563,6 +573,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     }
 
     /// Permute dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `perm` does not have one
+    /// entry per axis, and [`StridedError::InvalidAxis`] when an entry
+    /// names an axis outside the rank or repeats an axis.
     pub fn permute(&self, perm: &[usize]) -> Result<StridedView<'a, T, Op>> {
         let rank = self.dims().len();
         if perm.len() != rank {
@@ -671,6 +687,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Broadcast this view to a target shape.
     ///
     /// Size-1 dimensions are expanded (stride set to 0) to match target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `target_dims` does not
+    /// have one entry per axis, and [`StridedError::ShapeMismatch`] when an
+    /// axis is neither already the target extent nor of size one.
     pub fn broadcast(&self, target_dims: &[usize]) -> Result<StridedView<'a, T, Op>> {
         if self.dims().len() != target_dims.len() {
             return Err(StridedError::RankMismatch(
@@ -700,6 +722,10 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     /// Transpose a 2D view: reverses dimensions and composes the Transpose element op.
     ///
     /// Julia equivalent: `Base.transpose(a::AbstractStridedView{<:Any, 2})`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when the view is not 2-D.
     pub fn transpose_2d(&self) -> Result<StridedView<'a, T, Op::ComposeTranspose>> {
         if self.dims().len() != 2 {
             return Err(StridedError::RankMismatch(self.dims().len(), 2));
@@ -715,6 +741,10 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     /// Adjoint (conjugate transpose) of a 2D view.
     ///
     /// Julia equivalent: `Base.adjoint(a::AbstractStridedView{<:Any, 2})`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when the view is not 2-D.
     pub fn adjoint_2d(&self) -> Result<StridedView<'a, T, Op::ComposeAdjoint>> {
         if self.dims().len() != 2 {
             return Err(StridedError::RankMismatch(self.dims().len(), 2));
@@ -839,6 +869,16 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// The layout is copied, so it does not need to outlive the view and no
     /// heap allocation happens at rank `<= INLINE_RANK`.
     ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
+    ///
     /// # Examples
     ///
     /// ```
@@ -959,6 +999,12 @@ impl<'a, T> StridedViewMut<'a, T> {
     ///
     /// Returns a new mutable view with reordered dimensions and strides.
     /// Takes `self` by value to prevent aliasing of mutable views.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `perm` does not have one
+    /// entry per axis, and [`StridedError::InvalidAxis`] when an entry
+    /// names an axis outside the rank or repeats an axis.
     pub fn permute(self, perm: &[usize]) -> Result<StridedViewMut<'a, T>> {
         let rank = self.dims().len();
         if perm.len() != rank {
@@ -1249,6 +1295,16 @@ impl<T: Clone + Default> StridedArray<T> {
 
 impl<T> StridedArray<T> {
     /// Create from raw parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn from_parts(
         data: Vec<T>,
         dims: &[usize],
@@ -1351,6 +1407,12 @@ impl<T> StridedArray<T> {
     ///
     /// Returns a new array with reordered dims and strides.
     /// The underlying data buffer is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `perm` does not have one
+    /// entry per axis, and [`StridedError::InvalidAxis`] when an entry
+    /// names an axis outside the rank or repeats an axis.
     pub fn permuted(self, perm: &[usize]) -> Result<Self> {
         let rank = self.dims().len();
         if perm.len() != rank {

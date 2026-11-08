@@ -88,7 +88,7 @@ A view's metadata is `Cow<'a, [usize]>` / `Cow<'a, [isize]>`:
 - `StridedView::clone()` now copies a borrowed metadata reference instead of
   bumping a refcount, and copies the `Vec` for an owned view. `conj()` behaves
   the same way: free for borrowed metadata, two small allocations for computed
-  metadata (reachable from `strided-basic/src/ops_view.rs` `copy_conj` when its
+  metadata (reachable from `strided-basic/src/ops_view.rs` `copy_conj_into` when its
   source is a permuted or broadcast view).
 - The layout a view borrows must outlive the view. Callers that keep shapes and
   strides next to their data (the normal case, and what `RawStridedRef` callers

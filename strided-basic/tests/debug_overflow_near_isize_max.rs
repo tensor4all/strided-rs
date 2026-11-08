@@ -100,8 +100,8 @@ fn typed_ops_on_near_max_layouts_do_not_overflow() {
         copy_into_col_major(&mut dst, &src()).unwrap();
         map_into(&mut dst, &src(), |x| x, Exec::serial()).unwrap();
         zip_map2_into(&mut dst, &src(), &src(), |x, y| x + y, Exec::serial()).unwrap();
-        add(&mut dst, &src(), Exec::serial()).unwrap();
-        axpy(&mut dst, &src(), Z, Exec::serial()).unwrap();
+        add_acc(&mut dst, &src(), Exec::serial()).unwrap();
+        axpy_acc(&mut dst, &src(), Z, Exec::serial()).unwrap();
         let count = reduce(&src(), |_| 1u64, |a, b| a + b, 0u64, Exec::serial()).unwrap();
         assert_eq!(count, element_count(&c.dims));
         reduce_axis(&src(), 0, |_| 1u64, |a, b| a + b, 0u64, Exec::serial()).unwrap();

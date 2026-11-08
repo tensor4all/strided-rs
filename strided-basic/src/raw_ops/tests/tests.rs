@@ -1,5 +1,5 @@
 use super::*;
-use crate::ops_view::copy_scale;
+use crate::ops_view::copy_scale_into;
 use crate::{Exec, StridedView, StridedViewMut};
 
 fn reference_copy_scale(
@@ -12,7 +12,7 @@ fn reference_copy_scale(
 ) {
     let mut dest_view = StridedViewMut::new(dst, dims, dst_strides, 0).unwrap();
     let src_view: StridedView<'_, f64> = StridedView::new(src, dims, src_strides, 0).unwrap();
-    copy_scale(&mut dest_view, &src_view, scale, Exec::serial()).unwrap();
+    copy_scale_into(&mut dest_view, &src_view, scale, Exec::serial()).unwrap();
 }
 
 #[test]
@@ -21,10 +21,12 @@ fn raw_copy_scale_matches_view_kernel() {
     let src_strides = [1isize, 2, 6];
     let dst_strides = [6isize, 2, 1];
     let src: Vec<f64> = (0..12).map(|value| value as f64 - 3.0).collect();
-    let mut expected = vec![0.0; 12];
+    // Different nonzero initial values on each side, so either implementation
+    // accumulating into `dest` instead of overwriting makes the two differ.
+    let mut expected = vec![3.0; 12];
     reference_copy_scale(&mut expected, &src, &dims, &dst_strides, &src_strides, 1.5);
 
-    let mut actual = vec![0.0; 12];
+    let mut actual = vec![-5.0; 12];
     let mut dest = RawStridedMut::new(&mut actual, &dims, &dst_strides, 0).unwrap();
     let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
     copy_scale_raw(&mut dest, &source, 1.5).unwrap();

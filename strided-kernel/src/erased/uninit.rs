@@ -52,8 +52,17 @@ use strided_basic::execution::{
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
-/// or unsupported dtype/op contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `input` or `dest` does not
+/// carry the dtype that `input_dtype` and `op` imply,
+/// [`StridedError::UnsupportedOp`] for a `bool` input with any op other than
+/// [`ErasedMapOp::Conj`], [`StridedError::OverlappingInputOutput`] when the
+/// input allocation overlaps the destination,
+/// [`StridedError::InvalidBoolByte`] when a `bool` input holds a byte other
+/// than 0 or 1, [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven to place logical elements on distinct
+/// offsets, and [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from the
+/// input dims. Validation completes before any write.
 pub fn erased_map_into_uninit(
     input_dtype: KernelDType,
     op: ErasedMapOp,
@@ -124,9 +133,19 @@ pub fn erased_map_into_uninit(
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
-/// unsupported dtype/op contracts, or an integer zero divisor. Validation
-/// completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `dest`, `lhs`, or `rhs` does
+/// not carry `dtype`, [`StridedError::UnsupportedOp`] for `bool` operands or
+/// for a complex remainder/maximum/minimum,
+/// [`StridedError::OverlappingInputOutput`] when either input allocation
+/// overlaps the destination, [`StridedError::InvalidBoolByte`] when an input
+/// holds a `bool` byte other than 0 or 1,
+/// [`StridedError::IntegerDivisionByZero`] when an integer divide or
+/// remainder finds a zero divisor,
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven to place logical elements on distinct offsets, and
+/// [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`] when the
+/// destination dims differ from either input's dims. Validation completes
+/// before any write.
 pub fn erased_zip_into_uninit(
     dtype: KernelDType,
     op: ErasedZipOp,
@@ -197,8 +216,17 @@ pub fn erased_zip_into_uninit(
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, overlap,
-/// or unsupported dtype/op contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `dest` is not `bool` or when
+/// `lhs` or `rhs` does not carry `dtype`,
+/// [`StridedError::UnsupportedOp`] for an ordered comparison of complex
+/// operands, [`StridedError::OverlappingInputOutput`] when either input
+/// allocation overlaps the destination,
+/// [`StridedError::InvalidBoolByte`] when an input holds a `bool` byte other
+/// than 0 or 1, [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven to place logical elements on distinct
+/// offsets, and [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from
+/// either input's dims. Validation completes before any write.
 pub fn erased_compare_into_uninit(
     dtype: KernelDType,
     op: CompareOp,
@@ -269,8 +297,16 @@ pub fn erased_compare_into_uninit(
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, or
-/// overlap contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `pred` is not `bool` or when
+/// `dest`, `on_true`, or `on_false` does not carry `dtype`,
+/// [`StridedError::OverlappingInputOutput`] when any input allocation
+/// overlaps the destination, [`StridedError::InvalidBoolByte`] when `pred` or
+/// a `bool` operand holds a byte other than 0 or 1,
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven to place logical elements on distinct offsets, and
+/// [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`] when the
+/// destination dims differ from an input's dims. Validation completes before
+/// any write.
 pub fn erased_select_into_uninit(
     dtype: KernelDType,
     dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -348,8 +384,17 @@ pub fn erased_select_into_uninit(
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, shape, output-layout, or
-/// overlap contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `dest`, `x`, `lo`, or `hi`
+/// does not carry `dtype`, [`StridedError::OverlappingInputOutput`] when any
+/// input allocation overlaps the destination,
+/// [`StridedError::InvalidBoolByte`] when an input holds a `bool` byte other
+/// than 0 or 1, [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven to place logical elements on distinct
+/// offsets, [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from an
+/// input's dims, and
+/// [`StridedError::UnsupportedDType`] for a dtype other than `f32`, `f64`,
+/// `i32`, or `i64`. Validation completes before any write.
 pub fn erased_clamp_into_uninit(
     dtype: KernelDType,
     dest: &mut ErasedRawStridedUninitMut<'_>,
@@ -425,8 +470,19 @@ pub fn erased_clamp_into_uninit(
 ///
 /// # Errors
 ///
-/// Returns a typed [`StridedError`] for dtype, axis mapping, shape,
-/// output-layout, or overlap contracts. Validation completes before any write.
+/// Returns [`StridedError::DTypeMismatch`] when `dest`, `lhs`, or `rhs` does
+/// not carry `dtype`, [`StridedError::OverlappingInputOutput`] when either
+/// input allocation overlaps the destination,
+/// [`StridedError::InvalidBoolByte`] when an input holds a `bool` byte other
+/// than 0 or 1, [`StridedError::RankMismatch`] when `lhs_axes` or `rhs_axes`
+/// is not one axis per input dim, [`StridedError::InvalidAxis`] for a mapped
+/// axis that is out of range or named twice,
+/// [`StridedError::ShapeMismatch`] when a mapped input extent is neither the
+/// destination extent nor one,
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven to place logical elements on distinct offsets, and
+/// [`StridedError::UnsupportedDType`] for `bool`. Validation completes before
+/// any write.
 pub fn erased_broadcast_mul_into_uninit(
     dtype: KernelDType,
     dest: &mut ErasedRawStridedUninitMut<'_>,

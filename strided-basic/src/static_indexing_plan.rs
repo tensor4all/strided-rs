@@ -138,6 +138,21 @@ pub struct ConcatenatePlan {
 
 impl SlicePlan {
     /// Compile a static slice plan for one operand layout and destination layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination layout lengths differ from the operand rank, and
+    /// [`StridedError::RankMismatch`] when `starts`, `limits` or
+    /// `slice_strides` differ from it. Returns
+    /// [`StridedError::InvalidAxis`] for a window with `start > limit`, a
+    /// `limit` beyond the extent, or a zero slice stride, and
+    /// [`StridedError::ShapeMismatch`] when the destination dims are not the
+    /// sliced extents. Returns [`StridedError::NonInjectiveOutputLayout`]
+    /// when two destination elements map onto one offset or the layout span is
+    /// not representable, and
+    /// [`StridedError::OffsetOverflow`] when an element count, a scaled
+    /// source stride, or the source offset delta overflows.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -200,6 +215,13 @@ impl SlicePlan {
     }
 
     /// Execute the prepared static slice traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled operand and destination layouts, and
+    /// [`StridedError::OffsetOverflow`] when the operand offset plus the
+    /// compiled source offset delta overflows.
     pub fn execute<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -226,6 +248,13 @@ impl SlicePlan {
     }
 
     /// Execute into storage whose reachable destination elements are uninitialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled operand and destination layouts, and
+    /// [`StridedError::OffsetOverflow`] when the operand offset plus the
+    /// compiled source offset delta overflows.
     pub fn execute_uninit<T>(
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
@@ -269,6 +298,21 @@ impl SlicePlan {
 
 impl PadPlan {
     /// Compile a pad plan for one operand layout and destination layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination layout lengths differ from the operand rank, and
+    /// [`StridedError::RankMismatch`] when the edge or interior padding
+    /// lengths differ from it. Returns [`StridedError::InvalidAxis`] for a
+    /// negative interior padding or a padded extent that does not fit
+    /// `usize`, [`StridedError::ShapeMismatch`] when the destination dims are
+    /// not the padded extents, and
+    /// [`StridedError::NonInjectiveOutputLayout`] when two destination
+    /// elements map onto one offset, or the layout span is not representable.
+    /// Returns
+    /// [`StridedError::OffsetOverflow`] when an element count, a padded
+    /// extent or a cursor stride computation overflows.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         operand_dims: &[usize],
@@ -373,6 +417,13 @@ impl PadPlan {
     }
 
     /// Execute the prepared pad traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled operand and destination layouts, and
+    /// [`StridedError::OffsetOverflow`] when the destination base offset or
+    /// its contiguous fill span cannot be expressed in `usize`.
     pub fn execute<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -399,6 +450,13 @@ impl PadPlan {
     }
 
     /// Execute pad into storage whose reachable destination elements are uninitialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled operand and destination layouts, and
+    /// [`StridedError::OffsetOverflow`] when the destination base offset or
+    /// its contiguous fill span cannot be expressed in `usize`.
     pub fn execute_uninit<T>(
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
@@ -1219,6 +1277,22 @@ impl PadPlan {
 
 impl ConcatenatePlan {
     /// Compile a multi-input concatenate plan for fixed input and destination layouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedArity`] when no input is given, and
+    /// [`StridedError::RankMismatch`] when the dims and strides lists
+    /// disagree in length or an input's rank differs from the first
+    /// input's. Returns [`StridedError::StrideLengthMismatch`] when the
+    /// destination or an input stride list does not match the rank,
+    /// [`StridedError::InvalidAxis`] when `axis` is out of range, and
+    /// [`StridedError::ShapeMismatch`] when an input disagrees with the first
+    /// input off `axis` or the destination dims are not the concatenated
+    /// extents. Returns [`StridedError::NonInjectiveOutputLayout`] when two
+    /// destination elements map onto one offset or the layout span is not
+    /// representable, and
+    /// [`StridedError::OffsetOverflow`] when a segment total, a segment start
+    /// or a destination offset overflows.
     pub fn compile(
         input_dims: &[&[usize]],
         input_strides: &[&[isize]],
@@ -1313,6 +1387,14 @@ impl ConcatenatePlan {
     }
 
     /// Execute the prepared concatenate traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the destination or
+    /// an input view does not carry its compiled layout,
+    /// [`StridedError::RankMismatch`] when the number of inputs differs from
+    /// the compiled input count, and [`StridedError::OffsetOverflow`] when a
+    /// segment destination offset overflows.
     pub fn execute<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1349,6 +1431,14 @@ impl ConcatenatePlan {
     }
 
     /// Execute concatenate into storage whose reachable destination elements are uninitialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the destination or
+    /// an input view does not carry its compiled layout,
+    /// [`StridedError::RankMismatch`] when the number of inputs differs from
+    /// the compiled input count, and [`StridedError::OffsetOverflow`] when a
+    /// segment destination offset overflows.
     pub fn execute_uninit<T>(
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
@@ -1558,6 +1648,17 @@ impl ConcatenatePlan {
 
 impl ReversePlan {
     /// Compile a reverse plan for one operand layout, destination layout, and axis set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination stride list does not match the operand rank,
+    /// [`StridedError::InvalidAxis`] when a listed axis is out of range, and
+    /// [`StridedError::NonInjectiveOutputLayout`] when two destination
+    /// elements map onto one offset, or the layout span is not representable.
+    /// Returns
+    /// [`StridedError::OffsetOverflow`] when an element count, a negated
+    /// source stride or the source offset delta overflows.
     pub fn compile(
         operand_dims: &[usize],
         operand_strides: &[isize],
@@ -1611,6 +1712,13 @@ impl ReversePlan {
     }
 
     /// Execute the prepared reverse traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled operand and destination layouts, and
+    /// [`StridedError::OffsetOverflow`] when the operand offset plus the
+    /// compiled source offset delta overflows.
     pub fn execute<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1637,6 +1745,13 @@ impl ReversePlan {
     }
 
     /// Execute reverse into storage whose reachable destination elements are uninitialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled operand and destination layouts, and
+    /// [`StridedError::OffsetOverflow`] when the operand offset plus the
+    /// compiled source offset delta overflows.
     pub fn execute_uninit<T>(
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,

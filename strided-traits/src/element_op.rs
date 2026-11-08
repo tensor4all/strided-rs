@@ -30,8 +30,18 @@ use num_traits::Num;
 ///
 /// Default implementations return `self` unchanged, so real-valued types
 /// (and custom types that don't need complex operations) can simply write:
-/// ```ignore
+///
+/// ```
+/// use strided_traits::ElementOpApply;
+///
+/// #[derive(Clone, Copy, Debug, PartialEq)]
+/// struct MyType(f64);
+///
 /// impl ElementOpApply for MyType {}
+///
+/// // The provided methods leave the element unchanged.
+/// assert_eq!(MyType(2.0).conj(), MyType(2.0));
+/// assert_eq!(MyType(2.0).adjoint(), MyType(2.0));
 /// ```
 pub trait ElementOpApply: Copy {
     #[inline(always)]
