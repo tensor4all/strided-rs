@@ -9,11 +9,14 @@ Nothing touches the network. Requires `git` and `cargo`.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import importlib.util
 import io
+import json
 import pathlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -39,6 +42,24 @@ description = "fixture"
 
 def sh(cwd: pathlib.Path, *cmd: str) -> str:
     return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def repack(blob: bytes, replace: dict[str, bytes | None]) -> bytes:
+    """`blob` as a .crate again, with the named members' bytes replaced (or
+    dropped, when the replacement is None)."""
+    src = tarfile.open(fileobj=io.BytesIO(gzip.decompress(blob)), mode="r:")
+    buf = io.BytesIO()
+    with src, tarfile.open(fileobj=buf, mode="w") as dst:
+        for m in src.getmembers():
+            if not m.isfile():
+                continue
+            data = replace[m.name] if m.name in replace else src.extractfile(m).read()
+            if data is None:
+                continue
+            info = tarfile.TarInfo(m.name)
+            info.size, info.mtime = len(data), m.mtime
+            dst.addfile(info, io.BytesIO(data))
+    return gzip.compress(buf.getvalue())
 
 
 class Fixture:
@@ -257,6 +278,104 @@ class PublishedIdentityTest(unittest.TestCase):
         rc, out = self.fx.run("HEAD", lambda n, v: blob[:-8])
         self.assertEqual(rc, 2, out)
 
+    def test_damaged_member_header_is_not_green(self) -> None:
+        # #415: tarfile stops silently at a header whose checksum is wrong, so a
+        # damaged archive reads as a SHORTER member list. Here the last member's
+        # header is damaged and that file is gone from the tree, so the short
+        # parse "matches" and the checker used to report ok without looking.
+        self.fx.write("zz.txt", "zz\n")
+        self.fx.commit("add zz.txt")
+        raw = bytearray(gzip.decompress(self.fx.package()))
+        with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+            offset = tf.getmember("demo-0.1.0/zz.txt").offset
+        raw[offset] ^= 1  # the header checksum no longer matches
+        damaged = gzip.compress(bytes(raw))
+        (self.fx.root / "demo" / "zz.txt").unlink()
+        self.fx.commit("delete zz.txt, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: damaged)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("archive is not complete", out)
+
+    def test_archive_cut_at_a_member_boundary_is_not_green(self) -> None:
+        # #415: the same short parse can happen with no damaged header at all.
+        # Cutting the stream exactly where the last member's data ends leaves
+        # tarfile a clean end-of-file and an empty tail, so only the missing
+        # end-of-archive blocks give it away.
+        self.fx.write("zz.txt", "zz\n")
+        self.fx.commit("add zz.txt")
+        raw = gzip.decompress(self.fx.package())
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
+            last = tf.getmembers()[-1]
+        cut = last.offset + 512 + -(-last.size // 512) * 512  # end of its data
+        rc, out = self.fx.run("HEAD", lambda n, v: gzip.compress(raw[:cut]))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("archive is not complete", out)
+
+    VCS = "demo-0.1.0/.cargo_vcs_info.json"
+
+    def _repacked(self, vcs: dict | None) -> bytes:
+        """The published blob with its .cargo_vcs_info.json replaced (None: dropped)."""
+        body = None if vcs is None else json.dumps(vcs).encode()
+        return repack(self.fx.package(), {self.VCS: body})
+
+    def test_published_from_a_dirty_worktree_is_red(self) -> None:
+        # #415: cargo records the worktree state it packaged. dirty=true means
+        # the version names no committed content at all.
+        sha = sh(self.fx.root, "git", "rev-parse", "HEAD").strip()
+        blob = self._repacked({"git": {"sha1": sha, "dirty": True}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("dirty", out)
+
+    def test_published_from_a_commit_outside_the_history_is_red(self) -> None:
+        # #415: a commit that exists but is not an ancestor of the ref we check
+        # (a side branch, a rewritten history) is not what this version claims.
+        dangling = sh(self.fx.root, "git", "commit-tree", "HEAD^{tree}", "-m", "elsewhere").strip()
+        blob = self._repacked({"git": {"sha1": dangling}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not an ancestor", out)
+
+    def test_unknown_recorded_commit_is_not_green(self) -> None:
+        # #415: a clone without that commit cannot tell which commit published
+        # an archive. That is "could not check", never "no differences".
+        blob = self._repacked({"git": {"sha1": "0" * 40}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not in this repository", out)
+
+    def test_recorded_sha_must_be_a_sha(self) -> None:
+        # #415: a 40-character revision expression is not a commit id; `HEAD~34`
+        # can resolve here, so length alone is no validation.
+        blob = self._repacked({"git": {"sha1": "HEAD" + "~" * 36}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no usable commit", out)
+
+    def test_shallow_clone_is_reported_as_not_checked(self) -> None:
+        # #415: with the parent links cut, "not an ancestor" is not an answer
+        # either, so a shallow clone says so instead of blaming the archive.
+        blob = self.fx.package()
+        clone = pathlib.Path(self._tmp.name) / "shallow"
+        self.fx.write("b.txt", "b\n")
+        self.fx.commit("second commit")
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{self.fx.root}", str(clone)], check=True)
+        out = io.StringIO()
+        with mock.patch.object(pi, "published", lambda n, v: blob), \
+                mock.patch("sys.argv", ["published_identity.py", str(clone), "--ref", "HEAD"]), \
+                contextlib.redirect_stdout(out):
+            rc = pi.main()
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("shallow clone", out.getvalue())
+
+    def test_archive_without_vcs_info_is_not_green(self) -> None:
+        # #415: no recorded commit means no provenance evidence; report that
+        # rather than comparing files and calling it ok.
+        rc, out = self.fx.run("HEAD", lambda n, v: self._repacked(None))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no .cargo_vcs_info.json", out)
+
     def test_default_feature_flip_under_same_version_is_red(self) -> None:
         # GPT review on #411 (round 5): a manifest-only change that flips
         # `value()` from 0 to 1 must be a MISMATCH (seen via Cargo.toml.orig).
@@ -467,6 +586,13 @@ class MutationTest(unittest.TestCase):
             '        return 404, b""',
             ["PublishedIdentityTest.test_api_503_through_urlopen_is_not_green",
              "PublishedIdentityTest.test_injected_opener_503_from_published_is_a_check_error"],
+        ),
+        # The completeness check reduced to "nothing follows the last member",
+        # which a stream cut at a member boundary also satisfies (#415).
+        "tail_only_completeness": (
+            "    if len(raw) - end < 1024 or any(raw[end:]):",
+            "    if any(raw[end:]):",
+            ["PublishedIdentityTest.test_archive_cut_at_a_member_boundary_is_not_green"],
         ),
     }
 

@@ -27,11 +27,22 @@ Caveats, stated rather than hidden:
     checked-out commit, so every packaging rule is Cargo's own. Packaging
     resolves dependencies on crates.io; a published crate whose tree needs an
     unpublished dependency version cannot be packaged and exits 2.
-  * Cargo.toml, Cargo.lock and .cargo_vcs_info.json are excluded: Cargo
-    generates or rewrites them at package time. Cargo.toml.orig, the crate's
-    manifest exactly as written, IS compared, so a same-version change to
-    features, dependencies or build settings in the crate's own manifest is a
-    MISMATCH.
+  * Cargo.toml, Cargo.lock and .cargo_vcs_info.json are excluded from the
+    byte comparison: Cargo generates or rewrites them at package time.
+    Cargo.toml.orig, the crate's manifest exactly as written, IS compared, so a
+    same-version change to features, dependencies or build settings in the
+    crate's own manifest is a MISMATCH.
+  * .cargo_vcs_info.json is not compared, but it IS read: it names the commit
+    the archive was built from. A version published from a dirty worktree, or
+    from a commit that is not an ancestor of the checked ref, is a MISMATCH;
+    an archive that carries no such record, or names a commit this clone does
+    not have, is exit 2 (nothing was verified).
+  * Both archives must parse completely, down to the end-of-archive zero
+    blocks. tarfile silently ends the member list at a damaged header after the
+    first block, so a damaged .crate reads as a SHORTER one and a shipped file
+    that is gone from the tree compares as absent on both sides (#415). A
+    stream cut off exactly at a member boundary reads as shorter without any
+    error at all. Either way the run is exit 2.
   * Manifest comparison covers Cargo.toml.orig only; workspace-level
     inheritance is out of scope. A field written as `{ workspace = true }` (or
     `x.workspace = true`) reads the same in Cargo.toml.orig whatever the
@@ -53,6 +64,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -66,7 +78,9 @@ UA = "tensor4all-published-identity/1.0 (maintainer check)"
 # built from the tree with `cargo package`), so the file set is Cargo's. Only
 # the files Cargo generates or rewrites at package time are left out.
 # Cargo.toml.orig is NOT in this set: it is the author's manifest verbatim.
-SKIP_ALWAYS = {".cargo_vcs_info.json", "Cargo.lock", "Cargo.toml"}
+# VCS_INFO is read for provenance instead of being compared (see provenance()).
+VCS_INFO = ".cargo_vcs_info.json"
+SKIP_ALWAYS = {VCS_INFO, "Cargo.lock", "Cargo.toml"}
 
 
 class CheckError(Exception):
@@ -144,26 +158,85 @@ def published(name: str, ver: str, opener=None) -> bytes | None:
     return blob
 
 
-def crate_files(blob: bytes) -> dict[str, str]:
-    """path-inside-crate -> sha256 for the files worth comparing."""
+def crate_archive(blob: bytes) -> tuple[dict[str, str], dict | None]:
+    """(path-inside-crate -> sha256 for the files worth comparing, the archive's
+    .cargo_vcs_info.json or None)."""
     # Decompress the whole stream first: tarfile over a gzip stream stops at
     # the tar end marker and never checks the gzip trailer, so a truncated or
     # CRC-damaged download would otherwise read as valid. gzip.decompress
     # raises (BadGzipFile / EOFError), which main() turns into exit 2.
     raw = gzip.decompress(blob)
     out: dict[str, str] = {}
+    vcs: dict | None = None
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
-        for m in tf.getmembers():
+        try:
+            entries = list(tf)  # a damaged header can raise ReadError here
+        except tarfile.TarError as e:
+            raise CheckError(f"archive is not readable: {e}") from e
+        # ...and tarfile ENDS the list silently at other damaged headers (an
+        # invalid checksum after the first block), which would let a file that
+        # shipped and is now gone compare as absent on both sides (#415). A
+        # complete read is proved only by the end-of-archive marker.
+        end = tf.offset
+        for m in entries:
             if not m.isfile():
                 continue
             rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
-            if rel in SKIP_ALWAYS:
-                continue
             f = tf.extractfile(m)
             if f is None:
                 continue
-            out[rel] = hashlib.sha256(f.read()).hexdigest()
-    return out
+            body = f.read()
+            if rel == VCS_INFO:
+                vcs = json.loads(body)
+            elif rel not in SKIP_ALWAYS:
+                out[rel] = hashlib.sha256(body).hexdigest()
+    # Two zero blocks are what a complete tar ends with. A stream cut off
+    # exactly at a member boundary also parses without an error and leaves an
+    # empty tail, so "nothing follows" is not completeness either.
+    if len(raw) - end < 1024 or any(raw[end:]):
+        raise CheckError(
+            f"archive is not complete: {end} of {len(raw)} bytes parsed, and"
+            f" the {len(raw) - end} bytes after them are not the two"
+            " end-of-archive zero blocks a complete tar ends with")
+    return out, vcs
+
+
+def provenance(repo: str, ref: str, crate: dict, vcs: dict | None) -> list[str]:
+    """What commit the published archive says it was built from.
+
+    A second signal next to the file hashes, and a stronger one: it does not
+    go through `cargo package`. A version published from a dirty worktree, or
+    from a commit outside this history, does not identify our content; an
+    archive that records no commit, or names one this clone does not have,
+    cannot be checked and says so instead of comparing files and going green.
+    """
+    label = f"{crate['name']} {crate['version']}"
+    if vcs is None:
+        raise CheckError("the published archive has no .cargo_vcs_info.json, "
+                         "so it records no commit to check")
+    git = vcs.get("git") or {}
+    if git.get("dirty"):
+        return [f"{label}: published from a dirty worktree"
+                " (.cargo_vcs_info.json says dirty=true)"]
+    sha = git.get("sha1")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        raise CheckError(f"the published archive names no usable commit: {sha!r}")
+    rc, out, _ = run(["git", "rev-parse", "--is-shallow-repository"], cwd=repo)
+    if rc == 0 and out.strip() == "true":
+        raise CheckError(f"this is a shallow clone, so commit {sha} cannot be placed"
+                         " in history (check out the full history)")
+    rc, _, err = run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo)
+    if rc != 0:
+        raise CheckError(f"commit {sha} recorded in the published archive is not in"
+                         f" this repository: {err.strip()[:200]}")
+    rc, _, _ = run(["git", "merge-base", "--is-ancestor", sha, ref], cwd=repo)
+    if rc > 1:  # 0 = ancestor, 1 = not an ancestor, anything else is a git error
+        raise CheckError(f"could not place commit {sha} in history"
+                         f" (git merge-base --is-ancestor exited {rc})")
+    if rc == 1:
+        return [f"{label}: published from {sha[:10]}, which is not an ancestor"
+                f" of {ref[:10]}"]
+    return []
 
 
 def package_tree(repo: str, crate: dict, target_dir: str) -> bytes:
@@ -202,8 +275,8 @@ def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str,
     # Both sides are complete archives; only the generated files in
     # SKIP_ALWAYS are left out. A file that shipped but is gone from the tree
     # (a deleted build.rs, say) shows as "only in published .crate".
-    pub = crate_files(blob)
-    tree = crate_files(package_tree(repo, crate, target_dir))
+    pub, vcs = crate_archive(blob)
+    tree, _ = crate_archive(package_tree(repo, crate, target_dir))
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
         if rel not in pub:
@@ -212,6 +285,7 @@ def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str,
             diffs.append(f"only in published .crate: {rel}")
         elif pub[rel] != tree[rel]:
             diffs.append(f"differs: {rel}")
+    diffs += provenance(repo, ref, crate, vcs)
     if diffs:
         return "MISMATCH", [f"{name} {ver}"] + [f"    {d}" for d in diffs[:20]] + (
             [f"    ... and {len(diffs) - 20} more"] if len(diffs) > 20 else [])

@@ -71,7 +71,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # 公開アーカイブが記録する commit がこの ref の祖先かを git に聞くので、
+      # checkout の既定（fetch-depth: 1）では「検証不能」になる。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Compare each published .crate with this tree
         run: python3 scripts/published_identity.py . --ref "$GITHUB_SHA"
