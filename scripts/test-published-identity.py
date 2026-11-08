@@ -9,11 +9,15 @@ Nothing touches the network. Requires `git` and `cargo`.
 from __future__ import annotations
 
 import contextlib
+import gzip
+import hashlib
 import importlib.util
 import io
+import json
 import pathlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -39,6 +43,28 @@ description = "fixture"
 
 def sh(cwd: pathlib.Path, *cmd: str) -> str:
     return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def repack(blob: bytes, replace: dict[str, bytes | None]) -> bytes:
+    """`blob` as a .crate again, with the named members' bytes replaced (or
+    dropped, when the replacement is None)."""
+    src = tarfile.open(fileobj=io.BytesIO(gzip.decompress(blob)), mode="r:")
+    buf = io.BytesIO()
+    with src, tarfile.open(fileobj=buf, mode="w") as dst:
+        for m in src.getmembers():
+            if not m.isfile():
+                continue
+            data = replace[m.name] if m.name in replace else src.extractfile(m).read()
+            if data is None:
+                continue
+            info = tarfile.TarInfo(m.name)
+            info.size, info.mtime = len(data), m.mtime
+            dst.addfile(info, io.BytesIO(data))
+    body = buf.getvalue()
+    # tarfile pads to a 10240-byte record; Cargo stops after the two
+    # end-of-archive zero blocks, and the checker pins that.
+    end = -(-len(body.rstrip(b"\0")) // 512) * 512
+    return gzip.compress(body[:end + 1024])
 
 
 class Fixture:
@@ -257,6 +283,314 @@ class PublishedIdentityTest(unittest.TestCase):
         rc, out = self.fx.run("HEAD", lambda n, v: blob[:-8])
         self.assertEqual(rc, 2, out)
 
+    def test_damaged_member_header_is_not_green(self) -> None:
+        # #415: tarfile stops silently at a header whose checksum is wrong, so a
+        # damaged archive reads as a SHORTER member list. Here the last member's
+        # header is damaged and that file is gone from the tree, so the short
+        # parse "matches" and the checker used to report ok without looking.
+        self.fx.write("zz.txt", "zz\n")
+        self.fx.commit("add zz.txt")
+        raw = bytearray(gzip.decompress(self.fx.package()))
+        with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+            offset = tf.getmember("demo-0.1.0/zz.txt").offset
+        raw[offset] ^= 1  # the header checksum no longer matches
+        damaged = gzip.compress(bytes(raw))
+        (self.fx.root / "demo" / "zz.txt").unlink()
+        self.fx.commit("delete zz.txt, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: damaged)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("archive is not complete", out)
+
+    def test_archive_cut_at_a_member_boundary_is_not_green(self) -> None:
+        # #415: the same short parse can happen with no damaged header at all.
+        # Cutting the stream exactly where the last member's data ends leaves
+        # tarfile a clean end-of-file and an empty tail, so only the missing
+        # end-of-archive blocks give it away.
+        self.fx.write("zz.txt", "zz\n")
+        self.fx.commit("add zz.txt")
+        raw = gzip.decompress(self.fx.package())
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
+            last = tf.getmembers()[-1]
+        cut = last.offset + 512 + -(-last.size // 512) * 512  # end of its data
+        rc, out = self.fx.run("HEAD", lambda n, v: gzip.compress(raw[:cut]))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("archive is not complete", out)
+
+    def test_zeroed_member_header_is_not_green(self) -> None:
+        # GPT review on #416 (critical): zero the final member's 512-byte
+        # header, so tarfile takes it for the end-of-archive marker. The zero
+        # payload and padding behind it pass the tail check, and the publication
+        # commit is still an ancestor, so this used to report ok (exit 0) for a
+        # file that is gone from the tree. Only the checksum crates.io
+        # registered for the download sees it.
+        self.fx.write("zz.txt", "\0" * 512)  # all-zero payload, all the way to the tail
+        self.fx.commit("add zz.txt")
+        published = self.fx.package()
+        raw = bytearray(gzip.decompress(published))
+        with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+            offset = tf.getmember("demo-0.1.0/zz.txt").offset
+        raw[offset:offset + 512] = b"\0" * 512
+        damaged = gzip.compress(bytes(raw))
+        (self.fx.root / "demo" / "zz.txt").unlink()
+        self.fx.commit("delete zz.txt, same version")
+        with self._fake_crates_io(200, damaged, cksum=hashlib.sha256(published).hexdigest()):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not match the sha256 crates.io registered", out)
+        self.assertNotIn("ok          demo", out)
+
+    VCS = "demo-0.1.0/.cargo_vcs_info.json"
+
+    def test_zeroed_tree_member_header_is_not_green(self) -> None:
+        # GPT review on #416 (critical, tree side): the same zeroed-header trick
+        # against the archive *we* build. The registered checksum guards the
+        # published side only, so the tree archive is judged by the length of its
+        # end-of-archive blocks and by the file list `cargo package --list`
+        # names, both independently of its headers.
+        published = self.fx.package()
+        self.fx.write("zz.txt", "\0" * 512)
+        self.fx.commit("add shipped file without bumping version")
+        real = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real(*args)))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                offset = tf.getmember("demo-0.1.0/zz.txt").offset
+            raw[offset:offset + 512] = b"\0" * 512
+            return gzip.compress(bytes(raw))
+
+        with self._fake_crates_io(200, published):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 1, out)  # control: the added file is seen
+        self.assertIn("only in", out)
+        with self._fake_crates_io(200, published), \
+                mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("archive is not complete", out)  # the pinned end blocks
+        self.assertNotIn("ok          demo", out)
+
+    def _repacked(self, vcs: dict | None) -> bytes:
+        """The published blob with its .cargo_vcs_info.json replaced (None: dropped)."""
+        body = None if vcs is None else json.dumps(vcs).encode()
+        return repack(self.fx.package(), {self.VCS: body})
+
+    def test_tree_archive_missing_a_member_is_not_green(self) -> None:
+        # #416, in the form the tar reader cannot see: a structurally complete
+        # tree archive (both end-of-archive blocks, nothing behind them) that
+        # simply lacks a member. Only the independent `cargo package --list`
+        # comparison catches it.
+        blob = self.fx.package()
+        real = pi.package_tree
+
+        def shorter(*args):
+            return repack(real(*args), {"demo-0.1.0/src/lib.rs": None})
+
+        with mock.patch.object(pi, "package_tree", shorter):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not the file list Cargo shipped", out)
+
+    def test_long_member_name_checks_the_payload_offset(self) -> None:
+        # GPT review on #416 (round 3): a name longer than 100 bytes puts a pax
+        # extension in front of the header, and tarfile's `offset` points at
+        # that extension while `offset_data` points at the payload. Using
+        # `offset + 512` reads the extension as payload padding and rejects an
+        # unchanged archive.
+        self.fx.write("a" * 120 + ".txt", "x\n")
+        self.fx.commit("long file name")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_tree_member_size_field_lie_is_not_green(self) -> None:
+        # GPT review on #416 (critical, third round): flip one bit of a tree
+        # member's size field ('3' -> '2') and one of its UID ('0' -> '1'); the
+        # two cancel in the header checksum, so tarfile accepts the header, reads
+        # 'ab' out of 'abc' and takes the remaining 'c' for padding. Both sizes
+        # sit in one 512-byte block, so the end blocks and the `cargo package
+        # --list` comparison are unchanged, and the short member matched the
+        # published two-byte file: only the bytes on disk disagree.
+        self.fx.write("zz.txt", "ab")
+        self.fx.commit("published two-byte file")
+        published = self.fx.package()
+        self.fx.write("zz.txt", "abc")
+        self.fx.commit("changed content without version bump")
+        real = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real(*args)))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/zz.txt").offset
+            assert raw[o + 134] == ord("3") and raw[o + 114] == ord("0")
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the two cancel in the checksum
+            return gzip.compress(bytes(raw))
+
+        rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 1, out)  # control: the changed byte is seen
+        self.assertIn("differs: zz.txt", out)
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        # The nonzero leftover is caught by the padding check first; the NUL
+        # variant below is the one only the bytes on disk catch.
+        self.assertIn("the size field does not describe what the archive wrote", out)
+        self.assertNotIn("ok          demo", out)
+
+    def test_tree_member_size_lie_over_a_zero_byte_is_not_green(self) -> None:
+        # The same edit, but the byte the shortened size drops is a NUL: the
+        # leftover looks exactly like the padding, so the padding check alone
+        # stays green here and only the bytes on disk disagree.
+        self.fx.write("zz.txt", "ab")
+        self.fx.commit("published two-byte file")
+        published = self.fx.package()
+        self.fx.write("zz.txt", "ab\0")
+        self.fx.commit("grew by one NUL byte without a version bump")
+        real = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real(*args)))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/zz.txt").offset
+            assert raw[o + 134] == ord("3") and raw[o + 114] == ord("0")
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the two cancel in the checksum
+            return gzip.compress(bytes(raw))
+
+        rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 1, out)  # control: the added NUL is seen
+        self.assertIn("differs: zz.txt", out)
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("the member does not carry the bytes on disk", out)
+
+    def test_unchanged_file_with_a_carriage_return_in_its_name_is_ok(self) -> None:
+        # GPT review on #416 (post-review): text-mode stdout turns a CR in a
+        # name into an LF, which would report an unchanged file as changed.
+        self.fx.write("notes\rmore", "x\n")
+        self.fx.commit("file name with a carriage return")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+    def test_size_field_edited_with_the_checksum_intact_is_not_green(self) -> None:
+        # GPT review on #416 (21:10Z): move one bit between the size and the UID
+        # fields of a member header of the TREE-built archive, so the header
+        # checksum still matches while tarfile reads a one-byte-shorter member.
+        # The real content leftover byte stays in the padding, which no header
+        # or end-of-archive check can see, so the padding has to be checked.
+        self.fx.write("zz.txt", "ab")
+        self.fx.commit("published two-byte file")
+        published = self.fx.package()
+        self.fx.write("zz.txt", "abc")
+        self.fx.commit("changed content without a version bump")
+        real_package = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real_package(*args)))
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/zz.txt").offset
+            self.assertEqual(raw[o + 134], ord("3"))
+            self.assertEqual(raw[o + 114], ord("0"))
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the checksum is unchanged
+            return gzip.compress(raw)
+
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("zero padding", out)
+
+    def test_published_from_a_dirty_worktree_is_red(self) -> None:
+        # #415: cargo records the worktree state it packaged. dirty=true means
+        # the version names no committed content at all.
+        sha = sh(self.fx.root, "git", "rev-parse", "HEAD").strip()
+        blob = self._repacked({"git": {"sha1": sha, "dirty": True}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("dirty", out)
+
+    def test_published_from_a_commit_outside_the_history_is_red(self) -> None:
+        # #415: a commit that exists but is not an ancestor of the ref we check
+        # (a side branch, a rewritten history) is not what this version claims.
+        dangling = sh(self.fx.root, "git", "commit-tree", "HEAD^{tree}", "-m", "elsewhere").strip()
+        blob = self._repacked({"git": {"sha1": dangling}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not an ancestor", out)
+
+    def test_unknown_recorded_commit_is_not_green(self) -> None:
+        # #415: a clone without that commit cannot tell which commit published
+        # an archive. That is "could not check", never "no differences".
+        blob = self._repacked({"git": {"sha1": "0" * 40}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not in this repository", out)
+
+    def test_recorded_sha_must_be_a_sha(self) -> None:
+        # #415: a 40-character revision expression is not a commit id; `HEAD~34`
+        # can resolve here, so length alone is no validation.
+        blob = self._repacked({"git": {"sha1": "HEAD" + "~" * 36}})
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no usable commit", out)
+
+    def test_shallow_clone_is_reported_as_not_checked(self) -> None:
+        # #415: with the parent links cut, "not an ancestor" is not an answer
+        # either, so a shallow clone says so instead of blaming the archive.
+        blob = self.fx.package()
+        clone = pathlib.Path(self._tmp.name) / "shallow"
+        self.fx.write("b.txt", "b\n")
+        self.fx.commit("second commit")
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        f"file://{self.fx.root}", str(clone)], check=True)
+        out = io.StringIO()
+        with mock.patch.object(pi, "published", lambda n, v: blob), \
+                mock.patch("sys.argv", ["published_identity.py", str(clone), "--ref", "HEAD"]), \
+                contextlib.redirect_stdout(out):
+            rc = pi.main()
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("shallow clone", out.getvalue())
+
+    def test_terminated_ancestry_check_is_not_green(self) -> None:
+        # GPT review on #416: a negative return code is how Python reports a
+        # signal (SIGTERM → -15). That is no ancestry answer, so returning "no
+        # differences" for it is a false green.
+        blob = self.fx.package()
+        with self._patch_run("--is-ancestor", (-15, "", "")):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("could not place commit", out)
+
+    def test_failed_shallow_query_is_not_green(self) -> None:
+        # GPT review on #416: the shallow-history query failing means the clone's
+        # completeness is unknown, which is "could not check", not "no
+        # differences".
+        blob = self.fx.package()
+        with self._patch_run("--is-shallow-repository", (128, "", "fatal: injected git error")):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("could not tell whether this clone is shallow", out)
+
+    def test_unrecognised_shallow_answer_is_not_green(self) -> None:
+        # GPT review on #416 (follow-up): exit 0 with output that is neither
+        # `true` nor `false` answers nothing either, even when the files match.
+        blob = self.fx.package()
+        with self._patch_run("--is-shallow-repository", (0, "", "")):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not say whether commit", out)
+
+    def test_archive_without_vcs_info_is_not_green(self) -> None:
+        # #415: no recorded commit means no provenance evidence; report that
+        # rather than comparing files and calling it ok.
+        rc, out = self.fx.run("HEAD", lambda n, v: self._repacked(None))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no .cargo_vcs_info.json", out)
+
     def test_default_feature_flip_under_same_version_is_red(self) -> None:
         # GPT review on #411 (round 5): a manifest-only change that flips
         # `value()` from 0 to 1 must be a MISMATCH (seen via Cargo.toml.orig).
@@ -334,9 +668,10 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertNotIn("unpublished", out)
 
     @staticmethod
-    def _opener(api_status: int, crate_blob: bytes | None = None):
-        """A urlopen-compatible opener: the API URL answers `api_status`, the
-        static download answers 200 with `crate_blob`. Non-2xx statuses are
+    def _opener(api_status: int, crate_blob: bytes | None = None, cksum: str | None = None):
+        """A urlopen-compatible opener: the API URL answers `api_status` with the
+        checksum crates.io registered for `crate_blob` (override with `cksum`),
+        the static download answers 200 with `crate_blob`. Non-2xx statuses are
         raised as HTTPError, exactly as urllib does, so fetch()'s HTTPError
         branch runs."""
         import urllib.error
@@ -346,23 +681,27 @@ class PublishedIdentityTest(unittest.TestCase):
                 super().__init__(body)
                 self.status = 200
 
+        registered = cksum or (
+            hashlib.sha256(crate_blob).hexdigest() if crate_blob is not None else "0" * 64)
+
         def urlopen(req, *args, **kwargs):
             url = req.full_url
             if "/api/v1/crates/" in url:
                 if api_status != 200:
                     raise urllib.error.HTTPError(url, api_status, "status", {}, None)
-                return Resp(b"{}")
+                return Resp(json.dumps({"version": {"checksum": registered}}).encode())
             if "static.crates.io" in url and crate_blob is not None:
                 return Resp(crate_blob)
             raise urllib.error.HTTPError(url, 404, "not found", {}, None)
 
         return urlopen
 
-    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None):
+    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None,
+                        cksum: str | None = None):
         """For main()-level runs: the default opener (urllib.request.urlopen,
         looked up at call time) is replaced by `_opener(...)`."""
         return mock.patch.object(pi.urllib.request, "urlopen",
-                                 self._opener(api_status, crate_blob))
+                                 self._opener(api_status, crate_blob, cksum))
 
     def test_api_503_through_urlopen_is_not_green(self) -> None:
         # GPT review on #411 (round 6): an HTTPError 503 from the API must be
@@ -433,6 +772,18 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ok          demo 0.1.0", out)
 
+    def _patch_run(self, match: str, result: tuple[int, str, str]):
+        """pi.run with the command whose argv contains `match` answering
+        `result`; every other command still runs for real."""
+        real = pi.run
+
+        def fake(cmd, cwd=None, timeout=120):
+            if any(match in part for part in cmd):
+                return result
+            return real(cmd, cwd=cwd, timeout=timeout)
+
+        return mock.patch.object(pi, "run", fake)
+
     def test_only_404_means_unpublished(self) -> None:
         with mock.patch.object(pi, "fetch", lambda url, opener=None: (404, b"")):
             self.assertIsNone(pi.published("demo", "0.1.0"))
@@ -449,9 +800,9 @@ class PublishedIdentityTest(unittest.TestCase):
 
 
 class MutationTest(unittest.TestCase):
-    """The transport tests must catch the two mutations named in the round-6
-    review on #411. Each mutation is applied to a copy of the script, and the
-    targeted tests are run against that copy in a subprocess; they must fail."""
+    """Each mutation is applied to a copy of the script, and the targeted tests
+    are run against that copy in a subprocess; they must fail. The transport
+    entries pin the round-6 review on #411, the others #415 and #416."""
 
     MUTATIONS = {
         # Comparison disabled after a successful status check.
@@ -467,6 +818,64 @@ class MutationTest(unittest.TestCase):
             '        return 404, b""',
             ["PublishedIdentityTest.test_api_503_through_urlopen_is_not_green",
              "PublishedIdentityTest.test_injected_opener_503_from_published_is_a_check_error"],
+        ),
+        # The completeness check reduced to "nothing follows the last member",
+        # which a stream cut at a member boundary also satisfies (#415).
+        "tail_only_completeness": (
+            "    if len(raw) - end != 1024 or any(raw[end:]):",
+            "    if any(raw[end:]):",
+            ["PublishedIdentityTest.test_archive_cut_at_a_member_boundary_is_not_green"],
+        ),
+        # The registry checksum not compared at all: the zeroed-header archive
+        # reads as complete and shorter, and goes green (#416).
+        "checksum_not_compared": (
+            "    if got != registered.lower():",
+            "    if False and got != registered.lower():",
+            ["PublishedIdentityTest.test_zeroed_member_header_is_not_green"],
+        ),
+        # A terminated ancestry check (rc -15) read as "not an ancestor", which
+        # is what `if rc == 1` alone would accept (#416).
+        "terminated_ancestry_accepted": (
+            "    if rc != 1:  # a negative rc is a signal (SIGTERM); >1 is a git error",
+            "    if False:",
+            ["PublishedIdentityTest.test_terminated_ancestry_check_is_not_green"],
+        ),
+        # A failing shallow-history query ignored (#416).
+        "failed_shallow_query_ignored": (
+            "    rc, out, _ = run([\"git\", \"rev-parse\", \"--is-shallow-repository\"], cwd=repo)\n    if rc != 0:",
+            "    rc, out, _ = run([\"git\", \"rev-parse\", \"--is-shallow-repository\"], cwd=repo)\n    if False:",
+            ["PublishedIdentityTest.test_failed_shallow_query_is_not_green"],
+        ),
+        # Any answer other than true/false accepted as "not shallow" (#416).
+        "shallow_answer_not_checked": (
+            '    if out.strip() != "false":',
+            "    if False:",
+            ["PublishedIdentityTest.test_unrecognised_shallow_answer_is_not_green"],
+        ),
+        # The tree archive's member list not compared with `cargo package
+        # --list`: a complete archive that lost a member goes green (#416,
+        # tree side).
+        "tree_member_list_not_checked": (
+            "    if listed is not None and",
+            "    if False and",
+            ["PublishedIdentityTest.test_tree_archive_missing_a_member_is_not_green"],
+        ),
+        # The tree archive's member bytes not compared with the file on disk: a
+        # member shortened by a size-field edit that keeps the header checksum
+        # then goes green against a published file of that shorter length
+        # (#416, tree side).
+        "tree_member_bytes_not_checked": (
+            "    if on_disk != body:",
+            "    if False:",
+            ["PublishedIdentityTest.test_tree_member_size_lie_over_a_zero_byte_is_not_green"],
+        ),
+        # The end-of-archive check back to "something is there": a zeroed last
+        # member header then leaves its own header and payload behind two
+        # blocks that are already zeros (#416, tree side).
+        "end_blocks_not_pinned": (
+            "    if len(raw) - end != 1024 or any(raw[end:]):",
+            "    if len(raw) - end < 1024 or any(raw[end:]):",
+            ["PublishedIdentityTest.test_zeroed_tree_member_header_is_not_green"],
         ),
     }
 
