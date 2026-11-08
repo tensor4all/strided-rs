@@ -1814,9 +1814,10 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
 /// transposed extents of `src`, and
 /// [`StridedError::OffsetOverflow`] when the element count does not fit in
 /// `usize`. When `scale` is one and `T`'s transpose is the identity, the
-/// permutation path also returns
-/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
-/// cannot be proven representable and injective.
+/// permutation path also returns [`StridedError::OffsetOverflow`] when the
+/// layout cannot be expressed in `isize` stride arithmetic or a fused extent
+/// overflows, and [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven representable and injective.
 pub fn copy_transpose_scale_into<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
