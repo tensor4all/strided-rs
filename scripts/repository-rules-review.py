@@ -181,6 +181,16 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
         ),
     ),
     (
+        # The HPTT port's licence and blocking, and the denied third-party
+        # thread pools, are one rule; every path that can change one of them
+        # routes here.
+        re.compile(
+            r"^strided-perm/Cargo\.toml$|/hptt/|/hptt\b|^deny\.toml$|"
+            r"^THIRD-PARTY-LICENSES|^NOTICE\b|faer"
+        ),
+        frozenset({"HPTT And faer Integration"}),
+    ),
+    (
         re.compile(r"threading|rayon|parallel|threadteam|Exec::|thread_pool"),
         frozenset({"CPU Threading Contract"}),
     ),
@@ -249,6 +259,14 @@ CONTENT_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     (
         re.compile(r"criterion|black_box|Instant::now"),
         frozenset({"Performance And Benchmark Discipline"}),
+    ),
+    (
+        # A denied dependency is added in a Cargo.toml line, and path routing
+        # only inspects the path: `strided-basic/Cargo.toml` or the root
+        # `Cargo.toml` matches no dependency trigger, so the rule that forbids
+        # the dependency was never supplied to the reviewer.
+        re.compile(r"(?:^|[^A-Za-z0-9_-])(?:t4a-)?faer\b|\bspindle\b"),
+        frozenset({"HPTT And faer Integration"}),
     ),
 )
 

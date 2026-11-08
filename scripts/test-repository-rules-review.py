@@ -287,6 +287,34 @@ def test_select_rule_sections_ignores_generic_decode_and_offset_noise() -> None:
     assert sections == ["Public Boundary Safety", "Public Surface Discipline"]
 
 
+def test_select_rule_sections_routes_denied_dependencies_by_added_line() -> None:
+    """A denied dependency is added under a Cargo.toml path that names no crate.
+
+    Path routing alone never selected `HPTT And faer Integration` for
+    `strided-basic/Cargo.toml` or the root `Cargo.toml`, so the rule that denies
+    the dependency was not supplied to the reviewer. This fails if the added-line
+    trigger stops matching, which the section-name reachability test cannot see.
+    """
+    mod = load_module()
+    cases = (
+        ("strided-basic/Cargo.toml", 'faer = "0.21"'),
+        ("strided-kernel/Cargo.toml", 't4a-faer = "0.21"'),
+        ("Cargo.toml", 'spindle = "0.1"'),
+        ("strided-view/Cargo.toml", 't4a-faer = { version = "0.21" }'),
+    )
+    for path, line in cases:
+        sections = mod.select_rule_sections([path], {path: [(7, line)]})
+        assert "HPTT And faer Integration" in sections, (path, line)
+
+
+def test_select_rule_sections_ignores_other_dependencies() -> None:
+    mod = load_module()
+    path = "strided-basic/Cargo.toml"
+    for line in ('pulp = "0.22"', 'approx = "0.5"', 'notfaerish = "1"'):
+        sections = mod.select_rule_sections([path], {path: [(7, line)]})
+        assert "HPTT And faer Integration" not in sections, line
+
+
 def test_select_rule_sections_routes_bench_paths() -> None:
     mod = load_module()
     sections = mod.select_rule_sections(["strided-kernel/benches/map.rs"])
