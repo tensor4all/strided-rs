@@ -11,6 +11,11 @@ homepage = "https://github.com/tensor4all/strided-rs"
 description = "Runtime-DAG fused strided CPU kernel execution."
 keywords = ["tensor", "strided", "kernels", "numerical"]
 categories = ["science", "mathematics", "algorithms"]
+# `benches/overhead_smoke.rs` shares its counting-allocator and gate plumbing
+# with `strided-basic/benches/support` through `#[path]` (#306), so it cannot
+# compile from the packaged crate. It stays workspace-only rather than shipping
+# a second copy of gate logic that both crates must agree on.
+exclude = ["benches/overhead_smoke.rs"]
 
 [dependencies]
 strided-basic.workspace = true
