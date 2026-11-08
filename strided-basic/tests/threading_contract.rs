@@ -69,16 +69,21 @@ fn a_serial_token_never_justifies_a_second_worker() {
 // The gate that decides a fork (`cost.rs`'s `parallel_width` and the
 // `is_parallel` leaves) opens at `3 * dispatch_cost / ns_per_element`: 1732
 // elements for `KernelClass::Map` against this pool's 100 ns section cost on an
-// AVX-512 host (0.173 ns per element), about 3000 on the generic and aarch64
-// rates (0.100) — rounded to whole nanoseconds, so 2999 elements already clear
-// that count. 512x512 is 151x above the gate, so the element count is not what
-// decides this test; see [`Seen::record`] for the margin that does.
+// AVX-512 host (0.173 ns per element), 2995 on the generic and aarch64 rates
+// (0.100). The estimate is rounded to whole nanoseconds before the comparison,
+// so 2995 elements are 300 ns and clear the 300 ns that gate asks for, while
+// 2994 (299 ns) does not. 512x512 is 87x that count, 151x the AVX-512 one, so
+// the element count is not what decides this test; see [`Seen::record`] for the
+// margin that does.
 const ROWS: usize = 512;
 const COLS: usize = 512;
 
-/// How long a leaf waits for the second thread before giving up. Far above every
-/// measured wake latency (40 us at worst), so a timeout means the call never
-/// fanned out, not that the host was slow.
+/// How long a leaf waits for the second thread before giving up: a bound on how
+/// long the test waits, not a claim about the host. A call that does fan out but
+/// whose worker reaches the closure only after the bound also times out (a
+/// failure injection that delays the second `record()` reproduces that), so the
+/// failure message states what was observed — no second thread within the bound
+/// — and not that the call stayed serial.
 const SECOND_THREAD_LIMIT: Duration = Duration::from_secs(2);
 
 /// The distinct threads the closures of one call ran on, gated on a second one
