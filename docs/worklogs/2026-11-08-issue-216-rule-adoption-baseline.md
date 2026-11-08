@@ -81,6 +81,50 @@ claim that each of those comments documents one of those occurrences, and this
 counter does not establish that pairing; the shared rule requires one comment
 per block, so the per-block audit is the next measurement, not this one.
 
+## Re-measured at `25b6dad`
+
+The table above is the `8f89aae` measurement. Re-running the same two commands at
+`25b6dad` (the 0.13.0 release merge) moves exactly one row:
+
+```bash
+git log -1 --format=%h                                    # 25b6dad  (the sources)
+git log -1 --format=%h -- scripts/count-audit-metrics.py  # dea23b6  (the counter)
+python3 scripts/count-audit-metrics.py .                  # the seven source rows
+cargo test --doc --workspace                              # the doctest row
+```
+
+```
+invariant 59
+safety 360
+unsafe 537
+pub_result 189 with_errors 189
+inline_mods 1
+files_over_1000 21
+```
+
+| Metric | `25b6dad` | table above (`8f89aae`) |
+|--------|-----------|--------------------------|
+| `// INVARIANT:` markers | 59 | 59 |
+| `// SAFETY:` comments | **360** | 339 |
+| production `unsafe {` occurrences | 537 | 537 |
+| public `Result`-returning `fn` | 189 | 189 |
+| …of those with a `# Errors` section | 189 | 189 |
+| runnable doctests | 127 | 127 |
+| inline `#[cfg(test)] mod` blocks with a body | 1 | 1 |
+| files over 1000 lines | 21 | 21 |
+
+The 21 added `// SAFETY:` comments are
+[#403](https://github.com/tensor4all/strided-rs/pull/403) (23 markers added, 2
+rewritten in place, all comments). Nothing else moved: #402 moved a test target
+between crates, #404 changed version strings, and neither adds or removes
+production `unsafe`, public `Result` signatures, or runnable doctests. The doctest
+row is again the command's own output, `127 passed, 0 ignored`, the same total the
+previous run recorded.
+
+Read this section as the current baseline and the table above as the `8f89aae`
+measurement. A later re-measurement replaces this section instead of appending a
+third table, and it quotes both shas the way this one does.
+
 ## Counting rules
 
 `scripts/count-audit-metrics.py` is the only implementation of these rules, and
