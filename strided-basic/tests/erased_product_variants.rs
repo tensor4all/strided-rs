@@ -688,7 +688,7 @@ fn stable_product_subnormals_match_ordered_fold() {
         vec![smallest, 2.0, smallest, 2.0, smallest],
         (0..1000)
             .map(|_| {
-                if next(&mut state) % 2 == 0 {
+                if next(&mut state).is_multiple_of(2) {
                     smallest
                 } else {
                     3.0

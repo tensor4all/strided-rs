@@ -344,7 +344,7 @@ fn lane_order_fold(values: &[f64], init: f64, reduce: fn(f64, f64) -> f64) -> f6
         let lane = i % LANES;
         lanes[lane] = reduce(lanes[lane], v);
     }
-    lanes.into_iter().fold(init, |acc, lane| reduce(acc, lane))
+    lanes.into_iter().fold(init, reduce)
 }
 
 /// Magnitudes whose fold order is visible in the result value.
@@ -460,8 +460,7 @@ fn typed_contiguous_fold_lane_order_is_bit_visible_in_float_sums() {
         "probe data must separate the lane order from the source order"
     );
     let view = StridedView::<f64>::new(&data, &[len], &[1isize], 0).unwrap();
-    for budget in [Budget::Serial] {
-        let got = { reduce(&view, |x| x, add, 0.0, budget.exec()).unwrap() };
-        assert_eq!(got.to_bits(), lanes.to_bits(), "{budget:?}");
-    }
+    let budget = Budget::Serial;
+    let got = { reduce(&view, |x| x, add, 0.0, budget.exec()).unwrap() };
+    assert_eq!(got.to_bits(), lanes.to_bits(), "{budget:?}");
 }

@@ -727,8 +727,8 @@ where
         if ss == 1 {
             let values = core::slice::from_raw_parts(src.offset(so), n);
             let mut lanes = [F::key(values[0]); ARG_LANES];
-            let mut chunks = values.chunks_exact(ARG_LANES);
-            for chunk in &mut chunks {
+            let (chunks, remainder) = values.as_chunks::<ARG_LANES>();
+            for chunk in chunks {
                 for (lane, &value) in lanes.iter_mut().zip(chunk) {
                     let key = F::key(value);
                     *lane = if D::beats(key, *lane) { key } else { *lane };
@@ -737,7 +737,7 @@ where
             // Which NaN or which signed zero wins here does not matter: the
             // second pass matches by NaN-ness or by equality.
             let mut winner = lanes[0];
-            let tail = chunks.remainder().iter().map(|&value| F::key(value));
+            let tail = remainder.iter().map(|&value| F::key(value));
             for key in lanes[1..].iter().copied().chain(tail) {
                 if D::beats(key, winner) {
                     winner = key;

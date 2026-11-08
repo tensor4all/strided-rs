@@ -113,6 +113,8 @@ fn main() {
         .map(|row| ((row % j) * j + (row / j)) as isize)
         .collect();
     let mut lhs_values = Vec::with_capacity(j * k);
+    // Baseline arm: the pointer walk and its index cast are the shape under measurement.
+    #[allow(clippy::needless_range_loop, clippy::ptr_offset_with_cast)]
     bench_n("manual packed lhs noncompact", 20, 100, || {
         for batch in 0..t {
             lhs_values.clear();

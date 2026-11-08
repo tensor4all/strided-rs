@@ -711,8 +711,8 @@ impl ErasedGatherPlan {
                 &self.plan,
                 self.index_dtype,
                 dest,
-                &operand,
-                &start_indices,
+                operand,
+                start_indices,
                 exec,
             ),
             KernelDType::F64 => dispatch_gather_index::<f64>(
@@ -957,8 +957,8 @@ impl ErasedDynamicSlicePlan {
                 &self.plan,
                 self.index_dtype,
                 dest,
-                &operand,
-                &starts,
+                operand,
+                starts,
                 exec,
             ),
             KernelDType::F64 => dispatch_dynamic_slice_index::<f64>(
@@ -1204,9 +1204,9 @@ impl ErasedDynamicUpdateSlicePlan {
                 &self.plan,
                 self.index_dtype,
                 dest,
-                &operand,
-                &update,
-                &starts,
+                operand,
+                update,
+                starts,
                 exec,
             ),
             KernelDType::F64 => dispatch_dynamic_update_slice_index::<f64>(
@@ -1476,9 +1476,9 @@ impl ErasedScatterPlan {
                 &self.plan,
                 self.index_dtype,
                 dest,
-                &operand,
-                &scatter_indices,
-                &updates,
+                operand,
+                scatter_indices,
+                updates,
                 exec,
             ),
             KernelDType::F64 => dispatch_scatter_index::<f64>(
@@ -2434,6 +2434,9 @@ where
     }
 }
 
+// Dtype plus the operand, index, update and destination layouts and the combine op:
+// the dispatch key.
+#[allow(clippy::too_many_arguments)]
 fn execute_scatter_uninit_dispatch<T>(
     plan: &ScatterPlan,
     index_dtype: KernelDType,

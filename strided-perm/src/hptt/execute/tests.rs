@@ -18,7 +18,7 @@ fn terminal_cursor_advance_may_leave_the_allocation() {
     // outer loop's terminal advance reaches offset 6 after its last copy,
     // past the allocation. That cursor is never read, so the advance must
     // wrap; Miri flags the pre-fix `offset`.
-    let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
+    let src = [1.0f64, 2.0, 3.0, 4.0, 5.0];
     let mut dst = vec![0.0f64; 4];
     let plan = build_permute_plan(&[2, 2], &[1, 3], &[1, 2], 8).unwrap();
     unsafe {
@@ -33,7 +33,7 @@ fn test_execute_transpose_2d() {
     // src [3, 2] col-major: [1,2,3,4,5,6]
     // Permuted view: dims [2, 3], strides [3, 1]
     // dst col-major [2, 3]: strides [1, 2]
-    let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
     let mut dst = vec![0.0f64; 6];
     let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
     unsafe {
@@ -134,7 +134,7 @@ fn test_execute_5d_permute() {
 
 #[test]
 fn test_execute_rank0_scalar() {
-    let src = vec![42.0f64];
+    let src = [42.0f64];
     let mut dst = vec![0.0f64];
     let plan = build_permute_plan(&[], &[], &[], 8).unwrap();
     unsafe {
@@ -185,7 +185,7 @@ fn pool(threads: usize) -> threadteam::Pool {
 #[test]
 fn test_execute_par_transpose_2d() {
     let pool = pool(2);
-    let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
     let mut dst = vec![0.0f64; 6];
     let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
     unsafe {

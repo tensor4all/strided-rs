@@ -8,7 +8,7 @@ use crate::threading::run_serial_and_parallel;
 
 /// Visit every multi-index of `dims` in column-major order.
 fn for_each_index(dims: &[usize], mut visit: impl FnMut(&[usize])) {
-    if dims.iter().any(|&d| d == 0) {
+    if dims.contains(&0) {
         return;
     }
     let mut idx = vec![0usize; dims.len()];
@@ -50,7 +50,7 @@ fn offset_of(strides: &[isize], base: isize, idx: &[usize]) -> usize {
 
 /// Storage length and base offset for a strided layout, handling negative strides.
 fn layout_extent(dims: &[usize], strides: &[isize]) -> (usize, isize) {
-    if dims.iter().any(|&d| d == 0) {
+    if dims.contains(&0) {
         return (1, 0);
     }
     let mut lo = 0isize;

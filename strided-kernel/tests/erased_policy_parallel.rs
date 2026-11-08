@@ -25,12 +25,7 @@ use strided_kernel::{
 const LARGE_LEN: usize = (1 << 15) + 65;
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
+    unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), core::mem::size_of_val(data)) }
 }
 
 fn bounded_context() -> Exec<'static> {
@@ -410,7 +405,7 @@ fn dynamic_slice_and_update_match_serial_at_threshold_boundaries() {
         )
         .unwrap();
 
-        let run_slice = |mut ctx: Exec| {
+        let run_slice = |ctx: Exec| {
             let mut output = vec![0i32; len];
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)

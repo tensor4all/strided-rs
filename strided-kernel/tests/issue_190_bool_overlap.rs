@@ -92,8 +92,8 @@ fn bool_mutation_after_raw_pointer_handoff_is_validated_before_writes() {
             KernelDType::Bool,
             NonNull::new(input_ptr).unwrap(),
             input.len(),
-            &dims[0],
-            &strides[0],
+            dims[0],
+            strides[0],
             0,
         )
     }
@@ -141,8 +141,8 @@ fn bool_uninitialized_replay_does_not_read_strided_holes() {
             KernelDType::Bool,
             NonNull::new(input.as_ptr() as *mut u8).unwrap(),
             input.len(),
-            &input_dims[0],
-            &input_strides[0],
+            input_dims[0],
+            input_strides[0],
             0,
         )
     }

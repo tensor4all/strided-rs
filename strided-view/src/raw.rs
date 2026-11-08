@@ -120,7 +120,7 @@ fn validate_erased_buffer(dtype: KernelDType, data: &[u8]) -> Result<usize> {
 /// `&[T]` already holds valid values of `T::DTYPE`.
 fn validate_erased_buffer_extent(dtype: KernelDType, data: &[u8]) -> Result<usize> {
     let element_size = dtype.size_of();
-    if data.len() % element_size != 0 {
+    if !data.len().is_multiple_of(element_size) {
         return Err(StridedError::ByteLengthMismatch {
             dtype: dtype.label(),
             byte_len: data.len(),
@@ -134,7 +134,7 @@ fn validate_erased_buffer_extent(dtype: KernelDType, data: &[u8]) -> Result<usiz
     }
 
     let alignment = dtype.alignment();
-    if data.as_ptr() as usize % alignment != 0 {
+    if !(data.as_ptr() as usize).is_multiple_of(alignment) {
         return Err(StridedError::DataAlignmentMismatch {
             dtype: dtype.label(),
             alignment,
@@ -164,14 +164,14 @@ fn validate_erased_buffer_layout(
     byte_len: usize,
 ) -> Result<usize> {
     let element_size = dtype.size_of();
-    if byte_len % element_size != 0 {
+    if !byte_len.is_multiple_of(element_size) {
         return Err(StridedError::ByteLengthMismatch {
             dtype: dtype.label(),
             byte_len,
             element_size,
         });
     }
-    if byte_len != 0 && data.as_ptr() as usize % dtype.alignment() != 0 {
+    if byte_len != 0 && !(data.as_ptr() as usize).is_multiple_of(dtype.alignment()) {
         return Err(StridedError::DataAlignmentMismatch {
             dtype: dtype.label(),
             alignment: dtype.alignment(),
@@ -970,7 +970,7 @@ impl<'a, T> RawStridedRef<'a, T> {
 
     #[inline]
     pub fn ptr(&self) -> *const T {
-        if self.dims.iter().any(|&dim| dim == 0) {
+        if self.dims.contains(&0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
             // SAFETY: `offset` was accepted by `validate_bounds`
@@ -1094,7 +1094,7 @@ impl<'a, T> RawStridedMut<'a, T> {
 
     #[inline]
     pub fn ptr(&self) -> *const T {
-        if self.dims.iter().any(|&dim| dim == 0) {
+        if self.dims.contains(&0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
             // SAFETY: `offset` was accepted by `validate_bounds`
@@ -1109,7 +1109,7 @@ impl<'a, T> RawStridedMut<'a, T> {
 
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        if self.dims.iter().any(|&dim| dim == 0) {
+        if self.dims.contains(&0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
             // SAFETY: as `ptr` above — `offset` was accepted by

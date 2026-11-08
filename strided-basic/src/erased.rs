@@ -400,6 +400,9 @@ pub struct ErasedReducePlan {
     layout: ReduceLayout,
 }
 
+// Private plan enum: `Axes` carries the per-axis tables inline on purpose, so the
+// reduce hot path reads them without a second indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum ReduceLayout {
     Full {

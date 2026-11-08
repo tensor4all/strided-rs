@@ -27,6 +27,8 @@ fn test_custom_type_without_element_op_apply() {
         }
     }
 
+    // Tropical semiring: multiplication is field addition, so the lint does not apply.
+    #[allow(clippy::suspicious_arithmetic_impl)]
     impl std::ops::Mul for TropicalLike {
         type Output = Self;
         fn mul(self, rhs: Self) -> Self {

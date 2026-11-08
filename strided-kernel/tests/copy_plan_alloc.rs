@@ -51,12 +51,7 @@ fn record_allocation() {
 }
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
+    unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), core::mem::size_of_val(data)) }
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -109,7 +104,7 @@ fn assert_fused_uninit_allocation_parity(mint: &dyn Fn() -> Exec<'static>, fused
     let rhs = vec![2.0f64; dims[0]];
     let lhs_ref = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
     let rhs_ref = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
-    let inputs = [lhs_ref.clone(), rhs_ref.clone()];
+    let inputs = [lhs_ref, rhs_ref];
     let input_ptrs = [
         ErasedRawStridedPtr::from_ref(&lhs_ref),
         ErasedRawStridedPtr::from_ref(&rhs_ref),
@@ -1101,9 +1096,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
         ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap(),
         ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap(),
     ];
-    let input_ptrs = inputs
-        .each_ref()
-        .map(|input| ErasedRawStridedPtr::from_ref(input));
+    let input_ptrs = inputs.each_ref().map(ErasedRawStridedPtr::from_ref);
     let plan = ErasedFusedPlan::compile(
         KernelDType::F64,
         FusedPlan {

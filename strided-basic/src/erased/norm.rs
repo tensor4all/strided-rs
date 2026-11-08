@@ -749,14 +749,14 @@ const NORM_LANES: usize = 16;
 #[inline(always)]
 fn lane_sum<T: NormScalar>(values: &[T], map: impl Fn(T) -> T) -> T {
     let mut partial = [T::ZERO; NORM_LANES];
-    let mut chunks = values.chunks_exact(NORM_LANES);
-    for chunk in chunks.by_ref() {
+    let (chunks, remainder) = values.as_chunks::<NORM_LANES>();
+    for chunk in chunks {
         for (partial, &value) in partial.iter_mut().zip(chunk) {
             *partial = *partial + map(value);
         }
     }
     let mut tail = T::ZERO;
-    for &value in chunks.remainder() {
+    for &value in remainder {
         tail = tail + map(value);
     }
     // A left fold of the partial sums: a pairwise tree here makes the

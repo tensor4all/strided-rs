@@ -1018,9 +1018,9 @@ fn run_rank2_layout_scatter<I>(
     let index_dims = [4usize, 1];
     let index_strides = [1isize, 4];
     let mut expected = vec![-777i32; dest_len];
-    for linear in 0..8 {
+    for (linear, &value) in operand.iter().enumerate() {
         let coords = decode_col_major(linear, &dims);
-        expected[layout_offset(dest_offset, &dest_strides, &coords)] = operand[linear];
+        expected[layout_offset(dest_offset, &dest_strides, &coords)] = value;
     }
     for (batch, &start) in [0usize, 0, 3, 1].iter().enumerate() {
         for window in 0..2 {
