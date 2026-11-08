@@ -576,7 +576,7 @@ unsafe fn apply_run<D, S, Apply>(
         let dst_run = unsafe { core::slice::from_raw_parts_mut(dst_ptr.offset(dst_offset), len) };
         if src_stride == 1 {
             // A `copy_nonoverlapping` per run is not used for plain copies:
-            // it measured slower than this vectorized loop for short runs
+            // it measured slower than this element loop for short runs
             // (one `memcpy` call each) and for long cache-resident copies.
             // SAFETY: `len` consecutive in-bounds source slots, which the
             // exclusive destination run cannot overlap.
