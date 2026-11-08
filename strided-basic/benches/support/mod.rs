@@ -47,9 +47,9 @@ pub const ATTEMPTS: usize = 3;
 /// n ~ 5 an IQR is zero or jumps to a neighbour, while a scaled MAD stays
 /// defined.
 pub const MAD_TO_SIGMA: f64 = 1.4826;
-/// A parity gate is `median + SIGMA_MULTIPLE * sigma`, computed from this run's
-/// own paired samples: the width is derived from the run, not from a constant
-/// baked in from another machine.
+/// A parity gate is `PARITY_ANCHOR + SIGMA_MULTIPLE * width`, computed from this
+/// run's own paired samples: the width is derived from the run, not from a
+/// constant baked in from another machine.
 pub const SIGMA_MULTIPLE: f64 = 3.0;
 /// The ratio a [`Gate::Parity`] row asserts: A and B cost the same.
 pub const PARITY_ANCHOR: f64 = 1.0;
@@ -186,6 +186,45 @@ impl CaseResult {
     }
 }
 
+/// One attempt's verdict: the statistic, its width, and whether it was over.
+struct Attempt {
+    ratio: f64,
+    mad: f64,
+    width: Option<f64>,
+    bound: Option<f64>,
+    exceeded: bool,
+}
+
+/// Judge one attempt from its paired ratios.
+///
+/// This is the whole statistic-to-verdict path, split out so a test can drive it
+/// with fixed samples instead of wall-clock readings: a timing-based test can
+/// itself flake, because a genuinely 8x workload can measure as a legitimately
+/// admitted ratio.
+fn attempt_verdict(ratios: &[f64], gate: Gate) -> Attempt {
+    let mut sorted = ratios.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let ratio = percentile_sorted(&sorted, 0.5);
+    let mut deviations: Vec<f64> = sorted.iter().map(|r| (r - ratio).abs()).collect();
+    deviations.sort_by(f64::total_cmp);
+    let mad = percentile_sorted(&deviations, 0.5);
+    let (width, bound) = match gate {
+        Gate::Parity => {
+            let width = parity_width(ratio, mad);
+            (Some(width), Some(parity_bound(ratio, mad)))
+        }
+        Gate::Bound(bound) => (None, Some(bound)),
+        Gate::ReportGated | Gate::Report => (None, None),
+    };
+    Attempt {
+        ratio,
+        mad,
+        width,
+        bound,
+        exceeded: bound.is_some_and(|bound| ratio > bound),
+    }
+}
+
 /// Measure two paths on the same input and judge their ratio.
 ///
 /// Both paths are warmed up first, then sampled [`REPS`] times per attempt in an
@@ -235,35 +274,22 @@ pub fn measure_case(
         }
         a_samples.sort_by(f64::total_cmp);
         b_samples.sort_by(f64::total_cmp);
-        ratios.sort_by(f64::total_cmp);
 
         let a_med = percentile_sorted(&a_samples, 0.5);
         let a_p95 = percentile_sorted(&a_samples, 0.95);
         let b_med = percentile_sorted(&b_samples, 0.5);
         let b_p95 = percentile_sorted(&b_samples, 0.95);
-        let ratio = percentile_sorted(&ratios, 0.5);
-        // MAD about the ratio median, scaled to sigma, floored at 15% of it.
-        let mut deviations: Vec<f64> = ratios.iter().map(|r| (r - ratio).abs()).collect();
-        deviations.sort_by(f64::total_cmp);
-        let mad = percentile_sorted(&deviations, 0.5);
-        let (spread, bound) = match gate {
-            Gate::Parity => (
-                Some(parity_width(ratio, mad)),
-                Some(parity_bound(ratio, mad)),
-            ),
-            Gate::Bound(bound) => (None, Some(bound)),
-            Gate::ReportGated | Gate::Report => (None, None),
-        };
+        let verdict = attempt_verdict(&ratios, gate);
+        let (ratio, mad) = (verdict.ratio, verdict.mad);
+        let (spread, bound) = (verdict.width, verdict.bound);
+        if verdict.exceeded {
+            attempts_exceeded += 1;
+        }
 
         let a_allocs = allocations_per_op(&mut path_a);
         let b_allocs = allocations_per_op(&mut path_b);
         max_a_allocs = max_a_allocs.max(a_allocs);
         max_b_allocs = max_b_allocs.max(b_allocs);
-        if let Some(bound) = bound {
-            if ratio > bound {
-                attempts_exceeded += 1;
-            }
-        }
         // Report the worst attempt, and the bound that attempt was judged
         // against: a gate that only passes on its luckiest samples is the
         // failure mode #395 is about.
@@ -313,6 +339,9 @@ pub fn print_table(cases: &[CaseResult], title: &str) {
             // Never print a bare `<= bound`: a row passes while fewer than
             // ATTEMPTS attempts are over, so the reported ratio can sit above
             // the bound and still pass (#396 review). Say both numbers.
+            Gate::Parity | Gate::Bound(_) if case.a_allocs > 0.0 || case.b_allocs > 0.0 => {
+                "FAIL (alloc)".to_string()
+            }
             Gate::Parity | Gate::Bound(_) if case.failed() => format!(
                 "FAIL (>{:.3}, {}/{} over)",
                 bound.unwrap_or(0.0),
@@ -472,41 +501,49 @@ mod tests {
         assert!(!parity.failed());
     }
 
-    /// The only test that drives the real statistic-to-verdict path inside
-    /// [`measure_case`]. Without it, replacing the parity bound with
-    /// `f64::INFINITY` there leaves every other test green (#396 review).
+    /// The statistic-to-verdict path, driven with **fixed** paired samples.
     ///
-    /// An 8:1 work ratio cannot be absorbed by any width the rule can produce: at
-    /// the measured median the bound is `1 + 3 * 0.15 * 8 = 4.6`, so the verdict
-    /// does not depend on this host being quiet.
+    /// A wall-clock version of this test flaked: a genuinely 8x workload can
+    /// measure as `[6,6,6,6,8,10,10,10,10]`, whose median 8 and MAD 2 give a
+    /// bound of 9.896 and are therefore legitimately admitted (#396 review).
+    /// Fixed samples exercise the same code with no host in the loop — and
+    /// mutating the bound inside `attempt_verdict` to `f64::INFINITY` fails here,
+    /// which the direct-`CaseResult` tests cannot catch.
     #[test]
-    fn a_real_slowdown_fails_through_measure_case() {
-        fn work(n: u64) -> u64 {
-            let mut acc = 0u64;
-            for i in 0..n {
-                acc = acc.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(acc)
-        }
+    fn a_slowdown_is_judged_by_the_production_path() {
+        let uniform = |value: f64| vec![value; REPS];
 
-        let slow = measure_case(
-            "T",
-            "eight times the work in path A",
-            1,
-            Gate::Parity,
-            || {
-                work(8_000);
-            },
-            || {
-                work(1_000);
-            },
-        );
+        let steady_two = attempt_verdict(&uniform(2.0), Gate::Parity);
         assert!(
-            slow.failed(),
-            "an 8x slowdown passed: ratio {} against bound {:?}",
-            slow.ratio,
-            slow.tolerance
+            steady_two.exceeded,
+            "steady 2x admitted: ratio {} against bound {:?}",
+            steady_two.ratio, steady_two.bound
         );
+
+        let parity = attempt_verdict(&uniform(1.0), Gate::Parity);
+        assert!(!parity.exceeded);
+        assert_eq!(parity.width, Some(parity_width(1.0, 0.0)));
+        assert_eq!(parity.bound, Some(parity_bound(1.0, 0.0)));
+
+        // A wide spread widens the bound, which is the point of using MAD.
+        let noisy = attempt_verdict(&[0.5, 0.9, 1.0, 1.0, 1.1, 1.4, 1.6, 1.9, 2.6], Gate::Parity);
+        assert!(noisy.width.unwrap_or(0.0) > parity.width.unwrap_or(0.0));
+
+        // Bound rows ignore the dispersion and use the absolute limit.
+        assert!(!attempt_verdict(&uniform(2.4), Gate::Bound(2.5)).exceeded);
+        assert!(attempt_verdict(&uniform(2.6), Gate::Bound(2.5)).exceeded);
+        // One high sample does not move a Bound row either: the statistic is the
+        // median of the nine paired ratios, not the worst one.
+        assert!(
+            !attempt_verdict(
+                &[0.5, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                Gate::Bound(2.5)
+            )
+            .exceeded
+        );
+
+        // Report rows have no bound at all.
+        assert!(!attempt_verdict(&uniform(50.0), Gate::Report).exceeded);
     }
 
     #[test]

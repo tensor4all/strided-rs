@@ -94,8 +94,10 @@ occurrence is diagnosable instead of mysterious. If S1 recurs above the gate wit
 a small MAD, the 15% floor is the parameter to revisit, not the statistic.
 
 **This relaxes the steady band, and that is a decision for the owner, not a
-detail.** At parity the bound is ≈1.45–1.46, i.e. tighter than the old fixed 1.5,
-and `S3a` (`<= 2.5`) / `S3b` (`<= 4`) are untouched. But a *steady* ratio `m`
+detail.** At parity the bound is ≈1.45–1.46, i.e. below the old fixed 1.5, and
+`S3a` (`<= 2.5`) / `S3b` (`<= 4`) are untouched — but "below 1.5 at parity" is not
+"no loosening": the steady band below reaches 1.82x, which the fixed 1.5 would
+have failed. That relaxation is the owner-approved policy of this section. But a *steady* ratio `m`
 passes while `m <= 1 + 0.45 m`, i.e. up to **m = 1.82**, where the fixed 1.5
 flagged anything above 1.5. The two cannot both hold: a gate that passes the
 1.504 observation that motivated #395 is by definition looser than 1.5. Three
