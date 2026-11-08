@@ -142,3 +142,25 @@ fn test_compute_importance_short_row_contributes_its_prefix() {
         vec![32, 3]
     );
 }
+
+/// The other half of the length mismatch: a row **longer** than `n` must not
+/// index past `importance`. The row-wise loop this replaced panicked here
+/// (`fuse.rs:124`, `index out of bounds: the len is 2 but the index is 2`) and the
+/// index-based loop before it ignored the suffix; ignoring it is what this
+/// restores, so the score equals the three-`n`-long-rows case.
+///
+/// `dims = [2, 2]`, `m = 3` so `g = 3`; output row `[1, 2]` scores `[16, 2]`, each
+/// further row adds `[8, 1]` for two rows and the third entry `1` of the last row
+/// is dropped.
+#[test]
+fn test_compute_importance_long_row_ignores_its_suffix() {
+    let dims = [2, 2];
+    let full = [1isize, 2];
+    let all_strides: Vec<&[isize]> = vec![&full, &full, &full];
+    let index_orders = vec![vec![1usize, 2], vec![1, 2], vec![1, 2, 1]];
+
+    assert_eq!(
+        compute_importance(&dims, &all_strides, &index_orders),
+        vec![32, 4]
+    );
+}
