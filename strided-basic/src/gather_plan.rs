@@ -597,9 +597,13 @@ impl GatherPlan {
     ///
     /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, index,
     /// or destination view does not carry its compiled extents and strides,
-    /// before any destination write. That is the only rejection: start
-    /// indices are clamped into the operand window, so an out-of-range index
-    /// is not an error.
+    /// before any destination write, and
+    /// [`StridedError::OffsetOverflow`] when a replayed chunk's offset
+    /// arithmetic cannot be represented. Start indices are clamped into the
+    /// operand window, so an out-of-range index is not an error. The offset
+    /// arithmetic runs per worker above the threading threshold, so a
+    /// destination split across workers may be partially written when that
+    /// error surfaces.
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,

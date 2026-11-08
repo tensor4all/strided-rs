@@ -683,11 +683,14 @@ impl ErasedGatherPlan {
     /// # Errors
     ///
     /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
-    /// `start_indices` does not carry its compiled dtype, and
+    /// `start_indices` does not carry its compiled dtype,
     /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
-    /// compiled extents and strides. Start indices are clamped into the
-    /// operand window, so an out-of-range index is not an error. Nothing is
-    /// written unless every check succeeds.
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when a replayed chunk's offset arithmetic cannot be represented. Start
+    /// indices are clamped into the operand window, so an out-of-range index
+    /// is not an error. The dtype and layout checks precede every write, but
+    /// the offset arithmetic runs per worker, so a destination split across
+    /// workers may be partially written when that error surfaces.
     pub fn execute(
         &self,
         dest: &mut ErasedRawStridedMut<'_>,
@@ -763,13 +766,12 @@ impl ErasedGatherPlan {
     }
 
     /// Execute gather into a destination whose reachable slots may be
-    /// uninitialized. All validation precedes the first destination write.
-    /// On success, every reachable destination slot is fully overwritten;
-    /// unreachable holes are neither read nor initialized. Validation errors
-    /// are returned before any destination write. A panic during execution
-    /// may leave a partially initialized `MaybeUninit` destination, which is
-    /// still safely droppable; no readable value is promised for unwritten
-    /// reachable slots.
+    /// uninitialized. On success, every reachable destination slot is fully
+    /// overwritten; unreachable holes are neither read nor initialized. The
+    /// dtype, overlap and layout checks are returned before any destination
+    /// write. A panic during execution may leave a partially initialized
+    /// `MaybeUninit` destination, which is still safely droppable; no
+    /// readable value is promised for unwritten reachable slots.
     ///
     /// # Errors
     ///
@@ -779,8 +781,11 @@ impl ErasedGatherPlan {
     /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
     /// `bool` operand holds a byte other than 0 or 1,
     /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
-    /// compiled extents and strides. Every rejection above is returned before
-    /// any destination write.
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when a replayed chunk's offset arithmetic cannot be represented. Every
+    /// rejection except the last is returned before any destination write;
+    /// the offset arithmetic runs per worker, so a destination split across
+    /// workers may be partially initialized when that error surfaces.
     pub fn execute_uninit(
         &self,
         dest: &mut ErasedRawStridedUninitMut<'_>,
