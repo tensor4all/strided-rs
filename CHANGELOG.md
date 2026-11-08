@@ -4,6 +4,40 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
+## strided-view 0.8.0 (unreleased) — breaking
+
+`StridedArray::col_major_uninit`, `try_col_major_uninit`, `col_major_from_buffer_uninit` and
+`try_col_major_from_buffer_uninit` now return `StridedArray<MaybeUninit<T>>` and store their data as
+`Vec<MaybeUninit<T>>`. `Vec::set_len` over uninitialised slots is gone.
+
+**Why this is breaking, and why it had to be.** The old constructors built a `Vec<T>` whose `0..len` was not initialised.
+`Vec::set_len` is a claim that those slots *are* initialised; deferring that to the caller is not something it permits. With
+`T: Copy` admitting `bool`, `char`, `&U` and `NonNull<U>`, the `Vec` invariant was already broken before anyone wrote, so a
+later reborrow, reallocation or drop was UB — and a caller writing every element first did not make it sound.
+
+Migration, one line at a time:
+
+```rust
+// before
+let a: StridedArray<f64> = unsafe { StridedArray::col_major_uninit(&[3]) };
+let a = unsafe { a.write_all(...) };          // whatever wrote every element
+
+// after
+let a: StridedArray<MaybeUninit<f64>> = unsafe { StridedArray::col_major_uninit(&[3]) };
+// write every element through the uninit view, then read them out:
+let first: f64 = unsafe { a.get(&[0]).assume_init() };
+```
+
+There is deliberately no `StridedArray<MaybeUninit<T>> -> StridedArray<T>` conversion in this release: such a
+method would be an `unsafe fn` whose contract is "every slot is initialised", which is precisely the claim the old
+`set_len` made without evidence. A caller that wants the initialised type can build it from the values it wrote, or use the
+safe constructors from the start.
+
+Callers that do not need an uninitialised buffer should use the safe constructors and are unaffected.
+
+`strided-basic` and `strided-perm` move their `strided-view` requirement to `^0.8` in the same release; their own versions
+stay on the 0.13.x line because their public API is unchanged.
+
 ## 0.13.1 (unreleased)
 
 `strided-basic`, `strided-fused` and `strided-kernel` go to **0.13.1**: after
