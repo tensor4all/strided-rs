@@ -69,13 +69,13 @@ where
     }
     let (head, rest) = src.split_at(FOLD_LANES);
     let mut lanes: [U; FOLD_LANES] = core::array::from_fn(|lane| map_fn(Op::apply(head[lane])));
-    let mut chunks = rest.chunks_exact(FOLD_LANES);
-    for chunk in chunks.by_ref() {
+    let (chunks, remainder) = rest.as_chunks::<FOLD_LANES>();
+    for chunk in chunks {
         for (lane, &value) in lanes.iter_mut().zip(chunk) {
             *lane = reduce_fn(lane.clone(), map_fn(Op::apply(value)));
         }
     }
-    for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+    for (lane, &value) in lanes.iter_mut().zip(remainder) {
         *lane = reduce_fn(lane.clone(), map_fn(Op::apply(value)));
     }
     fold_lanes(lanes, init, reduce_fn)
@@ -319,7 +319,7 @@ where
 /// sharing a generic "map index to value" lane helper: routing the existing
 /// single-operand fold through such an accessor was measured at 0.34 ns/element
 /// against 0.11 ns/element on a contiguous `f64` `reduce` (1 MiB, release,
-/// `--release -j 4`), because the `chunks_exact` + `zip` form is what lets the
+/// `--release -j 4`), because the `as_chunks` + `zip` form is what lets the
 /// compiler drop the bound checks and vectorize the 16 lanes. Keep the two
 /// bodies in step by hand; both must use the lane assignment documented here.
 #[inline(always)]
@@ -351,9 +351,9 @@ where
     let (head_b, rest_b) = b.split_at(FOLD_LANES);
     let mut lanes: [U; FOLD_LANES] =
         core::array::from_fn(|lane| map_fn(OpA::apply(head_a[lane]), OpB::apply(head_b[lane])));
-    let mut chunks_a = rest_a.chunks_exact(FOLD_LANES);
-    let mut chunks_b = rest_b.chunks_exact(FOLD_LANES);
-    for (chunk_a, chunk_b) in chunks_a.by_ref().zip(chunks_b.by_ref()) {
+    let (chunks_a, remainder_a) = rest_a.as_chunks::<FOLD_LANES>();
+    let (chunks_b, remainder_b) = rest_b.as_chunks::<FOLD_LANES>();
+    for (chunk_a, chunk_b) in chunks_a.iter().zip(chunks_b) {
         for ((lane, &value_a), &value_b) in lanes.iter_mut().zip(chunk_a).zip(chunk_b) {
             *lane = reduce_fn(
                 lane.clone(),
@@ -361,11 +361,7 @@ where
             );
         }
     }
-    for ((lane, &value_a), &value_b) in lanes
-        .iter_mut()
-        .zip(chunks_a.remainder())
-        .zip(chunks_b.remainder())
-    {
+    for ((lane, &value_a), &value_b) in lanes.iter_mut().zip(remainder_a).zip(remainder_b) {
         *lane = reduce_fn(
             lane.clone(),
             map_fn(OpA::apply(value_a), OpB::apply(value_b)),
@@ -951,7 +947,7 @@ where
 /// [`strided_view::INLINE_RANK`] and spills above it.
 fn fill_outputs_with<U: Clone>(dest: &mut StridedViewMut<U>, value: &U) {
     let dims = dest.dims();
-    if dims.iter().any(|&dim| dim == 0) {
+    if dims.contains(&0) {
         return;
     }
     let strides = dest.strides();

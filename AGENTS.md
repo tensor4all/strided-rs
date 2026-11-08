@@ -56,6 +56,7 @@ All of the following must pass before pushing or creating a pull request:
 ```bash
 cargo fmt --all -- --check   # run `cargo fmt --all` to fix
 cargo test --workspace       # all tests
+cargo clippy --workspace --all-targets -- -D warnings   # the `clippy` CI job
 ```
 
 ## Repository Rules Review Bot

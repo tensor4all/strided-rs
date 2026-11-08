@@ -360,6 +360,7 @@ unsafe fn walk_outer<T>(
 ///
 /// Mirrors HPTT's `transpose_int`. Each [`LoopLevel`] iterates its dimension
 /// with inc=1. At the leaf, runs the 2D blocked transpose over dim_A × dim_B.
+#[allow(clippy::too_many_arguments)] // INVARIANT: raw cursors plus the tile geometry the leaf needs.
 unsafe fn transpose_recursive<T: Copy + 'static>(
     src: *const T,
     dst: *mut T,

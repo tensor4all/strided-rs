@@ -143,6 +143,9 @@ struct ScatterReplay {
 }
 
 impl ScatterReplay {
+    // Scatter compile: batch and window shapes, the index layout with its vector
+    // stride and component count, and the collapsed-slice set.
+    #[allow(clippy::too_many_arguments)]
     fn compile(
         batch_shape: &[usize],
         index_dims: &[usize],
@@ -192,6 +195,9 @@ impl ScatterReplay {
     }
 }
 
+// Replay strides: both shapes, the index strides and vector axis, the update
+// window set and the operand shape.
+#[allow(clippy::too_many_arguments)]
 fn scatter_replay_strides(
     index_dims: &[usize],
     index_strides: &[isize],
@@ -793,6 +799,8 @@ impl GatherPlan {
         // INVARIANT: compile and check_call validated compact rank-one layouts,
         // so incrementing these offsets once per logical element stays within
         // the validated allocations and cannot overflow isize.
+        // `index_offset` is the pointer walk of this gather line, not a counter.
+        #[allow(clippy::explicit_counter_loop)]
         for _ in 0..self.total {
             // SAFETY: the invariant above proves all three offsets are in bounds.
             unsafe {
@@ -2083,6 +2091,8 @@ impl ScatterPlan {
 
         // INVARIANT: compile and check_call validated compact rank-one index
         // and update layouts. Ordered replay preserves repeated-index semantics.
+        // `index_offset`/`update_offset` are the pointer walk, not counters.
+        #[allow(clippy::explicit_counter_loop)]
         for _ in 0..self.batch_elems {
             // SAFETY: the invariant above proves index/update reads and the
             // clamped destination offset are in their validated allocations.
@@ -2204,9 +2214,9 @@ fn expected_scatter_update_shape(
 ) -> AxisVec<usize> {
     let mut expected: AxisVec<usize> = AxisVec::with_capacity(update_dims.len());
     let mut batch_axis = 0usize;
-    for axis in 0..update_dims.len() {
+    for (axis, &dim) in update_dims.iter().enumerate() {
         if spec.update_window_dims.contains(&axis) {
-            expected.push(update_dims[axis]);
+            expected.push(dim);
         } else {
             expected.push(batch_shape[batch_axis]);
             batch_axis += 1;

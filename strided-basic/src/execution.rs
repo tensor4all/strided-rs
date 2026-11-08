@@ -511,6 +511,9 @@ pub unsafe fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
 /// cannot be represented, and otherwise only the error `f` returns; the
 /// splitter itself cannot fail. Callers must still satisfy the safety
 /// contract before invoking this prevalidated entry.
+// Splitter entry: the traversal's dims, blocks, per-operand strides and offsets,
+// the costs, the class, the token and the leaf closure.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub unsafe fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     dims: &[usize],

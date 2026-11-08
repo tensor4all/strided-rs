@@ -852,7 +852,7 @@ fn fused_all_real_ops_have_basic_parity() {
         let y = y.get(&[i]);
         let expected = [
             x / y,
-            x.max(1.5).min(2.0),
+            x.clamp(1.5, 2.0),
             x.ln(),
             x.sin(),
             x.cos(),

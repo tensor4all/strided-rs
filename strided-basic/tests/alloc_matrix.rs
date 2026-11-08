@@ -277,14 +277,14 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("map_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let source = sv(&src, dims, &strides, 0).unwrap();
+        let source = sv(&src, dims, strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         map_into(&mut dest, &source, |x| x + 1.0, exec).unwrap();
     });
 
     assert_entry("zip_map2_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         zip_map2_into(&mut dest, &va, &vb, |x, y| x + y, exec).unwrap();
@@ -292,7 +292,7 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("zip_map3_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let vc = sv(&c, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
@@ -301,7 +301,7 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("zip_map4_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let vc = sv(&c, dims, &dst_strides, 0).unwrap();
         let vd = sv(&src, dims, &dst_strides, 0).unwrap();
@@ -320,28 +320,28 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("add_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let source = sv(&src, dims, &strides, 0).unwrap();
+        let source = sv(&src, dims, strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         add_acc(&mut dest, &source, exec).unwrap();
     });
 
     assert_entry("mul_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let source = sv(&src, dims, &strides, 0).unwrap();
+        let source = sv(&src, dims, strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         mul_acc(&mut dest, &source, exec).unwrap();
     });
 
     assert_entry("axpy_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let source = sv(&src, dims, &strides, 0).unwrap();
+        let source = sv(&src, dims, strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         axpy_acc(&mut dest, &source, 1.5, exec).unwrap();
     });
 
     assert_entry("fma_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         fma_acc(&mut dest, &va, &vb, exec).unwrap();
@@ -349,7 +349,7 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("dot", pool, dims, &kinds, |kind, _exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let _ = dot::<f64, f64, f64, Identity, Identity>(&va, &vb).unwrap();
     });
@@ -359,19 +359,19 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
     // the one-operand entries.
     assert_entry("reduce", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let source = sv(&src, dims, &strides, 0).unwrap();
+        let source = sv(&src, dims, strides, 0).unwrap();
         let _ = reduce(&source, |x| x, |x, y| x + y, 0.0, exec).unwrap();
     });
 
     assert_entry("sum", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let source = sv(&src, dims, &strides, 0).unwrap();
+        let source = sv(&src, dims, strides, 0).unwrap();
         let _ = sum(&source, exec).unwrap();
     });
 
     assert_entry("zip_reduce", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let _: f64 = zip_reduce(&va, &vb, |x, y| x * y, |x, y| x + y, 0.0, exec).unwrap();
     });
@@ -383,7 +383,7 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("zip_update2_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         zip_update2_into::<f64, f64, Identity, Identity>(&mut dest, &va, |d, a| d + a, exec)
             .unwrap();
@@ -391,7 +391,7 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
 
     assert_entry("zip_update3_into", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
-        let va = sv(&a, dims, &strides, 0).unwrap();
+        let va = sv(&a, dims, strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
         zip_update3_into::<f64, f64, f64, Identity, Identity, Identity>(
@@ -411,7 +411,7 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
         let reduced_strides = col_major_strides(&reduced);
         assert_entry("reduce_axis_into", pool, dims, &kinds, |kind, exec| {
             let strides = &layouts[kind_index(kind)];
-            let source = sv(&src, dims, &strides, 0).unwrap();
+            let source = sv(&src, dims, strides, 0).unwrap();
             let mut dest =
                 StridedViewMut::new(&mut out[..reduced_len], &reduced, &reduced_strides, 0)
                     .unwrap();

@@ -470,8 +470,8 @@ fn compute_loop_order_transpose(
     dim_b: usize,
 ) -> PlanDimVec {
     let mut loop_dims: PlanDimVec = TinyVec::with_capacity(dims.len());
-    for d in 0..dims.len() {
-        if d != dim_a && d != dim_b && dims[d] > 1 {
+    for (d, &dim) in dims.iter().enumerate() {
+        if d != dim_a && d != dim_b && dim > 1 {
             loop_dims.push(d);
         }
     }
@@ -498,8 +498,8 @@ fn compute_loop_order_const(
     inner_dim: usize,
 ) -> PlanDimVec {
     let mut loop_dims: PlanDimVec = TinyVec::with_capacity(dims.len());
-    for d in 0..dims.len() {
-        if d != inner_dim && dims[d] > 1 {
+    for (d, &dim) in dims.iter().enumerate() {
+        if d != inner_dim && dim > 1 {
             loop_dims.push(d);
         }
     }

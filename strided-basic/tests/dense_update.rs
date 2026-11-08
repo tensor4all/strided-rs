@@ -228,7 +228,7 @@ fn triangular_mask_reads_reversed_offset_source() {
         .map(|flat| {
             let (row, col) = (flat % 4, flat / 4);
             // upper with k=1 keeps rows <= col - 1.
-            if row + 1 <= col {
+            if row < col {
                 at(&src, &[row, col])
             } else {
                 -1

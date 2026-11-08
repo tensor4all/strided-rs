@@ -362,6 +362,9 @@ fn halves(
 ///
 /// The leaf function `f` receives `(dims, blocks, strides_list, offsets)` describing
 /// the sub-region to process.
+// The whole traversal: dims, blocks, per-operand strides and offsets, the costs,
+// the class, the token and the leaf closure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mapreduce_threaded<S: AsRef<[isize]>, F>(
     dims: &[usize],
     blocks: &[usize],
@@ -390,6 +393,8 @@ fn strided_slices<S: AsRef<[isize]>>(strides_list: &[S]) -> SVec<&[isize]> {
 /// The leaf callback of a threaded region.
 type LeafFn<'a> = &'a (dyn Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<()> + Sync);
 
+// Borrowed-stride form of `mapreduce_threaded`, same arguments plus the leaf.
+#[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn mapreduce_threaded_dyn(
     dims: &[usize],

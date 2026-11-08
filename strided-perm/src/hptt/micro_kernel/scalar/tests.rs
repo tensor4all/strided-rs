@@ -24,7 +24,7 @@ fn test_scalar_f64_4x4() {
 #[test]
 fn test_scalar_f64_non_square_strides() {
     // src with lda=5 (5 elements per row), dst with ldb=6
-    let mut src = vec![0.0f64; 20];
+    let mut src = [0.0f64; 20];
     for i in 0..4 {
         for j in 0..4 {
             src[i * 5 + j] = (i * 10 + j) as f64;

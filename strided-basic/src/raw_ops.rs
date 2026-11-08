@@ -410,6 +410,8 @@ pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
     let mut rest = start;
     let mut dst_outer = dst_base;
     let mut src_outer = src_base;
+    // The axis indexes `index`, `layout.dims` and both stride tables at once.
+    #[allow(clippy::needless_range_loop)]
     for axis in 0..rank {
         let dim = layout.dims[axis];
         index[axis] = rest % dim;

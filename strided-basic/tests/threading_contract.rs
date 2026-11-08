@@ -244,6 +244,9 @@ fn a_pooled_token_opens_a_second_worker() {
 /// The remaining plans and the erased entries of the other crates are not listed
 /// here; each is replayed with a token by the tests that own it, so dropping the
 /// parameter fails those instead.
+// The point of this test is the exact argument and return type of every entry, so
+// the function-pointer types stay spelled out.
+#[allow(clippy::type_complexity)]
 #[test]
 fn every_fan_out_entry_takes_its_exec_token_last() {
     type V<'a> = StridedView<'a, f64>;
