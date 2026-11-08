@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -311,6 +312,29 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("archive is not complete", out)
 
+    def test_zeroed_member_header_is_not_green(self) -> None:
+        # GPT review on #416 (critical): zero the final member's 512-byte
+        # header, so tarfile takes it for the end-of-archive marker. The zero
+        # payload and padding behind it pass the tail check, and the publication
+        # commit is still an ancestor, so this used to report ok (exit 0) for a
+        # file that is gone from the tree. Only the checksum crates.io
+        # registered for the download sees it.
+        self.fx.write("zz.txt", "\0" * 512)  # all-zero payload, all the way to the tail
+        self.fx.commit("add zz.txt")
+        published = self.fx.package()
+        raw = bytearray(gzip.decompress(published))
+        with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+            offset = tf.getmember("demo-0.1.0/zz.txt").offset
+        raw[offset:offset + 512] = b"\0" * 512
+        damaged = gzip.compress(bytes(raw))
+        (self.fx.root / "demo" / "zz.txt").unlink()
+        self.fx.commit("delete zz.txt, same version")
+        with self._fake_crates_io(200, damaged, cksum=hashlib.sha256(published).hexdigest()):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not match the sha256 crates.io registered", out)
+        self.assertNotIn("ok          demo", out)
+
     VCS = "demo-0.1.0/.cargo_vcs_info.json"
 
     def _repacked(self, vcs: dict | None) -> bytes:
@@ -368,6 +392,35 @@ class PublishedIdentityTest(unittest.TestCase):
             rc = pi.main()
         self.assertEqual(rc, 2, out.getvalue())
         self.assertIn("shallow clone", out.getvalue())
+
+    def test_terminated_ancestry_check_is_not_green(self) -> None:
+        # GPT review on #416: a negative return code is how Python reports a
+        # signal (SIGTERM → -15). That is no ancestry answer, so returning "no
+        # differences" for it is a false green.
+        blob = self.fx.package()
+        with self._patch_run("--is-ancestor", (-15, "", "")):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("could not place commit", out)
+
+    def test_failed_shallow_query_is_not_green(self) -> None:
+        # GPT review on #416: the shallow-history query failing means the clone's
+        # completeness is unknown, which is "could not check", not "no
+        # differences".
+        blob = self.fx.package()
+        with self._patch_run("--is-shallow-repository", (128, "", "fatal: injected git error")):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("could not tell whether this clone is shallow", out)
+
+    def test_unrecognised_shallow_answer_is_not_green(self) -> None:
+        # GPT review on #416 (follow-up): exit 0 with output that is neither
+        # `true` nor `false` answers nothing either, even when the files match.
+        blob = self.fx.package()
+        with self._patch_run("--is-shallow-repository", (0, "", "")):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not say whether commit", out)
 
     def test_archive_without_vcs_info_is_not_green(self) -> None:
         # #415: no recorded commit means no provenance evidence; report that
@@ -453,9 +506,10 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertNotIn("unpublished", out)
 
     @staticmethod
-    def _opener(api_status: int, crate_blob: bytes | None = None):
-        """A urlopen-compatible opener: the API URL answers `api_status`, the
-        static download answers 200 with `crate_blob`. Non-2xx statuses are
+    def _opener(api_status: int, crate_blob: bytes | None = None, cksum: str | None = None):
+        """A urlopen-compatible opener: the API URL answers `api_status` with the
+        checksum crates.io registered for `crate_blob` (override with `cksum`),
+        the static download answers 200 with `crate_blob`. Non-2xx statuses are
         raised as HTTPError, exactly as urllib does, so fetch()'s HTTPError
         branch runs."""
         import urllib.error
@@ -465,23 +519,27 @@ class PublishedIdentityTest(unittest.TestCase):
                 super().__init__(body)
                 self.status = 200
 
+        registered = cksum or (
+            hashlib.sha256(crate_blob).hexdigest() if crate_blob is not None else "0" * 64)
+
         def urlopen(req, *args, **kwargs):
             url = req.full_url
             if "/api/v1/crates/" in url:
                 if api_status != 200:
                     raise urllib.error.HTTPError(url, api_status, "status", {}, None)
-                return Resp(b"{}")
+                return Resp(json.dumps({"version": {"checksum": registered}}).encode())
             if "static.crates.io" in url and crate_blob is not None:
                 return Resp(crate_blob)
             raise urllib.error.HTTPError(url, 404, "not found", {}, None)
 
         return urlopen
 
-    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None):
+    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None,
+                        cksum: str | None = None):
         """For main()-level runs: the default opener (urllib.request.urlopen,
         looked up at call time) is replaced by `_opener(...)`."""
         return mock.patch.object(pi.urllib.request, "urlopen",
-                                 self._opener(api_status, crate_blob))
+                                 self._opener(api_status, crate_blob, cksum))
 
     def test_api_503_through_urlopen_is_not_green(self) -> None:
         # GPT review on #411 (round 6): an HTTPError 503 from the API must be
@@ -552,6 +610,18 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ok          demo 0.1.0", out)
 
+    def _patch_run(self, match: str, result: tuple[int, str, str]):
+        """pi.run with the command whose argv contains `match` answering
+        `result`; every other command still runs for real."""
+        real = pi.run
+
+        def fake(cmd, cwd=None, timeout=120):
+            if any(match in part for part in cmd):
+                return result
+            return real(cmd, cwd=cwd, timeout=timeout)
+
+        return mock.patch.object(pi, "run", fake)
+
     def test_only_404_means_unpublished(self) -> None:
         with mock.patch.object(pi, "fetch", lambda url, opener=None: (404, b"")):
             self.assertIsNone(pi.published("demo", "0.1.0"))
@@ -568,9 +638,9 @@ class PublishedIdentityTest(unittest.TestCase):
 
 
 class MutationTest(unittest.TestCase):
-    """The transport tests must catch the two mutations named in the round-6
-    review on #411. Each mutation is applied to a copy of the script, and the
-    targeted tests are run against that copy in a subprocess; they must fail."""
+    """Each mutation is applied to a copy of the script, and the targeted tests
+    are run against that copy in a subprocess; they must fail. The transport
+    entries pin the round-6 review on #411, the others #415 and #416."""
 
     MUTATIONS = {
         # Comparison disabled after a successful status check.
@@ -593,6 +663,32 @@ class MutationTest(unittest.TestCase):
             "    if len(raw) - end < 1024 or any(raw[end:]):",
             "    if any(raw[end:]):",
             ["PublishedIdentityTest.test_archive_cut_at_a_member_boundary_is_not_green"],
+        ),
+        # The registry checksum not compared at all: the zeroed-header archive
+        # reads as complete and shorter, and goes green (#416).
+        "checksum_not_compared": (
+            "    if got != registered.lower():",
+            "    if False and got != registered.lower():",
+            ["PublishedIdentityTest.test_zeroed_member_header_is_not_green"],
+        ),
+        # A terminated ancestry check (rc -15) read as "not an ancestor", which
+        # is what `if rc == 1` alone would accept (#416).
+        "terminated_ancestry_accepted": (
+            "    if rc != 1:  # a negative rc is a signal (SIGTERM); >1 is a git error",
+            "    if False:",
+            ["PublishedIdentityTest.test_terminated_ancestry_check_is_not_green"],
+        ),
+        # A failing shallow-history query ignored (#416).
+        "failed_shallow_query_ignored": (
+            "    rc, out, _ = run([\"git\", \"rev-parse\", \"--is-shallow-repository\"], cwd=repo)\n    if rc != 0:",
+            "    rc, out, _ = run([\"git\", \"rev-parse\", \"--is-shallow-repository\"], cwd=repo)\n    if False:",
+            ["PublishedIdentityTest.test_failed_shallow_query_is_not_green"],
+        ),
+        # Any answer other than true/false accepted as "not shallow" (#416).
+        "shallow_answer_not_checked": (
+            '    if out.strip() != "false":',
+            "    if False:",
+            ["PublishedIdentityTest.test_unrecognised_shallow_answer_is_not_green"],
         ),
     }
 

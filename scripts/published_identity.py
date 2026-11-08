@@ -36,7 +36,17 @@ Caveats, stated rather than hidden:
     the archive was built from. A version published from a dirty worktree, or
     from a commit that is not an ancestor of the checked ref, is a MISMATCH;
     an archive that carries no such record, or names a commit this clone does
-    not have, is exit 2 (nothing was verified).
+    not have, is exit 2 (nothing was verified). The ancestry answer is only
+    accepted from `git merge-base --is-ancestor` exit 0 or 1; a git that fails
+    to answer (including a terminated process) is exit 2, and so is a failure
+    to say whether the clone is shallow.
+  * The downloaded .crate is checked against the sha256 crates.io registered
+    for that version before it is parsed, so a corrupt download is exit 2
+    whatever a tar reader makes of it. A .crate whose final member header is
+    zeroed reads as a complete, SHORTER archive (tarfile takes the zero header
+    for the end-of-archive marker, and the zero payload and padding behind it
+    pass a tail-is-zero check), which is the #415 false green; only the
+    registered checksum sees that.
   * Both archives must parse completely, down to the end-of-archive zero
     blocks. tarfile silently ends the member list at a damaged header after the
     first block, so a damaged .crate reads as a SHORTER one and a shipped file
@@ -146,15 +156,30 @@ def published(name: str, ver: str, opener=None) -> bytes | None:
     Only a 404 from the API counts as "not published". Any other failure is a
     failure to check: treating a network error as `unpublished` would turn an
     outage into a green run.
+
+    The download is checked against the sha256 crates.io registered for it: the
+    only integrity claim here that does not come from a parser of the file
+    itself (see the caveat at the top of this file for the zeroed-header case
+    that no tar-level check can see).
     """
-    code, _ = fetch(f"https://crates.io/api/v1/crates/{name}/{ver}", opener)
+    code, body = fetch(f"https://crates.io/api/v1/crates/{name}/{ver}", opener)
     if code == 404:
         return None
     if code != 200:
         raise CheckError(f"crates.io API returned {code} for {name} {ver}")
+    try:
+        registered = json.loads(body)["version"]["checksum"]
+        if not isinstance(registered, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", registered):
+            raise ValueError(registered)
+    except (ValueError, KeyError, TypeError) as e:
+        raise CheckError(f"crates.io registered no sha256 for {name} {ver}: {e!r}") from e
     code, blob = fetch(f"https://static.crates.io/crates/{name}/{name}-{ver}.crate", opener)
     if code != 200 or not blob:
         raise CheckError(f"download of {name}-{ver}.crate returned {code}")
+    got = hashlib.sha256(blob).hexdigest()
+    if got != registered.lower():
+        raise CheckError(f"{name}-{ver}.crate does not match the sha256 crates.io registered"
+                         f" (registered {registered.lower()}, downloaded {got})")
     return blob
 
 
@@ -222,21 +247,28 @@ def provenance(repo: str, ref: str, crate: dict, vcs: dict | None) -> list[str]:
     if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
         raise CheckError(f"the published archive names no usable commit: {sha!r}")
     rc, out, _ = run(["git", "rev-parse", "--is-shallow-repository"], cwd=repo)
-    if rc == 0 and out.strip() == "true":
+    if rc != 0:
+        raise CheckError(f"could not tell whether this clone is shallow, so commit"
+                         f" {sha} cannot be placed in history"
+                         f" (git rev-parse --is-shallow-repository exited {rc})")
+    if out.strip() == "true":
         raise CheckError(f"this is a shallow clone, so commit {sha} cannot be placed"
                          " in history (check out the full history)")
+    if out.strip() != "false":
+        raise CheckError(f"git rev-parse --is-shallow-repository answered {out.strip()!r},"
+                         f" which does not say whether commit {sha} can be placed in history")
     rc, _, err = run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo)
     if rc != 0:
         raise CheckError(f"commit {sha} recorded in the published archive is not in"
                          f" this repository: {err.strip()[:200]}")
     rc, _, _ = run(["git", "merge-base", "--is-ancestor", sha, ref], cwd=repo)
-    if rc > 1:  # 0 = ancestor, 1 = not an ancestor, anything else is a git error
+    if rc == 0:  # 0 = ancestor, 1 = not an ancestor; nothing else answers the question
+        return []
+    if rc != 1:  # a negative rc is a signal (SIGTERM); >1 is a git error
         raise CheckError(f"could not place commit {sha} in history"
                          f" (git merge-base --is-ancestor exited {rc})")
-    if rc == 1:
-        return [f"{label}: published from {sha[:10]}, which is not an ancestor"
-                f" of {ref[:10]}"]
-    return []
+    return [f"{label}: published from {sha[:10]}, which is not an ancestor"
+            f" of {ref[:10]}"]
 
 
 def package_tree(repo: str, crate: dict, target_dir: str) -> bytes:
