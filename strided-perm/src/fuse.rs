@@ -112,16 +112,19 @@ pub fn compute_importance(
     }
 
     // Add contributions from remaining arrays. `m` bounds the row count but not a
-    // row's length, so this matches the previous index-based loop only while every
-    // row has `n` entries, which is what the only caller builds. A short row is not
-    // skipped: `enumerate` stops at the row's end, so that row contributes to the
-    // dimensions it has an order for and nothing to the rest, whereas the previous
-    // loop read `index_orders[k][i]` for every `i < n` and panicked on the first
-    // missing entry. Measured (`dims = [2, 2]`, strides `[1, 2], [1, 2], [0]`): `[32, 3]`.
+    // row's length, which the only caller builds as `n` entries per row. Neither
+    // mismatch indexes past either side: a short row contributes the orders it has
+    // and nothing to the remaining dimensions, where the index-based loop this
+    // replaced (`for i in 0..n { index_orders[k][i] }`) panicked on the first
+    // missing entry; a row longer than `n` has its suffix ignored, as before.
+    // Measured (`dims = [2, 2]`, strides `[1, 2], [1, 2], [0]`): orders
+    // `[[1, 2], [1, 2], [1]]` -> `[32, 3]` (short), `[[1, 2], [1, 2], [1, 2, 1]]`
+    // -> `[32, 4]` (long, suffix ignored).
     for row in &index_orders[1..m] {
-        for (i, &order) in row.iter().enumerate() {
-            let shift = g * (n - order) as u64;
-            importance[i] += 1u64 << shift;
+        for (i, slot) in importance.iter_mut().enumerate() {
+            if let Some(&order) = row.get(i) {
+                *slot += 1u64 << (g * (n - order) as u64);
+            }
         }
     }
 
