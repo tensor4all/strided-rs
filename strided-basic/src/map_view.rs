@@ -1434,7 +1434,8 @@ pub(crate) fn map_raw_into_validated<
     )
 }
 
-// Raw parts: destination pointer/layout plus source pointer/layout, called per block.
+// Raw parts for the whole operation, not one block: this entry point checks the shapes and
+// the destination layout, then forwards the same parts to `map_parts_into_validated`.
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into<
     D: Copy + Send + Sync,
@@ -1811,7 +1812,8 @@ pub(crate) fn zip_map2_raw_into_validated<
     )
 }
 
-// Raw parts: destination and both operand pointers with their layouts, per block.
+// Raw parts for the whole binary operation: the shape and destination-layout checks live
+// here, and `zip_map2_parts_into_validated` below does the planning and dispatch.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into<
     D: Copy + Send + Sync,
@@ -1849,7 +1851,8 @@ fn zip_map2_parts_into<
     )
 }
 
-// Raw parts: the same three operands plus the `validated` marker, called per block.
+// The same three raw-parts operands plus the `validated` marker: the planned traversal for the
+// whole operation, entered once, not per block.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into_validated<
     D: Copy + Send + Sync,
@@ -1963,7 +1966,8 @@ fn zip_map2_parts_into_validated<
     )
 }
 
-// Raw parts: destination and both operand pointers with their layouts, per block.
+// Raw parts for the whole multiplication: it takes the contiguous fast path when the three
+// layouts agree, and otherwise walks the strided one. The operands are the operation's, not a block's.
 #[allow(clippy::too_many_arguments)]
 fn mul_identity_into_raw<
     O: MulOutput<D>,

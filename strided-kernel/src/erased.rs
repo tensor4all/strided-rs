@@ -885,7 +885,7 @@ impl ErasedDynamicSlicePlan {
     /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
     /// cannot be proven injective, and [`StridedError::InvalidAxis`] when a
     /// slice size exceeds its operand extent.
-    // Dtype pair plus the operand, start, destination and update layouts: the plan key.
+// Dtype pair plus the operand, start and destination layouts and the slice sizes: the plan key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
