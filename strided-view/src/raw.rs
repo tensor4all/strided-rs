@@ -667,7 +667,7 @@ impl<'a> ErasedRawStridedMut<'a> {
                 actual: self.dtype.label(),
             });
         }
-        // SAFETY: as `data_as` (raw.rs:386) — the dtype check proves `T`, and
+        // SAFETY: as `data_as` (raw.rs:529) — the dtype check proves `T`, and
         // `validate_erased_buffer_layout` (raw.rs:161) proved the base is
         // `T`-aligned with a whole multiple of `size_of::<T>()` bytes. `&mut
         // self` keeps this reborrow exclusive for its own lifetime.

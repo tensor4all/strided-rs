@@ -203,8 +203,8 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // and `at` (execute.rs:184) advances `src`/`dst` by the plan's
                     // own `lda_root`/`ldb_root` for that axis, so `s`/`d` and the
                     // tile `dispatch_blocked_2d`/`transpose_recursive` write stay
-                    // inside the buffers the caller proved valid under this
-                    // function's `# Safety` (execute.rs:104).
+                    // inside the buffers the caller proved valid under
+                    // `execute_permute_blocked`'s `# Safety` (execute.rs:104).
                     unsafe {
                         if inner.is_empty() {
                             dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
@@ -226,7 +226,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // SAFETY: as the Transpose arm above — `i` is a logical position
                     // on the root axis, so `s`/`d` advance by the plan's own strides
                     // for that axis and stay inside the caller-proved buffers
-                    // (`execute.rs:104`).
+                    // (`execute_permute_blocked`'s `# Safety`, execute.rs:104).
                     unsafe {
                         if inner.is_empty() {
                             const_stride1_copy(s, d, count, src_stride, dst_stride);
@@ -251,7 +251,8 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // grouped offset tables were built by
                     // `try_build_grouped_tile_plan` (plan.rs:274) from the same
                     // validated layout, so every access stays inside the
-                    // caller-proved buffers (`execute.rs:104`).
+                    // caller-proved buffers (`execute_permute_blocked`'s `# Safety`,
+                    // execute.rs:104).
                     unsafe {
                         if inner.is_empty() {
                             grouped_tile_copy(s, d, grouped);
@@ -579,14 +580,14 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     let src_addr = src as usize;
     let dst_addr = dst as usize;
     match native_float_kind::<T>() {
-        // SAFETY: `for_each_tile_par` (execute.rs:532) hands out tile origins in
+        // SAFETY: `for_each_tile_par` (execute.rs:533) hands out tile origins in
         // `0..size_a` x `0..size_b` with extents clamped to the grid, so each
         // sub-tile stays inside the `size_a` x `size_b` region whose validity the
         // caller proved under `execute_permute_blocked`'s `# Safety`
         // (execute.rs:109). Tiles are disjoint as logical index sets; that they
         // reach distinct destination offsets, and so that no two workers write one
         // offset, rests on the caller's injective destination (established at
-        // `copy.rs:184`), not on the tile partition.
+        // `is_injective_layout`, `copy.rs:184`), not on the tile partition.
         Some(8) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_f64(
                 (src_addr as *const f64).offset(ia as isize + ib as isize * lda),

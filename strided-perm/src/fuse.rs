@@ -111,7 +111,10 @@ pub fn compute_importance(
         importance[i] = 2 * (1u64 << shift);
     }
 
-    // Add contributions from remaining arrays
+    // Add contributions from remaining arrays. `m` bounds the rows but not their
+    // length, so this matches the previous index-based loop only for inputs whose
+    // rows all have `n` entries: a short row is skipped here where that loop read
+    // `index_orders[k][i]` and panicked.
     for row in &index_orders[1..m] {
         for (i, &order) in row.iter().enumerate() {
             let shift = g * (n - order) as u64;
