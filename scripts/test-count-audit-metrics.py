@@ -199,7 +199,7 @@ def test_path_exclusions_use_repo_relative_components() -> None:
         # 1001 logical lines: an absolute-path filter would drop this file and
         # report 0, and a constant-zero `files_over_1000` would too.
         (src / "real.rs").write_text(
-            "pub fn f() {\n    unsafe {}\n}\n" + "// filler\n" * 999, encoding="utf-8"
+            "pub fn f() {\n    unsafe {}\n}\n" + "// filler\n" * 998, encoding="utf-8"
         )
         counts = mod.count(root)
     assert counts["unsafe"] == 1, counts
