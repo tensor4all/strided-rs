@@ -260,6 +260,14 @@ CONTENT_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
         re.compile(r"criterion|black_box|Instant::now"),
         frozenset({"Performance And Benchmark Discipline"}),
     ),
+    (
+        # A denied dependency is added in a Cargo.toml line, and path routing
+        # only inspects the path: `strided-basic/Cargo.toml` or the root
+        # `Cargo.toml` matches no dependency trigger, so the rule that forbids
+        # the dependency was never supplied to the reviewer.
+        re.compile(r"(?:^|[^A-Za-z0-9_-])(?:t4a-)?faer\b|\bspindle\b"),
+        frozenset({"HPTT And faer Integration"}),
+    ),
 )
 
 

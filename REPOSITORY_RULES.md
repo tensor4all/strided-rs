@@ -247,12 +247,11 @@ Shared: [`common/provenance.md` § Record References In The Source](https://gith
 
 Shared: [`common/performance.md` § General Checklist](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/common/performance.md#general-checklist),
 [§ Evidence](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/common/performance.md#evidence),
-[`common/docs-and-tests.md` § Benchmarks](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/common/docs-and-tests.md#benchmarks).
+[`common/docs-and-tests.md` § Benchmarks](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/common/docs-and-tests.md#benchmarks),
+[`benchmark/measurement.md` § One measurement at a time](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/benchmark/measurement.md#one-measurement-at-a-time).
 
 - This workspace's own regression benchmarks live in `<crate>/benches/`. Keep
   them there. The rule is about location, not about which harness they use.
-- Use release-mode benchmarks for performance claims. Pin thread counts and
-  backend configuration, and do not run benchmark jobs concurrently.
 - Cross-repository comparisons, competitor and cross-language baselines, and
   any *published* benchmark results belong in
   `tensor4all/strided-rs-benchmark-suite`, not in this repository.
