@@ -396,6 +396,66 @@ class PublishedIdentityTest(unittest.TestCase):
         with self.assertRaises(pi.CheckError):
             pi.member_source("/repo", crate, "README.md", "/tmp")
 
+    def test_probe_payload_matching_neither_file_is_not_checked(self) -> None:
+        # GPT review on #421: a probe archive whose member is neither the marker
+        # nor the declared copy is a failed probe, not an answer ("the declared
+        # copy"), so it must not pick a witness.
+        (self.fx.root / "README.md").write_text("# external\n")
+        self.fx.write("README.md", "# crate-local\n")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("both readmes, no exclude")
+        blob = self.fx.package()
+        real = pi.package_tree
+
+        def unexpected(*args, **kwargs):
+            probe = real(*args, **kwargs)
+            if not kwargs.get("allow_dirty"):
+                return probe
+            return repack(probe, {"demo-0.1.0/README.md": b"neither candidate\n"})
+
+        with mock.patch.object(pi, "package_tree", unexpected):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("neither the crate-local file nor", out)
+        self.assertNotIn("ok          demo", out)
+
+    def test_probe_refuses_a_crate_outside_the_temporary_checkout(self) -> None:
+        # GPT review on #421 (critical): a workspace member that is a symlink to a
+        # directory elsewhere put a live file under the probe's write path. The
+        # probe must refuse before writing and before packaging anything.
+        outer = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (outer / "README.md").write_text("# live file\n")
+        wt = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (wt / "demo").symlink_to(outer, target_is_directory=True)
+        crate = {"name": "demo", "version": "0.1.0", "root": str(wt / "demo"),
+                 "readme": "../README.md", "license_file": None}
+        with mock.patch.object(pi, "package_tree",
+                               side_effect=AssertionError("probe wrote into a live tree")):
+            with self.assertRaises(pi.CheckError) as raised:
+                pi.ships_local_namesake(str(wt), crate, "README.md", str(wt),
+                                        outer / "README.md")
+        self.assertIn("outside the temporary checkout", str(raised.exception))
+        self.assertEqual((outer / "README.md").read_text(), "# live file\n")
+
+    def test_probe_puts_the_file_back_when_the_marker_write_fails(self) -> None:
+        # GPT review on #421 (critical): a failed marker write used to leave the
+        # original behind under the backup name. It must be restored instead.
+        root = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (root / "README.md").write_text("# crate-local\n")
+        (root.parent / "README.md").write_text("# external\n")
+        crate = {"name": "demo", "version": "0.1.0", "root": str(root),
+                 "readme": "../README.md", "license_file": None}
+
+        def no_space(self_, data):
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(pathlib.Path, "write_bytes", no_space):
+            with self.assertRaises(OSError):
+                pi.ships_local_namesake(str(root), crate, "README.md", str(root),
+                                        root.parent / "README.md")
+        self.assertEqual((root / "README.md").read_text(), "# crate-local\n")
+        self.assertEqual([p.name for p in root.iterdir()], ["README.md"])
+
     def test_unchanged_file_with_a_newline_in_its_name_is_ok(self) -> None:
         # GPT review on #411 (18:10Z, item 2): `notes\nmore` is one file.
         self.fx.write("notes\nmore", "x\n")
@@ -1022,6 +1082,28 @@ class MutationTest(unittest.TestCase):
             "    return (local if False",
             ["PublishedIdentityTest.test_tampered_crate_local_readme_behind_an_external_declaration_is_not_green",
              "PublishedIdentityTest.test_external_readme_next_to_a_shipped_crate_local_namesake_is_ok"],
+        ),
+        # A probe archive whose member is neither the marker nor the declared
+        # copy is a failed probe, not an answer (#421 review).
+        "probe_result_not_checked": (
+            """    raise CheckError(f"the probe packaging of {crate['name']} carries a {rel} that is"
+                     f" neither the crate-local file nor {declared}")""",
+            "    return True",
+            ["PublishedIdentityTest.test_probe_payload_matching_neither_file_is_not_checked"],
+        ),
+        # The probe writing through a symlinked workspace member, outside the
+        # throwaway checkout (#421 review, critical).
+        "probe_path_escape_allowed": (
+            "    if not local.resolve().is_relative_to(pathlib.Path(repo).resolve()):",
+            "    if False:",
+            ["PublishedIdentityTest.test_probe_refuses_a_crate_outside_the_temporary_checkout"],
+        ),
+        # The restore after a failed marker write skipped, which leaves the
+        # original behind under the backup name (#421 review, critical).
+        "probe_restore_skipped": (
+            "            except OSError:\n                pass  # nothing of ours to remove; the move below still restores",
+            "            except OSError:\n                raise",
+            ["PublishedIdentityTest.test_probe_puts_the_file_back_when_the_marker_write_fails"],
         ),
         # The end-of-archive check back to "something is there": a zeroed last
         # member header then leaves its own header and payload behind two

@@ -249,18 +249,34 @@ def ships_local_namesake(repo: str, crate: dict, rel: str, target_dir: str,
     is re-implemented here, and the worktree is this script's own temporary one.
     """
     local = pathlib.Path(crate["root"]) / rel
+    # The probe writes into the tree, so the file has to be one of this
+    # checkout's own files: a workspace member that is a symlink elsewhere would
+    # put a live file outside the throwaway worktree (#421 review).
+    if not local.resolve().is_relative_to(pathlib.Path(repo).resolve()):
+        raise CheckError(f"the tree archive's {rel} resolves to {local.resolve()}, outside"
+                         f" the temporary checkout {repo}: not writing there to ask Cargo")
     marker = os.urandom(32)
-    # Renamed aside in the same directory (same filesystem), under a name no file
-    # in a package can have, so nothing is clobbered and a symlink stays a symlink.
-    aside = local.with_name(f".identity-probe-{os.urandom(8).hex()}")
-    local.rename(aside)
+    # The backup goes to a temporary directory outside the package (Cargo ships a
+    # file left beside the crate-local one), and the restore below runs even when
+    # writing the marker fails, so the original is never left behind under a
+    # backup name (#421 review). shutil.move is a rename, or a copy across
+    # filesystems; moving rather than reading keeps a symlink a symlink.
+    backup = tempfile.mkdtemp(prefix="published-identity-probe-")
+    aside = pathlib.Path(backup) / local.name
     try:
-        local.write_bytes(marker)
-        probe, _ = crate_archive(package_tree(repo, crate, os.path.join(target_dir, "probe"),
-                                             allow_dirty=True))
+        shutil.move(str(local), str(aside))
+        try:
+            local.write_bytes(marker)
+            probe, _ = crate_archive(package_tree(repo, crate, os.path.join(target_dir, "probe"),
+                                                  allow_dirty=True))
+        finally:
+            try:
+                local.unlink()
+            except OSError:
+                pass  # nothing of ours to remove; the move below still restores
+            shutil.move(str(aside), str(local))
     finally:
-        local.unlink()
-        aside.rename(local)
+        shutil.rmtree(backup, ignore_errors=True)
     if rel not in probe:
         raise CheckError(f"the probe packaging of {crate['name']} has no {rel}, so it does"
                          " not say which file Cargo archived")
