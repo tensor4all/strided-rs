@@ -69,9 +69,10 @@ fn a_serial_token_never_justifies_a_second_worker() {
 // The gate that decides a fork (`cost.rs`'s `parallel_width` and the
 // `is_parallel` leaves) opens at `3 * dispatch_cost / ns_per_element`: 1732
 // elements for `KernelClass::Map` against this pool's 100 ns section cost on an
-// AVX-512 host (0.173 ns per element), 3000 on the generic and aarch64 rates
-// (0.100). 512x512 is 151x above that, so the element count is not what decides
-// this test; see [`Seen::record`] for the margin that does.
+// AVX-512 host (0.173 ns per element), about 3000 on the generic and aarch64
+// rates (0.100) — rounded to whole nanoseconds, so 2999 elements already clear
+// that count. 512x512 is 151x above the gate, so the element count is not what
+// decides this test; see [`Seen::record`] for the margin that does.
 const ROWS: usize = 512;
 const COLS: usize = 512;
 
