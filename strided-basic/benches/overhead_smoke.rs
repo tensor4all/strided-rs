@@ -10,8 +10,8 @@
 //! Run with `OVERHEAD_GATE=1` to make a failed gate exit non-zero; without it
 //! the table is printed and the process succeeds, so local runs and first CI
 //! runs can collect numbers. The gate is deliberately forgiving: it fails only
-//! when all [`support::ATTEMPTS`] attempts exceed the threshold, and the
-//! per-round timing is the minimum of [`support::ROUNDS`] rounds.
+//! when all [`support::ATTEMPTS`] attempts exceed its bound, and each attempt's
+//! time is the median of [`support::REPS`] samples.
 //!
 //! Rows (see `#306`):
 //! - S3a/S3b: `map_into` replanning per call vs a compiled typed `UpdatePlan`
@@ -192,7 +192,13 @@ fn main() {
     let cases = {
         vec![
             // Gated against the typed compiled plan (P4 per-call planning).
-            s3_case(&[16], "S3a", 20_000, S3Baseline::TypedUpdatePlan, Gate::Bound(2.5)),
+            s3_case(
+                &[16],
+                "S3a",
+                20_000,
+                S3Baseline::TypedUpdatePlan,
+                Gate::Bound(2.5),
+            ),
             s3_case(
                 &[4, 4, 4],
                 "S3b",
@@ -202,7 +208,13 @@ fn main() {
             ),
             // The erased compiled plan downstream actually replays: report
             // only, because the erased boundary adds its own overhead.
-            s3_case(&[16], "S3c", 20_000, S3Baseline::ErasedUpdatePlan, Gate::Report),
+            s3_case(
+                &[16],
+                "S3c",
+                20_000,
+                S3Baseline::ErasedUpdatePlan,
+                Gate::Report,
+            ),
             s3_case(
                 &[4, 4, 4],
                 "S3d",

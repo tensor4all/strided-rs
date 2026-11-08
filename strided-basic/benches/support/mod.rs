@@ -36,31 +36,42 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 /// Timed samples per path per attempt. The reported time is their median and the
-/// tolerance comes from their spread, so this must be large enough for a
-/// percentile to mean something: 9 keeps the p95 at the second-largest sample.
+/// tolerance comes from their spread. With 9 samples the nearest-rank p95 is the
+/// largest sample and the median is the 5th, so the spread is computed from the
+/// paired ratios rather than from p95.
 pub const REPS: usize = 9;
 /// Attempts before a gate may fail; a case fails only when all fail.
 pub const ATTEMPTS: usize = 3;
-/// A parity gate is `1 + GATE_MULTIPLE * spread`, so a run whose spread is `s`
-/// tolerates a ratio `2s` above 1 before it turns red. Two spreads is what the
-/// paired samples of a quiet run justify: the median moves by about the
-/// half-width of the distribution, and one attempt's median is not the next's.
-pub const GATE_MULTIPLE: f64 = 2.0;
-/// Floor for a parity gate, for a run whose measured spread is zero or near it.
-/// Without it a perfectly repeatable run would demand an exact ratio of 1.0 and
-/// fail on the rounding of a single sample.
-pub const GATE_FLOOR: f64 = 0.05;
+/// `MAD` scaled to a standard deviation for a normal distribution
+/// (`1 / Phi^-1(0.75)`). The ruling for #395 requires MAD rather than IQR: at
+/// n ~ 5 an IQR is zero or jumps to a neighbour, while a scaled MAD stays
+/// defined.
+pub const MAD_TO_SIGMA: f64 = 1.4826;
+/// A parity gate is `median + SIGMA_MULTIPLE * sigma`, computed from this run's
+/// own paired samples: the width is derived from the run, not from a constant
+/// baked in from another machine.
+pub const SIGMA_MULTIPLE: f64 = 3.0;
+/// The ratio a [`Gate::Parity`] row asserts: A and B cost the same.
+pub const PARITY_ANCHOR: f64 = 1.0;
+/// Floor on the width, as a fraction of the median. A perfectly repeatable run
+/// would otherwise get a zero-width gate and fail on the rounding of one sample.
+pub const GATE_FLOOR_FRACTION: f64 = 0.15;
 /// Calls per allocation-count window (the count is exact, so this is just
 /// enough to average over).
 pub const ALLOC_ITERS: usize = 64;
 
 /// How a row's ratio is judged.
+///
+/// The two benches share this file but gate different rows, so each compilation
+/// uses a subset of these variants.
+#[allow(dead_code)] // shared by two bench binaries; neither uses every variant
 #[derive(Clone, Copy)]
 pub enum Gate {
-    /// A and B should cost the same. The tolerance is derived from this run's
-    /// own spread ([`GATE_MULTIPLE`] x the wider of the two p95-over-median
-    /// ratios, never below [`GATE_FLOOR`]), so a quiet machine gets a tight gate
-    /// and a noisy one does not turn white noise into a red build.
+    /// A and B should cost the same. The bound is
+    /// `1 + 3 * max(1.4826 * MAD, 0.15 * median)` over this attempt's
+    /// paired ratios, so a quiet machine gets a tight gate and a run that is
+    /// already swinging widens its own, instead of turning the runner's noise
+    /// into a red build.
     Parity,
     /// A deliberately loose first bound on a ratio that is *not* expected to be
     /// 1 (see #306: these start loose and tighten with history). Allocations are
@@ -91,6 +102,36 @@ pub fn allocations_per_op(body: &mut impl FnMut()) -> f64 {
     (after - before) as f64 / ALLOC_ITERS as f64
 }
 
+/// Width of a [`Gate::Parity`] tolerance: `max(1.4826 * MAD, 0.15 * median)`.
+///
+/// The floor is what keeps a run whose MAD measures exactly zero from getting a
+/// zero-width gate: with `median > 0` the width is at least `0.15 * median`, so
+/// the bound is at least `1 + 3 * 0.15 * median` and a repeatable row is still
+/// allowed to move. Above parity that bound rises with the median, so a steady
+/// ratio of `m` passes while `m <= 1 + 0.45 * m`, i.e. up to `m = 1.82`; see the
+/// #395 worklog for why that band is the owner's decision. A `median` of zero means the timer measured nothing, which no row in
+/// these benches can produce (`time_once` divides elapsed nanoseconds, not a
+/// tick count).
+fn parity_width(median: f64, mad: f64) -> f64 {
+    (MAD_TO_SIGMA * mad).max(GATE_FLOOR_FRACTION * median)
+}
+
+/// Bound of a [`Gate::Parity`] row: `1 + 3 * width`.
+///
+/// The anchor is 1.0 — "the two paths cost the same" — not the measured median.
+/// Anchoring at the median would let a *steady* regression admit itself: nine
+/// identical ratios of 2.0 give `MAD = 0`, so the width is `0.15 * 2.0 = 0.3` and
+/// a `median + 3 * width` bound of 2.9 would pass a row that is twice as slow as
+/// it is allowed to be. With the 1.0 anchor the same row gets `1 + 0.9 = 1.9` and
+/// fails, and a row sitting at parity gets `1 + 3 * max(1.4826 * MAD, 0.15)`,
+/// i.e. ~1.45 for any median near 1.
+///
+/// MAD enters here and only here. [`Gate::Bound`] carries an absolute limit that
+/// no dispersion measurement can move.
+fn parity_bound(median: f64, mad: f64) -> f64 {
+    PARITY_ANCHOR + SIGMA_MULTIPLE * parity_width(median, mad)
+}
+
 /// Value at rank `q` (0..=1) of an already sorted slice, nearest rank.
 fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
@@ -108,7 +149,8 @@ pub struct CaseResult {
     b_med: f64,
     b_p95: f64,
     ratio: f64,
-    spread: f64,
+    spread: Option<f64>,
+    mad: f64,
     a_allocs: f64,
     b_allocs: f64,
     gate: Gate,
@@ -135,7 +177,10 @@ impl CaseResult {
             return true;
         }
         match self.gate_value() {
-            Some(_) => self.attempts_exceeded == ATTEMPTS,
+            // `ratio` is the worst attempt's median and `bound` is that same
+            // attempt's bound, so this is "the worst attempt is over its limit".
+            // One attempt over the limit is a blip; all of them is a verdict.
+            Some(bound) => self.attempts_exceeded == ATTEMPTS && self.ratio > bound,
             None => false,
         }
     }
@@ -145,9 +190,10 @@ impl CaseResult {
 ///
 /// Both paths are warmed up first, then sampled [`REPS`] times per attempt in an
 /// interleaved order, so a frequency or thermal drift cannot land entirely on
-/// one side of the ratio. Per attempt this records the median and p95 of each
-/// path and judges `median(A) / median(B)`; the spread that decides a
-/// [`Gate::Parity`] tolerance is the wider of the two `p95 / median` ratios.
+/// one side of the ratio. The statistic is the median of the **paired** ratios
+/// `A_i / B_i`, and a [`Gate::Parity`] width comes from the MAD of those same
+/// ratios. The per-path medians and p95 values are recorded for diagnosis, not
+/// for the verdict.
 ///
 /// A gated row fails only when all [`ATTEMPTS`] attempts exceed its bound. One
 /// attempt over the bound is a blip, not a verdict: attempt-to-attempt movement
@@ -168,6 +214,7 @@ pub fn measure_case(
 
     let mut a_samples = Vec::with_capacity(REPS);
     let mut b_samples = Vec::with_capacity(REPS);
+    let mut ratios = Vec::with_capacity(REPS);
     let mut worst_ratio = -f64::INFINITY;
     let mut reported = None;
     let mut tolerance: Option<f64> = None;
@@ -178,23 +225,34 @@ pub fn measure_case(
     for _ in 0..ATTEMPTS {
         a_samples.clear();
         b_samples.clear();
+        ratios.clear();
         for _ in 0..REPS {
-            a_samples.push(time_once(iterations, &mut path_a));
-            b_samples.push(time_once(iterations, &mut path_b));
+            let a = time_once(iterations, &mut path_a);
+            let b = time_once(iterations, &mut path_b);
+            a_samples.push(a);
+            b_samples.push(b);
+            ratios.push(a / b);
         }
         a_samples.sort_by(f64::total_cmp);
         b_samples.sort_by(f64::total_cmp);
+        ratios.sort_by(f64::total_cmp);
 
         let a_med = percentile_sorted(&a_samples, 0.5);
         let a_p95 = percentile_sorted(&a_samples, 0.95);
         let b_med = percentile_sorted(&b_samples, 0.5);
         let b_p95 = percentile_sorted(&b_samples, 0.95);
-        let ratio = a_med / b_med;
-        let spread = (a_p95 / a_med).max(b_p95 / b_med) - 1.0;
-        let bound = match gate {
-            Gate::Parity => Some(1.0 + (GATE_MULTIPLE * spread).max(GATE_FLOOR)),
-            Gate::Bound(bound) => Some(bound),
-            Gate::ReportGated | Gate::Report => None,
+        let ratio = percentile_sorted(&ratios, 0.5);
+        // MAD about the ratio median, scaled to sigma, floored at 15% of it.
+        let mut deviations: Vec<f64> = ratios.iter().map(|r| (r - ratio).abs()).collect();
+        deviations.sort_by(f64::total_cmp);
+        let mad = percentile_sorted(&deviations, 0.5);
+        let (spread, bound) = match gate {
+            Gate::Parity => (
+                Some(parity_width(ratio, mad)),
+                Some(parity_bound(ratio, mad)),
+            ),
+            Gate::Bound(bound) => (None, Some(bound)),
+            Gate::ReportGated | Gate::Report => (None, None),
         };
 
         let a_allocs = allocations_per_op(&mut path_a);
@@ -206,18 +264,17 @@ pub fn measure_case(
                 attempts_exceeded += 1;
             }
         }
-        if let Some(bound) = bound {
-            tolerance = Some(tolerance.map_or(bound, |t: f64| t.max(bound)));
-        }
-        // Report the worst attempt: a gate that only passes on its luckiest
-        // samples is the failure mode #395 is about.
+        // Report the worst attempt, and the bound that attempt was judged
+        // against: a gate that only passes on its luckiest samples is the
+        // failure mode #395 is about.
         if ratio > worst_ratio {
             worst_ratio = ratio;
-            reported = Some((a_med, a_p95, b_med, b_p95, spread));
+            tolerance = bound;
+            reported = Some((a_med, a_p95, b_med, b_p95, spread, mad));
         }
     }
 
-    let (a_med, a_p95, b_med, b_p95, spread) = reported.expect("ATTEMPTS > 0");
+    let (a_med, a_p95, b_med, b_p95, spread, mad) = reported.expect("ATTEMPTS > 0");
     CaseResult {
         id,
         description,
@@ -227,6 +284,7 @@ pub fn measure_case(
         b_p95,
         ratio: worst_ratio,
         spread,
+        mad,
         a_allocs: max_a_allocs,
         b_allocs: max_b_allocs,
         gate,
@@ -239,11 +297,11 @@ pub fn measure_case(
 pub fn print_table(cases: &[CaseResult], title: &str) {
     let mut table = String::new();
     table.push_str(
-        "| id | case | reps | A med ns | A p95 ns | B med ns | B p95 ns | ratio | spread | gate | \
+        "| id | case | reps | A med ns | A p95 ns | B med ns | B p95 ns | ratio | MAD | width | gate | \
          A allocs/op | B allocs/op |\n",
     );
     table.push_str(
-        "|----|------|-----:|---------:|---------:|---------:|---------:|------:|-------:|------|\
+        "|----|------|-----:|---------:|---------:|---------:|---------:|------:|------:|------:|------|\
          -----------:|-----------:|\n",
     );
     for case in cases {
@@ -253,12 +311,12 @@ pub fn print_table(cases: &[CaseResult], title: &str) {
             Gate::ReportGated if case.failed() => "FAIL (alloc)".to_string(),
             Gate::ReportGated => "report (alloc=0)".to_string(),
             Gate::Parity if case.failed() => format!("FAIL (>{:.3})", bound.unwrap_or(0.0)),
-            Gate::Parity => format!("<= {:.3} (2x spread)", bound.unwrap_or(0.0)),
+            Gate::Parity => format!("<= {:.3} (parity+3w)", bound.unwrap_or(0.0)),
             Gate::Bound(_) if case.failed() => format!("FAIL (>{})", bound.unwrap_or(0.0)),
             Gate::Bound(bound) => format!("<= {bound}"),
         };
         table.push_str(&format!(
-            "| {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.2} | {:.2} |\n",
+            "| {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.4} | {} | {} | {:.2} | {:.2} |\n",
             case.id,
             case.description,
             REPS,
@@ -267,7 +325,8 @@ pub fn print_table(cases: &[CaseResult], title: &str) {
             case.b_med,
             case.b_p95,
             case.ratio,
-            case.spread,
+            case.mad,
+            case.spread.map_or_else(String::new, |w| format!("{w:.4}")),
             gate,
             case.a_allocs,
             case.b_allocs,
@@ -296,6 +355,8 @@ pub fn exit_if_failed(cases: &[CaseResult]) {
 mod tests {
     use super::*;
 
+    // `cargo bench` compiles this module without running the tests below.
+    #[allow(dead_code)]
     fn case(gate: Gate, ratio: f64, exceeded: usize) -> CaseResult {
         CaseResult {
             id: "T",
@@ -305,7 +366,8 @@ mod tests {
             b_med: 1.0,
             b_p95: 1.0,
             ratio,
-            spread: 0.0,
+            spread: None,
+            mad: 0.0,
             a_allocs: 0.0,
             b_allocs: 0.0,
             gate,
@@ -321,9 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_gate_behaves_like_the_parity_one() {
+    fn a_bound_gate_compares_the_ratio_with_the_bound() {
         assert!(case(Gate::Bound(2.5), 2.6, ATTEMPTS).failed());
+        // Under the bound is a pass, however many attempts were counted.
         assert!(!case(Gate::Bound(2.5), 2.4, ATTEMPTS).failed());
+        // Over the bound in one attempt only is a blip, not a verdict.
+        assert!(!case(Gate::Bound(2.5), 2.6, ATTEMPTS - 1).failed());
     }
 
     #[test]
@@ -336,6 +401,58 @@ mod tests {
         gated.a_allocs = 0.0;
         gated.b_allocs = 1.0 / ALLOC_ITERS as f64;
         assert!(gated.failed());
+    }
+
+    /// The floor is not a decoration: a zero MAD must still yield a usable gate.
+    #[test]
+    fn a_parity_width_is_never_zero() {
+        for median in [0.5f64, 0.95, 1.0, 1.504, 2.0] {
+            let width = parity_width(median, 0.0);
+            assert!(width > 0.0, "median {median} gave a zero width");
+            assert!((width - 0.15 * median).abs() < 1e-12, "floor not applied");
+            assert!(
+                parity_bound(median, 0.0) > PARITY_ANCHOR,
+                "bound not above parity for median {median}"
+            );
+        }
+        // MAD wins once it exceeds the floor.
+        let wide = parity_width(1.0, 0.2);
+        assert!((wide - 1.4826 * 0.2).abs() < 1e-12);
+        assert!(wide > parity_width(1.0, 0.0));
+    }
+
+    /// A steady regression must not admit itself. Nine identical ratios give a
+    /// zero MAD, so a bound anchored at the measured median would pass a row that
+    /// is twice as slow as parity.
+    #[test]
+    fn a_steady_doubling_fails_the_parity_gate() {
+        let bound = parity_bound(2.0, 0.0);
+        assert!(bound < 2.0, "bound {bound} would pass a steady 2x slowdown");
+
+        let mut steady = case(Gate::Parity, 2.0, ATTEMPTS);
+        steady.tolerance = Some(bound);
+        assert!(steady.failed());
+
+        // Parity itself still passes with that same zero MAD.
+        let mut same = case(Gate::Parity, 1.0, 0);
+        same.tolerance = Some(parity_bound(1.0, 0.0));
+        assert!(!same.failed());
+    }
+
+    /// `Gate::Bound` is an absolute limit: MAD cannot move it.
+    #[test]
+    fn a_bound_gate_ignores_dispersion() {
+        let mut noisy = case(Gate::Bound(2.5), 2.4, ATTEMPTS);
+        noisy.mad = 10.0;
+        noisy.spread = Some(15.0);
+        assert!(!noisy.failed());
+        assert_eq!(noisy.gate_value(), Some(2.5));
+
+        // The same dispersion on a parity row widens its bound instead.
+        assert!(parity_bound(1.0, 10.0) > 2.5);
+        let mut parity = case(Gate::Parity, 2.4, ATTEMPTS);
+        parity.tolerance = Some(parity_bound(1.0, 10.0));
+        assert!(!parity.failed());
     }
 
     #[test]

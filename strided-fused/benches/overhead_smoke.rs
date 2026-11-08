@@ -10,9 +10,10 @@
 //!
 //! Run with `OVERHEAD_GATE=1` to make a failed gate exit non-zero; without it
 //! the table is printed and the process succeeds. Each attempt samples both
-//! paths [`support::REPS`] times and reports the median and p95 of each; S1
-//! gates on `median(A) / median(B)` against a tolerance derived from this run's
-//! own spread, so a quiet runner is held tighter than a noisy one. A gated row
+//! paths [`support::REPS`] times and reports the median of the paired ratios
+//! `A_i / B_i` plus the median and p95 of each path; S1 gates that paired-ratio
+//! median against `1 + 3 * max(1.4826 * MAD, 0.15 * median)` derived from this
+//! run's own spread, so a quiet runner is held tighter than a noisy one. A gated row
 //! fails only when all [`support::ATTEMPTS`] attempts exceed its bound; gated
 //! allocations must be zero.
 //!
