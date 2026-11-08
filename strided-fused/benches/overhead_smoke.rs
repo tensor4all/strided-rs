@@ -9,13 +9,17 @@
 //! every ratio.
 //!
 //! Run with `OVERHEAD_GATE=1` to make a failed gate exit non-zero; without it
-//! the table is printed and the process succeeds. A ratio gate fails only when
-//! all [`support::ATTEMPTS`] attempts exceed the threshold; gated allocations
-//! must be zero. Each timing is the minimum of [`support::ROUNDS`] rounds.
+//! the table is printed and the process succeeds. Each attempt samples both
+//! paths [`support::REPS`] times and reports the median and p95 of each; S1
+//! gates on `median(A) / median(B)` against a tolerance derived from this run's
+//! own spread, so a quiet runner is held tighter than a noisy one. A gated row
+//! fails only when all [`support::ATTEMPTS`] attempts exceed its bound; gated
+//! allocations must be zero.
 //!
 //! Rows (see `#306`):
 //! - S1: erased fused `execute` under `Exec::serial()` vs a
 //!   budget-one `Exec::new(&pool, 1)` for a two-op DAG, `8x8x8`; guards #305.
+//!   The two paths should cost the same, so it is the one parity-gated row.
 //! - S2: typed fused single `Add` vs `zip_map2_into` add, contiguous `8x8x8`;
 //!   reports the ratio and gates on zero allocations for both paths.
 //! - S5: unspecialized replay vs the specialized `add`-then-`multiply` DAG,
@@ -39,12 +43,10 @@ mod support;
 #[global_allocator]
 static GLOBAL: support::CountingAllocator = support::CountingAllocator;
 
-use support::{measure_case, print_table, CaseResult};
+use support::{measure_case, print_table, CaseResult, Gate};
 
 const SIDE: usize = 8;
 const LEN: usize = SIDE * SIDE * SIDE;
-// Shared runners have machine-dependent ratios, so this is a reference, not a gate.
-const S2_RATIO_REFERENCE: f64 = 1.5;
 
 fn two_op_dag() -> FusedPlan {
     FusedPlan::new(
@@ -113,7 +115,7 @@ fn s1_case() -> CaseResult {
         "S1",
         "fused serial token vs budget-one pooled token",
         2_000,
-        Some(1.5),
+        Gate::Parity,
         || {
             let mut dest =
                 ErasedRawStridedMut::from_slice_mut(&mut out_serial, &dims, &strides, 0).unwrap();
@@ -149,7 +151,7 @@ fn s2_case() -> CaseResult {
         "S2",
         "fused single add vs zip_map2_into add",
         5_000,
-        Some(S2_RATIO_REFERENCE),
+        Gate::ReportGated,
         || {
             fused_elementwise_into(
                 std::slice::from_mut(&mut fused_view),
@@ -172,7 +174,6 @@ fn s2_case() -> CaseResult {
             black_box(map_view.as_mut_ptr());
         },
     )
-    .report_ratio()
 }
 
 /// S5: unspecialized replay vs the recognized `add`-then-`multiply` shape.
@@ -199,7 +200,7 @@ fn s5_case() -> CaseResult {
         "S5",
         "unspecialized replay vs specialized add*mul",
         5_000,
-        None,
+        Gate::Report,
         || {
             fused_elementwise_into(
                 std::slice::from_mut(&mut unspecialized_view),
