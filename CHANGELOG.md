@@ -4,7 +4,12 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
-## strided-view 0.8.0 (unreleased) — breaking
+## 0.14.0 (unreleased) — breaking
+
+Bumped to **0.14.0**: `strided-basic`, `strided-perm`, `strided-kernel`, `strided-fused`, `strided-nn`.
+`strided-view` goes to **0.8.0** and `strided-traits` to **0.7.2**; the table below says why each one moves.
+
+### `strided-view`: `MaybeUninit` storage for the `*_uninit` constructors
 
 `StridedArray::col_major_uninit`, `try_col_major_uninit`, `col_major_from_buffer_uninit` and
 `try_col_major_from_buffer_uninit` now return `StridedArray<MaybeUninit<T>>` and store their data as
@@ -18,13 +23,19 @@ later reborrow, reallocation or drop was UB — and a caller writing every eleme
 Migration, one line at a time:
 
 ```rust
+use std::mem::MaybeUninit;
+
 // before
 let a: StridedArray<f64> = unsafe { StridedArray::col_major_uninit(&[3]) };
 let a = unsafe { a.write_all(...) };          // whatever wrote every element
 
 // after
-let a: StridedArray<MaybeUninit<f64>> = unsafe { StridedArray::col_major_uninit(&[3]) };
-// write every element through the uninit view, then read them out:
+let mut a = unsafe { StridedArray::<f64>::col_major_uninit(&[3]) };
+// write every slot before any of them is read:
+a.set(&[0], MaybeUninit::new(1.0));
+a.set(&[1], MaybeUninit::new(2.0));
+a.set(&[2], MaybeUninit::new(3.0));
+// SAFETY: every slot was written above.
 let first: f64 = unsafe { a.get(&[0]).assume_init() };
 ```
 
@@ -35,33 +46,40 @@ safe constructors from the start.
 
 Callers that do not need an uninitialised buffer should use the safe constructors and are unaffected.
 
-**`strided-basic` and `strided-kernel` break too**, and this is the part that is easy to miss: `strided-basic/src/lib.rs:157`
-does `pub use strided_view::*;` and `strided-kernel/src/lib.rs:5` does `pub use strided_basic::*;`, so the changed
-constructor signatures are part of *their* public APIs as well. They go to **0.14.0** and **0.14.0** respectively.
+### Why the five other crates move too
 
-`strided-perm`, `strided-fused` and `strided-nn` stay on the 0.13.x line: none of them re-exports the affected types, and
-none has an affected type in a public signature (`grep -rn 'pub fn .*StridedArray'` finds none in the three).
+`strided-view` types are part of four other public APIs, so 0.8.0 is their change as well: `strided-basic` re-exports
+the whole crate, `strided-kernel` re-exports `strided-basic`, and `strided-fused` and `strided-perm` take
+`&StridedView` / `&mut StridedViewMut` in their own signatures. `strided-nn` follows so the graph keeps one `strided-basic`.
 
-## 0.13.1 (unreleased)
+| crate | before | after | why |
+| --- | --- | --- | --- |
+| `strided-view` | 0.7.2 | **0.8.0** | the four `*_uninit` constructors return `StridedArray<MaybeUninit<T>>` |
+| `strided-basic` | 0.13.0 | **0.14.0** | `pub use strided_view::*` (`src/lib.rs:157`): the changed constructors are its API |
+| `strided-kernel` | 0.13.0 | **0.14.0** | `pub use strided_basic::*` (`src/lib.rs:5`) |
+| `strided-fused` | 0.13.0 | **0.14.0** | `fused_elementwise_into` takes `&[StridedView]` / `&mut [StridedViewMut]` (`src/fused.rs:1868`) |
+| `strided-perm` | 0.13.0 | **0.14.0** | `copy_into*` take `&StridedView` / `&mut StridedViewMut` (`src/copy.rs:228`) |
+| `strided-nn` | 0.13.0 | **0.14.0** | depends on `strided-basic`; a 0.13.x line would put two of them in one graph |
+| `strided-traits` | 0.7.1 | **0.7.2** | #412 rewrote shipped code; no public item changed |
 
-`strided-basic`, `strided-fused` and `strided-kernel` go to **0.13.1**: after
-0.13.0 was published from `25b6dad`, #405 added comments to their sources (a
-one-line rationale on each silenced lint), so the published 0.13.0 is not this
-tree. No code changed. `strided-nn` stays at 0.13.0.
+A patch on the 0.13.x line would be the wrong number: in 0.x the minor is the breaking position, and a downstream that
+keeps `strided-view = "0.7"` while taking the new `strided-perm` gets two view types and `E0308` at the boundary — the
+failure the version number has to announce, and one no workspace test can see, because the workspace builds on paths.
+`[workspace.dependencies]` names these versions, so a dependent packages against the dependency it needs. Nothing here is
+published yet, so `cargo package` of a dependent reports the missing version until the bottom-up publish (`traits`, `view`,
+`perm`, `basic`, `fused`, `nn`, `kernel`) has run.
 
-`strided-perm` goes to **0.13.1**, `strided-view` to **0.7.3** and
-`strided-traits` to **0.7.2**: #412 (`cargo clippy -D warnings`) rewrote code in
-their shipped sources under the published version numbers. The rewrites are
-equivalent (`iter().any(|&d| d == 0)` → `contains(&0)`, `x % n != 0` →
-`!x.is_multiple_of(n)`, index loops → `enumerate()`, `#[allow]` attributes with
-rationales, test-only edits); no public item changed. `strided-view` 0.7.3 now
-calls `usize::is_multiple_of`, so it needs **Rust 1.87 or newer** (no
-`rust-version` is declared).
+### The unpublished 0.13.1 batch
 
-The `[workspace.dependencies]` requirements stay at `^0.13.0` / `^0.7.2` /
-`^0.7.0`, which accept these versions. Raising them before the new versions are
-on crates.io breaks `cargo package` for every dependent (`failed to select a
-version for the requirement strided-view = "^0.7.3"`).
+`strided-view` 0.7.3, `strided-basic`/`strided-perm`/`strided-kernel` 0.13.1 and `strided-traits` 0.7.2 were staged and
+never published (crates.io carries 0.7.2 / 0.13.0 / 0.7.1), so that work ships in the numbers above. After 0.13.0 was
+published from `25b6dad`, #405 added comments to the `strided-basic`, `strided-fused` and `strided-kernel` sources (a
+one-line rationale on each silenced lint), so the published 0.13.0 is not this tree; no code changed. #412
+(`cargo clippy -D warnings`) rewrote code in the shipped sources of `strided-basic`, `strided-perm`, `strided-view` and
+`strided-traits`. The rewrites are equivalent (`iter().any(|&d| d == 0)` → `contains(&0)`, `x % n != 0` →
+`!x.is_multiple_of(n)`, index loops → `enumerate()`, `#[allow]` attributes with rationales, test-only edits); no public
+item changed. `strided-view` now calls `usize::is_multiple_of`, so it needs **Rust 1.87 or newer** (no `rust-version` is
+declared).
 
 ## 0.13.0 (2026-11-08)
 

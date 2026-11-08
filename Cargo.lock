@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "strided-fused"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "approx",
  "criterion",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "strided-nn"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "elem-simd-math",
  "pulp",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "strided-perm"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "strided-view",
  "thiserror",
