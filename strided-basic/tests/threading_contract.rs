@@ -19,11 +19,11 @@ use std::thread::ThreadId;
 
 use strided_basic::execution::{parallel_map_reduce, parallel_width, tree_width, KernelClass};
 use strided_basic::{
-    add, axpby_accum, axpy, batched_outer_product_into, batched_outer_product_into_uninit,
-    broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, copy_conj,
-    copy_into, copy_into_uninit, copy_scale, copy_transpose_scale_into, embed_diagonal_into_uninit,
-    embed_diagonal_view_into_uninit, fma, map_into, map_into_uninit_with_kernel, map_update_into,
-    mul, mul_into, mul_into_uninit, reduce, reduce_axis, reduce_axis_into, sum,
+    add_acc, axpby_accum, axpy_acc, batched_outer_product_into, batched_outer_product_into_uninit,
+    broadcast_mul_into, broadcast_mul_into_uninit, compare_into, compare_into_uninit, copy_conj_into,
+    copy_into, copy_into_uninit, copy_scale_into, copy_transpose_scale_into, embed_diagonal_into_uninit,
+    embed_diagonal_view_into_uninit, fma_acc, map_into, map_into_uninit_with_kernel, map_update_into,
+    mul_acc, mul_into, mul_into_uninit, reduce, reduce_axis, reduce_axis_into, sum,
     symmetrize_conj_into, symmetrize_into, triangular_mask_into_uninit,
     triangular_mask_view_into_uninit, zip_map2_into, zip_map3_into, zip_map4_into, zip_reduce,
     zip_update2_into, zip_update3_into, CompareOp, CopyPlan, Exec, Identity, RawStridedMut,
@@ -226,11 +226,11 @@ fn every_fan_out_entry_takes_its_exec_token_last() {
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
         |d, s, e| copy_into_uninit(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut StridedViewMut<'b, MaybeUninit<f64>>, &'a V<'b>, Exec<'e>) -> Result<()>;
-        |d, s, scale, e| copy_scale(d, s, scale, e)
+        |d, s, scale, e| copy_scale_into(d, s, scale, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, f64, Exec<'e>) -> Result<()>;
         |d, s, scale, e| copy_transpose_scale_into(d, s, scale, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, f64, Exec<'e>) -> Result<()>;
-        |d, s, e| copy_conj(d, s, e)
+        |d, s, e| copy_conj_into(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
         |d, s, e| perm_copy_into(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
@@ -238,13 +238,13 @@ fn every_fan_out_entry_takes_its_exec_token_last() {
             => for<'a, 'b, 'e> fn(&'a mut StridedViewMut<'b, MaybeUninit<f64>>, &'a V<'b>, Exec<'e>) -> Result<()>;
         |d, s, e| perm_copy_into_col_major(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
-        |d, s, e| add(d, s, e)
+        |d, s, e| add_acc(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
-        |d, s, e| mul(d, s, e)
+        |d, s, e| mul_acc(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
-        |d, s, alpha, e| axpy(d, s, alpha, e)
+        |d, s, alpha, e| axpy_acc(d, s, alpha, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, f64, Exec<'e>) -> Result<()>;
-        |d, a, b, e| fma(d, a, b, e)
+        |d, a, b, e| fma_acc(d, a, b, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
         |d, s, e| symmetrize_into(d, s, e)
             => for<'a, 'b, 'e> fn(&'a mut M<'b>, &'a V<'b>, Exec<'e>) -> Result<()>;
