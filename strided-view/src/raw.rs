@@ -213,6 +213,22 @@ impl<'a> ErasedRawStridedPtr<'a> {
     /// the same-provenance raw pointer before conversion. No concurrent
     /// mutation or conflicting access is permitted during overlap checking,
     /// conversion, or consumer access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
+    /// a whole number of `dtype` elements, and
+    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// not aligned for `dtype`. Returns
+    /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
+    /// have different lengths, and [`StridedError::OffsetOverflow`] when
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
+    /// Bool bytes are not checked here;
+    /// [`Self::try_as_ref_after_no_overlap`] does that.
     pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
@@ -257,6 +273,18 @@ impl<'a> ErasedRawStridedPtr<'a> {
     /// No mutation or other conflicting access may occur during this conversion
     /// or for the duration of the returned descriptor's consumer access.
     /// Bool bytes are validated here, immediately before typed access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::InvalidBoolByte`] when `dtype` is `Bool` and
+    /// a byte of the extent is neither 0 nor 1. It repeats the extent
+    /// length, alignment, stride length and bounds checks
+    /// ([`StridedError::ByteLengthMismatch`],
+    /// [`StridedError::DataAlignmentMismatch`],
+    /// [`StridedError::StrideLengthMismatch`],
+    /// [`StridedError::OffsetOverflow`]) that [`Self::from_raw_parts`] and
+    /// [`Self::from_ref`] already applied to the same values, so those
+    /// cannot fire again here.
     pub unsafe fn try_as_ref_after_no_overlap(&self) -> Result<ErasedRawStridedRef<'_>> {
         let bytes = core::slice::from_raw_parts(self.data.as_ptr(), self.byte_len);
         validate_erased_buffer(self.dtype, bytes)?;
@@ -276,6 +304,13 @@ impl<'a> ErasedRawStridedPtr<'a> {
     }
 
     /// Check overlap with initialized mutable storage without reading it.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in practice: both byte extents come from valid
+    /// descriptors, whose contracts already guarantee an allocation of that
+    /// size, so the end-address arithmetic cannot wrap. The `Result` only
+    /// carries that arithmetic's [`StridedError::OffsetOverflow`].
     pub fn overlaps_mut(&self, dest: &ErasedRawStridedMut<'_>) -> Result<bool> {
         ranges_overlap(
             self.data.as_ptr() as usize,
@@ -286,6 +321,13 @@ impl<'a> ErasedRawStridedPtr<'a> {
     }
 
     /// Check overlap with uninitialized mutable storage without reading it.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in practice: both byte extents come from valid
+    /// descriptors, whose contracts already guarantee an allocation of that
+    /// size, so the end-address arithmetic cannot wrap. The `Result` only
+    /// carries that arithmetic's [`StridedError::OffsetOverflow`].
     pub fn overlaps_uninit_mut(&self, dest: &ErasedRawStridedUninitMut<'_>) -> Result<bool> {
         ranges_overlap(
             self.data.as_ptr() as usize,
@@ -339,6 +381,18 @@ impl core::fmt::Debug for ErasedRawStridedRef<'_> {
 
 impl<'a> ErasedRawStridedRef<'a> {
     /// Create an erased input descriptor from typed, initialized storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check. The
+    /// byte-length and alignment checks
+    /// cannot fail for a typed `&[T]`.
     pub fn from_slice<T: KernelStorageElement>(
         data: &'a [T],
         dims: &'a [usize],
@@ -350,6 +404,11 @@ impl<'a> ErasedRawStridedRef<'a> {
             .len()
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `data` is a live `&[T]` and `byte_len` is
+        // `data.len() * size_of::<T>()` from the `checked_mul` above, so the
+        // `u8` view spans exactly that initialized allocation for `data`'s
+        // lifetime. `u8` has no invalid bit patterns, and the resulting length
+        // is re-checked by `validate_erased_buffer_extent` (raw.rs:121).
         let bytes = unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_len) };
         let element_count = validate_erased_buffer_extent(dtype, bytes)?;
         validate_bounds(element_count, dims, strides, offset)?;
@@ -371,6 +430,22 @@ impl<'a> ErasedRawStridedRef<'a> {
     /// The allocation and metadata must outlive `'a`; no mutable alias may
     /// exist while this descriptor is used. Alignment is an allocation
     /// property and must not be inferred from the observed address alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
+    /// a whole number of `dtype` elements, and
+    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// not aligned for `dtype`. Returns
+    /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
+    /// have different lengths, and [`StridedError::OffsetOverflow`] when
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
+    /// Bool bytes are the caller's responsibility here, per the safety
+    /// contract.
     pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
@@ -392,6 +467,11 @@ impl<'a> ErasedRawStridedRef<'a> {
     }
 
     /// Borrow the initialized storage as its concrete scalar type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `T` is not the
+    /// descriptor's dtype.
     pub fn data_as<T: KernelStorageElement>(&self) -> Result<&[T]> {
         if self.dtype != T::DTYPE {
             return Err(StridedError::DTypeMismatch {
@@ -399,6 +479,11 @@ impl<'a> ErasedRawStridedRef<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: the dtype check above proves the stored dtype is `T`, and the
+        // constructor ran `validate_erased_buffer_extent` (raw.rs:121) /
+        // `validate_erased_buffer_layout` (raw.rs:161): the byte length is a
+        // whole multiple of `size_of::<T>()` and the base is `T`-aligned, so
+        // `len / size_of::<T>()` initialized `T` values are in bounds.
         Ok(unsafe {
             core::slice::from_raw_parts(
                 self.data.as_ptr().cast::<T>(),
@@ -455,6 +540,18 @@ impl core::fmt::Debug for ErasedRawStridedMut<'_> {
 
 impl<'a> ErasedRawStridedMut<'a> {
     /// Create an erased output descriptor from typed, initialized storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check. The
+    /// byte-length and alignment checks
+    /// cannot fail for a typed `&mut [T]`.
     pub fn from_slice_mut<T: KernelStorageElement>(
         data: &'a mut [T],
         dims: &'a [usize],
@@ -466,6 +563,11 @@ impl<'a> ErasedRawStridedMut<'a> {
             .len()
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `data` is a live, exclusively borrowed `&mut [T]` and
+        // `byte_len` is `data.len() * size_of::<T>()` from the `checked_mul`
+        // above, so the `u8` view spans exactly that initialized allocation for
+        // `'a`. `u8` has no invalid bit patterns, and the resulting length is
+        // re-checked by `validate_erased_buffer_extent` (raw.rs:121).
         let data =
             unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), byte_len) };
         let element_count = validate_erased_buffer_extent(dtype, data)?;
@@ -489,6 +591,22 @@ impl<'a> ErasedRawStridedMut<'a> {
     /// The alignment requirement is on the allocation, not merely the observed
     /// address. The caller must retain exclusive access: no mutable alias or
     /// concurrent mutation may exist while this descriptor is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
+    /// a whole number of `dtype` elements, and
+    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// not aligned for `dtype`. Returns
+    /// [`StridedError::InvalidBoolByte`] when `dtype` is `Bool` and a byte
+    /// of the extent is neither 0 nor 1. Returns
+    /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
+    /// have different lengths, and [`StridedError::OffsetOverflow`] when
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
     pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
@@ -511,6 +629,11 @@ impl<'a> ErasedRawStridedMut<'a> {
     }
 
     /// Borrow initialized storage as its concrete scalar type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `T` is not the
+    /// descriptor's dtype.
     pub fn data_as<T: KernelStorageElement>(&self) -> Result<&[T]> {
         if self.dtype != T::DTYPE {
             return Err(StridedError::DTypeMismatch {
@@ -518,6 +641,11 @@ impl<'a> ErasedRawStridedMut<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: the dtype check above proves the stored dtype is `T`, and the
+        // constructor ran `validate_erased_buffer_extent` (raw.rs:121) /
+        // `validate_erased_buffer_layout` (raw.rs:161): the byte length is a
+        // whole multiple of `size_of::<T>()` and the base is `T`-aligned, so
+        // `len / size_of::<T>()` initialized `T` values are in bounds.
         Ok(unsafe {
             core::slice::from_raw_parts(
                 self.data.as_ptr().cast::<T>(),
@@ -527,6 +655,11 @@ impl<'a> ErasedRawStridedMut<'a> {
     }
 
     /// Borrow initialized storage mutably as its concrete scalar type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `T` is not the
+    /// descriptor's dtype.
     pub fn data_as_mut<T: KernelStorageElement>(&mut self) -> Result<&mut [T]> {
         if self.dtype != T::DTYPE {
             return Err(StridedError::DTypeMismatch {
@@ -534,6 +667,10 @@ impl<'a> ErasedRawStridedMut<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: as `data_as` (raw.rs:637) — the dtype check proves `T`, and
+        // `validate_erased_buffer_layout` (raw.rs:161) proved the base is
+        // `T`-aligned with a whole multiple of `size_of::<T>()` bytes. `&mut
+        // self` keeps this reborrow exclusive for its own lifetime.
         Ok(unsafe {
             core::slice::from_raw_parts_mut(
                 self.data.as_mut_ptr().cast::<T>(),
@@ -593,6 +730,18 @@ impl core::fmt::Debug for ErasedRawStridedUninitMut<'_> {
 
 impl<'a> ErasedRawStridedUninitMut<'a> {
     /// Create an uninitialized erased output descriptor from typed storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check. The
+    /// byte-length and alignment checks
+    /// cannot fail for a typed `&mut [MaybeUninit<T>]`.
     pub fn from_uninit_slice<T: KernelStorageElement>(
         data: &'a mut [MaybeUninit<T>],
         dims: &'a [usize],
@@ -604,6 +753,11 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
             .len()
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(StridedError::OffsetOverflow)?;
+        // SAFETY: `data` is a live, exclusively borrowed `&mut
+        // [MaybeUninit<T>]` and `byte_len` is `data.len() * size_of::<T>()` from
+        // the `checked_mul` above, so the view spans exactly that allocation for
+        // `'a`. `MaybeUninit<u8>` accepts every bit pattern, so no
+        // initialization is asserted here.
         let data = unsafe {
             core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<MaybeUninit<u8>>(), byte_len)
         };
@@ -630,6 +784,20 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     /// allocation's alignment is an allocation property independent of the
     /// observed address, and the descriptor must have exclusive access with no
     /// mutable alias or concurrent mutation during use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
+    /// a whole number of `dtype` elements, and
+    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// not aligned for `dtype`. Returns
+    /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
+    /// have different lengths, and [`StridedError::OffsetOverflow`] when
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
     pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
@@ -652,6 +820,11 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     }
 
     /// Borrow the uninitialized storage as its concrete scalar type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `T` is not the
+    /// descriptor's dtype.
     pub fn data_as_uninit_mut<T: KernelStorageElement>(&mut self) -> Result<&mut [MaybeUninit<T>]> {
         if self.dtype != T::DTYPE {
             return Err(StridedError::DTypeMismatch {
@@ -659,6 +832,11 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
                 actual: self.dtype.label(),
             });
         }
+        // SAFETY: the dtype check proves `T`, and
+        // `validate_erased_buffer_layout` (raw.rs:161) proved the base is
+        // `T`-aligned with a whole multiple of `size_of::<T>()` bytes.
+        // `MaybeUninit<T>` accepts every bit pattern, so the partially
+        // initialized extent is not read as `T` here.
         Ok(unsafe {
             core::slice::from_raw_parts_mut(
                 self.data.as_mut_ptr().cast::<MaybeUninit<T>>(),
@@ -726,6 +904,16 @@ impl<T: core::fmt::Debug> core::fmt::Debug for RawStridedRef<'_, T> {
 
 impl<'a, T> RawStridedRef<'a, T> {
     /// Create a raw strided input after validating reachable offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn new(
         data: &'a [T],
         dims: &'a [usize],
@@ -785,6 +973,12 @@ impl<'a, T> RawStridedRef<'a, T> {
         if self.dims.iter().any(|&dim| dim == 0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
+            // SAFETY: `offset` was accepted by `validate_bounds`
+            // (strided-view/src/view.rs:186) in `RawStridedRef::new`, or by the
+            // caller contract of `new_unchecked`, so `data.as_ptr() + offset`
+            // stays inside `data`. The empty-layout branch above returns a
+            // dangling pointer instead of offsetting a pointer no element
+            // reaches.
             unsafe { self.data.as_ptr().offset(self.offset) }
         }
     }
@@ -795,6 +989,10 @@ impl<'a, T> RawStridedRef<'a, T> {
     /// accessors directly all the same.
     #[inline]
     pub fn as_view(&self) -> StridedView<'a, T, Identity> {
+        // SAFETY: `new_unchecked` requires every reachable index to stay inside
+        // `data`; this descriptor's `offset`/`dims`/`strides` came from
+        // `validate_bounds` (strided-view/src/view.rs:186) in `RawStridedRef::new`,
+        // or from the same contract on `new_unchecked`.
         unsafe { StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 }
@@ -825,6 +1023,16 @@ impl<T: core::fmt::Debug> core::fmt::Debug for RawStridedMut<'_, T> {
 
 impl<'a, T> RawStridedMut<'a, T> {
     /// Create a raw strided output after validating reachable offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn new(
         data: &'a mut [T],
         dims: &'a [usize],
@@ -889,6 +1097,12 @@ impl<'a, T> RawStridedMut<'a, T> {
         if self.dims.iter().any(|&dim| dim == 0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
+            // SAFETY: `offset` was accepted by `validate_bounds`
+            // (strided-view/src/view.rs:186) in `RawStridedMut::new`, or by the
+            // caller contract of `new_unchecked`, so `data.as_ptr() + offset`
+            // stays inside `data`. The empty-layout branch above returns a
+            // dangling pointer instead of offsetting a pointer no element
+            // reaches.
             unsafe { self.data.as_ptr().offset(self.offset) }
         }
     }
@@ -898,6 +1112,10 @@ impl<'a, T> RawStridedMut<'a, T> {
         if self.dims.iter().any(|&dim| dim == 0) {
             NonNull::<T>::dangling().as_ptr()
         } else {
+            // SAFETY: as `ptr` above — `offset` was accepted by
+            // `validate_bounds` (strided-view/src/view.rs:186) in
+            // `RawStridedMut::new` or by the `new_unchecked` contract, and
+            // `&mut self` keeps the write provenance exclusive.
             unsafe { self.data.as_mut_ptr().offset(self.offset) }
         }
     }
@@ -908,6 +1126,10 @@ impl<'a, T> RawStridedMut<'a, T> {
     /// accessors directly all the same.
     #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
+        // SAFETY: `new_unchecked` requires every reachable index to stay inside
+        // `data`; this descriptor's metadata came from `validate_bounds`
+        // (strided-view/src/view.rs:186) in `RawStridedMut::new`, or from the
+        // same contract on `new_unchecked`.
         unsafe { StridedView::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 
@@ -917,6 +1139,8 @@ impl<'a, T> RawStridedMut<'a, T> {
     /// accessors directly all the same.
     #[inline]
     pub fn as_view_mut(&mut self) -> StridedViewMut<'_, T> {
+        // SAFETY: as `as_view` above, and `&mut self` keeps the mutable borrow
+        // exclusive to the returned view, which `new_unchecked` requires.
         unsafe { StridedViewMut::new_unchecked(self.data, self.dims, self.strides, self.offset) }
     }
 }

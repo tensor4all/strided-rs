@@ -14,7 +14,7 @@ use strided_basic::{copy_into_uninit, Exec, Pool, StridedArray, StridedViewMut};
 
 const ROWS: usize = 257;
 const COLS: usize = 257;
-// 257 * 257 = 66049, comfortably above MINTHREADLENGTH (1 << 15).
+// 257 * 257 = 66049 elements: a large, non-contiguous permutation copy.
 const _: () = assert!(ROWS * COLS > (1 << 15));
 
 #[test]

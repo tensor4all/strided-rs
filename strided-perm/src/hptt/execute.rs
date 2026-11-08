@@ -106,6 +106,11 @@ unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &P
 /// - `dst` must be valid for writes at all offsets determined by dims/dst_strides
 /// - src and dst must not overlap
 /// - no other thread may access the destination range during the call
+/// - when `exec` runs more than one task, distinct logical positions must map to
+///   distinct destination offsets. The partitions opened below are disjoint in
+///   logical index space, and that alone does not keep two workers off one byte
+///   when `dst_strides` is not injective. The crate's public entry proves this
+///   with `is_injective_layout` at `copy.rs:184` before calling here.
 pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
     src: *const T,
     dst: *mut T,
@@ -146,6 +151,15 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     let d = (dst_addr as isize
                         + range.start as isize * dst_stride * (std::mem::size_of::<T>() as isize))
                         as *mut T;
+                    // SAFETY: `range` is a disjoint subrange of `0..count`, and
+                    // `count`/`src_stride`/`dst_stride` are the plan's inner extent
+                    // and strides, so `s`/`d` span exactly the reachable elements
+                    // whose validity the caller proved under this function's
+                    // `# Safety` (execute.rs:109). Range disjointness is logical
+                    // only: two ranges land on distinct destination offsets solely
+                    // because the caller supplied an injective destination, proved
+                    // with `is_injective_layout` at `copy.rs:184`, not because the
+                    // split itself separates them.
                     unsafe { const_stride1_copy(s, d, range.len(), src_stride, dst_stride) };
                 });
             }
@@ -185,6 +199,12 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
             exec.for_ranges(outer_dim, ONE, |range| {
                 for i in range {
                     let (s, d) = at(i);
+                    // SAFETY: `i` comes from a disjoint subrange of `0..outer_dim`,
+                    // and `at` (execute.rs:184) advances `src`/`dst` by the plan's
+                    // own `lda_root`/`ldb_root` for that axis, so `s`/`d` and the
+                    // tile `dispatch_blocked_2d`/`transpose_recursive` write stay
+                    // inside the buffers the caller proved valid under
+                    // `execute_permute_blocked`'s `# Safety` (execute.rs:104).
                     unsafe {
                         if inner.is_empty() {
                             dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
@@ -203,6 +223,10 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
             exec.for_ranges(outer_dim, ONE, |range| {
                 for i in range {
                     let (s, d) = at(i);
+                    // SAFETY: as the Transpose arm above — `i` is a logical position
+                    // on the root axis, so `s`/`d` advance by the plan's own strides
+                    // for that axis and stay inside the caller-proved buffers
+                    // (`execute_permute_blocked`'s `# Safety`, execute.rs:104).
                     unsafe {
                         if inner.is_empty() {
                             const_stride1_copy(s, d, count, src_stride, dst_stride);
@@ -222,6 +246,13 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
             exec.for_ranges(outer_dim, ONE, |range| {
                 for i in range {
                     let (s, d) = at(i);
+                    // SAFETY: as the Transpose arm above — `s`/`d` are the tile
+                    // origins for logical position `i` on the root axis, and the
+                    // grouped offset tables were built by
+                    // `try_build_grouped_tile_plan` (plan.rs:274) from the same
+                    // validated layout, so every access stays inside the
+                    // caller-proved buffers (`execute_permute_blocked`'s `# Safety`,
+                    // execute.rs:104).
                     unsafe {
                         if inner.is_empty() {
                             grouped_tile_copy(s, d, grouped);
@@ -257,8 +288,11 @@ unsafe fn grouped_recursive<T: Copy>(
         } else {
             grouped_recursive(s, d, rest, grouped);
         }
-        // The advance after the last iteration may leave the allocation; the
-        // cursor is never dereferenced there, so it must not use `offset`.
+        // INVARIANT: the advance after the last iteration may leave the
+        // allocation — the cursor is never dereferenced there, so it must use
+        // `wrapping_offset` rather than `offset`. Rewriting it as an `offset`
+        // would be UB for a tile whose last origin sits within one stride of the
+        // buffer end, which is the common full-buffer case.
         s = s.wrapping_offset(node.lda);
         d = d.wrapping_offset(node.ldb);
     }
@@ -310,8 +344,9 @@ unsafe fn walk_outer<T>(
     let (mut s, mut d) = (src, dst);
     for _ in 0..n {
         walk_outer(rest, s, d, f);
-        // Last-iteration advance may leave the allocation; see
-        // `grouped_recursive`.
+        // INVARIANT: the last-iteration advance may leave the allocation; the
+        // cursor is not dereferenced after it, so `wrapping_offset` is required
+        // here (same reasoning as `grouped_recursive`).
         s = s.wrapping_offset(src_stride);
         d = d.wrapping_offset(dst_stride);
     }
@@ -346,8 +381,9 @@ unsafe fn transpose_recursive<T: Copy + 'static>(
         } else {
             transpose_recursive(s, d, rest, size_a, size_b, lda, ldb, block);
         }
-        // Last-iteration advance may leave the allocation; see
-        // `grouped_recursive`.
+        // INVARIANT: the last-iteration advance may leave the allocation; the
+        // cursor is not dereferenced after it, so `wrapping_offset` is required
+        // here (same reasoning as `grouped_recursive`).
         s = s.wrapping_offset(node.lda);
         d = d.wrapping_offset(node.ldb);
     }
@@ -525,6 +561,11 @@ fn for_each_tile_par(
 }
 
 #[inline]
+// INVARIANT: the eight parameters are the prepared plan's raw tile geometry,
+// forwarded unchanged from the `Transpose` arm of `execute_permute_blocked`;
+// bundling them into a struct would add a per-call aggregate without removing
+// any decision, so the lint is suppressed here rather than the call shape
+// changed.
 #[allow(clippy::too_many_arguments)]
 unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     src: *const T,
@@ -539,6 +580,14 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     let src_addr = src as usize;
     let dst_addr = dst as usize;
     match native_float_kind::<T>() {
+        // SAFETY: `for_each_tile_par` (execute.rs:533) hands out tile origins in
+        // `0..size_a` x `0..size_b` with extents clamped to the grid, so each
+        // sub-tile stays inside the `size_a` x `size_b` region whose validity the
+        // caller proved under `execute_permute_blocked`'s `# Safety`
+        // (execute.rs:109). Tiles are disjoint as logical index sets; that they
+        // reach distinct destination offsets, and so that no two workers write one
+        // offset, rests on the caller's injective destination (established at
+        // `is_injective_layout`, `copy.rs:184`), not on the tile partition.
         Some(8) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_f64(
                 (src_addr as *const f64).offset(ia as isize + ib as isize * lda),
@@ -549,6 +598,9 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
                 bb,
             );
         }),
+        // SAFETY: as the `f64` arm above. `native_float_kind` (execute.rs:29)
+        // admits `f32` here only for types whose alignment is at least 4, so the
+        // cast is aligned at every tile offset.
         Some(4) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_f32(
                 (src_addr as *const f32).offset(ia as isize + ib as isize * lda),
@@ -559,6 +611,8 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
                 bb,
             );
         }),
+        // SAFETY: as the `f64` arm above, on `T` itself, which needs no alignment
+        // or representation assumption.
         _ => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
             macro_kernel_fallback(
                 (src_addr as *const T).offset(ia as isize + ib as isize * lda),
@@ -599,8 +653,9 @@ unsafe fn const_stride1_recursive<T: Copy>(
         } else {
             const_stride1_recursive(s, d, rest, count, src_stride, dst_stride);
         }
-        // Last-iteration advance may leave the allocation; see
-        // `grouped_recursive`.
+        // INVARIANT: the last-iteration advance may leave the allocation; the
+        // cursor is not dereferenced after it, so `wrapping_offset` is required
+        // here (same reasoning as `grouped_recursive`).
         s = s.wrapping_offset(node.lda);
         d = d.wrapping_offset(node.ldb);
     }

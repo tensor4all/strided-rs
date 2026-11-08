@@ -150,6 +150,11 @@ where
 /// select the dtype-specific SIMD kernels of [`crate::ErasedReducePlan`];
 /// callers that reduce with a known operation (sum, product, max, min) on a
 /// supported dtype can use that plan for the fastest path.
+///
+/// # Errors
+///
+/// Returns [`StridedError::OffsetOverflow`] when the element count of `src`
+/// does not fit `usize`.
 pub fn reduce<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     map_fn: M,
@@ -655,6 +660,20 @@ where
 /// `exec` once the number of source elements read exceeds the threading
 /// threshold; each output is computed by one task, so the result does not
 /// depend on the budget.
+///
+/// # Errors
+///
+/// Returns [`StridedError::InvalidAxis`] when `axis >= src.ndim()`, and
+/// [`StridedError::OffsetOverflow`] when the source element count cannot be
+/// represented in `usize`. The destination layout is built here, so the
+/// destination-shape errors of [`reduce_axis_into`] cannot occur.
+///
+/// # Panics
+///
+/// Panics when the kept source extents cannot be described in `isize`, which
+/// an empty source extent hides from the element-count check: reducing axis 0
+/// of a `[0, usize::MAX]` source builds the output strides with
+/// [`col_major_strides`], which panics instead of reporting an error.
 pub fn reduce_axis<T: Copy + Send + Sync, Op: ElementOp<T>, M, R, U>(
     src: &StridedView<T, Op>,
     axis: usize,

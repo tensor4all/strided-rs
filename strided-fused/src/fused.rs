@@ -1852,6 +1852,20 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
 /// only copy-like identity plans and `Conj`; ambiguous arithmetic and
 /// transcendental op/dtype pairs are rejected before any destination is
 /// written.
+///
+/// # Errors
+///
+/// [`StridedError::RankMismatch`] reports a disagreement about counts or ranks:
+/// `inputs.len()` or `dests.len()` against the plan, the operand count of an
+/// instruction against its op's arity, or the rank of an input or destination
+/// against the destination rank. [`StridedError::ShapeMismatch`] reports an
+/// operand or destination whose rank matches but whose extents differ.
+/// [`StridedError::InvalidAxis`] reports an instruction
+/// or output referencing a value the plan has not defined yet,
+/// [`StridedError::UnsupportedOp`] reports an instruction `T` cannot evaluate,
+/// and [`StridedError::NonInjectiveOutputLayout`] a destination layout that
+/// cannot be proven injective (aliasing elements, or a span the check cannot
+/// represent). Every check runs before the first destination store.
 pub fn fused_elementwise_into<T: FusedScalar>(
     dests: &mut [StridedViewMut<'_, T>],
     inputs: &[StridedView<'_, T>],

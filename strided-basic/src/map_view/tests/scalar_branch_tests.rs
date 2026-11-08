@@ -356,8 +356,8 @@ fn test_range_plan_declines_transposed_scalar_tile_with_large_inner_aspect() {
 
 #[test]
 fn test_mul_into_transposed_rhs_above_range_threshold_matches_reference() {
-    // 384 * 384 elements is above `CONTIGUOUS_RANGE_MIN_LEN`, so the contiguous
-    // range path would be taken without the blocking gate.
+    // A transposed operand needs blocking: `walks_inputs_without_blocking`
+    // declines it, so this shape exercises the blocked kernel.
     let n = 384usize;
     let dims = [n, n];
     let col = [1isize, n as isize];

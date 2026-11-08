@@ -232,15 +232,16 @@ impl CopyPlan {
     /// Compile a copy plan for the given layout pair.
     ///
     /// Performs the layout validation and traversal construction
-    /// (fuse + order) once:
+    /// (fuse + order) once.
     ///
-    /// - `dims`, `dst_strides`, and `src_strides` must have equal length
-    ///   ([`StridedError::StrideLengthMismatch`]);
-    /// - the total element count must not overflow `usize`
-    ///   ([`StridedError::OffsetOverflow`]);
-    /// - the destination layout must be injective, i.e. map distinct logical
-    ///   indices to distinct offsets
-    ///   ([`StridedError::NonInjectiveOutputLayout`]).
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
+    /// `dst_strides`, and `src_strides` do not all have the same length,
+    /// [`StridedError::OffsetOverflow`] when the total element count does not
+    /// fit `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent).
     pub fn compile(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> Result<Self> {
         if dims.len() != dst_strides.len() || dims.len() != src_strides.len() {
             return Err(StridedError::StrideLengthMismatch);
@@ -298,6 +299,11 @@ impl CopyPlan {
     ///
     /// On success every reachable logical destination element is initialized.
     /// Non-reachable holes in the backing allocation are not written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled layout, before any write.
     pub fn execute_uninit<T>(
         &self,
         dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
@@ -319,6 +325,11 @@ impl CopyPlan {
 
     /// `dest = src`. Allocation-free for fused ranks at most
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled layout, before any write.
     pub fn execute<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -333,6 +344,11 @@ impl CopyPlan {
 
     /// `dest = scale * src`. Allocation-free for fused ranks at most
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled layout, before any write.
     pub fn execute_scale<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -353,6 +369,11 @@ impl CopyPlan {
 
     /// `dest = conj(src)`. Allocation-free for fused ranks at most
     /// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::PlanLayoutMismatch`] when the views do not
+    /// carry the compiled layout, before any write.
     pub fn execute_conj<T>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -434,15 +455,17 @@ pub struct UpdatePlan {
 impl UpdatePlan {
     /// Compile an update plan for the given layout pair.
     ///
-    /// Performs the same layout validation as [`CopyPlan::compile`]:
+    /// Performs the same layout validation as [`CopyPlan::compile`].
     ///
-    /// - `dims`, `dst_strides`, and `src_strides` must have equal length
-    ///   ([`StridedError::StrideLengthMismatch`]);
-    /// - the total element count must not overflow `usize`
-    ///   ([`StridedError::OffsetOverflow`]);
-    /// - the destination layout must be injective
-    ///   ([`StridedError::NonInjectiveOutputLayout`]), so two logical indices
-    ///   never name one slot and a parallel replay writes each slot once.
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
+    /// `dst_strides`, and `src_strides` do not all have the same length,
+    /// [`StridedError::OffsetOverflow`] when the total element count does not
+    /// fit `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective: two logical indices name
+    /// one slot (so a parallel replay would write that slot once per index), or
+    /// the offset span cannot be represented, leaving injectivity undecided.
     pub fn compile(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> Result<Self> {
         if dims.len() != dst_strides.len() || dims.len() != src_strides.len() {
             return Err(StridedError::StrideLengthMismatch);

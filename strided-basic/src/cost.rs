@@ -14,8 +14,8 @@
 //! `strided-perm`, which sits below this crate). Every kernel of the workspace is
 //! one of four classes, and the rate of a class depends on the *host class*
 //! (`strided_perm::HostClass`, keyed by the kernel dispatch the machine takes,
-//! detected once at first use; the enum and `detect()` are kept in sync with
-//! `threadteam`'s). Serial, `f64`, in nanoseconds per element:
+//! detected once at first use; the enum is `threadteam::HostClass` re-exported by
+//! `strided-perm`). Serial, `f64`, in nanoseconds per element:
 //!
 //! | [`KernelClass`] | `x86_64-avx512` | `aarch64-apple` | `generic` (every other class) | kernels |
 //! | --- | --- | --- | --- | --- |

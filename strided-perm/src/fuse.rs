@@ -111,12 +111,20 @@ pub fn compute_importance(
         importance[i] = 2 * (1u64 << shift);
     }
 
-    // Add contributions from remaining arrays
-    #[allow(clippy::needless_range_loop)]
-    for k in 1..m {
-        for i in 0..n {
-            let shift = g * (n - index_orders[k][i]) as u64;
-            importance[i] += 1u64 << shift;
+    // Add contributions from remaining arrays. `m` bounds the row count but not a
+    // row's length, which the only caller builds as `n` entries per row. Neither
+    // mismatch indexes past either side: a short row contributes the orders it has
+    // and nothing to the remaining dimensions, where the index-based loop this
+    // replaced (`for i in 0..n { index_orders[k][i] }`) panicked on the first
+    // missing entry; a row longer than `n` has its suffix ignored, as before.
+    // Measured (`dims = [2, 2]`, strides `[1, 2], [1, 2], [0]`): orders
+    // `[[1, 2], [1, 2], [1]]` -> `[32, 3]` (short), `[[1, 2], [1, 2], [1, 2, 1]]`
+    // -> `[32, 4]` (long, suffix ignored).
+    for row in &index_orders[1..m] {
+        for (i, slot) in importance.iter_mut().enumerate() {
+            if let Some(&order) = row.get(i) {
+                *slot += 1u64 << (g * (n - order) as u64);
+            }
         }
     }
 

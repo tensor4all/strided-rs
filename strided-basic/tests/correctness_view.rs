@@ -759,7 +759,8 @@ fn test_strided_view_broadcast_and_copy() {
 }
 
 // ============================================================================
-// Large-array tests: exceed MINTHREADLENGTH (32768) to exercise parallel paths
+// Large-array tests: large tensors driven through the serial token.
+// The token is serial, so these check the serial route at scale, not fan-out.
 // ============================================================================
 
 /// Helper: create a large col-major 2D array (n*n > 32768 when n >= 182).
@@ -2025,7 +2026,9 @@ fn test_axpy_mixed() {
 // 42. fma_acc: Complex64 += f64 * Complex64
 #[test]
 fn test_fma_mixed_f64_c64() {
-    let mut dest = StridedArray::<Complex64>::from_fn_row_major(&[3, 2], |_| c(0.0, 0.0));
+    let sentinel = c(7.0, -3.0);
+    // Nonzero initial values: an overwriting implementation must fail this test.
+    let mut dest = StridedArray::<Complex64>::from_fn_row_major(&[3, 2], |_| sentinel);
     let a = StridedArray::<f64>::from_fn_row_major(&[3, 2], |idx| (idx[0] * 2 + idx[1] + 1) as f64);
     let b = StridedArray::<Complex64>::from_fn_row_major(&[3, 2], |idx| {
         c(idx[0] as f64, idx[1] as f64)
@@ -2037,8 +2040,8 @@ fn test_fma_mixed_f64_c64() {
         for j in 0..2 {
             let av = (i * 2 + j + 1) as f64;
             let bv = c(i as f64, j as f64);
-            // f64 * Complex64 -> Complex64
-            assert_eq!(dest.get(&[i, j]), av * bv);
+            // f64 * Complex64 -> Complex64, accumulated into the sentinel
+            assert_eq!(dest.get(&[i, j]), sentinel + av * bv);
         }
     }
 }

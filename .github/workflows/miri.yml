@@ -1,0 +1,111 @@
+name: Miri
+
+# provenance 違反（Stacked Borrows / Tree Borrows）は Miri でしか観測できない。
+# ただし 1 回 15〜20 分かかるので **PR ごとの必須レーンには置かない**。週次で回し、
+# 失敗したら **issue を作る**（通知で終わらせない。issue なら手番と履歴が残る）。
+on:
+  schedule:
+    - cron: "0 18 * * 0"   # 日曜 18:00 UTC = 月曜 03:00 JST（週 1 回）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write        # 失敗時に issue を作るため
+
+env:
+  CARGO_TERM_COLOR: always
+  MIRIFLAGS: -Zmiri-disable-isolation
+
+jobs:
+  miri:
+    name: cargo miri (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # workflow 階層では matrix を参照できない（actionlint: context "matrix" is not allowed here）。
+    # job 階層なら参照できる。同じ target を 2 本同時に走らせない。
+    concurrency:
+      group: miri-${{ matrix.target }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: lib
+            args: -p strided-view --lib
+          - target: provenance
+            args: -p strided-view --test view_mut_ptr_provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.target }}
+
+      - name: cargo miri setup
+        timeout-minutes: 30
+        run: cargo miri setup
+
+      - name: cargo miri test
+        id: run
+        # ジョブ全体(120)より短くし、ハングしても通知ステップに必ず到達させる
+        timeout-minutes: 60
+        continue-on-error: true
+        run: cargo miri test ${{ matrix.args }}
+
+      # `continue-on-error` の step は conclusion が success になるので `failure()` では拾えない。
+      # **always()** で必ず到達させ、outcome を env で受け取って自分で判定する
+      # （setup 失敗・timeout で `run` が走らなかった場合も RUN_OUTCOME は空＝失敗扱い）。
+      - name: File an issue when Miri fails
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          TARGET: ${{ matrix.target }}
+          ARGS: ${{ matrix.args }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${RUN_OUTCOME}" = "success" ]; then
+            echo "Miri passed (${TARGET}); nothing to file."
+            exit 0
+          fi
+          MARK="<!-- miri-failure:${TARGET} -->"
+          # 既存判定は **ラベル**で行う（タイトル編集や検索の件数上限に依存しない）。
+          # ラベルは冪等に作る（既にあれば 422 が返るだけなので握り潰してよい）。
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/labels" \
+            -f name=miri-failure -f color=B60205 \
+            -f description="Miri failed on main (filed by the Miri workflow)" >/dev/null 2>&1 || true
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label miri-failure \
+            --json number,body --limit 100 \
+            --jq "[.[] | select(.body | contains(\"${MARK}\"))] | .[0].number // empty")
+          body=$(mktemp)
+          {
+            echo "$MARK"
+            echo "Miri (\`${ARGS}\`) が main で失敗しました。"
+            echo
+            echo "- commit: \`${SHA}\`"
+            echo "- 実行: \`${RUN_URL}\`"
+            echo "- 再現: \`MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test ${ARGS}\`"
+            echo
+            echo "provenance 違反は通常の \`cargo test\` では検出できません（このレーンだけが見ます）。"
+          } > "$body"
+          if [ -n "${existing}" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file "$body"
+            echo "commented on #${existing}"
+          else
+            # 失敗を握り潰さない: 起票できなければ **この step を赤くする**（通知が消えるのを防ぐ）
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "miri: ${ARGS} fails on main" \
+              --label miri-failure \
+              --body-file "$body"
+          fi
+          rm -f "$body"
+
+      - name: Fail the job if Miri failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1

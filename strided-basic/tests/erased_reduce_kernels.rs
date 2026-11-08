@@ -16,7 +16,7 @@ use strided_basic::{
     ReduceOp,
 };
 
-/// Larger than `MINTHREADLENGTH` so that parallel contexts split the work.
+/// Large enough that the cost gate splits the work in a parallel context.
 const LARGE: usize = (1 << 15) + 65;
 
 const ALL_OPS: [ReduceOp; 5] = [

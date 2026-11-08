@@ -14,8 +14,10 @@
 mod common;
 
 use std::mem::MaybeUninit;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use strided_basic::execution::{parallel_map_reduce, parallel_width, tree_width, KernelClass};
 use strided_basic::{
@@ -64,24 +66,90 @@ fn a_serial_token_never_justifies_a_second_worker() {
     }
 }
 
-const ROWS: usize = 257;
-const COLS: usize = 257;
+// The gate that decides a fork (`cost.rs`'s `parallel_width` and the
+// `is_parallel` leaves) opens at `3 * dispatch_cost / ns_per_element`: 1732
+// elements for `KernelClass::Map` against this pool's 100 ns section cost on an
+// AVX-512 host (0.173 ns per element), 2995 on the generic and aarch64 rates
+// (0.100). The estimate is rounded to whole nanoseconds before the comparison,
+// so 2995 elements are 300 ns and clear the 300 ns that gate asks for, while
+// 2994 (299 ns) does not. 512x512 is 87x that count, 151x the AVX-512 one, so
+// the element count is not what decides this test; see [`Seen::record`] for the
+// margin that does.
+const ROWS: usize = 512;
+const COLS: usize = 512;
 
-/// The distinct threads the closures of one call ran on.
-#[derive(Default)]
-struct Seen(Mutex<Vec<ThreadId>>);
+/// How long a leaf waits for the second thread before giving up: a bound on how
+/// long the test waits, not a claim about the host. A call that does fan out but
+/// whose worker reaches the closure only after the bound also times out (a
+/// failure injection that delays the second `record()` reproduces that), so the
+/// failure message states what was observed — no second thread within the bound
+/// — and not that the call stayed serial.
+const SECOND_THREAD_LIMIT: Duration = Duration::from_secs(2);
+
+/// The distinct threads the closures of one call ran on, gated on a second one
+/// when `wait` is set.
+struct Seen {
+    threads: Mutex<Vec<ThreadId>>,
+    opened: Condvar,
+    open: AtomicBool,
+    wait: bool,
+}
 
 impl Seen {
+    fn new(wait: bool) -> Self {
+        Self {
+            threads: Mutex::new(Vec::new()),
+            opened: Condvar::new(),
+            open: AtomicBool::new(false),
+            wait,
+        }
+    }
+
+    /// Records the calling thread and, when gated, blocks until a second thread
+    /// has recorded before letting it continue.
+    ///
+    /// Without the wait this test raced the pool instead of measuring
+    /// placement. The shape that failed in CI (257x257, 66049 elements) runs
+    /// 9.0 us on one thread at the 0.137 ns per element measured on an AVX-512
+    /// host, so even a quarter of it is only ~2-3 us of work per leaf, while a
+    /// worker needed 7-40 us to pick up the sibling (p50 8, p90 14, max 40 over 40 fresh pools
+    /// on a loaded 32-core host): the calling thread could finish the whole
+    /// region itself, and the same commit passed or failed with the host state.
+    /// Waiting makes "a four-slot token opens a second worker" an assertion
+    /// about the placement decision: it fails only when no second thread arrives
+    /// within [`SECOND_THREAD_LIMIT`].
     fn record(&self) {
+        if self.wait && self.open.load(Ordering::Relaxed) {
+            return;
+        }
         let id = std::thread::current().id();
-        let mut seen = self.0.lock().unwrap();
-        if !seen.contains(&id) {
-            seen.push(id);
+        let mut threads = self.threads.lock().unwrap();
+        if !threads.contains(&id) {
+            threads.push(id);
+            if threads.len() > 1 {
+                self.open.store(true, Ordering::Relaxed);
+            }
+            self.opened.notify_all();
+        }
+        if !self.wait || threads.len() > 1 {
+            return;
+        }
+        let (threads, timeout) = self
+            .opened
+            .wait_timeout_while(threads, SECOND_THREAD_LIMIT, |threads| threads.len() < 2)
+            .unwrap();
+        if timeout.timed_out() {
+            // Let the remaining elements through, so one failure is reported
+            // instead of every element waiting out the limit.
+            self.open.store(true, Ordering::Relaxed);
+            panic!(
+                "no second thread within {SECOND_THREAD_LIMIT:?}: the closures stayed on {threads:?}"
+            );
         }
     }
 
     fn threads(self) -> Vec<ThreadId> {
-        self.0.into_inner().unwrap()
+        self.threads.into_inner().unwrap()
     }
 }
 
@@ -89,10 +157,10 @@ fn source() -> StridedArray<f64> {
     StridedArray::from_fn_col_major(&[ROWS, COLS], |index| (index[0] * COLS + index[1]) as f64)
 }
 
-fn run_map(exec: Exec<'_>) -> Vec<ThreadId> {
+fn run_map(exec: Exec<'_>, wait: bool) -> Vec<ThreadId> {
     let src = source();
     let mut dest = StridedArray::<f64>::col_major(&[ROWS, COLS]);
-    let seen = Seen::default();
+    let seen = Seen::new(wait);
     map_into(
         &mut dest.view_mut(),
         &src.view(),
@@ -106,11 +174,11 @@ fn run_map(exec: Exec<'_>) -> Vec<ThreadId> {
     seen.threads()
 }
 
-fn run_zip(exec: Exec<'_>) -> Vec<ThreadId> {
+fn run_zip(exec: Exec<'_>, wait: bool) -> Vec<ThreadId> {
     let a = source();
     let b = source();
     let mut dest = StridedArray::<f64>::col_major(&[ROWS, COLS]);
-    let seen = Seen::default();
+    let seen = Seen::new(wait);
     zip_map2_into(
         &mut dest.view_mut(),
         &a.view(),
@@ -129,12 +197,12 @@ fn run_zip(exec: Exec<'_>) -> Vec<ThreadId> {
 fn a_serial_token_runs_the_observed_entries_on_the_calling_thread() {
     let caller = std::thread::current().id();
     assert_eq!(
-        run_map(Exec::serial()),
+        run_map(Exec::serial(), false),
         [caller],
         "map_into left the calling thread under Exec::serial()"
     );
     assert_eq!(
-        run_zip(Exec::serial()),
+        run_zip(Exec::serial(), false),
         [caller],
         "zip_map2_into left the calling thread under Exec::serial()"
     );
@@ -142,12 +210,19 @@ fn a_serial_token_runs_the_observed_entries_on_the_calling_thread() {
 
 /// The same shapes do fan out when the caller hands in a pool, so the serial
 /// assertion above is not vacuous.
+///
+/// The shapes are four times the work of the shape that failed under this
+/// assertion in CI (#382) and 87x the generic element count at which the fork
+/// gate opens (151x the AVX-512 one); the run also waits for the second thread
+/// rather than racing it, so the outcome no longer depends on how fast the host
+/// wakes a worker. The wait is bounded ([`SECOND_THREAD_LIMIT`]): a call that
+/// never fanned out fails, and so does one whose worker arrives after the bound.
 #[cfg(feature = "parallel")]
 #[test]
 fn a_pooled_token_opens_a_second_worker() {
     for threads in [
-        run_map(Exec::new(common::shared_pool(), 4).unwrap()),
-        run_zip(Exec::new(common::shared_pool(), 4).unwrap()),
+        run_map(Exec::new(common::shared_pool(), 4).unwrap(), true),
+        run_zip(Exec::new(common::shared_pool(), 4).unwrap(), true),
     ] {
         assert!(
             threads.len() > 1,

@@ -404,7 +404,14 @@ pub struct StridedView<'a, T, Op = Identity> {
     _op: PhantomData<Op>,
 }
 
+// SAFETY: `StridedView` owns no `T`. It holds `&'a [T]` and a `*const T`
+// derived from it, so moving the view moves a shared borrow, which is `Send`
+// exactly when `T: Sync`. `Op` appears only in `PhantomData`, and `ViewMeta` is
+// owned metadata (an inline `tinyvec::ArrayVec` plus an optional box).
 unsafe impl<T: Sync, Op: Send> Send for StridedView<'_, T, Op> {}
+// SAFETY: a shared `&StridedView` hands out only `&T` (`get`, `ptr`, the
+// `ElementOp` read path) and never `&mut T`, so sharing is sound when `T: Sync`.
+// `Op` is `Sync` and appears only in `PhantomData`.
 unsafe impl<T: Sync, Op: Sync> Sync for StridedView<'_, T, Op> {}
 
 impl<T, Op> Clone for StridedView<'_, T, Op> {
@@ -439,6 +446,14 @@ fn base_ptr<T>(data: &[T], dims: &[usize], offset: isize) -> *const T {
     if empty_layout(dims) {
         empty_const_ptr()
     } else {
+        // SAFETY: every caller reaches `base_ptr` from `from_meta`, whose
+        // `dims`/`strides`/`offset` were either accepted by `validate_bounds`
+        // (view.rs:186) — `StridedView::new`, `StridedViewMut::new`, the
+        // re-validated diagonal path, or a metadata transform that only reorders
+        // axes or zeroes strides and therefore cannot enlarge the reachable
+        // offset set — or were supplied under the `new_unchecked` contract. The
+        // empty-layout branch above excludes the case where `offset` may point
+        // past `data`.
         unsafe { data.as_ptr().offset(offset) }
     }
 }
@@ -468,6 +483,16 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// The layout is copied into the view's inline storage, so it does not
     /// need to outlive the view and no heap allocation happens at rank
     /// `<= INLINE_RANK`. The view's lifetime is tied to `data` only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     ///
     /// # Examples
     ///
@@ -563,6 +588,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     }
 
     /// Permute dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `perm` does not have one
+    /// entry per axis, and [`StridedError::InvalidAxis`] when an entry
+    /// names an axis outside the rank or repeats an axis.
     pub fn permute(&self, perm: &[usize]) -> Result<StridedView<'a, T, Op>> {
         let rank = self.dims().len();
         if perm.len() != rank {
@@ -671,6 +702,12 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Broadcast this view to a target shape.
     ///
     /// Size-1 dimensions are expanded (stride set to 0) to match target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `target_dims` does not
+    /// have one entry per axis, and [`StridedError::ShapeMismatch`] when an
+    /// axis is neither already the target extent nor of size one.
     pub fn broadcast(&self, target_dims: &[usize]) -> Result<StridedView<'a, T, Op>> {
         if self.dims().len() != target_dims.len() {
             return Err(StridedError::RankMismatch(
@@ -700,6 +737,10 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     /// Transpose a 2D view: reverses dimensions and composes the Transpose element op.
     ///
     /// Julia equivalent: `Base.transpose(a::AbstractStridedView{<:Any, 2})`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when the view is not 2-D.
     pub fn transpose_2d(&self) -> Result<StridedView<'a, T, Op::ComposeTranspose>> {
         if self.dims().len() != 2 {
             return Err(StridedError::RankMismatch(self.dims().len(), 2));
@@ -715,6 +756,10 @@ impl<'a, T: Copy + ElementOpApply, Op: ComposableElementOp<T>> StridedView<'a, T
     /// Adjoint (conjugate transpose) of a 2D view.
     ///
     /// Julia equivalent: `Base.adjoint(a::AbstractStridedView{<:Any, 2})`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when the view is not 2-D.
     pub fn adjoint_2d(&self) -> Result<StridedView<'a, T, Op::ComposeAdjoint>> {
         if self.dims().len() != 2 {
             return Err(StridedError::RankMismatch(self.dims().len(), 2));
@@ -752,6 +797,10 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        // SAFETY: `indexed_offset` (view.rs:239) asserts the index count and
+        // `index < dims[i]`, so the offset it returns lies within the reachable
+        // extent that `validate_bounds` (view.rs:186) proved stays inside
+        // `data` for this view's construction.
         Op::apply(unsafe { *self.ptr.offset(offset) })
     }
 
@@ -778,12 +827,32 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
 /// Always uses `Identity` element operation for write simplicity.
 /// Julia typically applies ops on the read side.
 pub struct StridedViewMut<'a, T> {
+    /// Element base: `base` plus `offset`, or a dangling pointer for an empty
+    /// layout. `get` and `set` go through it, so it stays cached.
+    ///
+    /// Nothing here reborrows the caller's `&mut [T]` any more: a stored slice
+    /// field was retagged at construction and by `data_mut`, which invalidated
+    /// this pointer and made every later `get`, `set`, and `as_view` access
+    /// undefined behavior.
     ptr: *mut T,
-    data: &'a mut [T],
+    /// Base of the whole backing slice.
+    ///
+    /// `base` with `src_len` is the handle `data` and `data_mut` re-derive the
+    /// slice from, so the backing extent stays independent of the shape (a
+    /// `[0]` shape still has a backing slice).
+    base: *mut T,
+    /// Length of the whole backing slice.
+    src_len: usize,
     meta: ViewMeta,
     offset: isize,
+    /// The view borrows the caller's slice for `'a` without holding it.
+    _marker: PhantomData<&'a mut [T]>,
 }
 
+// SAFETY: `StridedViewMut` uniquely owns its `&'a mut [T]` (held as
+// `PhantomData<&'a mut [T]>` plus the two raw pointers `base` and `ptr` derived
+// from it), and there is no `Sync` impl for it, so sending it moves that
+// exclusive borrow; `T: Send` is the bound `&mut [T]: Send` requires.
 unsafe impl<T: Send> Send for StridedViewMut<'_, T> {}
 
 impl<T: std::fmt::Debug> std::fmt::Debug for StridedViewMut<'_, T> {
@@ -801,16 +870,26 @@ impl<'a, T> StridedViewMut<'a, T> {
     #[inline]
     fn from_meta(data: &'a mut [T], dims: &[usize], strides: &[isize], offset: isize) -> Self {
         let meta = ViewMeta::from_slices(dims, strides);
+        let src_len = data.len();
+        let base = data.as_mut_ptr();
         let ptr = if empty_layout(meta.dims()) {
             empty_mut_ptr()
         } else {
-            unsafe { data.as_mut_ptr().offset(offset) }
+            // SAFETY: as `base_ptr` above — `offset` was accepted by
+            // `validate_bounds` (view.rs:186) in `StridedViewMut::new`, or by a
+            // metadata transform that only reorders axes or zeroes strides, or
+            // came from the `new_unchecked` contract. `base` is this view's own
+            // live handle on `data` and the empty-layout branch above excludes
+            // the case where `offset` may point past it.
+            unsafe { base.offset(offset) }
         };
         Self {
             ptr,
-            data,
+            base,
+            src_len,
             meta,
             offset,
+            _marker: PhantomData,
         }
     }
 
@@ -818,6 +897,16 @@ impl<'a, T> StridedViewMut<'a, T> {
     ///
     /// The layout is copied, so it does not need to outlive the view and no
     /// heap allocation happens at rank `<= INLINE_RANK`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     ///
     /// # Examples
     ///
@@ -918,21 +1007,45 @@ impl<'a, T> StridedViewMut<'a, T> {
     }
 
     /// Returns a reference to the backing data slice.
+    ///
+    /// The length is the backing slice's, not the shape's: a view whose shape
+    /// has a zero extent still reports the whole buffer.
     #[inline]
     pub fn data(&self) -> &[T] {
-        &self.data
+        // SAFETY: `base` is the caller's `data.as_mut_ptr()` and `src_len` is
+        // that slice's length, both recorded at construction, so this rebuilds
+        // exactly the borrowed slice. No length is derived from the shape, which
+        // is why a zero-extent layout still reports the whole buffer. `T` is
+        // initialized across it, and `&self` restricts this to a shared borrow.
+        unsafe { std::slice::from_raw_parts(self.base, self.src_len) }
     }
 
     /// Returns a mutable reference to the backing data slice.
+    ///
+    /// The slice is re-derived from the view's storage handle, so `ptr`, `get`,
+    /// and `set` stay valid after the returned borrow ends.
     #[inline]
     pub fn data_mut(&mut self) -> &mut [T] {
-        &mut self.data
+        // SAFETY: as `data` above — the same `base`/`src_len` pair, so this
+        // rebuilds the caller's slice rather than a shape-sized one. `&mut self`
+        // keeps the returned slice the only reference into the view while it
+        // lives. In a non-empty layout `ptr` is `base + offset`, derived without
+        // a retag, so re-deriving the slice here does not invalidate it — the
+        // property `get`/`set` rely on; an empty layout caches a dangling `ptr`
+        // that no element access dereferences.
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.src_len) }
     }
 
     /// Permute dimensions, consuming the mutable view.
     ///
     /// Returns a new mutable view with reordered dimensions and strides.
     /// Takes `self` by value to prevent aliasing of mutable views.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `perm` does not have one
+    /// entry per axis, and [`StridedError::InvalidAxis`] when an entry
+    /// names an axis outside the rank or repeats an axis.
     pub fn permute(self, perm: &[usize]) -> Result<StridedViewMut<'a, T>> {
         let rank = self.dims().len();
         if perm.len() != rank {
@@ -951,12 +1064,10 @@ impl<'a, T> StridedViewMut<'a, T> {
         }
         let new_dims: AxisVec = perm.iter().map(|&p| self.dims()[p]).collect();
         let new_strides: StrideVec = perm.iter().map(|&p| self.strides()[p]).collect();
-        Ok(Self::from_meta(
-            self.data,
-            &new_dims,
-            &new_strides,
-            self.offset,
-        ))
+        Ok(Self {
+            meta: ViewMeta::from_slices(&new_dims, &new_strides),
+            ..self
+        })
     }
 
     /// Reborrow as an immutable view.
@@ -977,13 +1088,16 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// ```
     #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
-        StridedView {
-            ptr: self.ptr as *const T,
-            data: unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.data.len()) },
-            meta: self.meta.clone(),
-            offset: self.offset,
-            _op: PhantomData,
-        }
+        // SAFETY: `data()` re-derives the slice from this view's own handle
+        // (`base` + `src_len`), and `ptr` is `base + offset` for the same
+        // `offset`, so the immutable view ends up pointing at the same storage
+        // the mutable view owns. A zero-extent layout yields a dangling pointer
+        // on both sides (`empty_mut_ptr` here, the `empty_layout` branch of
+        // `base_ptr` in the immutable view), so they agree there too. `&self`
+        // keeps that storage exclusively borrowed for the returned view's
+        // lifetime, so the shared view can only read it, and `T` is initialized
+        // across the whole slice.
+        unsafe { StridedView::new_unchecked(self.data(), self.dims(), self.strides(), self.offset) }
     }
 }
 
@@ -996,6 +1110,18 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        // SAFETY: in a non-empty layout `ptr` is `base + offset`, derived from
+        // the caller's `&'a mut [T]` through raw pointers only, so a reborrow of
+        // the backing slice does not invalidate it: `data_mut` re-derives that
+        // slice from `base` and never rewrites `ptr`, and offsetting a raw
+        // pointer keeps `base`'s provenance. (An empty layout caches a dangling
+        // `ptr`, but no index satisfies `index < dims[i]` there, so this access
+        // is unreachable.) `indexed_offset` (view.rs:239) asserts the index
+        // count and `index < dims[i]`, so the relative offset it returns keeps
+        // `ptr + offset` inside the extent `validate_bounds` (view.rs:186)
+        // proved reachable, i.e. inside `base..base + src_len`, where every
+        // element is initialized because the view borrows an initialized
+        // `&'a mut [T]` and no method shortens that borrow.
         unsafe { *self.ptr.offset(offset) }
     }
 
@@ -1007,6 +1133,12 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn set(&mut self, indices: &[usize], value: T) {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
+        // SAFETY: as `get` above — the same `ptr` survives an earlier `data_mut`
+        // reborrow, and `indexed_offset` (view.rs:239) bounds-checks every index,
+        // so the store lands inside `base..base + src_len`. `&mut self` makes
+        // this the only access through the view for the call, and the view holds
+        // the sole `&'a mut [T]` borrow of that storage, so nothing else can
+        // alias the written place.
         unsafe {
             *self.ptr.offset(offset) = value;
         }
@@ -1229,6 +1361,16 @@ impl<T: Clone + Default> StridedArray<T> {
 
 impl<T> StridedArray<T> {
     /// Create from raw parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
+    /// `strides` have different lengths, and
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn from_parts(
         data: Vec<T>,
         dims: &[usize],
@@ -1296,6 +1438,11 @@ impl<T> StridedArray<T> {
         let ptr = if self.is_empty() {
             empty_const_ptr()
         } else {
+            // SAFETY: `offset` is either 0 from a constructor or was accepted by
+            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1374), so
+            // `data.as_ptr() + offset` stays inside `data`. The empty branch
+            // above excludes a zero-sized layout, whose offset need not be
+            // reachable.
             unsafe { self.data.as_ptr().offset(self.offset) }
         };
         StridedView {
@@ -1310,16 +1457,25 @@ impl<T> StridedArray<T> {
     /// Create a mutable view over this tensor.
     #[inline]
     pub fn view_mut(&mut self) -> StridedViewMut<'_, T> {
+        let src_len = self.data.len();
+        let base = self.data.as_mut_ptr();
         let ptr = if self.is_empty() {
             empty_mut_ptr()
         } else {
-            unsafe { self.data.as_mut_ptr().offset(self.offset) }
+            // SAFETY: as `view` above — `self.offset` is either 0 from a
+            // constructor or was accepted by `validate_bounds` in
+            // `StridedArray::from_parts` (view.rs:1374), and `&mut self` keeps
+            // this reborrow exclusive. The empty branch above excludes a
+            // zero-sized layout, whose offset need not be reachable.
+            unsafe { base.offset(self.offset) }
         };
         StridedViewMut {
             ptr,
-            data: &mut self.data,
+            base,
+            src_len,
             meta: self.meta.clone(),
             offset: self.offset,
+            _marker: PhantomData,
         }
     }
 
@@ -1327,6 +1483,12 @@ impl<T> StridedArray<T> {
     ///
     /// Returns a new array with reordered dims and strides.
     /// The underlying data buffer is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::RankMismatch`] when `perm` does not have one
+    /// entry per axis, and [`StridedError::InvalidAxis`] when an entry
+    /// names an axis outside the rank or repeats an axis.
     pub fn permuted(self, perm: &[usize]) -> Result<Self> {
         let rank = self.dims().len();
         if perm.len() != rank {
