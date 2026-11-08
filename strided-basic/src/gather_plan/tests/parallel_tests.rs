@@ -193,14 +193,18 @@ fn dynamic_update_generic_replay_parallel_matches_serial() {
     let source = RawStridedRef::new(&operand, &dims, &operand_strides, 0).unwrap();
     let update_ref = RawStridedRef::new(&update, &update_dims, &update_strides, 0).unwrap();
     let start_ref = RawStridedRef::new(&starts, &[9], &[1], 0).unwrap();
-    let total: usize = dims.iter().product();
+    let update_len: usize = update_dims.iter().product();
+    // The update replay is gated on the window length, not the operand length:
+    // execute_update_with_writer dispatches with plan.total.
+    assert_eq!(update_len, plan.total);
     let (serial, parallel) = run_serial_and_parallel(|mut exec| {
         // The same gate the plan applies: a pooled context must really fan out
         // for this length, or this test would silently re-run the serial path.
         if !exec.is_serial() {
             assert!(
-                !crate::cost::for_len_tree(exec.reborrow(), KernelClass::Copy, total).is_serial(),
-                "the pooled run must fan out for {total} elements"
+                !crate::cost::for_len_tree(exec.reborrow(), KernelClass::Copy, update_len)
+                    .is_serial(),
+                "the pooled run must fan out for {update_len} update elements"
             );
         }
         let mut out = vec![-1i64; expected.len()];

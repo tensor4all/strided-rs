@@ -440,3 +440,81 @@ fn dynamic_update_generic_replay_matches_reference() {
         .unwrap();
     assert_eq!(out, expected);
 }
+
+/// The preflight guards the whole window span, not just its base. These cases
+/// call the preflight directly, so a missing guard fails an assertion instead
+/// of sending an overflowing descriptor into the pointer replay, and each span
+/// has its own case so deleting either `covers` call turns one of them red.
+#[test]
+fn preflight_rejects_a_window_that_overflows_the_update_span() {
+    use crate::{RawStridedMut, RawStridedRef, StridedError};
+
+    for (update_stride, update_offset) in [(1isize, isize::MAX), (-1, isize::MIN)] {
+        let dims = [2usize];
+        let update_storage = [0i32];
+        let starts = [0i64];
+        let update_strides = [update_stride];
+        let plan = DynamicUpdateSlicePlan::compile(
+            &dims,
+            &[1],
+            &[1],
+            &[1],
+            &dims,
+            &update_strides,
+            &dims,
+            &[1],
+        )
+        .unwrap();
+        // SAFETY: the preflight rejects this window, so the unreachable update
+        // offset is never dereferenced.
+        let update_ref = unsafe {
+            RawStridedRef::new_unchecked(&update_storage[..], &dims, &update_strides, update_offset)
+        };
+        let start_ref = RawStridedRef::new(&starts, &[1], &[1], 0).unwrap();
+        let mut out = [-1i32; 2];
+        let dest = RawStridedMut::new(&mut out, &dims, &[1], 0).unwrap();
+        let result = plan.preflight_update_window(&dest, &update_ref, &start_ref);
+        assert!(
+            matches!(result, Err(StridedError::OffsetOverflow)),
+            "a window past the update span must be rejected"
+        );
+    }
+}
+
+/// The same whole-window guard on the destination side: a destination base that
+/// fits `isize` is still rejected when the window reaches past it.
+#[test]
+fn preflight_rejects_a_window_that_overflows_the_dest_span() {
+    use crate::{RawStridedMut, RawStridedRef, StridedError};
+
+    for (dest_stride, dest_offset) in [(1isize, isize::MAX), (-1, isize::MIN)] {
+        let dims = [2usize];
+        let update = [3i32, 4];
+        let starts = [0i64];
+        let dest_strides = [dest_stride];
+        let plan = DynamicUpdateSlicePlan::compile(
+            &dims,
+            &[1],
+            &[1],
+            &[1],
+            &dims,
+            &[1],
+            &dims,
+            &dest_strides,
+        )
+        .unwrap();
+        let update_ref = RawStridedRef::new(&update, &dims, &[1], 0).unwrap();
+        let start_ref = RawStridedRef::new(&starts, &[1], &[1], 0).unwrap();
+        let mut out = [0i32; 2];
+        // SAFETY: the preflight rejects this window before the copy writes
+        // through the destination, so the unreachable offset is never used.
+        let dest = unsafe {
+            RawStridedMut::new_unchecked(&mut out[..], &dims, &dest_strides, dest_offset)
+        };
+        let result = plan.preflight_update_window(&dest, &update_ref, &start_ref);
+        assert!(
+            matches!(result, Err(StridedError::OffsetOverflow)),
+            "a window past the destination span must be rejected"
+        );
+    }
+}

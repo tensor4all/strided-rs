@@ -239,8 +239,8 @@ fn issue_243_zero_rank_and_empty_window_copy_only() {
     assert_eq!(out, operand);
 }
 
-/// Negative destination and update strides and out-of-range start values keep
-/// the documented copy-then-clamped-window semantics.
+/// Negative destination and update strides and both signed extremes of the
+/// start range keep the documented copy-then-clamped-window semantics.
 #[test]
 fn issue_243_negative_strides_and_extreme_starts_match_reference() {
     let dest_dims = [4usize, 3];
@@ -251,7 +251,7 @@ fn issue_243_negative_strides_and_extreme_starts_match_reference() {
     let update_strides = [-1isize, -2];
     let operand: Vec<i32> = (1..=12).collect();
     let update = [10i32, 20, 30, 40];
-    let starts = [1i64, i64::MAX];
+    let starts = [i64::MIN, i64::MAX];
 
     let plan = DynamicUpdateSlicePlan::compile(
         &operand_dims,
