@@ -22,7 +22,7 @@ strided-basic = { version = "0.13.0", path = "strided-basic", default-features =
 strided-nn = { version = "0.13.0", path = "strided-nn", default-features = false }
 strided-fused = { version = "0.13.0", path = "strided-fused", default-features = false }
 strided-traits = { version = "0.7.0", path = "strided-traits" }
-strided-view = { version = "0.7.0", path = "strided-view" }
+strided-view = { version = "0.7.2", path = "strided-view" }
 strided-perm = { version = "0.13.0", path = "strided-perm" }
 strided-kernel = { version = "0.13.0", path = "strided-kernel" }
 threadteam = { version = "0.5", default-features = false }
