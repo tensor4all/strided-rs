@@ -6,10 +6,11 @@ name: Packaged crate tests
 # クリーンに publish され、`.crate` を展開した人（distro packager、vendored
 # build、`cargo install --path`）の `cargo test` で初めて落ちる（#399、#397 → #398）。
 #
-# コスト: クレートごとに 2 回目のビルドが要る（workspace のビルドをもう一周する）。
-# なので PR ごとの必須レーンには置かない。週次 schedule + `workflow_dispatch` と、
-# リリースブランチへの push のときだけ回す。失敗は run の色だけで示す（miri の
-# ように issue は起票しない。PR を止めない週次の信号なので、まず色を見る）。
+# コスト: matrix の各ジョブが自分の依存グラフを一からビルドするので、1 回の run で
+# 共有クレート（strided-traits など）をジョブの数だけコンパイルし直す。なので PR ごとの
+# 必須レーンには置かない。週次 schedule + `workflow_dispatch` と、リリースブランチへの
+# push のときだけ回す。失敗は run の色だけで示す（miri のように issue は起票しない。
+# PR を止めない週次の信号なので、まず色を見る）。
 #
 # 対象クレートはハードコードしない。ここは workspace の Cargo.toml の publish 設定
 # から機械的に決める（`cargo metadata` の `publish` が `[]` のクレート＝
@@ -89,8 +90,13 @@ jobs:
             | jq -r --arg c "${CRATE}" '.packages[] | select(.name == $c) | .version')
           # `--no-verify` は展開ディレクトリを作らない（展開は検証ビルドの一部）。
           # テストはクリーンな .crate の中身に対して回すので、自分で展開する。
-          tar xzf "target/package/${CRATE}-${version}.crate" -C target/package/
-          dir="target/package/${CRATE}-${version}"
+          # 展開先は checkout の **外**（$RUNNER_TEMP）。中で展開すると、cargo の
+          # parent 探索から `git rev-parse --show-toplevel` でリポジトリ root に
+          # 届き、パッケージ外の fixture を読むテストが緑のまま通ってしまう。
+          dir="${RUNNER_TEMP}/package/${CRATE}-${version}"
+          mkdir -p "$dir"
+          tar xzf "target/package/${CRATE}-${version}.crate" -C "$dir"
+          dir="${dir}/${CRATE}-${version}"
           test -d "$dir"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
