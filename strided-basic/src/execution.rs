@@ -666,11 +666,12 @@ where
 ///
 /// Returns `StridedError::PlanLayoutMismatch` when the destination, operand,
 /// update, or start view does not carry the plan's compiled extents and
-/// strides, before any destination write. That is the only rejection: an
-/// empty destination returns before any offset arithmetic, and a non-empty
-/// one carries the bounds its constructor validated, so the replay
-/// arithmetic cannot overflow. Out-of-range start values are clamped, not
-/// rejected.
+/// strides, before any destination write. The clamped update window is
+/// preflighted next, still before any destination write, and rejects a window
+/// that does not fit `isize`: an empty destination returns before that offset
+/// arithmetic, and a non-empty one carries the bounds its constructor
+/// validated, so a checked view never reaches that rejection. Out-of-range
+/// start values are clamped, not rejected.
 #[inline]
 pub unsafe fn dynamic_update_into_uninit<'a, T, I>(
     plan: &crate::DynamicUpdateSlicePlan,
