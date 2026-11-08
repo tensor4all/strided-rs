@@ -147,8 +147,8 @@ Shared: [`rust/performance.md` § Allocation And Copies](https://github.com/tens
   `broadcast`) never touch element data and stay allocation-free up to
   `strided_view::INLINE_RANK`. They change dims/strides/offset, and `conj` and
   `adjoint` additionally compose an `ElementOp` (`conj` returns
-  `StridedView<T, Op::ComposeConj>`), so the whole metadata contract is the half
-  that stays; keep it when adding one of them.
+  `StridedView<T, Op::ComposeConj>`). Keep both halves of that contract — no
+  element data touched, no allocation — when adding one of them.
 - A method that could alias a mutable view takes `self` by value or returns a
   borrowing view so the borrow checker rejects the alias
   (`permute(self, ...)` at `strided-view/src/view.rs:1049`, `as_view(&self)` at
