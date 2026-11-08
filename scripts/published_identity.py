@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Check that a version number identifies one body of content.
+
+On 2026-11-08 this invariant broke twice in the same repository:
+
+  strided-basic 0.12.0   published from 97e6e41 (add / mul / fma / axpy),
+                         then main changed to add_acc / mul_acc ... while the
+                         manifest still said 0.12.0.
+  strided-view  0.7.1    published with wrapping isize arithmetic, while main
+                         said 0.7.1 and panicked instead.
+
+Neither is a normal "forgot to bump" bug: in both cases `cargo update` gives a
+downstream crate different behaviour for the same version string, and no test
+in the workspace can see it, because the workspace builds against paths. The
+only thing that can see it is a comparison of the published artefact with the
+tree that claims that version. That is this script.
+
+Usage:
+  published_identity.py <repo-path> [--ref REF] [--crate NAME ...]
+
+Exit codes: 0 = every crate's declared version is either unpublished or
+matches the published artefact, 1 = at least one mismatch, 2 = could not check
+(git, cargo, network or crates.io failure; never reported as green).
+
+Caveats, stated rather than hidden:
+  * Cargo.toml is excluded. `cargo package` rewrites it, so a byte comparison
+    would always differ. The version string selects which .crate is compared,
+    so it is not compared itself.
+  * The comparison is byte-for-byte: a comment-only change under the same
+    version is a MISMATCH. That is intended — the published source is what
+    a user reads and builds.
+  * Crates whose declared version is not on crates.io yet are reported as
+    `unpublished` and do not fail the run — that is a release in progress.
+  * A crate with `publish = false` is skipped.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import tarfile
+import urllib.error
+import urllib.request
+
+UA = "tensor4all-published-identity/1.0 (maintainer check)"
+# Files worth comparing: what a user compiles. Manifest and lockfiles excluded.
+# The file set is taken from `cargo package --list`, which honours each crate's
+# `include` / `exclude`. Inventing a file set here produced false positives on
+# files a crate deliberately does not ship (#402 removed exactly such a test).
+SKIP_ALWAYS = {".cargo_vcs_info.json", "Cargo.lock", "Cargo.toml", "Cargo.toml.orig"}
+
+
+class CheckError(Exception):
+    """The check itself could not run (network, crates.io, git); exit 2, never green."""
+
+
+def run(cmd: list[str], cwd: str | None = None, timeout: int = 120) -> tuple[int, str]:
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout)
+    return r.returncode, (r.stdout + r.stderr)
+
+
+def checkout_ref(repo: str, ref: str) -> tuple[str, str | None]:
+    """Materialise `ref` in a throwaway worktree.
+
+    Reading the version from the working tree while reading the files from `ref`
+    produced a false MISMATCH the first time this ran against a pull request
+    (working tree said 0.7.0, the branch said 0.7.1). Both have to come from the
+    same commit, and `cargo package --list` also needs the real manifest, so the
+    ref is checked out rather than patched up in place.
+    """
+    tmp = tempfile.mkdtemp(prefix="published-identity-")
+    wt = pathlib.Path(tmp) / "wt"
+    rc, out = run(["git", "worktree", "add", "--detach", str(wt), ref], cwd=repo, timeout=300)
+    if rc != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return repo, None
+    return str(wt), tmp
+
+
+def workspace_crates(repo: str, ref: str) -> list[dict]:
+    rc, out = run(["cargo", "metadata", "--no-deps", "--format-version", "1",
+                   f"--manifest-path", f"{repo}/Cargo.toml"])
+    if rc != 0:
+        raise CheckError(f"cargo metadata failed: {out[:300]}")
+    meta = json.loads(out)
+    crates = []
+    for p in meta["packages"]:
+        if p.get("publish") == []:
+            continue
+        man = pathlib.Path(os.path.realpath(p["manifest_path"])).parent
+        rel = man.relative_to(pathlib.Path(os.path.realpath(repo)))
+        crates.append({"name": p["name"], "version": p["version"], "dir": str(rel)})
+    return crates
+
+
+def fetch(url: str) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as f:
+            return f.status, f.read()
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except Exception as e:  # DNS, TLS, timeout: not evidence of anything
+        raise CheckError(f"GET {url}: {e}") from e
+
+
+def published(name: str, ver: str) -> bytes | None:
+    """The published .crate, or None when crates.io has no such version.
+
+    Only a 404 from the API counts as "not published". Any other failure is a
+    failure to check: treating a network error as `unpublished` would turn an
+    outage into a green run.
+    """
+    code, _ = fetch(f"https://crates.io/api/v1/crates/{name}/{ver}")
+    if code == 404:
+        return None
+    if code != 200:
+        raise CheckError(f"crates.io API returned {code} for {name} {ver}")
+    code, blob = fetch(f"https://static.crates.io/crates/{name}/{name}-{ver}.crate")
+    if code != 200 or not blob:
+        raise CheckError(f"download of {name}-{ver}.crate returned {code}")
+    return blob
+
+
+def crate_files(blob: bytes) -> dict[str, str]:
+    """path-inside-crate -> sha256 for the files worth comparing."""
+    out: dict[str, str] = {}
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
+            if rel in SKIP_ALWAYS:
+                continue
+            f = tf.extractfile(m)
+            if f is None:
+                continue
+            out[rel] = hashlib.sha256(f.read()).hexdigest()
+    return out
+
+
+def shipped_paths(repo: str, crate: dict) -> set[str]:
+    """The exact files `cargo package` would ship, honouring include/exclude."""
+    rc, out = run(["cargo", "package", "-p", crate["name"], "--list", "-q",
+                   "--manifest-path", f"{repo}/Cargo.toml"], timeout=300)
+    if rc != 0:
+        raise CheckError(f"cargo package --list failed for {crate['name']}: {out[:300]}")
+    return {line.strip() for line in out.splitlines()
+            if line.strip() and line.strip() not in SKIP_ALWAYS}
+
+
+def git_files(repo: str, ref: str, crate_dir: str, wanted: set[str]) -> dict[str, str]:
+    """path-inside-crate -> sha256 for the files the crate actually ships.
+
+    Blobs are read as bytes: decoding them as text would fail on, or rewrite,
+    any file that is not UTF-8.
+    """
+    files: dict[str, str] = {}
+    for rel in wanted:
+        r = subprocess.run(["git", "show", f"{ref}:{crate_dir}/{rel}"],
+                           capture_output=True, cwd=repo, timeout=60)
+        if r.returncode != 0:
+            continue
+        files[rel] = hashlib.sha256(r.stdout).hexdigest()
+    return files
+
+
+def check_crate(repo: str, ref: str, crate: dict) -> tuple[str, list[str]]:
+    name, ver, cdir = crate["name"], crate["version"], crate["dir"]
+    blob = published(name, ver)
+    if blob is None:
+        return "unpublished", [f"{name} {ver} is not on crates.io (release in progress?)"]
+    wanted = shipped_paths(repo, crate)
+    pub = {k: v for k, v in crate_files(blob).items() if k in wanted}
+    tree = git_files(repo, ref, cdir, wanted)
+    diffs: list[str] = []
+    for rel in sorted(set(pub) | set(tree)):
+        if rel not in pub:
+            diffs.append(f"only in {ref}: {rel}")
+        elif rel not in tree:
+            diffs.append(f"only in published .crate: {rel}")
+        elif pub[rel] != tree[rel]:
+            diffs.append(f"differs: {rel}")
+    if diffs:
+        return "MISMATCH", [f"{name} {ver} ({cdir})"] + [f"    {d}" for d in diffs[:20]] + (
+            [f"    ... and {len(diffs) - 20} more"] if len(diffs) > 20 else [])
+    return "ok", []
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo")
+    ap.add_argument("--ref", default="HEAD")
+    ap.add_argument("--crate", action="append", default=[])
+    a = ap.parse_args()
+
+    ref = a.ref
+    rc, out = run(["git", "rev-parse", "--verify", ref], cwd=a.repo)
+    if rc != 0:
+        print(f"cannot resolve {ref}: {out[:200]}")
+        return 2
+    tree, tmp = checkout_ref(a.repo, ref)
+    if tmp is None:
+        print(f"could not check out {ref}")
+        return 2
+    try:
+        try:
+            crates = workspace_crates(tree, ref)
+        except CheckError as e:
+            print(f"could not list crates: {e}")
+            return 2
+        if a.crate:
+            unknown = sorted(set(a.crate) - {c["name"] for c in crates})
+            if unknown:
+                print(f"not a publishable workspace crate: {', '.join(unknown)}")
+                return 2
+            crates = [c for c in crates if c["name"] in a.crate]
+        if not crates:
+            print("no publishable crate found; nothing was checked")
+            return 2
+        bad = 0
+        for c in crates:
+            try:
+                verdict, lines = check_crate(tree, ref, c)
+            except CheckError as e:
+                print(f"could not check {c['name']} {c['version']}: {e}")
+                return 2
+            print(f"{verdict:11s} {c['name']} {c['version']}")
+            for line in lines:
+                print(line)
+            if verdict == "MISMATCH":
+                bad += 1
+    finally:
+        run(["git", "worktree", "remove", "--force", tree], cwd=a.repo, timeout=120)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print()
+    print(f"{len(crates)} crate(s) checked at {ref}: {bad} mismatch(es)")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
