@@ -10,7 +10,9 @@ baseline: the gap counts the rule-remediation issues check themselves against.
 Measured over the maintained crates (`strided-traits`, `strided-view`,
 `strided-basic`, `strided-kernel`, `strided-fused`, `strided-nn`,
 `strided-perm`) on the Rust sources **at this branch's head** — `c3b8999`, which
-includes the merge of `main` — with the counter at the same head:
+includes the merge of `main`; the branch was later rebased onto `8f89aae`
+(#397, #398), which changed 11 more Rust files and left every row and the
+doctest total unchanged — with the counter at the same head:
 
 ```bash
 python3 scripts/count-audit-metrics.py .   # the seven source rows
@@ -34,7 +36,9 @@ since the first version of this table, which is why it now carries its own head:
   print `339, 537` here.
 - The sources changed: the merge of `main` into this branch touched 36 Rust files,
   so the earlier `52 / 302 / 534 / 185 / 185 / 123` is a **historical** measurement
-  at `f7f9c5b` (#386), not evidence for this tree.
+  at `f7f9c5b` (#386), not evidence for this tree. The rebase onto `8f89aae`
+  (#397, #398) changed 11 further Rust files and the rows were re-run there:
+  `59 / 339 / 537 / 189 / 189 / 127 / 1 / 21`, identical to the table below.
 
 Record both when quoting a row: `git log -1 --format=%h -- scripts/count-audit-metrics.py`
 for the counter and `git log -1 --format=%h` for the sources.
@@ -93,10 +97,12 @@ Production scope is `strided-*/src/**/*.rs` with a `tests/` path component, a
 `NAME/`, an inline `#[cfg(test)] mod NAME { .. }` excludes `NAME/` as well, and a
 `#[path = "..."]` attribute names its file directly. Ordinary declarations resolve
 in the declaring module's directory (`foo/` for `foo.rs`, the containing directory
-for `lib.rs`/`mod.rs`); an explicit path resolves against the declaring file's own
-directory, so it may point outside the module subtree. The exclusion set is built
-from every candidate file, including ones that are themselves excluded, which is
-why one pass is enough. Inline `#[cfg(test)] mod NAME { .. }` bodies are skipped
+for `lib.rs`/`mod.rs`); an explicit path resolves like rustc's: against the
+declaring file's own directory at the top level, and against the enclosing module's
+directory when it sits inside an inline module, so it may point outside the module
+subtree. A file that both a test-only and a production declaration load stays in
+scope: test-only is a greatest fixed point over every declaration, including ones
+that are themselves excluded. Inline `#[cfg(test)] mod NAME { .. }` bodies are skipped
 for the first five rows; the `# Errors` row uses the same production files as the
 `Result` row, and the inline-module and file rows scan all of `strided-*/**/*.rs`
 with a `target/` component excluded.
@@ -116,7 +122,7 @@ the command's own output at this tree (127 passed, 0 ignored).
 | `// SAFETY:` | the same for `// SAFETY:`; an independent total, not paired with the row below |
 | `unsafe {` | occurrences of `unsafe` + `{` in the scanned text, comments and string literals blanked first, `unsafe` and `{` allowed on different lines; an independent total, not paired with the row above, and subject to the limits above |
 | public `Result` `fn` | a `pub` (or `pub unsafe` / `pub const` / `pub extern "C"`) `fn` whose signature, read to the first `{` or `;`, has a `Result<` after its own `->`; the line's own columns are preserved, so an `extern "C"` item is classified like any other; an arrow is consumed as one token, so a callback parameter's `-> Result<…>` is never read as the item's return type |
-| `# Errors` | the doc block nearest above such a `fn` contains a `/// # Errors` line; attribute lines (`#[inline]`, `#[must_use]`, `#[allow(..)]`, including multi-line ones) and blank lines between the doc block and the `fn` do not break the association |
+| `# Errors` | the doc block nearest above such a `fn` contains a `/// # Errors` heading — the word boundary is required, so `/// # ErrorsAreNotDocumented` does not count; attribute lines (`#[inline]`, `#[must_use]`, `#[allow(..)]`, including multi-line ones) and blank lines between the doc block and the `fn` do not break the association |
 | runnable doctests | `cargo test --doc` pass count at the repository root, not a fence count |
 | inline test modules | `#[cfg(test)]` (optionally with further attributes) followed by `mod NAME { .. }`; a `mod NAME;` declaration counts 0, because its body lives in another file and moving the body is exactly what this row is meant to move |
 | files over 1000 lines | logical lines (`str.splitlines()`) over `strided-*/**/*.rs`, which is one more than `wc -l` for a file without a final newline |
@@ -157,13 +163,15 @@ Consequences for reading a row:
 
 ### Counting defects found in review, and what each fix changed
 
-Twenty-one findings. Items 1-9 and 11-20 are scanner or attribution defects, each reproduced with
+Twenty-five findings. Items 1-9 and 11-20 and 22-25 are scanner or attribution
+defects, each reproduced with
 a fixture before the fix and pinned by a test after it; the suite fails on the
 pre-fix counter for every one of them except item 2 (`# Errors` across
 attributes), which an earlier round had already fixed and which keeps its own
 test. Items 1-6 came from the first review round, 7-10 from the second
-(`2026-11-08T05:25Z`, head `96dc462`), 11-15 from the third (head `274372d`) and
-16-21 from the fourth (`2026-11-08T09:36Z`, head `c3b8999`).
+(`2026-11-08T05:25Z`, head `96dc462`), 11-15 from the third (head `274372d`),
+16-21 from the fourth (`2026-11-08T09:36Z`, head `c3b8999`) and 22-25 from the
+fifth (head `57f88fc`, before the rebase).
 Item 10 is an attribution error rather than a scanner defect, so it has no
 regression test.
 
@@ -295,3 +303,32 @@ regression test.
     the merge touched 36 Rust files. The table is re-measured at `c3b8999`
     (`59 / 339 / 537 / 189 / 189 / 127 / 1 / 21`) and the earlier values are
     labelled historical.
+22. **An inline module's `#[path]` moved nothing.**
+    `#[path = "elsewhere"] mod checks { mod child; }` resolves to
+    `elsewhere/child.rs`, but the counter looked in `checks/`, so test-only code
+    stayed in production (`unsafe 1, pub_result 1`, expected 0/0). A nested
+    attribute also lost the file's own module directory: `mod inner {
+    #[path = "helper.rs"] mod checks; }` in `foo.rs` loads
+    `foo/inner/helper.rs`, and the counter read the other two files instead
+    (`unsafe 3, pub_result 2`, expected 2/1). Both resolve like rustc now;
+    `test_an_inline_module_path_moves_its_child`,
+    `test_an_explicit_path_inside_an_inline_module_keeps_the_file_module_dir`.
+23. **Removing a test module left its `# Errors` documentation behind.** A blank
+    line or a multi-line attribute's closing row between the doc block and
+    `#[cfg(test)]` stopped the backward cleanup, so the removed module's docs
+    credited the next undocumented `fn` (`with_errors 1`, expected 0). Blank rows
+    are transparent and attribute continuations are recognised now;
+    `test_docs_of_a_removed_test_module_do_not_credit_a_function_after_a_blank_line`,
+    `..._after_a_multiline_attribute`.
+24. **A test-only alias dropped a production file.** A file loaded by both a
+    test-only and a production declaration was excluded whole (`unsafe 0,
+    pub_result 0`, expected 1/1). Test-only is a greatest fixed point now;
+    `test_a_test_only_alias_does_not_drop_a_production_file`.
+25. **`# Errors` was matched by prefix.** `/// # ErrorsAreNotDocumented`
+    satisfied the count (`with_errors 1`, expected 0). It is a heading with a
+    word boundary now, and a `## ` subheading is still not the section;
+    `test_a_heading_that_merely_starts_with_errors_is_not_the_section`.
+
+The four fixes of items 22-25 move no whole-repository row: the production file
+list is identical and the table stays at
+`59 / 339 / 537 / 189 / 189 / 127 / 1 / 21`.
