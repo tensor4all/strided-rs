@@ -111,10 +111,13 @@ pub fn compute_importance(
         importance[i] = 2 * (1u64 << shift);
     }
 
-    // Add contributions from remaining arrays. `m` bounds the rows but not their
-    // length, so this matches the previous index-based loop only for inputs whose
-    // rows all have `n` entries: a short row is skipped here where that loop read
-    // `index_orders[k][i]` and panicked.
+    // Add contributions from remaining arrays. `m` bounds the row count but not a
+    // row's length, so this matches the previous index-based loop only while every
+    // row has `n` entries, which is what the only caller builds. A short row is not
+    // skipped: `enumerate` stops at the row's end, so that row contributes to the
+    // dimensions it has an order for and nothing to the rest, whereas the previous
+    // loop read `index_orders[k][i]` for every `i < n` and panicked on the first
+    // missing entry. Measured (`dims = [2, 2]`, strides `[1, 2], [1, 2], [0]`): `[32, 3]`.
     for row in &index_orders[1..m] {
         for (i, &order) in row.iter().enumerate() {
             let shift = g * (n - order) as u64;

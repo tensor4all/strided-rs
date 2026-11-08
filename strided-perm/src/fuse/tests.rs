@@ -94,8 +94,9 @@ fn test_compute_importance_uses_each_array_row() {
 /// A third array must contribute too, so the `&index_orders[1..m]` slice bound
 /// is exercised past the first contributing row. `m` is `all_strides.len()`, so
 /// the two inputs have to stay in lockstep, as the only caller keeps them; for a
-/// row shorter than `n` the loop differs from the one it replaced (it skips the
-/// row instead of panicking), which is noted at `fuse.rs:114`.
+/// row shorter than `n` the loop differs from the one it replaced (it contributes
+/// only the orders that row actually has, instead of panicking), which is noted at
+/// `fuse.rs:114`.
 ///
 /// The scores are pinned exactly rather than compared across `m`: `g` is the bit
 /// length of `m + 1`, so dropping a row changes every shift as well as the sum.
