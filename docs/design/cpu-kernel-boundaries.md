@@ -55,7 +55,10 @@ There is one execution-policy implementation in basic
 the same cost gate: `strided-fused/src/fused.rs:13` imports `compute_costs`,
 `mapreduce_threaded`, `parallel_width` and `KernelClass` from
 `strided_basic::execution`, and `strided-fused/src/fused.rs:18` imports the token
-itself. It does not construct an independent pool. `parallel` and `simd` features
+itself. It does not construct an independent pool — a contract, not a dependency
+restriction: `strided-basic` re-exports `Pool` and `PoolBuilder`
+(`strided-basic/src/lib.rs:145`), so fused code *could* build one and is asked
+not to. `parallel` and `simd` features
 propagate from each concrete owner to basic (`strided-fused/Cargo.toml:23-24`). No
 operation-family feature switches are added.
 

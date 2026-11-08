@@ -16,8 +16,9 @@ use strided_basic::{
     dot, reduce, sum, zip_reduce, Conj, ElementOp, Identity, StridedArray, StridedView,
 };
 
-/// Large-layout size of the suite; the pooled branch must match the serial
-/// reference bitwise.
+/// Large-layout size of the suite; a pooled call must match the serial
+/// reference bitwise. At this size the cost gate may keep the work on one
+/// worker, so the case asserts the result, not that a fork happened.
 #[cfg(feature = "parallel")]
 const THREADING_THRESHOLD: usize = 1 << 15;
 
@@ -423,10 +424,11 @@ mod parallel {
         .unwrap()
     }
 
-    /// Above the threading threshold `zip_reduce` splits work across workers on
-    /// both the contiguous leaf path and the general fused plan; exact
-    /// integer-valued data makes every split order exact, so each parallel
-    /// branch must equal the naive reference bitwise.
+    /// An explicit pool is passed with each width, on both the contiguous leaf
+    /// path and the general fused plan; exact integer-valued data makes every
+    /// split order exact, so any result the split produces must equal the naive
+    /// reference bitwise. Whether a fork happens at these sizes is the cost
+    /// gate's decision and is not asserted here.
     #[test]
     fn parallel_branch_matches_the_naive_reference_above_the_threshold() {
         for case in threshold_cases(true) {

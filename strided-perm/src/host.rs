@@ -12,6 +12,15 @@
 /// ones the placement token uses and cannot drift from them. The upstream doc
 /// below still names `strided-rs` among the crates that keep a hand-synced copy;
 /// this crate no longer does.
+///
+/// # Compatibility
+///
+/// This is a **type-identity change**, not a rename: `strided_perm::HostClass`
+/// is now the same type as `threadteam::HostClass` instead of a distinct copy.
+/// A downstream crate that implemented its own trait for both types compiles
+/// against the old pair and fails with `E0119` (conflicting implementations)
+/// against this one. Code that names the type, compares it, or matches on its
+/// variants is unaffected.
 pub use threadteam::HostClass;
 
 /// Serial throughput of a copy in nanoseconds per element, of a host class.

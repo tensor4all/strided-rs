@@ -759,7 +759,8 @@ fn test_strided_view_broadcast_and_copy() {
 }
 
 // ============================================================================
-// Large-array tests: large tensors driven through the serial token
+// Large-array tests: large tensors driven through the serial token.
+// The token is serial, so these check the serial route at scale, not fan-out.
 // ============================================================================
 
 /// Helper: create a large col-major 2D array (n*n > 32768 when n >= 182).
