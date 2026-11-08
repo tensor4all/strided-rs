@@ -169,9 +169,30 @@ where
     F: Fn(Range<usize>) + Sync,
 {
     let start = range.start;
+    #[cfg(test)]
+    let chunks = core::sync::atomic::AtomicUsize::new(0);
     exec.for_ranges(range.end - range.start, ONE, |chunk| {
+        #[cfg(test)]
+        chunks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         operation(start + chunk.start..start + chunk.end)
     });
+    #[cfg(test)]
+    DISPATCHED_CHUNKS.with(|n| n.set(n.get() + chunks.into_inner()));
+}
+
+// Ledger high-water marks depend on scheduling; the chunk count that
+// `for_ranges` hands out does not. Thread-local on the calling thread so that
+// concurrently running tests do not see each other's chunks.
+#[cfg(test)]
+thread_local! {
+    static DISPATCHED_CHUNKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The chunks every `parallel_for_each` called on this thread has run since
+/// the last call, and resets the count.
+#[cfg(test)]
+pub(crate) fn take_dispatched_chunks() -> usize {
+    DISPATCHED_CHUNKS.with(|n| n.replace(0))
 }
 
 /// Copy `len` contiguous elements, chunked across the budget of `exec` when
