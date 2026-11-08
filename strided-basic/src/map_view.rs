@@ -859,6 +859,10 @@ fn strided_offset_for_contiguous_linear_index(
     offset
 }
 
+// Raw parts entry for the whole contiguous product: the three base pointers, the
+// dims and strides of both operands and the executor. The argument list is wide
+// because this function splits the work itself (`parallel_for_each` below) from
+// exactly these values; nothing calls it once per worker range.
 #[allow(clippy::too_many_arguments)]
 fn try_contiguous_range_mul<
     O: MulOutput<D>,
@@ -1433,6 +1437,8 @@ pub(crate) fn map_raw_into_validated<
     )
 }
 
+// Raw parts for the whole operation, not one block: this entry point checks the shapes and
+// the destination layout, then forwards the same parts to `map_parts_into_validated`.
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into<
     D: Copy + Send + Sync,
@@ -1487,6 +1493,8 @@ fn map_contiguous<D: Copy, A: Copy, Op: ElementOp<A>>(
     });
 }
 
+// Raw parts, the element op, the kernel, the class and the token: the operands are the
+// operation's, not a block's.
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into_validated<
     D: Copy + Send + Sync,
@@ -1808,6 +1816,8 @@ pub(crate) fn zip_map2_raw_into_validated<
     )
 }
 
+// Raw parts for the whole binary operation: the shape and destination-layout checks live
+// here, and `zip_map2_parts_into_validated` below does the planning and dispatch.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into<
     D: Copy + Send + Sync,
@@ -1845,6 +1855,8 @@ fn zip_map2_parts_into<
     )
 }
 
+// The same three raw-parts operands plus the closure, the `validated` marker and the
+// token: the planned traversal for the whole operation, entered once, not per block.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into_validated<
     D: Copy + Send + Sync,
@@ -1958,6 +1970,9 @@ fn zip_map2_parts_into_validated<
     )
 }
 
+// Raw parts for the whole multiplication: it takes the contiguous fast path when the three
+// layouts agree, and otherwise walks the strided one. The operands here are the
+// operation's, not a block's.
 #[allow(clippy::too_many_arguments)]
 fn mul_identity_into_raw<
     O: MulOutput<D>,
@@ -2576,6 +2591,8 @@ pub fn zip_map4_into<
     zip_map4_into_validated(dest, a, b, c, e, f, validated, exec)
 }
 
+// Four operand views plus the destination, the closure, the `validated` marker and
+// the token: the entry's shape.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn zip_map4_into_validated<
     D: Copy + Send + Sync,

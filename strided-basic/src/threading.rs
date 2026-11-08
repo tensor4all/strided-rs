@@ -455,6 +455,8 @@ impl ThreadedMapReduce<'_> {
 /// never needs a worker-count-sized output-slot vector (#306 scope addition).
 /// `f` must reduce the whole sub-region it is handed, using the supplied
 /// `for_each_inner_block_with_offsets` traversal.
+// The whole traversal: dims, blocks, per-operand strides, offsets and costs, the
+// class, the token and the two closures.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mapreduce_threaded_fold<S, F, C, R>(
     dims: &[usize],

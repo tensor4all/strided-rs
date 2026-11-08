@@ -15,6 +15,7 @@ pub const SMALL_TENSOR_THRESHOLD: usize = 1024;
 /// Blocking metadata produced by the execution planners; not a layout-validity proof.
 #[derive(Debug)]
 pub struct KernelPlan {
+    // `order` is only read by the `#[cfg(test)]` `for_each_inner_block` traversal.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) order: InlineVec<usize>, // inner -> outer
     pub block: InlineVec<usize>,

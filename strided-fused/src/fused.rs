@@ -1317,6 +1317,8 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
 ///
 /// # Safety
 /// As [`interpret_inner_loop`].
+// Inert: `interpret_loop_body` takes 7 arguments and clippy's `too_many_arguments`
+// fires only above 7, so this allow suppresses nothing; it is left in place.
 #[allow(clippy::too_many_arguments)]
 unsafe fn interpret_loop_body<T: FusedScalar>(
     dst_ptrs: &[*mut T],
@@ -1627,6 +1629,8 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
 ///
 /// # Safety
 /// As [`interpret_inner_loop_uninit`].
+// Inert: `interpret_loop_body_uninit` takes 7 arguments and clippy's
+// `too_many_arguments` fires only above 7, so this allow suppresses nothing.
 #[allow(clippy::too_many_arguments)]
 unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
     dst_ptrs: &[*mut MaybeUninit<T>],

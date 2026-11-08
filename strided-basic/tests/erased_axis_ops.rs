@@ -209,6 +209,8 @@ fn all_scan_options() -> [ScanOptions; 4] {
 
 /// Runs a scan through both entries and checks it against the reference
 /// with `same` (bitwise for every dtype: the fold order is fixed).
+// Test helper: dtype, op, both layouts, axis and options stay separate, plus the value
+// and the closures, so the call reads as the case it builds.
 #[allow(clippy::too_many_arguments)]
 fn check_scan<T: KernelStorageElement + core::fmt::Debug>(
     dtype: KernelDType,
@@ -1039,6 +1041,8 @@ fn close(got: f64, want: f64, tol: f64) -> bool {
     (got - want).abs() <= tol * (1.0 + want.abs())
 }
 
+// Inert: `check_norm` takes 7 arguments and clippy's `too_many_arguments` fires
+// only above 7, so this allow suppresses nothing; it is left in place as it is.
 #[allow(clippy::too_many_arguments)]
 fn check_norm<T: NormElem>(
     kind: NormKind,

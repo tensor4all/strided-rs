@@ -147,6 +147,7 @@ impl_simd_mul_ptr!(
 
 #[cfg(feature = "simd")]
 #[inline]
+// Only `simd/tests` call this safe wrapper; production calls `try_mul_contiguous_ptr`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_mul_contiguous<D: 'static, A: 'static, B: 'static>(
     dst: &mut [D],
@@ -188,6 +189,7 @@ pub(crate) unsafe fn try_mul_contiguous_ptr<D: 'static, A: 'static, B: 'static>(
 
 #[cfg(not(feature = "simd"))]
 #[inline]
+// Same as the `simd` branch above: only the tests call this safe wrapper.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_mul_contiguous<D: 'static, A: 'static, B: 'static>(
     _dst: &mut [D],

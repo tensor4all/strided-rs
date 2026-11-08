@@ -642,6 +642,10 @@ impl PadPlan {
     /// slot and no other access may overlap the call; the operand may only be
     /// read at coordinates that are copied, but no read is performed for a
     /// padding-only column.
+    // Whole-plan entry for the column write: both base pointers with their offsets,
+    // the fill value and the compiled column plan, handed to
+    // `write_axis0_columns_range` per worker range. The argument list is that plan
+    // forwarded, not a per-column invocation.
     #[allow(clippy::too_many_arguments)]
     unsafe fn write_axis0_columns_raw<T, const UNINIT: bool>(
         &self,
@@ -723,6 +727,7 @@ impl PadPlan {
     ///
     /// As for [`Self::write_axis0_columns_raw`], and no other thread may write
     /// the destination columns visited by this call.
+    // Per-range sibling of `write_axis0_columns_raw`, same arguments plus the range.
     #[allow(clippy::too_many_arguments)]
     unsafe fn write_axis0_columns_range<T, const UNINIT: bool>(
         &self,
@@ -959,6 +964,8 @@ impl PadPlan {
     ///
     /// As for [`Self::copy_axis0_runs_raw`], and no other thread may write the
     /// destination runs visited by this call.
+    // Run-copy leaf: both bases, the compiled run, the outer index, the count and the
+    // token.
     #[allow(clippy::too_many_arguments)]
     unsafe fn copy_axis0_run_range<T>(
         &self,
@@ -2091,6 +2098,8 @@ fn compile_contiguous_pad_axis0_run(
 
 /// Compile the disjoint-span column write for the dense, non-cropping,
 /// no-interior-padding class, or `None` to keep the fill-then-copy fallback.
+// Compile key: the operand layout, the destination dims, the three padding
+// vectors, the destination-fill flag and the run.
 #[allow(clippy::too_many_arguments)]
 fn compile_contiguous_pad_axis0_columns(
     operand_dims: &[usize],

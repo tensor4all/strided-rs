@@ -35,6 +35,7 @@ fn run_full<T: KernelStorageElement + Default>(
     output[0]
 }
 
+// Test helper: the reduce case's layouts and axes stay separate for readability.
 #[allow(clippy::too_many_arguments)]
 fn run_axes<T: KernelStorageElement + Default>(
     dtype: KernelDType,

@@ -1,6 +1,7 @@
 //! Shared test helpers: a copyable thread-budget description that mints a fresh
 //! `Exec` token for each call, since `Exec` is neither `Clone` nor `Copy`.
 
+// Each integration test binary that includes this module uses a subset of the helpers.
 #![allow(dead_code)]
 
 use std::sync::OnceLock;
