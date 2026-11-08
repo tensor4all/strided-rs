@@ -17,10 +17,11 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use strided_basic::{
-    add, axpy, batched_outer_product_into, col_major_strides, dot, embed_diagonal_into_uninit, fma,
-    map_into, map_update_into, mul, reduce, reduce_axis_into, sum, symmetrize_into, zip_map2_into,
-    zip_map3_into, zip_map4_into, zip_reduce, zip_update2_into, zip_update3_into, Exec, Identity,
-    Pool, StridedArray, StridedView, StridedViewMut,
+    add_acc, axpy_acc, batched_outer_product_into, col_major_strides, dot,
+    embed_diagonal_into_uninit, fma_acc, map_into, map_update_into, mul_acc, reduce,
+    reduce_axis_into, sum, symmetrize_into, zip_map2_into, zip_map3_into, zip_map4_into,
+    zip_reduce, zip_update2_into, zip_update3_into, Exec, Identity, Pool, StridedArray,
+    StridedView, StridedViewMut,
 };
 
 const SMALL_TENSOR_THRESHOLD: usize = 1024;
@@ -317,33 +318,33 @@ fn run_map_entries(dims: &[usize], pool: &Pool) {
         .unwrap();
     });
 
-    assert_entry("add", pool, dims, &kinds, |kind, exec| {
+    assert_entry("add_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        add(&mut dest, &source, exec).unwrap();
+        add_acc(&mut dest, &source, exec).unwrap();
     });
 
-    assert_entry("mul", pool, dims, &kinds, |kind, exec| {
+    assert_entry("mul_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        mul(&mut dest, &source, exec).unwrap();
+        mul_acc(&mut dest, &source, exec).unwrap();
     });
 
-    assert_entry("axpy", pool, dims, &kinds, |kind, exec| {
+    assert_entry("axpy_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let source = sv(&src, dims, &strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        axpy(&mut dest, &source, 1.5, exec).unwrap();
+        axpy_acc(&mut dest, &source, 1.5, exec).unwrap();
     });
 
-    assert_entry("fma", pool, dims, &kinds, |kind, exec| {
+    assert_entry("fma_acc", pool, dims, &kinds, |kind, exec| {
         let strides = &layouts[kind_index(kind)];
         let va = sv(&a, dims, &strides, 0).unwrap();
         let vb = sv(&b, dims, &dst_strides, 0).unwrap();
         let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
-        fma(&mut dest, &va, &vb, exec).unwrap();
+        fma_acc(&mut dest, &va, &vb, exec).unwrap();
     });
 
     assert_entry("dot", pool, dims, &kinds, |kind, _exec| {

@@ -50,11 +50,21 @@
 //! repay a fork stays on the calling thread whatever the budget. Without the
 //! `parallel` feature every token runs inline.
 //!
+//! ## Suffix Vocabulary
+//!
+//! Mutation semantics are visible in the name, and no two names may suggest the
+//! same operation: `*_acc` reads `dest[i]` and accumulates into it, `*_into`
+//! overwrites it without reading the previous value, and `*_view` returns
+//! metadata only. Pre-1.0, a rename deletes the old name outright: no alias, no
+//! deprecated wrapper.
+//!
 //! ## Basic Operations
 //!
 //! - [`copy_into`]: Copy array contents
-//! - [`add`], [`mul`]: Element-wise arithmetic
-//! - [`axpy`]: y = alpha*x + y (array version)
+//! - [`add_acc`], [`mul_acc`]: Accumulating element-wise arithmetic (`dest[i] += src[i]`,
+//!   `dest[i] *= src[i]`)
+//! - [`axpy_acc`]: y = alpha*x + y (array version)
+//! - [`fma_acc`]: `dest[i] += a[i] * b[i]`
 //! - [`sum`], [`dot`]: Reductions
 //! - [`symmetrize_into`], [`symmetrize_conj_into`]: Matrix symmetrization
 //!
@@ -133,8 +143,9 @@ pub use map_view::{
 };
 pub use nan_select::{nan_propagating_maximum, nan_propagating_minimum};
 pub use ops_view::{
-    add, axpy, copy_conj, copy_into, copy_into_col_major, copy_into_uninit, copy_scale,
-    copy_transpose_scale_into, dot, fma, mul, sum, symmetrize_conj_into, symmetrize_into,
+    add_acc, axpy_acc, copy_conj_into, copy_into, copy_into_col_major, copy_into_uninit,
+    copy_scale_into, copy_transpose_scale_into, dot, fma_acc, mul_acc, sum, symmetrize_conj_into,
+    symmetrize_into,
 };
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, replay_copy_raw,
