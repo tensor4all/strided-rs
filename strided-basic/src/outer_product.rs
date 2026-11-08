@@ -15,6 +15,15 @@ type AxisVec<T> = crate::inline::InlineVec<T>;
 /// This is a semantic convenience wrapper over [`broadcast_mul_into`]. The
 /// broadcast/mul planner owns kernel selection, so explicit outer-product calls
 /// and equivalent broadcasted multiplication use the same implementation path.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] when the free/batch split does not
+/// describe the operand and destination ranks, [`StridedError::ShapeMismatch`]
+/// when the batch or free extents disagree, or
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective. Validation completes before
+/// the first write.
 pub fn batched_outer_product_into<D, A, B, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     lhs: &StridedView<A, OpA>,
@@ -59,7 +68,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns a typed rank or shape error for incompatible free/batch dimensions,
+/// Returns [`StridedError::RankMismatch`] when the free/batch split does not
+/// describe the operand and destination ranks, or
+/// [`StridedError::ShapeMismatch`] when the batch or free extents disagree,
 /// [`StridedError::NonInjectiveOutputLayout`] for an overlapping output layout,
 /// [`StridedError::OverlappingInputOutput`] for aliased storage, or
 /// [`StridedError::OffsetOverflow`] when a reachable byte range is not

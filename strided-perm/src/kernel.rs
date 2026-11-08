@@ -298,6 +298,13 @@ where
 }
 
 /// Iterate over blocks with pre-ordered dimensions and initial offsets.
+///
+/// # Errors
+///
+/// The traversal itself cannot fail: every return value is `Ok(())`, or
+/// exactly the error returned by `f`, which this function propagates
+/// unchanged. Non-zero ranks dispatch to the specialized 1D..8D kernels and
+/// higher ranks to the generic iterator.
 #[inline]
 pub fn for_each_inner_block_preordered<F>(
     dims: &[usize],

@@ -49,6 +49,14 @@ pub struct ValidatedDestinationLayout(());
 /// here. Kernel families that need the marker for more than one step (for
 /// example validating shapes and then taking a specialization) should call this
 /// once and pass the marker on instead of re-running the check.
+///
+/// # Errors
+///
+/// Returns [`StridedError::NonInjectiveOutputLayout`] when the layout cannot
+/// be proven representable and injective: two distinct logical indices of
+/// `dims` name the same offset under `strides`, or the element count or the
+/// address span is too large to represent. A rejected layout need not be
+/// colliding.
 #[inline]
 pub fn validate_destination_layout(
     dims: &[usize],
@@ -1231,6 +1239,15 @@ impl<A, D, F: Fn(A) -> D + Sync> MapFn<A, D> for Classed<F> {
 ///
 /// `f` is any `Fn(A) -> D + Sync`, gated as [`KernelClass::Map`], or a function declared
 /// with a class of its own (see [`MapFn`]), so an expensive element function forks sooner.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the views have different ranks or
+/// extents, and [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven representable and injective: two
+/// logical indices name one offset, or the element count or address span is
+/// too large to represent. Nothing is written unless validation succeeds.
 pub fn map_into<D: Copy + Send + Sync, A: Copy + Send + Sync, Op: ElementOp<A>>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<A, Op>,
@@ -1574,6 +1591,16 @@ fn map_parts_into_validated<
 ///
 /// Source operands `a` and `b` may have different element types from each other
 /// and from `dest`. The closure `f` handles per-element type conversion.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when `dest` and either source view have
+/// different ranks or extents, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn zip_map2_into<
     D: Copy + Send + Sync,
     A: Copy + Send + Sync,
@@ -2059,6 +2086,16 @@ fn mul_identity_into_raw<
 ///
 /// All views must have the same shape. Broadcast operands should be represented
 /// as stride-0 views before calling this function.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when `dest` and either operand have
+/// different ranks or extents, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn mul_into<
     D: Copy + Send + Sync + 'static,
     A: Copy + Mul<B, Output = D> + Send + Sync + 'static,
@@ -2214,6 +2251,17 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
 ///
 /// `a_axes` and `b_axes` map each source axis to an axis of `dest`. Output axes
 /// not referenced by a source operand are treated as stride-0 broadcast axes.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] when an axis list does not have one
+/// entry per source axis, [`StridedError::InvalidAxis`] when an axis lies
+/// outside `dest` or is mapped twice, [`StridedError::ShapeMismatch`] when a
+/// source extent is neither the destination extent nor 1, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn broadcast_mul_into<
     D: Copy + Send + Sync + 'static,
     A: Copy + Mul<B, Output = D> + Send + Sync + 'static,
@@ -2316,6 +2364,16 @@ pub fn broadcast_mul_into_uninit<
 }
 
 /// Ternary element-wise operation: `dest[i] = f(a[i], b[i], c[i])`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when `dest` and any of the three source
+/// views have different ranks or extents, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn zip_map3_into<
     D: Copy + Send + Sync,
     A: Copy + Send + Sync,
@@ -2468,6 +2526,16 @@ pub(crate) fn zip_map3_into_validated<
 }
 
 /// Quaternary element-wise operation: `dest[i] = f(a[i], b[i], c[i], e[i])`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when `dest` and any of the four source
+/// views have different ranks or extents, and
+/// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+/// cannot be proven representable and injective: two logical indices name
+/// one offset, or the element count or address span is too large to
+/// represent. Nothing is written unless validation succeeds.
 pub fn zip_map4_into<
     D: Copy + Send + Sync,
     A: Copy + Send + Sync,

@@ -613,7 +613,9 @@ fn preordered_dyn(
 /// ```
 ///
 /// # Errors
-/// Returns a rank or shape mismatch.
+///
+/// Returns [`StridedError::RankMismatch`] when the two shapes have different
+/// ranks, and [`StridedError::ShapeMismatch`] when their extents differ.
 pub fn ensure_same_shape(a: &[usize], b: &[usize]) -> Result<()> {
     if a.len() != b.len() {
         return Err(crate::StridedError::RankMismatch(a.len(), b.len()));
