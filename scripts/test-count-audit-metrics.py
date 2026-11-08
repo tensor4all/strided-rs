@@ -51,6 +51,19 @@ def char_literal_is_blanked(literal: str) -> bool:
     return literal not in "".join(str(row["code_no_strings"]) for row in rows)
 
 
+def test_scan_line_keeps_the_column_of_every_character() -> None:
+    """Both returned fields keep the line's length, including a `*/` terminator."""
+    mod = load_module()
+    raw = "/*x*/unsafe {}"
+    code, no_strings, _ = mod.scan_line(
+        raw, {"block_comment": 0, "raw_string": None, "plain_string": False}
+    )
+    assert len(code) == len(raw), (code, raw)
+    assert len(no_strings) == len(raw), (no_strings, raw)
+    assert code.index("unsafe") == raw.index("unsafe"), (code, raw)
+    assert no_strings.index("unsafe") == raw.index("unsafe"), (no_strings, raw)
+
+
 def test_block_comment_is_not_code() -> None:
     """A block comment holds no production `unsafe`, `// SAFETY:` or `// INVARIANT:`."""
     counts = count_sources({"only_comment.rs": "/* unsafe {} // SAFETY: x // INVARIANT: y */\n"})
@@ -483,6 +496,16 @@ def test_a_path_attribute_moves_the_test_only_file() -> None:
     )
     assert counts["unsafe"] == 1, counts
     assert counts["pub_result"] == 1, counts
+    # A `#[path]` in `foo.rs` resolves against `src/`, not `src/foo/`.
+    counts = count_sources(
+        {
+            "lib.rs": "mod foo;\n",
+            "foo.rs": '#[cfg(test)]\n#[path = "helper.rs"]\nmod checks;\n',
+            "helper.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
 
 
 def test_an_inline_test_module_owns_its_directory() -> None:

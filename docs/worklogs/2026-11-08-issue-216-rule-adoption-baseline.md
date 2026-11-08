@@ -37,10 +37,9 @@ under the source revision alone. Record both, e.g.
 
 The counter is a line-oriented approximation, not a Rust parser. It is accurate
 enough for a trend, and it is not evidence that a file or a tree is clean: the
-script's docstring lists what it still mismatches (`///` inside a string or a
-block comment, strings inside attributes and macro invocations, braces inside
-macro bodies, `unsafe extern`, macro-expanded `unsafe {`, `<`/`>` read as
-brackets). Where a row matters, measure the thing itself — `cargo test --doc`
+script's docstring lists what it still mismatches (strings inside attributes and
+macro invocations, braces inside macro bodies, `unsafe extern`, macro-expanded
+`unsafe {`, `<`/`>` read as brackets, a macro-produced declaration). Where a row matters, measure the thing itself — `cargo test --doc`
 for the doctest row, a file read for a per-block `// SAFETY:` audit.
 
 | Metric | Count | #216's opening count |
@@ -62,8 +61,9 @@ literal around it, `scripts/count-audit-metrics.py:31-32`, so this is "no item
 the scan can read", not an exhaustive claim), the doctests are the same
 sweep, and the inline-test drop is the move
 of the inline unit test modules into `*/tests/` directories (#362) — the files
-that have unit tests carry a `mod tests;` declaration (30 of the 60 production
-files have none, having no unit tests of their own), and the one remaining inline
+that have unit tests carry a test-module declaration (30 of the 60 production
+files declare none; several of those name their module something other than
+`tests`), and the one remaining inline
 block with a body is `strided-basic/benches/support/mod.rs:208`. The gap the
 remediation issues should take next is `SAFETY` coverage, and 21 files are over
 1000 lines. Read the old numbers as history and these as the baseline.

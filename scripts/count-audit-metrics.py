@@ -111,6 +111,8 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
                 continue
             if raw.startswith("*/", i):
                 depth -= 1
+                no_comments.append("  ")
+                no_strings.append("  ")
                 i += 2
                 continue
             no_comments.append(" ")
@@ -461,7 +463,12 @@ def production_files(root: Path) -> list[Path]:
         rows = scan_file(p.read_text(encoding="utf-8"))
         module_dir = declared_module_dir(p)
         for name in test_only_module_names(rows):
-            excluded.add(module_dir / name[1:] if name.startswith("@") else module_dir / name)
+            if name.startswith("@"):
+                # A `#[path = "..."]` target is relative to the file's own
+                # directory, even when the declaration sits in `foo.rs`.
+                excluded.add(p.parent / name[1:])
+            else:
+                excluded.add(module_dir / name)
         for name in inline_test_module_names(rows):
             excluded.add(module_dir / name)
     if not excluded:
