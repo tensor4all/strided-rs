@@ -106,7 +106,7 @@ options, in increasing strictness:
 | option | bound at MAD 0 | steady band | the 1.504 flake |
 |---|---|---|---|
 | **A. as implemented** — anchor 1.0, floor `0.15 * median` | 1.45 at parity, rising with the median | passes to 1.82x | passes |
-| B. anchor 1.0, floor `0.15 * 1.0` | 1.45 flat | passes to 1.45x | **fails** |
+| B. anchor 1.0, floor `0.15 * 1.0` | 1.45 flat | passes to 1.45x | fails below MAD 0.113 (see below) |
 | C. keep the fixed 1.5, change only the statistic | 1.50 | passes to 1.5x | passes if the median-of-9 statistic never reaches 1.504 (unproven) |
 
 A is shipped because it is the form the ruling specifies (`0.15 * median`) with
@@ -130,7 +130,12 @@ floor is what dominates in those runs — i.e. if `1.4826 * MAD < 0.15 * median`
 all five, which every run measured so far satisfies (MAD 0.0009–0.049, so
 `1.4826 * MAD` = 0.001–0.073 against a floor of 0.143–0.152). Taking B snaps the
 zero-MAD bound back to 1.45 and fails a steady 1.5x, at the cost of re-failing a
-repeat of the 1.504 event. If instead one of the five shows `1.4826 * MAD` at or
+repeat of the 1.504 event **when that run's own MAD is small**. That caveat is
+real: B passes a steady 1.504 as soon as the run's MAD exceeds `0.504 / (3 *
+1.4826) = 0.113`, because its width then grows with the dispersion instead of
+sitting on the floor. The 1.504 run's within-run MAD is unknown — the old harness
+kept only the minimum of five rounds — so "B re-fails 1.504" is a prediction for
+the small-MAD case, not a certainty. If instead one of the five shows `1.4826 * MAD` at or
 above the floor, the width is doing real work and A is the right rule to keep.
 Do not switch on a single run: the condition is about which term dominates,
 observed over five.
