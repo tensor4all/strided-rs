@@ -100,10 +100,33 @@ struct WindowReplayAxis {
     dest_reset: isize,
 }
 
+/// The offsets a strided window reaches, relative to its base offset.
+#[derive(Clone, Copy, Debug, Default)]
+struct OffsetSpan {
+    min: isize,
+    max: isize,
+}
+
+impl OffsetSpan {
+    /// Every offset the window reaches from `base` fits `isize`.
+    fn covers(&self, base: isize) -> Result<()> {
+        base.checked_add(self.min)
+            .ok_or(StridedError::OffsetOverflow)?;
+        base.checked_add(self.max)
+            .ok_or(StridedError::OffsetOverflow)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct WindowReplay {
     shape: AxisVec<usize>,
     axes: AxisVec<WindowReplayAxis>,
+    /// Offsets the window reaches in the update and destination layouts,
+    /// relative to the runtime base. Fusing keeps the reachable offset set, so
+    /// these spans also bound every fused replay step.
+    source_span: OffsetSpan,
+    dest_span: OffsetSpan,
 }
 
 struct WindowReplayState {
@@ -219,8 +242,8 @@ fn scatter_replay_strides(
 
 impl WindowReplay {
     fn compile(shape: &[usize], source_strides: &[isize], dest_strides: &[isize]) -> Result<Self> {
-        validate_layout_span(shape, source_strides)?;
-        validate_layout_span(shape, dest_strides)?;
+        let source_span = validate_layout_span(shape, source_strides)?;
+        let dest_span = validate_layout_span(shape, dest_strides)?;
         let mut fused_shape: AxisVec<usize> = AxisVec::with_capacity(shape.len());
         let mut axes: AxisVec<WindowReplayAxis> = AxisVec::with_capacity(shape.len());
         for (axis, &dim) in shape.iter().enumerate() {
@@ -261,7 +284,20 @@ impl WindowReplay {
         Ok(Self {
             shape: fused_shape,
             axes,
+            source_span,
+            dest_span,
         })
+    }
+
+    /// The replay state at linear index zero. Every coordinate is zero, so
+    /// this needs no offset arithmetic and cannot fail after the destination
+    /// copy.
+    fn start(&self, source_base: isize, dest_base: isize) -> WindowReplayState {
+        WindowReplayState {
+            coords: CoordScratch::new(self.shape.len()),
+            source_offset: source_base,
+            dest_offset: dest_base,
+        }
     }
 
     fn decode(
@@ -370,6 +406,24 @@ pub struct DynamicUpdateSlicePlan {
     /// `replay`/`execute_update_parallel` walk the window instead.
     window: Option<FusedPairLayout>,
     replay: WindowReplay,
+}
+
+/// Update-window metadata resolved before the operand copy.
+///
+/// Reading the clamped start vector, mapping it onto the destination layout,
+/// bounding the window against both runtime bases, and (on the rank-one
+/// contiguous path) converting the run bounds are the only fallible steps of
+/// the update phase. Preparing them up front keeps a rejected call from
+/// leaving `dest` copied but un-updated.
+enum UpdateWindow<'a, T> {
+    /// The window is empty: the copy alone is the result.
+    Empty,
+    /// Rank-one contiguous run, as the checked update run and destination
+    /// index.
+    RankOne { update: &'a [T], dest_start: usize },
+    /// Replay base in the destination layout, shared by the fused and generic
+    /// paths.
+    Replay { dest_base: isize },
 }
 
 /// A compiled additive scatter traversal.
@@ -1385,9 +1439,11 @@ impl DynamicUpdateSlicePlan {
     ///
     /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, update,
     /// start, or destination view does not carry its compiled extents and
-    /// strides, before the operand copy runs. Start values are clamped to
-    /// `operand_dims - update_dims`, so an out-of-range start is not an
-    /// error.
+    /// strides, and [`StridedError::OffsetOverflow`] when the checked update
+    /// window does not fit `isize`. Both are decided before the operand copy
+    /// runs, so a failed call leaves `dest` unmodified. Start values are
+    /// clamped to `operand_dims - update_dims`, so an out-of-range start is
+    /// not an error.
     pub fn execute<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1402,12 +1458,14 @@ impl DynamicUpdateSlicePlan {
     {
         let mut exec = exec;
         self.check_call(dest, operand, update, starts)?;
+        let window = self.preflight_update_window(dest, update, starts)?;
         self.copy_plan.execute(dest, operand, exec.reborrow())?;
-        self.execute_update_with_writer(dest, update, starts, exec)
+        self.execute_update_with_writer(dest, update, &window, exec)
     }
 
     /// Execute dynamic update into a destination whose reachable slots may be
-    /// uninitialized. The copy completes before any read-modify-write access.
+    /// uninitialized. The copy completes before any read-modify-write access,
+    /// and a rejected update window is reported before the copy.
     pub(crate) fn execute_uninit<'a, T, I>(
         &self,
         dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
@@ -1421,39 +1479,28 @@ impl DynamicUpdateSlicePlan {
         I: GatherIndex,
     {
         self.check_call(dest, operand, update, starts)?;
+        let window = self.preflight_update_window(dest, update, starts)?;
         self.copy_plan
             .execute_uninit_then(dest, operand, exec, |mut receipt, exec| {
-                self.execute_update_with_writer(&mut receipt, update, starts, exec)
+                self.execute_update_with_writer(&mut receipt, update, &window, exec)
             })?
     }
 
-    fn execute_update_with_writer<T, I, W>(
+    /// Resolve every fallible step of the update phase before the operand copy.
+    fn preflight_update_window<'a, T, I, W>(
         &self,
-        dest: &mut W,
-        update: &RawStridedRef<'_, T>,
+        dest: &W,
+        update: &'a RawStridedRef<'_, T>,
         starts: &RawStridedRef<'_, I>,
-        exec: Exec<'_>,
-    ) -> Result<()>
+    ) -> Result<UpdateWindow<'a, T>>
     where
-        T: Copy + Send + Sync,
+        T: Copy,
         I: GatherIndex,
         W: OverwriteWriter<T>,
     {
         if self.total == 0 {
-            return Ok(());
+            return Ok(UpdateWindow::Empty);
         }
-        if self.uses_rank_one_contiguous_path() {
-            return self.execute_rank_one_contiguous(dest, update, starts, exec);
-        }
-        if let Some(window) = &self.window {
-            return self.execute_fused_window(dest, update, starts, window, exec);
-        }
-        let replay = &self.replay;
-        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.total);
-        if !exec.is_serial() {
-            return self.execute_update_parallel(dest, update, starts, exec, replay);
-        }
-
         let mut starts_storage = CoordScratch::new(self.operand_dims.len());
         let clamped_starts = starts_storage.as_mut_slice();
         read_clamped_starts(
@@ -1462,14 +1509,64 @@ impl DynamicUpdateSlicePlan {
             &self.update_dims,
             clamped_starts,
         )?;
-        let source_base = update.offset();
-        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, &clamped_starts)?;
-        let mut state = replay.decode(0, source_base, dest_base)?;
+        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, clamped_starts)?;
+        // The replay adds per-axis steps to these bases, on every worker, so
+        // the whole window and not only its base has to fit `isize` first.
+        self.replay.source_span.covers(update.offset())?;
+        self.replay.dest_span.covers(dest_base)?;
+        if self.uses_rank_one_contiguous_path() {
+            let update_start =
+                usize::try_from(update.offset()).map_err(|_| StridedError::OffsetOverflow)?;
+            let dest_start =
+                usize::try_from(dest_base).map_err(|_| StridedError::OffsetOverflow)?;
+            let update_end = update_start
+                .checked_add(self.total)
+                .ok_or(StridedError::OffsetOverflow)?;
+            let run = update
+                .data()
+                .get(update_start..update_end)
+                .ok_or(StridedError::OffsetOverflow)?;
+            return Ok(UpdateWindow::RankOne {
+                update: run,
+                dest_start,
+            });
+        }
+        Ok(UpdateWindow::Replay { dest_base })
+    }
+
+    fn execute_update_with_writer<T, W>(
+        &self,
+        dest: &mut W,
+        update: &RawStridedRef<'_, T>,
+        window: &UpdateWindow<'_, T>,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        T: Copy + Send + Sync,
+        W: OverwriteWriter<T>,
+    {
+        let dest_base = match *window {
+            UpdateWindow::Empty => return Ok(()),
+            UpdateWindow::RankOne { update, dest_start } => {
+                return self.execute_rank_one_contiguous(dest, update, dest_start, exec)
+            }
+            UpdateWindow::Replay { dest_base } => dest_base,
+        };
+        if let Some(fused) = &self.window {
+            return self.execute_fused_window(dest, update, dest_base, fused, exec);
+        }
+        let replay = &self.replay;
+        let exec = crate::cost::for_len_tree(exec, KernelClass::Copy, self.total);
+        if !exec.is_serial() {
+            return self.execute_update_parallel(dest, update, dest_base, exec);
+        }
+
+        let mut state = replay.start(update.offset(), dest_base);
         let update_data = update.data();
 
         // INVARIANT: the initial CopyPlan has completed before this replay;
-        // compile validated both window spans and the checked bases/resets keep
-        // every update read and destination write reachable.
+        // compile validated both window spans and the preflight proved every
+        // replay offset fits from the checked bases.
         for _ in 0..self.total {
             // SAFETY: checked replay metadata proves the current update read.
             let value = unsafe { *update_data.as_ptr().offset(state.source_offset) };
@@ -1481,30 +1578,20 @@ impl DynamicUpdateSlicePlan {
         Ok(())
     }
 
-    /// Replay the compiled fused update window at the clamped runtime
+    /// Replay the compiled fused update window at the preflighted runtime
     /// destination base (see [`DynamicSlicePlan`]'s fused window replay).
-    fn execute_fused_window<T, I, W>(
+    fn execute_fused_window<T, W>(
         &self,
         dest: &mut W,
         update: &RawStridedRef<'_, T>,
-        starts: &RawStridedRef<'_, I>,
+        dest_base: isize,
         window: &FusedPairLayout,
         exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + Send + Sync,
-        I: GatherIndex,
         W: OverwriteWriter<T>,
     {
-        let mut starts_storage = CoordScratch::new(self.operand_dims.len());
-        let clamped_starts = starts_storage.as_mut_slice();
-        read_clamped_starts(
-            starts,
-            &self.operand_dims,
-            &self.update_dims,
-            clamped_starts,
-        )?;
-        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, clamped_starts)?;
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = unsafe { dest.data_ptr() }.cast::<MaybeUninit<T>>();
         // SAFETY: `window` fuses `update_dims` with the checked destination
@@ -1537,39 +1624,22 @@ impl DynamicUpdateSlicePlan {
             && self.dest_strides[0] == 1
     }
 
-    fn execute_rank_one_contiguous<T, I, W>(
+    fn execute_rank_one_contiguous<T, W>(
         &self,
         dest: &mut W,
-        update: &RawStridedRef<'_, T>,
-        starts: &RawStridedRef<'_, I>,
+        update: &[T],
+        dest_start: usize,
         exec: Exec<'_>,
     ) -> Result<()>
     where
         T: Copy + Send + Sync,
-        I: GatherIndex,
         W: OverwriteWriter<T>,
     {
-        let mut clamped_starts = [0usize; 1];
-        read_clamped_starts(
-            starts,
-            &self.operand_dims,
-            &self.update_dims,
-            &mut clamped_starts,
-        )?;
-        let update_start =
-            usize::try_from(update.offset()).map_err(|_| StridedError::OffsetOverflow)?;
-        let dest_start = checked_offset_add(dest.offset(), 1, clamped_starts[0])?;
-        let dest_start = usize::try_from(dest_start).map_err(|_| StridedError::OffsetOverflow)?;
-        let update_end = update_start
-            .checked_add(self.total)
-            .ok_or(StridedError::OffsetOverflow)?;
-        let update = update
-            .data()
-            .get(update_start..update_end)
-            .ok_or(StridedError::OffsetOverflow)?;
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = unsafe { dest.data_ptr() };
-        // SAFETY: the checked ranges are inside the destination allocation.
+        // SAFETY: the preflight checked that the update run of `self.total`
+        // elements and the destination run from `dest_start` are inside their
+        // allocations.
         unsafe {
             // Chunked across workers above the repository threshold; each
             // worker writes a disjoint chunk of the checked destination run.
@@ -1583,28 +1653,19 @@ impl DynamicUpdateSlicePlan {
         Ok(())
     }
 
-    fn execute_update_parallel<T, I, W>(
+    fn execute_update_parallel<T, W>(
         &self,
         dest: &mut W,
         update: &RawStridedRef<'_, T>,
-        starts: &RawStridedRef<'_, I>,
+        dest_base: isize,
         exec: Exec<'_>,
-        replay: &WindowReplay,
     ) -> Result<()>
     where
         T: Copy + Send + Sync,
-        I: GatherIndex,
         W: OverwriteWriter<T>,
     {
-        let mut clamped_starts: AxisVec<usize> = (0..self.operand_dims.len()).map(|_| 0).collect();
-        read_clamped_starts(
-            starts,
-            &self.operand_dims,
-            &self.update_dims,
-            &mut clamped_starts,
-        )?;
+        let replay = &self.replay;
         let source_base = update.offset();
-        let dest_base = checked_strided_offset(dest.offset(), &self.dest_strides, &clamped_starts)?;
         let update_ptr = crate::threading::SendPtr(update.data().as_ptr() as *mut T);
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = crate::threading::SendPtr(unsafe { dest.data_ptr() });
@@ -1619,7 +1680,8 @@ impl DynamicUpdateSlicePlan {
 
                 // INVARIANT: the initial operand copy completed before this
                 // replay; workers own disjoint ranges and injective output
-                // layouts make their writes distinct.
+                // layouts make their writes distinct. Preflight bounded both
+                // window spans, so a worker decode cannot overflow.
                 for _ in range {
                     // SAFETY: checked replay bases/resets prove both offsets are
                     // within the initialized update and destination allocations.
@@ -2149,12 +2211,12 @@ fn index_batch_shape(index_dims: &[usize], index_vector_dim: usize) -> AxisVec<u
         .collect()
 }
 
-fn validate_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
+/// Validate a layout's reachable offsets and return them relative to its base.
+fn validate_layout_span(dims: &[usize], strides: &[isize]) -> Result<OffsetSpan> {
     if dims.len() != strides.len() {
         return Err(StridedError::StrideLengthMismatch);
     }
-    let mut min_offset = 0isize;
-    let mut max_offset = 0isize;
+    let mut span = OffsetSpan::default();
     for (&dim, &stride) in dims.iter().zip(strides.iter()) {
         let last =
             isize::try_from(dim.saturating_sub(1)).map_err(|_| StridedError::OffsetOverflow)?;
@@ -2162,16 +2224,18 @@ fn validate_layout_span(dims: &[usize], strides: &[isize]) -> Result<()> {
             .checked_mul(last)
             .ok_or(StridedError::OffsetOverflow)?;
         if extent < 0 {
-            min_offset = min_offset
+            span.min = span
+                .min
                 .checked_add(extent)
                 .ok_or(StridedError::OffsetOverflow)?;
         } else {
-            max_offset = max_offset
+            span.max = span
+                .max
                 .checked_add(extent)
                 .ok_or(StridedError::OffsetOverflow)?;
         }
     }
-    Ok(())
+    Ok(span)
 }
 
 fn checked_replay_reset(dim: usize, step: isize) -> Result<isize> {

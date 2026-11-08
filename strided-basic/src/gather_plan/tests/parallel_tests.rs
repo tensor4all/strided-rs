@@ -4,6 +4,7 @@
 use core::mem::MaybeUninit;
 
 use super::{DynamicSlicePlan, DynamicUpdateSlicePlan, RawStridedMut, RawStridedRef};
+use crate::cost::KernelClass;
 use crate::threading::run_serial_and_parallel;
 
 #[test]
@@ -137,4 +138,87 @@ fn dynamic_slice_rank_six_parallel_matches_serial() {
     // Spot check: dest index (0,0,0,0,0,0) maps to operand (0,1,0,1,0,0).
     assert_eq!(serial[0], 3 + 105);
     assert!(!serial.contains(&-1));
+}
+
+/// The compiled non-fused window replay above the copy threshold runs on both
+/// `Exec` contexts, so the per-worker replay starts are compared against the
+/// same reference.
+#[test]
+fn dynamic_update_generic_replay_parallel_matches_serial() {
+    let dims = [2usize, 2, 2, 2, 2, 2, 2, 2, 320];
+    let operand_strides = [1isize, 2, 4, 8, 16, 32, 64, 128, 256];
+    let update_dims = [2usize, 2, 2, 2, 2, 2, 2, 2, 256];
+    let update_strides = [1isize, 3, 7, 15, 31, 63, 127, 255, 511];
+    let dest_strides = [40960isize, 20480, 10240, 5120, 2560, 1280, 640, 320, 1];
+    let starts = [i64::MAX, 0, 5, i64::MIN, 3, 0, 1, 2, 40];
+    let plan = DynamicUpdateSlicePlan::compile(
+        &dims,
+        &operand_strides,
+        &[9],
+        &[1],
+        &update_dims,
+        &update_strides,
+        &dims,
+        &dest_strides,
+    )
+    .unwrap();
+    assert!(
+        plan.window.is_none(),
+        "a non-fusible rank-9 window keeps the compiled non-fused replay"
+    );
+    assert!(!plan.uses_rank_one_contiguous_path());
+
+    let len = |dims: &[usize], strides: &[isize]| -> usize {
+        1 + dims
+            .iter()
+            .zip(strides.iter())
+            .map(|(&dim, &stride)| (dim as isize - 1) * stride.abs())
+            .sum::<isize>() as usize
+    };
+    let operand: Vec<i64> = (0..len(&dims, &operand_strides) as i64).collect();
+    let update: Vec<i64> = (0..len(&update_dims, &update_strides) as i64)
+        .map(|value| -value - 1)
+        .collect();
+    let expected = super::tests::dynamic_update_reference(
+        &dims,
+        &operand_strides,
+        &operand,
+        &update_dims,
+        &update_strides,
+        &update,
+        &starts,
+        &dest_strides,
+    );
+
+    let source = RawStridedRef::new(&operand, &dims, &operand_strides, 0).unwrap();
+    let update_ref = RawStridedRef::new(&update, &update_dims, &update_strides, 0).unwrap();
+    let start_ref = RawStridedRef::new(&starts, &[9], &[1], 0).unwrap();
+    let total: usize = dims.iter().product();
+    let (serial, parallel) = run_serial_and_parallel(|mut exec| {
+        // The same gate the plan applies: a pooled context must really fan out
+        // for this length, or this test would silently re-run the serial path.
+        if !exec.is_serial() {
+            assert!(
+                !crate::cost::for_len_tree(exec.reborrow(), KernelClass::Copy, total).is_serial(),
+                "the pooled run must fan out for {total} elements"
+            );
+        }
+        let mut out = vec![-1i64; expected.len()];
+        let mut dest = RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
+        plan.execute(&mut dest, &source, &update_ref, &start_ref, exec.reborrow())
+            .unwrap();
+
+        let mut storage = vec![MaybeUninit::<i64>::uninit(); expected.len()];
+        let mut dest = RawStridedMut::new(&mut storage, &dims, &dest_strides, 0).unwrap();
+        plan.execute_uninit(&mut dest, &source, &update_ref, &start_ref, exec.reborrow())
+            .unwrap();
+        // SAFETY: the dense destination reaches every slot and a successful
+        // `execute_uninit` initializes every reachable slot.
+        let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+        (out, uninit)
+    });
+    assert_eq!(serial.0, expected);
+    assert_eq!(parallel.0, expected);
+    assert_eq!(serial.1, expected);
+    assert_eq!(parallel.1, expected);
 }
