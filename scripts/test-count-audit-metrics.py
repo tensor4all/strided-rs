@@ -205,6 +205,19 @@ def test_path_exclusions_use_repo_relative_components() -> None:
     assert counts["unsafe"] == 1, counts
     assert counts["files_over_1000"] == 1, counts
 
+    # Exactly 1000 logical lines is not "over 1000": a `>= 1000` threshold would
+    # count this file.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "checkout"
+        src = root / "strided-x" / "src"
+        src.mkdir(parents=True)
+        (src / "boundary.rs").write_text(
+            "pub fn f() {\n    unsafe {}\n}\n" + "// filler\n" * 997, encoding="utf-8"
+        )
+        counts = mod.count(root)
+    assert counts["unsafe"] == 1, counts
+    assert counts["files_over_1000"] == 0, counts
+
     # A generated file below `strided-x/target/` is excluded from the all-source
     # rows; this root has no `target` component of its own.
     with tempfile.TemporaryDirectory() as tmp:

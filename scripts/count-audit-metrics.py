@@ -49,6 +49,9 @@ none", not "none exists".
   comparison operator reads to the wrong place.
 - A `mod NAME;` whose declaration is itself produced by a macro is not followed,
   and a `#[path = "..."]` given through a macro is not seen.
+- A nested block-comment opener (`/*a/*b*/c*/`) is consumed without keeping its
+  columns, so each nesting level shortens the returned line by two characters and
+  the columns after it shift. No production source in this repository hits it.
 
 Where a row matters, measure the thing itself instead of this script: run
 `cargo test --doc` for the doctest row, and read a file for a per-block
@@ -80,7 +83,9 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
 
     State carries open block comments (Rust nests them) and an open raw string
     across lines. Both returned strings keep the line's length and column
-    positions, so `^\\s*pub`, brace counting and offsets stay valid.
+    positions, so `^\\s*pub`, brace counting and offsets stay valid — except across
+    a nested block-comment opener, where two characters are dropped per nesting
+    level (see Known limits).
     """
     no_comments: list[str] = []
     no_strings: list[str] = []
