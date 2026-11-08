@@ -1261,8 +1261,16 @@ impl DynamicSlicePlan {
             .ok_or(StridedError::OffsetOverflow)?;
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = unsafe { dest.data_ptr() };
-        // SAFETY: bounds were checked above and the writer owns the logical
-        // destination storage.
+        // SAFETY: the source run was resolved above (`operand.data().get`,
+        // :1260) and the destination run is the plan's own layout: compile set
+        // `total = checked_total_len(dest_dims)` with `dest_dims == slice_sizes`
+        // (:1050-:1054), required `dest_strides[0] == 1` on this rank-one path
+        // (:1228), and `check_call` (:1341) proved the writer carries exactly the
+        // compiled destination layout, whose reachable offsets `RawStridedMut::new`
+        // validated (strided-view/src/raw.rs:1036, `validate_bounds` at :1042;
+        // strided-view/src/view.rs:186). `data_ptr()` (copy_plan.rs:41) is the
+        // allocation base, so `dest.offset() .. dest.offset() + total` is inside the
+        // writer's allocation and the chunked workers write disjoint slices of it.
         unsafe {
             // Chunked across workers above the repository threshold; each
             // worker writes a disjoint chunk of the checked destination run.
@@ -1635,9 +1643,16 @@ impl DynamicUpdateSlicePlan {
     {
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = unsafe { dest.data_ptr() };
-        // SAFETY: the preflight checked that the update run of `self.total`
-        // elements and the destination run from `dest_start` are inside their
-        // allocations.
+        // SAFETY: the preflight resolved the update run (`update.data().get`,
+        // :1534) and proved the window span fits `isize` (`dest_span.covers`,
+        // :1523); the destination run is the plan's own layout: compile set
+        // `total = checked_total_len(update_dims)` (:1409) with
+        // `dest_dims == operand_dims` (:1414) and `validate_window_sizes`
+        // (:1423), this rank-one path requires `dest_strides[0] == 1` (:1630),
+        // and `check_call` (:1714) proved the writer carries exactly that
+        // layout, so `dest_start + total` cannot pass the reachable offset
+        // `RawStridedMut::new` validated (strided-view/src/raw.rs:1036,
+        // `validate_bounds` at :1042).
         unsafe {
             // Chunked across workers above the repository threshold; each
             // worker writes a disjoint chunk of the checked destination run.

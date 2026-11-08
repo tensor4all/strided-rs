@@ -2244,6 +2244,14 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     target_dims: &[usize],
     strides: &[isize],
 ) -> StridedView<'a, T, Op> {
+    // SAFETY: `broadcast_strides_for_axes` (:2192) keeps a source stride only on
+    // axes where `source_dims[src_axis] == target_dims[dst_axis]`, sets every other
+    // target axis to stride 0, rejects repeated and out-of-range target axes, and
+    // requires `source_dims.len() == axes.len()`, so this view reaches a subset of
+    // the offsets `view` reaches; `StridedView` construction (`new`,
+    // strided-view/src/view.rs:508 via `validate_bounds`, :186) already proved those
+    // in bounds, and `target_dims`/`strides` come from the caller's `dest.dims()`
+    // and that validation. The metadata is copied inline by `new_unchecked`.
     unsafe { StridedView::new_unchecked(view.data(), target_dims, strides, view.offset()) }
 }
 

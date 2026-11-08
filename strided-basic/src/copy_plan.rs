@@ -206,6 +206,22 @@ impl CopyPlan {
         self.fused.inline()
     }
 
+    /// Copy into uninitialized storage, then lend the initialized destination to `f`.
+    ///
+    /// [`Self::execute_uninit`] initializes every reachable logical destination
+    /// element before `f` runs, so the [`InitializedRawDest`] receipt handed to `f`
+    /// may read and overwrite exactly those offsets. Slots outside the plan's
+    /// reachable set stay uninitialized, which is why the receipt exposes
+    /// `write_at`/`add_at` (copy_plan.rs:138, :150) instead of a typed slice: their
+    /// contracts require an offset proven by this plan's layout. The receipt borrows
+    /// the destination for `f`'s lifetime, so a read-modify-write consumer (the
+    /// gather and scatter update replay in gather_plan.rs) sees the copied operand
+    /// once and cannot alias the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::execute_uninit`] errors (`PlanLayoutMismatch`, before any
+    /// write); `f` runs only on success.
     pub(crate) fn execute_uninit_then<'a, T, R>(
         &self,
         dest: &'a mut RawStridedMut<'a, MaybeUninit<T>>,
