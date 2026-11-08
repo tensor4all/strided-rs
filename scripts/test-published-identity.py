@@ -332,6 +332,57 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertNotIn("unpublished", out)
 
+    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None):
+        """A urlopen replacement: the API URL answers `api_status`, the static
+        download answers 200 with `crate_blob`. Non-2xx statuses are raised as
+        HTTPError, exactly as urllib does, so fetch()'s HTTPError branch runs."""
+        import urllib.error
+
+        class Resp(io.BytesIO):
+            def __init__(self, body: bytes) -> None:
+                super().__init__(body)
+                self.status = 200
+
+        def urlopen(req, *args, **kwargs):
+            url = req.full_url
+            if "/api/v1/crates/" in url:
+                if api_status != 200:
+                    raise urllib.error.HTTPError(url, api_status, "status", {}, None)
+                return Resp(b"{}")
+            if "static.crates.io" in url and crate_blob is not None:
+                return Resp(crate_blob)
+            raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+
+        return mock.patch.object(pi.urllib.request, "urlopen", urlopen)
+
+    def test_api_503_through_urlopen_is_not_green(self) -> None:
+        # GPT review on #411 (round 6): an HTTPError 503 from the API must be
+        # exit 2. Mutating fetch()'s HTTPError branch to `return 404, b""`
+        # turns this red; mocking fetch() itself could not see that.
+        with self._fake_crates_io(503):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn("unpublished", out)
+
+    def test_api_404_through_urlopen_is_unpublished(self) -> None:
+        with self._fake_crates_io(404):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unpublished demo 0.1.0", out)
+
+    def test_published_archive_with_different_source_through_urlopen_is_red(self) -> None:
+        # GPT review on #411 (round 6): API 200, then a valid archive whose
+        # source differs from the tree, must be exit 1. A mutation that
+        # returns None after the API check (disabling every comparison)
+        # turns this red.
+        blob = self.fx.package()
+        self.fx.write("src/lib.rs", "pub fn value() -> u32 { 2 }\n")
+        self.fx.commit("same version, new content")
+        with self._fake_crates_io(200, blob):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("differs: src/lib.rs", out)
+
     def test_whitespace_in_a_shipped_name_is_kept(self) -> None:
         # GPT review on #411 (round 3): "notes" and "notes " are two files.
         self.fx.write("notes", "a\n")
