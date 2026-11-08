@@ -642,10 +642,10 @@ impl PadPlan {
     /// slot and no other access may overlap the call; the operand may only be
     /// read at coordinates that are copied, but no read is performed for a
     /// padding-only column.
-    // Whole-plan dispatcher for the column write: it takes both base pointers and the
-// compiled column plan, then hands each worker range to
-// `write_axis0_columns_range`. The wide argument list is that plan forwarded, not
-// a per-column invocation.
+    // Whole-plan dispatcher for the column write: it takes both base pointers and
+    // the compiled column plan, then hands each worker range to
+    // `write_axis0_columns_range`. The wide argument list is that plan forwarded,
+    // not a per-column invocation.
     #[allow(clippy::too_many_arguments)]
     unsafe fn write_axis0_columns_raw<T, const UNINIT: bool>(
         &self,
