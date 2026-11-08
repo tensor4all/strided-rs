@@ -195,6 +195,33 @@ pub(crate) fn take_dispatched_chunks() -> usize {
     DISPATCHED_CHUNKS.with(|n| n.replace(0))
 }
 
+/// One leaf box of a split tiled replay: the destination and source offsets
+/// of its origin, and its extents.
+#[cfg(test)]
+pub(crate) type TiledLeaf = (isize, isize, Vec<usize>);
+
+// Every leaf box of the tiled replays split on this thread, in completion
+// order.
+#[cfg(test)]
+thread_local! {
+    static TILED_LEAVES: core::cell::RefCell<Vec<TiledLeaf>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records the leaves of one split tiled replay; they also count as
+/// dispatched chunks.
+#[cfg(test)]
+pub(crate) fn record_tiled_leaves(leaves: Vec<TiledLeaf>) {
+    DISPATCHED_CHUNKS.with(|n| n.set(n.get() + leaves.len()));
+    TILED_LEAVES.with(|all| all.borrow_mut().extend(leaves));
+}
+
+/// The leaves every split tiled replay called on this thread has recorded
+/// since the last call, and resets them.
+#[cfg(test)]
+pub(crate) fn take_tiled_leaves() -> Vec<TiledLeaf> {
+    TILED_LEAVES.with(|all| all.take())
+}
+
 /// Copy `len` contiguous elements, chunked across the budget of `exec` when
 /// one section pays for a copy of that size (`KernelClass::Copy`) and as one
 /// direct `copy_nonoverlapping` otherwise.
