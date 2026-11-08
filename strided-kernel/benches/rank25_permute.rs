@@ -2,6 +2,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_kernel::Exec;
 use strided_kernel::{col_major_strides, copy_into, StridedArray};
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -105,7 +106,7 @@ fn verify_correctness(a: &StridedArray<f64>, dims: &[usize], perm: &[usize], lab
     }
 
     let a_perm = a.view().permute(perm).unwrap();
-    copy_into(&mut b_strided.view_mut(), &a_perm).unwrap();
+    copy_into(&mut b_strided.view_mut(), &a_perm, Exec::serial()).unwrap();
 
     for i in 0..total {
         assert_eq!(
@@ -142,7 +143,7 @@ fn benchmark_permutation(
     });
 
     bench_n("rust_strided", 1, 3, || {
-        copy_into(&mut b.view_mut(), &a_perm).unwrap();
+        copy_into(&mut b.view_mut(), &a_perm, Exec::serial()).unwrap();
         black_box(b.data().as_ptr());
     });
     println!();

@@ -1,16 +1,50 @@
 # faer SIMD Design Analysis & strided-kernel Optimization Plan
 
+> **Historical design record.** Written 2026-01-30 (the commit date of this
+file); the measurements below are the ones it recorded then, on one Apple
+Silicon M2 core as stated under "Performance Gap Analysis". Nothing here has
+been re-measured since. The code has moved on: the typed kernels this document
+targets now live in `strided-basic`, and most of the plan below has shipped.
+Read "Current Status" before acting on any gap or priority.
+
 Analysis of SIMD optimization techniques used in `extern/faer`, and a concrete plan for applying them to `strided-kernel`.
 
 ## Current Status
 
-**Completed:**
+**Shipped since this document was written:**
 
-- **faer GEMM backend** (PR #19): `strided-einsum2` uses `faer::linalg::matmul::matmul_with_conj` for SIMD-optimized tensor contraction. The matmul microkernel (pattern 7 below) is already leveraged via faer.
-- **Zero-copy conjugation** (PR #21): `Conj`/`Adjoint` ElementOps are passed as conjugation flags to the GEMM kernel, avoiding materialization (allocate + copy).
-- **Crate rename** (PR #22): `stridedview` → `strided-view`, `strided` → `strided-kernel` for naming consistency.
+- **faer GEMM backend** (PR #19), **zero-copy conjugation** (PR #21) and the
+  crate renames `stridedview` → `strided-view`, `strided` → `strided-kernel`
+  (PR #22). The `strided-einsum2` crate that used the faer backend here was
+  removed from the workspace after 0.4.4; its release remains on crates.io.
+- The typed kernels and plans moved to `strided-basic`; `strided-kernel` owns
+  the dtype-erased entries. Paths below that name `strided-kernel/src/` now
+  resolve to `strided-basic/src/`.
+- **`pulp` runtime dispatch on the map, reduce and update inner loops**
+  (`simd::dispatch_if_large`, `strided-basic/src/map_view.rs`,
+  `reduce_view.rs`, `ops_view.rs`, `update_view.rs`), which is most of
+  Priority 3. `reduce_axis` / `reduce_axis_into` and the plan loops still run
+  undispatchsed loops; the exceptions are listed under Priority 3.
+- **Hand-written `pulp` SIMD leaves** (`strided-basic/src/simd.rs`): sum,
+  product, dot, sum-of-squares and the add/mul block folds for `f32`/`f64`.
+  This covers Priority 1 and the block-fold part of Priority 4; `add_acc`, `axpy_acc`
+  and `fma_acc` still run dispatched scalar loop bodies.
+- **Contiguous identity `memcpy` fast path** in `copy_into`
+  (`strided-basic/src/ops_view.rs`), closing Gap 4.
+- **The per-element `Option` accumulator this document criticizes is gone**
+  from `strided-basic/src/reduce_view.rs` (Priority 5).
+- **Inline metadata** (`InlineVec`, `OperandVec`) replaces the per-call `Vec`
+  plan allocations of Priority 6.
 
-**Remaining:** The `strided-kernel` crate's element-wise and reduction kernels (`map_into`, `reduce`, `sum`, `copy_into`, `add`, `axpy`, `dot`, etc.) still rely on LLVM auto-vectorization via generic closures. This document analyzes the performance gap and proposes improvements.
+**Not adopted:** pairwise summation (Priority 7). The shipped reductions use a
+fixed multi-accumulator lane count with a documented merge order and
+association instead; see the reduction-order contract in the `strided-kernel`
+README.
+
+**Remaining:** explicit SIMD specialization of the map/update loop bodies
+(`map_into`, `add_acc`, `axpy_acc`, `fma_acc`). They already reach `pulp` runtime dispatch,
+so what is left is the vectorized body itself, which is still LLVM's
+auto-vectorization inside the dispatched ISA.
 
 ## SIMD Abstraction Architecture
 
@@ -179,7 +213,7 @@ pub enum SimdCapabilities {
 | Head/body/tail + masked load/store | Contiguous innermost loop remainder handling | High |
 | Multiple accumulators (4×) | ILP in `reduce` / `sum` kernels | High |
 | `pulp` runtime dispatch | Use AVX2/AVX-512 without `target-cpu=native` | High |
-| FMA via `simd.mul_add` | `axpy`, `fma`, `dot` kernels | High |
+| FMA via `simd.mul_add` | `axpy_acc`, `fma_acc`, `dot` kernels | High |
 | Pairwise summation | Precision for large reductions | Medium |
 | Complex→real reinterpretation | When adding `Complex` support | Low |
 | Register tiling (MR×NR) | Not directly applicable (strided-rs is not matmul-focused) | Low |
@@ -188,7 +222,14 @@ pub enum SimdCapabilities {
 
 ## Performance Gap Analysis: strided-kernel vs Strided.jl
 
-Benchmark environment: Apple Silicon M2, single-threaded.
+Benchmark environment: Apple Silicon M2, single-threaded. These numbers were
+recorded when this document was written, on the pre-split `strided-kernel`
+crate; no raw log was kept and nothing has been re-measured since, so treat them
+as reference values rather than a reproducible measurement. The committed
+regression benchmarks live in `<crate>/benches/`; cross-project results live in
+[`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite).
+The numbers below are evidence for the decisions in this record, not a current
+measurement.
 
 ### Gap 1: 1D contiguous sum — Rust ~2x slower than Julia Strided
 
@@ -198,7 +239,7 @@ Benchmark environment: Apple Silicon M2, single-threaded.
 
 Julia `Base.sum` uses hand-tuned SIMD reduction. Julia Strided is ~2x faster than Rust.
 
-**Root cause**: the contiguous fast path in `strided-kernel/src/reduce_view.rs`:
+**Root cause**: the contiguous fast path in `strided-basic/src/reduce_view.rs`:
 
 ```rust
 for &val in src.iter() {
@@ -208,7 +249,7 @@ for &val in src.iter() {
 
 This has a **loop-carried dependency** — each iteration depends on the previous `acc` value. LLVM cannot auto-vectorize this even with `#[inline(always)]` and `impl Fn`, because it cannot prove floating-point addition is associative (which is required to split into independent accumulators).
 
-The non-contiguous reduce path (`strided-kernel/src/reduce_view.rs`) is even worse — it calls `acc.take().ok_or(StridedError::OffsetOverflow)?` per element, adding Option unwrap overhead in the hot loop.
+The non-contiguous path had the same problem plus a per-element `acc.take().ok_or(...)?`; that `Option` accumulator has since been removed.
 
 ### Gap 2: 4D permute — up to 2.0x slower on specific patterns
 
@@ -220,7 +261,7 @@ The non-contiguous reduce path (`strided-kernel/src/reduce_view.rs`) is even wor
 
 (4,3,2,1) is near parity. (3,4,1,2) is 2x slower.
 
-**Root cause**: Julia's `@simd` pragma guarantees vectorization of the stride=1 innermost loop. Rust relies on LLVM auto-vectorization through the closure in `strided-kernel/src/kernel.rs::inner_loop_map1`. When the closure is trivial (identity copy), LLVM usually succeeds. But the presence of `Op::apply()` and generic `f` can inhibit vectorization in some code paths.
+**Root cause**: Julia's `@simd` pragma guarantees vectorization of the stride=1 innermost loop. Rust relies on LLVM auto-vectorization through the closure in `strided-basic/src/map_view.rs::inner_loop_map1` (it was `kernel.rs` when this document was written). When the closure is trivial (identity copy), LLVM usually succeeds. But the presence of `Op::apply()` and generic `f` can inhibit vectorization in some code paths.
 
 ### Gap 3: complex_elementwise — 1.6x slower
 
@@ -228,7 +269,7 @@ Julia 7.8ms vs Rust 12.7ms. Julia's `@simd` enables aggressive vectorization of 
 
 ### Gap 4: contiguous copy — Julia 10-25x faster
 
-Julia uses optimized `memcpy` for contiguous array copy. Rust's `strided-kernel::copy_into` routes through `map_into` with an identity closure, which never collapses to `memcpy`.
+Julia uses optimized `memcpy` for contiguous array copy, while Rust's `copy_into` routed through `map_into` with an identity closure, which never collapsed to `memcpy`. **Closed:** `copy_into` now takes the contiguous-identity `copy_nonoverlapping` path in `strided-basic/src/ops_view.rs`.
 
 ### Gap 5: small array overhead — Rust 3-5x slower
 
@@ -265,13 +306,16 @@ This is the **correct approach for generic `map_into`** — arbitrary closures (
 
 1. **Reductions** (`sum`, `dot`, `reduce`): `acc = reduce_fn(acc, val)` has a loop-carried dependency. Even with perfect inlining, LLVM will not break the dependency chain because it cannot assume floating-point associativity. Manual multi-accumulator unrolling is required.
 
-2. **Fixed operations** (`copy_into`, `add`, `axpy`): these are known at compile time and can bypass the closure entirely, using hand-written SIMD kernels or `memcpy`.
+2. **Fixed operations** (`copy_into`, `add_acc`, `axpy_acc`): these are known at compile time and can bypass the closure entirely, using hand-written SIMD kernels or `memcpy`.
 
 ## Improvement Plan for strided-kernel
 
-All items below target `strided-kernel/src/`. Matmul performance is already handled by faer in `strided-einsum2`.
+The plan below is the 2026-01-30 proposal, kept as the rationale for the
+decisions listed under "Current Status". All items target what is now
+`strided-basic/src/`; matmul performance was handled by the faer backend in the
+retired `strided-einsum2`.
 
-### Priority 1 (High Impact): SIMD reduce via `pulp`
+### Priority 1 (High Impact): SIMD reduce via `pulp` — shipped
 
 Add a hand-written SIMD kernel for contiguous reductions using the faer pattern:
 
@@ -320,7 +364,7 @@ pub fn sum_contiguous(data: &[f64]) -> f64 {
 
 Applies to: `sum`, `dot`, `norm_l2_sqr`, and any contiguous reduction.
 
-### Priority 2 (High Impact): `memcpy` for contiguous identity copy
+### Priority 2 (High Impact): `memcpy` for contiguous identity copy — shipped
 
 ```rust
 pub fn copy_into<T: Copy>(dst: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()> {
@@ -340,15 +384,38 @@ pub fn copy_into<T: Copy>(dst: &mut StridedViewMut<T>, src: &StridedView<T>) -> 
 
 **Expected improvement**: 10x+ for contiguous copy, matching Julia's `copy!`.
 
-### Priority 3 (High Impact): `pulp` runtime dispatch for all contiguous inner loops
+### Priority 3 (High Impact): `pulp` runtime dispatch for contiguous inner loops — shipped for the map, reduce and update kernels
 
 Wrap the stride=1 fast paths in `pulp::Arch::default().dispatch(...)` so that AVX2/AVX-512/NEON is used without requiring `RUSTFLAGS="-C target-cpu=native"`.
 
-This is orthogonal to the other improvements and benefits every contiguous operation.
+Dispatch exists as `simd::dispatch_if_large` and the map, reduce and update inner
+loops go through it: `map_into` / `zip_map*_into` (`strided-basic/src/map_view.rs`),
+the fixed operations in `ops_view.rs`, `map_update_into` / `zip_update*_into`
+(`update_view.rs`), `reduce` and `zip_reduce` (`reduce_view.rs:196`, `:213`,
+`:521`, `:542`), and the erased reduction kernels (`erased/reduce_kernel.rs`).
 
-### Priority 4 (Medium Impact): dedicated SIMD kernels for fixed ops
+It is not universal. These contiguous paths still run an undispatchsed loop:
 
-For `add`, `axpy`, `fma`, `dot` — bypass the generic closure path with hand-written SIMD kernels using `pulp`. These operations are simple enough (add, mul-add) that explicit SIMD is straightforward.
+- `reduce_axis` on a rank-1 source (`reduce_view.rs:826-834` -> `fold_run`
+  `:104-107` -> `fold_contiguous` `:55-81`). Reproducer: a 1024-element
+  `StridedArray::<f64>::col_major(&[1024])` folded with `reduce_axis(...)` under
+  `Exec::serial()` never reaches `dispatch_if_large`.
+- `reduce_axis_into`'s sweep and cursor loops (`reduce_view.rs:1047`, `:1051`,
+  `:1148`, `:1153`).
+- The copy, gather and structural plans (`copy_plan.rs`, `gather_plan.rs`,
+  `static_indexing_plan.rs`), which contain no `simd::` call at all.
+
+The dispatched bodies are still LLVM's auto-vectorization inside the selected
+ISA; dispatch adds the ISA-level codegen path, not a hand-written kernel.
+
+This is orthogonal to the other improvements and benefits every dispatched operation.
+
+### Priority 4 (Medium Impact): dedicated SIMD kernels for fixed ops — block folds shipped
+
+For `add_acc`, `axpy_acc`, `fma_acc`, `dot` — bypass the generic closure path with hand-written SIMD kernels using `pulp`. These operations are simple enough (add, mul-add) that explicit SIMD is straightforward.
+
+The add/mul block folds are implemented in `strided-basic/src/simd.rs`; `add_acc`,
+`axpy_acc` and `fma_acc` still run dispatched scalar loop bodies.
 
 ```rust
 // Instead of: map_into(dst, src, |x| x)        → copy_into with memcpy
@@ -356,9 +423,11 @@ For `add`, `axpy`, `fma`, `dot` — bypass the generic closure path with hand-wr
 // Instead of: reduce(src, |x| x, |a,b| a+b, 0.0)  → sum_simd kernel
 ```
 
-### Priority 5 (Medium Impact): eliminate `Option` in reduce hot loop
+### Priority 5 (Medium Impact): eliminate `Option` in reduce hot loop — shipped
 
-Change `strided-kernel/src/reduce_view.rs` from:
+`strided-basic/src/reduce_view.rs` no longer carries the `Option` accumulator
+shown here (the path was `strided-kernel/src/reduce_view.rs` at the time).
+Originally the loop was:
 
 ```rust
 let mut acc = Some(init);
@@ -367,26 +436,15 @@ for _ in 0..len {
     acc = Some(reduce_fn(current, mapped));
 }
 ```
-
-To simply:
-
-```rust
-let mut acc = init;
-for _ in 0..len {
-    acc = reduce_fn(acc, map_fn(Op::apply(unsafe { *ptr })));
-    ptr = ptr.offset(stride);
-}
-```
-
 **Expected improvement**: 10-30% for non-contiguous reduce.
 
-### Priority 6 (Low Impact): small-array overhead reduction
+### Priority 6 (Low Impact): small-array overhead reduction — shipped as inline metadata
 
 Replace `Vec` allocations in the internal fused-plan builder with `SmallVec<[_; 8]>` or stack arrays for rank ≤ 8 (covers the vast majority of use cases).
 
 **Expected improvement**: 2-5x for arrays with < 1K elements.
 
-### Priority 7 (Low Impact): pairwise summation for precision
+### Priority 7 (Low Impact): pairwise summation for precision — not adopted
 
 For large contiguous reductions (> 128 elements), recursively split in half before applying the SIMD kernel. This improves rounding error from O(n) to O(log n) at negligible performance cost.
 
@@ -404,4 +462,5 @@ For large contiguous reductions (> 128 elements), recursively split in half befo
 
 Priorities 1+3 combined have the largest impact: they address the fundamental SIMD gap that accounts for most of the difference between Rust strided-kernel and Julia Strided.
 
-Note: matmul/GEMM performance is already addressed by the faer backend in `strided-einsum2` (PR #19).
+Note: matmul/GEMM performance was addressed by the faer backend in
+`strided-einsum2` (PR #19), which left the workspace after 0.4.4.

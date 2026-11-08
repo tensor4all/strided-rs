@@ -1,0 +1,979 @@
+//! P6 counting-allocator matrix for the strided-basic planner and fast paths
+//! (tensor4all/strided-rs#306 items 2-4, tensor4all/strided-rs#312).
+//!
+//! Asserts 0 library-owned allocations at rank 1..=8 for every touched entry,
+//! on both sides of `SMALL_TENSOR_THRESHOLD`, with contiguous, permuted and
+//! stride-0 operands, serial and inside an explicit two-worker pool. Output
+//! data of array-returning APIs and allocations made inside user callbacks are
+//! out of scope (P1) and are not asserted. The rank-9 spill is executed but not
+//! gated: above the inline rank bound the planner may spill by contract.
+//!
+//! The counter is process global, so the whole matrix runs in one test; the
+//! setup and warm-up calls stay outside every counted window.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use strided_basic::{
+    add_acc, axpy_acc, batched_outer_product_into, col_major_strides, dot,
+    embed_diagonal_into_uninit, fma_acc, map_into, map_update_into, mul_acc, reduce,
+    reduce_axis_into, sum, symmetrize_into, zip_map2_into, zip_map3_into, zip_map4_into,
+    zip_reduce, zip_update2_into, zip_update3_into, Exec, Identity, Pool, StridedArray,
+    StridedView, StridedViewMut,
+};
+
+const SMALL_TENSOR_THRESHOLD: usize = 1024;
+
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation() {
+    ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+    let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+}
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_allocation();
+        System.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        record_allocation();
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// Steady-state allocations made by every thread while `run` executes.
+///
+/// The window runs three times and reports the minimum. A pool worker the
+/// warm-up never scheduled pays one-time first-touch costs (thread-local
+/// registration allocates on macOS) the first time it picks up a split, which
+/// is not a per-call allocation; a per-call allocation shows up in every round.
+/// (#321)
+fn count_allocations(mut run: impl FnMut()) -> usize {
+    (0..3)
+        .map(|_| {
+            let before = ALLOCATIONS.load(Ordering::SeqCst);
+            run();
+            ALLOCATIONS.load(Ordering::SeqCst) - before
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// Allocations made by the calling thread while `run` executes.
+///
+/// Serial windows use this so a concurrently idle worker pool or the global
+/// global pool cannot leak background allocations into the count.
+fn count_thread_allocations(run: impl FnOnce()) -> usize {
+    let before = THREAD_ALLOCATIONS.with(Cell::get);
+    run();
+    THREAD_ALLOCATIONS.with(Cell::get) - before
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LayoutKind {
+    Contiguous,
+    Permuted,
+    Broadcast,
+}
+
+/// Immutable identity view over test data.
+fn sv<'a>(
+    data: &'a [f64],
+    dims: &[usize],
+    strides: &[isize],
+    offset: isize,
+) -> Result<StridedView<'a, f64, Identity>, strided_basic::StridedError> {
+    StridedView::new(data, dims, strides, offset)
+}
+
+fn strides_for(dims: &[usize], kind: LayoutKind) -> Vec<isize> {
+    match kind {
+        LayoutKind::Contiguous => col_major_strides(dims).into_vec(),
+        LayoutKind::Permuted => {
+            let mut strides = col_major_strides(dims).into_vec();
+            strides.reverse();
+            strides
+        }
+        LayoutKind::Broadcast => vec![0; dims.len()],
+    }
+}
+
+fn kind_index(kind: LayoutKind) -> usize {
+    match kind {
+        LayoutKind::Contiguous => 0,
+        LayoutKind::Permuted => 1,
+        LayoutKind::Broadcast => 2,
+    }
+}
+
+fn total(dims: &[usize]) -> usize {
+    dims.iter().product()
+}
+
+/// Backing length needed to make every layout in `strides` in-bounds.
+fn required_len(dims: &[usize], strides: &[isize]) -> usize {
+    let mut max_offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides) {
+        if dim > 1 {
+            max_offset += (dim as isize - 1) * stride.abs();
+        }
+    }
+    (max_offset + 1) as usize
+}
+
+/// `count_allocations` runs its window three times, and a pooled token is
+/// minted once per run: the pool entry and token setup stay outside the window.
+fn pooled_tokens(pool: &Pool, runs: usize) -> Vec<Exec<'_>> {
+    (0..runs).map(|_| Exec::new(pool, 2).unwrap()).collect()
+}
+
+/// Runs `f` on a worker of `pool`. A pooled entry called from a worker spawns
+/// into the current scope without installing, so the counted windows measure
+/// the entry itself, not the one-time cost of entering the pool from outside.
+fn on_worker<R: Send>(pool: &Pool, f: impl FnOnce(&Pool) -> R + Send) -> R {
+    let slot = std::sync::Mutex::new(Some(f));
+    let out = std::sync::Mutex::new(None);
+    Exec::new(pool, 2).unwrap().fork(2, |job, _child| {
+        if job == 0 {
+            let f = slot.lock().unwrap().take().unwrap();
+            *out.lock().unwrap() = Some(f(pool));
+        }
+    });
+    out.into_inner().unwrap().expect("job 0 ran on a worker")
+}
+
+/// Runs one entry serially and on a two-slot token of `pool`, asserting no
+/// allocations. `entry` is warmed up first so one-time runtime state stays
+/// outside the counted windows. Every input layout in `kinds` is exercised.
+fn assert_entry<'p>(
+    name: &str,
+    pool: &'p Pool,
+    dims: &[usize],
+    kinds: &[LayoutKind],
+    mut entry: impl FnMut(LayoutKind, Exec<'p>) + Send,
+) {
+    for &kind in kinds {
+        // Warm up outside the counted windows.
+        entry(kind, Exec::serial());
+        let serial = count_thread_allocations(|| entry(kind, Exec::serial()));
+        assert_eq!(
+            serial, 0,
+            "{name} {kind:?} serial at rank {dims:?} allocated {serial}"
+        );
+        let parallel = on_worker(pool, |_| {
+            let mut tokens = pooled_tokens(pool, 4);
+            entry(kind, tokens.pop().unwrap());
+            count_allocations(|| entry(kind, tokens.pop().unwrap()))
+        });
+        assert_eq!(
+            parallel, 0,
+            "{name} {kind:?} two-slot at rank {dims:?} allocated {parallel}"
+        );
+    }
+}
+
+/// The plan-free `replay_*_raw` entries replay borrowed raw views without
+/// compiling anything: no allocation on a successful warm call, serial or on
+/// a pooled token, for every source layout (the callbacks allocate nothing).
+fn run_replay_entries(dims: &[usize], pool: &Pool) {
+    use strided_basic::{
+        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit,
+        RawStridedMut, RawStridedRef,
+    };
+    let layouts = [
+        strides_for(dims, LayoutKind::Contiguous),
+        strides_for(dims, LayoutKind::Permuted),
+        strides_for(dims, LayoutKind::Broadcast),
+    ];
+    let len = layouts
+        .iter()
+        .map(|strides| required_len(dims, strides))
+        .max()
+        .unwrap_or(0)
+        .max(total(dims));
+    let src: Vec<f64> = (0..len).map(|v| v as f64 + 1.0).collect();
+    let mut out = vec![0.0f64; len];
+    let mut uninit = vec![MaybeUninit::<f64>::uninit(); len];
+    let kinds = [
+        LayoutKind::Contiguous,
+        LayoutKind::Permuted,
+        LayoutKind::Broadcast,
+    ];
+    let dst_layouts = [LayoutKind::Contiguous, LayoutKind::Permuted];
+    for dst_kind in dst_layouts {
+        let dst_strides = strides_for(dims, dst_kind);
+        assert_entry("replay_copy_raw", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+            replay_copy_raw(&mut dest, &source, exec).unwrap();
+        });
+        assert_entry("replay_map_raw", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+            replay_map_raw(&mut dest, &source, |d: &mut f64, s| *d += s, exec).unwrap();
+        });
+        assert_entry(
+            "replay_copy_raw_uninit",
+            pool,
+            dims,
+            &kinds,
+            |kind, exec| {
+                let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+                let mut dest = RawStridedMut::new(&mut uninit, dims, &dst_strides, 0).unwrap();
+                replay_copy_raw_uninit(&mut dest, &source, exec).unwrap();
+            },
+        );
+        assert_entry("replay_map_raw_uninit", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut uninit, dims, &dst_strides, 0).unwrap();
+            replay_map_raw_uninit(&mut dest, &source, |s| 2.0 * s, exec).unwrap();
+        });
+    }
+}
+
+fn run_map_entries(dims: &[usize], pool: &Pool) {
+    let layouts = [
+        strides_for(dims, LayoutKind::Contiguous),
+        strides_for(dims, LayoutKind::Permuted),
+        strides_for(dims, LayoutKind::Broadcast),
+    ];
+    // Every layout must index inside the same backing buffers, so size them by
+    // the widest reachable offset.
+    let len = layouts
+        .iter()
+        .map(|strides| required_len(dims, strides))
+        .max()
+        .unwrap_or(0)
+        .max(total(dims));
+    let dst_strides = strides_for(dims, LayoutKind::Contiguous);
+    let src: Vec<f64> = (0..len).map(|v| v as f64 + 1.0).collect();
+    let a: Vec<f64> = (0..len).map(|v| v as f64 + 2.0).collect();
+    let b: Vec<f64> = (0..len).map(|v| v as f64 + 3.0).collect();
+    let c: Vec<f64> = (0..len).map(|v| v as f64 + 4.0).collect();
+    let mut out = vec![0.0f64; len];
+
+    let kinds = [
+        LayoutKind::Contiguous,
+        LayoutKind::Permuted,
+        LayoutKind::Broadcast,
+    ];
+
+    assert_entry("map_into", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        map_into(&mut dest, &source, |x| x + 1.0, exec).unwrap();
+    });
+
+    assert_entry("zip_map2_into", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        zip_map2_into(&mut dest, &va, &vb, |x, y| x + y, exec).unwrap();
+    });
+
+    assert_entry("zip_map3_into", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let vc = sv(&c, dims, &dst_strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        zip_map3_into(&mut dest, &va, &vb, &vc, |x, y, z| x + y + z, exec).unwrap();
+    });
+
+    assert_entry("zip_map4_into", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let vc = sv(&c, dims, &dst_strides, 0).unwrap();
+        let vd = sv(&src, dims, &dst_strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        zip_map4_into(
+            &mut dest,
+            &va,
+            &vb,
+            &vc,
+            &vd,
+            |x, y, z, w| x + y + z + w,
+            exec,
+        )
+        .unwrap();
+    });
+
+    assert_entry("add_acc", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        add_acc(&mut dest, &source, exec).unwrap();
+    });
+
+    assert_entry("mul_acc", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        mul_acc(&mut dest, &source, exec).unwrap();
+    });
+
+    assert_entry("axpy_acc", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        axpy_acc(&mut dest, &source, 1.5, exec).unwrap();
+    });
+
+    assert_entry("fma_acc", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        fma_acc(&mut dest, &va, &vb, exec).unwrap();
+    });
+
+    assert_entry("dot", pool, dims, &kinds, |kind, _exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let _ = dot::<f64, f64, f64, Identity, Identity>(&va, &vb).unwrap();
+    });
+
+    // Single- and two-operand full reductions (#280). `dot` above is the typed
+    // two-operand entry; `zip_reduce` is the mapped one, and `reduce`/`sum` are
+    // the one-operand entries.
+    assert_entry("reduce", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let _ = reduce(&source, |x| x, |x, y| x + y, 0.0, exec).unwrap();
+    });
+
+    assert_entry("sum", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let source = sv(&src, dims, &strides, 0).unwrap();
+        let _ = sum(&source, exec).unwrap();
+    });
+
+    assert_entry("zip_reduce", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let _: f64 = zip_reduce(&va, &vb, |x, y| x * y, |x, y| x + y, 0.0, exec).unwrap();
+    });
+
+    assert_entry("map_update_into", pool, dims, &kinds, |_kind, exec| {
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        map_update_into::<f64, Identity>(&mut dest, |x| x + 1.0, exec).unwrap();
+    });
+
+    assert_entry("zip_update2_into", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        zip_update2_into::<f64, f64, Identity, Identity>(&mut dest, &va, |d, a| d + a, exec)
+            .unwrap();
+    });
+
+    assert_entry("zip_update3_into", pool, dims, &kinds, |kind, exec| {
+        let strides = &layouts[kind_index(kind)];
+        let va = sv(&a, dims, &strides, 0).unwrap();
+        let vb = sv(&b, dims, &dst_strides, 0).unwrap();
+        let mut dest = StridedViewMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+        zip_update3_into::<f64, f64, f64, Identity, Identity, Identity>(
+            &mut dest,
+            &va,
+            &vb,
+            |d, a, b| d + a + b,
+            exec,
+        )
+        .unwrap();
+    });
+
+    // `reduce_axis_into` writes caller storage, so the output is in scope.
+    if dims.len() >= 2 {
+        let reduced: Vec<usize> = dims[1..].to_vec();
+        let reduced_len = total(&reduced);
+        let reduced_strides = col_major_strides(&reduced);
+        assert_entry("reduce_axis_into", pool, dims, &kinds, |kind, exec| {
+            let strides = &layouts[kind_index(kind)];
+            let source = sv(&src, dims, &strides, 0).unwrap();
+            let mut dest =
+                StridedViewMut::new(&mut out[..reduced_len], &reduced, &reduced_strides, 0)
+                    .unwrap();
+            reduce_axis_into(&mut dest, &source, 0, |x| x, |x, y| x + y, 0.0, exec).unwrap();
+        });
+    }
+}
+
+fn run_composites(pool: &Pool) {
+    // symmetrize, rank 2.
+    let dims = [8usize, 8];
+    let len = 64;
+    let src: Vec<f64> = (0..len).map(|v| v as f64 + 1.0).collect();
+    let strides = col_major_strides(&dims);
+    let mut out = vec![0.0f64; len];
+    assert_entry(
+        "symmetrize_into",
+        pool,
+        &dims,
+        &[LayoutKind::Permuted],
+        |_kind, exec| {
+            let source = sv(&src, &dims, &strides, 0).unwrap();
+            let mut dest = StridedViewMut::new(&mut out, &dims, &strides, 0).unwrap();
+            symmetrize_into(&mut dest, &source, exec).unwrap();
+        },
+    );
+
+    // batched outer product: dest [2, 3, n], lhs [2, n], rhs [3, n].
+    let batch = 8usize;
+    let dest_dims = [2usize, 3, batch];
+    let lhs_dims = [2usize, batch];
+    let rhs_dims = [3usize, batch];
+    let dest_strides = col_major_strides(&dest_dims);
+    let lhs_strides = col_major_strides(&lhs_dims);
+    let rhs_strides = col_major_strides(&rhs_dims);
+    let lhs: Vec<f64> = (0..2 * batch).map(|v| v as f64).collect();
+    let rhs: Vec<f64> = (0..3 * batch).map(|v| v as f64 + 1.0).collect();
+    let mut dest_data = vec![0.0f64; dest_dims.iter().product()];
+    assert_entry(
+        "batched_outer_product_into",
+        pool,
+        &dest_dims,
+        &[LayoutKind::Contiguous],
+        |_kind, exec| {
+            let lhs_view = sv(&lhs, &lhs_dims, &lhs_strides, 0).unwrap();
+            let rhs_view = sv(&rhs, &rhs_dims, &rhs_strides, 0).unwrap();
+            let mut dest =
+                StridedViewMut::new(&mut dest_data, &dest_dims, &dest_strides, 0).unwrap();
+            batched_outer_product_into(&mut dest, &lhs_view, &rhs_view, 1, 1, exec).unwrap();
+        },
+    );
+
+    // embed diagonal, rank 2 -> rank 3.
+    let shape = [8usize, 8];
+    let len: usize = 64;
+    let input: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    let mut out: Vec<MaybeUninit<f64>> = vec![MaybeUninit::uninit(); len * shape[0]];
+    assert_entry(
+        "embed_diagonal_into_uninit",
+        pool,
+        &shape,
+        &[LayoutKind::Contiguous],
+        |_kind, exec| {
+            embed_diagonal_into_uninit(&mut out, &input, &shape, 0, 0, 0.0, exec).unwrap();
+        },
+    );
+}
+
+#[test]
+fn typed_entries_are_allocation_free_up_to_rank_limit() {
+    let pool = Pool::builder().threads(2).build().unwrap();
+
+    for rank in 1..=8usize {
+        let small = vec![2usize; rank];
+        let mut large = vec![2usize; rank];
+        // Push the element count just past SMALL_TENSOR_THRESHOLD.
+        large[0] = (SMALL_TENSOR_THRESHOLD >> (rank - 1)) + 1;
+        assert!(total(&small) <= SMALL_TENSOR_THRESHOLD);
+        assert!(total(&large) > SMALL_TENSOR_THRESHOLD);
+
+        for dims in [&small, &large] {
+            run_map_entries(dims, &pool);
+            run_replay_entries(dims, &pool);
+        }
+    }
+
+    run_composites(&pool);
+    check_reduce_axis(&pool);
+    check_parallel_threshold();
+    check_full_reduction(&pool);
+    check_plans(&pool);
+    record_rank9_spill(&pool);
+    check_replay_rank9_spill_is_bounded();
+}
+
+/// Tensor-sized cases that must reach the parallel branches. The default
+/// dispatch costs of the shared pool keep these sizes serial, so they run on a
+/// pool with cheap dispatch costs, and the replay width is asserted so the
+/// counting windows cannot fall back to the serial path unnoticed.
+fn check_parallel_threshold() {
+    use strided_basic::execution::{parallel_width, KernelClass};
+    use threadteam::{DispatchCosts, DispatchKind, HostClass, WidthCosts};
+
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    let pool = Pool::builder()
+        .threads(2)
+        .dispatch_costs(
+            DispatchCosts::for_class(HostClass::Generic)
+                .with(DispatchKind::Team, cheap)
+                .with(DispatchKind::InPool, cheap)
+                .with(DispatchKind::Outside, cheap),
+        )
+        .build()
+        .unwrap();
+    let shapes: [&[usize]; 3] = [
+        &[33, 33, 33],
+        &[3, 3, 3, 3, 3, 3, 3, 21],
+        &[5, 4, 4, 4, 4, 4, 4, 2],
+    ];
+    for dims in shapes {
+        let width = on_worker(&pool, |pool| {
+            parallel_width(&Exec::new(pool, 2).unwrap(), KernelClass::Copy, total(dims)).get()
+        });
+        #[cfg(feature = "parallel")]
+        assert!(width >= 2, "replay case {dims:?} runs at width {width}");
+        #[cfg(not(feature = "parallel"))]
+        let _ = width;
+        run_map_entries(dims, &pool);
+        run_replay_entries(dims, &pool);
+    }
+}
+
+/// The recursive full-reduction fold (`reduce`, whose parallel path combines
+/// per-worker partials in a tree) must also be allocation-free on every worker
+/// for a non-contiguous source above the threading threshold.
+fn check_full_reduction(pool: &Pool) {
+    use strided_basic::reduce;
+
+    let dims = [257usize, 128];
+    let strides = [1isize, 300];
+    assert!(
+        total(&dims) > 32_768,
+        "full-reduction case is not tensor-sized"
+    );
+    let len = required_len(&dims, &strides);
+    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    // A gapped stride keeps the source non-contiguous so the recursive
+    // partial-combination fold runs instead of the contiguous lane fold.
+    let source = sv(&src, &dims, &strides, 0).unwrap();
+
+    // Warm up outside the counted windows.
+    let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
+
+    let serial = count_thread_allocations(|| {
+        let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
+    });
+    assert_eq!(serial, 0, "serial full reduction allocated {serial}");
+
+    let parallel = on_worker(pool, |pool| {
+        let mut tokens = pooled_tokens(pool, 4);
+        let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, tokens.pop().unwrap()).unwrap();
+        count_allocations(|| {
+            let _ = reduce(&source, |x| x, |a, b| a + b, 0.0, tokens.pop().unwrap()).unwrap();
+        })
+    });
+    assert_eq!(parallel, 0, "two-slot full reduction allocated {parallel}");
+}
+
+/// Compiled plans must not allocate on compile or execute within the inline
+/// rank/operand bounds (P4), so downstream code that compiles per call and
+/// executes per accumulate does not touch the heap.
+fn check_plans(_pool: &Pool) {
+    use strided_basic::{
+        ConcatenatePlan, ErasedConcatenatePlan, ErasedRawStridedMut, ErasedRawStridedPtr,
+        ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan, ErasedUpdatePlan,
+        KernelDType, RawStridedMut, RawStridedRef, ReduceOp, UpdateOp, UpdatePlan,
+    };
+    for rank in 1..=8usize {
+        let dims = vec![2usize; rank];
+        let strides = col_major_strides(&dims).into_vec();
+        let len = total(&dims);
+        let src: Vec<f64> = (0..len).map(|v| v as f64 + 1.0).collect();
+        let mut dst = vec![0.0f64; len];
+
+        // UpdatePlan: compile and execute allocation-free.
+        let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+        {
+            let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+            let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x, Exec::serial())
+                .unwrap();
+        }
+        let update_compile = count_thread_allocations(|| {
+            let plan = UpdatePlan::compile(&dims, &strides, &strides).unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            update_compile, 0,
+            "UpdatePlan::compile rank {rank} allocated {update_compile}"
+        );
+        let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+        let update_execute = count_thread_allocations(|| {
+            plan.execute(&mut dst_mut, &src_ref, 2.0, 3.0, |x| x, Exec::serial())
+                .unwrap();
+        });
+        assert_eq!(
+            update_execute, 0,
+            "UpdatePlan::execute rank {rank} allocated {update_execute}"
+        );
+
+        // Write-only uninitialized destination: same allocation-free replay.
+        let mut uninit_dst = vec![MaybeUninit::<f64>::uninit(); len];
+        let mut uninit_mut = RawStridedMut::new(&mut uninit_dst, &dims, &strides, 0).unwrap();
+        plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x, Exec::serial())
+            .unwrap();
+        let update_uninit = count_thread_allocations(|| {
+            plan.execute_uninit(&mut uninit_mut, &src_ref, 1.0, |x| x, Exec::serial())
+                .unwrap();
+        });
+        assert_eq!(
+            update_uninit, 0,
+            "UpdatePlan::execute_uninit rank {rank} allocated {update_uninit}"
+        );
+
+        // Erased update plan: same traversal behind a dtype-erased boundary.
+        let erased_update =
+            ErasedUpdatePlan::compile(KernelDType::F64, &dims, &strides, &strides).unwrap();
+        {
+            let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let mut erased_dst = vec![0.0f64; len];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dims, &strides, 0).unwrap();
+            erased_update
+                .execute(
+                    &mut dest,
+                    &source,
+                    2.0,
+                    3.0,
+                    UpdateOp::Identity,
+                    Exec::serial(),
+                )
+                .unwrap();
+        }
+        let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut erased_dst = vec![0.0f64; len];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dims, &strides, 0).unwrap();
+        let erased_update_execute = count_thread_allocations(|| {
+            erased_update
+                .execute(
+                    &mut dest,
+                    &source,
+                    2.0,
+                    3.0,
+                    UpdateOp::Identity,
+                    Exec::serial(),
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            erased_update_execute, 0,
+            "ErasedUpdatePlan::execute rank {rank} allocated {erased_update_execute}"
+        );
+
+        // Erased write-only uninitialized destination.
+        let mut erased_uninit = vec![MaybeUninit::<f64>::uninit(); len];
+        let mut uninit_dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut erased_uninit, &dims, &strides, 0)
+                .unwrap();
+        let source_ptr = ErasedRawStridedPtr::from_ref(&source);
+        erased_update
+            .execute_uninit(
+                &mut uninit_dest,
+                &source_ptr,
+                1.0,
+                UpdateOp::Identity,
+                Exec::serial(),
+            )
+            .unwrap();
+        let erased_update_uninit = count_thread_allocations(|| {
+            erased_update
+                .execute_uninit(
+                    &mut uninit_dest,
+                    &source_ptr,
+                    1.0,
+                    UpdateOp::Identity,
+                    Exec::serial(),
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            erased_update_uninit, 0,
+            "ErasedUpdatePlan::execute_uninit rank {rank} allocated {erased_update_uninit}"
+        );
+
+        // ConcatenatePlan with two inputs: compile and execute allocation-free.
+        let mut dest_dims = dims.clone();
+        dest_dims[0] *= 2;
+        let dest_strides = col_major_strides(&dest_dims).into_vec();
+        let dest_len = total(&dest_dims);
+        let mut concat_dst = vec![0.0f64; dest_len];
+        let concat_compile = count_thread_allocations(|| {
+            let plan = ConcatenatePlan::compile(
+                &[&dims, &dims],
+                &[&strides, &strides],
+                &dest_dims,
+                &dest_strides,
+                0,
+            )
+            .unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            concat_compile, 0,
+            "ConcatenatePlan::compile rank {rank} allocated {concat_compile}"
+        );
+        let concat_plan = ConcatenatePlan::compile(
+            &[&dims, &dims],
+            &[&strides, &strides],
+            &dest_dims,
+            &dest_strides,
+            0,
+        )
+        .unwrap();
+        {
+            let a = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+            let b = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+            let mut dest =
+                RawStridedMut::new(&mut concat_dst, &dest_dims, &dest_strides, 0).unwrap();
+            concat_plan
+                .execute(&mut dest, &[a, b], Exec::serial())
+                .unwrap();
+        }
+        let a = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let b = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let mut dest = RawStridedMut::new(&mut concat_dst, &dest_dims, &dest_strides, 0).unwrap();
+        let concat_execute = count_thread_allocations(|| {
+            concat_plan
+                .execute(&mut dest, &[a, b], Exec::serial())
+                .unwrap();
+        });
+        assert_eq!(
+            concat_execute, 0,
+            "ConcatenatePlan::execute rank {rank} allocated {concat_execute}"
+        );
+
+        // Erased concatenate execute (typed scalar, erased dtype tag).
+        let erased_plan = ErasedConcatenatePlan::compile(
+            KernelDType::F64,
+            &[&dims, &dims],
+            &[&strides, &strides],
+            &dest_dims,
+            &dest_strides,
+            0,
+        )
+        .unwrap();
+        let mut erased_dst = vec![0.0f64; dest_len];
+        {
+            let a = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let b = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dest_dims, &dest_strides, 0)
+                    .unwrap();
+            erased_plan
+                .execute(&mut dest, &[a, b], Exec::serial())
+                .unwrap();
+        }
+        let a = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let b = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut erased_dst, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        let erased_concat_execute = count_thread_allocations(|| {
+            erased_plan
+                .execute(&mut dest, &[a, b], Exec::serial())
+                .unwrap();
+        });
+        assert_eq!(
+            erased_concat_execute, 0,
+            "ErasedConcatenatePlan::execute rank {rank} allocated {erased_concat_execute}"
+        );
+
+        // Erased reduction compile (full and one axis) allocation-free.
+        let full_compile = count_thread_allocations(|| {
+            let plan = ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides)
+                .unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            full_compile, 0,
+            "ErasedReducePlan::compile rank {rank} allocated {full_compile}"
+        );
+        let reduced_dims: Vec<usize> = dims[1..].to_vec();
+        let reduced_strides = col_major_strides(&reduced_dims).into_vec();
+        let axes_compile = count_thread_allocations(|| {
+            let plan = ErasedReducePlan::compile_axes(
+                KernelDType::F64,
+                ReduceOp::Sum,
+                &dims,
+                &strides,
+                &reduced_dims,
+                &reduced_strides,
+                &[0],
+            )
+            .unwrap();
+            std::hint::black_box(plan);
+        });
+        assert_eq!(
+            axes_compile, 0,
+            "ErasedReducePlan::compile_axes rank {rank} allocated {axes_compile}"
+        );
+    }
+
+    // Axis-reduction execute for each kernel strategy, allocation-free. The
+    // `OutputBlocks` path exercises the per-thread reusable accumulator scratch.
+    let dims = [16usize, 4];
+    let strides = col_major_strides(&dims).into_vec();
+    let src: Vec<f64> = (0..64).map(|v| v as f64).collect();
+    for reduced_dims in [vec![4usize], vec![16usize]] {
+        let reduce_axis = if reduced_dims[0] == 4 { 0 } else { 1 };
+        let reduced_strides = col_major_strides(&reduced_dims).into_vec();
+        let plan = ErasedReducePlan::compile_axes(
+            KernelDType::F64,
+            ReduceOp::Sum,
+            &dims,
+            &strides,
+            &reduced_dims,
+            &reduced_strides,
+            &[reduce_axis],
+        )
+        .unwrap();
+        let mut out = vec![0.0f64; reduced_dims.iter().product::<usize>()];
+        {
+            let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut out, &reduced_dims, &reduced_strides, 0)
+                    .unwrap();
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
+        }
+        let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut out, &reduced_dims, &reduced_strides, 0)
+                .unwrap();
+        let execute = count_thread_allocations(|| {
+            plan.execute(&mut dest, &source, Exec::serial()).unwrap();
+        });
+        assert_eq!(
+            execute, 0,
+            "ErasedReducePlan::execute {reduced_dims:?} allocated {execute}"
+        );
+    }
+    let full = ErasedReducePlan::compile(KernelDType::F64, ReduceOp::Sum, &dims, &strides).unwrap();
+    let mut scalar = [0.0f64; 1];
+    {
+        let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+        let mut dest = ErasedRawStridedMut::from_slice_mut(&mut scalar, &[1], &[1], 0).unwrap();
+        full.execute(&mut dest, &source, Exec::serial()).unwrap();
+    }
+    let source = ErasedRawStridedRef::from_slice(&src, &dims, &strides, 0).unwrap();
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut scalar, &[1], &[1], 0).unwrap();
+    let full_execute = count_thread_allocations(|| {
+        full.execute(&mut dest, &source, Exec::serial()).unwrap();
+    });
+    assert_eq!(
+        full_execute, 0,
+        "ErasedReducePlan full execute allocated {full_execute}"
+    );
+}
+
+/// `reduce_axis_into` must be allocation-free; the array-returning
+/// `reduce_axis` wrapper must allocate only its column-major output.
+fn check_reduce_axis(_pool: &Pool) {
+    use strided_basic::reduce_axis;
+
+    let dims = [4usize, 4, 4];
+    let src: Vec<f64> = (0..64).map(|v| v as f64).collect();
+    let strides = col_major_strides(&dims);
+    let source = sv(&src, &dims, &strides, 0).unwrap();
+    let _ = reduce_axis(&source, 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
+    let wrapper = count_thread_allocations(|| {
+        let out = reduce_axis(&source, 0, |x| x, |a, b| a + b, 0.0, Exec::serial()).unwrap();
+        std::hint::black_box(out);
+    });
+    assert_eq!(
+        wrapper, 1,
+        "reduce_axis must allocate exactly its column-major output"
+    );
+
+    let reduced = [4usize, 4];
+    let mut out = StridedArray::<f64>::col_major(&reduced);
+    let mut dest = out.view_mut();
+    reduce_axis_into(
+        &mut dest,
+        &source,
+        0,
+        |x| x,
+        |a, b| a + b,
+        0.0,
+        Exec::serial(),
+    )
+    .unwrap();
+    let into = count_thread_allocations(|| {
+        reduce_axis_into(
+            &mut dest,
+            &source,
+            0,
+            |x| x,
+            |a, b| a + b,
+            0.0,
+            Exec::serial(),
+        )
+        .unwrap();
+    });
+    assert_eq!(into, 0, "reduce_axis_into must not allocate");
+}
+
+/// Above `INLINE_RANK` the planner spills by contract. This records the spill
+/// instead of gating it, so a change from inline to unconditional heap use
+/// above the bound is visible without making rank 9 a failure.
+fn record_rank9_spill(pool: &Pool) {
+    let dims = vec![2usize; 9];
+    let len = total(&dims);
+    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    let mut out = vec![0.0f64; len];
+    let dest_strides = strides_for(&dims, LayoutKind::Contiguous);
+    let src_strides = strides_for(&dims, LayoutKind::Permuted);
+    let source = sv(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = StridedViewMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
+    map_into(&mut dest, &source, |x| x + 1.0, Exec::serial()).unwrap();
+    let serial = count_thread_allocations(|| {
+        map_into(&mut dest, &source, |x| x + 1.0, Exec::serial()).unwrap();
+    });
+    let parallel = on_worker(pool, |pool| {
+        let mut tokens = pooled_tokens(pool, 4);
+        map_into(&mut dest, &source, |x| x + 1.0, tokens.pop().unwrap()).unwrap();
+        count_allocations(|| {
+            map_into(&mut dest, &source, |x| x + 1.0, tokens.pop().unwrap()).unwrap();
+        })
+    });
+    eprintln!("rank-9 permuted map_into spill: serial={serial}, parallel={parallel}");
+}
+
+/// Above the inline rank the plan-free replay spills its axis list and range
+/// cursors by contract; the count is bounded by the rank, so it must not grow
+/// from one warm call to the next.
+fn check_replay_rank9_spill_is_bounded() {
+    use strided_basic::{replay_copy_raw, RawStridedMut, RawStridedRef};
+    let dims = vec![2usize; 9];
+    let len = total(&dims);
+    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    let mut out = vec![0.0f64; len];
+    let dest_strides = strides_for(&dims, LayoutKind::Contiguous);
+    let src_strides = strides_for(&dims, LayoutKind::Permuted);
+    let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
+    replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap();
+    let mut call = || {
+        count_thread_allocations(|| replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap())
+    };
+    let first = call();
+    let second = call();
+    assert!(first <= 2, "rank-9 replay allocated {first} times");
+    assert_eq!(first, second, "rank-9 replay allocations grew");
+}

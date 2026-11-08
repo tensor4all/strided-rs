@@ -124,7 +124,7 @@ faer exposes fused multiply-add through the scalar trait layer:
   `maybe_conj_mul_add`.
 - `faer-traits/src/lib.rs:604` wraps `abs2_add`.
 
-Rule for `strided-rs`: fixed operations such as `axpy`, `fma`, `dot`, and GEMM
+Rule for `strided-rs`: fixed operations such as `axpy_acc`, `fma_acc`, `dot`, and GEMM
 fallbacks should call an explicit FMA-capable path where available. Do not
 write these kernels only as generic closures if the operation is known.
 
@@ -196,7 +196,7 @@ The remaining gap versus faer is mostly:
 - `strided-kernel/src/simd.rs:71` and `strided-kernel/src/simd.rs:113` use
   `as_simd_*` plus scalar tail loops, not masked head/body/tail.
 - Alignment is not treated as an inner-block property.
-- Fixed operations such as `add`, `mul`, `axpy`, and `fma` still mostly rely on
+- Fixed operations such as `add_acc`, `mul_acc`, `axpy_acc`, and `fma_acc` still mostly rely on
   generic closure loops.
 - Generic reductions still have loop-carried scalar accumulators.
 
@@ -227,11 +227,11 @@ pub fn zip_map2_broadcast_into<D, A, B, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
     b: &StridedView<B, OpB>,
-    f: impl Fn(A, B) -> D + MaybeSync,
+    f: impl Fn(A, B) -> D + Send + Sync,
 ) -> Result<()>
 ```
 
-For `mul`, add a fixed operation wrapper:
+For `mul_into` (overwrite `dest = a * b`), add a fixed operation wrapper:
 
 ```rust
 pub fn broadcast_mul_into<T, OpA, OpB>(
@@ -256,7 +256,7 @@ Current `zip_map2_into` already has good first-order structure:
 
 The next improvements should be:
 
-- Add fixed-operation kernels for `copy`, `mul`, `add`, `axpy`, `fma`, and
+- Add fixed-operation kernels for `copy`, `mul_acc`, `add_acc`, `axpy_acc`, `fma_acc`, and
   `dot` instead of relying only on closure-based `zip_map2_into`.
 - Preserve the current generic `zip_map2_into` as the fallback for arbitrary
   closures.

@@ -1,0 +1,209 @@
+# Publishing a strided-rs release
+
+Publish only a commit that has already landed on `main`. The release tag must
+identify that exact commit, and every crate must be published from a clean
+checkout of the tag.
+
+## 1. Prepare and validate `main`
+
+Complete all version and dependency changes in a reviewed commit before the
+release. Do not edit manifests while publishing: crates.io must receive the
+same manifests recorded by the tag.
+
+```bash
+set -euo pipefail
+
+git switch main
+git pull --ff-only origin main
+cargo fmt --all -- --check
+cargo test --workspace
+```
+
+Confirm all six package file lists contain their license and provenance files:
+
+```bash
+set -euo pipefail
+
+for crate in \
+  strided-traits strided-view strided-perm strided-basic \
+  strided-fused strided-kernel
+do
+  package_files=$(cargo package -p "$crate" --list)
+  printf '%s\n' "$package_files"
+  for required in LICENSE-APACHE LICENSE-MIT NOTICE; do
+    grep -Fxq "$required" <<<"$package_files"
+  done
+  case "$crate" in
+    strided-traits|strided-view|strided-perm|strided-basic|strided-fused|strided-kernel)
+      grep -Fxq THIRD-PARTY-LICENSES <<<"$package_files"
+      ;;
+    *)
+      if grep -Fxq THIRD-PARTY-LICENSES <<<"$package_files"; then
+        echo "unexpected THIRD-PARTY-LICENSES in $crate" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+```
+
+Every package must contain `LICENSE-APACHE`, `LICENSE-MIT`, and its
+package-specific `NOTICE`. Only `strided-traits`, `strided-view`,
+`strided-perm`, `strided-basic`, `strided-fused`, and `strided-kernel` contain
+ported or license-derived code, so only those archives contain
+`THIRD-PARTY-LICENSES`.
+
+## 2. Tag before publishing
+
+Push the validated `main` commit before creating and pushing the release tag.
+Replace `0.4.0` below for later releases.
+
+```bash
+set -euo pipefail
+
+git push origin main
+release_sha=$(git rev-parse HEAD)
+test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
+
+# Wait for the required CI workflow triggered by this exact pushed commit.
+run_id=
+for attempt in {1..30}; do
+  run_id=$(gh run list --workflow ci.yml --branch main --event push \
+    --commit "$release_sha" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+  test -z "$run_id" || break
+  sleep 10
+done
+test -n "$run_id"
+gh run watch "$run_id" --exit-status
+test "$(gh run view "$run_id" --json headSha --jq .headSha)" = "$release_sha"
+test "$(gh run view "$run_id" --json conclusion --jq .conclusion)" = success
+
+git tag -a v0.4.0 "$release_sha" -m "strided-rs v0.4.0"
+git push origin v0.4.0
+git switch --detach v0.4.0
+test -z "$(git status --porcelain)"
+```
+
+The detached tag checkout is the publication source. Do not create all six
+archives at once: Cargo cannot package a crate whose v0.4 workspace
+prerequisites are not yet available from crates.io.
+
+## 3. Package, inspect, and publish in dependency order
+
+Process one crate completely before starting the next, in this exact order:
+
+1. `strided-traits`
+2. `strided-view`
+3. `strided-perm`
+4. `strided-basic`
+5. `strided-fused`
+6. `strided-kernel`
+
+For every crate, first query crates.io for the exact version. An absent
+version is packaged, inspected, dry-run, published, and awaited. An existing
+version is skipped only after its registry archive passes the same provenance
+checks. Thus every prerequisite is registry-visible before Cargo packages a
+dependent crate, and the first new archive is fully inspected before the first
+irreversible publish.
+
+```bash
+set -euo pipefail
+
+version=0.4.0
+expected=$(git rev-parse HEAD)
+test "$(git describe --exact-match --tags HEAD)" = "v$version"
+
+download_dir=$(mktemp -d)
+trap 'rm -rf "$download_dir"' EXIT
+
+verify_archive() {
+  local crate=$1 archive=$2 prefix="${1}-${version}"
+  local vcs_info actual dirty archive_files
+
+  vcs_info=$(tar -xOf "$archive" "$prefix/.cargo_vcs_info.json")
+  actual=$(printf '%s' "$vcs_info" | python3 -c 'import json, sys; print(json.load(sys.stdin)["git"]["sha1"])')
+  dirty=$(printf '%s' "$vcs_info" | python3 -c 'import json, sys; print(str(json.load(sys.stdin)["git"].get("dirty", False)).lower())')
+  test "$actual" = "$expected"
+  test "$dirty" = false
+
+  for required in LICENSE-APACHE LICENSE-MIT NOTICE; do
+    tar -xOf "$archive" "$prefix/$required" | cmp - "$crate/$required"
+  done
+  case "$crate" in
+    strided-traits|strided-view|strided-perm|strided-basic|strided-fused|strided-kernel)
+      tar -xOf "$archive" "$prefix/THIRD-PARTY-LICENSES" |
+        cmp - "$crate/THIRD-PARTY-LICENSES"
+      ;;
+    *)
+      archive_files=$(tar -tf "$archive")
+      if grep -q '/THIRD-PARTY-LICENSES$' <<<"$archive_files"; then
+        echo "unexpected THIRD-PARTY-LICENSES in $crate" >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+
+for crate in \
+  strided-traits strided-view strided-perm strided-basic \
+  strided-fused strided-kernel
+do
+  test -z "$(git status --porcelain)"
+
+  metadata_response="$download_dir/${crate}-${version}.json"
+  if ! http_status=$(curl --silent --show-error \
+    --user-agent "strided-rs-release/$version" \
+    --output "$metadata_response" --write-out '%{http_code}' \
+    "https://crates.io/api/v1/crates/$crate/$version"); then
+    echo "failed to query crates.io for $crate@$version" >&2
+    exit 1
+  fi
+
+  case "$http_status" in
+    200)
+      registry_archive="$download_dir/${crate}-${version}.crate"
+      curl --fail --location --silent --show-error \
+        --user-agent "strided-rs-release/$version" \
+        --output "$registry_archive" \
+        "https://crates.io/api/v1/crates/$crate/$version/download"
+      verify_archive "$crate" "$registry_archive"
+      echo "$crate@$version already exists and matches tag; skipping"
+      continue
+      ;;
+    404)
+      rm -f "$metadata_response"
+      ;;
+    *)
+      echo "unexpected HTTP status $http_status for $crate@$version" >&2
+      exit 1
+      ;;
+  esac
+
+  cargo package -p "$crate" --no-verify
+  archive="target/package/${crate}-${version}.crate"
+  verify_archive "$crate" "$archive"
+
+  cargo publish -p "$crate" --dry-run
+  cargo publish -p "$crate"
+
+  visible=false
+  for attempt in {1..30}; do
+    if cargo info "$crate@$version"; then
+      visible=true
+      break
+    fi
+    sleep 10
+  done
+  test "$visible" = true
+done
+
+test -z "$(git status --porcelain)"
+```
+
+The visibility wait is bounded to 30 attempts and retries because registry
+indexing is asynchronous. If it expires, rerun the same unchanged block: this
+is safe only because every existing version is downloaded and
+provenance-verified against the tag before it is skipped. Any network failure,
+HTTP result other than 200 or 404, or archive mismatch aborts the release. Do
+not edit a manifest, repackage with different metadata, or publish a dependent
+early. After the last crate is visible, leave the detached checkout unchanged.

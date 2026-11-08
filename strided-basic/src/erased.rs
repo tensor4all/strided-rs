@@ -1,0 +1,1980 @@
+use crate::cost::KernelClass;
+use crate::erased_common::*;
+use crate::*;
+use core::mem::MaybeUninit;
+use num_complex::{Complex32, Complex64};
+use num_traits::{One, Zero};
+mod arg_reduce;
+mod line;
+mod norm;
+mod reduce_kernel;
+mod scan;
+
+pub use arg_reduce::{ArgReduceOp, ErasedArgReducePlan};
+pub use norm::{ErasedNormPlan, NormKind, NormSpec};
+pub use scan::{ErasedScanPlan, ScanOp, ScanOptions};
+
+use reduce_kernel::{
+    reduce_axes_range, reduce_full_range, AxesRange, FullTraversal, MaxKernel, MinKernel,
+    ReassociatedProductKernel, ReduceKernel, StableProductKernel, StableProductScalar, SumKernel,
+    SumSquaresKernel,
+};
+
+trait ReduceWriter<T> {
+    fn offset(&self) -> isize;
+    /// # Safety
+    /// The pointer may only be used within the validated destination extent.
+    unsafe fn ptr(&mut self) -> *mut T;
+    fn extent(&self) -> usize;
+    /// # Safety
+    /// The offset must be an in-bounds logical reduction destination offset.
+    unsafe fn write_at(&mut self, offset: isize, value: T) {
+        debug_assert!(offset >= 0 && (offset as usize) < self.extent());
+        // SAFETY: reduction layout validation proves the logical offset.
+        unsafe { self.ptr().offset(offset).write(value) }
+    }
+}
+
+struct RawReduceWriter<'a, T> {
+    ptr: *mut T,
+    extent: usize,
+    offset: isize,
+    _marker: core::marker::PhantomData<&'a mut [MaybeUninit<T>]>,
+}
+
+impl<'a, T> ReduceWriter<T> for RawReduceWriter<'a, T> {
+    fn offset(&self) -> isize {
+        self.offset
+    }
+    unsafe fn ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+    fn extent(&self) -> usize {
+        self.extent
+    }
+}
+
+/// Dtype-erased wrapper around [`CopyPlan`].
+#[derive(Clone, Debug)]
+pub struct ErasedCopyPlan {
+    dtype: KernelDType,
+    plan: CopyPlan,
+}
+
+/// Dtype-erased concatenate wrapper.
+#[derive(Clone, Debug)]
+pub struct ErasedConcatenatePlan {
+    dtype: KernelDType,
+    plan: ConcatenatePlan,
+}
+
+impl ErasedCopyPlan {
+    /// Compile a copy plan for one dtype and layout pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
+    /// `dst_strides`, and `src_strides` do not all have the same length,
+    /// [`StridedError::OffsetOverflow`] when the element count does not fit
+    /// `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent). The dtype
+    /// is only stored here; [`execute`](Self::execute) checks it.
+    pub fn compile(
+        dtype: KernelDType,
+        dims: &[usize],
+        dst_strides: &[isize],
+        src_strides: &[isize],
+    ) -> Result<Self> {
+        Ok(Self {
+            dtype,
+            plan: CopyPlan::compile(dims, dst_strides, src_strides)?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    /// `dest = src` through a non-generic dtype-erased replay boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `src` carries a
+    /// different dtype than the plan, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Nothing is written unless every check
+    /// succeeds.
+    pub fn execute(
+        &self,
+        dest: &mut ErasedRawStridedMut<'_>,
+        src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        self.check_dtype(dest.dtype())?;
+        self.check_dtype(src.dtype())?;
+
+        match self.dtype {
+            KernelDType::F32 => execute_copy::<f32>(&self.plan, dest, src, exec),
+            KernelDType::F64 => execute_copy::<f64>(&self.plan, dest, src, exec),
+            KernelDType::I32 => execute_copy::<i32>(&self.plan, dest, src, exec),
+            KernelDType::I64 => execute_copy::<i64>(&self.plan, dest, src, exec),
+            KernelDType::Bool => execute_copy::<bool>(&self.plan, dest, src, exec),
+            KernelDType::C32 => execute_copy::<Complex32>(&self.plan, dest, src, exec),
+            KernelDType::C64 => execute_copy::<Complex64>(&self.plan, dest, src, exec),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
+    }
+
+    fn check_dtype(&self, actual: KernelDType) -> Result<()> {
+        if actual != self.dtype {
+            return Err(StridedError::DTypeMismatch {
+                expected: self.dtype.label(),
+                actual: actual.label(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ErasedConcatenatePlan {
+    /// Validate and store a concatenate plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedArity`] when no input is given,
+    /// [`StridedError::RankMismatch`] when
+    /// `input_dims` and `input_strides` list different numbers of layouts or
+    /// an input rank differs from the first input's rank,
+    /// [`StridedError::StrideLengthMismatch`] when a stride list does not
+    /// match its dimension list, [`StridedError::InvalidAxis`] when `axis` is
+    /// outside the rank, [`StridedError::ShapeMismatch`] when a
+    /// non-concatenated extent differs or the destination is not the
+    /// concatenation of the inputs,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// maps two logical indices onto one offset, and
+    /// [`StridedError::OffsetOverflow`] when a segment length or base offset
+    /// cannot be represented.
+    pub fn compile(
+        dtype: KernelDType,
+        input_dims: &[&[usize]],
+        input_strides: &[&[isize]],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        axis: usize,
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: ConcatenatePlan::compile(
+                input_dims,
+                input_strides,
+                dest_dims,
+                dest_strides,
+                axis,
+            )?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &ConcatenatePlan {
+        &self.plan
+    }
+
+    /// Execute concatenate into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when the destination or any
+    /// input carries a different dtype than the plan,
+    /// [`StridedError::RankMismatch`] when the number of inputs differs from
+    /// the compiled one, [`StridedError::PlanLayoutMismatch`] when the
+    /// destination or an input does not carry its compiled extents and
+    /// strides, and [`StridedError::OffsetOverflow`] when a segment's
+    /// destination offset cannot be expressed in `isize`. Every check runs
+    /// before the first segment is written.
+    pub fn execute(
+        &self,
+        dest: &mut ErasedRawStridedMut<'_>,
+        inputs: &[ErasedRawStridedRef<'_>],
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        for input in inputs {
+            check_dtype(self.dtype, input.dtype())?;
+        }
+
+        match self.dtype {
+            KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs, exec),
+            KernelDType::F64 => execute_concatenate::<f64>(&self.plan, dest, inputs, exec),
+            KernelDType::I32 => execute_concatenate::<i32>(&self.plan, dest, inputs, exec),
+            KernelDType::I64 => execute_concatenate::<i64>(&self.plan, dest, inputs, exec),
+            KernelDType::Bool => execute_concatenate::<bool>(&self.plan, dest, inputs, exec),
+            KernelDType::C32 => execute_concatenate::<Complex32>(&self.plan, dest, inputs, exec),
+            KernelDType::C64 => execute_concatenate::<Complex64>(&self.plan, dest, inputs, exec),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
+    }
+
+    /// Execute concatenate as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when the destination or any
+    /// input carries a different dtype than the plan,
+    /// [`StridedError::RankMismatch`] when the number of inputs differs from
+    /// the compiled one, [`StridedError::OverlappingInputOutput`] when an
+    /// input allocation overlaps the destination,
+    /// [`StridedError::InvalidBoolByte`] when `bool` input bytes are not 0 or
+    /// 1, [`StridedError::PlanLayoutMismatch`] when the destination or an
+    /// input does not carry its compiled extents and strides, and
+    /// [`StridedError::OffsetOverflow`] when a segment's destination offset
+    /// cannot be expressed in `isize`. Everything above is returned before any
+    /// destination write.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        inputs: &[ErasedRawStridedPtr<'_>],
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        if inputs.len() != self.plan.input_count() {
+            return Err(StridedError::RankMismatch(
+                inputs.len(),
+                self.plan.input_count(),
+            ));
+        }
+        for input in inputs {
+            check_dtype(self.dtype, input.dtype())?;
+        }
+        for (position, input) in inputs.iter().enumerate() {
+            validate_uninit_no_overlap(dest, input, position)?;
+        }
+        for input in inputs {
+            // SAFETY: input/output overlap was rejected before forming references.
+            unsafe { input.try_as_ref_after_no_overlap() }?;
+        }
+
+        match self.dtype {
+            KernelDType::F32 => execute_concatenate_uninit::<f32>(&self.plan, dest, inputs, exec),
+            KernelDType::F64 => execute_concatenate_uninit::<f64>(&self.plan, dest, inputs, exec),
+            KernelDType::I32 => execute_concatenate_uninit::<i32>(&self.plan, dest, inputs, exec),
+            KernelDType::I64 => execute_concatenate_uninit::<i64>(&self.plan, dest, inputs, exec),
+            KernelDType::Bool => execute_concatenate_uninit::<bool>(&self.plan, dest, inputs, exec),
+            KernelDType::C32 => {
+                execute_concatenate_uninit::<Complex32>(&self.plan, dest, inputs, exec)
+            }
+            KernelDType::C64 => {
+                execute_concatenate_uninit::<Complex64>(&self.plan, dest, inputs, exec)
+            }
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
+    }
+}
+
+/// Runtime reduction operation for dtype-erased full reductions.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReduceOp {
+    Sum,
+    Product,
+    /// Reassociated, overflow/underflow-safe product.
+    ///
+    /// Tracks a signed mantissa and an exact integer exponent per lane, so
+    /// factors outside the dtype range do not overflow or underflow a partial.
+    /// The reduction is reassociated and threaded like [`Self::Sum`].
+    ///
+    /// A zero, subnormal, infinite or NaN input cannot be represented by the
+    /// exponent-tracked accumulator; the affected output is then recomputed in
+    /// source order, keeping IEEE propagation (`0 * inf = NaN`, a zero or an
+    /// infinity result) identical to the sequential fold. For integers this is
+    /// the reassociated wrapping product and for complex dtypes the
+    /// source-order product.
+    StableProduct,
+    /// Sum of same-dtype rounded squares.
+    ///
+    /// Each input is first multiplied by itself without FMA contraction, then
+    /// accumulated under the same association policy as [`Self::Sum`].
+    SumSquares,
+    /// NaN-propagating maximum for `f32`/`f64`, ordered maximum for
+    /// `i32`/`i64`.
+    ///
+    /// Any NaN operand makes the result the canonical NaN of the dtype. The
+    /// identity written for an empty reduction is `-inf` for floats and the
+    /// dtype minimum for integers. Complex and `bool` dtypes are rejected.
+    /// When the reduced values contain both `-0.0` and `+0.0`, which zero is
+    /// returned is unspecified.
+    Max,
+    /// NaN-propagating minimum for `f32`/`f64`, ordered minimum for
+    /// `i32`/`i64`.
+    ///
+    /// Any NaN operand makes the result the canonical NaN of the dtype. The
+    /// identity written for an empty reduction is `+inf` for floats and the
+    /// dtype maximum for integers. Complex and `bool` dtypes are rejected.
+    /// When the reduced values contain both `-0.0` and `+0.0`, which zero is
+    /// returned is unspecified.
+    Min,
+}
+
+/// Dtype-erased reduction wrapper.
+///
+/// This is the erased replay boundary for full-tensor scalar reductions and
+/// axis reductions with a fixed output layout. It supports only operations with
+/// an unambiguous identity value in the selected dtype.
+///
+/// # Evaluation order
+///
+/// The op is matched once per execution; every loop runs a kernel
+/// specialized for one `(dtype, op)` pair. Integer results are exact
+/// (wrapping) and [`ReduceOp::Max`] / [`ReduceOp::Min`] do not depend on
+/// order, so the rules below only affect the rounding of floating point and
+/// complex [`ReduceOp::Sum`], [`ReduceOp::Product`], [`ReduceOp::StableProduct`]
+/// and [`ReduceOp::SumSquares`]. Two details of float max and min follow the
+/// visit order: a NaN input makes the result NaN, but which NaN (payload and
+/// sign) is returned is unspecified, and when the extremum is a zero its sign
+/// is unspecified if both `+0.0` and `-0.0` occur.
+///
+/// [`ReduceOp::Product`] is the reassociated product, matching PyTorch: it
+/// splits each run into lanes, uses the SIMD product where available, threads a
+/// full reduction, and combines the partials in a fixed tree. It is fast and
+/// never recomputes an output, but reassociating can overflow a lane to `inf`
+/// and underflow another to `0`, whose `inf * 0` combine is `NaN`; an
+/// alternating `2.0`/`0.5` input at `2^600`/`2^-600` scale can therefore give
+/// `NaN` where the source-order product is representable (tenferro-rs#2150).
+///
+/// [`ReduceOp::StableProduct`] avoids that. For `f32`/`f64` it tracks a signed
+/// mantissa and an exact integer exponent per lane and across runs and workers,
+/// so a partial cannot overflow or underflow; the final value is scaled with a
+/// correctly rounded `ldexp`. An input that is zero, subnormal, infinite or NaN
+/// cannot be represented this way, so an output that saw one is recomputed in
+/// source order, preserving IEEE propagation. It is reassociated and threaded
+/// like [`ReduceOp::Product`] otherwise. For integers it is the reassociated
+/// wrapping product and for complex dtypes the source-order product.
+///
+/// * Full reductions (from [`Self::compile`], or [`Self::compile_axes`]
+///   with every axis reduced) visit the source in a layout derived order:
+///   extent one axes are dropped, the rest are ordered by increasing
+///   absolute stride and contiguous axes are fused into runs. Each run is
+///   reduced by the SIMD kernel (unit stride, `simd` feature), a sixteen
+///   lane kernel (other unit stride runs) or an eight lane kernel (strided
+///   runs), and runs are combined left to right. A dense column major
+///   source therefore reduces exactly like one contiguous slice.
+/// * With a budget above one and a region whose serial time (the `Reduce`
+///   class of `execution::KernelClass`) repays the sections of a tree split, a
+///   full reduction splits the traversal into one deterministic range per
+///   task. Each range runs the same run kernel as the serial path and
+///   the partials are combined in a fixed tree. The result is bitwise
+///   repeatable for a fixed layout and budget, but may differ between
+///   budgets and from the serial result.
+/// * Axis reductions with kept axes compute every output independently, so
+///   the result never depends on the token or its budget. Each output
+///   folds its reduced elements sequentially in caller reduced axis order,
+///   except that a unit stride leading reduced run (after fusing adjacent
+///   reduced axes) of length at least 16 is reduced by the contiguous run
+///   kernel, with runs folded in order. When instead the leading kept axis
+///   has unit stride, adjacent outputs are accumulated as a block from one
+///   contiguous source run per reduced element; each output still folds in
+///   caller reduced axis order.
+#[derive(Clone, Debug)]
+pub struct ErasedReducePlan {
+    dtype: KernelDType,
+    op: ReduceOp,
+    layout: ReduceLayout,
+}
+
+#[derive(Clone, Debug)]
+enum ReduceLayout {
+    Full {
+        dims: crate::inline::InlineVec<usize>,
+        src_strides: crate::inline::InlineVec<isize>,
+        traversal: FullTraversal,
+    },
+    Axes {
+        src_dims: crate::inline::InlineVec<usize>,
+        src_strides: crate::inline::InlineVec<isize>,
+        dest_dims: crate::inline::InlineVec<usize>,
+        dest_strides: crate::inline::InlineVec<isize>,
+        outer_axes: crate::inline::InlineVec<ReduceOuterAxis>,
+        inner_axes: crate::inline::InlineVec<ReduceInnerAxis>,
+        dest_total: usize,
+        reduce_total: usize,
+        /// Set when every source axis is reduced; the plan then runs the
+        /// full-reduction traversal.
+        full: Option<FullTraversal>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReduceOuterAxis {
+    extent: usize,
+    source_step: isize,
+    source_reset: isize,
+    dest_step: isize,
+    dest_reset: isize,
+}
+#[derive(Clone, Copy, Debug, Default)]
+struct ReduceInnerAxis {
+    extent: usize,
+    source_step: isize,
+    source_reset: isize,
+}
+impl ReduceLayout {
+    fn src_dims(&self) -> &[usize] {
+        match self {
+            Self::Full { dims, .. } => dims,
+            Self::Axes { src_dims, .. } => src_dims,
+        }
+    }
+
+    fn src_strides(&self) -> &[isize] {
+        match self {
+            Self::Full { src_strides, .. } | Self::Axes { src_strides, .. } => src_strides,
+        }
+    }
+
+    fn check_src_layout(&self, src: &ErasedRawStridedRef<'_>) -> Result<()> {
+        if src.dims() != self.src_dims() || src.strides() != self.src_strides() {
+            return Err(StridedError::PlanLayoutMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AxesLayout<'a> {
+    outer_axes: &'a [ReduceOuterAxis],
+    inner_axes: &'a [ReduceInnerAxis],
+    dest_total: usize,
+    reduce_total: usize,
+}
+
+impl ErasedReducePlan {
+    /// Validate and store a full-reduction plan for one dtype and source layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `op` has no identity
+    /// in `dtype`: [`ReduceOp::SumSquares`] outside `f32`/`f64`,
+    /// [`ReduceOp::Max`] or [`ReduceOp::Min`] for a complex or `bool` dtype,
+    /// and every op for `bool`. Returns
+    /// [`StridedError::StrideLengthMismatch`] when `dims` and `src_strides`
+    /// have different lengths, and [`StridedError::OffsetOverflow`] when the
+    /// element count overflows `usize` or the fused traversal arithmetic
+    /// (extents, steps, and negated resets) does not fit `isize`.
+    pub fn compile(
+        dtype: KernelDType,
+        op: ReduceOp,
+        dims: &[usize],
+        src_strides: &[isize],
+    ) -> Result<Self> {
+        check_reduce_op_dtype(dtype, op)?;
+        if dims.len() != src_strides.len() {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        checked_total_len(dims)?;
+        let traversal = FullTraversal::compile(dims, src_strides)?;
+        Ok(Self {
+            dtype,
+            op,
+            layout: ReduceLayout::Full {
+                dims: dims.into(),
+                src_strides: src_strides.into(),
+                traversal,
+            },
+        })
+    }
+
+    /// Validate and store an axis-reduction plan for one dtype and fixed source/output layouts.
+    ///
+    /// `axes` names the source axes reduced away. Output dimensions must be the
+    /// remaining source dimensions in source-axis order. When all axes are
+    /// reduced, any output layout with exactly one reachable element is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `op` has no identity
+    /// in `dtype` (see [`Self::compile`]),
+    /// [`StridedError::StrideLengthMismatch`] when a stride list does not
+    /// match its dimension list, [`StridedError::OffsetOverflow`] when an
+    /// element count, a layout span, a reset or a fused extent does not fit
+    /// `usize`/`isize`, [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent),
+    /// [`StridedError::InvalidAxis`] when `axes` repeats an axis or names one
+    /// outside the source rank, and [`StridedError::ShapeMismatch`] when
+    /// `dest_dims` is not the kept source extents in source-axis order (or,
+    /// when every axis is reduced, does not hold exactly one element).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_axes(
+        dtype: KernelDType,
+        op: ReduceOp,
+        src_dims: &[usize],
+        src_strides: &[isize],
+        dest_dims: &[usize],
+        dest_strides: &[isize],
+        axes: &[usize],
+    ) -> Result<Self> {
+        check_reduce_op_dtype(dtype, op)?;
+        if src_dims.len() != src_strides.len() || dest_dims.len() != dest_strides.len() {
+            return Err(StridedError::StrideLengthMismatch);
+        }
+        checked_total_len(src_dims)?;
+        check_reduce_layout_offset_arithmetic(src_dims, src_strides)?;
+        let dest_total = checked_total_len(dest_dims)?;
+        check_reduce_layout_offset_arithmetic(dest_dims, dest_strides)?;
+        if !crate::layout_check::is_injective_layout(dest_dims, dest_strides) {
+            return Err(StridedError::NonInjectiveOutputLayout);
+        }
+        validate_unique_axes(axes, src_dims.len())?;
+
+        let kept_axes: crate::inline::InlineVec<usize> = (0..src_dims.len())
+            .filter(|axis| !axes.contains(axis))
+            .collect();
+        let expected_dest_dims: crate::inline::InlineVec<usize> =
+            kept_axes.iter().map(|&axis| src_dims[axis]).collect();
+        if expected_dest_dims.is_empty() {
+            if dest_total != 1 {
+                return Err(StridedError::ShapeMismatch(
+                    dest_dims.to_vec(),
+                    expected_dest_dims.to_vec(),
+                ));
+            }
+        } else if dest_dims != expected_dest_dims.as_slice() {
+            return Err(StridedError::ShapeMismatch(
+                dest_dims.to_vec(),
+                expected_dest_dims.to_vec(),
+            ));
+        }
+
+        let reduce_total = axes
+            .iter()
+            .try_fold(1usize, |total, &axis| total.checked_mul(src_dims[axis]))
+            .ok_or(StridedError::OffsetOverflow)?;
+        let outer_axes = compress_reduce_outer_axes(
+            kept_axes
+                .iter()
+                .enumerate()
+                .map(|(dest_axis, &src_axis)| {
+                    let extent = src_dims[src_axis];
+                    Ok(ReduceOuterAxis {
+                        extent,
+                        source_step: src_strides[src_axis],
+                        source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                        dest_step: dest_strides[dest_axis],
+                        dest_reset: checked_reduce_reset(extent, dest_strides[dest_axis])?,
+                    })
+                })
+                .collect::<Result<crate::inline::InlineVec<_>>>()?,
+        )?;
+        let inner_axes = compress_reduce_inner_axes(
+            axes.iter()
+                .map(|&src_axis| {
+                    let extent = src_dims[src_axis];
+                    Ok(ReduceInnerAxis {
+                        extent,
+                        source_step: src_strides[src_axis],
+                        source_reset: checked_reduce_reset(extent, src_strides[src_axis])?,
+                    })
+                })
+                .collect::<Result<crate::inline::InlineVec<_>>>()?,
+        )?;
+        let full = if kept_axes.is_empty() {
+            Some(FullTraversal::compile(src_dims, src_strides)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            dtype,
+            op,
+            layout: ReduceLayout::Axes {
+                src_dims: src_dims.into(),
+                src_strides: src_strides.into(),
+                dest_dims: dest_dims.into(),
+                dest_strides: dest_strides.into(),
+                outer_axes,
+                inner_axes,
+                dest_total,
+                reduce_total,
+                full,
+            },
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    #[inline]
+    pub fn op(&self) -> ReduceOp {
+        self.op
+    }
+
+    /// Execute the reduction into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `src` carries a
+    /// different dtype than the plan,
+    /// [`StridedError::PlanLayoutMismatch`] when the source layout or the
+    /// axis-reduction destination layout does not match the compiled one,
+    /// [`StridedError::RankMismatch`] when a full reduction gets a
+    /// destination that does not hold exactly one element,
+    /// [`StridedError::OffsetOverflow`] when that destination's extents
+    /// multiply beyond `usize`. All are returned before the first destination
+    /// write.
+    pub fn execute(
+        &self,
+        dest: &mut ErasedRawStridedMut<'_>,
+        src: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        self.layout.check_src_layout(src)?;
+        match &self.layout {
+            ReduceLayout::Full { .. } => {
+                let dest_len = checked_total_len(dest.dims())?;
+                if dest_len != 1 {
+                    return Err(StridedError::RankMismatch(dest_len, 1));
+                }
+            }
+            ReduceLayout::Axes {
+                dest_dims,
+                dest_strides,
+                ..
+            } => {
+                if dest.dims() != dest_dims.as_slice() || dest.strides() != dest_strides.as_slice()
+                {
+                    return Err(StridedError::PlanLayoutMismatch);
+                }
+            }
+        }
+
+        let result = match self.dtype {
+            KernelDType::F32 => {
+                let mut writer = reduce_writer::<f32>(dest)?;
+                dispatch_reduce::<f32, _>(self.op, &self.layout, &mut writer, src, exec)
+            }
+            KernelDType::F64 => {
+                let mut writer = reduce_writer::<f64>(dest)?;
+                dispatch_reduce::<f64, _>(self.op, &self.layout, &mut writer, src, exec)
+            }
+            KernelDType::I32 => {
+                let mut writer = reduce_writer::<i32>(dest)?;
+                dispatch_reduce::<i32, _>(self.op, &self.layout, &mut writer, src, exec)
+            }
+            KernelDType::I64 => {
+                let mut writer = reduce_writer::<i64>(dest)?;
+                dispatch_reduce::<i64, _>(self.op, &self.layout, &mut writer, src, exec)
+            }
+            KernelDType::C32 => {
+                let mut writer = reduce_writer::<Complex32>(dest)?;
+                dispatch_reduce::<Complex32, _>(self.op, &self.layout, &mut writer, src, exec)
+            }
+            KernelDType::C64 => {
+                let mut writer = reduce_writer::<Complex64>(dest)?;
+                dispatch_reduce::<Complex64, _>(self.op, &self.layout, &mut writer, src, exec)
+            }
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        };
+        result
+    }
+
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `src` carries a
+    /// different dtype than the plan,
+    /// [`StridedError::OverlappingInputOutput`] when the source allocation
+    /// overlaps the destination, [`StridedError::PlanLayoutMismatch`],
+    /// [`StridedError::RankMismatch`], and [`StridedError::OffsetOverflow`]
+    /// exactly as [`Self::execute`] does. All are returned before the first
+    /// destination write.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        src: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        validate_uninit_no_overlap(dest, src, 0)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let src = unsafe { src.try_as_ref_after_no_overlap() }?;
+        self.layout.check_src_layout(&src)?;
+        match &self.layout {
+            ReduceLayout::Full { .. } => {
+                let total = checked_total_len(dest.dims())?;
+                if total != 1 {
+                    return Err(StridedError::RankMismatch(total, 1));
+                }
+            }
+            ReduceLayout::Axes {
+                dest_dims,
+                dest_strides,
+                ..
+            } => {
+                if dest.dims() != dest_dims.as_slice() || dest.strides() != dest_strides.as_slice()
+                {
+                    return Err(StridedError::PlanLayoutMismatch);
+                }
+            }
+        }
+        macro_rules! run {
+            ($ty:ty) => {{
+                let mut writer = reduce_uninit_writer::<$ty>(dest)?;
+                dispatch_reduce::<$ty, _>(self.op, &self.layout, &mut writer, &src, exec)
+            }};
+        }
+        match self.dtype {
+            KernelDType::F32 => run!(f32),
+            KernelDType::F64 => run!(f64),
+            KernelDType::I32 => run!(i32),
+            KernelDType::I64 => run!(i64),
+            KernelDType::C32 => run!(Complex32),
+            KernelDType::C64 => run!(Complex64),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
+    }
+}
+
+fn reduce_writer<'a, T>(dest: &'a mut ErasedRawStridedMut<'_>) -> Result<RawReduceWriter<'a, T>>
+where
+    T: KernelStorageElement,
+{
+    let offset = dest.offset();
+    let data = dest.data_as_mut::<T>()?;
+    let ptr = data.as_mut_ptr();
+    let extent = data.len();
+    Ok(RawReduceWriter {
+        ptr,
+        extent,
+        offset,
+        _marker: core::marker::PhantomData,
+    })
+}
+
+fn reduce_uninit_writer<'a, T>(
+    dest: &'a mut ErasedRawStridedUninitMut<'_>,
+) -> Result<RawReduceWriter<'a, T>>
+where
+    T: KernelStorageElement,
+{
+    let offset = dest.offset();
+    let data = dest.data_as_uninit_mut::<T>()?;
+    let ptr = data.as_mut_ptr().cast::<T>();
+    let extent = data.len();
+    Ok(RawReduceWriter {
+        ptr,
+        extent,
+        offset,
+        _marker: core::marker::PhantomData,
+    })
+}
+
+fn check_reduce_dtype(dtype: KernelDType) -> Result<()> {
+    match dtype {
+        KernelDType::F32
+        | KernelDType::F64
+        | KernelDType::I32
+        | KernelDType::I64
+        | KernelDType::C32
+        | KernelDType::C64 => Ok(()),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
+}
+
+fn check_reduce_op_dtype(dtype: KernelDType, op: ReduceOp) -> Result<()> {
+    if op == ReduceOp::SumSquares && !matches!(dtype, KernelDType::F32 | KernelDType::F64) {
+        return Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        });
+    }
+    if matches!(op, ReduceOp::Max | ReduceOp::Min)
+        && !matches!(
+            dtype,
+            KernelDType::F32 | KernelDType::F64 | KernelDType::I32 | KernelDType::I64
+        )
+    {
+        return Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        });
+    }
+    check_reduce_dtype(dtype)
+}
+
+fn checked_total_len(dims: &[usize]) -> Result<usize> {
+    if dims.is_empty() {
+        return Ok(1);
+    }
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)
+}
+
+fn execute_copy<T>(
+    plan: &CopyPlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    src: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let source_data = src.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let source = unsafe {
+        RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+    };
+    let mut dest =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest, &source, exec)
+}
+
+fn execute_concatenate<T>(
+    plan: &ConcatenatePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    inputs: &[ErasedRawStridedRef<'_>],
+    mut exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    if inputs.len() != plan.input_count() {
+        return Err(StridedError::RankMismatch(inputs.len(), plan.input_count()));
+    }
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.check_dest_layout(&dest_ref)?;
+
+    for (position, input) in inputs.iter().enumerate() {
+        let input_data = input.data_as::<T>()?;
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.check_input_layout(position, &input_ref)?;
+        plan.segment_offset(position, dest_offset)?;
+    }
+    if plan.prefers_whole_plan(&exec)
+        && !inputs.is_empty()
+        && inputs.len() <= crate::inline::OPERAND_CAP
+    {
+        // Build the typed descriptors on the stack: `RawStridedRef` is `Copy`,
+        // so this stays allocation-free within the operand bound. The
+        // whole-plan entry then splits the concatenated space and the typed
+        // `try_execute_parallel` reads each segment straight from the plan.
+        let first_data = inputs[0].data_as::<T>()?;
+        let first = unsafe {
+            RawStridedRef::new_unchecked(
+                first_data,
+                inputs[0].dims(),
+                inputs[0].strides(),
+                inputs[0].offset(),
+            )
+        };
+        let mut input_refs = [first; crate::inline::OPERAND_CAP];
+        for (slot, input) in input_refs.iter_mut().zip(inputs) {
+            let input_data = input.data_as::<T>()?;
+            *slot = unsafe {
+                RawStridedRef::new_unchecked(
+                    input_data,
+                    input.dims(),
+                    input.strides(),
+                    input.offset(),
+                )
+            };
+        }
+        return plan.execute(&mut dest_ref, &input_refs[..inputs.len()], exec);
+    }
+    for (position, input) in inputs.iter().enumerate() {
+        let input_data = input.data_as::<T>()?;
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.execute_segment(position, &mut dest_ref, &input_ref, exec.reborrow())?;
+    }
+    Ok(())
+}
+
+fn execute_concatenate_uninit<T>(
+    plan: &ConcatenatePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    inputs: &[ErasedRawStridedPtr<'_>],
+    mut exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.check_dest_layout(&dest_ref)?;
+
+    for (position, input) in inputs.iter().enumerate() {
+        // SAFETY: input/output overlap was rejected before forming references.
+        let input = unsafe { input.try_as_ref_after_no_overlap() }?;
+        let input_data = input.data_as::<T>()?;
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.check_input_layout(position, &input_ref)?;
+        plan.segment_offset(position, dest_offset)?;
+    }
+    if plan.prefers_whole_plan(&exec)
+        && !inputs.is_empty()
+        && inputs.len() <= crate::inline::OPERAND_CAP
+    {
+        // SAFETY: input/output overlap was rejected before forming references.
+        let first_erased = unsafe { inputs[0].try_as_ref_after_no_overlap() }?;
+        let mut erased_refs = [first_erased; crate::inline::OPERAND_CAP];
+        for (slot, input) in erased_refs.iter_mut().zip(inputs) {
+            // SAFETY: input/output overlap was rejected before forming references.
+            *slot = unsafe { input.try_as_ref_after_no_overlap() }?;
+        }
+        let first_data = erased_refs[0].data_as::<T>()?;
+        let first = unsafe {
+            RawStridedRef::new_unchecked(
+                first_data,
+                erased_refs[0].dims(),
+                erased_refs[0].strides(),
+                erased_refs[0].offset(),
+            )
+        };
+        let mut input_refs = [first; crate::inline::OPERAND_CAP];
+        for (slot, erased) in input_refs.iter_mut().zip(&erased_refs) {
+            let input_data = erased.data_as::<T>()?;
+            *slot = unsafe {
+                RawStridedRef::new_unchecked(
+                    input_data,
+                    erased.dims(),
+                    erased.strides(),
+                    erased.offset(),
+                )
+            };
+        }
+        return plan.execute_uninit(&mut dest_ref, &input_refs[..inputs.len()], exec);
+    }
+    for (position, input) in inputs.iter().enumerate() {
+        // SAFETY: input/output overlap was rejected before forming references.
+        let input = unsafe { input.try_as_ref_after_no_overlap() }?;
+        let input_data = input.data_as::<T>()?;
+        let input_ref = unsafe {
+            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
+        };
+        plan.execute_segment_uninit(position, &mut dest_ref, &input_ref, exec.reborrow())?;
+    }
+    Ok(())
+}
+
+/// Runtime unary operation applied to the source of an [`ErasedUpdatePlan`].
+///
+/// The real dtypes have only [`Self::Identity`]; the complex dtypes also have
+/// [`Self::Conj`], matching the `ElementOp` choices a beta accumulator uses.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateOp {
+    /// `op(x) = x`.
+    Identity,
+    /// `op(x) = conj(x)`.
+    Conj,
+}
+
+/// Dtype-erased wrapper around [`UpdatePlan`].
+///
+/// The layout traversal is compiled once and stored without a scalar type;
+/// each [`execute`](Self::execute) names the concrete scalar type, resolves the
+/// runtime element op once per call, and then replays monomorphized loops.
+#[derive(Clone, Debug)]
+pub struct ErasedUpdatePlan {
+    dtype: KernelDType,
+    plan: UpdatePlan,
+}
+
+impl ErasedUpdatePlan {
+    /// Compile an update plan for one dtype and layout pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when `dims`,
+    /// `dst_strides`, and `src_strides` do not all have the same length,
+    /// [`StridedError::OffsetOverflow`] when the element count does not fit
+    /// `usize`, and [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective (aliasing elements, or a
+    /// span the check cannot represent).
+    pub fn compile(
+        dtype: KernelDType,
+        dims: &[usize],
+        dst_strides: &[isize],
+        src_strides: &[isize],
+    ) -> Result<Self> {
+        check_static_indexing_dtype(dtype)?;
+        Ok(Self {
+            dtype,
+            plan: UpdatePlan::compile(dims, dst_strides, src_strides)?,
+        })
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> KernelDType {
+        self.dtype
+    }
+
+    /// The compiled typed traversal.
+    #[inline]
+    pub fn plan(&self) -> &UpdatePlan {
+        &self.plan
+    }
+
+    /// `dest = alpha * op(src) + beta * dest` into an erased destination.
+    ///
+    /// `alpha`, `beta`, and `op` are resolved once per call; the layout check
+    /// and replay are the same allocation-free [`UpdatePlan`] path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `src`, or the
+    /// scalar type `T` carries a different dtype than the plan, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Both are returned before any destination
+    /// write.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_basic::{
+    ///     ErasedRawStridedMut, ErasedRawStridedRef, ErasedUpdatePlan, Exec, KernelDType,
+    ///     UpdateOp,
+    /// };
+    ///
+    /// let plan = ErasedUpdatePlan::compile(KernelDType::F64, &[2], &[1], &[1]).unwrap();
+    /// let src_data = [1.0_f64, 2.0];
+    /// let mut dst_data = [10.0_f64, 20.0];
+    /// let src = ErasedRawStridedRef::from_slice(&src_data, &[2], &[1], 0).unwrap();
+    /// let mut dst = ErasedRawStridedMut::from_slice_mut(&mut dst_data, &[2], &[1], 0).unwrap();
+    /// // dst = 2 * src + 3 * dst
+    /// plan.execute(&mut dst, &src, 2.0, 3.0, UpdateOp::Identity, Exec::serial())
+    ///     .unwrap();
+    /// drop(dst);
+    /// assert_eq!(dst_data, [32.0, 64.0]);
+    /// ```
+    pub fn execute<T>(
+        &self,
+        dest: &mut ErasedRawStridedMut<'_>,
+        src: &ErasedRawStridedRef<'_>,
+        alpha: T,
+        beta: T,
+        op: UpdateOp,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        T: Copy
+            + Send
+            + Sync
+            + KernelStorageElement
+            + core::ops::Add<Output = T>
+            + core::ops::Mul<Output = T>
+            + Zero
+            + One
+            + PartialEq
+            + ElementOpApply,
+    {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        let source_data = src.data_as::<T>()?;
+        let dest_dims = dest.dims();
+        let dest_strides = dest.strides();
+        let dest_offset = dest.offset();
+        let dest_data = dest.data_as_mut::<T>()?;
+        let source = unsafe {
+            RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+        };
+        let mut dest_ref = unsafe {
+            RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
+        };
+        match op {
+            UpdateOp::Identity => {
+                self.plan
+                    .execute(&mut dest_ref, &source, alpha, beta, |x| x, exec)
+            }
+            UpdateOp::Conj => {
+                self.plan
+                    .execute(&mut dest_ref, &source, alpha, beta, |x| x.conj(), exec)
+            }
+        }
+    }
+
+    /// `dest = alpha * op(src)` into an uninitialized erased destination.
+    ///
+    /// This is [`execute`](Self::execute) with `beta = 0`: the destination is
+    /// never read, so a NaN-filled or uninitialized output cannot contaminate
+    /// the result. On success every reachable destination element is written;
+    /// validation errors are returned before any write. A panic during
+    /// execution may leave a partially initialized `MaybeUninit` destination,
+    /// which is still safely droppable; no readable value is promised for
+    /// unwritten reachable slots.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::mem::MaybeUninit;
+    /// use strided_basic::{
+    ///     ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedUpdatePlan,
+    ///     Exec, KernelDType, UpdateOp,
+    /// };
+    ///
+    /// let plan = ErasedUpdatePlan::compile(KernelDType::F64, &[2], &[1], &[1]).unwrap();
+    /// let src_data = [1.0_f64, 2.0];
+    /// let mut dst_data = [MaybeUninit::<f64>::uninit(); 2];
+    /// let src = ErasedRawStridedRef::from_slice(&src_data, &[2], &[1], 0).unwrap();
+    /// let src_ptr = ErasedRawStridedPtr::from_ref(&src);
+    /// let mut dst =
+    ///     ErasedRawStridedUninitMut::from_uninit_slice(&mut dst_data, &[2], &[1], 0).unwrap();
+    /// // dst = 2 * src
+    /// plan.execute_uninit(&mut dst, &src_ptr, 2.0, UpdateOp::Identity, Exec::serial())
+    ///     .unwrap();
+    /// let values: Vec<f64> = dst_data.iter().map(|v| unsafe { v.assume_init() }).collect();
+    /// assert_eq!(values, [2.0, 4.0]);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `DTypeMismatch` or `PlanLayoutMismatch` when a descriptor does
+    /// not match the plan, and `OverlappingInputOutput` when the source
+    /// overlaps the destination allocation, all before any destination write.
+    pub fn execute_uninit<T>(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        src: &ErasedRawStridedPtr<'_>,
+        alpha: T,
+        op: UpdateOp,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        T: Copy
+            + Send
+            + Sync
+            + KernelStorageElement
+            + core::ops::Mul<Output = T>
+            + One
+            + PartialEq
+            + ElementOpApply,
+    {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, src.dtype())?;
+        validate_uninit_no_overlap(dest, src, 0)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let src = unsafe { src.try_as_ref_after_no_overlap() }?;
+        let source_data = src.data_as::<T>()?;
+        let dest_dims = dest.dims();
+        let dest_strides = dest.strides();
+        let dest_offset = dest.offset();
+        let dest_data = dest.data_as_uninit_mut::<T>()?;
+        let source = unsafe {
+            RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
+        };
+        let mut dest_ref = unsafe {
+            RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset)
+        };
+        match op {
+            UpdateOp::Identity => {
+                self.plan
+                    .execute_uninit(&mut dest_ref, &source, alpha, |x| x, exec)
+            }
+            UpdateOp::Conj => {
+                self.plan
+                    .execute_uninit(&mut dest_ref, &source, alpha, |x| x.conj(), exec)
+            }
+        }
+    }
+}
+
+fn execute_reduce_full<T, W, K>(
+    dest: &mut W,
+    src: &ErasedRawStridedRef<'_>,
+    traversal: &FullTraversal,
+    exec: Exec<'_>,
+) -> Result<bool>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    let source = src.data_as::<T>()?;
+    let total = traversal.total();
+    if total == 0 {
+        // SAFETY: validated rank-zero destination layout proves the offset.
+        unsafe { dest.write_at(dest.offset(), K::finish(K::identity())) };
+        return Ok(false);
+    }
+    let acc = reduce_full_split::<T, K>(source, src.offset(), traversal, exec)?;
+
+    if K::needs_ordered_fallback(&acc) {
+        // The caller re-runs this layout with `K::Fallback`; the destination is
+        // left untouched so nothing observable is written twice.
+        return Ok(true);
+    }
+    // SAFETY: validated rank-zero destination layout proves the offset.
+    unsafe { dest.write_at(dest.offset(), K::finish(acc)) };
+    Ok(false)
+}
+
+/// Full reduction of `source` over the traversal, split across the budget of
+/// `exec` above the repository threshold.
+///
+/// Splitting reassociates one output element's factors across ranges, so only
+/// a kernel that may be reassociated takes it (tenferro-rs#2150). A stable
+/// accumulator that detects an unrepresentable factor sets the fallback flag,
+/// and the caller then recomputes the whole output in source order.
+fn reduce_full_split<T, K>(
+    source: &[T],
+    source_base: isize,
+    traversal: &FullTraversal,
+    exec: Exec<'_>,
+) -> Result<K::Acc>
+where
+    T: ErasedReduceScalar,
+    K: ReduceKernel<T>,
+{
+    let total = traversal.total();
+    // INVARIANT: (1) FullTraversal::compile checked every step/reset of the
+    // source layout; (2) the raw source descriptor validated every reachable
+    // offset; (3) execute checked exact plan-layout equality.
+    if !K::reassociable() {
+        // SAFETY: the three-link invariant proves every traversal offset is
+        // readable.
+        return unsafe {
+            reduce_full_range::<T, K>(source.as_ptr(), source_base, traversal, 0..total)
+        };
+    }
+    let source_ptr = crate::threading::SendPtr(source.as_ptr() as *mut T);
+    crate::threading::parallel_map_reduce(
+        0..total,
+        crate::cost::for_len_tree(exec, KernelClass::Reduce, total),
+        &|range| {
+            // SAFETY: same three-link invariant as above; each range is
+            // non-empty.
+            unsafe {
+                reduce_full_range::<T, K>(source_ptr.as_const(), source_base, traversal, range)
+            }
+        },
+        &|left, right| Ok(K::combine(left?, right?)),
+    )
+}
+
+fn dispatch_reduce<T, W>(
+    op: ReduceOp,
+    layout: &ReduceLayout,
+    dest: &mut W,
+    src: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+{
+    // The op is matched once per execution; every loop below is generic over
+    // the selected kernel type.
+    match op {
+        ReduceOp::Sum => dispatch_reduce_kernel::<T, W, SumKernel>(layout, dest, src, exec),
+        ReduceOp::Product => {
+            dispatch_reduce_kernel::<T, W, ReassociatedProductKernel>(layout, dest, src, exec)
+        }
+        ReduceOp::StableProduct => {
+            dispatch_reduce_kernel::<T, W, StableProductKernel>(layout, dest, src, exec)
+        }
+        ReduceOp::SumSquares => {
+            dispatch_reduce_kernel::<T, W, SumSquaresKernel>(layout, dest, src, exec)
+        }
+        ReduceOp::Max => dispatch_reduce_kernel::<T, W, MaxKernel>(layout, dest, src, exec),
+        ReduceOp::Min => dispatch_reduce_kernel::<T, W, MinKernel>(layout, dest, src, exec),
+    }
+}
+
+fn dispatch_reduce_kernel<T, W, K>(
+    layout: &ReduceLayout,
+    dest: &mut W,
+    src: &ErasedRawStridedRef<'_>,
+    mut exec: Exec<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    let fallback = match layout {
+        ReduceLayout::Full { traversal, .. } => {
+            execute_reduce_full::<T, W, K>(dest, src, traversal, exec.reborrow())?
+        }
+        ReduceLayout::Axes {
+            outer_axes,
+            inner_axes,
+            dest_total,
+            reduce_total,
+            full,
+            ..
+        } => {
+            let axes = AxesLayout {
+                outer_axes,
+                inner_axes,
+                dest_total: *dest_total,
+                reduce_total: *reduce_total,
+            };
+            match full {
+                Some(traversal) => {
+                    execute_reduce_full::<T, W, K>(dest, src, traversal, exec.reborrow())?
+                }
+                None => {
+                    // An axis reduction falls back per output inside
+                    // `reduce_axes_range`; it never asks for a layout-wide
+                    // recompute.
+                    execute_reduce_axes::<T, W, K>(dest, src, axes, exec.reborrow())?;
+                    false
+                }
+            }
+        }
+    };
+    if fallback {
+        // Only a full reduction (one output) requests the layout-wide
+        // recompute; `K::Fallback` must not itself request a fallback, so this
+        // recurses at most once. Scalar kernels use `Fallback = Self` and never
+        // set the flag, so the branch is unreachable for them.
+        return dispatch_reduce_kernel::<T, W, K::Fallback>(layout, dest, src, exec);
+    }
+    Ok(())
+}
+
+fn execute_reduce_axes<T, W, K>(
+    dest: &mut W,
+    src: &ErasedRawStridedRef<'_>,
+    layout: AxesLayout<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    if layout.dest_total == 0 {
+        return Ok(());
+    }
+
+    if layout.reduce_total == 0 {
+        execute_reduce_axes_identity::<T, W, K>(dest, layout, exec)
+    } else {
+        execute_reduce_axes_split::<T, W, K>(dest, src, layout, exec)
+    }
+}
+
+fn execute_reduce_axes_split<T, W, K>(
+    dest: &mut W,
+    src: &ErasedRawStridedRef<'_>,
+    layout: AxesLayout<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    let source_data = src.data_as::<T>()?;
+    let source_base = src.offset();
+    let dest_base = dest.offset();
+    // SAFETY: the validated reduction writer owns the destination allocation.
+    let dest_ptr = unsafe { dest.ptr() };
+    // The threshold counts source elements read (outputs times reduced
+    // elements), as documented in docs/design/erased-execution-policy.md,
+    // so a few thousand outputs with long reductions still split. Ranges
+    // partition the independent outputs; with the output block kernel this
+    // splits along the contiguous kept axis.
+    let work = layout.dest_total.saturating_mul(layout.reduce_total);
+    let exec = crate::cost::for_len_tree(exec, KernelClass::Reduce, work).limit(
+        core::num::NonZeroUsize::new(layout.dest_total).unwrap_or(core::num::NonZeroUsize::MIN),
+    );
+    if !exec.is_serial() {
+        let dest_ptr = crate::threading::SendPtr(dest_ptr);
+        let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
+        return crate::threading::parallel_map_reduce(
+            0..layout.dest_total,
+            exec,
+            &|range| {
+                let parts = AxesRange {
+                    source: source_ptr.as_const(),
+                    source_base,
+                    dest: dest_ptr.as_ptr(),
+                    dest_base,
+                    outer_axes: layout.outer_axes,
+                    inner_axes: layout.inner_axes,
+                    reduce_total: layout.reduce_total,
+                };
+                // SAFETY: see `execute_reduce_axes_split` serial call.
+                unsafe { reduce_axes_range::<T, K>(parts, range) }
+            },
+            &|left, right| left.and(right),
+        );
+    }
+
+    let parts = AxesRange {
+        source: source_data.as_ptr(),
+        source_base,
+        dest: dest_ptr,
+        dest_base,
+        outer_axes: layout.outer_axes,
+        inner_axes: layout.inner_axes,
+        reduce_total: layout.reduce_total,
+    };
+    // INVARIANT: (1) compile_axes checked signed source/destination spans and
+    // every cursor step/reset; (2) raw input and output descriptors validated
+    // every reachable offset; (3) execute checked exact plan-layout equality
+    // before dispatch. Output ranges are disjoint, and the initialized entry
+    // holds distinct borrows while the uninit entry rejected overlap.
+    // SAFETY: the three-link invariant above; `reduce_total` is nonzero.
+    unsafe { reduce_axes_range::<T, K>(parts, 0..layout.dest_total) }
+}
+
+fn execute_reduce_axes_identity_serial<T, W, K>(dest: &mut W, layout: AxesLayout<'_>) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    let mut outer = ReduceOuterCursor::decode(0, 0, dest.offset(), layout.outer_axes)?;
+    for output in 0..layout.dest_total {
+        // INVARIANT: (1) compile_axes checked the destination span and every
+        // destination step/reset, including -(extent-1)*stride; (2) the raw
+        // destination descriptor validated every reachable offset; (3) execute
+        // checked exact plan-layout equality before dispatch.
+        // SAFETY: the three-link layout invariant proves this destination
+        // cursor offset is in bounds; the source pointer is intentionally never
+        // formed for an empty reduction domain.
+        unsafe { dest.write_at(outer.dest_offset, K::finish(K::identity())) };
+        if output + 1 < layout.dest_total {
+            outer.advance();
+        }
+    }
+    Ok(())
+}
+fn execute_reduce_axes_identity<T, W, K>(
+    dest: &mut W,
+    layout: AxesLayout<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    let exec = crate::cost::for_len_tree(exec, KernelClass::Reduce, layout.dest_total);
+    if !exec.is_serial() {
+        return execute_reduce_axes_identity_parallel::<T, W, K>(dest, layout, exec);
+    }
+    execute_reduce_axes_identity_serial::<T, W, K>(dest, layout)
+}
+
+fn execute_reduce_axes_identity_parallel<T, W, K>(
+    dest: &mut W,
+    layout: AxesLayout<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: ErasedReduceScalar,
+    W: ReduceWriter<T>,
+    K: ReduceKernel<T>,
+{
+    // SAFETY: the validated reduction writer owns the destination allocation.
+    let dest_ptr = crate::threading::SendPtr(unsafe { dest.ptr() });
+    let dest_offset_base = dest.offset();
+    crate::threading::parallel_map_reduce(
+        0..layout.dest_total,
+        exec,
+        &|range| {
+            let range_end = range.end;
+            let mut outer =
+                ReduceOuterCursor::decode(range.start, 0, dest_offset_base, layout.outer_axes)?;
+            let dest_ptr = dest_ptr.as_ptr();
+            for output in range {
+                // INVARIANT: (1) compile_axes checked the destination span and
+                // every destination step/reset, including
+                // -(extent-1)*stride; (2) the raw destination descriptor
+                // validated every reachable pointer offset; (3) execute checked
+                // exact plan-layout equality before dispatch.
+                // SAFETY: the three-link layout invariant proves this
+                // destination offset is in bounds; no source pointer is formed.
+                unsafe {
+                    dest_ptr
+                        .offset(outer.dest_offset)
+                        .write(K::finish(K::identity()))
+                };
+                if output + 1 < range_end {
+                    outer.advance();
+                }
+            }
+            Ok(())
+        },
+        &|left, right| left.and(right),
+    )
+}
+
+trait ErasedReduceScalar:
+    KernelStorageElement
+    + Copy
+    + One
+    + Zero
+    + Send
+    + Sync
+    + crate::simd::MaybeSimdOps
+    + crate::simd::MaybeSimdProduct
+    + crate::simd::MaybeSimdSumSquares
+    + crate::simd::MaybeSimdBlockFold
+    + StableProductScalar
+{
+    fn reduce_sum(lhs: Self, rhs: Self) -> Self;
+    fn reduce_product(lhs: Self, rhs: Self) -> Self;
+    /// Identity of [`ReduceOp::Max`]; unreachable for dtypes the plan rejects.
+    fn max_identity() -> Self;
+    /// Identity of [`ReduceOp::Min`]; unreachable for dtypes the plan rejects.
+    fn min_identity() -> Self;
+    fn reduce_max(lhs: Self, rhs: Self) -> Self;
+    fn reduce_min(lhs: Self, rhs: Self) -> Self;
+}
+
+macro_rules! impl_float_erased_reduce_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ErasedReduceScalar for $ty {
+                #[inline(always)]
+                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
+                    lhs + rhs
+                }
+
+                #[inline(always)]
+                fn reduce_product(lhs: Self, rhs: Self) -> Self {
+                    lhs * rhs
+                }
+
+                #[inline(always)]
+                fn max_identity() -> Self {
+                    <$ty>::NEG_INFINITY
+                }
+
+                #[inline(always)]
+                fn min_identity() -> Self {
+                    <$ty>::INFINITY
+                }
+
+                #[inline(always)]
+                fn reduce_max(lhs: Self, rhs: Self) -> Self {
+                    // Select form: both sides are evaluated and the NaN test
+                    // picks the result, so lane loops lower to compare and
+                    // blend instead of a data dependent branch.
+                    // A NaN `lhs` is kept by the second test and a NaN
+                    // `rhs` fails the comparison, so NaN propagates from
+                    // either side. Equal values (including +0.0 and -0.0)
+                    // return `rhs`.
+                    if (lhs > rhs) | lhs.is_nan() {
+                        lhs
+                    } else {
+                        rhs
+                    }
+                }
+
+                #[inline(always)]
+                fn reduce_min(lhs: Self, rhs: Self) -> Self {
+                    // Select form: both sides are evaluated and the NaN test
+                    // picks the result, so lane loops lower to compare and
+                    // blend instead of a data dependent branch.
+                    // A NaN `lhs` is kept by the second test and a NaN
+                    // `rhs` fails the comparison, so NaN propagates from
+                    // either side. Equal values (including +0.0 and -0.0)
+                    // return `rhs`.
+                    if (lhs < rhs) | lhs.is_nan() {
+                        lhs
+                    } else {
+                        rhs
+                    }
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! impl_complex_erased_reduce_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ErasedReduceScalar for $ty {
+                #[inline(always)]
+                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
+                    lhs + rhs
+                }
+
+                #[inline(always)]
+                fn reduce_product(lhs: Self, rhs: Self) -> Self {
+                    lhs * rhs
+                }
+
+                fn max_identity() -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Max at compile time.
+                    unreachable!("complex max reduction is rejected at plan compile")
+                }
+
+                fn min_identity() -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Min at compile time.
+                    unreachable!("complex min reduction is rejected at plan compile")
+                }
+
+                fn reduce_max(_lhs: Self, _rhs: Self) -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Max at compile time.
+                    unreachable!("complex max reduction is rejected at plan compile")
+                }
+
+                fn reduce_min(_lhs: Self, _rhs: Self) -> Self {
+                    // INVARIANT: check_reduce_op_dtype rejects complex Min at compile time.
+                    unreachable!("complex min reduction is rejected at plan compile")
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! impl_wrapping_erased_reduce_scalar {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ErasedReduceScalar for $ty {
+                #[inline(always)]
+                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
+                    lhs.wrapping_add(rhs)
+                }
+
+                #[inline(always)]
+                fn reduce_product(lhs: Self, rhs: Self) -> Self {
+                    lhs.wrapping_mul(rhs)
+                }
+
+                #[inline(always)]
+                fn max_identity() -> Self {
+                    <$ty>::MIN
+                }
+
+                #[inline(always)]
+                fn min_identity() -> Self {
+                    <$ty>::MAX
+                }
+
+                #[inline(always)]
+                fn reduce_max(lhs: Self, rhs: Self) -> Self {
+                    lhs.max(rhs)
+                }
+
+                #[inline(always)]
+                fn reduce_min(lhs: Self, rhs: Self) -> Self {
+                    lhs.min(rhs)
+                }
+            }
+        )*
+    };
+}
+
+impl_float_erased_reduce_scalar!(f32, f64);
+
+impl_complex_erased_reduce_scalar!(Complex32, Complex64);
+
+impl_wrapping_erased_reduce_scalar!(i32, i64);
+
+fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
+    // Inline for the rank bound (P4); above it the spill may allocate.
+    let mut inline = [false; strided_view::INLINE_RANK];
+    let mut spill: Vec<bool> = Vec::new();
+    let seen: &mut [bool] = if rank <= strided_view::INLINE_RANK {
+        &mut inline[..rank]
+    } else {
+        spill.resize(rank, false);
+        &mut spill
+    };
+    for &axis in axes {
+        if axis >= rank {
+            return Err(StridedError::InvalidAxis { axis, rank });
+        }
+        if seen[axis] {
+            return Err(StridedError::InvalidAxis { axis, rank });
+        }
+        seen[axis] = true;
+    }
+    Ok(())
+}
+
+struct ReduceOuterCursor<'a> {
+    axes: &'a [ReduceOuterAxis],
+    coords: CoordScratch,
+    source_offset: isize,
+    dest_offset: isize,
+}
+impl<'a> ReduceOuterCursor<'a> {
+    fn decode(
+        mut linear: usize,
+        source_base: isize,
+        dest_base: isize,
+        axes: &'a [ReduceOuterAxis],
+    ) -> Result<Self> {
+        let mut coords = CoordScratch::new(axes.len());
+        let mut source_offset = source_base;
+        let mut dest_offset = dest_base;
+        for (coord, axis) in coords.as_mut_slice().iter_mut().zip(axes) {
+            // INVARIANT: a non-empty destination domain implies every outer
+            // extent is nonzero before decode; compile-time span checks make
+            // these one-time checked additions represent valid layout offsets.
+            debug_assert!(axis.extent != 0);
+            *coord = linear % axis.extent;
+            linear /= axis.extent;
+            source_offset = checked_offset_add(source_offset, axis.source_step, *coord)?;
+            dest_offset = checked_offset_add(dest_offset, axis.dest_step, *coord)?;
+        }
+        Ok(Self {
+            axes,
+            coords,
+            source_offset,
+            dest_offset,
+        })
+    }
+
+    /// Coordinate along the first (fastest) compressed outer axis.
+    #[inline]
+    fn leading_coord(&self) -> usize {
+        self.coords.first()
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        // INVARIANT: compile_axes checked every signed step and reset delta;
+        // descriptor validation plus exact layout equality proves each cursor
+        // state is a reachable source/destination offset.
+        for (coord, axis) in self.coords.as_mut_slice().iter_mut().zip(self.axes) {
+            let next = *coord + 1;
+            if next < axis.extent {
+                *coord = next;
+                self.source_offset += axis.source_step;
+                self.dest_offset += axis.dest_step;
+                return;
+            }
+            *coord = 0;
+            self.source_offset += axis.source_reset;
+            self.dest_offset += axis.dest_reset;
+        }
+    }
+}
+struct ReduceInnerCursor<'a> {
+    axes: &'a [ReduceInnerAxis],
+    coords: CoordScratch,
+    source_offset: isize,
+}
+impl<'a> ReduceInnerCursor<'a> {
+    fn new(source_base: isize, axes: &'a [ReduceInnerAxis]) -> Self {
+        Self {
+            axes,
+            coords: CoordScratch::new(axes.len()),
+            source_offset: source_base,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self, source_base: isize) {
+        self.coords.as_mut_slice().fill(0);
+        self.source_offset = source_base;
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        // INVARIANT: compile_axes checked every signed source step and reset
+        // delta, and the validated descriptor/layout chain proves each value
+        // offset is reachable from the current outer source base.
+        for (coord, axis) in self.coords.as_mut_slice().iter_mut().zip(self.axes) {
+            let next = *coord + 1;
+            if next < axis.extent {
+                *coord = next;
+                self.source_offset += axis.source_step;
+                return;
+            }
+            *coord = 0;
+            self.source_offset += axis.source_reset;
+        }
+    }
+}
+fn check_reduce_layout_offset_arithmetic(dims: &[usize], strides: &[isize]) -> Result<()> {
+    if dims.len() != strides.len() {
+        return Err(StridedError::StrideLengthMismatch);
+    }
+    let mut min_offset = 0isize;
+    let mut max_offset = 0isize;
+    for (&dim, &stride) in dims.iter().zip(strides) {
+        let last =
+            isize::try_from(dim.saturating_sub(1)).map_err(|_| StridedError::OffsetOverflow)?;
+        let extent = stride
+            .checked_mul(last)
+            .ok_or(StridedError::OffsetOverflow)?;
+        if extent < 0 {
+            min_offset = min_offset
+                .checked_add(extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+        } else {
+            max_offset = max_offset
+                .checked_add(extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+    }
+    let _ = (min_offset, max_offset);
+    Ok(())
+}
+fn compress_reduce_outer_axes(
+    axes: crate::inline::InlineVec<ReduceOuterAxis>,
+) -> Result<crate::inline::InlineVec<ReduceOuterAxis>> {
+    let mut compressed: crate::inline::InlineVec<ReduceOuterAxis> =
+        crate::inline::InlineVec::with_capacity(axes.len());
+    for axis in axes {
+        if let Some(previous) = compressed.last_mut() {
+            let previous_extent =
+                isize::try_from(previous.extent).map_err(|_| StridedError::OffsetOverflow)?;
+            let expected_source = previous
+                .source_step
+                .checked_mul(previous_extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+            let expected_dest = previous
+                .dest_step
+                .checked_mul(previous_extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+            if axis.source_step == expected_source && axis.dest_step == expected_dest {
+                let fused_extent = previous
+                    .extent
+                    .checked_mul(axis.extent)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                previous.extent = fused_extent;
+                previous.source_reset = checked_reduce_reset(fused_extent, previous.source_step)?;
+                previous.dest_reset = checked_reduce_reset(fused_extent, previous.dest_step)?;
+                continue;
+            }
+        }
+        compressed.push(axis);
+    }
+    Ok(compressed)
+}
+fn compress_reduce_inner_axes(
+    axes: crate::inline::InlineVec<ReduceInnerAxis>,
+) -> Result<crate::inline::InlineVec<ReduceInnerAxis>> {
+    let mut compressed: crate::inline::InlineVec<ReduceInnerAxis> =
+        crate::inline::InlineVec::with_capacity(axes.len());
+    for axis in axes {
+        if let Some(previous) = compressed.last_mut() {
+            let previous_extent =
+                isize::try_from(previous.extent).map_err(|_| StridedError::OffsetOverflow)?;
+            let expected_source = previous
+                .source_step
+                .checked_mul(previous_extent)
+                .ok_or(StridedError::OffsetOverflow)?;
+            if axis.source_step == expected_source {
+                let fused_extent = previous
+                    .extent
+                    .checked_mul(axis.extent)
+                    .ok_or(StridedError::OffsetOverflow)?;
+                previous.extent = fused_extent;
+                previous.source_reset = checked_reduce_reset(fused_extent, previous.source_step)?;
+                continue;
+            }
+        }
+        compressed.push(axis);
+    }
+    Ok(compressed)
+}
+fn checked_reduce_reset(extent: usize, stride: isize) -> Result<isize> {
+    if extent == 0 {
+        return Ok(0);
+    }
+    let last = isize::try_from(extent - 1).map_err(|_| StridedError::OffsetOverflow)?;
+    stride
+        .checked_mul(last)
+        .and_then(isize::checked_neg)
+        .ok_or(StridedError::OffsetOverflow)
+}
+fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
+    let coord = isize::try_from(coord).map_err(|_| StridedError::OffsetOverflow)?;
+    let scaled = stride
+        .checked_mul(coord)
+        .ok_or(StridedError::OffsetOverflow)?;
+    base.checked_add(scaled).ok_or(StridedError::OffsetOverflow)
+}
+
+struct CoordScratch {
+    inline: [usize; RAW_FUSED_RANK_LIMIT],
+    heap: Option<Vec<usize>>,
+    len: usize,
+}
+
+impl CoordScratch {
+    fn new(len: usize) -> Self {
+        if len <= RAW_FUSED_RANK_LIMIT {
+            Self {
+                inline: [0; RAW_FUSED_RANK_LIMIT],
+                heap: None,
+                len,
+            }
+        } else {
+            Self {
+                inline: [0; RAW_FUSED_RANK_LIMIT],
+                heap: Some(vec![0; len]),
+                len,
+            }
+        }
+    }
+
+    #[inline]
+    fn first(&self) -> usize {
+        match &self.heap {
+            Some(heap) => heap.first().copied().unwrap_or(0),
+            None => self.inline[0],
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [usize] {
+        match &mut self.heap {
+            Some(heap) => heap,
+            None => &mut self.inline[..self.len],
+        }
+    }
+}

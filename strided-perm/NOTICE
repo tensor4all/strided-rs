@@ -1,0 +1,11 @@
+strided-perm
+
+This crate derives its tensor permutation algorithm and implementation
+structure from HPTT by Paul Springer, Tong Su, and Paolo Bientinesi:
+https://github.com/springer13/hptt
+
+HPTT's SIMD kernels and autotuning are not ported. The complete applicable
+BSD-3-Clause license text and citation are in `THIRD-PARTY-LICENSES`.
+
+This crate is licensed as `(MIT OR Apache-2.0) AND BSD-3-Clause`; see
+`LICENSE-APACHE`, `LICENSE-MIT`, and `THIRD-PARTY-LICENSES`.

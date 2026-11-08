@@ -1,0 +1,1559 @@
+#!/usr/bin/env python3
+"""Self-contained tests for scripts/repository-rules-review.py.
+
+Run with `python3 scripts/test-repository-rules-review.py`; no pytest needed.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+import re
+import sys
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "scripts" / "repository-rules-review.py"
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("repository_rules_review", MODULE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load {MODULE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_diff(path: str, added: list[str], *, start: int = 1) -> str:
+    return "\n".join(
+        [
+            f"diff --git a/{path} b/{path}",
+            "index abc..def 100644",
+            f"--- a/{path}",
+            f"+++ b/{path}",
+            f"@@ -{start},1 +{start},{len(added) + 1} @@",
+            " unchanged",
+            *(f"+{line}" for line in added),
+        ]
+    )
+
+
+# Secret-shaped fixtures are assembled at runtime so this file contains no
+# contiguous secret-shaped literal of its own. Otherwise the guard under test
+# blocks the LLM pass on every PR that touches its own tests, and the only way
+# to review such a PR is a maintainer waiver. Short names keep the interpolated
+# span below the 12-character threshold the quoted-credential pattern uses.
+PAT = "ghp" + "_" + "abcdefghijklmnopqrstuvwxyz0123"
+PW = "correct " + "horse " + "battery " + "staple"
+# Spelled out, the opener plus the following value line would make this
+# file trip the continuation detector it exercises.
+KEYNAME = "API" + "_KEY"
+AWS = "AKIA" + "ABCDEFGHIJKLMNOP"
+SK = "sk-" + "0123456789abcdef0123456789abcdef"
+VALUE = "abcdefghij" + "klmnopqrst"
+BEARER = "Authorization: Bearer " + VALUE
+MAINTAINED_CRATES = (
+    "strided-traits",
+    "strided-view",
+    "strided-perm",
+    "strided-basic",
+    "strided-fused",
+    "strided-kernel",
+)
+
+
+# --- diff parsing ------------------------------------------------------------
+
+
+def test_added_line_numbers_tracks_context_offsets() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/foo.rs b/foo.rs",
+            "index abc..def 100644",
+            "--- a/foo.rs",
+            "+++ b/foo.rs",
+            "@@ -1,3 +1,4 @@",
+            " unchanged",
+            "+added",
+            " context",
+        ]
+    )
+    lines = mod.added_line_numbers(mod.added_lines_with_text(diff))
+    assert lines["foo.rs"] == {2}
+
+
+def test_added_lines_with_text_matches_line_numbers() -> None:
+    mod = load_module()
+    diff = make_diff("strided-view/src/view.rs", ["let a = 1;", "let b = 2;"])
+    entries = mod.added_lines_with_text(diff)
+    assert entries["strided-view/src/view.rs"] == [(2, "let a = 1;"), (3, "let b = 2;")]
+    numbers = mod.added_line_numbers(entries)
+    assert numbers["strided-view/src/view.rs"] == {2, 3}
+
+
+def test_added_lines_with_text_ignores_deleted_file() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/gone.rs b/gone.rs",
+            "--- a/gone.rs",
+            "+++ /dev/null",
+            "@@ -1,1 +0,0 @@",
+            "-removed",
+        ]
+    )
+    assert mod.added_lines_with_text(diff) == {}
+
+
+# --- model defaults ----------------------------------------------------------
+
+
+def test_default_deepseek_model_uses_current_v4_name() -> None:
+    mod = load_module()
+    assert mod.DEFAULT_MODEL == "deepseek-flash"
+    assert mod.DEFAULT_API_URL == "https://api.deepseek.com/chat/completions"
+
+
+# --- finding filtering -------------------------------------------------------
+
+
+def test_filter_findings_drops_unchanged_files() -> None:
+    mod = load_module()
+    finding = mod.Finding(
+        id="x",
+        severity="block",
+        rule_section="Public Surface Discipline",
+        file="other.rs",
+        line=1,
+        summary="test",
+        detail="detail",
+    )
+    assert mod.filter_findings([finding], ["foo.rs"], {"foo.rs": {1}}) == []
+
+
+def test_filter_findings_keeps_added_line() -> None:
+    mod = load_module()
+    finding = mod.Finding(
+        id="x",
+        severity="block",
+        rule_section="Public Surface Discipline",
+        file="foo.rs",
+        line=2,
+        summary="test",
+        detail="detail",
+    )
+    assert len(mod.filter_findings([finding], ["foo.rs"], {"foo.rs": {2}})) == 1
+
+
+def test_filter_findings_drops_line_finding_without_added_lines() -> None:
+    mod = load_module()
+    finding = mod.Finding(
+        id="x",
+        severity="block",
+        rule_section="Public Surface Discipline",
+        file="deleted.rs",
+        line=4,
+        summary="test",
+        detail="detail",
+    )
+    assert mod.filter_findings([finding], ["deleted.rs"], {}) == []
+
+
+def test_filter_findings_drops_file_level_block_finding() -> None:
+    mod = load_module()
+    block = mod.Finding(
+        id="x",
+        severity="block",
+        rule_section="Public Surface Discipline",
+        file="foo.rs",
+        line=None,
+        summary="test",
+        detail="detail",
+    )
+    warn = mod.Finding(
+        id="w",
+        severity="warn",
+        rule_section="Public Surface Discipline",
+        file="foo.rs",
+        line=None,
+        summary="test",
+        detail="detail",
+    )
+    assert mod.filter_findings([block, warn], ["foo.rs"], {"foo.rs": {1}}) == [warn]
+
+
+def test_filter_findings_drops_global_llm_finding_when_disallowed() -> None:
+    mod = load_module()
+    finding = mod.Finding(
+        id="x",
+        severity="block",
+        rule_section="Public Surface Discipline",
+        file="",
+        line=None,
+        summary="test",
+        detail="detail",
+    )
+    kept = mod.filter_findings(
+        [finding], ["foo.rs"], {"foo.rs": {1}}, allow_global=False
+    )
+    assert kept == []
+
+
+def test_reconcile_verdict_only_blocks_fail() -> None:
+    mod = load_module()
+    warn = mod.Finding("w", "warn", "s", "f", 1, "s", "d")
+    block = mod.Finding("b", "block", "s", "f", 1, "s", "d")
+    assert mod.reconcile_verdict([warn]) == "pass"
+    assert mod.reconcile_verdict([warn, block]) == "fail"
+
+
+def test_merge_findings_prefers_block_over_warn() -> None:
+    mod = load_module()
+    warn = mod.Finding("dup", "warn", "s", "f.rs", 3, "same", "d")
+    block = mod.Finding("dup", "block", "s", "f.rs", 3, "same", "d")
+    merged = mod.merge_findings([warn, block])
+    assert len(merged) == 1
+    assert merged[0].severity == "block"
+
+
+# --- rule section routing ----------------------------------------------------
+
+
+def test_select_rule_sections_always_includes_public_surface_and_boundary() -> None:
+    mod = load_module()
+    sections = mod.select_rule_sections(["Cargo.toml"])
+    assert "Public Surface Discipline" in sections
+    assert "Public Boundary Safety" in sections
+
+
+def test_select_rule_sections_routes_kernel_paths_to_threading() -> None:
+    mod = load_module()
+    sections = mod.select_rule_sections(["strided-kernel/src/threading.rs"])
+    assert "CPU Threading Contract" in sections
+    assert "Unsafe And Fast-Path Boundaries" in sections
+
+
+def test_select_rule_sections_routes_perm_paths() -> None:
+    mod = load_module()
+    sections = mod.select_rule_sections(["strided-perm/src/hptt/execute.rs"])
+    assert "CPU Threading Contract" in sections
+    assert "Layout And Copy Semantics" in sections
+
+
+def test_select_rule_sections_routes_view_paths() -> None:
+    mod = load_module()
+    sections = mod.select_rule_sections(["strided-view/src/view.rs"])
+    assert "Layout And Copy Semantics" in sections
+    assert "Materialization And Copies" in sections
+    assert "Performance And Benchmark Discipline" in sections
+
+
+def test_select_rule_sections_routes_kernel_and_perm_paths_to_performance() -> None:
+    mod = load_module()
+    for path in (
+        "strided-kernel/src/map.rs",
+        "strided-perm/src/hptt/execute.rs",
+    ):
+        assert "Performance And Benchmark Discipline" in mod.select_rule_sections(
+            [path]
+        ), path
+
+
+def test_select_rule_sections_routes_each_index_replay_trigger() -> None:
+    mod = load_module()
+    path = "notes.txt"
+    terms = (
+        "checked_strided_offset",
+        "flat_to_multi_index",
+        "multi_index",
+        "advance_col_major_index",
+        "fill_col_major_index",
+    )
+    for term in terms:
+        sections = mod.select_rule_sections([path], {path: [(1, f"call {term}()")]})
+        assert "Layout And Copy Semantics" in sections, term
+        assert "Performance And Benchmark Discipline" in sections, term
+
+
+def test_select_rule_sections_ignores_generic_decode_and_offset_noise() -> None:
+    mod = load_module()
+    path = "notes.txt"
+    sections = mod.select_rule_sections(
+        [path], {path: [(1, "decode(offset); generic_index += value;")]}
+    )
+    assert sections == ["Public Boundary Safety", "Public Surface Discipline"]
+
+
+def test_select_rule_sections_routes_bench_paths() -> None:
+    mod = load_module()
+    sections = mod.select_rule_sections(["strided-kernel/benches/map.rs"])
+    assert "Performance And Benchmark Discipline" in sections
+
+
+def test_select_rule_sections_does_not_freeze_maintained_crates() -> None:
+    mod = load_module()
+    for crate in MAINTAINED_CRATES:
+        sections = mod.select_rule_sections([f"{crate}/src/lib.rs"])
+        assert "Deprecated Tree Freeze" not in sections, crate
+    assert "Deprecated Tree Freeze" in mod.select_rule_sections(
+        ["deprecated/benches/strided_bench.rs"]
+    )
+
+
+def test_select_rule_sections_excludes_human_only_sections() -> None:
+    mod = load_module()
+    sections = set(mod.select_rule_sections(["strided-kernel/src/threading.rs"]))
+    assert sections.isdisjoint(mod.HUMAN_ONLY_SECTIONS)
+
+
+def test_every_rule_section_is_reachable() -> None:
+    """A new REPOSITORY_RULES section must be routed, always-on, or human-only.
+
+    Without this, adding a section silently makes it invisible to the reviewer.
+    """
+    mod = load_module()
+    documented = set(mod.parse_repository_rules_sections())
+    routed = set(mod.ALWAYS_SECTIONS) | set(mod.HUMAN_ONLY_SECTIONS)
+    for _pattern, names in mod.SECTION_TRIGGERS:
+        routed |= set(names)
+    assert documented <= routed, f"unrouted rule sections: {sorted(documented - routed)}"
+    assert routed <= documented, f"routing names a missing section: {sorted(routed - documented)}"
+
+
+def test_build_rules_payload_returns_requested_section_bodies() -> None:
+    mod = load_module()
+    payload = mod.build_rules_payload(["CPU Threading Contract"])
+    assert payload.startswith("## CPU Threading Contract")
+    assert "Public Surface Discipline" not in payload
+
+
+# --- maintained crates ------------------------------------------------------
+
+
+def test_maintained_crates_are_not_deterministically_frozen() -> None:
+    mod = load_module()
+    for crate in MAINTAINED_CRATES:
+        path = f"{crate}/src/lib.rs"
+        diff = make_diff(path, ["fn maintained() -> usize { 1 }"])
+        assert mod.deterministic_checks(
+            [path], added=mod.added_lines_with_text(diff)
+        ) == [], crate
+
+
+def test_deprecated_tree_freeze_blocks_source_change() -> None:
+    mod = load_module()
+    path = "deprecated/strided/src/lib.rs"
+    diff = make_diff(path, ["fn new_feature() -> usize { 1 }"])
+    findings = mod.deterministic_checks([path], added=mod.added_lines_with_text(diff))
+    assert len(findings) == 1
+    assert findings[0].severity == "block"
+    assert findings[0].id == "deprecated-tree-freeze"
+    assert f"{path}:2" in findings[0].detail
+
+
+def test_deprecated_tree_freeze_allows_deprecation_notices() -> None:
+    mod = load_module()
+    path = "deprecated/strided/src/lib.rs"
+    diff = make_diff(
+        path,
+        [
+            "//! Deprecated: use strided-view instead.",
+            "/// Migration pointer.",
+            '#[deprecated(note = "use strided-view")]',
+            "",
+        ],
+    )
+    assert mod.deterministic_checks(
+        [path], added=mod.added_lines_with_text(diff)
+    ) == []
+
+
+def test_deprecated_tree_freeze_exempts_block_comments_but_not_dereference() -> None:
+    mod = load_module()
+    path = "deprecated/strided/src/uninit.rs"
+    diff = make_diff(
+        path,
+        [
+            "/** Deprecated. */",
+            " * continuation",
+            " */",
+            "*dst = value;",
+        ],
+    )
+    findings = mod.deterministic_checks([path], added=mod.added_lines_with_text(diff))
+    assert len(findings) == 1
+    assert "*dst = value;" in findings[0].detail
+    assert "continuation" not in findings[0].detail
+
+
+def test_deprecated_tree_freeze_allows_readme_and_manifest() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            make_diff("deprecated/strided/README.md", ["> **Deprecated.**"]),
+            make_diff("deprecated/strided/Cargo.toml", ['description = "deprecated"']),
+        ]
+    )
+    assert mod.deterministic_checks(
+        ["deprecated/strided/README.md", "deprecated/strided/Cargo.toml"],
+        added=mod.added_lines_with_text(diff),
+    ) == []
+
+
+# --- model response handling -------------------------------------------------
+
+
+def test_extract_json_payload_strips_fence() -> None:
+    mod = load_module()
+    payload = mod.extract_json_payload('```json\n{"verdict": "pass"}\n```')
+    assert payload == {"verdict": "pass"}
+
+
+def test_extract_json_payload_reports_malformed_embedded_object() -> None:
+    mod = load_module()
+    try:
+        mod.extract_json_payload("noise {not json} tail")
+    except ValueError as err:
+        assert "not valid JSON" in str(err)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_parse_findings_caps_model_output() -> None:
+    mod = load_module()
+    raw = {
+        "verdict": "fail",
+        "findings": [
+            {
+                "id": f"f{index}",
+                "severity": "block",
+                "rule_section": "Public Boundary Safety",
+                "file": "strided-view/src/view.rs",
+                "line": index + 1,
+                "summary": "s",
+                "detail": "d",
+            }
+            for index in range(mod.MAX_FINDINGS_PER_CHUNK + 5)
+        ],
+    }
+    verdict, findings = mod.parse_findings(raw)
+    assert verdict == "fail"
+    assert len(findings) == mod.MAX_FINDINGS_PER_CHUNK
+
+
+def test_parse_findings_normalizes_common_severity_aliases() -> None:
+    mod = load_module()
+    raw = {
+        "verdict": "fail",
+        "findings": [
+            {"id": "a", "severity": "CRITICAL", "file": "f.rs", "line": 1},
+            {"id": "b", "severity": "info", "file": "f.rs", "line": 2},
+            {"id": "c", "severity": "nonsense", "file": "f.rs", "line": 3},
+        ],
+    }
+    _, findings = mod.parse_findings(raw)
+    assert [item.severity for item in findings] == ["block", "warn", "warn"]
+
+
+def test_parse_findings_rejects_non_integer_line() -> None:
+    mod = load_module()
+    raw = {"verdict": "pass", "findings": [{"id": "a", "line": "3"}]}
+    try:
+        mod.parse_findings(raw)
+    except ValueError as err:
+        assert "line must be an integer" in str(err)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_parse_findings_rejects_unknown_verdict() -> None:
+    mod = load_module()
+    try:
+        mod.parse_findings({"verdict": "maybe", "findings": []})
+    except ValueError as err:
+        assert "verdict" in str(err)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_llm_response_error_finding_blocks_with_diagnostic() -> None:
+    mod = load_module()
+    finding = mod.llm_response_error_finding(ValueError("bad json"))
+    assert finding.severity == "block"
+    assert "ValueError: bad json" in finding.detail
+
+
+# --- diff chunking -----------------------------------------------------------
+
+
+def test_split_diff_chunks_respects_limit() -> None:
+    mod = load_module()
+    # Each file stays under the per-file limit, so only the aggregate limit splits.
+    piece = "x" * (mod.MAX_FILE_DIFF_CHARS - 10)
+    per_chunk = mod.MAX_DIFF_CHARS // len(piece)
+    files = {f"f{index}.rs": piece for index in range(per_chunk + 1)}
+    chunks = mod.split_diff_chunks(files)
+    assert len(chunks) == 2
+    assert all(len(chunk) <= mod.MAX_DIFF_CHARS for chunk in chunks)
+
+
+def test_split_large_file_diff_preserves_file_header() -> None:
+    mod = load_module()
+    header = [
+        "diff --git a/big.rs b/big.rs",
+        "--- a/big.rs",
+        "+++ b/big.rs",
+    ]
+    body = "\n".join(
+        f"@@ -{index},1 +{index},1 @@\n+{'y' * 1000}"
+        for index in range(1, 120)
+    )
+    chunks = mod.split_large_file_diff("\n".join([*header, body]))
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.startswith("diff --git a/big.rs b/big.rs")
+        assert len(chunk) <= mod.MAX_FILE_DIFF_CHARS
+
+
+def test_split_large_file_diff_splits_single_overlong_line() -> None:
+    mod = load_module()
+    header = [
+        "diff --git a/big.rs b/big.rs",
+        "--- a/big.rs",
+        "+++ b/big.rs",
+    ]
+    line = "+" + "z" * (mod.MAX_FILE_DIFF_CHARS * 2)
+    chunks = mod.split_large_file_diff("\n".join([*header, "@@ -1,1 +1,1 @@", line]))
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.startswith("diff --git a/big.rs b/big.rs")
+        assert len(chunk) <= mod.MAX_FILE_DIFF_CHARS
+
+
+def test_transport_errors_cover_every_below_json_failure() -> None:
+    """socket.timeout only aliases TimeoutError from Python 3.10 on."""
+    import http.client
+    import socket
+    import urllib.error
+
+    mod = load_module()
+    for exc_type in (
+        socket.timeout,
+        TimeoutError,
+        ConnectionResetError,
+        urllib.error.URLError,
+        http.client.IncompleteRead,
+    ):
+        assert issubclass(exc_type, mod.TRANSPORT_ERRORS), exc_type
+
+
+def test_call_deepseek_retries_transient_network_errors() -> None:
+    import socket
+    import urllib.request
+
+    mod = load_module()
+    calls = {"n": 0}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{\\"verdict\\":\\"pass\\"}"}}]}'
+
+    def fake_urlopen(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise socket.timeout("The read operation timed out")
+        return FakeResponse()
+
+    original_urlopen = urllib.request.urlopen
+    original_sleep = mod.time.sleep
+    urllib.request.urlopen = fake_urlopen
+    mod.time.sleep = lambda _seconds: None
+    try:
+        payload = mod.call_deepseek(
+            api_key="k",
+            model="m",
+            api_url="https://example.invalid",
+            system_prompt="s",
+            user_content="u",
+            timeout=1.0,
+        )
+    finally:
+        urllib.request.urlopen = original_urlopen
+        mod.time.sleep = original_sleep
+
+    assert calls["n"] == 2
+    assert payload == {"verdict": "pass"}
+
+
+def test_call_deepseek_reraises_after_retries_exhausted() -> None:
+    import socket
+    import urllib.request
+
+    mod = load_module()
+
+    def always_timeout(request, timeout=None):
+        raise socket.timeout("nope")
+
+    original_urlopen = urllib.request.urlopen
+    original_sleep = mod.time.sleep
+    urllib.request.urlopen = always_timeout
+    mod.time.sleep = lambda _seconds: None
+    try:
+        mod.call_deepseek(
+            api_key="k",
+            model="m",
+            api_url="https://example.invalid",
+            system_prompt="s",
+            user_content="u",
+            timeout=1.0,
+        )
+    except mod.TRANSPORT_ERRORS:
+        pass
+    else:
+        raise AssertionError("expected the timeout to propagate")
+    finally:
+        urllib.request.urlopen = original_urlopen
+        mod.time.sleep = original_sleep
+
+
+def test_contains_sensitive_text_flags_typed_declaration() -> None:
+    """A type annotation used to hide the literal from the pre-upload guard."""
+    mod = load_module()
+    for line in (
+        f'const API_KEY: &str = "{VALUE}";',
+        f'let api_key: String = "{VALUE}".into();',
+        f'client_secret : &\'static str = "{VALUE}"',
+        f'PASSWORD: str = "{VALUE}"',
+    ):
+        assert mod.contains_sensitive_text(line), line
+
+
+def test_redact_sensitive_text_masks_typed_declaration() -> None:
+    mod = load_module()
+    redacted = mod.redact_sensitive_text(f'const API_KEY: &str = "{VALUE}";')
+    assert VALUE not in redacted
+    assert "[REDACTED_SECRET]" in redacted
+
+
+def test_typed_declaration_guard_keeps_env_lookups_quiet() -> None:
+    mod = load_module()
+    for line in (
+        'let key = std::env::var("DEEPSEEK_API_KEY")?;',
+        "DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}",
+        "api_key: Option<String>,",
+    ):
+        assert not mod.contains_sensitive_text(line), line
+
+
+# --- hunk header renumbering --------------------------------------------------
+
+
+def test_split_oversized_hunk_renumbers_each_chunk() -> None:
+    mod = load_module()
+    header = ["diff --git a/big.rs b/big.rs", "--- a/big.rs", "+++ b/big.rs"]
+    body = [f"+line {index}" + "y" * 900 for index in range(120)]
+    chunks = mod.split_oversized_hunk(header, ["@@ -1,0 +1,120 @@ fn ctx()", *body])
+    assert len(chunks) > 1
+
+    starts = []
+    for chunk in chunks:
+        assert len(chunk) <= mod.MAX_FILE_DIFF_CHARS
+        hunk_line = [line for line in chunk.splitlines() if line.startswith("@@")][0]
+        parsed = mod.HUNK_HEADER.match(hunk_line)
+        assert parsed is not None
+        assert parsed.group(5) == " fn ctx()"
+        starts.append((int(parsed.group(3)), int(parsed.group(4))))
+
+    # Every chunk starts where the previous one ended, and the counts sum to
+    # the original 120 added lines.
+    assert starts[0][0] == 1
+    for (start, count), (next_start, _) in zip(starts, starts[1:]):
+        assert start + count == next_start
+    assert sum(count for _, count in starts) == 120
+
+
+def test_split_oversized_hunk_counts_context_and_removals() -> None:
+    mod = load_module()
+    header = ["diff --git a/a.rs b/a.rs", "--- a/a.rs", "+++ b/a.rs"]
+    hunk = ["@@ -10,3 +20,3 @@", " ctx", "-gone", "+added"]
+    chunks = mod.split_oversized_hunk(header, hunk)
+    assert len(chunks) == 1
+    hunk_line = [line for line in chunks[0].splitlines() if line.startswith("@@")][0]
+    parsed = mod.HUNK_HEADER.match(hunk_line)
+    # context + removal advance old; context + addition advance new.
+    assert (int(parsed.group(1)), int(parsed.group(2))) == (10, 2)
+    assert (int(parsed.group(3)), int(parsed.group(4))) == (20, 2)
+
+
+def test_split_oversized_hunk_falls_back_on_unparseable_header() -> None:
+    mod = load_module()
+    header = ["diff --git a/a.rs b/a.rs", "--- a/a.rs", "+++ b/a.rs"]
+    chunks = mod.split_oversized_hunk(header, ["@@ garbage @@", "+one"])
+    assert len(chunks) == 1
+    assert "@@ garbage @@" in chunks[0]
+
+
+def test_line_deltas_classifies_diff_lines() -> None:
+    mod = load_module()
+    assert mod.line_deltas("+added") == (0, 1)
+    assert mod.line_deltas("-removed") == (1, 0)
+    assert mod.line_deltas(" context") == (1, 1)
+    assert mod.line_deltas("\\ No newline at end of file") == (0, 0)
+
+
+# --- API key validation -------------------------------------------------------
+
+
+def test_api_key_problem_detects_non_ascii_without_echoing_it() -> None:
+    mod = load_module()
+    key = SK[:29] + "\u2026" + "tail"
+    problem = mod.api_key_problem(key)
+    assert problem is not None
+    assert "non-ASCII" in problem
+    assert "29" in problem
+    assert key not in problem
+
+
+def test_api_key_problem_detects_empty_and_whitespace() -> None:
+    mod = load_module()
+    assert "empty" in mod.api_key_problem("")
+    assert "whitespace" in mod.api_key_problem("sk-abc def")
+
+
+def test_api_key_problem_accepts_a_normal_key() -> None:
+    mod = load_module()
+    assert mod.api_key_problem(SK) is None
+
+
+def test_api_key_error_finding_blocks_and_names_the_secret() -> None:
+    mod = load_module()
+    finding = mod.api_key_error_finding("The secret is empty.")
+    assert finding.severity == "block"
+    assert finding.id == "llm-api-key-invalid"
+    assert "DEEPSEEK_API_KEY" in finding.summary
+
+
+def test_run_git_disables_pathname_quoting() -> None:
+    """git C-quotes non-ASCII paths by default, and the quoted form matches none."""
+    mod = load_module()
+    import subprocess
+
+    captured = {}
+    original = subprocess.run
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return original(["true"], capture_output=True, text=True)
+
+    subprocess.run = fake_run
+    try:
+        mod.run_git(["diff", "--name-only"])
+    finally:
+        subprocess.run = original
+    assert captured["args"][:3] == ["git", "-c", "core.quotePath=false"]
+
+
+def test_contains_sensitive_text_flags_passphrase_with_spaces() -> None:
+    mod = load_module()
+    assert mod.contains_sensitive_text(f'password = "{PW}"')
+
+
+def test_redact_sensitive_text_masks_whole_quoted_value() -> None:
+    mod = load_module()
+    redacted = mod.redact_sensitive_text(f'password = "{PW}"')
+    assert "horse" not in redacted and "battery" not in redacted
+    assert redacted == "password = [REDACTED_SECRET]"
+
+
+def test_contains_sensitive_text_flags_unterminated_quote() -> None:
+    mod = load_module()
+    assert mod.contains_sensitive_text('secret = "opens here')
+
+
+def test_metadata_names_are_not_credentials() -> None:
+    """Allowing spaces in values means the name must carry the discrimination."""
+    mod = load_module()
+    assert not mod.is_credential_name("token_type")
+    assert not mod.is_credential_name("secret_name")
+    assert not mod.is_credential_name("private_key_path")
+    assert mod.is_credential_name("api_token")
+    assert mod.is_credential_name("password")
+    assert not mod.contains_sensitive_text(
+        'token_type: "WebGPU event token from another queue"'
+    )
+    assert not mod.redact_sensitive_text(
+        'token_type: "an ordinary description"'
+    ).count("[REDACTED_SECRET]")
+
+
+def test_select_rule_sections_routes_on_changed_content() -> None:
+    mod = load_module()
+    path = "strided-traits/src/lib.rs"
+    assert "Unsafe And Fast-Path Boundaries" not in mod.select_rule_sections([path])
+    added = {path: [(10, "    unsafe { ptr.read() }")]}
+    assert "Unsafe And Fast-Path Boundaries" in mod.select_rule_sections([path], added)
+
+
+def test_content_triggers_name_only_documented_sections() -> None:
+    mod = load_module()
+    documented = set(mod.parse_repository_rules_sections())
+    for _pattern, names in mod.CONTENT_TRIGGERS:
+        assert set(names) <= documented, names
+
+
+def test_content_triggers_never_select_human_only_sections() -> None:
+    mod = load_module()
+    path = "strided-traits/src/lib.rs"
+    added = {path: [(1, "unsafe { }"), (2, "rayon::join(|| (), || ())")]}
+    assert set(mod.select_rule_sections([path], added)).isdisjoint(
+        mod.HUMAN_ONLY_SECTIONS
+    )
+
+
+def test_budget_is_smaller_than_the_workflow_timeout() -> None:
+    """The script must finish before the job is killed, or no report is posted."""
+    mod = load_module()
+    workflow = (mod.ROOT / ".github" / "workflows" / "review_bot.yml").read_text()
+    minutes = [
+        int(line.split(":")[1].strip())
+        for line in workflow.splitlines()
+        if line.strip().startswith("timeout-minutes:")
+    ]
+    assert minutes, "review_bot.yml lost its job timeout"
+    assert mod.DEFAULT_BUDGET_SECONDS < min(minutes) * 60
+
+
+def test_call_deepseek_does_not_retry_past_the_deadline() -> None:
+    import socket
+    import urllib.request
+
+    mod = load_module()
+    calls = {"n": 0}
+
+    def always_timeout(request, timeout=None):
+        calls["n"] += 1
+        raise socket.timeout("nope")
+
+    original_urlopen = urllib.request.urlopen
+    original_sleep = mod.time.sleep
+    urllib.request.urlopen = always_timeout
+    mod.time.sleep = lambda _seconds: None
+    try:
+        mod.call_deepseek(
+            api_key="k",
+            model="m",
+            api_url="https://example.invalid",
+            system_prompt="s",
+            user_content="u",
+            timeout=1.0,
+            deadline=mod.time.monotonic(),
+        )
+    except mod.TRANSPORT_ERRORS:
+        pass
+    else:
+        raise AssertionError("expected the timeout to propagate")
+    finally:
+        urllib.request.urlopen = original_urlopen
+        mod.time.sleep = original_sleep
+    assert calls["n"] == 1
+
+
+def test_budget_exhausted_finding_warns_without_blocking() -> None:
+    mod = load_module()
+    finding = mod.budget_exhausted_finding(2, 5, 30.0)
+    assert finding.severity == "warn"
+    assert "2 of 5" in finding.detail
+    # The configured budget, not the default, or the diagnostic misleads
+    # whoever is trying to work out why the review was incomplete.
+    assert "30s budget" in finding.detail
+    assert "900s" not in finding.detail
+
+
+def test_sensitive_diff_blocks_a_value_on_a_continuation_line() -> None:
+    """The assignment can stay unchanged while only the value line is replaced."""
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/src/x.rs b/src/x.rs",
+            "--- a/src/x.rs",
+            "+++ b/src/x.rs",
+            "@@ -1,2 +1,2 @@",
+            f" const {KEYNAME}: &str =",
+            '-    "old";',
+            f'+    "{PW}";',
+        ]
+    )
+    finding = mod.sensitive_diff_finding(diff)
+    assert finding is not None
+    assert finding.severity == "block"
+
+
+def test_sensitive_diff_ignores_an_ordinary_continuation_value() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/src/x.rs b/src/x.rs",
+            "--- a/src/x.rs",
+            "+++ b/src/x.rs",
+            "@@ -1,2 +1,2 @@",
+            " let message =",
+            '+    "hello world there";',
+        ]
+    )
+    assert mod.sensitive_diff_finding(diff) is None
+
+
+def test_sensitive_diff_ignores_an_unchanged_continuation_value() -> None:
+    """Only added lines may be reported; a context value is pre-existing."""
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/src/x.rs b/src/x.rs",
+            "--- a/src/x.rs",
+            "+++ b/src/x.rs",
+            "@@ -1,3 +1,3 @@",
+            f" const {KEYNAME}: &str =",
+            f'     "{PW}";',
+            "+let unrelated = 1;",
+        ]
+    )
+    assert mod.sensitive_diff_finding(diff) is None
+
+
+def test_redactor_does_not_consume_a_deletion_marker_as_the_value() -> None:
+    mod = load_module()
+    text = 'const API_KEY: &str =\n-    "old";'
+    # The separator must not cross the newline and swallow the `-` marker,
+    # which used to leave the following line's literal untouched.
+    assert mod.redact_sensitive_text(text).splitlines()[1] == '-    "old";'
+
+
+def test_filter_findings_keeps_file_level_block_for_deletions() -> None:
+    """A deletion-only violation has no new-file line the model can anchor to."""
+    mod = load_module()
+    block = mod.Finding("x", "block", "S", "a.rs", None, "removed validation", "d")
+    assert mod.filter_findings([block], ["a.rs"], {}) == []
+    kept = mod.filter_findings([block], ["a.rs"], {}, files_with_deletions={"a.rs"})
+    assert kept == [block]
+
+
+def test_files_with_deleted_lines_reads_the_new_side_path() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/a.rs b/a.rs",
+            "--- a/a.rs",
+            "+++ b/a.rs",
+            "@@ -1,2 +1,1 @@",
+            " keep",
+            "-gone",
+            "diff --git a/b.rs b/b.rs",
+            "--- a/b.rs",
+            "+++ b/b.rs",
+            "@@ -1,1 +1,2 @@",
+            " keep",
+            "+added",
+        ]
+    )
+    assert mod.files_with_deleted_lines(diff) == {"a.rs"}
+
+
+def test_sensitive_diff_blocks_a_bare_continuation_value() -> None:
+    """The continuation value need not be quoted."""
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/src/x.rs b/src/x.rs",
+            "--- a/src/x.rs",
+            "+++ b/src/x.rs",
+            "@@ -1,2 +1,2 @@",
+            f" {KEYNAME} =",
+            "-old",
+            "+abcdefghijklmnopqrstuvwx",
+        ]
+    )
+    assert mod.sensitive_diff_finding(diff) is not None
+
+
+def test_sensitive_diff_ignores_an_ordinary_bare_continuation() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/src/x.rs b/src/x.rs",
+            "--- a/src/x.rs",
+            "+++ b/src/x.rs",
+            "@@ -1,2 +1,2 @@",
+            " let total =",
+            "+    compute_sum(values)",
+        ]
+    )
+    assert mod.sensitive_diff_finding(diff) is None
+
+
+# --- secret handling ---------------------------------------------------------
+
+
+def test_redact_sensitive_text_masks_common_secret_forms() -> None:
+    mod = load_module()
+    text = "\n".join([PAT, AWS, "api_key = supersecretvalue", BEARER])
+    redacted = mod.redact_sensitive_text(text)
+    assert PAT not in redacted
+    assert AWS not in redacted
+    assert "supersecretvalue" not in redacted
+    assert redacted.count("[REDACTED_SECRET]") >= 4
+
+
+def test_contains_sensitive_text_ignores_env_lookup_code() -> None:
+    mod = load_module()
+    assert not mod.contains_sensitive_text(
+        'let key = std::env::var("DEEPSEEK_API_KEY")?;'
+    )
+    assert not mod.contains_sensitive_text("DEEPSEEK_API_KEY: ${{ secrets.KEY }}")
+
+
+def test_contains_sensitive_text_flags_quoted_credential() -> None:
+    mod = load_module()
+    assert mod.contains_sensitive_text(f'let api_key = "{VALUE}";')
+
+
+def test_sensitive_diff_finding_checks_added_lines_only() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/a.rs b/a.rs",
+            "--- a/a.rs",
+            "+++ b/a.rs",
+            "@@ -1,2 +1,2 @@",
+            f" let token = {PAT};",
+            "+let clean = 1;",
+        ]
+    )
+    assert mod.sensitive_diff_finding(diff) is None
+
+
+def test_sensitive_diff_finding_reports_added_match_location() -> None:
+    mod = load_module()
+    diff = make_diff(
+        "a.rs", ["let clean = 1;", f"let t = {PAT};"]
+    )
+    finding = mod.sensitive_diff_finding(diff)
+    assert finding is not None
+    assert finding.severity == "block"
+    assert (finding.file, finding.line) == ("a.rs", 3)
+
+
+# --- reporting ---------------------------------------------------------------
+
+
+def test_summarize_llm_review_computes_dropped_count() -> None:
+    mod = load_module()
+    summary = mod.summarize_llm_review(
+        chunk_sizes=[100, 200], elapsed_seconds=1.25, returned_count=5, kept_count=2
+    )
+    assert "2 chunk(s)" in summary
+    assert "3 dropped" in summary
+
+
+def test_format_report_includes_llm_summary_line() -> None:
+    mod = load_module()
+    report = mod.format_report(
+        base="base",
+        head="head",
+        verdict="pass",
+        findings=[],
+        waived=False,
+        llm_summary="LLM review: 1 chunk(s)",
+    )
+    assert "LLM review: 1 chunk(s)" in report
+    assert "No findings." in report
+
+
+def test_format_report_omits_llm_summary_when_absent() -> None:
+    mod = load_module()
+    report = mod.format_report(
+        base="base", head="head", verdict="pass", findings=[], waived=False
+    )
+    assert "LLM review:" not in report
+
+
+def test_format_report_lists_findings_with_location() -> None:
+    mod = load_module()
+    finding = mod.Finding(
+        id="x",
+        severity="block",
+        rule_section="Public Boundary Safety",
+        file="strided-view/src/view.rs",
+        line=42,
+        summary="missing validation",
+        detail="detail line",
+    )
+    report = mod.format_report(
+        base="base", head="head", verdict="fail", findings=[finding], waived=False
+    )
+    assert "[block] x (Public Boundary Safety) strided-view/src/view.rs:42" in report
+    assert "detail line" in report
+
+
+# --- hunk-aware diff parsing (tensor4all-meta#88) ----------------------------
+#
+# `git diff` is a state machine: `@@ -a,b +c,d @@` opens a hunk whose body is
+# exactly `b` old-side and `d` new-side lines, and `+++ ` is a file header only
+# while no body is outstanding. The fixtures below are network-free and shared
+# with the pre-fix loops kept here, so the defect stays pinned even after the
+# fix.
+
+REVIEW_GATE_FIXTURES = ROOT / "scripts" / "fixtures" / "review-gate"
+FROZEN_FILE = "deprecated/strided-legacy/src/layout.rs"
+FORGED_FILE = "review.txt"
+
+
+def review_gate_fixture(name: str) -> str:
+    return (REVIEW_GATE_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def legacy_added_lines_with_text(diff_text: str) -> dict[str, list[tuple[int, str]]]:
+    """The pre-fix loop, verbatim from this script before the #88 fix.
+
+    Kept so the vulnerability stays pinned: if an edit reintroduces "a file
+    header is any line starting with `+++ `", this records exactly what that
+    buys an attacker instead of letting the regression pass silently.
+    """
+
+    result: dict[str, list[tuple[int, str]]] = {}
+    current_file: str | None = None
+    new_line = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line.removeprefix("+++ b/").removeprefix("+++ ")
+            current_file = None if raw == "/dev/null" else raw
+            if current_file is not None:
+                result.setdefault(current_file, [])
+            continue
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)", line)
+            new_line = int(match.group(1)) if match else 0
+            continue
+        if current_file is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            result[current_file].append((new_line, line[1:]))
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            continue
+        elif line.startswith(" "):
+            new_line += 1
+
+    return result
+
+
+def legacy_files_with_deleted_lines(diff_text: str) -> set[str]:
+    """The pre-fix deletion collector, verbatim from before the #88 fix."""
+
+    result: set[str] = set()
+    current_file: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line.removeprefix("+++ b/").removeprefix("+++ ")
+            current_file = None if raw == "/dev/null" else raw
+            continue
+        if line.startswith("--- ") or line.startswith("@@"):
+            continue
+        if current_file and line.startswith("-") and not line.startswith("---"):
+            result.add(current_file)
+    return result
+
+
+def test_the_pre_fix_parser_really_was_forgeable() -> None:
+    """Pin the defect: the old loop did believe the payload."""
+
+    legacy = legacy_added_lines_with_text(review_gate_fixture("forged-header.diff"))
+
+    assert FORGED_FILE in legacy, "fixture no longer exercises the forged header"
+    # The payload line was consumed as a file header, so it is not an addition
+    # anywhere; everything after it landed on the author's chosen path.
+    assert legacy[FROZEN_FILE] == [(6, "    /*")]
+    assert legacy[FORGED_FILE] == [(7, "*/")]
+
+
+def test_a_hunk_body_line_cannot_reassign_the_file() -> None:
+    mod = load_module()
+
+    added = mod.added_lines_with_text(review_gate_fixture("forged-header.diff"))
+
+    assert FORGED_FILE not in added
+    assert sorted(added) == [FROZEN_FILE]
+
+
+def test_every_addition_stays_with_the_real_file() -> None:
+    mod = load_module()
+
+    added = mod.added_lines_with_text(review_gate_fixture("forged-header.diff"))
+
+    assert added[FROZEN_FILE] == [
+        (6, "    /*"),
+        (7, "++ b/review.txt"),
+        (8, "*/"),
+    ]
+
+
+def test_added_line_numbers_stay_with_the_real_file() -> None:
+    mod = load_module()
+
+    added = mod.added_line_numbers(
+        mod.added_lines_with_text(review_gate_fixture("forged-header.diff"))
+    )
+
+    assert added == {FROZEN_FILE: {6, 7, 8}}
+
+
+def test_a_forged_payload_cannot_take_over_a_deletion() -> None:
+    """The deletion collector read the same forged `+++ ` header."""
+
+    mod = load_module()
+    diff = "\n".join(
+        [
+            f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}",
+            f"--- a/{FROZEN_FILE}",
+            f"+++ b/{FROZEN_FILE}",
+            "@@ -1,4 +1,4 @@",
+            " keep",
+            "+++ b/review.txt",
+            "-removed",
+            "+added",
+        ]
+    )
+
+    assert legacy_files_with_deleted_lines(diff) == {FORGED_FILE}, (
+        "fixture no longer exercises the forged header"
+    )
+    assert mod.files_with_deleted_lines(diff) == {FROZEN_FILE}
+    assert mod.files_with_deleted_lines(
+        review_gate_fixture("forged-header.diff")
+    ) == {FROZEN_FILE}
+
+
+def test_a_sensitive_line_that_renders_as_a_header_is_still_inspected() -> None:
+    """The same missing state hid a secret from the upload guard."""
+
+    mod = load_module()
+    # Assembled at runtime: this file must not contain a secret-shaped literal.
+    payload = "++ " + PAT
+    # The pre-fix loop's first test was `line.startswith("+++ ")` and it
+    # `continue`d on a match, so this line never reached the secret patterns.
+    assert ("+" + payload).startswith("+++ ")
+
+    diff = "\n".join(
+        [
+            f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}",
+            f"--- a/{FROZEN_FILE}",
+            f"+++ b/{FROZEN_FILE}",
+            "@@ -1,2 +1,3 @@",
+            " fn main() {}",
+            "+" + payload,
+        ]
+    )
+
+    assert mod.sensitive_diff_location(diff) == (FROZEN_FILE, 2)
+
+
+def test_the_deprecated_freeze_cannot_be_escaped_by_a_forged_header() -> None:
+    """The end-to-end consequence: the frozen tree was the file that mattered."""
+
+    mod = load_module()
+    fixture = review_gate_fixture("forged-header.diff")
+
+    # Pre-fix, the additions after the payload were attributed to review.txt, so
+    # the freeze never looked at the deprecated tree at all.
+    assert mod.deprecated_tree_freeze_violations(
+        legacy_added_lines_with_text(fixture)
+    ) == []
+
+    violations = mod.deprecated_tree_freeze_violations(
+        mod.added_lines_with_text(fixture)
+    )
+    assert violations == [f"{FROZEN_FILE}:7: ++ b/review.txt"], violations
+
+
+def test_an_honest_diff_keeps_its_attribution() -> None:
+    mod = load_module()
+
+    added = mod.added_lines_with_text(review_gate_fixture("normal.diff"))
+
+    assert added == {
+        FROZEN_FILE: [
+            (6, "    let added_marker = total * 2;"),
+            (7, "    added_marker"),
+        ]
+    }
+    assert mod.added_line_numbers(
+        mod.added_lines_with_text(review_gate_fixture("normal.diff"))
+    ) == {FROZEN_FILE: {6, 7}}
+    assert mod.changed_paths(review_gate_fixture("normal.diff")) == {FROZEN_FILE}
+
+
+def test_dev_null_handling_is_unchanged() -> None:
+    """A create and a delete keep the meaning the call sites already rely on."""
+
+    mod = load_module()
+    diff = review_gate_fixture("devnull.diff")
+    fresh = "strided-view/src/fresh.rs"
+
+    # The new side of a delete is `/dev/null`, so there is no new-side path and
+    # no bucket -- exactly what the pre-fix helpers reported.
+    assert mod.added_lines_with_text(diff) == {
+        fresh: [
+            (1, "pub fn fresh() -> u8 {"),
+            (2, "    9"),
+            (3, "}"),
+        ]
+    }
+    assert mod.added_line_numbers(mod.added_lines_with_text(diff)) == {fresh: {1, 2, 3}}
+    assert mod.files_with_deleted_lines(diff) == set()
+
+
+def test_a_real_header_after_a_spent_hunk_is_honoured_again() -> None:
+    """Do not over-correct: headers resume once the hunk budget is spent."""
+
+    mod = load_module()
+    other = "strided-view/src/other.rs"
+    combined = (
+        review_gate_fixture("forged-header.diff")
+        + f"diff --git a/{other} b/{other}\n"
+        f"--- a/{other}\n"
+        f"+++ b/{other}\n"
+        "@@ -1 +1,2 @@\n"
+        " fn other() {}\n"
+        "+fn added() {}\n"
+    )
+
+    added = mod.added_lines_with_text(combined)
+
+    assert sorted(added) == sorted([FROZEN_FILE, other])
+    assert added[other] == [(2, "fn added() {}")]
+    assert mod.changed_paths(combined) == {FROZEN_FILE, other}
+
+
+def test_omitted_counts_and_the_no_newline_marker() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/x.rs b/x.rs",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+            "\\ No newline at end of file",
+        ]
+    )
+
+    assert mod.added_lines_with_text(diff) == {"x.rs": [(1, "new")]}
+
+
+def test_a_rename_reports_both_paths() -> None:
+    mod = load_module()
+    diff = "\n".join(
+        [
+            "diff --git a/old.rs b/new.rs",
+            "similarity index 100%",
+            "rename from old.rs",
+            "rename to new.rs",
+        ]
+    )
+
+    assert sorted(mod.changed_paths(diff)) == ["new.rs", "old.rs"]
+    assert mod.paths_consistent(diff, "R100\0old.rs\0new.rs\0").ok
+
+
+def test_name_status_cross_check_flags_a_path_git_does_not_list() -> None:
+    """Second layer: a diff naming a path git does not list must fail closed."""
+
+    mod = load_module()
+    forged_as_headers = "".join(
+        [
+            f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}\n",
+            f"--- a/{FROZEN_FILE}\n",
+            f"+++ b/{FORGED_FILE}\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        ]
+    )
+
+    consistency = mod.paths_consistent(forged_as_headers, f"M\0{FROZEN_FILE}\0")
+
+    assert not consistency.ok
+    assert consistency.unexpected == (FORGED_FILE,)
+    assert consistency.missing == ()
+
+
+def test_name_status_cross_check_accepts_an_honest_diff() -> None:
+    mod = load_module()
+
+    for name in ("forged-header.diff", "normal.diff"):
+        consistency = mod.paths_consistent(
+            review_gate_fixture(name), f"M\0{FROZEN_FILE}\0"
+        )
+        assert consistency.ok, (name, consistency)
+
+
+def test_name_status_cross_check_understands_deletes() -> None:
+    mod = load_module()
+    diff = review_gate_fixture("devnull.diff")
+    name_status = f"D\0{FROZEN_FILE}\0A\0strided-view/src/fresh.rs\0"
+
+    consistency = mod.paths_consistent(diff, name_status)
+
+    assert consistency.ok, consistency
+
+
+def test_path_consistency_finding_blocks_only_on_a_mismatch() -> None:
+    mod = load_module()
+
+    honest = mod.path_consistency_finding(
+        review_gate_fixture("normal.diff"), f"M\0{FROZEN_FILE}\0"
+    )
+    assert honest is None
+
+    mismatch = mod.path_consistency_finding(
+        f"diff --git a/{FROZEN_FILE} b/{FROZEN_FILE}\n"
+        f"--- a/{FROZEN_FILE}\n"
+        f"+++ b/{FORGED_FILE}\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n",
+        f"M\0{FROZEN_FILE}\0",
+    )
+    assert mismatch is not None
+    assert mismatch.severity == "block"
+    assert FORGED_FILE in mismatch.detail
+
+
+def test_binary_mode_and_quoted_paths_do_not_look_like_tampering() -> None:
+    """Fail-closed must not fire on the shapes git itself emits."""
+
+    mod = load_module()
+    quoted = "strided-view/src/\u00fc\u00f1\u00ee/na\u00efve file.rs"
+    diff = "\n".join(
+        [
+            "diff --git a/blob.bin b/blob.bin",
+            "index 5d27a55..1f09903 100644",
+            "Binary files a/blob.bin and b/blob.bin differ",
+            "diff --git a/mode.sh b/mode.sh",
+            "old mode 100644",
+            "new mode 100755",
+            "index 587be6b..975fbec",
+            "--- a/mode.sh",
+            "+++ b/mode.sh",
+            "@@ -1 +1 @@",
+            "-x",
+            "+y",
+            f"diff --git a/{quoted} b/{quoted}",
+            "index 7898192..422c2b7 100644",
+            f"--- a/{quoted}\t",
+            f"+++ b/{quoted}\t",
+            "@@ -1 +1,2 @@",
+            " a",
+            "+b",
+        ]
+    )
+    name_status = f"M\0blob.bin\0M\0mode.sh\0M\0{quoted}\0"
+
+    assert mod.paths_consistent(diff, name_status).ok
+    assert mod.added_line_numbers(mod.added_lines_with_text(diff)) == {
+        # A binary or mode-only file names its path but adds no line; the empty
+        # bucket is inert at every call site (`if not touched: continue`).
+        "blob.bin": set(),
+        "mode.sh": {1},
+        quoted: {2},
+    }
+
+
+def test_split_large_file_diff_keeps_body_lines_out_of_the_header_split() -> None:
+    """A body line can never open a hunk, whatever text it happens to carry."""
+
+    mod = load_module()
+    body = ["diff --git a/big.rs b/big.rs", "--- a/big.rs", "+++ b/big.rs"]
+    body.append("@@ -1,300 +1,300 @@")
+    for index in range(260):
+        body.append(f"+// filler {index} " + "x" * 180)
+        if index == 30:
+            # Added content that renders with a `+++ ` prefix: a header
+            # lookalike that must stay body text.
+            body.append("+++ b/review.txt")
+    assert len("\n".join(body)) > mod.MAX_FILE_DIFF_CHARS
+
+    chunks = mod.split_large_file_diff("\n".join(body))
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert "+++ b/big.rs" in chunk
+        # Only the one chunk that holds the lookalike may mention it, and it
+        # must appear as body text rather than as a rewrite of the header.
+        assert "\n+++ b/review.txt" in chunk or "review.txt" not in chunk
+
+
+# --- prompt and rules files --------------------------------------------------
+
+
+def test_prompt_file_exists_and_requires_json_only() -> None:
+    mod = load_module()
+    assert mod.PROMPT_PATH.is_file()
+    text = mod.PROMPT_PATH.read_text(encoding="utf-8")
+    assert "JSON only" in text
+    assert "untrusted data" in text
+
+
+def test_prompt_scopes_hot_loop_and_benchmark_review() -> None:
+    mod = load_module()
+    text = " ".join(mod.PROMPT_PATH.read_text(encoding="utf-8").split())
+    for phrase in (
+        "loop multiplicity",
+        "worker-range",
+        "traversal-block decoding",
+        "Plan-time injectivity checks",
+        "offset-table construction",
+        "worker-range/block initialization",
+        "per-element",
+        "generic fast-path-miss coverage",
+        "representative rank scaling",
+        "relevant fallback or layout cases",
+        "without requiring a nonexistent fast-path miss",
+        "explicitly scoped claim linked to a residual generic-path issue",
+        "at most a `warn`",
+        "routine non-performance kernel",
+    ):
+        assert phrase in text, phrase
+
+
+def test_rules_file_documents_the_deprecated_tree_freeze() -> None:
+    mod = load_module()
+    assert "Einsum Maintenance Ownership" not in mod.parse_repository_rules_sections()
+    deprecated = mod.parse_repository_rules_sections()["Deprecated Tree Freeze"]
+    assert "deprecated/" in deprecated
+
+
+def main() -> int:
+    tests = [
+        value
+        for name, value in sorted(globals().items())
+        if name.startswith("test_") and callable(value)
+    ]
+    for test in tests:
+        test()
+    print(f"repository-rules-review: {len(tests)} tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -20,8 +20,63 @@
 
 pub mod auxiliary;
 mod element_op;
+pub mod injectivity;
 mod raw;
 pub mod view;
+
+// ============================================================================
+// Inline metadata capacity
+// ============================================================================
+
+/// Maximum rank whose metadata is stored inline without a heap allocation.
+///
+/// [`StridedView`], [`StridedViewMut`] and [`StridedArray`] keep up to this
+/// many dimensions and strides inline in a fixed-size `Copy` buffer. Derived
+/// views,
+/// clones and array constructors are allocation-free at ranks 1 through
+/// `INLINE_RANK`; a higher rank spills to the heap gracefully (never an
+/// error).
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::{StridedView, INLINE_RANK};
+///
+/// assert_eq!(INLINE_RANK, 8);
+/// let data = [0.0f64; 8];
+/// let view = StridedView::<f64>::new(&data, &[2, 2, 2], &[1, 2, 4], 0).unwrap();
+/// assert_eq!(view.ndim(), 3);
+/// ```
+pub const INLINE_RANK: usize = 8;
+
+/// Stride metadata with inline storage for up to [`INLINE_RANK`] dimensions.
+///
+/// Returned by [`view::col_major_strides`] and [`view::row_major_strides`],
+/// so a computed layout at rank `<= INLINE_RANK` does not allocate.
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::StrideVec;
+///
+/// let strides: StrideVec = [1isize, 2, 4].into_iter().collect();
+/// assert_eq!(&strides[..], &[1, 2, 4]);
+/// ```
+pub type StrideVec = tinyvec::TinyVec<[isize; INLINE_RANK]>;
+
+/// Axis metadata with inline storage for up to [`INLINE_RANK`] dimensions.
+///
+/// Returned by [`auxiliary::index_order`].
+///
+/// # Examples
+///
+/// ```
+/// use strided_view::AxisVec;
+///
+/// let axes: AxisVec = [3usize, 1, 2].into_iter().collect();
+/// assert_eq!(&axes[..], &[3, 1, 2]);
+/// ```
+pub type AxisVec = tinyvec::TinyVec<[usize; INLINE_RANK]>;
 
 // ============================================================================
 // Element operations
@@ -31,10 +86,18 @@ pub use element_op::{
 };
 
 // ============================================================================
+// Layout validation
+// ============================================================================
+pub use injectivity::is_injective_layout;
+#[doc(hidden)]
+pub use injectivity::is_injective_layout_without_alloc;
+
+// ============================================================================
 // View-based types
 // ============================================================================
 pub use raw::{
-    ErasedRawStridedMut, ErasedRawStridedRef, KernelDType, RawStridedMut, RawStridedRef,
+    ErasedRawStridedMut, ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut,
+    KernelDType, KernelStorageElement, RawStridedMut, RawStridedRef,
 };
 pub use view::{col_major_strides, row_major_strides, StridedArray, StridedView, StridedViewMut};
 
@@ -74,6 +137,10 @@ pub enum StridedError {
     NonSquare { rows: usize, cols: usize },
 
     /// Mutable output layout maps multiple logical elements to the same memory offset.
+    ///
+    /// Raised when [`is_injective_layout`] returns `false`; see its
+    /// documentation for the one size-bounded residual it reports as `false`
+    /// without deciding.
     #[error("mutable output layout is not injective")]
     NonInjectiveOutputLayout,
 
@@ -109,10 +176,6 @@ pub enum StridedError {
     #[error("invalid bool byte value {value}")]
     InvalidBoolByte { value: u8 },
 
-    /// An execution context requested an invalid worker-thread budget.
-    #[error("invalid thread budget {max_threads}")]
-    InvalidThreadBudget { max_threads: usize },
-
     /// The dtype is recognized but unsupported by the selected operation.
     #[error("unsupported dtype {dtype}")]
     UnsupportedDType { dtype: &'static str },
@@ -123,6 +186,14 @@ pub enum StridedError {
         op: &'static str,
         dtype: &'static str,
     },
+
+    /// A mutable destination overlaps one of the operation inputs.
+    #[error("destination overlaps input {input}")]
+    OverlappingInputOutput { input: usize },
+
+    /// Integer division or remainder encountered a zero divisor.
+    #[error("integer {op} encountered a zero divisor")]
+    IntegerDivisionByZero { op: &'static str },
 
     /// The operation arity is unsupported by this entry point.
     #[error("unsupported arity {arity}; maximum supported arity is {max}")]

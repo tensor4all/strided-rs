@@ -158,24 +158,27 @@ pub unsafe fn const_stride1_copy<T: Copy>(
         let mut d = dst;
         for _ in 0..count {
             *d = *s;
-            s = s.offset(src_stride);
-            d = d.add(1);
+            // The cursor advance after the last copy may leave the
+            // allocation and is never dereferenced, so it must not use
+            // `offset`/`add` (which require the result to stay in bounds).
+            s = s.wrapping_offset(src_stride);
+            d = d.wrapping_offset(1);
         }
     } else if src_stride == 1 {
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
             *d = *s;
-            s = s.add(1);
-            d = d.offset(dst_stride);
+            s = s.wrapping_offset(1);
+            d = d.wrapping_offset(dst_stride);
         }
     } else {
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
             *d = *s;
-            s = s.offset(src_stride);
-            d = d.offset(dst_stride);
+            s = s.wrapping_offset(src_stride);
+            d = d.wrapping_offset(dst_stride);
         }
     }
 }
@@ -201,99 +204,4 @@ pub unsafe fn macro_kernel_fallback<T: Copy>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_macro_kernel_f64_full_block() {
-        // 16×16 tile, lda=16, ldb=16 (both square)
-        let n = 16;
-        let src: Vec<f64> = (0..n * n).map(|i| i as f64).collect();
-        let mut dst = vec![0.0f64; n * n];
-
-        unsafe {
-            macro_kernel_f64(src.as_ptr(), n as isize, n, dst.as_mut_ptr(), n as isize, n);
-        }
-
-        for j in 0..n {
-            for i in 0..n {
-                assert_eq!(dst[j + i * n], src[i + j * n], "mismatch at i={i}, j={j}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_macro_kernel_f64_with_remainder() {
-        // 15×17 tile (both have remainders w.r.t. MICRO=4)
-        let block_a = 15;
-        let block_b = 17;
-        let lda = 20isize; // src leading dim
-        let ldb = 18isize; // dst leading dim
-
-        let src: Vec<f64> = (0..(block_a as isize * 1 + (block_b - 1) as isize * lda + 1) as usize)
-            .map(|i| i as f64)
-            .collect();
-        let mut dst =
-            vec![0.0f64; ((block_b - 1) as isize * 1 + (block_a - 1) as isize * ldb + 1) as usize];
-
-        unsafe {
-            macro_kernel_f64(src.as_ptr(), lda, block_a, dst.as_mut_ptr(), ldb, block_b);
-        }
-
-        for j in 0..block_b {
-            for i in 0..block_a {
-                let s = src[(i as isize + j as isize * lda) as usize];
-                let d = dst[(j as isize + i as isize * ldb) as usize];
-                assert_eq!(d, s, "mismatch at i={i}, j={j}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_macro_kernel_f64_small() {
-        // 3×5 tile (smaller than MICRO=4)
-        let block_a = 3;
-        let block_b = 5;
-        let lda = 8isize;
-        let ldb = 6isize;
-
-        let src_len = ((block_a - 1) as isize + (block_b - 1) as isize * lda + 1) as usize;
-        let dst_len = ((block_b - 1) as isize + (block_a - 1) as isize * ldb + 1) as usize;
-        let src: Vec<f64> = (0..src_len).map(|i| i as f64).collect();
-        let mut dst = vec![0.0f64; dst_len];
-
-        unsafe {
-            macro_kernel_f64(src.as_ptr(), lda, block_a, dst.as_mut_ptr(), ldb, block_b);
-        }
-
-        for j in 0..block_b {
-            for i in 0..block_a {
-                let s = src[(i as isize + j as isize * lda) as usize];
-                let d = dst[(j as isize + i as isize * ldb) as usize];
-                assert_eq!(d, s, "mismatch at i={i}, j={j}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_const_stride1_copy_contiguous() {
-        let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
-        let mut dst = vec![0.0f64; 5];
-        unsafe {
-            const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 5, 1, 1);
-        }
-        assert_eq!(dst, src);
-    }
-
-    #[test]
-    fn test_const_stride1_copy_strided() {
-        let src = vec![1.0f64, 0.0, 2.0, 0.0, 3.0];
-        let mut dst = vec![0.0f64; 5];
-        unsafe {
-            const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 3, 2, 1);
-        }
-        assert_eq!(dst[0], 1.0);
-        assert_eq!(dst[1], 2.0);
-        assert_eq!(dst[2], 3.0);
-    }
-}
+mod tests;

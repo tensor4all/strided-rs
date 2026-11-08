@@ -1,9 +1,22 @@
 //! Copy/permutation operations on strided views.
 
-#[cfg(feature = "parallel")]
-use crate::hptt::execute_permute_blocked_par;
+use crate::fuse::FusionPlanError;
 use crate::hptt::{build_permute_plan, execute_permute_blocked};
 use strided_view::{Result, StridedError, StridedView, StridedViewMut};
+use threadteam::Exec;
+
+/// Map a permutation planning failure onto the shared view error vocabulary.
+///
+/// Rank and shape are validated before planning, so a length mismatch cannot
+/// reach this point; it still maps to a typed error instead of a panic. An
+/// oversized (typically stride-0 broadcast) extent whose fused product cannot
+/// be represented is reported as an offset overflow (issue #263).
+fn plan_error(err: FusionPlanError) -> StridedError {
+    match err {
+        FusionPlanError::LengthMismatch { .. } => StridedError::StrideLengthMismatch,
+        FusionPlanError::DimensionOverflow => StridedError::OffsetOverflow,
+    }
+}
 
 fn total_len(dims: &[usize]) -> usize {
     dims.iter().product()
@@ -52,14 +65,27 @@ fn is_both_contiguous(dims: &[usize], dst_strides: &[isize], src_strides: &[isiz
     row_ok
 }
 
-/// Copy elements from source to destination: `dest[i] = src[i]`.
+/// The validated raw geometry of one copy: the shared dims, both stride
+/// runs and the two origins. `U` is the destination element type: `T` for
+/// an initialized destination, `MaybeUninit<T>` for a fresh one.
+struct RawCopy<'a, T, U> {
+    dims: &'a [usize],
+    dst_strides: &'a [isize],
+    src_strides: &'a [isize],
+    dst: *mut U,
+    src: *const T,
+}
+
+/// Validates rank and shape and extracts the raw geometry; `None` for a
+/// zero-sized copy, which has nothing to write.
 ///
-/// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
-/// cache-aware blocking, and optimal loop ordering.
-///
-/// This is a simple copy without ElementOp support. For copies with
-/// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
-pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) -> Result<()> {
+/// A zero-sized view validates without its other extents or strides forming
+/// an in-range product, so neither the contiguous fast path nor the
+/// permutation planner may see it.
+fn prepare<'a, T, U>(
+    dest: &'a mut StridedViewMut<U>,
+    src: &'a StridedView<T>,
+) -> Result<Option<RawCopy<'a, T, U>>> {
     let dst_dims = dest.dims();
     let src_dims = src.dims();
     if dst_dims.len() != src_dims.len() {
@@ -71,94 +97,199 @@ pub fn copy_into<T: Copy>(dest: &mut StridedViewMut<T>, src: &StridedView<T>) ->
             src_dims.to_vec(),
         ));
     }
+    if dst_dims.contains(&0) {
+        return Ok(None);
+    }
+    Ok(Some(RawCopy {
+        dims: dst_dims,
+        dst_strides: dest.strides(),
+        src_strides: src.strides(),
+        dst: dest.as_mut_ptr(),
+        src: src.ptr(),
+    }))
+}
 
-    let dst_ptr = dest.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_strides = dest.strides();
-    let src_strides = src.strides();
-
-    // Fast path: both contiguous
-    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
-        let len = total_len(dst_dims);
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
+/// The copy over validated raw geometry, run within the budget of `exec`.
+///
+/// # Safety
+///
+/// `raw.dst` must be valid for writes of `T` at every destination offset and
+/// `raw.src` valid for reads of initialized `T` at every source offset; the
+/// two ranges must not overlap. Every store goes through raw pointers, so the
+/// destination may be uninitialized storage.
+unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
+    raw: RawCopy<'_, T, U>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    let dst_ptr = raw.dst.cast::<T>();
+    // The width is the token's decision: the serial time of the copy against the
+    // dispatch cost of the one section the engine opens (`for_ranges`).
+    let exec = match raw.dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d)) {
+        Some(n) => {
+            let estimate =
+                std::time::Duration::from_secs_f64(n as f64 * crate::copy_ns_per_element() * 1e-9);
+            let width = exec.width_for(estimate, 1);
+            exec.limit(width)
+        }
+        // An overflowing count is reported by planning below; run it serially.
+        None => exec.limit(std::num::NonZeroUsize::MIN),
+    };
+    // Fast path: both contiguous. A contiguous layout is injective by
+    // construction, so it skips the validation below.
+    if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
+        let len = total_len(raw.dims);
+        if exec.is_serial() {
+            // SAFETY: `prepare` (copy.rs:85) proved `dims`, the strides and the two
+            // origins describe the same shape, and each view's constructor proved
+            // through `validate_bounds` (strided-view/src/view.rs:186) that its
+            // reachable offsets stay inside its own slice. A contiguous layout
+            // reaches exactly `total_len(dims)` consecutive elements from that
+            // origin, so both ranges are live for `len` elements; the caller holds
+            // `&mut StridedViewMut` against a shared `&StridedView`, so they do not
+            // overlap.
+            unsafe { std::ptr::copy_nonoverlapping(raw.src, dst_ptr, len) };
+        } else {
+            let src_addr = raw.src as usize;
+            let dst_addr = dst_ptr as usize;
+            exec.for_ranges(len, std::num::NonZeroUsize::MIN, |range| {
+                // SAFETY: `range` is a disjoint subrange of `0..len`, so both
+                // `.add(range.start)` pointers stay within the two live `len`-element
+                // contiguous ranges justified above; the subranges are disjoint, and
+                // raw stores are valid for the uninitialized `U` destination.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (src_addr as *const T).add(range.start),
+                        (dst_addr as *mut T).add(range.start),
+                        range.len(),
+                    );
+                }
+            });
+        }
         return Ok(());
     }
 
-    // HPTT-inspired blocked permutation
+    // HPTT-inspired blocked permutation. Planning runs before the injectivity
+    // check so an unrepresentable layout keeps reporting `OffsetOverflow`
+    // (issue #263) even when its destination is also non-injective; planning
+    // only builds metadata and writes nothing.
     let elem_size = std::mem::size_of::<T>();
-    let plan = build_permute_plan(dst_dims, src_strides, dst_strides, elem_size);
-    unsafe {
-        execute_permute_blocked(src_ptr, dst_ptr, &plan);
+    let plan = build_permute_plan(raw.dims, raw.src_strides, raw.dst_strides, elem_size)
+        .map_err(plan_error)?;
+    // A non-injective destination maps distinct logical elements onto one
+    // offset, so the unsafe write loop would produce overlapping writes (and a
+    // data race when `exec` fans out). This matches the sibling output-writing
+    // APIs (issue #281). The check is global over the destination, so two
+    // worker partitions (disjoint logical positions) can never write one
+    // offset; no extra per-partition separation proof is needed.
+    if !strided_view::is_injective_layout(raw.dims, raw.dst_strides) {
+        return Err(StridedError::NonInjectiveOutputLayout);
     }
+    execute_permute_blocked(raw.src, dst_ptr, &plan, exec);
     Ok(())
+}
+
+/// Copy elements from source to destination: `dest[i] = src[i]`.
+///
+/// Uses HPTT-inspired blocked permutation with bilateral dimension fusion,
+/// cache-aware blocking, and optimal loop ordering. The permutation is split
+/// across the budget of `exec`, at the width the token's dispatch cost
+/// justifies for the copy ([`copy_ns_per_element`](crate::copy_ns_per_element)
+/// times its elements); a small copy stays on the calling thread. A caller that wants a large copy on one thread passes
+/// [`Exec::serial`] or narrows the token with [`Exec::limit`].
+/// A contiguous copy uses one `memcpy` per range of the narrowed token, or a
+/// single `memcpy` on the calling thread when that token is serial.
+///
+/// This is a simple copy without ElementOp support. For copies with
+/// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`]
+/// when the views describe different extents,
+/// [`StridedError::OffsetOverflow`] when the layout cannot be expressed in
+/// `isize` stride arithmetic or a fused extent overflows, and
+/// [`StridedError::NonInjectiveOutputLayout`] when two destination elements
+/// map onto the same memory offset, or the layout span is not representable.
+/// Nothing is written unless validation succeeds.
+///
+/// # Examples
+///
+/// ```
+/// use threadteam::Exec;
+/// use strided_perm::copy_into;
+/// use strided_view::StridedArray;
+///
+/// let src = StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
+/// let mut dst = StridedArray::<f64>::col_major(&[2, 3]);
+/// copy_into(&mut dst.view_mut(), &src.view(), Exec::serial()).unwrap();
+/// assert_eq!(dst.get(&[1, 2]), 12.0);
+/// ```
+pub fn copy_into<T: Copy + Send + Sync + 'static>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: `prepare` (copy.rs:85) rejected a rank or shape mismatch and a
+        // zero-sized copy, and each view's constructor proved its reachable offsets
+        // stay inside its slice through `validate_bounds`
+        // (strided-view/src/view.rs:186). `&mut StridedViewMut` excludes any other
+        // borrow of the destination, so the two raw extents cannot overlap.
+        Some(raw) => unsafe { copy_raw(raw, exec) },
+        None => Ok(()),
+    }
+}
+
+/// Copy elements into an uninitialized destination: `dest[i] = src[i]`.
+///
+/// The same permutation engine as [`copy_into`], selected on `T` rather than
+/// on `MaybeUninit<T>`: the engine's native `f32`/`f64` kernels are chosen by
+/// element type, so a destination reinterpreted as `MaybeUninit<T>` would
+/// otherwise fall to the generic element path (about 2.5x slower on a
+/// 4096x4096 `f64` transpose). Every destination element the views describe
+/// is written exactly once; the stores go through raw pointers only, so no
+/// reference to uninitialized storage is formed.
+///
+/// # Errors
+///
+/// Same rejection set as [`copy_into`]: [`StridedError::RankMismatch`],
+/// [`StridedError::ShapeMismatch`], [`StridedError::OffsetOverflow`] and
+/// [`StridedError::NonInjectiveOutputLayout`]. Nothing is written unless
+/// validation succeeds.
+pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
+    dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
+    src: &StridedView<T>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: as `copy_into` (copy.rs:227) — `prepare` matched the shapes and
+        // both views proved their bounds at construction. `MaybeUninit<T>` has `T`'s
+        // size and alignment, and the engine only stores into the destination, so
+        // the uninitialized extent is never read.
+        Some(raw) => unsafe { copy_raw(raw, exec) },
+        None => Ok(()),
+    }
 }
 
 /// Copy elements to a col-major destination.
 ///
-/// This now delegates to the same HPTT-inspired blocked permutation as
-/// `copy_into`. The HPTT planner automatically handles the col-major
-/// destination case optimally.
-pub fn copy_into_col_major<T: Copy>(
+/// This delegates to the same HPTT-inspired blocked permutation as
+/// [`copy_into`]. The HPTT planner handles the col-major destination case
+/// optimally.
+///
+/// # Errors
+///
+/// The errors of [`copy_into`]: [`StridedError::RankMismatch`],
+/// [`StridedError::ShapeMismatch`], [`StridedError::OffsetOverflow`] and
+/// [`StridedError::NonInjectiveOutputLayout`].
+pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
-    copy_into(dst, src)
+    copy_into(dst, src, exec)
 }
 
-/// Copy elements from source to destination with Rayon parallelism.
-///
-/// Parallelizes the outermost block loop of the HPTT-inspired permutation.
-/// Falls back to single-threaded for small tensors.
-#[cfg(feature = "parallel")]
-pub fn copy_into_par<T: Copy + Send + Sync>(
-    dest: &mut StridedViewMut<T>,
-    src: &StridedView<T>,
-) -> Result<()> {
-    let dst_dims = dest.dims();
-    let src_dims = src.dims();
-    if dst_dims.len() != src_dims.len() {
-        return Err(StridedError::RankMismatch(dst_dims.len(), src_dims.len()));
-    }
-    if dst_dims != src_dims {
-        return Err(StridedError::ShapeMismatch(
-            dst_dims.to_vec(),
-            src_dims.to_vec(),
-        ));
-    }
-
-    let dst_ptr = dest.as_mut_ptr();
-    let src_ptr = src.ptr();
-    let dst_strides = dest.strides();
-    let src_strides = src.strides();
-
-    // Fast path: both contiguous (memcpy is already bandwidth-limited)
-    if is_both_contiguous(dst_dims, dst_strides, src_strides) {
-        let len = total_len(dst_dims);
-        unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len) };
-        return Ok(());
-    }
-
-    let elem_size = std::mem::size_of::<T>();
-    let plan = build_permute_plan(dst_dims, src_strides, dst_strides, elem_size);
-    unsafe {
-        execute_permute_blocked_par(src_ptr, dst_ptr, &plan);
-    }
-    Ok(())
-}
-
-/// Copy elements to a col-major destination with Rayon parallelism.
-#[cfg(feature = "parallel")]
-pub fn copy_into_col_major_par<T: Copy + Send + Sync>(
-    dst: &mut StridedViewMut<T>,
-    src: &StridedView<T>,
-) -> Result<()> {
-    copy_into_par(dst, src)
-}
-
-/// Try to fuse a contiguous dimension group into a single (total_size, innermost_stride).
-///
-/// For the group to be fusable, consecutive dimensions must have contiguous strides.
-/// Returns `None` if strides are not contiguous within the group.
 #[cfg(test)]
 fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
     match dims.len() {
@@ -221,136 +352,4 @@ fn try_fuse_group(dims: &[usize], strides: &[isize]) -> Option<(usize, isize)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use strided_view::StridedArray;
-
-    #[test]
-    fn test_copy_into_contiguous() {
-        let src =
-            StridedArray::<f64>::from_fn_col_major(&[2, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
-        let mut dst = StridedArray::<f64>::col_major(&[2, 3]);
-        copy_into(&mut dst.view_mut(), &src.view()).unwrap();
-        assert_eq!(dst.get(&[0, 0]), 0.0);
-        assert_eq!(dst.get(&[1, 2]), 12.0);
-    }
-
-    #[test]
-    fn test_copy_into_transposed() {
-        // src is row-major [3,2], dst is col-major [3,2]
-        let src = StridedArray::<f64>::from_parts(
-            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-            &[3, 2],
-            &[2, 1], // row-major
-            0,
-        )
-        .unwrap();
-        let mut dst = StridedArray::<f64>::col_major(&[3, 2]);
-        copy_into(&mut dst.view_mut(), &src.view()).unwrap();
-        assert_eq!(dst.get(&[0, 0]), 0.0);
-        assert_eq!(dst.get(&[0, 1]), 1.0);
-        assert_eq!(dst.get(&[1, 0]), 2.0);
-        assert_eq!(dst.get(&[2, 1]), 5.0);
-    }
-
-    #[test]
-    fn test_copy_into_col_major_basic() {
-        let src =
-            StridedArray::<f64>::from_fn_col_major(&[4, 3], |idx| (idx[0] * 10 + idx[1]) as f64);
-        let mut dst = StridedArray::<f64>::col_major(&[4, 3]);
-        copy_into_col_major(&mut dst.view_mut(), &src.view()).unwrap();
-        assert_eq!(dst.get(&[0, 0]), 0.0);
-        assert_eq!(dst.get(&[3, 2]), 32.0);
-    }
-
-    #[test]
-    fn test_copy_into_col_major_permuted_src() {
-        // src has scattered strides, dst is col-major
-        let data: Vec<f64> = (0..24).map(|i| i as f64).collect();
-        let src = StridedArray::<f64>::from_parts(
-            data,
-            &[2, 3, 4],
-            &[12, 4, 1], // row-major
-            0,
-        )
-        .unwrap();
-        let mut dst = StridedArray::<f64>::col_major(&[2, 3, 4]);
-        copy_into_col_major(&mut dst.view_mut(), &src.view()).unwrap();
-        // Verify element-by-element
-        for i in 0..2 {
-            for j in 0..3 {
-                for k in 0..4 {
-                    assert_eq!(
-                        dst.get(&[i, j, k]),
-                        src.get(&[i, j, k]),
-                        "mismatch at [{},{},{}]",
-                        i,
-                        j,
-                        k
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_copy_into_grouped_high_rank_binary_permutation() {
-        let dims = vec![2usize; 12];
-        let total: usize = dims.iter().product();
-        let src = StridedArray::<u32>::from_fn_col_major(&dims, |idx| {
-            idx.iter()
-                .enumerate()
-                .map(|(axis, &coord)| (coord as u32) << axis)
-                .sum::<u32>()
-        });
-        let perm = vec![2, 4, 5, 6, 0, 3, 7, 1, 8, 9, 10, 11];
-        let src_view = src.view().permute(&perm).unwrap();
-        let mut dst = StridedArray::<u32>::col_major(&dims);
-
-        copy_into(&mut dst.view_mut(), &src_view).unwrap();
-
-        for flat in 0..total {
-            let mut rem = flat;
-            let mut src_offset = 0usize;
-            for &stride in src_view.strides() {
-                let coord = rem & 1;
-                rem >>= 1;
-                src_offset += coord * stride as usize;
-            }
-            assert_eq!(dst.data()[flat], src.data()[src_offset], "flat={flat}");
-        }
-    }
-
-    #[test]
-    fn test_try_fuse_group_empty() {
-        assert_eq!(try_fuse_group(&[], &[]), Some((1, 0)));
-    }
-
-    #[test]
-    fn test_try_fuse_group_single() {
-        assert_eq!(try_fuse_group(&[5], &[2]), Some((5, 2)));
-    }
-
-    #[test]
-    fn test_try_fuse_group_contiguous_row_major() {
-        assert_eq!(try_fuse_group(&[3, 4], &[4, 1]), Some((12, 1)));
-    }
-
-    #[test]
-    fn test_try_fuse_group_contiguous_col_major() {
-        assert_eq!(try_fuse_group(&[3, 4], &[1, 3]), Some((12, 1)));
-    }
-
-    #[test]
-    fn test_try_fuse_group_non_contiguous() {
-        assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
-    }
-
-    #[test]
-    fn test_copy_shape_mismatch() {
-        let src = StridedArray::<f64>::col_major(&[2, 3]);
-        let mut dst = StridedArray::<f64>::col_major(&[3, 2]);
-        let result = copy_into(&mut dst.view_mut(), &src.view());
-        assert!(result.is_err());
-    }
-}
+mod tests;

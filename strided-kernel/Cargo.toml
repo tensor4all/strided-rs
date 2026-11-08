@@ -1,27 +1,30 @@
 [package]
 name = "strided-kernel"
-version.workspace = true
+version = "0.12.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Cache-optimized kernels for strided multidimensional array operations in Rust (ported from Julia Strided.jl/StridedViews.jl)."
+keywords = ["tensor", "strided", "kernels", "numerical"]
+categories = ["science", "mathematics", "algorithms"]
 
 [dependencies]
-strided-view.workspace = true
-strided-perm.workspace = true
-num-traits.workspace = true
+strided-basic.workspace = true
+# Compatibility re-exports of the fused API that strided-kernel 0.4.0 exposed
+# (issue #261); new code should depend on strided-fused directly.
+strided-fused.workspace = true
 num-complex.workspace = true
-rayon = { workspace = true, optional = true }
-smallvec = { workspace = true, optional = true }
-pulp = { workspace = true, optional = true }
 
 [features]
 default = ["simd"]
-parallel = ["dep:rayon", "dep:smallvec", "strided-perm/parallel"]
-simd = ["dep:pulp"]
+parallel = ["strided-basic/parallel", "strided-fused/parallel"]
+simd = ["strided-basic/simd", "strided-fused/simd"]
 
 [dev-dependencies]
+strided-nn.workspace = true
+threadteam = { workspace = true, features = ["ledger"] }
+num-traits.workspace = true
 criterion.workspace = true
 approx.workspace = true
 rand.workspace = true
@@ -38,6 +41,7 @@ harness = false
 [[bench]]
 name = "scaling_compare"
 harness = false
+required-features = ["parallel"]
 
 [[bench]]
 name = "threaded_compare"
@@ -55,12 +59,28 @@ harness = false
 [[bench]]
 name = "mul_pytorch_compare"
 harness = false
-
-[[bench]]
-name = "fused_elementwise"
-harness = false
+required-features = ["parallel"]
 
 [[bench]]
 name = "erased_policy_thresholds"
+harness = false
+required-features = ["parallel"]
+
+[[bench]]
+name = "erased_uninit_elementwise"
+harness = false
+
+[[bench]]
+name = "issue_184_uninit_replay"
+harness = false
+required-features = ["parallel"]
+
+[[bench]]
+name = "issue_187_uninit_indexed"
+harness = false
+required-features = ["parallel"]
+
+[[bench]]
+name = "axis_ops"
 harness = false
 required-features = ["parallel"]

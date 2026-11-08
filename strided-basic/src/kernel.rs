@@ -1,0 +1,757 @@
+//! Kernel iteration engine ported from Julia's Strided.jl/src/mapreduce.jl
+//!
+//! This module implements the core iteration engine that follows Julia's
+//! `_mapreduce_kernel!` pattern for cache-optimized strided array operations.
+
+use crate::fuse::{compress_dims, fuse_dims};
+use crate::inline::{InlineVec, OperandVec};
+use crate::{block, order, Exec, Result, StridedError};
+
+/// Maximum total elements for the small tensor fast path.
+/// Tensors at or below this size skip `compute_order` and `compute_block_sizes`
+/// since they fit in L1 cache and blocking provides no benefit.
+pub const SMALL_TENSOR_THRESHOLD: usize = 1024;
+
+/// Blocking metadata produced by the execution planners; not a layout-validity proof.
+#[derive(Debug)]
+pub struct KernelPlan {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) order: InlineVec<usize>, // inner -> outer
+    pub block: InlineVec<usize>,
+}
+
+/// Build an execution plan for strided iteration (used only in tests).
+///
+/// This follows Julia's `_mapreduce_order!` -> `_mapreduce_block!` pipeline
+/// without fusion:
+/// 1. Compute optimal iteration order
+/// 2. Reorder dims and strides into that order
+/// 3. Compute block sizes for cache efficiency
+#[cfg(test)]
+pub(crate) fn build_plan(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    dest_index: Option<usize>,
+    elem_size: usize,
+) -> KernelPlan {
+    let order = order::compute_order(dims, strides_list, dest_index);
+    let ordered_dims: InlineVec<usize> = order.iter().map(|&d| dims[d]).collect();
+    let ordered_strides: OperandVec<InlineVec<isize>> = strides_list
+        .iter()
+        .map(|strides| order.iter().map(|&d| strides[d]).collect())
+        .collect();
+    let ordered_strides_refs: OperandVec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
+    let block = block::compute_block_sizes(&ordered_dims, &ordered_strides_refs, elem_size);
+    KernelPlan { order, block }
+}
+
+/// Build an execution plan with dimension fusion.
+///
+/// Pipeline: order -> reorder -> fuse -> block.
+///
+/// Ordering first ensures that dimensions are sorted by stride importance
+/// (smallest stride innermost). Fusing *after* ordering catches contiguous
+/// dimensions regardless of the original memory layout (column-major,
+/// row-major, or any permutation).
+///
+/// Returns `(fused_dims, ordered_strides, KernelPlan)` where dimensions
+/// and strides are already in iteration order (plan.order is identity).
+pub(crate) fn build_plan_fused(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    dest_index: Option<usize>,
+    elem_size: usize,
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
+    // 1. Compute optimal iteration order on original dims
+    let order = order::compute_order(dims, strides_list, dest_index);
+
+    // 2. Reorder dims and strides
+    let ordered_dims: InlineVec<usize> = order.iter().map(|&d| dims[d]).collect();
+    let ordered_strides: OperandVec<InlineVec<isize>> = strides_list
+        .iter()
+        .map(|strides| order.iter().map(|&d| strides[d]).collect())
+        .collect();
+    let ordered_strides_refs: OperandVec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
+
+    // 3. Fuse contiguous dimensions in ordered space
+    let fused_dims = fuse_dims(&ordered_dims, &ordered_strides_refs);
+
+    // 4. Compress: remove size-1 dimensions to reduce loop depth
+    let (compressed_dims, compressed_strides) = compress_dims(&fused_dims, &ordered_strides_refs);
+    let compressed_strides_refs: OperandVec<&[isize]> =
+        compressed_strides.iter().map(|s| s.as_slice()).collect();
+
+    // 5. Compute blocks on the already ordered axes
+    let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
+    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_size);
+
+    (
+        compressed_dims,
+        compressed_strides,
+        KernelPlan {
+            order: identity,
+            block,
+        },
+    )
+}
+
+/// Simplified plan for small tensors that fit in L1 cache.
+///
+/// Skips `compute_order` and `compute_block_sizes` since blocking is
+/// unnecessary for small data. Only fuses and compresses dimensions
+/// to reduce loop depth.
+///
+/// Returns `(fused_dims, fused_strides, KernelPlan)` where the plan's
+/// order is identity and block sizes equal the full dimension sizes.
+pub(crate) fn build_plan_fused_small(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
+    // Single fuse + compress pass (no ordering needed)
+    let fused = fuse_dims(dims, strides_list);
+    let (fused_dims, fused_strides) = compress_dims(&fused, strides_list);
+
+    // Block = full dimension (no tiling)
+    let block = fused_dims.clone();
+    let identity: InlineVec<usize> = (0..fused_dims.len()).collect();
+
+    (
+        fused_dims,
+        fused_strides,
+        KernelPlan {
+            order: identity,
+            block,
+        },
+    )
+}
+
+// ============================================================================
+// Block-based iteration with inner stride callback
+// ============================================================================
+
+/// Iterate over blocks, calling f with (offsets, block_len, inner_strides).
+///
+/// The callback receives the current byte offsets for each array, the number
+/// of elements in the innermost block, and the innermost strides for each array.
+/// This allows the caller to implement vectorized inner loops.
+#[cfg(test)]
+#[inline]
+pub(crate) fn for_each_inner_block<F>(
+    dims: &[usize],
+    plan: &KernelPlan,
+    strides_list: &[&[isize]],
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let rank = dims.len();
+    if rank == 0 {
+        let offsets: OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
+        return f(&offsets, 1, &[]);
+    }
+
+    // Reorder dimensions and strides according to plan
+    let ordered_dims: InlineVec<usize> = plan.order.iter().map(|&d| dims[d]).collect();
+    let ordered_blocks: InlineVec<usize> = plan.block.clone();
+
+    // Build stride vectors for each array, ordered by plan
+    let mut ordered_strides: OperandVec<InlineVec<isize>> = OperandVec::new();
+    for strides in strides_list {
+        ordered_strides.push(plan.order.iter().map(|&d| strides[d]).collect());
+    }
+    let ordered_strides_refs: OperandVec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
+
+    // Initial offsets (all zero)
+    let mut offsets: OperandVec<isize> = strides_list.iter().map(|_| 0isize).collect();
+
+    // Call the specialized kernel based on rank
+    match rank {
+        1 => kernel_1d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        2 => kernel_2d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        3 => kernel_3d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        4 => kernel_4d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        5 => kernel_5d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        6 => kernel_6d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        7 => kernel_7d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        8 => kernel_8d_inner(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+        _ => kernel_nd_inner_iterative(
+            &ordered_dims,
+            &ordered_blocks,
+            &ordered_strides_refs,
+            &mut offsets,
+            &mut f,
+        ),
+    }
+}
+
+// ============================================================================
+// Macro-generated rank-specialized kernels (inner-block callback)
+// ============================================================================
+
+// Every loop below advances an offset only when another position along its
+// level follows, and each loop rewinds its own level on completion. Offsets
+// therefore only ever hold reachable positions of the validated layouts (plus
+// the caller's initial offsets), so no intermediate value can overflow even
+// when a layout ends within one stride of `isize::MAX` (issue #243
+// follow-up). The rewind distance is the difference of two reachable offsets,
+// so it is representable as well.
+
+/// Element-level nested loops for ranks >= 2.
+///
+/// Iterates over the element block, calling `f` at each innermost position.
+/// Levels are listed from outermost to innermost (excluding level 0 which is
+/// the callback level). For a rank-N kernel, element levels are N-1, N-2, ..., 1.
+/// Each level leaves the offsets where it found them.
+macro_rules! elem_loops {
+    // Base case: single level (innermost element level).
+    // Iterates blens[$lv] times, calling f and advancing by stride[$lv]
+    // between calls.
+    ($offsets:ident, $strides:ident, $f:ident, $blens:ident, $is:ident; $lv:literal) => {
+        for _i in 0..$blens[$lv] {
+            $f($offsets, $blens[0], &$is)?;
+            if _i + 1 < $blens[$lv] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += s[$lv];
+                }
+            }
+        }
+        let _back = $blens[$lv].saturating_sub(1) as isize;
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= _back * s[$lv];
+        }
+    };
+    // Recursive case: outermost level wraps inner levels, which rewind
+    // themselves; this level advances between inner passes.
+    ($offsets:ident, $strides:ident, $f:ident, $blens:ident, $is:ident;
+     $lv:literal, $next:literal $(, $rest:literal)*) => {
+        for _i in 0..$blens[$lv] {
+            elem_loops!($offsets, $strides, $f, $blens, $is; $next $(, $rest)*);
+            if _i + 1 < $blens[$lv] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += s[$lv];
+                }
+            }
+        }
+        let _back = $blens[$lv].saturating_sub(1) as isize;
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= _back * s[$lv];
+        }
+    };
+}
+
+/// Block-level nested while loops for ranks >= 2.
+///
+/// Each block level iterates over tiles of the corresponding dimension.
+/// At level 0 (innermost), element loops are executed. Each block level
+/// advances to the next tile only when one follows and rewinds itself on
+/// completion; inner levels rewind themselves.
+macro_rules! block_loop {
+    // Base case: single block level (the innermost).
+    ($dims:ident, $blocks:ident, $strides:ident, $offsets:ident, $f:ident,
+     $blens:ident, $is:ident; elem=[$($el:literal),+]; $lv0:literal; top=$top:literal) => {{
+        let mut _j = 0usize;
+        let mut _advanced = 0usize;
+        while _j < $dims[$lv0] {
+            $blens[$lv0] = $blocks[$lv0].max(1).min($dims[$lv0]).min($dims[$lv0] - _j);
+            elem_loops!($offsets, $strides, $f, $blens, $is; $($el),+);
+            _j += $blens[$lv0];
+            if _j < $dims[$lv0] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += ($blens[$lv0] as isize) * s[$lv0];
+                }
+                _advanced = _j;
+            }
+        }
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= (_advanced as isize) * s[$lv0];
+        }
+    }};
+    // Recursive case: outer block level wraps inner block levels.
+    ($dims:ident, $blocks:ident, $strides:ident, $offsets:ident, $f:ident,
+     $blens:ident, $is:ident; elem=[$($el:literal),+];
+     $lv:literal, $next:literal $(, $rest:literal)*; top=$top:literal) => {{
+        let mut _j = 0usize;
+        let mut _advanced = 0usize;
+        while _j < $dims[$lv] {
+            $blens[$lv] = $blocks[$lv].max(1).min($dims[$lv]).min($dims[$lv] - _j);
+            block_loop!($dims, $blocks, $strides, $offsets, $f, $blens, $is;
+                elem=[$($el),+]; $next $(, $rest)*; top=$top);
+            _j += $blens[$lv];
+            if _j < $dims[$lv] {
+                for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+                    *o += ($blens[$lv] as isize) * s[$lv];
+                }
+                _advanced = _j;
+            }
+        }
+        for (o, s) in $offsets.iter_mut().zip($strides.iter()) {
+            *o -= (_advanced as isize) * s[$lv];
+        }
+    }};
+}
+
+/// Generate a rank-specialized kernel function.
+///
+/// For rank 1 there are no element loops; only a single block loop on dim 0.
+/// For rank >= 2, block loops nest from outermost to innermost (dim 0), and
+/// element loops nest from dim N-1 down to dim 1 inside the innermost block.
+/// The offsets are back at their starting values on return.
+macro_rules! make_kernel {
+    // Rank 1: single block loop, no element nesting.
+    ($name:ident, rank=1) => {
+        #[inline]
+        fn $name<F>(
+            dims: &[usize],
+            blocks: &[usize],
+            strides: &[&[isize]],
+            offsets: &mut [isize],
+            f: &mut F,
+        ) -> Result<()>
+        where
+            F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+        {
+            let d0 = dims[0];
+            let b0 = blocks[0].max(1).min(d0);
+            let inner_strides: OperandVec<isize> = strides.iter().map(|s| s[0]).collect();
+
+            let mut j0 = 0usize;
+            let mut advanced = 0usize;
+            while j0 < d0 {
+                let blen0 = b0.min(d0 - j0);
+                f(offsets, blen0, &inner_strides)?;
+                j0 += blen0;
+                if j0 < d0 {
+                    for (o, s) in offsets.iter_mut().zip(strides.iter()) {
+                        *o += (blen0 as isize) * s[0];
+                    }
+                    advanced = j0;
+                }
+            }
+            for (o, s) in offsets.iter_mut().zip(strides.iter()) {
+                *o -= (advanced as isize) * s[0];
+            }
+            Ok(())
+        }
+    };
+    // Rank >= 2: nested block loops + element loops.
+    //   block=[outermost, ..., 0]  - block loop levels from outermost to innermost
+    //   elem=[N-1, ..., 1]         - element loop levels from outermost to innermost
+    //   top=N-1                    - topmost element level (= rank - 1)
+    ($name:ident, rank=$rank:literal,
+     block=[$($blk:literal),+], elem=[$($el:literal),+], top=$top:literal) => {
+        #[inline]
+        fn $name<F>(
+            dims: &[usize],
+            blocks: &[usize],
+            strides: &[&[isize]],
+            offsets: &mut [isize],
+            f: &mut F,
+        ) -> Result<()>
+        where
+            F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+        {
+            let inner_strides: OperandVec<isize> = strides.iter().map(|s| s[0]).collect();
+            let mut blens = [0usize; $rank];
+            block_loop!(dims, blocks, strides, offsets, f, blens, inner_strides;
+                elem=[$($el),+]; $($blk),+; top=$top);
+            Ok(())
+        }
+    };
+}
+
+make_kernel!(kernel_1d_inner, rank = 1);
+make_kernel!(
+    kernel_2d_inner,
+    rank = 2,
+    block = [1, 0],
+    elem = [1],
+    top = 1
+);
+make_kernel!(
+    kernel_3d_inner,
+    rank = 3,
+    block = [2, 1, 0],
+    elem = [2, 1],
+    top = 2
+);
+make_kernel!(
+    kernel_4d_inner,
+    rank = 4,
+    block = [3, 2, 1, 0],
+    elem = [3, 2, 1],
+    top = 3
+);
+make_kernel!(
+    kernel_5d_inner,
+    rank = 5,
+    block = [4, 3, 2, 1, 0],
+    elem = [4, 3, 2, 1],
+    top = 4
+);
+make_kernel!(
+    kernel_6d_inner,
+    rank = 6,
+    block = [5, 4, 3, 2, 1, 0],
+    elem = [5, 4, 3, 2, 1],
+    top = 5
+);
+make_kernel!(
+    kernel_7d_inner,
+    rank = 7,
+    block = [6, 5, 4, 3, 2, 1, 0],
+    elem = [6, 5, 4, 3, 2, 1],
+    top = 6
+);
+make_kernel!(
+    kernel_8d_inner,
+    rank = 8,
+    block = [7, 6, 5, 4, 3, 2, 1, 0],
+    elem = [7, 6, 5, 4, 3, 2, 1],
+    top = 7
+);
+
+/// N-dimensional kernel with inner block callback (iterative form).
+///
+/// Fallback for rank >= 9. Uses a carry-style increment over outer levels
+/// instead of compile-time unrolled nested loops.
+#[inline]
+fn kernel_nd_inner_iterative<F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[&[isize]],
+    offsets: &mut [isize],
+    f: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let rank = dims.len();
+    debug_assert!(rank >= 9);
+
+    let d0 = dims[0];
+    let b0 = blocks[0].max(1).min(d0);
+    let inner_strides: OperandVec<isize> = strides.iter().map(|s| s[0]).collect();
+
+    // Current position for each outer level (1..rank-1). Level 0 uses block loop.
+    let mut idx: Vec<usize> = vec![0usize; rank];
+
+    // As in the rank-specialized kernels, offsets advance only when another
+    // position follows and each level rewinds from its last position, so they
+    // never leave the reachable span.
+    if dims.contains(&0) {
+        return Ok(());
+    }
+    loop {
+        // Level 0: callback over contiguous block fragments.
+        let mut j0 = 0usize;
+        let mut advanced = 0usize;
+        while j0 < d0 {
+            let blen0 = b0.min(d0 - j0);
+            f(offsets, blen0, &inner_strides)?;
+            j0 += blen0;
+            if j0 < d0 {
+                for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                    *offset += (blen0 as isize) * s[0];
+                }
+                advanced = j0;
+            }
+        }
+        for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+            *offset -= (advanced as isize) * s[0];
+        }
+
+        // Carry-style increment for outer levels.
+        let mut level = 1usize;
+        loop {
+            if idx[level] + 1 < dims[level] {
+                idx[level] += 1;
+                for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                    *offset += s[level];
+                }
+                break;
+            }
+
+            let last = (dims[level] - 1) as isize;
+            idx[level] = 0;
+            for (offset, s) in offsets.iter_mut().zip(strides.iter()) {
+                *offset -= last * s[level];
+            }
+            level += 1;
+            if level == rank {
+                return Ok(());
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Pre-ordered iteration (for threaded leaf functions)
+// ============================================================================
+
+/// Iterate over blocks with pre-ordered dimensions and initial offsets.
+///
+/// Unlike `for_each_inner_block`, this function assumes that `dims`, `blocks`,
+/// and `strides` are **already in iteration order** (i.e., identity ordering).
+/// It also accepts `initial_offsets` which are added to the starting offsets
+/// before iteration begins.
+///
+/// This avoids the redundant re-ordering and per-callback `Vec` allocation
+/// that `for_each_inner_block_with_offsets` previously incurred.
+///
+/// The block-walking machinery is compiled once (`preordered_dyn`): a generic
+/// caller only instantiates its own callback, reached through one indirect call
+/// per inner block (a run of elements, never per element). Keeping the walk
+/// generic would duplicate it for every operation, dtype and element-op
+/// combination of every downstream crate.
+#[inline]
+pub(crate) fn for_each_inner_block_preordered<S: AsRef<[isize]>, F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[S],
+    initial_offsets: &[isize],
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let refs: OperandVec<&[isize]> = strides.iter().map(|s| s.as_ref()).collect();
+    preordered_dyn(dims, blocks, &refs, initial_offsets, &mut f)
+}
+
+type BlockFn<'a> = &'a mut dyn FnMut(&[isize], usize, &[isize]) -> Result<()>;
+
+#[inline(never)]
+fn preordered_dyn(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[&[isize]],
+    initial_offsets: &[isize],
+    mut f: BlockFn<'_>,
+) -> Result<()> {
+    let rank = dims.len();
+    if rank == 0 {
+        return f(initial_offsets, 1, &[]);
+    }
+
+    // Start from initial_offsets (kernel functions reset to starting values at end)
+    let mut offsets: OperandVec<isize> = initial_offsets.iter().copied().collect();
+
+    match rank {
+        1 => kernel_1d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        2 => kernel_2d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        3 => kernel_3d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        4 => kernel_4d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        5 => kernel_5d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        6 => kernel_6d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        7 => kernel_7d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        8 => kernel_8d_inner(dims, blocks, strides, &mut offsets, &mut f),
+        _ => kernel_nd_inner_iterative(dims, blocks, strides, &mut offsets, &mut f),
+    }
+}
+
+// ============================================================================
+// Utility functions
+// ============================================================================
+
+/// Check exact shape agreement before prevalidated replay.
+///
+/// # Examples
+///
+/// ```
+/// use strided_basic::execution::ensure_same_shape;
+/// ensure_same_shape(&[2, 3], &[2, 3]).unwrap();
+/// assert!(ensure_same_shape(&[2, 3], &[3, 2]).is_err());
+/// ```
+///
+/// # Errors
+///
+/// Returns [`StridedError::RankMismatch`] when the two shapes have different
+/// ranks, and [`StridedError::ShapeMismatch`] when their extents differ.
+pub fn ensure_same_shape(a: &[usize], b: &[usize]) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(crate::StridedError::RankMismatch(a.len(), b.len()));
+    }
+    if a != b {
+        return Err(crate::StridedError::ShapeMismatch(a.to_vec(), b.to_vec()));
+    }
+    Ok(())
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ContiguousLayout {
+    /// C-like layout: last axis varies fastest.
+    RowMajor,
+    /// Julia/Fortran-like layout: first axis varies fastest.
+    ColMajor,
+}
+
+/// Returns the contiguous memory layout kind for the given (dims, strides).
+///
+/// Notes:
+/// - Ignores axes with `dim <= 1` since they do not affect addressability.
+/// - Does not treat negative-stride views as contiguous for fast-path purposes.
+pub(crate) fn contiguous_layout(dims: &[usize], strides: &[isize]) -> Option<ContiguousLayout> {
+    if dims.len() != strides.len() {
+        return None;
+    }
+    if dims.is_empty() {
+        return Some(ContiguousLayout::RowMajor);
+    }
+
+    // Row-major: check from last to first.
+    let mut expected = 1isize;
+    let mut row_ok = true;
+    for (&dim, &stride) in dims.iter().rev().zip(strides.iter().rev()) {
+        if dim <= 1 {
+            continue;
+        }
+        if stride != expected {
+            row_ok = false;
+            break;
+        }
+        expected = expected.saturating_mul(dim as isize);
+    }
+    if row_ok {
+        return Some(ContiguousLayout::RowMajor);
+    }
+
+    // Col-major: check from first to last.
+    let mut expected = 1isize;
+    for (&dim, &stride) in dims.iter().zip(strides.iter()) {
+        if dim <= 1 {
+            continue;
+        }
+        if stride != expected {
+            return None;
+        }
+        expected = expected.saturating_mul(dim as isize);
+    }
+    Some(ContiguousLayout::ColMajor)
+}
+
+/// Checked element count of `dims`.
+///
+/// A shape containing a zero extent has zero elements even when the product
+/// of its other extents would overflow; such views pass
+/// `strided_view::validate_bounds`, so this must not form that product. A
+/// nonempty shape whose element count exceeds `usize::MAX` (for example a
+/// huge stride-0 broadcast) returns [`StridedError::OffsetOverflow`].
+pub(crate) fn total_len(dims: &[usize]) -> Result<usize> {
+    if dims.contains(&0) {
+        return Ok(0);
+    }
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)
+}
+
+/// Whether the sequential contiguous fast path should be used.
+///
+/// When a fork over `total` elements of `class` pays and `exec` has a second slot,
+/// the contiguous fast path must not be taken so that the parallel kernel path
+/// can be reached. A serial token has no threaded path to reach and the
+/// sequential slice loop is the right kernel.
+#[inline]
+pub(crate) fn use_sequential_fast_path(
+    class: crate::cost::KernelClass,
+    total: usize,
+    exec: &Exec<'_>,
+) -> bool {
+    !crate::threading::is_parallel(class, total, exec)
+}
+
+/// Returns the common contiguous layout if **all** provided stride arrays
+/// share the same contiguous layout for the given `dims`.
+///
+/// Returns `None` if `strides_list` is empty, any array is not contiguous,
+/// or any two arrays have different contiguous layouts.
+#[inline]
+pub(crate) fn same_contiguous_layout(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+) -> Option<ContiguousLayout> {
+    let first = contiguous_layout(dims, strides_list.first()?)?;
+    for strides in &strides_list[1..] {
+        if contiguous_layout(dims, strides)? != first {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// Returns the common contiguous layout only when the sequential fast path
+/// should be used (a fork over the elements does not pay for `class`, or a serial token).
+///
+/// `class` is the cost class of the kernel the caller would otherwise fork:
+/// a copy asks as `Copy`, a reduction as `Reduce`, an element map as `Map`.
+///
+/// Returns [`StridedError::OffsetOverflow`] when the element count of `dims`
+/// does not fit in `usize`.
+#[inline]
+pub(crate) fn sequential_contiguous_layout(
+    class: crate::cost::KernelClass,
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    exec: &Exec<'_>,
+) -> Result<Option<ContiguousLayout>> {
+    if !use_sequential_fast_path(class, total_len(dims)?, exec) {
+        return Ok(None);
+    }
+    Ok(same_contiguous_layout(dims, strides_list))
+}
+
+#[cfg(test)]
+#[path = "kernel/tests/tests.rs"]
+mod tests;

@@ -1,0 +1,8 @@
+strided-fused
+
+This crate contains runtime-DAG fused execution separated from strided-kernel.
+Its shared traversal foundation, strided-basic, ports algorithms from Julia's
+Strided.jl: https://github.com/Jutho/Strided.jl
+
+The upstream MIT notice inherited with the original component is retained in
+THIRD-PARTY-LICENSES. This crate is licensed under LICENSE-APACHE and LICENSE-MIT.

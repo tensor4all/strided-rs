@@ -57,7 +57,6 @@ def configure_thread_env(num_threads: int) -> None:
             "OMP_NUM_THREADS": value,
             "OMP_THREAD_LIMIT": value,
             "OMP_DYNAMIC": "FALSE",
-            "RAYON_NUM_THREADS": value,
             "OPENBLAS_NUM_THREADS": value,
             "GOTO_NUM_THREADS": value,
             "MKL_NUM_THREADS": value,
@@ -302,6 +301,11 @@ def run(args: argparse.Namespace, writer: csv.DictWriter) -> None:
     torch.manual_seed(0)
     torch.set_num_threads(args.num_threads)
     torch.set_num_interop_threads(args.num_threads)
+    effective = torch.get_num_threads()
+    if effective != args.num_threads:
+        raise SystemExit(
+            f"torch effective thread count {effective} != requested {args.num_threads}"
+        )
 
     for dtype in parse_dtypes(args.dtypes):
         for kind, dims in case_specs(args.profile):

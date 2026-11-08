@@ -12,6 +12,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  workflow-lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # YAML の構文だけでなく「そのコンテキストがそこで使えるか」まで見る。
+      # 実例: workflow 階層の `concurrency.group` で `matrix` を参照しており、
+      # YAML としては正しいが GitHub が受け付けず、ワークフローが起動しなかった。
+      - uses: raven-actions/actionlint@v2
+        with:
+          # shellcheck も走るが、`ci.yml` には既存の SC2086 が 3 件ある（本 PR の範囲外）。
+          # 先に既存を直すまで shellcheck は切り、actionlint 本体（構文・コンテキスト）だけ強制する。
+          shellcheck: false
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -26,6 +40,11 @@ jobs:
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Backstop, measured on run 42451599046 (2026-11-08): this job takes 3m25s on
+    # ubuntu. 30 min still surfaces a hang as a failure instead of leaving the job
+    # `in_progress` (tensor4all/strided-rs#395), and it is far above the slowest
+    # legitimate run, including a cold cargo cache.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -38,10 +57,142 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --profile ci
 
-      - name: Run facade README doctests
-        run: cargo test -p strided-rs --doc
+      # The step carries its own, tighter budget: the hang in #395 is here, and a
+      # step timeout fails the job while still letting the `if: always()` step
+      # below run. Measured at 1m34s on run 42451599046; 15 min is ~10x that.
+      - name: Overhead smoke gates (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: |
+          OVERHEAD_GATE=1 cargo bench --profile release -p strided-basic --bench overhead_smoke
+          OVERHEAD_GATE=1 cargo bench --profile release -p strided-fused --bench overhead_smoke
+
+      - name: Runtime SIMD dispatch check (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/check-runtime-simd-dispatch.py
+
+      - name: Report Cargo artifact usage
+        if: always()
+        run: |
+          du -sh target
+          df -h target
+
+  # Feature lanes, one job per lane, each lane selecting its own crates and then
+  # proving the feature set cargo actually compiled.
+  #
+  # The crates are selected with `-p` instead of building the workspace: a
+  # workspace-wide `--no-default-features` run does not turn anything off, because
+  # `strided-nn` requires `strided-basic/parallel` and depends on `pulp`
+  # unconditionally (strided-nn/Cargo.toml:18,20), and feature unification then
+  # keeps `threadteam/parallel` and `pulp` in every lane. `strided-nn` is covered
+  # by the workspace-wide `test` job above, where those requirements are already
+  # on.
+  #
+  # The `default` lane is the `test` job's `cargo test --profile ci` step. The
+  # `parallel` lane runs on both operating systems, because it is the only place
+  # the `#[cfg(feature = "parallel")]` tests of `strided-fused`
+  # (strided-fused/src/fused/tests/tests.rs:336,778) run alongside the macOS
+  # host class.
+  features:
+    name: feature lanes (${{ matrix.lane }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      LANE_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-kernel -p strided-fused
+      # `strided-kernel` is deliberately absent: its dev-dependency `strided-nn`
+      # requires `strided-basic/parallel` and `pulp` unconditionally, and cargo
+      # unifies features across the whole invocation, so any `cargo test` that
+      # includes `strided-kernel` re-enables parallelism for every crate in the
+      # graph. Its library is still proven below; its tests run in the `test`
+      # job and the `parallel` lanes, where those requirements are on anyway.
+      LANE_TEST_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-fused
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: parallel
+            os: ubuntu-latest
+            flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            basic: default parallel simd
+            pulp: yes
+          - lane: parallel
+            os: macos-latest
+            flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            basic: default parallel simd
+            pulp: yes
+          - lane: no-default-features
+            os: ubuntu-latest
+            flags: --no-default-features
+            test_flags: --no-default-features
+            basic: ""
+            pulp: no
+          - lane: parallel-no-simd
+            os: ubuntu-latest
+            flags: --no-default-features --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --no-default-features --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            basic: parallel
+            pulp: no
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: features-${{ matrix.lane }}-${{ matrix.os }}
+
+      # A lane that compiles something other than its name is worse than no lane:
+      # this reads the enabled feature list of every `strided-basic` unit cargo
+      # built, and whether `pulp` was built at all. The library graph and the test
+      # graph are asserted separately: they are not the same graph, and only the
+      # test graph is what the tests actually run against.
+      - name: Assert the lane's feature set (library graph)
+        env:
+          WANT_BASIC: ${{ matrix.basic }}
+          WANT_PULP: ${{ matrix.pulp }}
+        run: |
+          cargo build --profile ci $LANE_PACKAGES ${{ matrix.flags }} --message-format=json \
+            | python3 scripts/assert-lane-features.py
+
+      - name: Assert the lane's feature set (test graph)
+        env:
+          WANT_BASIC: ${{ matrix.basic }}
+          WANT_PULP: ${{ matrix.pulp }}
+        run: |
+          cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }} --no-run --message-format=json \
+            | python3 scripts/assert-lane-features.py
+
+      - name: Run tests (${{ matrix.lane }})
+        run: cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }}
+
+  placement:
+    name: placement rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Only threadteam depends on rayon
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans
+
+  scripts:
+    name: maintenance scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the repository-rules review script
+        run: python3 scripts/test-repository-rules-review.py
+      - name: Test the runtime SIMD dispatch check script
+        run: python3 scripts/test-check-runtime-simd-dispatch.py
+      - name: Test the review waiver script
+        run: node --test scripts/test-review-waiver.js
+      - name: Check the two oracle copies are identical
+        run: bash scripts/check-oracle-copy.sh
 
   coverage:
     name: coverage
@@ -61,6 +212,8 @@ jobs:
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

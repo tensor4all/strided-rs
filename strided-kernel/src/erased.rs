@@ -1,38 +1,167 @@
-//! Dtype-erased prepared kernel entry points.
-//!
-//! These wrappers keep dtype-specific monomorphization inside `strided-kernel`
-//! so downstream runtime crates can replay prepared kernels through stable,
-//! non-generic entry points.
-//!
-//! C ABI symbols are intentionally out of scope here. A future ABI layer must
-//! pass an explicit execution context, preserve the non-overlap contract for
-//! descriptors used by one replay call, and validate ABI dtype tags before
-//! constructing these Rust descriptors.
-//!
-//! The safe Rust descriptor constructors validate dtype byte layout up front.
-//! Mutable erased descriptors only re-scan value-constrained dtypes, currently
-//! `bool`, after their raw bytes have escaped through `data_mut`.
-
+use crate::*;
 use core::ops::Add;
-
 use num_complex::{Complex32, Complex64};
-use num_traits::{One, Zero};
+use strided_basic::execution::check_static_indexing_dtype;
+use strided_basic::execution::{check_dtype, validate_uninit_no_overlap};
 
-use crate::{
-    fused_elementwise_into, ConcatenatePlan, CopyPlan, DynamicSlicePlan, DynamicUpdateSlicePlan,
-    ErasedRawStridedMut, ErasedRawStridedRef, ExecContext, FusedPlan, FusedScalar, GatherIndex,
-    GatherPlan, GatherSpec, KernelDType, PadPlan, RawStridedMut, RawStridedRef, Result,
-    ReversePlan, ScatterPlan, ScatterSpec, SlicePlan, StridedError, StridedView, StridedViewMut,
-    RAW_FUSED_RANK_LIMIT,
+mod uninit;
+pub use uninit::{
+    erased_broadcast_mul_into_uninit, erased_clamp_into_uninit, erased_compare_into_uninit,
+    erased_map_into_uninit, erased_select_into_uninit, erased_zip_into_uninit,
 };
+/// Runtime unary operation for [`erased_map_into`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErasedMapOp {
+    Negate,
+    Conj,
+    Abs,
+    Sign,
+}
 
-const ERASED_FUSED_INPUT_LIMIT: usize = 4;
+impl ErasedMapOp {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Negate => "negate",
+            Self::Conj => "conj",
+            Self::Abs => "abs",
+            Self::Sign => "sign",
+        }
+    }
+}
 
-/// Dtype-erased wrapper around [`CopyPlan`].
-#[derive(Clone, Debug)]
-pub struct ErasedCopyPlan {
+/// Runtime binary operation for [`erased_zip_into`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErasedZipOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Maximum,
+    Minimum,
+}
+
+impl ErasedZipOp {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Multiply => "multiply",
+            Self::Divide => "divide",
+            Self::Remainder => "remainder",
+            Self::Maximum => "maximum",
+            Self::Minimum => "minimum",
+        }
+    }
+}
+
+/// Apply one runtime-selected unary operation without compiling a plan.
+///
+/// The destination must not overlap the input. Real and complex dtypes support
+/// every [`ErasedMapOp`], signed integers use wrapping negate/abs semantics,
+/// and `bool` supports only [`ErasedMapOp::Conj`]. Complex absolute value has
+/// the real output contract `c32 -> f32` and `c64 -> f64`; all other supported
+/// unary operations preserve dtype.
+///
+/// # Errors
+///
+/// Returns [`StridedError::DTypeMismatch`] when `input` or `dest` does not
+/// carry the dtype that `input_dtype` and `op` imply,
+/// [`StridedError::UnsupportedOp`] for a `bool` input with any op other than
+/// [`ErasedMapOp::Conj`], [`StridedError::OverlappingInputOutput`] when the
+/// input allocation overlaps the destination,
+/// [`StridedError::InvalidBoolByte`] when a `bool` input holds a byte other
+/// than 0 or 1, [`StridedError::NonInjectiveOutputLayout`] when the
+/// destination layout cannot be proven to place logical elements on distinct
+/// offsets, and [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from the
+/// input dims. Validation completes before any write.
+pub fn erased_map_into(
+    input_dtype: KernelDType,
+    op: ErasedMapOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    check_dtype(input_dtype, input.dtype())?;
+    check_dtype(map_output_dtype(input_dtype, op)?, dest.dtype())?;
+    validate_no_overlap(dest, input, 0)?;
+    // SAFETY: input/output overlap was rejected before forming references.
+    let input = unsafe { input.try_as_ref_after_no_overlap() }?;
+
+    match (input_dtype, op) {
+        (KernelDType::C32, ErasedMapOp::Abs) => {
+            execute_one_shot_map_with::<f32, Complex32>(dest, &input, |value| value.norm(), exec)
+        }
+        (KernelDType::C64, ErasedMapOp::Abs) => {
+            execute_one_shot_map_with::<f64, Complex64>(dest, &input, |value| value.norm(), exec)
+        }
+        (KernelDType::F32, _) => execute_one_shot_map::<f32>(op, dest, &input, exec),
+        (KernelDType::F64, _) => execute_one_shot_map::<f64>(op, dest, &input, exec),
+        (KernelDType::I32, _) => execute_one_shot_map::<i32>(op, dest, &input, exec),
+        (KernelDType::I64, _) => execute_one_shot_map::<i64>(op, dest, &input, exec),
+        (KernelDType::Bool, _) => execute_one_shot_map::<bool>(op, dest, &input, exec),
+        (KernelDType::C32, _) => execute_one_shot_map::<Complex32>(op, dest, &input, exec),
+        (KernelDType::C64, _) => execute_one_shot_map::<Complex64>(op, dest, &input, exec),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: input_dtype.label(),
+        }),
+    }
+}
+
+/// Apply one runtime-selected binary operation without compiling a plan.
+///
+/// The destination must not overlap either input. Real dtypes support every
+/// [`ErasedZipOp`]. Signed integers support every operation with wrapping
+/// arithmetic and a pre-write zero-divisor check. Complex dtypes support
+/// add/subtract/multiply/divide. `bool` has no binary one-shot operations.
+///
+/// # Errors
+///
+/// Returns [`StridedError::DTypeMismatch`] when `dest`, `lhs`, or `rhs` does
+/// not carry `dtype`, [`StridedError::UnsupportedOp`] for `bool` operands or
+/// for a complex remainder/maximum/minimum,
+/// [`StridedError::OverlappingInputOutput`] when either input allocation
+/// overlaps the destination, [`StridedError::InvalidBoolByte`] when an input
+/// holds a `bool` byte other than 0 or 1,
+/// [`StridedError::IntegerDivisionByZero`] when an integer divide or
+/// remainder finds a zero divisor, [`StridedError::NonInjectiveOutputLayout`]
+/// when the destination layout cannot be proven to place logical elements on
+/// distinct offsets, and [`StridedError::RankMismatch`] or
+/// [`StridedError::ShapeMismatch`] when the destination dims differ from
+/// either input's dims. Validation completes before any write.
+pub fn erased_zip_into(
     dtype: KernelDType,
-    plan: CopyPlan,
+    op: ErasedZipOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    lhs: &ErasedRawStridedPtr<'_>,
+    rhs: &ErasedRawStridedPtr<'_>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    check_dtype(dtype, dest.dtype())?;
+    check_dtype(dtype, lhs.dtype())?;
+    check_dtype(dtype, rhs.dtype())?;
+    validate_no_overlap(dest, lhs, 0)?;
+    validate_no_overlap(dest, rhs, 1)?;
+    // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+    let lhs = unsafe { lhs.try_as_ref_after_no_overlap() }?;
+    // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+    let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
+
+    match dtype {
+        KernelDType::F32 => execute_one_shot_zip::<f32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::F64 => execute_one_shot_zip::<f64>(op, dest, &lhs, &rhs, exec),
+        KernelDType::I32 => execute_one_shot_zip::<i32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::I64 => execute_one_shot_zip::<i64>(op, dest, &lhs, &rhs, exec),
+        KernelDType::Bool => execute_one_shot_zip::<bool>(op, dest, &lhs, &rhs, exec),
+        KernelDType::C32 => execute_one_shot_zip::<Complex32>(op, dest, &lhs, &rhs, exec),
+        KernelDType::C64 => execute_one_shot_zip::<Complex64>(op, dest, &lhs, &rhs, exec),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: dtype.label(),
+        }),
+    }
 }
 
 /// Dtype-erased static-slice wrapper.
@@ -56,78 +185,21 @@ pub struct ErasedPadPlan {
     plan: PadPlan,
 }
 
-/// Dtype-erased concatenate wrapper.
-#[derive(Clone, Debug)]
-pub struct ErasedConcatenatePlan {
-    dtype: KernelDType,
-    plan: ConcatenatePlan,
-}
-
-impl ErasedCopyPlan {
-    /// Compile a copy plan for one dtype and layout pair.
-    pub fn compile(
-        dtype: KernelDType,
-        dims: &[usize],
-        dst_strides: &[isize],
-        src_strides: &[isize],
-    ) -> Result<Self> {
-        Ok(Self {
-            dtype,
-            plan: CopyPlan::compile(dims, dst_strides, src_strides)?,
-        })
-    }
-
-    #[inline]
-    pub fn dtype(&self) -> KernelDType {
-        self.dtype
-    }
-
-    /// `dest = src` through a non-generic dtype-erased replay boundary.
-    pub fn execute(
-        &self,
-        ctx: &ExecContext,
-        dest: &mut ErasedRawStridedMut<'_>,
-        src: &ErasedRawStridedRef<'_>,
-    ) -> Result<()> {
-        self.check_dtype(dest.dtype())?;
-        self.check_dtype(src.dtype())?;
-        dest.validate_data_if_needed()?;
-
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_copy::<f32>(&self.plan, dest, src),
-            KernelDType::F64 => execute_copy::<f64>(&self.plan, dest, src),
-            KernelDType::I32 => execute_copy::<i32>(&self.plan, dest, src),
-            KernelDType::I64 => execute_copy::<i64>(&self.plan, dest, src),
-            KernelDType::Bool => execute_copy::<bool>(&self.plan, dest, src),
-            KernelDType::C32 => execute_copy::<Complex32>(&self.plan, dest, src),
-            KernelDType::C64 => execute_copy::<Complex64>(&self.plan, dest, src),
-            _ => Err(StridedError::UnsupportedDType {
-                dtype: self.dtype.label(),
-            }),
-        });
-        if result.is_ok() {
-            // SAFETY: `execute_copy` only writes values produced from the
-            // already-validated source descriptor for the same dtype.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
-        result
-    }
-
-    fn check_dtype(&self, actual: KernelDType) -> Result<()> {
-        if actual != self.dtype {
-            return Err(StridedError::DTypeMismatch {
-                expected: self.dtype.label(),
-                actual: actual.label(),
-            });
-        }
-        Ok(())
-    }
-}
-
 impl ErasedSlicePlan {
     /// Validate and store a static slice plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination layout lengths differ from the operand rank,
+    /// [`StridedError::RankMismatch`] when `starts`, `limits`, or
+    /// `slice_strides` differ from it, [`StridedError::InvalidAxis`] for a
+    /// window with `start > limit`, a `limit` beyond the operand extent, or a
+    /// zero slice stride, [`StridedError::ShapeMismatch`] when `dest_dims` is
+    /// not the sliced extents, [`StridedError::NonInjectiveOutputLayout`]
+    /// when the destination layout cannot be proven injective, and
+    /// [`StridedError::OffsetOverflow`] when an element count, a scaled
+    /// source stride, or the source offset delta overflows.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -165,41 +237,99 @@ impl ErasedSlicePlan {
     }
 
     /// Execute a static slice into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows, which an empty operand view whose offset the descriptor
+    /// contract does not bound can reach. Nothing is written unless every
+    /// check succeeds.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_slice::<f32>(&self.plan, dest, operand),
-            KernelDType::F64 => execute_slice::<f64>(&self.plan, dest, operand),
-            KernelDType::I32 => execute_slice::<i32>(&self.plan, dest, operand),
-            KernelDType::I64 => execute_slice::<i64>(&self.plan, dest, operand),
-            KernelDType::Bool => execute_slice::<bool>(&self.plan, dest, operand),
-            KernelDType::C32 => execute_slice::<Complex32>(&self.plan, dest, operand),
-            KernelDType::C64 => execute_slice::<Complex64>(&self.plan, dest, operand),
+        match self.dtype {
+            KernelDType::F32 => execute_slice::<f32>(&self.plan, dest, operand, exec),
+            KernelDType::F64 => execute_slice::<f64>(&self.plan, dest, operand, exec),
+            KernelDType::I32 => execute_slice::<i32>(&self.plan, dest, operand, exec),
+            KernelDType::I64 => execute_slice::<i64>(&self.plan, dest, operand, exec),
+            KernelDType::Bool => execute_slice::<bool>(&self.plan, dest, operand, exec),
+            KernelDType::C32 => execute_slice::<Complex32>(&self.plan, dest, operand, exec),
+            KernelDType::C64 => execute_slice::<Complex64>(&self.plan, dest, operand, exec),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: static slice writes values read from a descriptor with
-            // the same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
         }
-        result
+    }
+
+    /// Execute a static slice as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::OverlappingInputOutput`] when the input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` input holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows. Every rejection above is returned before any destination
+    /// write.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = unsafe { operand.try_as_ref_after_no_overlap() }?;
+
+        match self.dtype {
+            KernelDType::F32 => execute_slice_uninit::<f32>(&self.plan, dest, &operand, exec),
+            KernelDType::F64 => execute_slice_uninit::<f64>(&self.plan, dest, &operand, exec),
+            KernelDType::I32 => execute_slice_uninit::<i32>(&self.plan, dest, &operand, exec),
+            KernelDType::I64 => execute_slice_uninit::<i64>(&self.plan, dest, &operand, exec),
+            KernelDType::Bool => execute_slice_uninit::<bool>(&self.plan, dest, &operand, exec),
+            KernelDType::C32 => execute_slice_uninit::<Complex32>(&self.plan, dest, &operand, exec),
+            KernelDType::C64 => execute_slice_uninit::<Complex64>(&self.plan, dest, &operand, exec),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
     }
 }
 
 impl ErasedReversePlan {
     /// Validate and store a reverse plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination stride list does not match the operand rank,
+    /// [`StridedError::InvalidAxis`] when a listed axis is out of range,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, and [`StridedError::OffsetOverflow`] when
+    /// an element count, a negated source stride, or the source offset delta
+    /// overflows.
     pub fn compile(
         dtype: KernelDType,
         operand_dims: &[usize],
@@ -225,41 +355,106 @@ impl ErasedReversePlan {
     }
 
     /// Execute a reverse into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows, which an empty operand view whose offset the descriptor
+    /// contract does not bound can reach. Nothing is written unless every
+    /// check succeeds.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_reverse::<f32>(&self.plan, dest, operand),
-            KernelDType::F64 => execute_reverse::<f64>(&self.plan, dest, operand),
-            KernelDType::I32 => execute_reverse::<i32>(&self.plan, dest, operand),
-            KernelDType::I64 => execute_reverse::<i64>(&self.plan, dest, operand),
-            KernelDType::Bool => execute_reverse::<bool>(&self.plan, dest, operand),
-            KernelDType::C32 => execute_reverse::<Complex32>(&self.plan, dest, operand),
-            KernelDType::C64 => execute_reverse::<Complex64>(&self.plan, dest, operand),
+        match self.dtype {
+            KernelDType::F32 => execute_reverse::<f32>(&self.plan, dest, operand, exec),
+            KernelDType::F64 => execute_reverse::<f64>(&self.plan, dest, operand, exec),
+            KernelDType::I32 => execute_reverse::<i32>(&self.plan, dest, operand, exec),
+            KernelDType::I64 => execute_reverse::<i64>(&self.plan, dest, operand, exec),
+            KernelDType::Bool => execute_reverse::<bool>(&self.plan, dest, operand, exec),
+            KernelDType::C32 => execute_reverse::<Complex32>(&self.plan, dest, operand, exec),
+            KernelDType::C64 => execute_reverse::<Complex64>(&self.plan, dest, operand, exec),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: reverse writes values read from a descriptor with the
-            // same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
         }
-        result
+    }
+
+    /// Execute reverse as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::OverlappingInputOutput`] when the input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` input holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when the operand offset plus the compiled source offset delta
+    /// overflows. Every rejection above is returned before any destination
+    /// write.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = unsafe { operand.try_as_ref_after_no_overlap() }?;
+
+        match self.dtype {
+            KernelDType::F32 => execute_reverse_uninit::<f32>(&self.plan, dest, &operand, exec),
+            KernelDType::F64 => execute_reverse_uninit::<f64>(&self.plan, dest, &operand, exec),
+            KernelDType::I32 => execute_reverse_uninit::<i32>(&self.plan, dest, &operand, exec),
+            KernelDType::I64 => execute_reverse_uninit::<i64>(&self.plan, dest, &operand, exec),
+            KernelDType::Bool => execute_reverse_uninit::<bool>(&self.plan, dest, &operand, exec),
+            KernelDType::C32 => {
+                execute_reverse_uninit::<Complex32>(&self.plan, dest, &operand, exec)
+            }
+            KernelDType::C64 => {
+                execute_reverse_uninit::<Complex64>(&self.plan, dest, &operand, exec)
+            }
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
     }
 }
 
 impl ErasedPadPlan {
     /// Validate and store a pad plan for one dtype and fixed layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::StrideLengthMismatch`] when the operand or
+    /// destination layout lengths differ from the operand rank,
+    /// [`StridedError::RankMismatch`] when the edge or interior padding
+    /// lengths differ from it, [`StridedError::InvalidAxis`] for a negative
+    /// interior padding or a padded extent that does not fit `usize`,
+    /// [`StridedError::ShapeMismatch`] when `dest_dims` is not the padded
+    /// extents, [`StridedError::NonInjectiveOutputLayout`] when the
+    /// destination layout cannot be proven injective, and
+    /// [`StridedError::OffsetOverflow`] when an element count, a padded
+    /// extent, or a cursor stride computation overflows.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -297,193 +492,93 @@ impl ErasedPadPlan {
     }
 
     /// Execute pad into an erased output descriptor using one dtype scalar as fill.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::ByteLengthMismatch`] when `fill` is not exactly one
+    /// element wide, [`StridedError::InvalidBoolByte`] when a `bool` fill
+    /// holds a byte other than 0 or 1, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Nothing is written unless every check
+    /// succeeds.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         fill: &[u8],
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         validate_scalar_bytes(self.dtype, fill)?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_pad::<f32>(&self.plan, dest, operand, fill),
-            KernelDType::F64 => execute_pad::<f64>(&self.plan, dest, operand, fill),
-            KernelDType::I32 => execute_pad::<i32>(&self.plan, dest, operand, fill),
-            KernelDType::I64 => execute_pad::<i64>(&self.plan, dest, operand, fill),
-            KernelDType::Bool => execute_pad::<bool>(&self.plan, dest, operand, fill),
-            KernelDType::C32 => execute_pad::<Complex32>(&self.plan, dest, operand, fill),
-            KernelDType::C64 => execute_pad::<Complex64>(&self.plan, dest, operand, fill),
+        match self.dtype {
+            KernelDType::F32 => execute_pad::<f32>(&self.plan, dest, operand, fill, exec),
+            KernelDType::F64 => execute_pad::<f64>(&self.plan, dest, operand, fill, exec),
+            KernelDType::I32 => execute_pad::<i32>(&self.plan, dest, operand, fill, exec),
+            KernelDType::I64 => execute_pad::<i64>(&self.plan, dest, operand, fill, exec),
+            KernelDType::Bool => execute_pad::<bool>(&self.plan, dest, operand, fill, exec),
+            KernelDType::C32 => execute_pad::<Complex32>(&self.plan, dest, operand, fill, exec),
+            KernelDType::C64 => execute_pad::<Complex64>(&self.plan, dest, operand, fill, exec),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: pad writes either the validated fill scalar or values
-            // read from a descriptor with the same validated dtype.
-            unsafe {
-                dest.assume_data_valid();
-            }
         }
-        result
-    }
-}
-
-impl ErasedConcatenatePlan {
-    /// Validate and store a concatenate plan for one dtype and fixed layout set.
-    pub fn compile(
-        dtype: KernelDType,
-        input_dims: &[&[usize]],
-        input_strides: &[&[isize]],
-        dest_dims: &[usize],
-        dest_strides: &[isize],
-        axis: usize,
-    ) -> Result<Self> {
-        check_static_indexing_dtype(dtype)?;
-        Ok(Self {
-            dtype,
-            plan: ConcatenatePlan::compile(
-                input_dims,
-                input_strides,
-                dest_dims,
-                dest_strides,
-                axis,
-            )?,
-        })
     }
 
-    #[inline]
-    pub fn dtype(&self) -> KernelDType {
-        self.dtype
-    }
-
-    #[inline]
-    pub fn plan(&self) -> &ConcatenatePlan {
-        &self.plan
-    }
-
-    /// Execute concatenate into an erased output descriptor.
-    pub fn execute(
+    /// Execute pad as a full overwrite of uninitialized output storage.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution
+    /// may leave a partially initialized `MaybeUninit` destination, which is
+    /// still safely droppable; no readable value is promised for unwritten
+    /// reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest` or `operand`
+    /// carries a different dtype than the plan,
+    /// [`StridedError::ByteLengthMismatch`] when `fill` is not exactly one
+    /// element wide, [`StridedError::InvalidBoolByte`] when a `bool` fill or
+    /// a `bool` operand holds a byte other than 0 or 1,
+    /// [`StridedError::OverlappingInputOutput`] when the input allocation
+    /// overlaps the destination, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry the
+    /// compiled extents and strides. Every rejection above is returned before
+    /// any destination write.
+    pub fn execute_uninit(
         &self,
-        ctx: &ExecContext,
-        dest: &mut ErasedRawStridedMut<'_>,
-        inputs: &[ErasedRawStridedRef<'_>],
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        fill: &[u8],
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
-        for input in inputs {
-            check_dtype(self.dtype, input.dtype())?;
-        }
-        dest.validate_data_if_needed()?;
+        check_dtype(self.dtype, operand.dtype())?;
+        validate_scalar_bytes(self.dtype, fill)?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = unsafe { operand.try_as_ref_after_no_overlap() }?;
 
-        let result = ctx.run(|| match self.dtype {
-            KernelDType::F32 => execute_concatenate::<f32>(&self.plan, dest, inputs),
-            KernelDType::F64 => execute_concatenate::<f64>(&self.plan, dest, inputs),
-            KernelDType::I32 => execute_concatenate::<i32>(&self.plan, dest, inputs),
-            KernelDType::I64 => execute_concatenate::<i64>(&self.plan, dest, inputs),
-            KernelDType::Bool => execute_concatenate::<bool>(&self.plan, dest, inputs),
-            KernelDType::C32 => execute_concatenate::<Complex32>(&self.plan, dest, inputs),
-            KernelDType::C64 => execute_concatenate::<Complex64>(&self.plan, dest, inputs),
+        match self.dtype {
+            KernelDType::F32 => execute_pad_uninit::<f32>(&self.plan, dest, &operand, fill, exec),
+            KernelDType::F64 => execute_pad_uninit::<f64>(&self.plan, dest, &operand, fill, exec),
+            KernelDType::I32 => execute_pad_uninit::<i32>(&self.plan, dest, &operand, fill, exec),
+            KernelDType::I64 => execute_pad_uninit::<i64>(&self.plan, dest, &operand, fill, exec),
+            KernelDType::Bool => execute_pad_uninit::<bool>(&self.plan, dest, &operand, fill, exec),
+            KernelDType::C32 => {
+                execute_pad_uninit::<Complex32>(&self.plan, dest, &operand, fill, exec)
+            }
+            KernelDType::C64 => {
+                execute_pad_uninit::<Complex64>(&self.plan, dest, &operand, fill, exec)
+            }
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: concatenate writes values read from descriptors with
-            // the same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
-        result
-    }
-}
-
-/// Dtype-erased single-output wrapper around [`FusedPlan`].
-///
-/// This is the erased replay boundary for unary map and zip-map elementwise
-/// families. It supports the same runtime op-code vocabulary as [`FusedPlan`],
-/// but only for the scalar dtypes currently implementing [`FusedScalar`].
-#[derive(Clone, Debug)]
-pub struct ErasedFusedPlan {
-    dtype: KernelDType,
-    plan: FusedPlan,
-}
-
-/// Runtime reduction operation for dtype-erased full reductions.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReduceOp {
-    Sum,
-    Product,
-}
-
-/// Dtype-erased reduction wrapper.
-///
-/// This is the erased replay boundary for full-tensor scalar reductions and
-/// axis reductions with a fixed output layout. It supports only operations with
-/// an unambiguous identity value in the selected dtype.
-#[derive(Clone, Debug)]
-pub struct ErasedReducePlan {
-    dtype: KernelDType,
-    op: ReduceOp,
-    layout: ReduceLayout,
-}
-
-#[derive(Clone, Debug)]
-enum ReduceLayout {
-    Full {
-        dims: Vec<usize>,
-        src_strides: Vec<isize>,
-    },
-    Axes {
-        src_dims: Vec<usize>,
-        src_strides: Vec<isize>,
-        dest_dims: Vec<usize>,
-        dest_strides: Vec<isize>,
-        axes: Vec<usize>,
-        kept_axes: Vec<usize>,
-        reduce_dims: Vec<usize>,
-        dest_total: usize,
-        reduce_total: usize,
-    },
-}
-
-impl ReduceLayout {
-    fn src_dims(&self) -> &[usize] {
-        match self {
-            Self::Full { dims, .. } => dims,
-            Self::Axes { src_dims, .. } => src_dims,
         }
     }
-
-    fn src_strides(&self) -> &[isize] {
-        match self {
-            Self::Full { src_strides, .. } | Self::Axes { src_strides, .. } => src_strides,
-        }
-    }
-
-    fn check_src_layout(&self, src: &ErasedRawStridedRef<'_>) -> Result<()> {
-        if src.dims() != self.src_dims() || src.strides() != self.src_strides() {
-            return Err(StridedError::PlanLayoutMismatch);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AxesLayout<'a> {
-    src_dims: &'a [usize],
-    src_strides: &'a [isize],
-    dest_dims: &'a [usize],
-    dest_strides: &'a [isize],
-    axes: &'a [usize],
-    kept_axes: &'a [usize],
-    reduce_dims: &'a [usize],
-    dest_total: usize,
-    reduce_total: usize,
 }
 
 /// Dtype-erased gather wrapper.
@@ -521,225 +616,24 @@ pub struct ErasedScatterPlan {
     plan: ScatterPlan,
 }
 
-impl ErasedFusedPlan {
-    /// Validate and store a single-output fused elementwise plan for one dtype.
-    pub fn compile(dtype: KernelDType, plan: FusedPlan) -> Result<Self> {
-        check_fused_dtype(dtype)?;
-        if plan.input_count == 0 || plan.input_count > ERASED_FUSED_INPUT_LIMIT {
-            return Err(StridedError::UnsupportedArity {
-                arity: plan.input_count,
-                max: ERASED_FUSED_INPUT_LIMIT,
-            });
-        }
-        if plan.outputs.len() != 1 {
-            return Err(StridedError::RankMismatch(plan.outputs.len(), 1));
-        }
-        validate_fused_plan_for_dtype(dtype, &plan)?;
-        Ok(Self { dtype, plan })
-    }
-
-    #[inline]
-    pub fn dtype(&self) -> KernelDType {
-        self.dtype
-    }
-
-    #[inline]
-    pub fn plan(&self) -> &FusedPlan {
-        &self.plan
-    }
-
-    /// Execute a single-output fused elementwise plan through erased descriptors.
-    pub fn execute(
-        &self,
-        ctx: &ExecContext,
-        dest: &mut ErasedRawStridedMut<'_>,
-        inputs: &[ErasedRawStridedRef<'_>],
-    ) -> Result<()> {
-        if inputs.len() != self.plan.input_count {
-            return Err(StridedError::RankMismatch(
-                inputs.len(),
-                self.plan.input_count,
-            ));
-        }
-        check_dtype(self.dtype, dest.dtype())?;
-        for input in inputs {
-            check_dtype(self.dtype, input.dtype())?;
-        }
-        dest.validate_data_if_needed()?;
-
-        let result = match self.dtype {
-            KernelDType::F32 => execute_fused::<f32>(&self.plan, ctx, dest, inputs),
-            KernelDType::F64 => execute_fused::<f64>(&self.plan, ctx, dest, inputs),
-            KernelDType::I32 => execute_fused::<i32>(&self.plan, ctx, dest, inputs),
-            KernelDType::I64 => execute_fused::<i64>(&self.plan, ctx, dest, inputs),
-            KernelDType::Bool => execute_fused::<bool>(&self.plan, ctx, dest, inputs),
-            KernelDType::C32 => execute_fused::<Complex32>(&self.plan, ctx, dest, inputs),
-            KernelDType::C64 => execute_fused::<Complex64>(&self.plan, ctx, dest, inputs),
-            _ => Err(StridedError::UnsupportedDType {
-                dtype: self.dtype.label(),
-            }),
-        };
-        if result.is_ok() {
-            // SAFETY: supported fused elementwise dtypes have no extra byte
-            // validity invariant beyond the typed values written by the kernel.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
-        result
-    }
-}
-
-impl ErasedReducePlan {
-    /// Validate and store a full-reduction plan for one dtype and source layout.
-    pub fn compile(
-        dtype: KernelDType,
-        op: ReduceOp,
-        dims: &[usize],
-        src_strides: &[isize],
-    ) -> Result<Self> {
-        check_reduce_dtype(dtype)?;
-        if dims.len() != src_strides.len() {
-            return Err(StridedError::StrideLengthMismatch);
-        }
-        checked_total_len(dims)?;
-        Ok(Self {
-            dtype,
-            op,
-            layout: ReduceLayout::Full {
-                dims: dims.to_vec(),
-                src_strides: src_strides.to_vec(),
-            },
-        })
-    }
-
-    /// Validate and store an axis-reduction plan for one dtype and fixed source/output layouts.
-    ///
-    /// `axes` names the source axes reduced away. Output dimensions must be the
-    /// remaining source dimensions in source-axis order. When all axes are
-    /// reduced, any output layout with exactly one reachable element is accepted.
-    #[allow(clippy::too_many_arguments)]
-    pub fn compile_axes(
-        dtype: KernelDType,
-        op: ReduceOp,
-        src_dims: &[usize],
-        src_strides: &[isize],
-        dest_dims: &[usize],
-        dest_strides: &[isize],
-        axes: &[usize],
-    ) -> Result<Self> {
-        check_reduce_dtype(dtype)?;
-        if src_dims.len() != src_strides.len() || dest_dims.len() != dest_strides.len() {
-            return Err(StridedError::StrideLengthMismatch);
-        }
-        checked_total_len(src_dims)?;
-        let dest_total = checked_total_len(dest_dims)?;
-        if !crate::fused::is_injective_layout(dest_dims, dest_strides) {
-            return Err(StridedError::NonInjectiveOutputLayout);
-        }
-        validate_unique_axes(axes, src_dims.len())?;
-
-        let kept_axes: Vec<usize> = (0..src_dims.len())
-            .filter(|axis| !axes.contains(axis))
-            .collect();
-        let expected_dest_dims: Vec<usize> = kept_axes.iter().map(|&axis| src_dims[axis]).collect();
-        if expected_dest_dims.is_empty() {
-            if dest_total != 1 {
-                return Err(StridedError::ShapeMismatch(
-                    dest_dims.to_vec(),
-                    expected_dest_dims,
-                ));
-            }
-        } else if dest_dims != expected_dest_dims.as_slice() {
-            return Err(StridedError::ShapeMismatch(
-                dest_dims.to_vec(),
-                expected_dest_dims,
-            ));
-        }
-
-        let reduce_dims = axes.iter().map(|&axis| src_dims[axis]).collect::<Vec<_>>();
-        let reduce_total = checked_total_len(&reduce_dims)?;
-        Ok(Self {
-            dtype,
-            op,
-            layout: ReduceLayout::Axes {
-                src_dims: src_dims.to_vec(),
-                src_strides: src_strides.to_vec(),
-                dest_dims: dest_dims.to_vec(),
-                dest_strides: dest_strides.to_vec(),
-                axes: axes.to_vec(),
-                kept_axes,
-                reduce_dims,
-                dest_total,
-                reduce_total,
-            },
-        })
-    }
-
-    #[inline]
-    pub fn dtype(&self) -> KernelDType {
-        self.dtype
-    }
-
-    #[inline]
-    pub fn op(&self) -> ReduceOp {
-        self.op
-    }
-
-    /// Execute the reduction into an erased output descriptor.
-    pub fn execute(
-        &self,
-        ctx: &ExecContext,
-        dest: &mut ErasedRawStridedMut<'_>,
-        src: &ErasedRawStridedRef<'_>,
-    ) -> Result<()> {
-        check_dtype(self.dtype, dest.dtype())?;
-        check_dtype(self.dtype, src.dtype())?;
-        self.layout.check_src_layout(src)?;
-        match &self.layout {
-            ReduceLayout::Full { .. } => {
-                let dest_len = checked_total_len(dest.dims())?;
-                if dest_len != 1 {
-                    return Err(StridedError::RankMismatch(dest_len, 1));
-                }
-            }
-            ReduceLayout::Axes {
-                dest_dims,
-                dest_strides,
-                ..
-            } => {
-                if dest.dims() != dest_dims.as_slice() || dest.strides() != dest_strides.as_slice()
-                {
-                    return Err(StridedError::PlanLayoutMismatch);
-                }
-            }
-        }
-        dest.validate_data_if_needed()?;
-
-        let result = match self.dtype {
-            KernelDType::F32 => dispatch_reduce::<f32>(self.op, &self.layout, ctx, dest, src),
-            KernelDType::F64 => dispatch_reduce::<f64>(self.op, &self.layout, ctx, dest, src),
-            KernelDType::I32 => dispatch_reduce::<i32>(self.op, &self.layout, ctx, dest, src),
-            KernelDType::I64 => dispatch_reduce::<i64>(self.op, &self.layout, ctx, dest, src),
-            KernelDType::C32 => dispatch_reduce::<Complex32>(self.op, &self.layout, ctx, dest, src),
-            KernelDType::C64 => dispatch_reduce::<Complex64>(self.op, &self.layout, ctx, dest, src),
-            _ => Err(StridedError::UnsupportedDType {
-                dtype: self.dtype.label(),
-            }),
-        };
-        if result.is_ok() {
-            // SAFETY: supported reduction dtypes have no extra byte validity
-            // invariant beyond the typed scalar written by the kernel.
-            unsafe {
-                dest.assume_data_valid();
-            }
-        }
-        result
-    }
-}
-
 impl ErasedGatherPlan {
     /// Validate and store a gather plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, [`StridedError::StrideLengthMismatch`] when a stride list
+    /// does not match its dimension list, [`StridedError::OffsetOverflow`]
+    /// when an element count or a layout span does not fit `usize`/`isize`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, [`StridedError::RankMismatch`] when
+    /// `spec.slice_sizes` or `spec.offset_dims` has the wrong length or an
+    /// index vector does not match `spec.start_index_map`,
+    /// [`StridedError::InvalidAxis`] for a listed axis outside its rank, a
+    /// repeating axis, an `index_vector_dim` beyond the index rank, a slice
+    /// size beyond its operand extent, or a collapsed axis whose slice size
+    /// is not one, and [`StridedError::ShapeMismatch`] when `dest_dims` is
+    /// not the gathered window/batch shape.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -785,25 +679,37 @@ impl ErasedGatherPlan {
     }
 
     /// Execute an indexed read into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `start_indices` does not carry its compiled dtype,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when a replayed chunk's offset arithmetic cannot be represented. Start
+    /// indices are clamped into the operand window, so an out-of-range index
+    /// is not an error. The dtype and layout checks precede every write, but
+    /// the offset arithmetic runs per worker, so a destination split across
+    /// workers may be partially written when that error surfaces.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         start_indices: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.index_dtype, start_indices.dtype())?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
+        match self.dtype {
             KernelDType::F32 => dispatch_gather_index::<f32>(
                 &self.plan,
                 self.index_dtype,
                 dest,
-                operand,
-                start_indices,
+                &operand,
+                &start_indices,
+                exec,
             ),
             KernelDType::F64 => dispatch_gather_index::<f64>(
                 &self.plan,
@@ -811,6 +717,7 @@ impl ErasedGatherPlan {
                 dest,
                 operand,
                 start_indices,
+                exec,
             ),
             KernelDType::I32 => dispatch_gather_index::<i32>(
                 &self.plan,
@@ -818,6 +725,7 @@ impl ErasedGatherPlan {
                 dest,
                 operand,
                 start_indices,
+                exec,
             ),
             KernelDType::I64 => dispatch_gather_index::<i64>(
                 &self.plan,
@@ -825,6 +733,7 @@ impl ErasedGatherPlan {
                 dest,
                 operand,
                 start_indices,
+                exec,
             ),
             KernelDType::Bool => dispatch_gather_index::<bool>(
                 &self.plan,
@@ -832,6 +741,7 @@ impl ErasedGatherPlan {
                 dest,
                 operand,
                 start_indices,
+                exec,
             ),
             KernelDType::C32 => dispatch_gather_index::<Complex32>(
                 &self.plan,
@@ -839,6 +749,7 @@ impl ErasedGatherPlan {
                 dest,
                 operand,
                 start_indices,
+                exec,
             ),
             KernelDType::C64 => dispatch_gather_index::<Complex64>(
                 &self.plan,
@@ -846,24 +757,131 @@ impl ErasedGatherPlan {
                 dest,
                 operand,
                 start_indices,
+                exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: gather writes values read from a descriptor with the
-            // same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
         }
-        result
+    }
+
+    /// Execute gather into a destination whose reachable slots may be
+    /// uninitialized. On success, every reachable destination slot is fully
+    /// overwritten; unreachable holes are neither read nor initialized. The
+    /// dtype, overlap and layout checks are returned before any destination
+    /// write. A panic during execution may leave a partially initialized
+    /// `MaybeUninit` destination, which is still safely droppable; no
+    /// readable value is promised for unwritten reachable slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `start_indices` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` operand holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides, and [`StridedError::OffsetOverflow`]
+    /// when a replayed chunk's offset arithmetic cannot be represented. Every
+    /// rejection except the last is returned before any destination write;
+    /// the offset arithmetic runs per worker, so a destination split across
+    /// workers may be partially initialized when that error surfaces.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        start_indices: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.index_dtype, start_indices.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        validate_uninit_no_overlap(dest, start_indices, 1)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let start_indices = &unsafe { start_indices.try_as_ref_after_no_overlap() }?;
+        match self.dtype {
+            KernelDType::F32 => execute_gather_uninit_dispatch::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            KernelDType::F64 => execute_gather_uninit_dispatch::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            KernelDType::I32 => execute_gather_uninit_dispatch::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            KernelDType::I64 => execute_gather_uninit_dispatch::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            KernelDType::Bool => execute_gather_uninit_dispatch::<bool>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            KernelDType::C32 => execute_gather_uninit_dispatch::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            KernelDType::C64 => execute_gather_uninit_dispatch::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                start_indices,
+                exec,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
     }
 }
 
 impl ErasedDynamicSlicePlan {
     /// Validate and store a dynamic-slice plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, [`StridedError::StrideLengthMismatch`] when a stride list
+    /// does not match its dimension list, [`StridedError::RankMismatch`] when
+    /// `slice_sizes` differs from the operand rank, or the start layout is
+    /// not a rank-1 vector of that same length,
+    /// [`StridedError::OffsetOverflow`] when an element count or a layout
+    /// span does not fit `usize`/`isize`, [`StridedError::ShapeMismatch`]
+    /// when `dest_dims` differs from `slice_sizes`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, and [`StridedError::InvalidAxis`] when a
+    /// slice size exceeds its operand extent.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -909,25 +927,34 @@ impl ErasedDynamicSlicePlan {
     }
 
     /// Execute a fixed-window dynamic slice into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `starts` does not carry its compiled dtype, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Starts are clamped to `operand_dims -
+    /// slice_sizes`, so an out-of-range start is not an error, and nothing is
+    /// written unless every check succeeds.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         starts: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.index_dtype, starts.dtype())?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
+        match self.dtype {
             KernelDType::F32 => dispatch_dynamic_slice_index::<f32>(
                 &self.plan,
                 self.index_dtype,
                 dest,
-                operand,
-                starts,
+                &operand,
+                &starts,
+                exec,
             ),
             KernelDType::F64 => dispatch_dynamic_slice_index::<f64>(
                 &self.plan,
@@ -935,6 +962,7 @@ impl ErasedDynamicSlicePlan {
                 dest,
                 operand,
                 starts,
+                exec,
             ),
             KernelDType::I32 => dispatch_dynamic_slice_index::<i32>(
                 &self.plan,
@@ -942,6 +970,7 @@ impl ErasedDynamicSlicePlan {
                 dest,
                 operand,
                 starts,
+                exec,
             ),
             KernelDType::I64 => dispatch_dynamic_slice_index::<i64>(
                 &self.plan,
@@ -949,6 +978,7 @@ impl ErasedDynamicSlicePlan {
                 dest,
                 operand,
                 starts,
+                exec,
             ),
             KernelDType::Bool => dispatch_dynamic_slice_index::<bool>(
                 &self.plan,
@@ -956,6 +986,7 @@ impl ErasedDynamicSlicePlan {
                 dest,
                 operand,
                 starts,
+                exec,
             ),
             KernelDType::C32 => dispatch_dynamic_slice_index::<Complex32>(
                 &self.plan,
@@ -963,6 +994,7 @@ impl ErasedDynamicSlicePlan {
                 dest,
                 operand,
                 starts,
+                exec,
             ),
             KernelDType::C64 => dispatch_dynamic_slice_index::<Complex64>(
                 &self.plan,
@@ -970,24 +1002,128 @@ impl ErasedDynamicSlicePlan {
                 dest,
                 operand,
                 starts,
+                exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: dynamic slice writes values read from a descriptor with
-            // the same dtype and already-validated byte representation.
-            unsafe {
-                dest.assume_data_valid();
-            }
         }
-        result
+    }
+
+    /// Execute dynamic slice into a destination whose reachable slots may be
+    /// uninitialized.
+    /// On success, every reachable destination slot is fully overwritten;
+    /// unreachable holes are neither read nor initialized. Validation errors
+    /// are returned before any destination write. A panic during execution may
+    /// leave reachable slots partially initialized, but the `MaybeUninit`
+    /// destination remains safely droppable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`, or
+    /// `starts` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` operand holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Every rejection above is returned before
+    /// any destination write.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        starts: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.index_dtype, starts.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        validate_uninit_no_overlap(dest, starts, 1)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let starts = &unsafe { starts.try_as_ref_after_no_overlap() }?;
+        match self.dtype {
+            KernelDType::F32 => execute_dynamic_slice_uninit_dispatch::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            KernelDType::F64 => execute_dynamic_slice_uninit_dispatch::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            KernelDType::I32 => execute_dynamic_slice_uninit_dispatch::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            KernelDType::I64 => execute_dynamic_slice_uninit_dispatch::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            KernelDType::Bool => execute_dynamic_slice_uninit_dispatch::<bool>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            KernelDType::C32 => execute_dynamic_slice_uninit_dispatch::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            KernelDType::C64 => execute_dynamic_slice_uninit_dispatch::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                starts,
+                exec,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
     }
 }
 
 impl ErasedDynamicUpdateSlicePlan {
     /// Validate and store a dynamic-update-slice plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, [`StridedError::StrideLengthMismatch`] when a stride list
+    /// does not match its dimension list, [`StridedError::RankMismatch`]
+    /// when `update_dims` differs from the operand rank, or the start layout
+    /// is not a rank-1 vector of that same length,
+    /// [`StridedError::OffsetOverflow`] when an element count or a layout
+    /// span does not fit `usize`/`isize`, [`StridedError::ShapeMismatch`]
+    /// when `dest_dims` differs from `operand_dims`,
+    /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
+    /// cannot be proven injective, and [`StridedError::InvalidAxis`] when
+    /// an update extent exceeds its operand extent.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -1035,28 +1171,37 @@ impl ErasedDynamicUpdateSlicePlan {
     }
 
     /// Execute a dynamic update slice into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `update`, or `starts` does not carry its compiled dtype, and
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Starts are clamped to
+    /// `operand_dims - update_dims`, so an out-of-range start is not an
+    /// error, and the operand copy rejects everything above before it runs.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         update: &ErasedRawStridedRef<'_>,
         starts: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.dtype, update.dtype())?;
         check_dtype(self.index_dtype, starts.dtype())?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
+        match self.dtype {
             KernelDType::F32 => dispatch_dynamic_update_slice_index::<f32>(
                 &self.plan,
                 self.index_dtype,
                 dest,
-                operand,
-                update,
-                starts,
+                &operand,
+                &update,
+                &starts,
+                exec,
             ),
             KernelDType::F64 => dispatch_dynamic_update_slice_index::<f64>(
                 &self.plan,
@@ -1065,6 +1210,7 @@ impl ErasedDynamicUpdateSlicePlan {
                 operand,
                 update,
                 starts,
+                exec,
             ),
             KernelDType::I32 => dispatch_dynamic_update_slice_index::<i32>(
                 &self.plan,
@@ -1073,6 +1219,7 @@ impl ErasedDynamicUpdateSlicePlan {
                 operand,
                 update,
                 starts,
+                exec,
             ),
             KernelDType::I64 => dispatch_dynamic_update_slice_index::<i64>(
                 &self.plan,
@@ -1081,6 +1228,7 @@ impl ErasedDynamicUpdateSlicePlan {
                 operand,
                 update,
                 starts,
+                exec,
             ),
             KernelDType::Bool => dispatch_dynamic_update_slice_index::<bool>(
                 &self.plan,
@@ -1089,6 +1237,7 @@ impl ErasedDynamicUpdateSlicePlan {
                 operand,
                 update,
                 starts,
+                exec,
             ),
             KernelDType::C32 => dispatch_dynamic_update_slice_index::<Complex32>(
                 &self.plan,
@@ -1097,6 +1246,7 @@ impl ErasedDynamicUpdateSlicePlan {
                 operand,
                 update,
                 starts,
+                exec,
             ),
             KernelDType::C64 => dispatch_dynamic_update_slice_index::<Complex64>(
                 &self.plan,
@@ -1105,24 +1255,143 @@ impl ErasedDynamicUpdateSlicePlan {
                 operand,
                 update,
                 starts,
+                exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
-        });
-        if result.is_ok() {
-            // SAFETY: dynamic-update-slice writes either values copied from
-            // `operand` or values read from `update`, both with matching dtype.
-            unsafe {
-                dest.assume_data_valid();
-            }
         }
-        result
+    }
+
+    /// On success, the copy phase initializes every reachable destination
+    /// slot before the read-modify-write phase. Unreachable holes are neither
+    /// read nor initialized. Validation errors before the copy leave the
+    /// destination untouched; an error or panic after the copy may leave a
+    /// mixture of old and new reachable values, all initialized and safely
+    /// droppable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `update`, or `starts` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, [`StridedError::InvalidBoolByte`] when a
+    /// `bool` operand or update holds a byte other than 0 or 1,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Every rejection above is returned before
+    /// the operand copy runs.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        update: &ErasedRawStridedPtr<'_>,
+        starts: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.dtype, update.dtype())?;
+        check_dtype(self.index_dtype, starts.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        validate_uninit_no_overlap(dest, update, 1)?;
+        validate_uninit_no_overlap(dest, starts, 2)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let update = &unsafe { update.try_as_ref_after_no_overlap() }?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let starts = &unsafe { starts.try_as_ref_after_no_overlap() }?;
+        match self.dtype {
+            KernelDType::F32 => execute_dynamic_update_uninit_dispatch::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            KernelDType::F64 => execute_dynamic_update_uninit_dispatch::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            KernelDType::I32 => execute_dynamic_update_uninit_dispatch::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            KernelDType::I64 => execute_dynamic_update_uninit_dispatch::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            KernelDType::Bool => execute_dynamic_update_uninit_dispatch::<bool>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            KernelDType::C32 => execute_dynamic_update_uninit_dispatch::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            KernelDType::C64 => execute_dynamic_update_uninit_dispatch::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                update,
+                starts,
+                exec,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
     }
 }
 
 impl ErasedScatterPlan {
     /// Validate and store an additive scatter plan for one value dtype, index dtype, and layout set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::UnsupportedDType`] when `index_dtype` is not
+    /// `i32`/`i64`, or `dtype` is `bool`,
+    /// [`StridedError::StrideLengthMismatch`] when a stride list does not
+    /// match its dimension list, [`StridedError::OffsetOverflow`] when an
+    /// element count or a layout span does not fit `usize`/`isize`,
+    /// [`StridedError::ShapeMismatch`] when `dest_dims` differs from
+    /// `operand_dims` or an update batch extent differs from the index batch
+    /// shape, [`StridedError::NonInjectiveOutputLayout`] when the destination
+    /// layout cannot be proven injective, [`StridedError::InvalidAxis`] for a
+    /// listed axis outside its rank, a repeating axis, an `index_vector_dim`
+    /// beyond the index rank, or an update window extent exceeding its
+    /// operand extent, and [`StridedError::RankMismatch`] for an index vector
+    /// that does not match `spec.scatter_dims_to_operand_dims`, a
+    /// wrong-length `spec.update_window_dims`, or an update batch rank that
+    /// disagrees with the index batch shape.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -1172,28 +1441,37 @@ impl ErasedScatterPlan {
     }
 
     /// Execute additive scatter into an erased output descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `scatter_indices`, or `updates` does not carry its compiled dtype,
+    /// [`StridedError::PlanLayoutMismatch`] when a view does not carry its
+    /// compiled extents and strides. Scatter indices are clamped into the
+    /// operand window, so an out-of-range index is not an error, and the
+    /// operand copy rejects everything above before it runs.
     pub fn execute(
         &self,
-        ctx: &ExecContext,
         dest: &mut ErasedRawStridedMut<'_>,
         operand: &ErasedRawStridedRef<'_>,
         scatter_indices: &ErasedRawStridedRef<'_>,
         updates: &ErasedRawStridedRef<'_>,
+        exec: Exec<'_>,
     ) -> Result<()> {
         check_dtype(self.dtype, dest.dtype())?;
         check_dtype(self.dtype, operand.dtype())?;
         check_dtype(self.dtype, updates.dtype())?;
         check_dtype(self.index_dtype, scatter_indices.dtype())?;
-        dest.validate_data_if_needed()?;
 
-        let result = ctx.run(|| match self.dtype {
+        match self.dtype {
             KernelDType::F32 => dispatch_scatter_index::<f32>(
                 &self.plan,
                 self.index_dtype,
                 dest,
-                operand,
-                scatter_indices,
-                updates,
+                &operand,
+                &scatter_indices,
+                &updates,
+                exec,
             ),
             KernelDType::F64 => dispatch_scatter_index::<f64>(
                 &self.plan,
@@ -1202,6 +1480,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                exec,
             ),
             KernelDType::I32 => dispatch_scatter_index::<i32>(
                 &self.plan,
@@ -1210,6 +1489,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                exec,
             ),
             KernelDType::I64 => dispatch_scatter_index::<i64>(
                 &self.plan,
@@ -1218,6 +1498,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                exec,
             ),
             KernelDType::C32 => dispatch_scatter_index::<Complex32>(
                 &self.plan,
@@ -1226,6 +1507,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                exec,
             ),
             KernelDType::C64 => dispatch_scatter_index::<Complex64>(
                 &self.plan,
@@ -1234,87 +1516,605 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
                 dtype: self.dtype.label(),
             }),
+        }
+    }
+
+    /// On success, the copy phase initializes every reachable destination
+    /// slot before the read-modify-write phase. Unreachable holes are neither
+    /// read nor initialized. Validation errors before the copy leave the
+    /// destination untouched; an error or panic after the copy may leave a
+    /// mixture of old and new reachable values, all initialized and safely
+    /// droppable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StridedError::DTypeMismatch`] when `dest`, `operand`,
+    /// `scatter_indices`, or `updates` does not carry its compiled dtype,
+    /// [`StridedError::OverlappingInputOutput`] when an input allocation
+    /// overlaps the destination, and [`StridedError::PlanLayoutMismatch`]
+    /// when a view does not carry its compiled extents and strides. Every
+    /// rejection above is returned before the operand copy runs.
+    pub fn execute_uninit(
+        &self,
+        dest: &mut ErasedRawStridedUninitMut<'_>,
+        operand: &ErasedRawStridedPtr<'_>,
+        scatter_indices: &ErasedRawStridedPtr<'_>,
+        updates: &ErasedRawStridedPtr<'_>,
+        exec: Exec<'_>,
+    ) -> Result<()> {
+        check_dtype(self.dtype, dest.dtype())?;
+        check_dtype(self.dtype, operand.dtype())?;
+        check_dtype(self.dtype, updates.dtype())?;
+        check_dtype(self.index_dtype, scatter_indices.dtype())?;
+        validate_uninit_no_overlap(dest, operand, 0)?;
+        validate_uninit_no_overlap(dest, scatter_indices, 1)?;
+        validate_uninit_no_overlap(dest, updates, 2)?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let scatter_indices = &unsafe { scatter_indices.try_as_ref_after_no_overlap() }?;
+        // SAFETY: the owning erased entry rejected all input/output overlap before conversion.
+        let updates = &unsafe { updates.try_as_ref_after_no_overlap() }?;
+        match self.dtype {
+            KernelDType::F32 => execute_scatter_uninit_dispatch::<f32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+                add_values::<f32>,
+                exec,
+            ),
+            KernelDType::F64 => execute_scatter_uninit_dispatch::<f64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+                add_values::<f64>,
+                exec,
+            ),
+            KernelDType::I32 => execute_scatter_uninit_dispatch::<i32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+                i32::wrapping_add,
+                exec,
+            ),
+            KernelDType::I64 => execute_scatter_uninit_dispatch::<i64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+                i64::wrapping_add,
+                exec,
+            ),
+            KernelDType::C32 => execute_scatter_uninit_dispatch::<Complex32>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+                add_values::<Complex32>,
+                exec,
+            ),
+            KernelDType::C64 => execute_scatter_uninit_dispatch::<Complex64>(
+                &self.plan,
+                self.index_dtype,
+                dest,
+                operand,
+                scatter_indices,
+                updates,
+                add_values::<Complex64>,
+                exec,
+            ),
+            _ => Err(StridedError::UnsupportedDType {
+                dtype: self.dtype.label(),
+            }),
+        }
+    }
+}
+
+fn add_values<T: Add<Output = T>>(lhs: T, rhs: T) -> T {
+    lhs + rhs
+}
+
+fn execute_one_shot_map<T: OneShotScalar>(
+    op: ErasedMapOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    if !T::supports_map(op) {
+        return Err(StridedError::UnsupportedOp {
+            op: op.label(),
+            dtype: T::one_shot_dtype_label(),
         });
-        if result.is_ok() {
-            // SAFETY: additive scatter copies or adds values with matching,
-            // already-validated dtypes.
+    }
+    let validated = strided_basic::execution::validate_destination_layout_without_alloc(
+        dest.dims(),
+        dest.strides(),
+    )?;
+    strided_basic::execution::ensure_same_shape(dest.dims(), input.dims())?;
+    if dest.dims().contains(&0) {
+        return Ok(());
+    }
+
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let mut dest =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    let input = erased_raw_ref::<T>(input)?;
+
+    // The op is matched once here so each arm replays a loop whose closure
+    // names a constant op. After inlining, `T::map` folds to one arithmetic
+    // expression and the contiguous and threaded leaf loops can vectorize.
+    macro_rules! replay {
+        ($op:ident) => {
+            // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
             unsafe {
-                dest.assume_data_valid();
+                strided_basic::execution::map_raw_into_validated::<T, T, Identity>(
+                    &mut dest,
+                    &input,
+                    |value| T::map(ErasedMapOp::$op, value),
+                    validated, exec,
+)
+            }
+        };
+    }
+    match op {
+        ErasedMapOp::Negate => replay!(Negate),
+        ErasedMapOp::Conj => replay!(Conj),
+        ErasedMapOp::Abs => replay!(Abs),
+        ErasedMapOp::Sign => replay!(Sign),
+    }
+}
+
+fn execute_one_shot_map_with<D, A>(
+    dest: &mut ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedRef<'_>,
+    map: impl Fn(A) -> D + Sync,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync + KernelStorageElement,
+    A: Copy + Send + Sync + KernelStorageElement,
+{
+    let validated = strided_basic::execution::validate_destination_layout_without_alloc(
+        dest.dims(),
+        dest.strides(),
+    )?;
+    strided_basic::execution::ensure_same_shape(dest.dims(), input.dims())?;
+    if dest.dims().contains(&0) {
+        return Ok(());
+    }
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<D>()?;
+    let mut dest =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    let input = erased_raw_ref::<A>(input)?;
+    // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+    unsafe {
+        strided_basic::execution::map_raw_into_validated::<D, A, Identity>(
+            &mut dest, &input, map, validated, exec,
+        )
+    }
+}
+
+fn execute_one_shot_zip<T: OneShotScalar>(
+    op: ErasedZipOp,
+    dest: &mut ErasedRawStridedMut<'_>,
+    lhs: &ErasedRawStridedRef<'_>,
+    rhs: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    if !T::supports_zip(op) {
+        return Err(StridedError::UnsupportedOp {
+            op: op.label(),
+            dtype: T::one_shot_dtype_label(),
+        });
+    }
+    let validated = strided_basic::execution::validate_destination_layout_without_alloc(
+        dest.dims(),
+        dest.strides(),
+    )?;
+    strided_basic::execution::ensure_same_shape(dest.dims(), lhs.dims())?;
+    strided_basic::execution::ensure_same_shape(dest.dims(), rhs.dims())?;
+    if dest.dims().contains(&0) {
+        return Ok(());
+    }
+
+    let lhs = erased_raw_ref::<T>(lhs)?;
+    let rhs = erased_raw_ref::<T>(rhs)?;
+    if matches!(op, ErasedZipOp::Divide | ErasedZipOp::Remainder)
+        && T::INTEGER
+        && raw_any(&rhs, T::is_zero)?
+    {
+        return Err(StridedError::IntegerDivisionByZero { op: op.label() });
+    }
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let mut dest =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    // The op is matched once here so each arm replays a loop whose closure
+    // names a constant op; see `execute_one_shot_map`.
+    macro_rules! replay {
+        ($op:ident) => {
+            // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+            unsafe {
+                strided_basic::execution::zip_map2_raw_into_validated::<
+                    T,
+                    T,
+                    T,
+                    Identity,
+                    Identity,
+                >(
+                    &mut dest,
+                    &lhs,
+                    &rhs,
+                    |lhs, rhs| T::zip(ErasedZipOp::$op, lhs, rhs),
+                    validated, exec,
+)
+            }
+        };
+    }
+    match op {
+        ErasedZipOp::Add => replay!(Add),
+        ErasedZipOp::Subtract => replay!(Subtract),
+        ErasedZipOp::Multiply => replay!(Multiply),
+        ErasedZipOp::Divide => replay!(Divide),
+        ErasedZipOp::Remainder => replay!(Remainder),
+        ErasedZipOp::Maximum => replay!(Maximum),
+        ErasedZipOp::Minimum => replay!(Minimum),
+    }
+}
+
+fn validate_no_overlap(
+    dest: &ErasedRawStridedMut<'_>,
+    input: &ErasedRawStridedPtr<'_>,
+    input_index: usize,
+) -> Result<()> {
+    if input.overlaps_mut(dest)? {
+        Err(StridedError::OverlappingInputOutput { input: input_index })
+    } else {
+        Ok(())
+    }
+}
+
+trait OneShotScalar: Copy + Send + Sync + KernelStorageElement + 'static {
+    const INTEGER: bool = false;
+    fn is_zero(_value: Self) -> bool {
+        false
+    }
+    fn one_shot_dtype_label() -> &'static str;
+    fn supports_map(op: ErasedMapOp) -> bool;
+    fn supports_zip(op: ErasedZipOp) -> bool;
+    fn map(op: ErasedMapOp, value: Self) -> Self;
+    fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self;
+    /// `minimum(hi, maximum(lo, x))`, the composition clamp promises.
+    #[inline(always)]
+    fn clamp(x: Self, lo: Self, hi: Self) -> Self {
+        let raised = Self::zip(ErasedZipOp::Maximum, lo, x);
+        Self::zip(ErasedZipOp::Minimum, hi, raised)
+    }
+}
+
+macro_rules! impl_real_one_shot_scalar {
+    ($ty:ty, $label:literal) => {
+        impl OneShotScalar for $ty {
+            fn one_shot_dtype_label() -> &'static str {
+                $label
+            }
+
+            fn supports_map(_op: ErasedMapOp) -> bool {
+                true
+            }
+
+            fn supports_zip(_op: ErasedZipOp) -> bool {
+                true
+            }
+
+            #[inline(always)]
+            fn map(op: ErasedMapOp, value: Self) -> Self {
+                match op {
+                    ErasedMapOp::Negate => -value,
+                    ErasedMapOp::Conj => value,
+                    ErasedMapOp::Abs => value.abs(),
+                    ErasedMapOp::Sign => {
+                        if value == 0.0 {
+                            0.0
+                        } else {
+                            value.signum()
+                        }
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self {
+                match op {
+                    ErasedZipOp::Add => lhs + rhs,
+                    ErasedZipOp::Subtract => lhs - rhs,
+                    ErasedZipOp::Multiply => lhs * rhs,
+                    ErasedZipOp::Divide => lhs / rhs,
+                    ErasedZipOp::Remainder => lhs % rhs,
+                    // Shared NaN-propagating selects, so the fused path
+                    // cannot drift from the ordinary binary kernel.
+                    ErasedZipOp::Maximum => strided_basic::nan_propagating_maximum(lhs, rhs),
+                    ErasedZipOp::Minimum => strided_basic::nan_propagating_minimum(lhs, rhs),
+                }
+            }
+
+            // Same result as the default composition: any NaN operand gives
+            // the canonical NaN and ties return the bound. Testing NaN once
+            // over the three operands, instead of once per step, keeps the
+            // loop at memory bandwidth.
+            #[inline(always)]
+            fn clamp(x: Self, lo: Self, hi: Self) -> Self {
+                let raised = if lo >= x { lo } else { x };
+                let lowered = if hi <= raised { hi } else { raised };
+                if x.is_nan() | lo.is_nan() | hi.is_nan() {
+                    <$ty>::NAN
+                } else {
+                    lowered
+                }
             }
         }
-        result
+    };
+}
+
+macro_rules! impl_integer_one_shot_scalar {
+    ($ty:ty, $label:literal) => {
+        impl OneShotScalar for $ty {
+            const INTEGER: bool = true;
+
+            fn is_zero(value: Self) -> bool {
+                value == 0
+            }
+            fn one_shot_dtype_label() -> &'static str {
+                $label
+            }
+
+            fn supports_map(_op: ErasedMapOp) -> bool {
+                true
+            }
+
+            fn supports_zip(_op: ErasedZipOp) -> bool {
+                true
+            }
+
+            #[inline(always)]
+            fn map(op: ErasedMapOp, value: Self) -> Self {
+                match op {
+                    ErasedMapOp::Negate => value.wrapping_neg(),
+                    ErasedMapOp::Conj => value,
+                    ErasedMapOp::Abs => value.wrapping_abs(),
+                    ErasedMapOp::Sign => value.signum(),
+                }
+            }
+
+            #[inline(always)]
+            fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self {
+                match op {
+                    ErasedZipOp::Add => lhs.wrapping_add(rhs),
+                    ErasedZipOp::Subtract => lhs.wrapping_sub(rhs),
+                    ErasedZipOp::Multiply => lhs.wrapping_mul(rhs),
+                    ErasedZipOp::Maximum => lhs.max(rhs),
+                    ErasedZipOp::Minimum => lhs.min(rhs),
+                    ErasedZipOp::Divide => lhs.wrapping_div(rhs),
+                    ErasedZipOp::Remainder => lhs.wrapping_rem(rhs),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_complex_one_shot_scalar {
+    ($ty:ty, $label:literal, $div:path) => {
+        impl OneShotScalar for $ty {
+            fn one_shot_dtype_label() -> &'static str {
+                $label
+            }
+
+            fn supports_map(_op: ErasedMapOp) -> bool {
+                true
+            }
+
+            fn supports_zip(op: ErasedZipOp) -> bool {
+                !matches!(
+                    op,
+                    ErasedZipOp::Remainder | ErasedZipOp::Maximum | ErasedZipOp::Minimum
+                )
+            }
+
+            #[inline(always)]
+            fn map(op: ErasedMapOp, value: Self) -> Self {
+                match op {
+                    ErasedMapOp::Negate => -value,
+                    ErasedMapOp::Conj => value.conj(),
+                    ErasedMapOp::Abs => Self::new(value.norm(), 0.0),
+                    ErasedMapOp::Sign => {
+                        if value.re == 0.0 && value.im == 0.0 {
+                            Self::new(0.0, 0.0)
+                        } else {
+                            // Divide the components by the real modulus: complex
+                            // division squares the divisor's components, which
+                            // underflows for tiny magnitudes such as 1e-200 in
+                            // f64 and yields NaN instead of the unit phase.
+                            let norm = value.norm();
+                            Self::new(value.re / norm, value.im / norm)
+                        }
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn zip(op: ErasedZipOp, lhs: Self, rhs: Self) -> Self {
+                match op {
+                    ErasedZipOp::Add => lhs + rhs,
+                    ErasedZipOp::Subtract => lhs - rhs,
+                    ErasedZipOp::Multiply => lhs * rhs,
+                    ErasedZipOp::Divide => $div(lhs, rhs),
+                    ErasedZipOp::Remainder | ErasedZipOp::Maximum | ErasedZipOp::Minimum => {
+                        unreachable!("unsupported complex one-shot op")
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_real_one_shot_scalar!(f32, "f32");
+
+impl_real_one_shot_scalar!(f64, "f64");
+
+impl_integer_one_shot_scalar!(i32, "i32");
+
+impl_integer_one_shot_scalar!(i64, "i64");
+
+impl_complex_one_shot_scalar!(Complex32, "c32", strided_basic::robust_complex_divide_f32);
+
+impl_complex_one_shot_scalar!(Complex64, "c64", strided_basic::robust_complex_divide_f64);
+
+impl OneShotScalar for bool {
+    fn one_shot_dtype_label() -> &'static str {
+        "bool"
+    }
+
+    fn supports_map(op: ErasedMapOp) -> bool {
+        matches!(op, ErasedMapOp::Conj)
+    }
+
+    fn supports_zip(_op: ErasedZipOp) -> bool {
+        false
+    }
+
+    fn map(op: ErasedMapOp, value: Self) -> Self {
+        match op {
+            ErasedMapOp::Conj => value,
+            _ => unreachable!("unsupported bool one-shot op"),
+        }
+    }
+
+    fn zip(_op: ErasedZipOp, _lhs: Self, _rhs: Self) -> Self {
+        unreachable!("unsupported bool one-shot op")
     }
 }
 
-fn check_dtype(expected: KernelDType, actual: KernelDType) -> Result<()> {
-    if actual != expected {
-        return Err(StridedError::DTypeMismatch {
-            expected: expected.label(),
-            actual: actual.label(),
-        });
-    }
-    Ok(())
+fn erased_raw_ref<'a, T: KernelStorageElement>(
+    src: &'a ErasedRawStridedRef<'a>,
+) -> Result<RawStridedRef<'a, T>> {
+    let data = src.data_as::<T>()?;
+    Ok(unsafe { RawStridedRef::new_unchecked(data, src.dims(), src.strides(), src.offset()) })
 }
 
-fn check_fused_dtype(dtype: KernelDType) -> Result<()> {
-    match dtype {
-        KernelDType::F32
-        | KernelDType::F64
-        | KernelDType::I32
-        | KernelDType::I64
-        | KernelDType::Bool
-        | KernelDType::C32
-        | KernelDType::C64 => Ok(()),
-        _ => Err(StridedError::UnsupportedDType {
+fn map_output_dtype(dtype: KernelDType, op: ErasedMapOp) -> Result<KernelDType> {
+    match (dtype, op) {
+        (KernelDType::C32, ErasedMapOp::Abs) => Ok(KernelDType::F32),
+        (KernelDType::C64, ErasedMapOp::Abs) => Ok(KernelDType::F64),
+        (KernelDType::Bool, ErasedMapOp::Conj) => Ok(KernelDType::Bool),
+        (KernelDType::Bool, _) => Err(StridedError::UnsupportedOp {
+            op: op.label(),
             dtype: dtype.label(),
         }),
+        _ => Ok(dtype),
     }
 }
 
-fn validate_fused_plan_for_dtype(dtype: KernelDType, plan: &FusedPlan) -> Result<()> {
-    match dtype {
-        KernelDType::F32 => {
-            crate::fused::validate_plan_for_scalar::<f32>(plan, plan.input_count, 1)
-        }
-        KernelDType::F64 => {
-            crate::fused::validate_plan_for_scalar::<f64>(plan, plan.input_count, 1)
-        }
-        KernelDType::I32 => {
-            crate::fused::validate_plan_for_scalar::<i32>(plan, plan.input_count, 1)
-        }
-        KernelDType::I64 => {
-            crate::fused::validate_plan_for_scalar::<i64>(plan, plan.input_count, 1)
-        }
-        KernelDType::Bool => {
-            crate::fused::validate_plan_for_scalar::<bool>(plan, plan.input_count, 1)
-        }
-        KernelDType::C32 => {
-            crate::fused::validate_plan_for_scalar::<Complex32>(plan, plan.input_count, 1)
-        }
-        KernelDType::C64 => {
-            crate::fused::validate_plan_for_scalar::<Complex64>(plan, plan.input_count, 1)
-        }
-        _ => Err(StridedError::UnsupportedDType {
-            dtype: dtype.label(),
-        }),
+fn raw_any<T: Copy>(
+    src: &RawStridedRef<'_, T>,
+    predicate: impl Fn(T) -> bool + Copy,
+) -> Result<bool> {
+    let total = src
+        .dims()
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+        .ok_or(StridedError::OffsetOverflow)?;
+    if total == 0 {
+        return Ok(false);
+    }
+
+    let rank = src.dims().len();
+    if rank <= RAW_FUSED_RANK_LIMIT {
+        let mut coordinates = [0usize; RAW_FUSED_RANK_LIMIT];
+        let mut resets = [0isize; RAW_FUSED_RANK_LIMIT];
+        raw_any_odometer(
+            src,
+            predicate,
+            &mut coordinates[..rank],
+            &mut resets[..rank],
+        )
+    } else {
+        // Ranks above the fused limit keep the same incremental-offset
+        // odometer; only the cursor storage moves to the heap.
+        let mut coordinates = vec![0usize; rank];
+        let mut resets = vec![0isize; rank];
+        raw_any_odometer(src, predicate, &mut coordinates, &mut resets)
     }
 }
 
-fn check_reduce_dtype(dtype: KernelDType) -> Result<()> {
-    match dtype {
-        KernelDType::F32
-        | KernelDType::F64
-        | KernelDType::I32
-        | KernelDType::I64
-        | KernelDType::C32
-        | KernelDType::C64 => Ok(()),
-        _ => Err(StridedError::UnsupportedDType {
-            dtype: dtype.label(),
-        }),
+fn raw_any_odometer<T: Copy>(
+    src: &RawStridedRef<'_, T>,
+    predicate: impl Fn(T) -> bool + Copy,
+    coordinates: &mut [usize],
+    resets: &mut [isize],
+) -> Result<bool> {
+    let dims = src.dims();
+    let strides = src.strides();
+    // INVARIANT: the caller rejected empty extents, so every `dim - 1` is valid.
+    for axis in 0..dims.len() {
+        let last = isize::try_from(dims[axis] - 1).map_err(|_| StridedError::OffsetOverflow)?;
+        resets[axis] = strides[axis]
+            .checked_mul(last)
+            .and_then(isize::checked_neg)
+            .ok_or(StridedError::OffsetOverflow)?;
+    }
+
+    let mut offset = src.offset();
+    loop {
+        // SAFETY: RawStridedRef construction validated every reachable offset.
+        if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
+            return Ok(true);
+        }
+
+        let mut axis = 0;
+        while axis < dims.len() && coordinates[axis] == dims[axis] - 1 {
+            axis += 1;
+        }
+        if axis == dims.len() {
+            return Ok(false);
+        }
+        for reset_axis in 0..axis {
+            coordinates[reset_axis] = 0;
+            offset = offset
+                .checked_add(resets[reset_axis])
+                .ok_or(StridedError::OffsetOverflow)?;
+        }
+        coordinates[axis] = coordinates[axis]
+            .checked_add(1)
+            .ok_or(StridedError::OffsetOverflow)?;
+        offset = offset
+            .checked_add(strides[axis])
+            .ok_or(StridedError::OffsetOverflow)?;
     }
 }
 
@@ -1356,21 +2156,6 @@ fn check_scatter_value_dtype(dtype: KernelDType) -> Result<()> {
     }
 }
 
-fn check_static_indexing_dtype(dtype: KernelDType) -> Result<()> {
-    match dtype {
-        KernelDType::F32
-        | KernelDType::F64
-        | KernelDType::I32
-        | KernelDType::I64
-        | KernelDType::Bool
-        | KernelDType::C32
-        | KernelDType::C64 => Ok(()),
-        _ => Err(StridedError::UnsupportedDType {
-            dtype: dtype.label(),
-        }),
-    }
-}
-
 fn validate_scalar_bytes(dtype: KernelDType, bytes: &[u8]) -> Result<()> {
     let element_size = dtype.size_of();
     if bytes.len() != element_size {
@@ -1388,49 +2173,20 @@ fn validate_scalar_bytes(dtype: KernelDType, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn checked_total_len(dims: &[usize]) -> Result<usize> {
-    if dims.is_empty() {
-        return Ok(1);
-    }
-    dims.iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or(StridedError::OffsetOverflow)
-}
-
-fn execute_copy<T>(
-    plan: &CopyPlan,
-    dest: &mut ErasedRawStridedMut<'_>,
-    src: &ErasedRawStridedRef<'_>,
-) -> Result<()>
-where
-    T: Copy + crate::MaybeSendSync,
-{
-    let source_data = typed_slice::<T>(src.data());
-    let dest_dims = dest.dims();
-    let dest_strides = dest.strides();
-    let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    let source = unsafe {
-        RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
-    };
-    let mut dest =
-        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest, &source)
-}
-
 fn execute_slice<T>(
     plan: &SlicePlan,
     dest: &mut ErasedRawStridedMut<'_>,
     operand: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
+    let operand_data = operand.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -1441,603 +2197,51 @@ where
     };
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref)
+    plan.execute(&mut dest_ref, &operand_ref, exec)
 }
 
-fn execute_reverse<T>(
-    plan: &ReversePlan,
-    dest: &mut ErasedRawStridedMut<'_>,
-    operand: &ErasedRawStridedRef<'_>,
-) -> Result<()>
-where
-    T: Copy + crate::MaybeSendSync,
-{
-    let operand_data = typed_slice::<T>(operand.data());
-    let dest_dims = dest.dims();
-    let dest_strides = dest.strides();
-    let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    let operand_ref = unsafe {
-        RawStridedRef::new_unchecked(
-            operand_data,
-            operand.dims(),
-            operand.strides(),
-            operand.offset(),
-        )
-    };
-    let mut dest_ref =
-        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref)
-}
-
-fn execute_pad<T>(
-    plan: &PadPlan,
-    dest: &mut ErasedRawStridedMut<'_>,
-    operand: &ErasedRawStridedRef<'_>,
-    fill: &[u8],
-) -> Result<()>
-where
-    T: Copy + crate::MaybeSendSync,
-{
-    let fill = read_unaligned_scalar::<T>(fill);
-    let operand_data = typed_slice::<T>(operand.data());
-    let dest_dims = dest.dims();
-    let dest_strides = dest.strides();
-    let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    let operand_ref = unsafe {
-        RawStridedRef::new_unchecked(
-            operand_data,
-            operand.dims(),
-            operand.strides(),
-            operand.offset(),
-        )
-    };
-    let mut dest_ref =
-        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref, fill)
-}
-
-fn execute_concatenate<T>(
-    plan: &ConcatenatePlan,
-    dest: &mut ErasedRawStridedMut<'_>,
-    inputs: &[ErasedRawStridedRef<'_>],
-) -> Result<()>
-where
-    T: Copy + crate::MaybeSendSync,
-{
-    if inputs.len() != plan.input_count() {
-        return Err(StridedError::RankMismatch(inputs.len(), plan.input_count()));
-    }
-    let dest_dims = dest.dims();
-    let dest_strides = dest.strides();
-    let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    let mut dest_ref =
-        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.check_dest_layout(&dest_ref)?;
-
-    for (position, input) in inputs.iter().enumerate() {
-        let input_data = typed_slice::<T>(input.data());
-        let input_ref = unsafe {
-            RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
-        };
-        plan.check_input_layout(position, &input_ref)?;
-        plan.execute_segment(position, &mut dest_ref, &input_ref)?;
-    }
-    Ok(())
-}
-
-fn execute_reduce<T>(
-    op: ReduceOp,
-    ctx: &ExecContext,
-    dest: &mut ErasedRawStridedMut<'_>,
-    src: &ErasedRawStridedRef<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    let source = erased_view::<T>(src);
-    let value = if ctx.is_serial() {
-        crate::reduce_view::reduce_serial(
-            &source,
-            |value| value,
-            |a, b| reduce_values(op, a, b),
-            reduce_identity(op),
-        )?
-    } else {
-        ctx.run(|| {
-            crate::reduce(
-                &source,
-                |value| value,
-                |a, b| reduce_values(op, a, b),
-                reduce_identity(op),
-            )
-        })?
-    };
-
-    let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    unsafe {
-        *dest_data.as_mut_ptr().offset(dest_offset) = value;
-    }
-    Ok(())
-}
-
-fn dispatch_reduce<T>(
-    op: ReduceOp,
-    layout: &ReduceLayout,
-    ctx: &ExecContext,
-    dest: &mut ErasedRawStridedMut<'_>,
-    src: &ErasedRawStridedRef<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    match layout {
-        ReduceLayout::Full { .. } => execute_reduce::<T>(op, ctx, dest, src),
-        ReduceLayout::Axes {
-            src_dims,
-            src_strides,
-            dest_dims,
-            dest_strides,
-            axes,
-            kept_axes,
-            reduce_dims,
-            dest_total,
-            reduce_total,
-        } => execute_reduce_axes::<T>(
-            op,
-            ctx,
-            dest,
-            src,
-            AxesLayout {
-                src_dims,
-                src_strides,
-                dest_dims,
-                dest_strides,
-                axes,
-                kept_axes,
-                reduce_dims,
-                dest_total: *dest_total,
-                reduce_total: *reduce_total,
-            },
-        ),
-    }
-}
-
-fn execute_reduce_axes<T>(
-    op: ReduceOp,
-    ctx: &ExecContext,
-    dest: &mut ErasedRawStridedMut<'_>,
-    src: &ErasedRawStridedRef<'_>,
-    layout: AxesLayout<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    if layout.kept_axes.is_empty()
-        && layout.axes.len() == layout.src_dims.len()
-        && layout.dest_total == 1
-    {
-        return execute_reduce::<T>(op, ctx, dest, src);
-    }
-
-    if layout.dest_total == 0 {
-        return Ok(());
-    }
-
-    if ctx.is_serial() {
-        execute_reduce_axes_serial::<T>(op, dest, src, layout)
-    } else {
-        ctx.run(|| execute_reduce_axes_policy::<T>(op, dest, src, layout))
-    }
-}
-
-fn execute_reduce_axes_policy<T>(
-    op: ReduceOp,
-    dest: &mut ErasedRawStridedMut<'_>,
-    src: &ErasedRawStridedRef<'_>,
-    layout: AxesLayout<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    let source_data = typed_slice::<T>(src.data());
-    let dest_offset_base = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    #[cfg(feature = "parallel")]
-    {
-        let nthreads = crate::threading::parallel_threads_for_len(layout.dest_total);
-        if nthreads > 1 {
-            return execute_reduce_axes_parallel(
-                op,
-                dest_offset_base,
-                dest_data,
-                src.offset(),
-                source_data,
-                layout,
-                nthreads,
-            );
-        }
-    }
-
-    execute_reduce_axes_serial_data(
-        op,
-        dest_offset_base,
-        dest_data,
-        src.offset(),
-        source_data,
-        layout,
-    )
-}
-
-fn execute_reduce_axes_serial<T>(
-    op: ReduceOp,
-    dest: &mut ErasedRawStridedMut<'_>,
-    src: &ErasedRawStridedRef<'_>,
-    layout: AxesLayout<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    let source_data = typed_slice::<T>(src.data());
-    let dest_offset_base = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    execute_reduce_axes_serial_data(
-        op,
-        dest_offset_base,
-        dest_data,
-        src.offset(),
-        source_data,
-        layout,
-    )
-}
-
-fn execute_reduce_axes_serial_data<T>(
-    op: ReduceOp,
-    dest_offset_base: isize,
-    dest_data: &mut [T],
-    source_offset_base: isize,
-    source_data: &[T],
-    layout: AxesLayout<'_>,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    let mut out_idx_storage = CoordScratch::new(layout.dest_dims.len());
-    let mut reduce_idx_storage = CoordScratch::new(layout.reduce_dims.len());
-    let mut src_idx_storage = CoordScratch::new(layout.src_dims.len());
-    let out_idx = out_idx_storage.as_mut_slice();
-    let reduce_idx = reduce_idx_storage.as_mut_slice();
-    let src_idx = src_idx_storage.as_mut_slice();
-
-    for _ in 0..layout.dest_total {
-        src_idx.fill(0);
-        for (dest_axis, &src_axis) in layout.kept_axes.iter().enumerate() {
-            src_idx[src_axis] = out_idx[dest_axis];
-        }
-
-        let mut acc = reduce_identity(op);
-        reduce_idx.fill(0);
-        for _ in 0..layout.reduce_total {
-            for (reduce_axis, &src_axis) in layout.axes.iter().enumerate() {
-                src_idx[src_axis] = reduce_idx[reduce_axis];
-            }
-            let source_offset =
-                checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
-            let value = unsafe { *source_data.as_ptr().offset(source_offset) };
-            acc = reduce_values(op, acc, value);
-            advance_col_major_index(reduce_idx, layout.reduce_dims);
-        }
-
-        let dest_offset = checked_strided_offset(dest_offset_base, layout.dest_strides, out_idx)?;
-        unsafe {
-            *dest_data.as_mut_ptr().offset(dest_offset) = acc;
-        }
-        advance_col_major_index(out_idx, layout.dest_dims);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "parallel")]
-fn execute_reduce_axes_parallel<T>(
-    op: ReduceOp,
-    dest_offset_base: isize,
-    dest_data: &mut [T],
-    source_offset_base: isize,
-    source_data: &[T],
-    layout: AxesLayout<'_>,
-    nthreads: usize,
-) -> Result<()>
-where
-    T: ErasedReduceScalar,
-{
-    let dest_ptr = crate::threading::SendPtr(dest_data.as_mut_ptr());
-    let source_ptr = crate::threading::SendPtr(source_data.as_ptr() as *mut T);
-    crate::threading::parallel_map_reduce(
-        0..layout.dest_total,
-        nthreads,
-        &|range| {
-            let mut out_idx_storage = CoordScratch::new(layout.dest_dims.len());
-            let mut reduce_idx_storage = CoordScratch::new(layout.reduce_dims.len());
-            let mut src_idx_storage = CoordScratch::new(layout.src_dims.len());
-            let out_idx = out_idx_storage.as_mut_slice();
-            let reduce_idx = reduce_idx_storage.as_mut_slice();
-            let src_idx = src_idx_storage.as_mut_slice();
-            fill_col_major_index(range.start, layout.dest_dims, out_idx);
-            let dest_ptr = dest_ptr.as_ptr();
-            let source_ptr = source_ptr.as_const();
-
-            for _ in range {
-                src_idx.fill(0);
-                for (dest_axis, &src_axis) in layout.kept_axes.iter().enumerate() {
-                    src_idx[src_axis] = out_idx[dest_axis];
-                }
-
-                let mut acc = reduce_identity(op);
-                reduce_idx.fill(0);
-                for _ in 0..layout.reduce_total {
-                    for (reduce_axis, &src_axis) in layout.axes.iter().enumerate() {
-                        src_idx[src_axis] = reduce_idx[reduce_axis];
-                    }
-                    let source_offset =
-                        checked_strided_offset(source_offset_base, layout.src_strides, src_idx)?;
-                    let value = unsafe { *source_ptr.offset(source_offset) };
-                    acc = reduce_values(op, acc, value);
-                    advance_col_major_index(reduce_idx, layout.reduce_dims);
-                }
-
-                let dest_offset =
-                    checked_strided_offset(dest_offset_base, layout.dest_strides, out_idx)?;
-                unsafe {
-                    // SAFETY: axis reduction writes exactly one scalar per
-                    // logical output position, and compile rejected
-                    // non-injective destination layouts.
-                    *dest_ptr.offset(dest_offset) = acc;
-                }
-                advance_col_major_index(out_idx, layout.dest_dims);
-            }
-            Ok(())
-        },
-        &|left, right| left.and(right),
-    )
-}
-
-#[inline]
-fn reduce_identity<T>(op: ReduceOp) -> T
-where
-    T: One + Zero,
-{
-    match op {
-        ReduceOp::Sum => T::zero(),
-        ReduceOp::Product => T::one(),
-    }
-}
-
-#[inline]
-fn reduce_values<T>(op: ReduceOp, a: T, b: T) -> T
-where
-    T: ErasedReduceScalar,
-{
-    match op {
-        ReduceOp::Sum => T::reduce_sum(a, b),
-        ReduceOp::Product => T::reduce_product(a, b),
-    }
-}
-
-trait ErasedReduceScalar: Copy + One + Zero + crate::MaybeSendSync {
-    fn reduce_sum(lhs: Self, rhs: Self) -> Self;
-    fn reduce_product(lhs: Self, rhs: Self) -> Self;
-}
-
-macro_rules! impl_default_erased_reduce_scalar {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl ErasedReduceScalar for $ty {
-                #[inline(always)]
-                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
-                    lhs + rhs
-                }
-
-                #[inline(always)]
-                fn reduce_product(lhs: Self, rhs: Self) -> Self {
-                    lhs * rhs
-                }
-            }
-        )*
-    };
-}
-
-macro_rules! impl_wrapping_erased_reduce_scalar {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl ErasedReduceScalar for $ty {
-                #[inline(always)]
-                fn reduce_sum(lhs: Self, rhs: Self) -> Self {
-                    lhs.wrapping_add(rhs)
-                }
-
-                #[inline(always)]
-                fn reduce_product(lhs: Self, rhs: Self) -> Self {
-                    lhs.wrapping_mul(rhs)
-                }
-            }
-        )*
-    };
-}
-
-impl_default_erased_reduce_scalar!(f32, f64, Complex32, Complex64);
-impl_wrapping_erased_reduce_scalar!(i32, i64);
-
-fn validate_unique_axes(axes: &[usize], rank: usize) -> Result<()> {
-    let mut seen = vec![false; rank];
-    for &axis in axes {
-        if axis >= rank {
-            return Err(StridedError::InvalidAxis { axis, rank });
-        }
-        if seen[axis] {
-            return Err(StridedError::InvalidAxis { axis, rank });
-        }
-        seen[axis] = true;
-    }
-    Ok(())
-}
-
-fn checked_strided_offset(base: isize, strides: &[isize], index: &[usize]) -> Result<isize> {
-    let mut offset = base;
-    for (&stride, &coord) in strides.iter().zip(index.iter()) {
-        offset = checked_offset_add(offset, stride, coord)?;
-    }
-    Ok(offset)
-}
-
-fn checked_offset_add(base: isize, stride: isize, coord: usize) -> Result<isize> {
-    let coord = isize::try_from(coord).map_err(|_| StridedError::OffsetOverflow)?;
-    let scaled = stride
-        .checked_mul(coord)
-        .ok_or(StridedError::OffsetOverflow)?;
-    base.checked_add(scaled).ok_or(StridedError::OffsetOverflow)
-}
-
-fn advance_col_major_index(index: &mut [usize], shape: &[usize]) {
-    for axis in 0..index.len() {
-        index[axis] += 1;
-        if index[axis] < shape[axis] {
-            return;
-        }
-        index[axis] = 0;
-    }
-}
-
-#[cfg(feature = "parallel")]
-fn fill_col_major_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
-    for (axis, coord) in out.iter_mut().enumerate() {
-        let dim = shape[axis];
-        *coord = linear % dim;
-        linear /= dim;
-    }
-}
-
-struct CoordScratch {
-    inline: [usize; RAW_FUSED_RANK_LIMIT],
-    heap: Option<Vec<usize>>,
-    len: usize,
-}
-
-impl CoordScratch {
-    fn new(len: usize) -> Self {
-        if len <= RAW_FUSED_RANK_LIMIT {
-            Self {
-                inline: [0; RAW_FUSED_RANK_LIMIT],
-                heap: None,
-                len,
-            }
-        } else {
-            Self {
-                inline: [0; RAW_FUSED_RANK_LIMIT],
-                heap: Some(vec![0; len]),
-                len,
-            }
-        }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [usize] {
-        match &mut self.heap {
-            Some(heap) => heap,
-            None => &mut self.inline[..self.len],
-        }
-    }
-}
-
-fn execute_fused<T>(
-    plan: &FusedPlan,
-    ctx: &ExecContext,
-    dest: &mut ErasedRawStridedMut<'_>,
-    inputs: &[ErasedRawStridedRef<'_>],
-) -> Result<()>
-where
-    T: FusedScalar,
-{
-    let dest_dims = dest.dims();
-    let dest_strides = dest.strides();
-    let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
-    let dest_view =
-        unsafe { StridedViewMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-
-    match inputs {
-        [a] => {
-            let input_views = [erased_view::<T>(a)];
-            let mut dests = [dest_view];
-            execute_fused_views(ctx, &mut dests, &input_views, plan)
-        }
-        [a, b] => {
-            let input_views = [erased_view::<T>(a), erased_view::<T>(b)];
-            let mut dests = [dest_view];
-            execute_fused_views(ctx, &mut dests, &input_views, plan)
-        }
-        [a, b, c] => {
-            let input_views = [
-                erased_view::<T>(a),
-                erased_view::<T>(b),
-                erased_view::<T>(c),
-            ];
-            let mut dests = [dest_view];
-            execute_fused_views(ctx, &mut dests, &input_views, plan)
-        }
-        [a, b, c, d] => {
-            let input_views = [
-                erased_view::<T>(a),
-                erased_view::<T>(b),
-                erased_view::<T>(c),
-                erased_view::<T>(d),
-            ];
-            let mut dests = [dest_view];
-            execute_fused_views(ctx, &mut dests, &input_views, plan)
-        }
-        _ => Err(StridedError::UnsupportedArity {
-            arity: inputs.len(),
-            max: ERASED_FUSED_INPUT_LIMIT,
-        }),
-    }
-}
-
-fn dispatch_gather_index<T>(
+fn execute_gather_uninit_dispatch<T>(
     plan: &GatherPlan,
     index_dtype: KernelDType,
-    dest: &mut ErasedRawStridedMut<'_>,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
     operand: &ErasedRawStridedRef<'_>,
     start_indices: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     match index_dtype {
-        KernelDType::I32 => execute_gather::<T, i32>(plan, dest, operand, start_indices),
-        KernelDType::I64 => execute_gather::<T, i64>(plan, dest, operand, start_indices),
+        KernelDType::I32 => {
+            execute_gather_uninit::<T, i32>(plan, index_dtype, dest, operand, start_indices, exec)
+        }
+        KernelDType::I64 => {
+            execute_gather_uninit::<T, i64>(plan, index_dtype, dest, operand, start_indices, exec)
+        }
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
         }),
     }
 }
 
-fn execute_gather<T, I>(
+fn execute_gather_uninit<T, I>(
     plan: &GatherPlan,
-    dest: &mut ErasedRawStridedMut<'_>,
+    _index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
     operand: &ErasedRawStridedRef<'_>,
     start_indices: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let index_data = typed_slice::<I>(start_indices.data());
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = start_indices.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2056,7 +2260,466 @@ where
     };
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref, &index_ref)
+    // SAFETY: the erased entry rejected overlap before constructing these descriptors.
+    unsafe {
+        strided_basic::execution::gather_into_uninit(
+            plan,
+            &mut dest_ref,
+            &operand_ref,
+            &index_ref,
+            exec,
+        )
+    }
+}
+
+fn execute_dynamic_slice_uninit_dispatch<T>(
+    plan: &DynamicSlicePlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    match index_dtype {
+        KernelDType::I32 => {
+            execute_dynamic_slice_uninit::<T, i32>(plan, dest, operand, starts, exec)
+        }
+        KernelDType::I64 => {
+            execute_dynamic_slice_uninit::<T, i64>(plan, dest, operand, starts, exec)
+        }
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_dynamic_slice_uninit<T, I>(
+    plan: &DynamicSlicePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
+{
+    let operand_data = operand.data_as::<T>()?;
+    let starts_data = starts.data_as::<I>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let starts_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            starts_data,
+            starts.dims(),
+            starts.strides(),
+            starts.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    // SAFETY: the erased entry rejected overlap before constructing these descriptors.
+    unsafe {
+        strided_basic::execution::dynamic_slice_into_uninit(
+            plan,
+            &mut dest_ref,
+            &operand_ref,
+            &starts_ref,
+            exec,
+        )
+    }
+}
+
+fn execute_dynamic_update_uninit_dispatch<T>(
+    plan: &DynamicUpdateSlicePlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    update: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    match index_dtype {
+        KernelDType::I32 => {
+            execute_dynamic_update_uninit::<T, i32>(plan, dest, operand, update, starts, exec)
+        }
+        KernelDType::I64 => {
+            execute_dynamic_update_uninit::<T, i64>(plan, dest, operand, update, starts, exec)
+        }
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_dynamic_update_uninit<T, I>(
+    plan: &DynamicUpdateSlicePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    update: &ErasedRawStridedRef<'_>,
+    starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
+{
+    let operand_data = operand.data_as::<T>()?;
+    let update_data = update.data_as::<T>()?;
+    let starts_data = starts.data_as::<I>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let update_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            update_data,
+            update.dims(),
+            update.strides(),
+            update.offset(),
+        )
+    };
+    let starts_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            starts_data,
+            starts.dims(),
+            starts.strides(),
+            starts.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    // SAFETY: the erased entry rejected overlap before constructing these descriptors.
+    unsafe {
+        strided_basic::execution::dynamic_update_into_uninit(
+            plan,
+            &mut dest_ref,
+            &operand_ref,
+            &update_ref,
+            &starts_ref,
+            exec,
+        )
+    }
+}
+
+fn execute_scatter_uninit_dispatch<T>(
+    plan: &ScatterPlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    scatter_indices: &ErasedRawStridedRef<'_>,
+    updates: &ErasedRawStridedRef<'_>,
+    combine: fn(T, T) -> T,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+{
+    match index_dtype {
+        KernelDType::I32 => execute_scatter_uninit::<T, i32>(
+            plan,
+            dest,
+            operand,
+            scatter_indices,
+            updates,
+            combine,
+            exec,
+        ),
+        KernelDType::I64 => execute_scatter_uninit::<T, i64>(
+            plan,
+            dest,
+            operand,
+            scatter_indices,
+            updates,
+            combine,
+            exec,
+        ),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_scatter_uninit<T, I>(
+    plan: &ScatterPlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    scatter_indices: &ErasedRawStridedRef<'_>,
+    updates: &ErasedRawStridedRef<'_>,
+    combine: fn(T, T) -> T,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
+{
+    let indices = scatter_indices;
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = indices.data_as::<I>()?;
+    let update_data = updates.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let index_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            index_data,
+            indices.dims(),
+            indices.strides(),
+            indices.offset(),
+        )
+    };
+    let update_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            update_data,
+            updates.dims(),
+            updates.strides(),
+            updates.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    // SAFETY: the erased entry rejected overlap before constructing these descriptors.
+    unsafe {
+        strided_basic::execution::scatter_into_uninit(
+            plan,
+            &mut dest_ref,
+            &operand_ref,
+            &index_ref,
+            &update_ref,
+            combine,
+            exec,
+        )
+    }
+}
+
+fn execute_slice_uninit<T>(
+    plan: &SlicePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let operand_data = operand.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute_uninit(&mut dest_ref, &operand_ref, exec)
+}
+
+fn execute_reverse<T>(
+    plan: &ReversePlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let operand_data = operand.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, exec)
+}
+
+fn execute_reverse_uninit<T>(
+    plan: &ReversePlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let operand_data = operand.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute_uninit(&mut dest_ref, &operand_ref, exec)
+}
+
+fn execute_pad<T>(
+    plan: &PadPlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    fill: &[u8],
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let fill = read_unaligned_scalar::<T>(fill);
+    let operand_data = operand.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, fill, exec)
+}
+
+fn execute_pad_uninit<T>(
+    plan: &PadPlan,
+    dest: &mut ErasedRawStridedUninitMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    fill: &[u8],
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    let fill = read_unaligned_scalar::<T>(fill);
+    let operand_data = operand.data_as::<T>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_uninit_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute_uninit(&mut dest_ref, &operand_ref, fill, exec)
+}
+
+fn dispatch_gather_index<T>(
+    plan: &GatherPlan,
+    index_dtype: KernelDType,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    start_indices: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+{
+    match index_dtype {
+        KernelDType::I32 => execute_gather::<T, i32>(plan, dest, operand, start_indices, exec),
+        KernelDType::I64 => execute_gather::<T, i64>(plan, dest, operand, start_indices, exec),
+        _ => Err(StridedError::UnsupportedDType {
+            dtype: index_dtype.label(),
+        }),
+    }
+}
+
+fn execute_gather<T, I>(
+    plan: &GatherPlan,
+    dest: &mut ErasedRawStridedMut<'_>,
+    operand: &ErasedRawStridedRef<'_>,
+    start_indices: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
+{
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = start_indices.data_as::<I>()?;
+    let dest_dims = dest.dims();
+    let dest_strides = dest.strides();
+    let dest_offset = dest.offset();
+    let dest_data = dest.data_as_mut::<T>()?;
+    let operand_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            operand_data,
+            operand.dims(),
+            operand.strides(),
+            operand.offset(),
+        )
+    };
+    let index_ref = unsafe {
+        RawStridedRef::new_unchecked(
+            index_data,
+            start_indices.dims(),
+            start_indices.strides(),
+            start_indices.offset(),
+        )
+    };
+    let mut dest_ref =
+        unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, exec)
 }
 
 fn dispatch_dynamic_slice_index<T>(
@@ -2065,13 +2728,14 @@ fn dispatch_dynamic_slice_index<T>(
     dest: &mut ErasedRawStridedMut<'_>,
     operand: &ErasedRawStridedRef<'_>,
     starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     match index_dtype {
-        KernelDType::I32 => execute_dynamic_slice::<T, i32>(plan, dest, operand, starts),
-        KernelDType::I64 => execute_dynamic_slice::<T, i64>(plan, dest, operand, starts),
+        KernelDType::I32 => execute_dynamic_slice::<T, i32>(plan, dest, operand, starts, exec),
+        KernelDType::I64 => execute_dynamic_slice::<T, i64>(plan, dest, operand, starts, exec),
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
         }),
@@ -2083,17 +2747,18 @@ fn execute_dynamic_slice<T, I>(
     dest: &mut ErasedRawStridedMut<'_>,
     operand: &ErasedRawStridedRef<'_>,
     starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let start_data = typed_slice::<I>(starts.data());
+    let operand_data = operand.data_as::<T>()?;
+    let start_data = starts.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2107,7 +2772,7 @@ where
     };
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref, &start_ref)
+    plan.execute(&mut dest_ref, &operand_ref, &start_ref, exec)
 }
 
 fn dispatch_dynamic_update_slice_index<T>(
@@ -2117,16 +2782,17 @@ fn dispatch_dynamic_update_slice_index<T>(
     operand: &ErasedRawStridedRef<'_>,
     update: &ErasedRawStridedRef<'_>,
     starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
+    T: Copy + Send + Sync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
-            execute_dynamic_update_slice::<T, i32>(plan, dest, operand, update, starts)
+            execute_dynamic_update_slice::<T, i32>(plan, dest, operand, update, starts, exec)
         }
         KernelDType::I64 => {
-            execute_dynamic_update_slice::<T, i64>(plan, dest, operand, update, starts)
+            execute_dynamic_update_slice::<T, i64>(plan, dest, operand, update, starts, exec)
         }
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
@@ -2140,18 +2806,19 @@ fn execute_dynamic_update_slice<T, I>(
     operand: &ErasedRawStridedRef<'_>,
     update: &ErasedRawStridedRef<'_>,
     starts: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let update_data = typed_slice::<T>(update.data());
-    let start_data = typed_slice::<I>(starts.data());
+    let operand_data = operand.data_as::<T>()?;
+    let update_data = update.data_as::<T>()?;
+    let start_data = starts.data_as::<I>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2173,7 +2840,7 @@ where
     };
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref, &update_ref, &start_ref)
+    plan.execute(&mut dest_ref, &operand_ref, &update_ref, &start_ref, exec)
 }
 
 fn dispatch_scatter_index<T>(
@@ -2183,16 +2850,17 @@ fn dispatch_scatter_index<T>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + crate::MaybeSendSync,
+    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
-            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates)
+            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates, exec)
         }
         KernelDType::I64 => {
-            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates)
+            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates, exec)
         }
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
@@ -2206,18 +2874,19 @@ fn execute_scatter<T, I>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
+    exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + crate::MaybeSendSync,
-    I: GatherIndex,
+    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+    I: GatherIndex + KernelStorageElement,
 {
-    let operand_data = typed_slice::<T>(operand.data());
-    let index_data = typed_slice::<I>(scatter_indices.data());
-    let update_data = typed_slice::<T>(updates.data());
+    let operand_data = operand.data_as::<T>()?;
+    let index_data = scatter_indices.data_as::<I>()?;
+    let update_data = updates.data_as::<T>()?;
     let dest_dims = dest.dims();
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
-    let dest_data = typed_slice_mut::<T>(dest.data_mut());
+    let dest_data = dest.data_as_mut::<T>()?;
     let operand_ref = unsafe {
         RawStridedRef::new_unchecked(
             operand_data,
@@ -2244,53 +2913,7 @@ where
     };
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref, &index_ref, &update_ref)
-}
-
-fn execute_fused_views<T>(
-    ctx: &ExecContext,
-    dests: &mut [StridedViewMut<'_, T>],
-    inputs: &[StridedView<'_, T>],
-    plan: &FusedPlan,
-) -> Result<()>
-where
-    T: FusedScalar,
-{
-    if ctx.is_serial() {
-        crate::fused::fused_elementwise_into_serial(dests, inputs, plan)
-    } else {
-        ctx.run(|| fused_elementwise_into(dests, inputs, plan))
-    }
-}
-
-fn erased_view<'a, T>(src: &ErasedRawStridedRef<'a>) -> StridedView<'a, T> {
-    let data = typed_slice::<T>(src.data());
-    unsafe { StridedView::new_unchecked(data, src.dims(), src.strides(), src.offset()) }
-}
-
-fn typed_slice<T>(bytes: &[u8]) -> &[T] {
-    if bytes.is_empty() {
-        return &[];
-    }
-    unsafe {
-        core::slice::from_raw_parts(
-            bytes.as_ptr().cast::<T>(),
-            bytes.len() / core::mem::size_of::<T>(),
-        )
-    }
-}
-
-fn typed_slice_mut<T>(bytes: &mut [u8]) -> &mut [T] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            if bytes.is_empty() {
-                core::ptr::NonNull::<T>::dangling().as_ptr()
-            } else {
-                bytes.as_mut_ptr().cast::<T>()
-            },
-            bytes.len() / core::mem::size_of::<T>(),
-        )
-    }
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, &update_ref, exec)
 }
 
 fn read_unaligned_scalar<T>(bytes: &[u8]) -> T

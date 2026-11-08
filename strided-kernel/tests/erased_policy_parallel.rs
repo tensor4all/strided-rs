@@ -1,9 +1,25 @@
 #![cfg(feature = "parallel")]
 
+use strided_kernel::Pool;
+
+/// Shared four-worker pool for the bounded entries of this test.
+fn pool() -> &'static Pool {
+    static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Pool::builder().threads(4).build().unwrap())
+}
+
+/// A token with at most the given number of slots of the shared pool.
+fn bounded(threads: usize) -> Exec<'static> {
+    Exec::new(pool(), threads).unwrap()
+}
+
+use core::mem::MaybeUninit;
 use strided_kernel::{
-    ErasedCopyPlan, ErasedDynamicSlicePlan, ErasedDynamicUpdateSlicePlan, ErasedGatherPlan,
-    ErasedPadPlan, ErasedRawStridedMut, ErasedRawStridedRef, ErasedReducePlan, ErasedScatterPlan,
-    ExecContext, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    erased_zip_into, ErasedConcatenatePlan, ErasedCopyPlan, ErasedDynamicSlicePlan,
+    ErasedDynamicUpdateSlicePlan, ErasedGatherPlan, ErasedPadPlan, ErasedRawStridedMut,
+    ErasedRawStridedPtr, ErasedRawStridedRef, ErasedRawStridedUninitMut, ErasedReducePlan,
+    ErasedScatterPlan, ErasedZipOp, Exec, GatherSpec, KernelDType, ReduceOp, ScatterSpec,
+    StridedError,
 };
 
 const LARGE_LEN: usize = (1 << 15) + 65;
@@ -17,17 +33,65 @@ fn as_bytes<T>(data: &[T]) -> &[u8] {
     }
 }
 
-fn as_bytes_mut<T>(data: &mut [T]) -> &mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            data.as_mut_ptr().cast::<u8>(),
-            data.len() * core::mem::size_of::<T>(),
-        )
-    }
+fn bounded_context() -> Exec<'static> {
+    bounded(2)
 }
 
-fn bounded_context() -> ExecContext {
-    ExecContext::max_threads(2).unwrap()
+#[test]
+fn large_one_shot_zip_matches_serial() {
+    let dims = [LARGE_LEN];
+    let strides = [1isize];
+    let lhs: Vec<f64> = (0..LARGE_LEN).map(|index| index as f64).collect();
+    let rhs: Vec<f64> = (0..LARGE_LEN)
+        .map(|index| (LARGE_LEN - index) as f64)
+        .collect();
+
+    let run = |ctx: Exec| {
+        let lhs = ErasedRawStridedRef::from_slice(&lhs, &dims, &strides, 0).unwrap();
+        let rhs = ErasedRawStridedRef::from_slice(&rhs, &dims, &strides, 0).unwrap();
+        let mut output = vec![0.0f64; LARGE_LEN];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
+        erased_zip_into(
+            KernelDType::F64,
+            ErasedZipOp::Add,
+            &mut dest,
+            &ErasedRawStridedPtr::from_ref(&lhs),
+            &ErasedRawStridedPtr::from_ref(&rhs),
+            ctx,
+        )
+        .unwrap();
+        output
+    };
+
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
+}
+
+#[test]
+fn bounded_one_shot_rejects_noninjective_destination_before_raw_replay() {
+    let dims = [LARGE_LEN];
+    let source_strides = [1isize];
+    let dest_strides = [0isize];
+    let lhs = vec![1.0f64; LARGE_LEN];
+    let rhs = vec![2.0f64; LARGE_LEN];
+    let lhs = ErasedRawStridedRef::from_slice(&lhs, &dims, &source_strides, 0).unwrap();
+    let rhs = ErasedRawStridedRef::from_slice(&rhs, &dims, &source_strides, 0).unwrap();
+    let mut actual = [7.0f64];
+    let mut dest =
+        ErasedRawStridedMut::from_slice_mut(&mut actual, &dims, &dest_strides, 0).unwrap();
+
+    let error = erased_zip_into(
+        KernelDType::F64,
+        ErasedZipOp::Add,
+        &mut dest,
+        &ErasedRawStridedPtr::from_ref(&lhs),
+        &ErasedRawStridedPtr::from_ref(&rhs),
+        bounded_context(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, StridedError::NonInjectiveOutputLayout));
+    assert_eq!(actual, [7.0]);
 }
 
 #[test]
@@ -42,24 +106,16 @@ fn large_erased_copy_matches_serial() {
     let plan =
         ErasedCopyPlan::compile(KernelDType::I64, &dims, &dest_strides, &src_strides).unwrap();
 
-    let run = |ctx: ExecContext| {
-        let source_ref =
-            ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&source), &dims, &src_strides, 0)
-                .unwrap();
+    let run = |ctx: Exec| {
+        let source_ref = ErasedRawStridedRef::from_slice(&source, &dims, &src_strides, 0).unwrap();
         let mut output = vec![0i64; LEN];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::I64,
-            as_bytes_mut(&mut output),
-            &dims,
-            &dest_strides,
-            0,
-        )
-        .unwrap();
-        plan.execute(&ctx, &mut dest, &source_ref).unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &dest_strides, 0).unwrap();
+        plan.execute(&mut dest, &source_ref, ctx).unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
 }
 
 #[test]
@@ -82,29 +138,43 @@ fn large_erased_axis_reduce_matches_serial() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
-        let source_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&source),
-            &src_dims,
-            &src_strides,
-            0,
-        )
-        .unwrap();
+    let run = |ctx: Exec| {
+        let source_ref =
+            ErasedRawStridedRef::from_slice(&source, &src_dims, &src_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::I32,
-            as_bytes_mut(&mut output),
-            &dest_dims,
-            &dest_strides,
-            0,
-        )
-        .unwrap();
-        plan.execute(&ctx, &mut dest, &source_ref).unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        plan.execute(&mut dest, &source_ref, ctx).unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
+
+    let rank8_dims = [2, 2, 2, 2, 2, 2, 2, LARGE_LEN];
+    let rank8_strides = [1, 2, 4, 8, 16, 32, 64, 128];
+    let rank8_source: Vec<i32> = (0..128 * LARGE_LEN)
+        .map(|index| (index % 251) as i32 - 113)
+        .collect();
+    let rank8_plan = ErasedReducePlan::compile_axes(
+        KernelDType::I32,
+        ReduceOp::Sum,
+        &rank8_dims,
+        &rank8_strides,
+        &dest_dims,
+        &dest_strides,
+        &[6, 0, 3, 1, 5, 2, 4],
+    )
+    .unwrap();
+    let run_rank8 = |ctx: Exec| {
+        let source_ref =
+            ErasedRawStridedRef::from_slice(&rank8_source, &rank8_dims, &rank8_strides, 0).unwrap();
+        let mut output = vec![0i32; LARGE_LEN];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        rank8_plan.execute(&mut dest, &source_ref, ctx).unwrap();
+        output
+    };
+    assert_eq!(run_rank8(bounded_context()), run_rank8(Exec::serial()));
 }
 
 #[test]
@@ -135,28 +205,86 @@ fn large_erased_gather_matches_serial() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
-        let operand_ref =
-            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&operand), &dims, &strides, 0)
-                .unwrap();
-        let index_ref =
-            ErasedRawStridedRef::new(KernelDType::I64, as_bytes(&indices), &dims, &strides, 0)
-                .unwrap();
+    let run = |ctx: Exec| {
+        let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+        let index_ref = ErasedRawStridedRef::from_slice(&indices, &dims, &strides, 0).unwrap();
         let mut output = vec![0.0f64; LARGE_LEN];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::F64,
-            as_bytes_mut(&mut output),
-            &dims,
-            &strides,
-            0,
-        )
-        .unwrap();
-        plan.execute(&ctx, &mut dest, &operand_ref, &index_ref)
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
+        plan.execute(&mut dest, &operand_ref, &index_ref, ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
+}
+
+#[test]
+fn generic_gather_matches_across_threshold_for_initialized_and_uninit_outputs() {
+    for &len in &[4_096usize, 1 << 15, (1 << 15) + 2, 131_074] {
+        let batch = len / 2;
+        let operand_dims = [2usize, batch];
+        let operand_strides = [1isize, 2];
+        let operand: Vec<f64> = (0..len).map(|index| index as f64 * 0.25).collect();
+        let index_dims = [batch, 1];
+        let index_strides = [1isize, batch as isize];
+        let indices: Vec<i64> = (0..batch)
+            .map(|index| ((index * 5 + 1) % batch) as i64)
+            .collect();
+        let dest_dims = operand_dims;
+        let dest_strides = operand_strides;
+        let plan = ErasedGatherPlan::compile(
+            KernelDType::F64,
+            KernelDType::I64,
+            &operand_dims,
+            &operand_strides,
+            &index_dims,
+            &index_strides,
+            &dest_dims,
+            &dest_strides,
+            GatherSpec {
+                offset_dims: vec![0],
+                collapsed_slice_dims: vec![1],
+                start_index_map: vec![1],
+                index_vector_dim: 1,
+                slice_sizes: vec![2, 1],
+            },
+        )
+        .unwrap();
+        let source =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let index =
+            ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+        let mut expected = vec![0.0f64; len];
+        let mut serial_dest =
+            ErasedRawStridedMut::from_slice_mut(&mut expected, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute(&mut serial_dest, &source, &index, Exec::serial())
+            .unwrap();
+
+        let mut initialized = vec![0.0f64; len];
+        let mut initialized_dest =
+            ErasedRawStridedMut::from_slice_mut(&mut initialized, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute(&mut initialized_dest, &source, &index, bounded_context())
+            .unwrap();
+        assert_eq!(initialized, expected);
+
+        let mut raw = vec![MaybeUninit::<f64>::uninit(); len];
+        let mut uninit_dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut raw, &dest_dims, &dest_strides, 0)
+                .unwrap();
+        plan.execute_uninit(
+            &mut uninit_dest,
+            &ErasedRawStridedPtr::from_ref(&source),
+            &ErasedRawStridedPtr::from_ref(&index),
+            bounded_context(),
+        )
+        .unwrap();
+        for (actual, expected) in raw.iter().zip(&expected) {
+            assert_eq!(unsafe { actual.assume_init_ref() }, expected);
+        }
+    }
 }
 
 #[test]
@@ -201,85 +329,113 @@ fn large_erased_dynamic_slice_and_update_match_serial() {
     )
     .unwrap();
 
-    let run_slice = |ctx: ExecContext| {
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
-        let starts_ref = ErasedRawStridedRef::new(
-            KernelDType::I64,
-            as_bytes(&starts),
-            &starts_dims,
-            &starts_strides,
-            0,
-        )
-        .unwrap();
+    let run_slice = |mut ctx: Exec| {
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let starts_ref =
+            ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::I32,
-            as_bytes_mut(&mut output),
-            &window_dims,
-            &window_strides,
-            0,
-        )
-        .unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
+                .unwrap();
         slice
-            .execute(&ctx, &mut dest, &operand_ref, &starts_ref)
+            .execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
             .unwrap();
         output
     };
-    let run_update = |ctx: ExecContext| {
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
-        let update_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&update),
-            &window_dims,
-            &window_strides,
-            0,
-        )
-        .unwrap();
-        let starts_ref = ErasedRawStridedRef::new(
-            KernelDType::I64,
-            as_bytes(&starts),
-            &starts_dims,
-            &starts_strides,
-            0,
-        )
-        .unwrap();
+    let run_update = |ctx: Exec| {
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let update_ref =
+            ErasedRawStridedRef::from_slice(&update, &window_dims, &window_strides, 0).unwrap();
+        let starts_ref =
+            ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN + 128];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::I32,
-            as_bytes_mut(&mut output),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &operand_dims, &operand_strides, 0)
+                .unwrap();
         update_slice
-            .execute(&ctx, &mut dest, &operand_ref, &update_ref, &starts_ref)
+            .execute(&mut dest, &operand_ref, &update_ref, &starts_ref, ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(
-        run_slice(bounded_context()),
-        run_slice(ExecContext::serial())
-    );
-    assert_eq!(
-        run_update(bounded_context()),
-        run_update(ExecContext::serial())
-    );
+    assert_eq!(run_slice(bounded_context()), run_slice(Exec::serial()));
+    assert_eq!(run_update(bounded_context()), run_update(Exec::serial()));
+}
+
+#[test]
+fn dynamic_slice_and_update_match_serial_at_threshold_boundaries() {
+    const THRESHOLD: usize = 1 << 15;
+    for len in [THRESHOLD - 2, THRESHOLD, THRESHOLD + 2] {
+        let cols = len / 2;
+        let operand_dims = [3usize, cols];
+        let window_dims = [2usize, cols];
+        let operand_strides = [1isize, 3];
+        let window_strides = [1isize, 2];
+        let starts_dims = [2usize];
+        let starts_strides = [1isize];
+        let operand: Vec<i32> = (0..3 * cols).map(|index| index as i32 - 17).collect();
+        let update: Vec<i32> = (0..len).map(|index| 1000 + index as i32).collect();
+        let starts = [1i64, 0];
+        let source =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
+        let update_ref =
+            ErasedRawStridedRef::from_slice(&update, &window_dims, &window_strides, 0).unwrap();
+        let starts_ref =
+            ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
+        let slice = ErasedDynamicSlicePlan::compile(
+            KernelDType::I32,
+            KernelDType::I64,
+            &operand_dims,
+            &operand_strides,
+            &starts_dims,
+            &starts_strides,
+            &window_dims,
+            &window_strides,
+            &window_dims,
+        )
+        .unwrap();
+        let update_slice = ErasedDynamicUpdateSlicePlan::compile(
+            KernelDType::I32,
+            KernelDType::I64,
+            &operand_dims,
+            &operand_strides,
+            &starts_dims,
+            &starts_strides,
+            &window_dims,
+            &window_strides,
+            &operand_dims,
+            &operand_strides,
+        )
+        .unwrap();
+
+        let run_slice = |mut ctx: Exec| {
+            let mut output = vec![0i32; len];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
+                    .unwrap();
+            slice.execute(&mut dest, &source, &starts_ref, ctx).unwrap();
+            output
+        };
+        let run_update = |ctx: Exec| {
+            let mut output = vec![0i32; 3 * cols];
+            let mut dest = ErasedRawStridedMut::from_slice_mut(
+                &mut output,
+                &operand_dims,
+                &operand_strides,
+                0,
+            )
+            .unwrap();
+            update_slice
+                .execute(&mut dest, &source, &update_ref, &starts_ref, ctx)
+                .unwrap();
+            output
+        };
+
+        assert_eq!(run_slice(bounded_context()), run_slice(Exec::serial()));
+        assert_eq!(run_update(bounded_context()), run_update(Exec::serial()));
+    }
 }
 
 #[test]
@@ -305,30 +461,52 @@ fn large_erased_pad_matches_serial() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
-        let operand_ref = ErasedRawStridedRef::new(
-            KernelDType::I32,
-            as_bytes(&operand),
-            &operand_dims,
-            &operand_strides,
-            0,
-        )
-        .unwrap();
+    let run = |ctx: Exec| {
+        let operand_ref =
+            ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, 0).unwrap();
         let mut output = vec![0i32; LARGE_LEN + 128];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::I32,
-            as_bytes_mut(&mut output),
-            &dest_dims,
-            &dest_strides,
-            0,
-        )
-        .unwrap();
-        plan.execute(&ctx, &mut dest, &operand_ref, as_bytes(&fill))
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
+}
+
+#[test]
+fn generic_pad_matches_serial_at_threshold_boundaries() {
+    for len in [(1usize << 15) - 1, 1usize << 15, (1usize << 15) + 1] {
+        let dims = [1usize, len];
+        let strides = [1isize, 1];
+        let edge = [0i64, 0];
+        let interior = [1i64, 0];
+        let fill = [-7i32];
+        let operand = (0..len).map(|index| index as i32).collect::<Vec<_>>();
+        let plan = ErasedPadPlan::compile(
+            KernelDType::I32,
+            &dims,
+            &strides,
+            &dims,
+            &strides,
+            &edge,
+            &edge,
+            &interior,
+        )
+        .unwrap();
+        let run = |ctx: Exec| {
+            let operand_ref =
+                ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+            let mut output = vec![0i32; len];
+            let mut dest =
+                ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
+            plan.execute(&mut dest, &operand_ref, as_bytes(&fill), ctx)
+                .unwrap();
+            output
+        };
+        assert_eq!(run(bounded_context()), run(Exec::serial()), "len={len}");
+    }
 }
 
 #[test]
@@ -363,34 +541,200 @@ fn large_erased_scatter_matches_serial_with_overlaps() {
     )
     .unwrap();
 
-    let run = |ctx: ExecContext| {
-        let operand_ref =
-            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&operand), &dims, &strides, 0)
-                .unwrap();
-        let index_ref = ErasedRawStridedRef::new(
-            KernelDType::I64,
-            as_bytes(&indices),
-            &index_dims,
-            &index_strides,
-            0,
-        )
-        .unwrap();
-        let update_ref =
-            ErasedRawStridedRef::new(KernelDType::F64, as_bytes(&updates), &dims, &strides, 0)
-                .unwrap();
+    let run = |ctx: Exec| {
+        let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
+        let index_ref =
+            ErasedRawStridedRef::from_slice(&indices, &index_dims, &index_strides, 0).unwrap();
+        let update_ref = ErasedRawStridedRef::from_slice(&updates, &dims, &strides, 0).unwrap();
         let mut output = vec![0.0f64; LARGE_LEN];
-        let mut dest = ErasedRawStridedMut::new(
-            KernelDType::F64,
-            as_bytes_mut(&mut output),
-            &dims,
-            &strides,
-            0,
-        )
-        .unwrap();
-        plan.execute(&ctx, &mut dest, &operand_ref, &index_ref, &update_ref)
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dims, &strides, 0).unwrap();
+        plan.execute(&mut dest, &operand_ref, &index_ref, &update_ref, ctx)
             .unwrap();
         output
     };
 
-    assert_eq!(run(bounded_context()), run(ExecContext::serial()));
+    assert_eq!(run(bounded_context()), run(Exec::serial()));
+}
+
+#[test]
+fn large_erased_concatenate_matches_serial_for_initialized_and_uninit_outputs() {
+    // Several segments, one reversed, odd total above the threshold.
+    let lens = [LARGE_LEN / 3, 17usize, LARGE_LEN / 2 + 3, 0, 1001];
+    let strides_of = |position: usize| [if position == 2 { -1isize } else { 1 }];
+    let data: Vec<Vec<i64>> = lens
+        .iter()
+        .enumerate()
+        .map(|(position, &len)| {
+            (0..len)
+                .map(|index| 1_000_000 * position as i64 + index as i64)
+                .collect()
+        })
+        .collect();
+    let dims: Vec<[usize; 1]> = lens.iter().map(|&len| [len]).collect();
+    let strides: Vec<[isize; 1]> = (0..lens.len()).map(strides_of).collect();
+    let total: usize = lens.iter().sum();
+    let dest_dims = [total];
+    let dest_strides = [1isize];
+    let input_dims: Vec<&[usize]> = dims.iter().map(|d| &d[..]).collect();
+    let input_strides: Vec<&[isize]> = strides.iter().map(|s| &s[..]).collect();
+    let plan = ErasedConcatenatePlan::compile(
+        KernelDType::I64,
+        &input_dims,
+        &input_strides,
+        &dest_dims,
+        &dest_strides,
+        0,
+    )
+    .unwrap();
+    let inputs: Vec<ErasedRawStridedRef<'_>> = data
+        .iter()
+        .enumerate()
+        .map(|(position, values)| {
+            let offset = if position == 2 {
+                lens[2] as isize - 1
+            } else {
+                0
+            };
+            ErasedRawStridedRef::from_slice(values, &dims[position], &strides[position], offset)
+                .unwrap()
+        })
+        .collect();
+    let mut expected = Vec::with_capacity(total);
+    for (position, values) in data.iter().enumerate() {
+        if position == 2 {
+            expected.extend(values.iter().rev());
+        } else {
+            expected.extend(values.iter());
+        }
+    }
+
+    let run = |ctx: Exec| {
+        let mut output = vec![-1i64; total];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &dest_dims, &dest_strides, 0).unwrap();
+        plan.execute(&mut dest, &inputs, ctx).unwrap();
+        output
+    };
+    let run_uninit = |ctx: Exec| {
+        let ptrs: Vec<ErasedRawStridedPtr<'_>> =
+            inputs.iter().map(ErasedRawStridedPtr::from_ref).collect();
+        let mut storage = vec![MaybeUninit::<i64>::uninit(); total];
+        let mut dest = ErasedRawStridedUninitMut::from_uninit_slice(
+            &mut storage,
+            &dest_dims,
+            &dest_strides,
+            0,
+        )
+        .unwrap();
+        plan.execute_uninit(&mut dest, &ptrs, ctx).unwrap();
+        // SAFETY: the dense destination reaches every slot and a successful
+        // uninit execute initializes every reachable slot.
+        storage
+            .iter()
+            .map(|value| unsafe { value.assume_init() })
+            .collect::<Vec<_>>()
+    };
+    let makers: [fn() -> Exec<'static>; 2] = [Exec::serial, bounded_context];
+    for make in makers {
+        assert_eq!(run(make()), expected);
+        assert_eq!(run_uninit(make()), expected);
+    }
+}
+
+#[test]
+fn large_erased_rank_two_dynamic_slice_and_update_match_serial() {
+    // Window replay through the fused layout: reversed operand axis,
+    // transposed destination and a start that needs clamping.
+    let operand_dims = [307usize, 211];
+    let operand_strides = [-1isize, 307];
+    let operand_offset = 306isize;
+    let starts_dims = [2usize];
+    let starts_strides = [1isize];
+    let window_dims = [257usize, 131];
+    let window_strides = [131isize, 1];
+    let operand: Vec<f64> = (0..307 * 211).map(|index| index as f64 * 0.5).collect();
+    let update: Vec<f64> = (0..257 * 131).map(|index| -(index as f64) - 1.0).collect();
+    let starts = [13i64, 500];
+    let (s0, s1) = (13usize, 211 - 131);
+    let operand_at = |i: usize, j: usize| operand[306 - i + 307 * j];
+
+    let slice = ErasedDynamicSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &operand_dims,
+        &operand_strides,
+        &starts_dims,
+        &starts_strides,
+        &window_dims,
+        &window_strides,
+        &window_dims,
+    )
+    .unwrap();
+    let dest_strides = [1isize, 307];
+    let update_slice = ErasedDynamicUpdateSlicePlan::compile(
+        KernelDType::F64,
+        KernelDType::I64,
+        &operand_dims,
+        &operand_strides,
+        &starts_dims,
+        &starts_strides,
+        &window_dims,
+        &window_strides,
+        &operand_dims,
+        &dest_strides,
+    )
+    .unwrap();
+
+    let operand_ref =
+        ErasedRawStridedRef::from_slice(&operand, &operand_dims, &operand_strides, operand_offset)
+            .unwrap();
+    let starts_ref =
+        ErasedRawStridedRef::from_slice(&starts, &starts_dims, &starts_strides, 0).unwrap();
+    let update_ref =
+        ErasedRawStridedRef::from_slice(&update, &window_dims, &window_strides, 0).unwrap();
+
+    let mut expected_slice = vec![0.0f64; 257 * 131];
+    for j in 0..131 {
+        for i in 0..257 {
+            expected_slice[131 * i + j] = operand_at(s0 + i, s1 + j);
+        }
+    }
+    let mut expected_update = vec![0.0f64; 307 * 211];
+    for j in 0..211 {
+        for i in 0..307 {
+            expected_update[i + 307 * j] = operand_at(i, j);
+        }
+    }
+    for j in 0..131 {
+        for i in 0..257 {
+            expected_update[(s0 + i) + 307 * (s1 + j)] = update[131 * i + j];
+        }
+    }
+
+    for mut ctx in [Exec::serial(), bounded_context()] {
+        let mut output = vec![f64::NAN; 257 * 131];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &window_dims, &window_strides, 0)
+                .unwrap();
+        slice
+            .execute(&mut dest, &operand_ref, &starts_ref, ctx.reborrow())
+            .unwrap();
+        assert_eq!(output, expected_slice);
+
+        let mut output = vec![f64::NAN; 307 * 211];
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut output, &operand_dims, &dest_strides, 0)
+                .unwrap();
+        update_slice
+            .execute(
+                &mut dest,
+                &operand_ref,
+                &update_ref,
+                &starts_ref,
+                ctx.reborrow(),
+            )
+            .unwrap();
+        assert_eq!(output, expected_update);
+    }
 }

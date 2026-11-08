@@ -1,6 +1,7 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use strided_kernel::Exec;
 use strided_kernel::{
     batched_outer_product_into, zip_map2_into, Identity, StridedArray, StridedView, StridedViewMut,
 };
@@ -57,26 +58,49 @@ fn main() {
     println!();
 
     bench_n("batched_outer compact", 20, 100, || {
-        batched_outer_product_into(&mut out.view_mut(), &lhs_compact.view(), &rhs.view(), 2, 1)
-            .unwrap();
+        batched_outer_product_into(
+            &mut out.view_mut(),
+            &lhs_compact.view(),
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     });
 
     bench_n("batched_outer noncompact", 20, 100, || {
-        batched_outer_product_into(&mut out.view_mut(), &lhs_noncompact, &rhs.view(), 2, 1)
-            .unwrap();
+        batched_outer_product_into(
+            &mut out.view_mut(),
+            &lhs_noncompact,
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out.data().as_ptr());
     });
 
+    let out_dims = [j, k, o, t];
     bench_n("batched_outer noncompact torchlike output", 20, 100, || {
         let mut out_view = StridedViewMut::new(
             out_torchlike.data_mut(),
-            &[j, k, o, t],
+            &out_dims,
             &torchlike_out_strides,
             0,
         )
         .unwrap();
-        batched_outer_product_into(&mut out_view, &lhs_noncompact, &rhs.view(), 2, 1).unwrap();
+        batched_outer_product_into(
+            &mut out_view,
+            &lhs_noncompact,
+            &rhs.view(),
+            2,
+            1,
+            Exec::serial(),
+        )
+        .unwrap();
         black_box(out_torchlike.data().as_ptr());
     });
 
@@ -223,16 +247,20 @@ fn main() {
         black_box(out_ptr);
     });
 
+    let lhs_seed_dims = [j, k, 1, t];
+    let lhs_seed_strides = [j as isize, 1, 0, (j * k) as isize];
     let lhs_broadcast_seed: StridedView<'_, f64, Identity> = StridedView::new(
         lhs_noncompact_base.data(),
-        &[j, k, 1, t],
-        &[j as isize, 1, 0, (j * k) as isize],
+        &lhs_seed_dims,
+        &lhs_seed_strides,
         0,
     )
     .unwrap();
     let lhs_broadcast = lhs_broadcast_seed.broadcast(&[j, k, o, t]).unwrap();
+    let rhs_seed_dims = [1, 1, o, t];
+    let rhs_seed_strides = [0isize, 0, 1, o as isize];
     let rhs_broadcast_seed: StridedView<'_, f64, Identity> =
-        StridedView::new(rhs.data(), &[1, 1, o, t], &[0, 0, 1, o as isize], 0).unwrap();
+        StridedView::new(rhs.data(), &rhs_seed_dims, &rhs_seed_strides, 0).unwrap();
     let rhs_broadcast = rhs_broadcast_seed.broadcast(&[j, k, o, t]).unwrap();
 
     bench_n("zip_map2 broadcast noncompact", 20, 100, || {
@@ -241,6 +269,7 @@ fn main() {
             &lhs_broadcast,
             &rhs_broadcast,
             |x, y| x * y,
+            Exec::serial(),
         )
         .unwrap();
         black_box(out.data().as_ptr());
@@ -253,12 +282,19 @@ fn main() {
         || {
             let mut out_view = StridedViewMut::new(
                 out_torchlike.data_mut(),
-                &[j, k, o, t],
+                &out_dims,
                 &torchlike_out_strides,
                 0,
             )
             .unwrap();
-            zip_map2_into(&mut out_view, &lhs_broadcast, &rhs_broadcast, |x, y| x * y).unwrap();
+            zip_map2_into(
+                &mut out_view,
+                &lhs_broadcast,
+                &rhs_broadcast,
+                |x, y| x * y,
+                Exec::serial(),
+            )
+            .unwrap();
             black_box(out_torchlike.data().as_ptr());
         },
     );

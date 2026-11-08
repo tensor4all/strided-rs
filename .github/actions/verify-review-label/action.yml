@@ -1,0 +1,28 @@
+name: Verify review label
+description: >-
+  Fail unless a maintainer/admin comment says `waive-review <full head sha>` for
+  the current PR head. The label only decides which job runs; it grants nothing
+  on its own, and the SHA binding makes a waiver stop applying the moment the
+  head moves.
+
+inputs:
+  label:
+    description: Label this job was triggered by (recorded in the failure text)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v7
+      env:
+        REVIEW_LABEL: ${{ inputs.label }}
+      with:
+        script: |
+          // The waiver is a maintainer comment naming the current head sha, so
+          // it stops applying the moment the head moves. This used to read
+          // `created_at` off `committed` timeline events, which those events do
+          // not carry, so the staleness branch never fired; `committer.date` is
+          // author-controlled and is not a substitute. See
+          // scripts/review-waiver.js.
+          const { run } = require(`${process.env.GITHUB_WORKSPACE}/scripts/review-waiver.js`);
+          await run({ github, core, context, labelName: process.env.REVIEW_LABEL });

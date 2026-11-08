@@ -39,13 +39,12 @@ license-bearing attributions (`strided-perm` is
 |-------|------|
 | `strided-traits` | Element-operation and scalar traits (`Identity`, `Conj`, `Transpose`, `Adjoint`) |
 | `strided-view` | Dynamic-rank strided views (`StridedView`, `StridedViewMut`, `StridedArray`) and metadata ops |
-| `strided-kernel` | Cache-optimized map/reduce/broadcast kernels, Rayon threading, pulp SIMD (feature `simd`) |
+| `strided-basic` | Shared typed primitives, layout/indexing plans, copy/reduction taking an `Exec` placement token, pulp SIMD |
+| `strided-kernel` | Ordinary dtype-erased arithmetic/indexing and re-exported typed APIs |
+| `strided-fused` | Runtime-DAG fused execution using the shared basic implementation |
+| `strided-nn` | Fused neural-network kernels (axis-0 softmax) over contiguous slices, with caller-provided scratch |
 | `strided-perm` | Cache-efficient permutation / transpose (HPTT-derived, `src/hptt/`), feature `parallel` |
-| `strided-einsum2` | Binary einsum via GEMM backends |
-| `strided-opteinsum` | N-ary einsum with contraction-order optimization |
-| `mdarray-opteinsum` | Einsum adapter for `mdarray` (row-major conversion at the boundary) |
-| `ndarray-opteinsum` | Einsum adapter for `ndarray` (direct stride passthrough) |
-| `strided-rs` | User-facing facade re-exporting the workspace APIs |
+| `threadteam` (external crate, tensor4all/threadteam-rs) | Splittable CPU placement token (`Pool`, `Exec`) and the only crate that starts tasks; `strided-perm` and `strided-basic` take it explicitly (docs/design/cpu-exec-placement.md; the type lives in [threadteam-rs](https://github.com/tensor4all/threadteam-rs)) |
 
 Dense flat-buffer APIs are column-major; see `REPOSITORY_RULES.md` for the
 layout and copy-semantics contracts.
@@ -59,6 +58,41 @@ cargo fmt --all -- --check   # run `cargo fmt --all` to fix
 cargo test --workspace       # all tests
 ```
 
+## Repository Rules Review Bot
+
+`.github/workflows/review_bot.yml` reviews every PR diff against
+`REPOSITORY_RULES.md`. It runs from the trusted base revision and treats PR
+contents as data: the PR head is fetched for `git diff` only, never checked out
+or executed. Findings are posted as a single updating PR comment; only
+`block`-severity findings fail CI. The external LLM pass is permanently
+disabled, matching tenferro-rs: CI runs the deterministic checks only, with
+`--dry-run --llm-skipped-reason ...`.
+
+Preview the review locally before pushing:
+
+```bash
+python3 scripts/repository-rules-review.py --base main --worktree --dry-run
+python3 scripts/test-repository-rules-review.py   # the script's own tests
+```
+
+Two deterministic checks run: secret-shaped text in added lines is blocked,
+and the **Deprecated Tree Freeze** rejects source changes under `deprecated/`.
+The LLM prompt in `ai/prompts/repository-rules-review.md` is kept but unused
+while the LLM pass is disabled.
+
+Maintainer escape hatches, both requiring the `maintain`/`admin` role and
+reapplication after the latest push:
+
+| Label | Effect |
+|-------|--------|
+| `rules-review:no-llm` | Legacy; the LLM pass is already disabled |
+| `rules-review:waive` | Waives the review entirely |
+
+When adding a `## ` section to `REPOSITORY_RULES.md`, also route it in
+`SECTION_TRIGGERS` (or `ALWAYS_SECTIONS` / `HUMAN_ONLY_SECTIONS`); an unrouted
+section is never shown to the reviewer, and
+`test_every_rule_section_is_reachable` fails.
+
 ## Build And Test Commands
 
 ```bash
@@ -67,19 +101,29 @@ cargo test --workspace
 cargo test -p strided-perm             # single crate
 cargo test test_name                   # single test
 cargo bench                            # benchmarks
-RUSTFLAGS="-C target-cpu=native" cargo bench   # enable AVX2/NEON auto-vectorization
 ```
+
+SIMD levels are selected at run time (pulp dispatch, AVX2 and AVX-512 included),
+so a baseline build is the measured configuration. Distribution builds never use
+`-C target-cpu=native`; see
+[`docs/design/runtime-simd-dispatch.md`](docs/design/runtime-simd-dispatch.md),
+which also holds the baseline-vs-native comparison commands and the
+`scripts/check-runtime-simd-dispatch.py` regression check.
 
 ## Benchmarking Notes
 
-- Keep benchmark programs and published results in
-  [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite);
-  crate READMEs document usage and API contracts, not performance tables.
+- Start with [`docs/design/erased-execution-policy.md`](docs/design/erased-execution-policy.md) when changing CPU threading thresholds or prepared-plan fast paths; it links the policy, benchmark, worklog, issue, and external results flow.
+- This workspace's own regression benchmarks live in `<crate>/benches/`.
+  Cross-repository comparisons and published results go to
+  [`strided-rs-benchmark-suite`](https://github.com/tensor4all/strided-rs-benchmark-suite).
+- Crate READMEs and rustdoc document usage and API contracts, not performance
+  tables. Dated worklogs under `docs/worklogs/` may quote measurements as evidence.
 - Naive baselines must be credible: pointer-based loops with precomputed
   strides, not per-element high-level indexing.
 - Keep setup out of timed regions; use `black_box`.
-- For parity with Julia, pin threads (`RAYON_NUM_THREADS=1`,
+- For parity with Julia, pin threads (`STRIDED_KERNEL_BENCH_THREADS=1`,
   `JULIA_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`) unless testing threading.
+  There is no Rayon dependency: `RAYON_NUM_THREADS` pins nothing.
 
 ## Key Constants
 

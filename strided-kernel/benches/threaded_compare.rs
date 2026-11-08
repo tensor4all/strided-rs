@@ -3,7 +3,8 @@ use rand_distr::StandardNormal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use strided_kernel::{
-    copy_into, copy_transpose_scale_into, map_into, sum, zip_map2_into, zip_map4_into, StridedArray,
+    copy_into, copy_transpose_scale_into, map_into, sum, zip_map2_into, zip_map4_into, Exec, Pool,
+    StridedArray,
 };
 
 fn mean(durations: &[Duration]) -> Duration {
@@ -38,10 +39,36 @@ fn make_random_4d(n: usize, seed: u64) -> StridedArray<f64> {
     StridedArray::<f64>::from_fn_col_major(&[n, n, n, n], |_| rng.sample(StandardNormal))
 }
 
+/// The width this run must use: `STRIDED_KERNEL_BENCH_THREADS` when set, the
+/// parallelism of the machine otherwise. A requested width is never replaced
+/// silently: the run asserts the pool and the token carry it.
+fn requested_threads() -> usize {
+    std::env::var("STRIDED_KERNEL_BENCH_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 fn main() {
-    let nthreads = rayon::current_num_threads();
+    let nthreads = requested_threads();
+    let pool = Pool::builder().threads(nthreads).build().unwrap();
+    assert_eq!(
+        pool.width().get(),
+        nthreads,
+        "the pool width does not match the requested thread count"
+    );
+    assert_eq!(
+        Exec::new(&pool, nthreads).unwrap().budget().get(),
+        nthreads,
+        "the exec budget does not match the requested thread count"
+    );
     println!("Rust threaded runner: benches/threaded_compare.rs");
-    println!("Rayon threads: {nthreads}");
+    println!(
+        "Requested threads: {nthreads}  pool width: {}  exec budget: {}",
+        pool.width(),
+        Exec::new(&pool, nthreads).unwrap().budget()
+    );
     println!();
 
     // 1) symmetrize_4000
@@ -54,7 +81,14 @@ fn main() {
         let mut b = StridedArray::<f64>::col_major(&[n, n]);
 
         bench_n("rust_strided", 1, 3, || {
-            zip_map2_into(&mut b.view_mut(), &a_view, &a_t, |x, y| (x + y) * 0.5).unwrap();
+            zip_map2_into(
+                &mut b.view_mut(),
+                &a_view,
+                &a_t,
+                |x, y| (x + y) * 0.5,
+                Exec::new(&pool, nthreads).unwrap(),
+            )
+            .unwrap();
             black_box(&b);
         });
         println!();
@@ -69,7 +103,13 @@ fn main() {
         let mut b = StridedArray::<f64>::col_major(&[n, n]);
 
         bench_n("rust_strided", 5, 10, || {
-            copy_transpose_scale_into(&mut b.view_mut(), &a_view, 3.0).unwrap();
+            copy_transpose_scale_into(
+                &mut b.view_mut(),
+                &a_view,
+                3.0,
+                Exec::new(&pool, nthreads).unwrap(),
+            )
+            .unwrap();
             black_box(&b);
         });
         println!();
@@ -86,7 +126,13 @@ fn main() {
         let mut b = StridedArray::<f64>::col_major(&[n, n]);
 
         bench_n("rust_strided_map", 5, 10, || {
-            map_into(&mut b.view_mut(), &a_t, |x| 3.0 * x).unwrap();
+            map_into(
+                &mut b.view_mut(),
+                &a_t,
+                |x| 3.0 * x,
+                Exec::new(&pool, nthreads).unwrap(),
+            )
+            .unwrap();
             black_box(&b);
         });
         println!();
@@ -101,9 +147,12 @@ fn main() {
         let mut b = StridedArray::<f64>::col_major(&[n, n]);
 
         bench_n("rust_strided", 3, 6, || {
-            map_into(&mut b.view_mut(), &a_view, |x| {
-                x * (-2.0 * x).exp() + (x * x).sin()
-            })
+            map_into(
+                &mut b.view_mut(),
+                &a_view,
+                |x: f64| x * (-2.0 * x).exp() + (x * x).sin(),
+                Exec::new(&pool, nthreads).unwrap(),
+            )
             .unwrap();
             black_box(&b);
         });
@@ -120,7 +169,12 @@ fn main() {
         let mut b = StridedArray::<f64>::col_major(&[n, n, n, n]);
 
         bench_n("rust_strided", 20, 50, || {
-            copy_into(&mut b.view_mut(), &a_perm).unwrap();
+            copy_into(
+                &mut b.view_mut(),
+                &a_perm,
+                Exec::new(&pool, nthreads).unwrap(),
+            )
+            .unwrap();
             black_box(&b);
         });
         println!();
@@ -140,9 +194,15 @@ fn main() {
         let mut b = StridedArray::<f64>::col_major(&[n, n, n, n]);
 
         bench_n("rust_strided_fused", 10, 30, || {
-            zip_map4_into(&mut b.view_mut(), &p1, &p2, &p3, &p4, |a, b, c, d| {
-                a + b + c + d
-            })
+            zip_map4_into(
+                &mut b.view_mut(),
+                &p1,
+                &p2,
+                &p3,
+                &p4,
+                |a, b, c, d| a + b + c + d,
+                Exec::new(&pool, nthreads).unwrap(),
+            )
             .unwrap();
             black_box(&b);
         });
@@ -158,7 +218,7 @@ fn main() {
         let a_view = a.view();
 
         bench_n("rust_strided_sum", 5, 10, || {
-            let s = sum(&a_view).unwrap();
+            let s = sum(&a_view, Exec::new(&pool, nthreads).unwrap()).unwrap();
             black_box(s);
         });
         println!();

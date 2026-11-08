@@ -1,0 +1,1000 @@
+//! Allocation-free copy/axpy over borrowed raw strided layouts.
+//!
+//! The map/zip kernels build a traversal plan per call; for small replay
+//! copies that fixed cost dominates. These entry points take
+//! [`RawStridedRef`]/[`RawStridedMut`], fuse the stride pair into a loop nest
+//! (inline storage for fused ranks at most [`RAW_FUSED_RANK_LIMIT`], one
+//! rank-bounded spill above that), and run plain loops - no view plan, no
+//! cache, and no per-element allocation on any call path. Higher *original*
+//! ranks are normalized and fused before that choice is made, so they no
+//! longer leave the fused replay.
+
+use crate::cost::KernelClass;
+use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result};
+use core::mem::MaybeUninit;
+use core::num::NonZeroUsize;
+use core::ops::{Add, Mul};
+
+/// Rank up to which a fused loop nest is stored inline.
+///
+/// The stateless [`copy_scale_raw`] family and [`crate::CopyPlan`] fuse any rank:
+/// layouts whose *fused* rank is at most this limit replay from that inline
+/// storage, and higher fused ranks spill to storage bounded by their rank.
+///
+/// Replay is allocation-free for an original rank at most this limit. A higher
+/// *original* rank needs one transient scratch buffer even when the fused layout
+/// still fits inline, because fusion happens before the representation is
+/// chosen; the replay itself is still allocation-free in that case.
+pub const RAW_FUSED_RANK_LIMIT: usize = 8;
+
+/// One fused axis, used while sorting and merging axes and when a layout has to
+/// spill beyond [`RAW_FUSED_RANK_LIMIT`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FusedAxis {
+    pub(crate) dim: usize,
+    pub(crate) dst: isize,
+    pub(crate) src: isize,
+}
+
+const EMPTY_AXIS: FusedAxis = FusedAxis {
+    dim: 1,
+    dst: 0,
+    src: 0,
+};
+
+/// Stack-allocated fused stride pair (axes ordered by destination stride,
+/// adjacent contiguous axes merged). Built once and replayed by both the
+/// per-call raw kernels and the prepared [`crate::CopyPlan`].
+///
+/// This is the representation every call site replays through, so it keeps the
+/// exact shape, size and `Copy`-ness it had before high-rank fusion existed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FusedPairLayout {
+    pub(crate) rank: usize,
+    pub(crate) dims: [usize; RAW_FUSED_RANK_LIMIT],
+    dst_strides: [isize; RAW_FUSED_RANK_LIMIT],
+    src_strides: [isize; RAW_FUSED_RANK_LIMIT],
+}
+
+impl FusedPairLayout {
+    /// An empty rank-zero layout (one element at the base offset).
+    ///
+    /// Used as the neutral value when an inline `TinyVec<[CopyPlan; N]>` is
+    /// default-initialized; it is never executed as a real plan.
+    fn empty() -> Self {
+        Self {
+            rank: 0,
+            dims: [1; RAW_FUSED_RANK_LIMIT],
+            dst_strides: [0; RAW_FUSED_RANK_LIMIT],
+            src_strides: [0; RAW_FUSED_RANK_LIMIT],
+        }
+    }
+
+    fn from_axes(axes: &[FusedAxis]) -> Self {
+        debug_assert!(axes.len() <= RAW_FUSED_RANK_LIMIT);
+        let mut layout = Self {
+            rank: axes.len(),
+            dims: [1; RAW_FUSED_RANK_LIMIT],
+            dst_strides: [0; RAW_FUSED_RANK_LIMIT],
+            src_strides: [0; RAW_FUSED_RANK_LIMIT],
+        };
+        for (slot, axis) in layout.dims[..axes.len()].iter_mut().zip(axes) {
+            *slot = axis.dim;
+        }
+        for (slot, axis) in layout.dst_strides[..axes.len()].iter_mut().zip(axes) {
+            *slot = axis.dst;
+        }
+        for (slot, axis) in layout.src_strides[..axes.len()].iter_mut().zip(axes) {
+            *slot = axis.src;
+        }
+        layout
+    }
+}
+
+/// A fused pair traversal of any rank.
+///
+/// Fused ranks at most [`RAW_FUSED_RANK_LIMIT`] use the inline layout; longer
+/// layouts keep their axes in one `Vec`. That storage is sized by the original
+/// rank (the fusion scratch is reused, and `truncate` keeps its capacity), never
+/// by the tensor's element count.
+#[derive(Clone, Debug)]
+pub(crate) enum PairTraversal {
+    Inline(FusedPairLayout),
+    Spilled(Vec<FusedAxis>),
+}
+
+impl Default for FusedPairLayout {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Default for PairTraversal {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl PairTraversal {
+    /// The empty inline layout, used as a neutral default.
+    #[inline]
+    fn empty() -> Self {
+        Self::Inline(FusedPairLayout::empty())
+    }
+
+    /// The inline layout, or `None` when the traversal spilled.
+    #[inline]
+    pub(crate) fn inline(&self) -> Option<&FusedPairLayout> {
+        match self {
+            Self::Inline(layout) => Some(layout),
+            Self::Spilled(_) => None,
+        }
+    }
+
+    /// Number of fused axes.
+    #[cfg(test)]
+    pub(crate) fn rank(&self) -> usize {
+        match self {
+            Self::Inline(layout) => layout.rank,
+            Self::Spilled(axes) => axes.len(),
+        }
+    }
+}
+
+/// Sort `dims`/`dst_strides`/`src_strides` by destination stride, drop size-1
+/// axes, and merge axes that are contiguous in both layouts.
+///
+/// Returns the fused rank written to `scratch[..rank]`. A zero extent collapses
+/// to a single zero-length axis, which every replay treats as an empty range.
+fn fuse_axes(
+    scratch: &mut [FusedAxis],
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+) -> usize {
+    debug_assert!(scratch.len() >= dims.len());
+    let mut rank = 0usize;
+    for axis in 0..dims.len() {
+        if dims[axis] == 1 {
+            continue;
+        }
+        if dims[axis] == 0 {
+            scratch[0] = FusedAxis {
+                dim: 0,
+                dst: 0,
+                src: 0,
+            };
+            return 1;
+        }
+        let entry = FusedAxis {
+            dim: dims[axis],
+            dst: dst_strides[axis],
+            src: src_strides[axis],
+        };
+        let mut position = rank;
+        while position > 0 && scratch[position - 1].dst > entry.dst {
+            scratch[position] = scratch[position - 1];
+            position -= 1;
+        }
+        scratch[position] = entry;
+        rank += 1;
+    }
+    if rank == 0 {
+        scratch[0] = EMPTY_AXIS;
+        return 1;
+    }
+    let mut fused = 0usize;
+    for axis in 1..rank {
+        // A merged extent that overflows (possible for a stride-0 broadcast
+        // whose element count exceeds usize) leaves the axes unfused.
+        let merged = isize::try_from(scratch[fused].dim)
+            .ok()
+            .filter(|&extent| {
+                scratch[fused].dst.checked_mul(extent) == Some(scratch[axis].dst)
+                    && scratch[fused].src.checked_mul(extent) == Some(scratch[axis].src)
+            })
+            .and_then(|_| scratch[fused].dim.checked_mul(scratch[axis].dim));
+        if let Some(merged) = merged {
+            scratch[fused].dim = merged;
+        } else {
+            fused += 1;
+            scratch[fused] = scratch[axis];
+        }
+    }
+    fused + 1
+}
+
+/// Fuse a raw stride pair into a traversal of any rank.
+///
+/// Inline when the fused rank is at most [`RAW_FUSED_RANK_LIMIT`], otherwise one
+/// rank-bounded spill. An original rank above the limit uses a transient scratch
+/// buffer even when the fused layout still fits inline, so that fusion happens
+/// before the representation is chosen.
+pub(crate) fn fuse_pair_traversal(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+) -> PairTraversal {
+    if dims.len() <= RAW_FUSED_RANK_LIMIT {
+        let mut scratch = [EMPTY_AXIS; RAW_FUSED_RANK_LIMIT];
+        let rank = fuse_axes(&mut scratch, dims, dst_strides, src_strides);
+        debug_assert!(rank <= RAW_FUSED_RANK_LIMIT);
+        return PairTraversal::Inline(FusedPairLayout::from_axes(&scratch[..rank]));
+    }
+    let mut scratch = vec![EMPTY_AXIS; dims.len()];
+    let rank = fuse_axes(&mut scratch, dims, dst_strides, src_strides);
+    scratch.truncate(rank);
+    if rank <= RAW_FUSED_RANK_LIMIT {
+        PairTraversal::Inline(FusedPairLayout::from_axes(&scratch))
+    } else {
+        PairTraversal::Spilled(scratch)
+    }
+}
+
+impl PairTraversal {
+    /// The given axes as a traversal, in their given order: nothing is
+    /// sorted, merged or dropped. Rank zero becomes the one-element
+    /// `EMPTY_AXIS` layout that [`fuse_axes`] also produces.
+    ///
+    /// The three slices must have equal length, and the extents a checked,
+    /// nonzero product (the replay totals multiply them unchecked).
+    pub(crate) fn given(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> Self {
+        debug_assert!(dims.len() == dst_strides.len() && dims.len() == src_strides.len());
+        let rank = dims.len();
+        if rank > RAW_FUSED_RANK_LIMIT {
+            return Self::Spilled(
+                dims.iter()
+                    .zip(dst_strides)
+                    .zip(src_strides)
+                    .map(|((&dim, &dst), &src)| FusedAxis { dim, dst, src })
+                    .collect(),
+            );
+        }
+        let mut layout = FusedPairLayout::empty();
+        layout.rank = rank.max(1);
+        layout.dims[..rank].copy_from_slice(dims);
+        layout.dst_strides[..rank].copy_from_slice(dst_strides);
+        layout.src_strides[..rank].copy_from_slice(src_strides);
+        Self::Inline(layout)
+    }
+}
+
+/// Fuse a raw stride pair into the inline representation.
+///
+/// Returns `None` when the fused rank exceeds [`RAW_FUSED_RANK_LIMIT`]. Used by
+/// the window plans, whose non-fused replay is compiled alongside the plan.
+pub(crate) fn fuse_pair_layout(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+) -> Option<FusedPairLayout> {
+    match fuse_pair_traversal(dims, dst_strides, src_strides) {
+        PairTraversal::Inline(layout) => Some(layout),
+        PairTraversal::Spilled(_) => None,
+    }
+}
+
+/// Number of logical elements covered by a fused layout.
+///
+/// Every constructor of a [`FusedPairLayout`] starts from dims whose product
+/// was checked by [`crate::kernel::total_len`], and fusion only merges axes
+/// with a checked product, so the product cannot overflow.
+#[inline]
+pub(crate) fn fused_total(layout: &FusedPairLayout) -> usize {
+    layout.dims[..layout.rank].iter().product()
+}
+
+/// Number of logical elements covered by a spilled axis list.
+#[inline]
+fn spilled_total(axes: &[FusedAxis]) -> usize {
+    axes.iter().map(|axis| axis.dim).product()
+}
+
+/// Serial replay of a fused pair layout over borrowed raw views.
+///
+/// The destination layout need not be injective: runs are replayed in order,
+/// so accumulating callers such as [`axpy_raw`] keep their sequential
+/// semantics. Parallel replay goes through `copy_plan::replay_fused`, which
+/// the plans and the `replay_*_raw` entries call only with a destination
+/// proven injective or a serial token.
+pub(crate) fn apply_fused_pair<D, S, Apply>(
+    dst: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    layout: &FusedPairLayout,
+    apply: Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    let total = fused_total(layout);
+    if total == 0 {
+        return;
+    }
+    let src_ptr = src.data().as_ptr();
+    let src_base = src.offset();
+    let dst_base = dst.offset();
+    let dst_ptr = dst.data_mut().as_mut_ptr();
+    // SAFETY: `RawStridedRef`/`RawStridedMut` guarantee (by `new`, or by the
+    // caller of `new_unchecked`) that every offset reachable from their offset
+    // through their dims/strides lies inside their data. Callers pass a layout
+    // fused from exactly those dims/strides, so every logical index in
+    // `0..total` maps to in-bounds source and destination slots. The shared
+    // and exclusive borrows cannot overlap, and this is the only writer.
+    unsafe {
+        apply_fused_range(
+            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply,
+        );
+    }
+}
+
+/// Serial replay of a spilled fused axis list over borrowed raw views.
+///
+/// Kept out of line and separate from [`apply_fused_pair`] so that the inline
+/// entry points keep the code shape they had before high-rank fusion existed:
+/// fused ranks above [`RAW_FUSED_RANK_LIMIT`] are the rare case, and inlining
+/// this second carry loop into them measurably slowed the inline path (extra
+/// register pressure in a loop that runs once per short run).
+#[inline(never)]
+pub(crate) fn apply_spilled_pair<D, S, Apply>(
+    dst: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    axes: &[FusedAxis],
+    apply: Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    let total = spilled_total(axes);
+    if total == 0 {
+        return;
+    }
+    let src_ptr = src.data().as_ptr();
+    let src_base = src.offset();
+    let dst_base = dst.offset();
+    let dst_ptr = dst.data_mut().as_mut_ptr();
+    // SAFETY: same contract as `apply_fused_pair`, for the axis list fused from
+    // the same dims/strides.
+    unsafe {
+        apply_spilled_range(dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &apply);
+    }
+}
+
+/// Replay logical indices `start..start + len` of a fused pair layout, in
+/// column-major order of the fused axes (axis 0 fastest).
+///
+/// The start coordinate is decoded once; runs along axis 0 then advance the
+/// outer coordinates incrementally, so no per-element range checks or
+/// coordinate rebuilds remain in the hot loop.
+///
+/// # Safety
+///
+/// - `start + len` must not exceed [`fused_total`] of `layout`.
+/// - For every logical index `i` in the range, `dst_base` plus the fused
+///   destination offset of `i` must be an in-bounds, writable slot of the
+///   allocation behind `dst_ptr`, and likewise `src_base` plus the source
+///   offset must be an in-bounds, readable slot behind `src_ptr`.
+/// - No other thread may access the destination slots of this range while it
+///   runs, and the source slots must not be written concurrently. Destination
+///   and source slots must not overlap.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    layout: &FusedPairLayout,
+    start: usize,
+    len: usize,
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    if len == 0 {
+        return;
+    }
+    let rank = layout.rank;
+    let inner_len = layout.dims[0];
+    let inner_dst = layout.dst_strides[0];
+    let inner_src = layout.src_strides[0];
+
+    // Decode the start coordinate once per range. `dst_offset`/`src_offset`
+    // track the offset of the current run start (outer coordinates plus the
+    // inner coordinate `inner_start`); every value is a reachable offset.
+    let mut index = [0usize; RAW_FUSED_RANK_LIMIT];
+    let mut rest = start;
+    let mut dst_outer = dst_base;
+    let mut src_outer = src_base;
+    for axis in 0..rank {
+        let dim = layout.dims[axis];
+        index[axis] = rest % dim;
+        rest /= dim;
+        if axis > 0 {
+            dst_outer += index[axis] as isize * layout.dst_strides[axis];
+            src_outer += index[axis] as isize * layout.src_strides[axis];
+        }
+    }
+    let mut inner_start = index[0];
+    let mut remaining = len;
+    loop {
+        let run = (inner_len - inner_start).min(remaining);
+        let dst_run = dst_outer + inner_start as isize * inner_dst;
+        let src_run = src_outer + inner_start as isize * inner_src;
+        // SAFETY: the run covers logical indices inside the caller's range, so
+        // by this function's contract every slot touched below is in-bounds,
+        // exclusively owned by this call (destination) and unaliased.
+        unsafe {
+            apply_run(
+                dst_ptr, dst_run, inner_dst, src_ptr, src_run, inner_src, run, apply,
+            )
+        };
+        remaining -= run;
+        if remaining == 0 {
+            return;
+        }
+        inner_start = 0;
+        // Advance an axis only when another position along it follows, and
+        // rewind it from its last position, so every intermediate base is a
+        // reachable offset of a validated layout (issue #243 follow-up): a
+        // layout ending within one stride of `isize::MAX` must not overflow.
+        // `remaining > 0` guarantees a following run exists, so the loop
+        // always finds an axis to advance before running out of rank.
+        let mut axis = 1;
+        while axis < rank {
+            if index[axis] + 1 < layout.dims[axis] {
+                index[axis] += 1;
+                dst_outer += layout.dst_strides[axis];
+                src_outer += layout.src_strides[axis];
+                break;
+            }
+            let last = (layout.dims[axis] - 1) as isize;
+            dst_outer -= last * layout.dst_strides[axis];
+            src_outer -= last * layout.src_strides[axis];
+            index[axis] = 0;
+            axis += 1;
+        }
+    }
+}
+
+/// Replay logical indices `start..start + len` of a spilled fused axis list, in
+/// column-major order of the axes (axis 0 fastest).
+///
+/// The carry loop is the one [`apply_fused_range`] uses, over interleaved axes
+/// with its carry state in one rank-bounded `Vec`: no allocation scales with
+/// the tensor size and no per-element coordinate decode happens.
+///
+/// # Safety
+///
+/// The [`apply_fused_range`] contract holds for `axes`.
+///
+/// Kept out of line: inlining this second carry loop into the inline replay
+/// measurably slows that one down.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) unsafe fn apply_spilled_range<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    axes: &[FusedAxis],
+    start: usize,
+    len: usize,
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    if len == 0 {
+        return;
+    }
+    let rank = axes.len();
+    let inner_len = axes[0].dim;
+    let inner_dst = axes[0].dst;
+    let inner_src = axes[0].src;
+
+    let mut index = vec![0usize; rank];
+    let mut rest = start;
+    let mut dst_outer = dst_base;
+    let mut src_outer = src_base;
+    for axis in 0..rank {
+        let dim = axes[axis].dim;
+        index[axis] = rest % dim;
+        rest /= dim;
+        if axis > 0 {
+            dst_outer += index[axis] as isize * axes[axis].dst;
+            src_outer += index[axis] as isize * axes[axis].src;
+        }
+    }
+    let mut inner_start = index[0];
+    let mut remaining = len;
+    loop {
+        let run = (inner_len - inner_start).min(remaining);
+        let dst_run = dst_outer + inner_start as isize * inner_dst;
+        let src_run = src_outer + inner_start as isize * inner_src;
+        // SAFETY: the run covers logical indices inside the caller's range, so
+        // by the caller's contract every slot touched below is in-bounds,
+        // exclusively owned by this call (destination) and unaliased.
+        unsafe {
+            apply_run(
+                dst_ptr, dst_run, inner_dst, src_ptr, src_run, inner_src, run, apply,
+            )
+        };
+        remaining -= run;
+        if remaining == 0 {
+            return;
+        }
+        inner_start = 0;
+        // Same incremental carry as the inline replay: offsets only ever hold
+        // reachable positions, and `remaining > 0` guarantees an axis advances.
+        let mut axis = 1;
+        while axis < rank {
+            if index[axis] + 1 < axes[axis].dim {
+                index[axis] += 1;
+                dst_outer += axes[axis].dst;
+                src_outer += axes[axis].src;
+                break;
+            }
+            let last = (axes[axis].dim - 1) as isize;
+            dst_outer -= last * axes[axis].dst;
+            src_outer -= last * axes[axis].src;
+            index[axis] = 0;
+            axis += 1;
+        }
+    }
+}
+
+/// One run along the fused inner axis.
+///
+/// # Safety
+///
+/// Every `dst_offset + k * dst_stride` and `src_offset + k * src_stride` for
+/// `k < len` must be an in-bounds slot as described in [`apply_fused_range`],
+/// with exclusive access to the destination slots.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn apply_run<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_offset: isize,
+    dst_stride: isize,
+    src_ptr: *const S,
+    src_offset: isize,
+    src_stride: isize,
+    len: usize,
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    if dst_stride == 1 {
+        // SAFETY: a unit destination stride makes the run `len` consecutive
+        // in-bounds slots starting at `dst_offset`, exclusively owned here.
+        let dst_run = unsafe { core::slice::from_raw_parts_mut(dst_ptr.offset(dst_offset), len) };
+        if src_stride == 1 {
+            // A `copy_nonoverlapping` per run is not used for plain copies:
+            // it measured slower than this element loop for short runs
+            // (one `memcpy` call each) and for long cache-resident copies.
+            // SAFETY: `len` consecutive in-bounds source slots, which the
+            // exclusive destination run cannot overlap.
+            let src_run = unsafe { core::slice::from_raw_parts(src_ptr.offset(src_offset), len) };
+            for (dst, &value) in dst_run.iter_mut().zip(src_run) {
+                apply(dst, value);
+            }
+            return;
+        }
+        if src_stride == -1 {
+            // INVARIANT: the range walks never pass an empty run, and both
+            // strides are nonzero, so the validated reach `len - 1` fits
+            // `isize`; casting `len` itself would wrap for a run of
+            // `isize::MAX + 1` elements. (A `saturating_sub` here measurably
+            // slowed short unit-stride runs by changing the code layout of
+            // the whole inlined walk.)
+            let last = (len - 1) as isize;
+            // SAFETY: the run reads `src_offset - (len - 1) ..= src_offset`,
+            // all in-bounds; the lowest one is the run's last source slot.
+            let src_run =
+                unsafe { core::slice::from_raw_parts(src_ptr.offset(src_offset - last), len) };
+            for (dst, &value) in dst_run.iter_mut().zip(src_run.iter().rev()) {
+                apply(dst, value);
+            }
+            return;
+        }
+        // SAFETY: the run start is an in-bounds source slot.
+        let src_start = unsafe { src_ptr.offset(src_offset) };
+        for (position, dst) in dst_run.iter_mut().enumerate() {
+            // SAFETY: `position < len`, so this is a run source slot.
+            let value = unsafe { *src_start.offset(position as isize * src_stride) };
+            apply(dst, value);
+        }
+        return;
+    }
+    // SAFETY: the run start is an in-bounds slot of each allocation.
+    let dst_start = unsafe { dst_ptr.offset(dst_offset) };
+    let src_start = unsafe { src_ptr.offset(src_offset) };
+    // The bound stays `usize`: a checked broadcast run may hold more than
+    // `isize::MAX` elements, and `len as isize` would wrap to an empty loop.
+    for position in 0..len {
+        // INVARIANT: a nonzero stride bounds the run by its validated reach,
+        // so `position` fits `isize` exactly; a longer run is possible only
+        // along a zero stride, where the wrapped cast is multiplied by zero.
+        let position = position as isize;
+        // SAFETY: `position < len`, so both are slots of this run.
+        unsafe {
+            let value = *src_start.offset(position * src_stride);
+            apply(&mut *dst_start.offset(position * dst_stride), value);
+        }
+    }
+}
+
+fn ensure_same_dims(dst: &[usize], src: &[usize]) -> Result<()> {
+    if dst != src {
+        return Err(crate::StridedError::ShapeMismatch(
+            dst.to_vec(),
+            src.to_vec(),
+        ));
+    }
+    // Reject an element count beyond usize (a huge stride-0 broadcast)
+    // instead of replaying it.
+    crate::kernel::total_len(dst)?;
+    Ok(())
+}
+
+/// `dest = scale * src` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
+pub fn copy_scale_raw<T>(
+    dest: &mut RawStridedMut<'_, T>,
+    src: &RawStridedRef<'_, T>,
+    scale: T,
+) -> Result<()>
+where
+    T: Copy + Mul<T, Output = T> + ElementOpApply + Send + Sync,
+{
+    ensure_same_dims(dest.dims(), src.dims())?;
+    match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
+        PairTraversal::Inline(layout) => {
+            apply_fused_pair(dest, src, &layout, |dst: &mut T, value: T| {
+                *dst = scale * value
+            })
+        }
+        PairTraversal::Spilled(axes) => {
+            apply_spilled_pair(dest, src, &axes, |dst: &mut T, value: T| {
+                *dst = scale * value
+            })
+        }
+    }
+    Ok(())
+}
+
+/// `dest = scale * conj(src)` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
+pub fn copy_scale_conj_raw<T>(
+    dest: &mut RawStridedMut<'_, T>,
+    src: &RawStridedRef<'_, T>,
+    scale: T,
+) -> Result<()>
+where
+    T: Copy + Mul<T, Output = T> + ElementOpApply + Send + Sync,
+{
+    ensure_same_dims(dest.dims(), src.dims())?;
+    match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
+        PairTraversal::Inline(layout) => {
+            apply_fused_pair(dest, src, &layout, |dst: &mut T, value: T| {
+                *dst = scale * value.conj()
+            })
+        }
+        PairTraversal::Spilled(axes) => {
+            apply_spilled_pair(dest, src, &axes, |dst: &mut T, value: T| {
+                *dst = scale * value.conj()
+            })
+        }
+    }
+    Ok(())
+}
+
+/// `dest = alpha * src + dest` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
+pub fn axpy_raw<T>(
+    dest: &mut RawStridedMut<'_, T>,
+    src: &RawStridedRef<'_, T>,
+    alpha: T,
+) -> Result<()>
+where
+    T: Copy + Add<T, Output = T> + Mul<T, Output = T> + ElementOpApply + Send + Sync,
+{
+    ensure_same_dims(dest.dims(), src.dims())?;
+    match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
+        PairTraversal::Inline(layout) => {
+            apply_fused_pair(dest, src, &layout, |dst: &mut T, value: T| {
+                *dst = *dst + alpha * value
+            })
+        }
+        PairTraversal::Spilled(axes) => {
+            apply_spilled_pair(dest, src, &axes, |dst: &mut T, value: T| {
+                *dst = *dst + alpha * value
+            })
+        }
+    }
+    Ok(())
+}
+
+/// `dest = alpha * conj(src) + dest` over borrowed raw strided layouts.
+///
+/// # Errors
+///
+/// Returns [`crate::StridedError::ShapeMismatch`] when `dest` and `src` do
+/// not describe the same extents, or [`crate::StridedError::OffsetOverflow`]
+/// when the element count does not fit `usize`. Nothing is written on error.
+pub fn axpy_conj_raw<T>(
+    dest: &mut RawStridedMut<'_, T>,
+    src: &RawStridedRef<'_, T>,
+    alpha: T,
+) -> Result<()>
+where
+    T: Copy + Add<T, Output = T> + Mul<T, Output = T> + ElementOpApply + Send + Sync,
+{
+    ensure_same_dims(dest.dims(), src.dims())?;
+    match fuse_pair_traversal(dest.dims(), dest.strides(), src.strides()) {
+        PairTraversal::Inline(layout) => {
+            apply_fused_pair(dest, src, &layout, |dst: &mut T, value: T| {
+                *dst = *dst + alpha * value.conj()
+            })
+        }
+        PairTraversal::Spilled(axes) => {
+            apply_spilled_pair(dest, src, &axes, |dst: &mut T, value: T| {
+                *dst = *dst + alpha * value.conj()
+            })
+        }
+    }
+    Ok(())
+}
+
+/// Checked replay of the given axes of two views: the shared body of the
+/// `replay_*_raw` entries.
+///
+/// The element count is checked before anything is built. The unfused
+/// traversal keeps every given extent, and the replay totals (`fused_total`,
+/// `replay_spilled_raw`) take an unchecked product, so the zero-first count
+/// of `kernel::total_len` has to keep an empty layout whose nonzero prefix
+/// overflows, such as `[usize::MAX, 2, 0]`, away from them.
+fn replay_given<D, S, Apply>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    apply: Apply,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Sync,
+{
+    ensure_same_dims(dest.dims(), src.dims())?;
+    let total = crate::kernel::total_len(dest.dims())?;
+    if total == 0 {
+        return Ok(());
+    }
+    let traversal = PairTraversal::given(dest.dims(), dest.strides(), src.strides());
+    let mut exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+    if !exec.is_serial()
+        && !crate::layout_check::is_injective_layout_without_alloc(dest.dims(), dest.strides())
+    {
+        // A destination not proven injective replays as one sequential walk,
+        // which is also its defined semantics; the budget-one token cannot be
+        // widened again by the replay's own width rule.
+        exec = exec.limit(NonZeroUsize::MIN);
+    }
+    // SAFETY: `traversal` is built from exactly the views' dims and strides
+    // (`ensure_same_dims` proved the dims agree), so the views' bounds proofs
+    // cover every replayed offset; `total_len` checked the nonzero product;
+    // a non-serial `exec` is left only for a destination proven injective;
+    // the exclusive and shared borrows cannot overlap.
+    unsafe { crate::copy_plan::replay_fused(dest, src, &traversal, apply, exec) };
+    Ok(())
+}
+
+/// `dest = src`, replaying the axes of the two views exactly as given.
+///
+/// The views carry already-fused dims: no axis is reordered, dropped or
+/// merged, and no plan is compiled. Axis 0 is the inner run. Bounds were validated when the views were built
+/// ([`RawStridedRef::new`], [`RawStridedMut::new`]). On a successful call the
+/// replay itself (validation, traversal and dispatch) allocates nothing for a
+/// rank at most [`RAW_FUSED_RANK_LIMIT`]; above it, the axis list and the cursor
+/// of each replayed range are stored in rank-sized buffers. An error may
+/// allocate its payload.
+///
+/// The width comes from the repository rule on `exec`. A parallel replay runs
+/// only on a destination proven injective without allocating; any other
+/// destination is replayed serially in column-major order of the given axes.
+///
+/// # Errors
+///
+/// [`StridedError::ShapeMismatch`](crate::StridedError::ShapeMismatch) when the
+/// two views have different dims, and
+/// [`StridedError::OffsetOverflow`](crate::StridedError::OffsetOverflow) when the
+/// element count overflows `usize`; both before any write.
+///
+/// # Examples
+///
+/// Copy the outer band `1..3` of a stored `2 x 3` block into a transposed
+/// destination:
+///
+/// ```rust
+/// use strided_basic::{replay_copy_raw, Exec, RawStridedMut, RawStridedRef};
+///
+/// let stored = [0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0]; // column-major 2 x 3
+/// let band = [2usize, 2];
+/// let src = RawStridedRef::new(&stored, &band, &[1, 2], 2).unwrap();
+/// let mut out = [0.0f64; 4];
+/// let mut dst = RawStridedMut::new(&mut out, &band, &[2, 1], 0).unwrap();
+/// replay_copy_raw(&mut dst, &src, Exec::serial()).unwrap();
+/// assert_eq!(out, [2.0, 4.0, 3.0, 5.0]);
+/// ```
+pub fn replay_copy_raw<T>(
+    dest: &mut RawStridedMut<'_, T>,
+    src: &RawStridedRef<'_, T>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync,
+{
+    replay_given(dest, src, |dst: &mut T, value: T| *dst = value, exec)
+}
+
+/// [`replay_copy_raw`] into a potentially uninitialized destination.
+///
+/// On success every reachable destination element is initialized and no
+/// other slot is written. The destination is never read.
+///
+/// # Errors
+///
+/// As [`replay_copy_raw`].
+///
+/// # Examples
+///
+/// ```rust
+/// use core::mem::MaybeUninit;
+/// use strided_basic::{replay_copy_raw_uninit, Exec, RawStridedMut, RawStridedRef};
+///
+/// let src = [1.0f64, 2.0, 3.0];
+/// let mut storage = [MaybeUninit::<f64>::uninit(); 3];
+/// let mut dst = RawStridedMut::new(&mut storage, &[3], &[1], 0).unwrap();
+/// let source = RawStridedRef::new(&src, &[3], &[-1], 2).unwrap();
+/// replay_copy_raw_uninit(&mut dst, &source, Exec::serial()).unwrap();
+/// drop(dst);
+/// // SAFETY: every reachable destination slot was initialized above.
+/// let values: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+/// assert_eq!(values, [3.0, 2.0, 1.0]);
+/// ```
+pub fn replay_copy_raw_uninit<T>(
+    dest: &mut RawStridedMut<'_, MaybeUninit<T>>,
+    src: &RawStridedRef<'_, T>,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    T: Copy + Send + Sync,
+{
+    replay_given(
+        dest,
+        src,
+        |dst: &mut MaybeUninit<T>, value: T| {
+            dst.write(value);
+        },
+        exec,
+    )
+}
+
+/// `f(&mut dest[i], src[i])` for every element, replaying the axes of the two
+/// views exactly as given.
+///
+/// Traversal, width and errors are those of [`replay_copy_raw`], and so is the
+/// allocation guarantee, which covers the replay only: allocations made by `f`
+/// are its own. `f` runs once per logical element with exactly its arithmetic,
+/// so an accumulate such as `|d, s| *d += s` is exact. The order in which
+/// elements are visited is unspecified, and on a parallel replay `f` runs
+/// concurrently on disjoint slots: the result is defined only for an `f` whose
+/// effect depends on the supplied slot values alone. On a destination that is
+/// not proven injective, the elements are visited serially in column-major
+/// order of the given axes.
+///
+/// # Errors
+///
+/// As [`replay_copy_raw`].
+///
+/// # Examples
+///
+/// ```rust
+/// use strided_basic::{replay_map_raw, Exec, RawStridedMut, RawStridedRef};
+///
+/// let src = [1.0f64, 2.0, 3.0, 4.0];
+/// let mut acc = [10.0f64, 20.0, 30.0, 40.0];
+/// let source = RawStridedRef::new(&src, &[2, 2], &[2, 1], 0).unwrap();
+/// let mut dst = RawStridedMut::new(&mut acc, &[2, 2], &[1, 2], 0).unwrap();
+/// replay_map_raw(&mut dst, &source, |d, s| *d += s, Exec::serial()).unwrap();
+/// assert_eq!(acc, [11.0, 23.0, 32.0, 44.0]);
+/// ```
+pub fn replay_map_raw<D, S, F>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    f: F,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    F: Fn(&mut D, S) + Send + Sync,
+{
+    replay_given(dest, src, f, exec)
+}
+
+/// `dest[i] = f(src[i])` into a potentially uninitialized destination.
+///
+/// `f` cannot read the destination. On success every reachable destination
+/// element is initialized and no other slot is written. The visit-order,
+/// callback and allocation contract is that of [`replay_map_raw`].
+///
+/// # Errors
+///
+/// As [`replay_copy_raw`].
+///
+/// # Examples
+///
+/// ```rust
+/// use core::mem::MaybeUninit;
+/// use strided_basic::{replay_map_raw_uninit, Exec, RawStridedMut, RawStridedRef};
+///
+/// let src = [1i32, 2, 3];
+/// let mut storage = [MaybeUninit::<f64>::uninit(); 3];
+/// let mut dst = RawStridedMut::new(&mut storage, &[3], &[1], 0).unwrap();
+/// let source = RawStridedRef::new(&src, &[3], &[1], 0).unwrap();
+/// replay_map_raw_uninit(&mut dst, &source, |s| f64::from(s) * 0.5, Exec::serial()).unwrap();
+/// drop(dst);
+/// // SAFETY: every reachable destination slot was initialized above.
+/// let values: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+/// assert_eq!(values, [0.5, 1.0, 1.5]);
+/// ```
+pub fn replay_map_raw_uninit<D, S, F>(
+    dest: &mut RawStridedMut<'_, MaybeUninit<D>>,
+    src: &RawStridedRef<'_, S>,
+    f: F,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    F: Fn(S) -> D + Send + Sync,
+{
+    replay_given(
+        dest,
+        src,
+        move |dst: &mut MaybeUninit<D>, value: S| {
+            dst.write(f(value));
+        },
+        exec,
+    )
+}
+
+#[cfg(test)]
+#[path = "raw_ops/tests/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "raw_ops/tests/replay_tests.rs"]
+mod replay_tests;

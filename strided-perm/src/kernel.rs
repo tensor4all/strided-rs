@@ -4,11 +4,7 @@ use crate::fuse::{compress_dims, fuse_dims};
 use crate::{block, order};
 use strided_view::Result;
 
-/// Maximum total elements for the small tensor fast path.
-pub const SMALL_TENSOR_THRESHOLD: usize = 1024;
-
 pub struct KernelPlan {
-    pub order: Vec<usize>,
     pub block: Vec<usize>,
 }
 
@@ -37,21 +33,9 @@ pub fn build_plan_fused(
         compressed_strides.iter().map(|s| s.as_slice()).collect();
 
     let identity: Vec<usize> = (0..compressed_dims.len()).collect();
-    let block = block::compute_block_sizes(
-        &compressed_dims,
-        &identity,
-        &compressed_strides_refs,
-        elem_size,
-    );
+    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_size);
 
-    (
-        compressed_dims,
-        compressed_strides,
-        KernelPlan {
-            order: identity,
-            block,
-        },
-    )
+    (compressed_dims, compressed_strides, KernelPlan { block })
 }
 
 /// Simplified plan for small tensors that fit in L1 cache.
@@ -65,16 +49,8 @@ pub fn build_plan_fused_small(
     let (fused_dims, fused_strides) = compress_dims(&fused, &strides_owned);
 
     let block = fused_dims.clone();
-    let identity: Vec<usize> = (0..fused_dims.len()).collect();
 
-    (
-        fused_dims,
-        fused_strides,
-        KernelPlan {
-            order: identity,
-            block,
-        },
-    )
+    (fused_dims, fused_strides, KernelPlan { block })
 }
 
 // ============================================================================
@@ -298,6 +274,13 @@ where
 }
 
 /// Iterate over blocks with pre-ordered dimensions and initial offsets.
+///
+/// # Errors
+///
+/// The traversal itself cannot fail: every return value is `Ok(())`, or
+/// exactly the error returned by `f`, which this function propagates
+/// unchanged. Non-zero ranks dispatch to the specialized 1D..8D kernels and
+/// higher ranks to the generic iterator.
 #[inline]
 pub fn for_each_inner_block_preordered<F>(
     dims: &[usize],
@@ -339,185 +322,4 @@ pub fn total_len(dims: &[usize]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_build_plan_fused_compresses() {
-        let dims = [2usize, 3];
-        let strides = [1isize, 2];
-        let strides_list: Vec<&[isize]> = vec![&strides];
-        let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), 8);
-        assert_eq!(fused_dims, vec![6]);
-        assert_eq!(fused_strides.len(), 1);
-        assert_eq!(fused_strides[0], vec![1]);
-        assert_eq!(plan.block.len(), 1);
-    }
-
-    #[test]
-    fn test_for_each_inner_block_preordered_total() {
-        let dims = vec![3, 4, 2];
-        let blocks = vec![3, 4, 2];
-        let strides = vec![vec![1, 3, 12], vec![1, 3, 12]];
-        let offsets = vec![0, 0];
-        let mut total = 0usize;
-        for_each_inner_block_preordered(&dims, &blocks, &strides, &offsets, |_, len, _| {
-            total += len;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(total, 24);
-    }
-
-    #[test]
-    fn test_build_plan_fused_non_contiguous() {
-        // Row-major [4,5]: strides [5, 1]
-        let dims = [4usize, 5];
-        let strides = [5isize, 1];
-        let strides_list: Vec<&[isize]> = vec![&strides];
-        let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), 8);
-        // Row-major: should reorder so stride-1 is first, then fuse to 20
-        assert_eq!(fused_dims, vec![20]);
-        assert_eq!(fused_strides[0], vec![1]);
-        assert_eq!(plan.block.len(), 1);
-    }
-
-    #[test]
-    fn test_build_plan_fused_multi_array() {
-        // Two arrays: one col-major, one row-major
-        let dims = [4usize, 5];
-        let dst_strides = [1isize, 4];
-        let src_strides = [5isize, 1];
-        let strides_list: Vec<&[isize]> = vec![&dst_strides, &src_strides];
-        let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), 8);
-        // Conflicting strides means no fusion possible
-        assert_eq!(fused_dims.len(), 2);
-        assert_eq!(fused_strides.len(), 2);
-        assert!(plan.block.len() >= 1);
-    }
-
-    #[test]
-    fn test_build_plan_fused_small_basic() {
-        let dims = [2usize, 3];
-        let strides = [1isize, 2];
-        let strides_list: Vec<&[isize]> = vec![&strides];
-        let (fused_dims, fused_strides, plan) = build_plan_fused_small(&dims, &strides_list);
-        assert_eq!(fused_dims, vec![6]);
-        assert_eq!(fused_strides[0], vec![1]);
-        // Small plan: block = dims (no blocking)
-        assert_eq!(plan.block, fused_dims);
-    }
-
-    #[test]
-    fn test_build_plan_fused_small_non_contiguous() {
-        let dims = [4usize, 5];
-        let strides = [5isize, 1];
-        let strides_list: Vec<&[isize]> = vec![&strides];
-        let (fused_dims, fused_strides, plan) = build_plan_fused_small(&dims, &strides_list);
-        // No ordering in small path, but fusion should still work on contiguous groups
-        assert!(!fused_dims.is_empty());
-        assert_eq!(fused_strides.len(), 1);
-        assert_eq!(plan.block, fused_dims);
-    }
-
-    #[test]
-    fn test_for_each_rank0() {
-        let dims = vec![];
-        let blocks = vec![];
-        let strides: Vec<Vec<isize>> = vec![vec![]];
-        let offsets = vec![0isize];
-        let mut called = false;
-        for_each_inner_block_preordered(&dims, &blocks, &strides, &offsets, |_, len, _| {
-            called = true;
-            assert_eq!(len, 1);
-            Ok(())
-        })
-        .unwrap();
-        assert!(called);
-    }
-
-    /// Helper: count total elements iterated for given rank
-    fn count_elements(dims: &[usize], blocks: &[usize]) -> usize {
-        let n_arrays = 1;
-        let strides: Vec<Vec<isize>> = {
-            let mut s = vec![vec![0isize; dims.len()]; n_arrays];
-            let mut stride = 1isize;
-            for d in 0..dims.len() {
-                for a in 0..n_arrays {
-                    s[a][d] = stride;
-                }
-                stride *= dims[d] as isize;
-            }
-            s
-        };
-        let offsets = vec![0isize; n_arrays];
-        let mut total = 0usize;
-        for_each_inner_block_preordered(dims, blocks, &strides, &offsets, |_, len, _| {
-            total += len;
-            Ok(())
-        })
-        .unwrap();
-        total
-    }
-
-    #[test]
-    fn test_for_each_rank4() {
-        assert_eq!(count_elements(&[2, 3, 4, 5], &[2, 3, 4, 5]), 120);
-    }
-
-    #[test]
-    fn test_for_each_rank5() {
-        assert_eq!(count_elements(&[2, 2, 2, 2, 2], &[2, 2, 2, 2, 2]), 32);
-    }
-
-    #[test]
-    fn test_for_each_rank6() {
-        assert_eq!(count_elements(&[2, 2, 2, 2, 2, 3], &[2, 2, 2, 2, 2, 3]), 96);
-    }
-
-    #[test]
-    fn test_for_each_rank7() {
-        assert_eq!(
-            count_elements(&[2, 2, 2, 2, 2, 2, 3], &[2, 2, 2, 2, 2, 2, 3]),
-            192
-        );
-    }
-
-    #[test]
-    fn test_for_each_rank8() {
-        assert_eq!(
-            count_elements(&[2, 2, 2, 2, 2, 2, 2, 3], &[2, 2, 2, 2, 2, 2, 2, 3]),
-            384
-        );
-    }
-
-    #[test]
-    fn test_for_each_rank9_iterative() {
-        // Rank 9 triggers kernel_nd_inner_iterative
-        assert_eq!(
-            count_elements(&[2, 2, 2, 2, 2, 2, 2, 2, 3], &[2, 2, 2, 2, 2, 2, 2, 2, 3]),
-            768
-        );
-    }
-
-    #[test]
-    fn test_for_each_rank10_iterative() {
-        assert_eq!(
-            count_elements(
-                &[2, 2, 2, 2, 2, 2, 2, 2, 2, 3],
-                &[2, 2, 2, 2, 2, 2, 2, 2, 2, 3]
-            ),
-            1536
-        );
-    }
-
-    #[test]
-    fn test_total_len_empty() {
-        assert_eq!(total_len(&[]), 1);
-    }
-
-    #[test]
-    fn test_total_len_basic() {
-        assert_eq!(total_len(&[2, 3, 4]), 24);
-    }
-}
+mod tests;
