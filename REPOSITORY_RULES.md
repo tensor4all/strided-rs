@@ -12,7 +12,11 @@ strided-rs part. Where a section here and the shared text differ, this
 repository's more specific rule wins
 ([loading policy](https://github.com/tensor4all/tensor4all-agent-rules/blob/main/rules/index.md)).
 `AGENTS.md` holds the workspace layout, commands, and constants;
-`docs/PROVENANCE_AND_CITATION_POLICY.md` holds the per-crate provenance.
+`docs/PROVENANCE_AND_CITATION_POLICY.md` holds the per-crate provenance. The
+audit baseline the rule-remediation issues check themselves against, and the
+counter that produces it, are in
+[`docs/worklogs/2026-11-08-issue-216-rule-adoption-baseline.md`](docs/worklogs/2026-11-08-issue-216-rule-adoption-baseline.md)
+(`scripts/count-audit-metrics.py`).
 
 ## Deprecated Tree Freeze
 
