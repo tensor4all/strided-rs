@@ -330,3 +330,191 @@ fn dynamic_slice_window_uses_fused_replay_only_when_it_fuses() {
         "a non-fusible rank-9 window keeps the non-fused replay"
     );
 }
+
+/// Reference for a full-rank dynamic update: copy the operand, then overwrite
+/// the clamped update window.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dynamic_update_reference(
+    dims: &[usize],
+    operand_strides: &[isize],
+    operand: &[i64],
+    update_dims: &[usize],
+    update_strides: &[isize],
+    update: &[i64],
+    starts: &[i64],
+    dest_strides: &[isize],
+) -> Vec<i64> {
+    let rank = dims.len();
+    let clamped: Vec<usize> = (0..rank)
+        .map(|axis| starts[axis].clamp(0, (dims[axis] - update_dims[axis]) as i64) as usize)
+        .collect();
+    let total: usize = dims.iter().product();
+    let mut expected = vec![0i64; total];
+    let mut coords = vec![0usize; rank];
+    let mut window_coords = vec![0usize; rank];
+    for linear in 0..total {
+        let mut rest = linear;
+        for (coord, &dim) in coords.iter_mut().zip(dims.iter()) {
+            *coord = rest % dim;
+            rest /= dim;
+        }
+        let in_window = (0..rank)
+            .all(|axis| (clamped[axis]..clamped[axis] + update_dims[axis]).contains(&coords[axis]));
+        let (data, strides, source): (&[i64], &[isize], &[usize]) = if in_window {
+            for (axis, (window_coord, &coord)) in
+                window_coords.iter_mut().zip(coords.iter()).enumerate()
+            {
+                *window_coord = coord - clamped[axis];
+            }
+            (update, update_strides, &window_coords)
+        } else {
+            (operand, operand_strides, &coords)
+        };
+        let dest_offset: isize = (0..rank)
+            .map(|axis| coords[axis] as isize * dest_strides[axis])
+            .sum();
+        let source_offset: isize = (0..rank)
+            .map(|axis| source[axis] as isize * strides[axis])
+            .sum();
+        expected[dest_offset as usize] = data[source_offset as usize];
+    }
+    expected
+}
+
+/// The compiled non-fused window replay (a fused rank above
+/// [`RAW_FUSED_RANK_LIMIT`](crate::RAW_FUSED_RANK_LIMIT)) copies the operand and
+/// then overwrites the clamped window from its preflighted replay bases.
+#[test]
+fn dynamic_update_generic_replay_matches_reference() {
+    let dims = [2usize, 2, 2, 2, 2, 2, 2, 2, 4];
+    let operand_strides = [1isize, 3, 7, 15, 31, 63, 127, 255, 511];
+    let update_strides = [511isize, 255, 127, 63, 31, 15, 7, 3, 1];
+    let dest_strides = [512isize, 256, 128, 64, 32, 16, 8, 4, 1];
+    let update_dims = [2usize; 9];
+    let starts = [0i64, 1, 0, 1, 0, 1, 0, i64::MIN, 3];
+    let plan = DynamicUpdateSlicePlan::compile(
+        &dims,
+        &operand_strides,
+        &[9],
+        &[1],
+        &update_dims,
+        &update_strides,
+        &dims,
+        &dest_strides,
+    )
+    .unwrap();
+    assert!(
+        plan.window.is_none(),
+        "a non-fusible rank-9 window keeps the compiled non-fused replay"
+    );
+    assert!(!plan.uses_rank_one_contiguous_path());
+
+    let len = |dims: &[usize], strides: &[isize]| -> usize {
+        1 + dims
+            .iter()
+            .zip(strides.iter())
+            .map(|(&dim, &stride)| (dim as isize - 1) * stride.abs())
+            .sum::<isize>() as usize
+    };
+    let operand: Vec<i64> = (0..len(&dims, &operand_strides) as i64).collect();
+    let update: Vec<i64> = (0..len(&update_dims, &update_strides) as i64)
+        .map(|value| -value - 1)
+        .collect();
+    let expected = dynamic_update_reference(
+        &dims,
+        &operand_strides,
+        &operand,
+        &update_dims,
+        &update_strides,
+        &update,
+        &starts,
+        &dest_strides,
+    );
+
+    let source = super::RawStridedRef::new(&operand, &dims, &operand_strides, 0).unwrap();
+    let update_ref = super::RawStridedRef::new(&update, &update_dims, &update_strides, 0).unwrap();
+    let start_ref = super::RawStridedRef::new(&starts, &[9], &[1], 0).unwrap();
+    let mut out = vec![-1i64; expected.len()];
+    let mut dest = super::RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
+    plan.execute(&mut dest, &source, &update_ref, &start_ref, Exec::serial())
+        .unwrap();
+    assert_eq!(out, expected);
+}
+
+/// The preflight guards the whole window span, not just its base. These cases
+/// call the preflight directly, so a missing guard fails an assertion instead
+/// of sending an overflowing descriptor into the pointer replay, and each span
+/// has its own case so deleting either `covers` call turns one of them red.
+#[test]
+fn preflight_rejects_a_window_that_overflows_the_update_span() {
+    use crate::{RawStridedMut, RawStridedRef, StridedError};
+
+    for (update_stride, update_offset) in [(1isize, isize::MAX), (-1, isize::MIN)] {
+        let dims = [2usize];
+        let update_storage = [0i32];
+        let starts = [0i64];
+        let update_strides = [update_stride];
+        let plan = DynamicUpdateSlicePlan::compile(
+            &dims,
+            &[1],
+            &[1],
+            &[1],
+            &dims,
+            &update_strides,
+            &dims,
+            &[1],
+        )
+        .unwrap();
+        // SAFETY: the preflight rejects this window, so the unreachable update
+        // offset is never dereferenced.
+        let update_ref = unsafe {
+            RawStridedRef::new_unchecked(&update_storage[..], &dims, &update_strides, update_offset)
+        };
+        let start_ref = RawStridedRef::new(&starts, &[1], &[1], 0).unwrap();
+        let mut out = [-1i32; 2];
+        let dest = RawStridedMut::new(&mut out, &dims, &[1], 0).unwrap();
+        let result = plan.preflight_update_window(&dest, &update_ref, &start_ref);
+        assert!(
+            matches!(result, Err(StridedError::OffsetOverflow)),
+            "a window past the update span must be rejected"
+        );
+    }
+}
+
+/// The same whole-window guard on the destination side: a destination base that
+/// fits `isize` is still rejected when the window reaches past it.
+#[test]
+fn preflight_rejects_a_window_that_overflows_the_dest_span() {
+    use crate::{RawStridedMut, RawStridedRef, StridedError};
+
+    for (dest_stride, dest_offset) in [(1isize, isize::MAX), (-1, isize::MIN)] {
+        let dims = [2usize];
+        let update = [3i32, 4];
+        let starts = [0i64];
+        let dest_strides = [dest_stride];
+        let plan = DynamicUpdateSlicePlan::compile(
+            &dims,
+            &[1],
+            &[1],
+            &[1],
+            &dims,
+            &[1],
+            &dims,
+            &dest_strides,
+        )
+        .unwrap();
+        let update_ref = RawStridedRef::new(&update, &dims, &[1], 0).unwrap();
+        let start_ref = RawStridedRef::new(&starts, &[1], &[1], 0).unwrap();
+        let mut out = [0i32; 2];
+        // SAFETY: the preflight rejects this window before the copy writes
+        // through the destination, so the unreachable offset is never used.
+        let dest = unsafe {
+            RawStridedMut::new_unchecked(&mut out[..], &dims, &dest_strides, dest_offset)
+        };
+        let result = plan.preflight_update_window(&dest, &update_ref, &start_ref);
+        assert!(
+            matches!(result, Err(StridedError::OffsetOverflow)),
+            "a window past the destination span must be rejected"
+        );
+    }
+}
