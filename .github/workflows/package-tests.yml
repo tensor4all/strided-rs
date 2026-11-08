@@ -60,6 +60,22 @@ jobs:
           echo "$crates"
           echo "crates=$crates" >> "$GITHUB_OUTPUT"
 
+  # 版数が内容を特定しているか（#409）。manifest が `X 0.13.0` と言うなら、
+  # crates.io の `X 0.13.0` の .crate はこの tree と同じ中身でなければならない。
+  # workspace は path 依存でビルドするので、テストでは見えない。公開物と tree を
+  # 直接比べる。版を上げずに中身（コメントを含む）を変えると赤になる。
+  # 未公開の版は `unpublished` で緑（リリース途中）。ネットワーク・crates.io の
+  # 失敗は exit 2 で赤（緑には倒さない）。`list` に依存しない独立 job。
+  identity:
+    name: published content identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compare each published .crate with this tree
+        run: python3 scripts/published_identity.py . --ref "$GITHUB_SHA"
+
   package:
     name: cargo test in the .crate (${{ matrix.crate }})
     needs: list
