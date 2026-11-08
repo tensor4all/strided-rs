@@ -44,7 +44,7 @@ feature every token runs inline.
 
 ```toml
 [dependencies]
-strided-perm = { version = "0.12", features = ["parallel"] }
+strided-perm = { version = "0.14", features = ["parallel"] }
 ```
 
 ```rust

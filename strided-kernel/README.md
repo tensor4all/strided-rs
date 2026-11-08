@@ -37,11 +37,11 @@ depend on one another.
 
 `fused_elementwise_into` and the runtime-DAG types stay re-exported from
 `strided-fused`, so those names keep resolving for code written against the 0.4
-line. The calls are not source compatible: 0.4 took three arguments, and 0.12
-requires a `threadteam::Exec` placement token as the fourth
+line. The calls are not source compatible: 0.4 took three arguments, and the
+current release line requires a `threadteam::Exec` placement token as the fourth
 (`strided-fused/src/fused.rs:1855`), so a 0.4 call site fails to compile. New
-code imports them from `strided-fused`; the re-exports are scheduled for removal
-in the next breaking release.
+code imports them from `strided-fused`; the re-exports survive in 0.14 and may
+be removed in a future breaking release.
 
 ## Quick Example
 
@@ -141,9 +141,8 @@ The library automatically optimizes iteration order for cache efficiency:
 
 ```toml
 [dependencies]
-# 0.12 (the published version) predates the `*_acc` / `*_into` names used here; they
-# arrive with the next release, so depend on the repository until then.
-strided-kernel = { git = "https://github.com/tensor4all/strided-rs", features = ["parallel"] }
+# 0.14 is the current published release and carries the `*_acc` / `*_into` names.
+strided-kernel = { version = "0.14", features = ["parallel"] }
 ```
 
 Every operation that can fan out takes a `threadteam::Exec` placement token as
