@@ -101,7 +101,10 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertIn("differs: src/lib.rs", out)
 
     def test_file_deleted_since_publication_is_red(self) -> None:
-        self.fx.write("build.rs", "fn main() {}\n")
+        # GPT review on #411: a build script that sets a cfg; deleting it
+        # under the same version flips `value()` from true to false.
+        self.fx.write("build.rs", 'fn main() { println!("cargo:rustc-cfg=build_flag"); }\n')
+        self.fx.write("src/lib.rs", "pub fn value() -> bool { cfg!(build_flag) }\n")
         self.fx.commit("add build.rs")
         blob = self.fx.package()
         (self.fx.root / "demo" / "build.rs").unlink()
