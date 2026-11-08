@@ -181,6 +181,16 @@ SECTION_TRIGGERS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
         ),
     ),
     (
+        # The HPTT port's licence and blocking, and the denied third-party
+        # thread pools, are one rule; every path that can change one of them
+        # routes here.
+        re.compile(
+            r"^strided-perm/Cargo\.toml$|/hptt/|/hptt\b|^deny\.toml$|"
+            r"^THIRD-PARTY-LICENSES|^NOTICE\b|faer"
+        ),
+        frozenset({"HPTT And faer Integration"}),
+    ),
+    (
         re.compile(r"threading|rayon|parallel|threadteam|Exec::|thread_pool"),
         frozenset({"CPU Threading Contract"}),
     ),
