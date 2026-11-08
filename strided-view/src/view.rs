@@ -778,10 +778,20 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
 /// Always uses `Identity` element operation for write simplicity.
 /// Julia typically applies ops on the read side.
 pub struct StridedViewMut<'a, T> {
+    /// The only handle on the element storage: the backing slice base plus
+    /// `offset`, or a dangling pointer for an empty layout.
+    ///
+    /// `data` and `data_mut` re-derive the slice extent from this pointer
+    /// instead of reborrowing a stored `&mut [T]`. A stored slice reborrow
+    /// retags the storage handle and invalidates `ptr`, which made every later
+    /// `get`, `set`, and `as_view` access undefined behavior.
     ptr: *mut T,
-    data: &'a mut [T],
+    /// Length of the whole backing slice, needed to re-derive it from `ptr`.
+    data_len: usize,
     meta: ViewMeta,
     offset: isize,
+    /// The view borrows the caller's slice for `'a` without holding it.
+    _marker: PhantomData<&'a mut [T]>,
 }
 
 unsafe impl<T: Send> Send for StridedViewMut<'_, T> {}
@@ -801,6 +811,7 @@ impl<'a, T> StridedViewMut<'a, T> {
     #[inline]
     fn from_meta(data: &'a mut [T], dims: &[usize], strides: &[isize], offset: isize) -> Self {
         let meta = ViewMeta::from_slices(dims, strides);
+        let data_len = data.len();
         let ptr = if empty_layout(meta.dims()) {
             empty_mut_ptr()
         } else {
@@ -808,9 +819,10 @@ impl<'a, T> StridedViewMut<'a, T> {
         };
         Self {
             ptr,
-            data,
+            data_len,
             meta,
             offset,
+            _marker: PhantomData,
         }
     }
 
@@ -918,15 +930,33 @@ impl<'a, T> StridedViewMut<'a, T> {
     }
 
     /// Returns a reference to the backing data slice.
+    ///
+    /// An empty layout keeps a dangling pointer, so it can only describe an
+    /// empty slice here.
     #[inline]
     pub fn data(&self) -> &[T] {
-        &self.data
+        let (base, len) = self.data_extent();
+        unsafe { std::slice::from_raw_parts(base, len) }
     }
 
     /// Returns a mutable reference to the backing data slice.
+    ///
+    /// The extent comes from the view's own pointer, so `ptr`, `get`, and
+    /// `set` stay valid after the returned borrow ends.
     #[inline]
     pub fn data_mut(&mut self) -> &mut [T] {
-        &mut self.data
+        let (base, len) = self.data_extent();
+        unsafe { std::slice::from_raw_parts_mut(base, len) }
+    }
+
+    /// Backing slice base and length, re-derived from the cached pointer.
+    #[inline]
+    fn data_extent(&self) -> (*mut T, usize) {
+        if empty_layout(self.meta.dims()) {
+            (empty_mut_ptr(), 0)
+        } else {
+            (unsafe { self.ptr.offset(-self.offset) }, self.data_len)
+        }
     }
 
     /// Permute dimensions, consuming the mutable view.
@@ -951,12 +981,10 @@ impl<'a, T> StridedViewMut<'a, T> {
         }
         let new_dims: AxisVec = perm.iter().map(|&p| self.dims()[p]).collect();
         let new_strides: StrideVec = perm.iter().map(|&p| self.strides()[p]).collect();
-        Ok(Self::from_meta(
-            self.data,
-            &new_dims,
-            &new_strides,
-            self.offset,
-        ))
+        Ok(Self {
+            meta: ViewMeta::from_slices(&new_dims, &new_strides),
+            ..self
+        })
     }
 
     /// Reborrow as an immutable view.
@@ -977,13 +1005,9 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// ```
     #[inline]
     pub fn as_view(&self) -> StridedView<'_, T, Identity> {
-        StridedView {
-            ptr: self.ptr as *const T,
-            data: unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.data.len()) },
-            meta: self.meta.clone(),
-            offset: self.offset,
-            _op: PhantomData,
-        }
+        // Derive both the slice and the pointer the immutable view caches from
+        // the same handle, so neither can outlive the storage it points into.
+        unsafe { StridedView::new_unchecked(self.data(), self.dims(), self.strides(), self.offset) }
     }
 }
 
@@ -1310,6 +1334,7 @@ impl<T> StridedArray<T> {
     /// Create a mutable view over this tensor.
     #[inline]
     pub fn view_mut(&mut self) -> StridedViewMut<'_, T> {
+        let data_len = self.data.len();
         let ptr = if self.is_empty() {
             empty_mut_ptr()
         } else {
@@ -1317,9 +1342,10 @@ impl<T> StridedArray<T> {
         };
         StridedViewMut {
             ptr,
-            data: &mut self.data,
+            data_len,
             meta: self.meta.clone(),
             offset: self.offset,
+            _marker: PhantomData,
         }
     }
 
