@@ -13,7 +13,7 @@ skipped):
                           brackets) returns `Result<`, and how many of those carry a
                           `/// # Errors` line
   inline_mods             `#[cfg(test)] mod name { .. }` blocks (a `mod name;` declaration is 0)
-  files_over_1000         `wc -l` over `strided-*/**/*.rs`
+  files_over_1000         logical lines (`str.splitlines()`) over `strided-*/**/*.rs`
 
 Run it as `python3 scripts/count-audit-metrics.py .` from the repository root;
 `scripts/test-count-audit-metrics.py` pins the cases a plain line scan gets wrong.

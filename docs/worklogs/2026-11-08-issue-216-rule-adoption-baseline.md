@@ -56,9 +56,8 @@ for the doctest row, a file read for a per-block `// SAFETY:` audit.
 Three of the rows are already at or near their target because the work landed
 between the issue's opening count and this baseline: the `# Errors` row reads
 185/185 (the sweep of #381 left no public `Result`-returning `fn` without the
-section — but an item whose `pub` a macro produces is dropped with the string
-literal around it, `scripts/count-audit-metrics.py:31-32`, so this is "no item
-the scan can read", not an exhaustive claim), the doctests are the same
+section — but a macro invocation is not expanded (see Known limits), so this is
+"no item the scan can read", not an exhaustive claim), the doctests are the same
 sweep, and the inline-test drop is the move
 of the inline unit test modules into `*/tests/` directories (#362) — the files
 that have unit tests carry a test-module declaration (some name it something other
@@ -116,7 +115,7 @@ the command's own output at this tree (123 passed, 0 ignored).
 | `# Errors` | the doc block nearest above such a `fn` contains a `/// # Errors` line; attribute lines (`#[inline]`, `#[must_use]`, `#[allow(..)]`, including multi-line ones) and blank lines between the doc block and the `fn` do not break the association |
 | runnable doctests | `cargo test --doc` pass count at the repository root, not a fence count |
 | inline test modules | `#[cfg(test)]` (optionally with further attributes) followed by `mod NAME { .. }`; a `mod NAME;` declaration counts 0, because its body lives in another file and moving the body is exactly what this row is meant to move |
-| files over 1000 lines | `wc -l` over `strided-*/**/*.rs` |
+| files over 1000 lines | logical lines (`str.splitlines()`) over `strided-*/**/*.rs`, so a file with 1000 newline characters and no final newline counts 1000, not 1001 |
 
 ### Known limits: the counts are a lower bound
 

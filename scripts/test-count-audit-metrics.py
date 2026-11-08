@@ -373,7 +373,7 @@ def test_a_differently_named_test_only_module_is_not_production() -> None:
 
 
 def test_a_test_only_module_directory_is_not_production() -> None:
-    """The target may be `NAME/mod.rs`; a declaration inside an excluded file still counts."""
+    """The target may be `NAME/mod.rs`, and the subtree below it is test-only too."""
     counts = count_sources(
         {
             "lib.rs": "#[cfg(test)]\nmod helpers;\n",
