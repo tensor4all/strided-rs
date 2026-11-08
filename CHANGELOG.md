@@ -34,9 +34,13 @@ All six live in `strided-basic` and are re-exported by `strided-kernel`
 
 Other breaking changes:
 
-- `strided_perm::SMALL_TENSOR_THRESHOLD` is removed.
 - `strided_perm::HostClass` is now a re-export of `threadteam::HostClass`
   instead of a copy; the variants and `HostClass::detect` are unchanged.
+
+Listed for completeness, not a downstream change: `strided-perm`'s own copy of
+`SMALL_TENSOR_THRESHOLD` (`src/kernel.rs`) is gone. That module was never public
+(`mod kernel`, not re-exported), so no path a downstream could name disappears;
+`strided_basic::execution::SMALL_TENSOR_THRESHOLD` is unchanged.
 
 ### Migrating
 
