@@ -13,8 +13,14 @@ downstream that runs `cargo update` without a version constraint change.
 Bumped to 0.13.0: `strided-basic`, `strided-perm`, `strided-kernel`,
 `strided-fused`, `strided-nn`. `strided-traits` keeps 0.7.0 (nothing in it changed).
 `strided-view` goes to **0.7.2**: the published 0.7.1 still multiplies strides with
-wrapping `isize` arithmetic, while this tree panics where the product would overflow
-(a zero-extent shape still saturates at `isize::MAX` instead of panicking).
+wrapping `isize` arithmetic. This tree replaces that with two behaviours, and they are
+not the same:
+
+- a **non-empty** shape whose stride or element count does not fit `isize` now **panics**;
+- a shape with a **zero extent** does not panic — it saturates at `isize::MAX`, so
+  `col_major_strides(&[usize::MAX, 0])` returns `[1, isize::MAX]` where published 0.7.1
+  returns `[1, -1]` (the wrapped value). Callers that indexed a zero-extent shape with a
+  negative stride will see the saturation, not an abort.
 
 ### Breaking changes
 
@@ -55,8 +61,10 @@ cargo add strided-basic@0.13 strided-perm@0.13 strided-kernel@0.13 strided-fused
 cargo build   # then fix the remaining call sites the compiler names
 ```
 
-Code that only calls `strided-traits` / `strided-view` needs no source change;
-`strided-view` 0.7.2 only replaces a silently wrapping stride with a panic.
+Code that only calls `strided-traits` / `strided-view` needs no source change.
+`strided-view` 0.7.2 replaces a silently wrapping stride with a panic for non-empty shapes,
+and with a saturation at `isize::MAX` for zero-extent shapes — the two cases differ, and
+only the first aborts.
 
 ### Additive
 
