@@ -53,18 +53,17 @@ cargo add strided-basic@0.13 strided-perm@0.13 strided-kernel@0.13 strided-fused
 # then rename the resolved calls: `add`→`add_acc`, `mul`→`mul_acc`, `fma`→`fma_acc`,
 # `axpy`→`axpy_acc`, `copy_scale`→`copy_scale_into`, `copy_conj`→`copy_conj_into`
 # (unqualified matching is unsafe: `ptr.add(1)` and `impl Add` are not these calls)
-
 cargo build   # then fix the remaining call sites the compiler names
+```
 
 Code that only calls `strided-traits` / `strided-view` needs no source change.
 `strided-view` 0.7.2 replaces silently wrapping stride arithmetic with checked
 arithmetic: a stride product or an element count that does not fit `isize` panics (or
 returns `Err(OffsetOverflow)`) where the published 0.7.1 returned a wrapped value.
-Dense-stride overflow is refused by `checked_col_major_strides` /
-`checked_row_major_strides`; a shape with an unrepresentable element count still
+Dense strides are refused by `checked_col_major_strides` / `checked_row_major_strides`;
+a shape whose element count does not fit still constructs a view, and its `len()`
+panics where it used to return 0.
 
-
-constructs a view, and its `len()` panics where it used to return 0.
 ### Additive
 
 - `strided_basic::replay_copy_raw`, `replay_copy_raw_uninit`,
