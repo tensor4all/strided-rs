@@ -37,6 +37,13 @@ fn parallel_width_follows_the_serial_time_against_the_section_cost() {
     use crate::cost::{parallel_width, tree_width};
     let pool = test_pool(4);
     let (exec, _) = pooled(&pool, 4);
+    // Without the `parallel` feature every token is serial, so no length pays and
+    // every width below is 1: the `no-default-features` lane runs this test.
+    if !cfg!(feature = "parallel") {
+        assert_eq!(parallel_width(&exec, KernelClass::Copy, LARGE).get(), 1);
+        assert_eq!(tree_width(&exec, KernelClass::Reduce, LARGE).get(), 1);
+        return;
+    }
     // 100 ns sections: a copy pays at 3 * 100 ns / 0.09 ns = 3334 elements on two slots.
     assert_eq!(parallel_width(&exec, KernelClass::Copy, 100).get(), 1);
     assert_eq!(parallel_width(&exec, KernelClass::Copy, LARGE).get(), 4);

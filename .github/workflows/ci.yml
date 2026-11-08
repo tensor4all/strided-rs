@@ -40,9 +40,6 @@ jobs:
       - name: Run tests
         run: cargo test --profile ci
 
-      - name: Run parallel feature tests
-        run: cargo test --profile ci -p strided-basic -p strided-kernel -p strided-fused --features parallel
-
       - name: Overhead smoke gates (ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -58,6 +55,97 @@ jobs:
         run: |
           du -sh target
           df -h target
+
+  # Feature lanes, one job per lane, each lane selecting its own crates and then
+  # proving the feature set cargo actually compiled.
+  #
+  # The crates are selected with `-p` instead of building the workspace: a
+  # workspace-wide `--no-default-features` run does not turn anything off, because
+  # `strided-nn` requires `strided-basic/parallel` and depends on `pulp`
+  # unconditionally (strided-nn/Cargo.toml:18,20), and feature unification then
+  # keeps `threadteam/parallel` and `pulp` in every lane. `strided-nn` is covered
+  # by the workspace-wide `test` job above, where those requirements are already
+  # on.
+  #
+  # The `default` lane is the `test` job's `cargo test --profile ci` step. The
+  # `parallel` lane runs on both operating systems, because it is the only place
+  # the `#[cfg(feature = "parallel")]` tests of `strided-fused`
+  # (strided-fused/src/fused/tests/tests.rs:336,778) run alongside the macOS
+  # host class.
+  features:
+    name: feature lanes (${{ matrix.lane }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      LANE_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-kernel -p strided-fused
+      # `strided-kernel` is deliberately absent: its dev-dependency `strided-nn`
+      # requires `strided-basic/parallel` and `pulp` unconditionally, and cargo
+      # unifies features across the whole invocation, so any `cargo test` that
+      # includes `strided-kernel` re-enables parallelism for every crate in the
+      # graph. Its library is still proven below; its tests run in the `test`
+      # job and the `parallel` lanes, where those requirements are on anyway.
+      LANE_TEST_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-fused
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: parallel
+            os: ubuntu-latest
+            flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            basic: default parallel simd
+            pulp: yes
+          - lane: parallel
+            os: macos-latest
+            flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            basic: default parallel simd
+            pulp: yes
+          - lane: no-default-features
+            os: ubuntu-latest
+            flags: --no-default-features
+            test_flags: --no-default-features
+            basic: ""
+            pulp: no
+          - lane: parallel-no-simd
+            os: ubuntu-latest
+            flags: --no-default-features --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+            test_flags: --no-default-features --features strided-basic/parallel,strided-fused/parallel,strided-perm/parallel
+            basic: parallel
+            pulp: no
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: features-${{ matrix.lane }}-${{ matrix.os }}
+
+      # A lane that compiles something other than its name is worse than no lane:
+      # this reads the enabled feature list of every `strided-basic` unit cargo
+      # built, and whether `pulp` was built at all. The library graph and the test
+      # graph are asserted separately: they are not the same graph, and only the
+      # test graph is what the tests actually run against.
+      - name: Assert the lane's feature set (library graph)
+        env:
+          WANT_BASIC: ${{ matrix.basic }}
+          WANT_PULP: ${{ matrix.pulp }}
+        run: |
+          cargo build --profile ci $LANE_PACKAGES ${{ matrix.flags }} --message-format=json \
+            | python3 scripts/assert-lane-features.py
+
+      - name: Assert the lane's feature set (test graph)
+        env:
+          WANT_BASIC: ${{ matrix.basic }}
+          WANT_PULP: ${{ matrix.pulp }}
+        run: |
+          cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }} --no-run --message-format=json \
+            | python3 scripts/assert-lane-features.py
+
+      - name: Run tests (${{ matrix.lane }})
+        run: cargo test --profile ci $LANE_TEST_PACKAGES ${{ matrix.test_flags }}
 
   placement:
     name: placement rules
@@ -99,6 +187,8 @@ jobs:
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
