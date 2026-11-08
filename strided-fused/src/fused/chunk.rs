@@ -136,7 +136,8 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
 /// must be validated for these operand counts, `strides` must satisfy
 /// [`block_replay_eligible`], and `regs` must hold [`register_file_len`]
 /// elements.
-// Chunk replay: pointer tables, plan, offsets, block bounds, strides and registers.
+// Chunk replay: pointer tables, plan, offsets, the block length, strides, direct
+// flags and registers.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn replay_chunked<T: FusedScalar>(
     dst_ptrs: &[*mut T],
@@ -434,7 +435,8 @@ unsafe fn fill_broadcast_inputs<T: FusedScalar>(
 /// copied here; stride-0 inputs were already filled by
 /// [`fill_broadcast_inputs`].
 #[inline]
-// Input chunk loader: pointer table, offsets, operand index, strides and registers.
+// Input chunk loader: pointer table, offsets, first operand, direct flags, strides,
+// the run offset, the chunk length and the registers.
 #[allow(clippy::too_many_arguments)]
 unsafe fn load_input_chunks<T: FusedScalar>(
     input_ptrs: &[*const T],
@@ -512,7 +514,8 @@ unsafe fn store_output_chunks_uninit<T: FusedScalar>(
 /// `input_count + k`, which validation guarantees, so splitting the file at the
 /// output register keeps the borrows disjoint without raw pointers.
 #[inline(always)]
-// Chunk executor: plan, chunk index, pointer tables, offsets and the register file.
+// Chunk executor: plan, the chunk length, pointer tables, offsets, first operand,
+// direct flags, the run offset and the register file.
 #[allow(clippy::too_many_arguments)]
 unsafe fn run_chunks<T: FusedScalar>(
     plan: &FusedPlan,

@@ -378,7 +378,8 @@ pub(crate) fn apply_spilled_pair<D, S, Apply>(
 /// - No other thread may access the destination slots of this range while it
 ///   runs, and the source slots must not be written concurrently. Destination
 ///   and source slots must not overlap.
-// Range leaf: both bases, the layout and the range, called once per worker range.
+// Range leaf: both bases, the layout, the range and the closure, called once per worker
+// range.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
     dst_ptr: *mut D,

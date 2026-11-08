@@ -773,7 +773,8 @@ where
 ///
 /// As [`arg_line`] for each line `j < width` with source base `so + j`, every
 /// destination offset must be writable, and `width <= PANEL`.
-// Panel leaf: both base/stride pairs plus the panel width, called once per panel.
+// Panel leaf: both base/offset/stride triples, the length and the panel width, once
+// per panel.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn arg_panel<T, I, F, D>(

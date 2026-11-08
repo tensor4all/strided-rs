@@ -522,7 +522,8 @@ impl ErasedReducePlan {
     /// outside the source rank, and [`StridedError::ShapeMismatch`] when
     /// `dest_dims` is not the kept source extents in source-axis order (or,
     /// when every axis is reduced, does not hold exactly one element).
-    // Dtype, op, both layouts and the axis list are the plan key; a struct would only wrap it.
+    // Inert: `compile_axes` takes 7 arguments and clippy's `too_many_arguments`
+    // fires only above 7, so this allow suppresses nothing; it is left in place.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_axes(
         dtype: KernelDType,

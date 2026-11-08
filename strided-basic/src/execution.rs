@@ -324,7 +324,8 @@ pub unsafe fn zip_map3_into_validated<
 /// Callers must still satisfy the safety contract before invoking this
 /// prevalidated entry.
 #[inline]
-// Four sources with their axes and element ops, the destination, and the token.
+// Four source views with their element ops, the destination, the closure, the
+// `validated` marker and the token.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn zip_map4_into_validated<
     D: Copy + Send + Sync,

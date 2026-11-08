@@ -1493,7 +1493,8 @@ fn map_contiguous<D: Copy, A: Copy, Op: ElementOp<A>>(
     });
 }
 
-// Raw parts: destination and source pointer/layouts plus the `validated` marker.
+// Raw parts, the element op, the kernel, the class and the token: the operands are the
+// operation's, not a block's.
 #[allow(clippy::too_many_arguments)]
 fn map_parts_into_validated<
     D: Copy + Send + Sync,
@@ -1854,8 +1855,8 @@ fn zip_map2_parts_into<
     )
 }
 
-// The same three raw-parts operands plus the `validated` marker: the planned traversal for the
-// whole operation, entered once, not per block.
+// The same three raw-parts operands plus the closure, the `validated` marker and the
+// token: the planned traversal for the whole operation, entered once, not per block.
 #[allow(clippy::too_many_arguments)]
 fn zip_map2_parts_into_validated<
     D: Copy + Send + Sync,
@@ -2590,7 +2591,8 @@ pub fn zip_map4_into<
     zip_map4_into_validated(dest, a, b, c, e, f, validated, exec)
 }
 
-// Four operand layout triples plus the destination and the token: the entry's shape.
+// Four operand views plus the destination, the closure, the `validated` marker and
+// the token: the entry's shape.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn zip_map4_into_validated<
     D: Copy + Send + Sync,

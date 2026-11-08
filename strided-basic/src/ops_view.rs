@@ -1355,7 +1355,8 @@ unsafe fn transpose_scale_4x4_f64(
 }
 
 #[inline]
-// Tile kernel for f64: both bases, both stride pairs, the tile bounds and the scale.
+// Tile kernel for f64: both bases, both stride pairs, the tile bounds, the scale and
+// the token.
 #[allow(clippy::too_many_arguments)]
 unsafe fn copy_transpose_scale_2d_f64_tiled_raw(
     dst: *mut f64,
@@ -1594,7 +1595,7 @@ unsafe fn transpose_scale_4x4_identity<T>(
 }
 
 #[inline]
-// Tile kernel: both bases, both stride pairs, the tile bounds and the scale.
+// Tile kernel: both bases, both stride pairs, the tile bounds, the scale and the token.
 #[allow(clippy::too_many_arguments)]
 unsafe fn copy_transpose_scale_2d_identity_tiled_raw<T>(
     dst: *mut T,

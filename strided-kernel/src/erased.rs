@@ -636,7 +636,8 @@ impl ErasedGatherPlan {
     /// size beyond its operand extent, or a collapsed axis whose slice size
     /// is not one, and [`StridedError::ShapeMismatch`] when `dest_dims` is
     /// not the gathered window/batch shape.
-    // Dtype pair plus the operand, index and destination layouts: the compile key.
+    // Dtype pair plus the operand, index and destination layouts and the gather
+    // spec: the compile key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
@@ -1397,7 +1398,8 @@ impl ErasedScatterPlan {
     /// that does not match `spec.scatter_dims_to_operand_dims`, a
     /// wrong-length `spec.update_window_dims`, or an update batch rank that
     /// disagrees with the index batch shape.
-    // Dtype pair plus the operand, index, update and destination layouts: the plan key.
+    // Dtype pair plus the operand, index, update and destination layouts and the
+    // scatter spec: the plan key.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         dtype: KernelDType,
