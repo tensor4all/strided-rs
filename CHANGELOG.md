@@ -11,7 +11,9 @@ crates.io with the old names: renaming inside a patch version would break every
 downstream that runs `cargo update` without a version constraint change.
 
 Bumped to 0.13.0: `strided-basic`, `strided-perm`, `strided-kernel`,
-`strided-fused`, `strided-nn`. `strided-traits` keeps 0.7.0 (nothing in it changed).
+`strided-fused`, `strided-nn`. `strided-traits` goes to **0.7.1**: tests moved to
+their own modules and a doc example became a doctest, so the published 0.7.0 is
+not this tree; the public API is unchanged.
 `strided-view` goes to **0.7.2**: the published 0.7.1 still multiplies strides with
 wrapping `isize` arithmetic. This tree replaces that with two behaviours, and they are
 not the same:
