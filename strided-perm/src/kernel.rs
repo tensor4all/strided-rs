@@ -37,12 +37,7 @@ pub fn build_plan_fused(
         compressed_strides.iter().map(|s| s.as_slice()).collect();
 
     let identity: Vec<usize> = (0..compressed_dims.len()).collect();
-    let block = block::compute_block_sizes(
-        &compressed_dims,
-        &identity,
-        &compressed_strides_refs,
-        elem_size,
-    );
+    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_size);
 
     (
         compressed_dims,

@@ -521,3 +521,10 @@ fn map_into_gates_on_the_class_of_the_function() {
         KernelClass::Reduce
     );
 }
+
+#[test]
+fn split_axis_scores_beyond_isize_select_the_exact_maximum() {
+    // Scores (3 - 1) * 2^62 = 2^63 and (8192 - 1) * 2 = 16382: axis 0. The
+    // wrapping `isize` score (-2^63) selected axis 1.
+    assert_eq!(split_axis(&[3, 8192], &[1, 1], &[1 << 62, 2]), Some(0));
+}

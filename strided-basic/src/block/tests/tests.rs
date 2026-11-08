@@ -5,8 +5,8 @@ fn test_total_memory_region_contiguous() {
     // Contiguous array: 100 elements * 8 bytes = 800 bytes
     // Should be about 800 bytes (plus cache line rounding)
     let dims = [100usize];
-    let strides = [8isize]; // 8 bytes per element
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let strides = [8u128]; // 8 bytes per element
+    let byte_strides: Vec<&[u128]> = vec![&strides];
 
     let region = total_memory_region(&dims, &byte_strides);
 
@@ -20,8 +20,8 @@ fn test_total_memory_region_contiguous() {
 fn test_total_memory_region_strided() {
     // Non-contiguous: stride larger than cache line
     let dims = [10usize];
-    let strides = [128isize]; // Stride >= cache line
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let strides = [128u128]; // Stride >= cache line
+    let byte_strides: Vec<&[u128]> = vec![&strides];
 
     let region = total_memory_region(&dims, &byte_strides);
 
@@ -35,9 +35,9 @@ fn test_compute_blocks_small() {
     // Small array that fits in cache
     let dims = [10usize, 10];
     let costs = [2isize, 2];
-    let strides = [8isize, 80];
+    let strides = [8u128, 80];
     let orders = [1usize, 2];
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
     let stride_orders: Vec<&[usize]> = vec![&orders];
 
     let blocks = compute_blocks(
@@ -57,9 +57,9 @@ fn test_compute_blocks_large() {
     // Large array that needs blocking
     let dims = [1000usize, 1000];
     let costs = [2isize, 2];
-    let strides = [8isize, 8000]; // 8 bytes per f64
+    let strides = [8u128, 8000]; // 8 bytes per f64
     let orders = [1usize, 2];
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
     let stride_orders: Vec<&[usize]> = vec![&orders];
 
     let blocks = compute_blocks(
@@ -106,11 +106,10 @@ fn test_last_argmax_weighted_tie() {
 fn test_compute_block_sizes_full_pipeline() {
     // Test the full compute_block_sizes function
     let dims = [100usize, 100];
-    let order = [0usize, 1];
     let strides = [1isize, 100];
     let strides_list: Vec<&[isize]> = vec![&strides];
 
-    let blocks = compute_block_sizes(&dims, &order, &strides_list, 8);
+    let blocks = compute_block_sizes(&dims, &strides_list, 8);
 
     // Should return valid block sizes
     assert_eq!(blocks.len(), 2);
@@ -129,8 +128,8 @@ fn test_total_memory_region_julia_match_2d() {
     // contiguous_lines = 72/64 + 1 = 2
     // memory = 64 * 2 * 10 = 1280
     let dims = [10usize, 10];
-    let strides = [8isize, 80];
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let strides = [8u128, 80];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
 
     let region = total_memory_region(&dims, &byte_strides);
     assert_eq!(region, 1280);
@@ -140,9 +139,9 @@ fn test_total_memory_region_julia_match_2d() {
 fn test_total_memory_region_julia_match_multiple_arrays() {
     // Two arrays with different strides
     let dims = [10usize, 10];
-    let strides1 = [8isize, 80]; // Column-major-ish
-    let strides2 = [80isize, 8]; // Row-major-ish
-    let byte_strides: Vec<&[isize]> = vec![&strides1, &strides2];
+    let strides1 = [8u128, 80]; // Column-major-ish
+    let strides2 = [80u128, 8]; // Row-major-ish
+    let byte_strides: Vec<&[u128]> = vec![&strides1, &strides2];
 
     let region = total_memory_region(&dims, &byte_strides);
 
@@ -158,8 +157,8 @@ fn test_total_memory_region_julia_match_multiple_arrays() {
 fn test_total_memory_region_all_contiguous() {
     // All strides < cache line
     let dims = [10usize, 5];
-    let strides = [8isize, 40]; // Both < 64
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let strides = [8u128, 40]; // Both < 64
+    let byte_strides: Vec<&[u128]> = vec![&strides];
 
     let region = total_memory_region(&dims, &byte_strides);
 
@@ -174,8 +173,8 @@ fn test_total_memory_region_all_contiguous() {
 fn test_total_memory_region_all_large_strides() {
     // All strides >= cache line
     let dims = [5usize, 4];
-    let strides = [64isize, 320]; // Both >= 64
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let strides = [64u128, 320]; // Both >= 64
+    let byte_strides: Vec<&[u128]> = vec![&strides];
 
     let region = total_memory_region(&dims, &byte_strides);
 
@@ -193,9 +192,9 @@ fn test_compute_blocks_first_dim_smallest_stride() {
     let dims = [100usize, 10, 10];
     let costs = [2isize, 2, 2];
     // All arrays have first dim with smallest stride
-    let strides1 = [8isize, 800, 8000];
+    let strides1 = [8u128, 800, 8000];
     let orders1 = [1usize, 2, 3]; // First dim has order 1 (smallest)
-    let byte_strides: Vec<&[isize]> = vec![&strides1];
+    let byte_strides: Vec<&[u128]> = vec![&strides1];
     let stride_orders: Vec<&[usize]> = vec![&orders1];
 
     let blocks = compute_blocks(
@@ -220,24 +219,24 @@ fn test_compute_blocks_min_stride_larger_than_blocksize() {
     let dims = [100usize, 100];
     let costs = [2isize, 2];
     // Stride order: dim 1 has smaller stride than dim 0, but both > blocksize
-    let strides = [40000000isize, 40000]; // dim 1 is smaller but still > 32768
+    let strides = [40000000u128, 40000]; // dim 1 is smaller but still > 32768
     let orders = [2usize, 1]; // dim 1 has smaller stride order
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
     let stride_orders: Vec<&[usize]> = vec![&orders];
 
     // Verify total memory exceeds blocksize first
     let initial_mem = total_memory_region(&dims, &byte_strides);
     assert!(
-        initial_mem > BLOCK_MEMORY_SIZE,
+        initial_mem > BLOCK_MEMORY_SIZE as u128,
         "Initial memory {} should exceed {}",
         initial_mem,
         BLOCK_MEMORY_SIZE
     );
 
     // Verify minimum stride > blocksize
-    let min_stride = strides.iter().map(|s| s.unsigned_abs()).min().unwrap();
+    let min_stride = strides.iter().copied().min().unwrap();
     assert!(
-        min_stride > BLOCK_MEMORY_SIZE,
+        min_stride > BLOCK_MEMORY_SIZE as u128,
         "Min stride {} should exceed {}",
         min_stride,
         BLOCK_MEMORY_SIZE
@@ -262,9 +261,9 @@ fn test_compute_blocks_4d_array_first_dim_smallest() {
     let dims = [10usize, 10, 10, 10];
     let costs = [2isize, 2, 2, 2];
     // Column-major strides: first dim has smallest stride
-    let strides = [8isize, 80, 800, 8000];
+    let strides = [8u128, 80, 800, 8000];
     let orders = [1usize, 2, 3, 4];
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
     let stride_orders: Vec<&[usize]> = vec![&orders];
 
     let blocks = compute_blocks(
@@ -290,14 +289,14 @@ fn test_compute_blocks_4d_needs_reduction() {
     let dims = [100usize, 100, 100, 100];
     let costs = [2isize, 2, 2, 2];
     // Mixed strides: dim 1 has smallest stride, not dim 0
-    let strides = [80isize, 8, 8000, 800];
+    let strides = [80u128, 8, 8000, 800];
     let orders = [2usize, 1, 4, 3]; // Reflects actual stride magnitudes
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
     let stride_orders: Vec<&[usize]> = vec![&orders];
 
     // Verify total memory exceeds blocksize
     let initial_mem = total_memory_region(&dims, &byte_strides);
-    assert!(initial_mem > BLOCK_MEMORY_SIZE);
+    assert!(initial_mem > BLOCK_MEMORY_SIZE as u128);
 
     let blocks = compute_blocks(
         &dims,
@@ -323,9 +322,9 @@ fn test_compute_blocks_4d_permuted() {
     let dims = [10usize, 10, 10, 10];
     let costs = [2isize, 4, 8, 16]; // Different costs
                                     // Permuted strides: last dim has smallest stride
-    let strides = [8000isize, 800, 80, 8];
+    let strides = [8000u128, 800, 80, 8];
     let orders = [4usize, 3, 2, 1];
-    let byte_strides: Vec<&[isize]> = vec![&strides];
+    let byte_strides: Vec<&[u128]> = vec![&strides];
     let stride_orders: Vec<&[usize]> = vec![&orders];
 
     let blocks = compute_blocks(
@@ -348,11 +347,11 @@ fn test_compute_blocks_mixed_strides_two_arrays() {
     // Two arrays with conflicting stride patterns
     let dims = [100usize, 100];
     let costs = [2isize, 2];
-    let strides1 = [8isize, 800]; // Column-major
-    let strides2 = [800isize, 8]; // Row-major
+    let strides1 = [8u128, 800]; // Column-major
+    let strides2 = [800u128, 8]; // Row-major
     let orders1 = [1usize, 2];
     let orders2 = [2usize, 1];
-    let byte_strides: Vec<&[isize]> = vec![&strides1, &strides2];
+    let byte_strides: Vec<&[u128]> = vec![&strides1, &strides2];
     let stride_orders: Vec<&[usize]> = vec![&orders1, &orders2];
 
     let blocks = compute_blocks(
@@ -408,26 +407,12 @@ fn test_last_argmax_weighted_cost_matters() {
 
 #[test]
 fn test_compute_blocks_negative_strides() {
-    // Negative strides should be handled via absolute value
-    let dims = [10usize, 10];
-    let costs = [2isize, 2];
-    let strides = [-8isize, -80]; // Negative strides
-    let orders = [1usize, 2];
-    let byte_strides: Vec<&[isize]> = vec![&strides];
-    let stride_orders: Vec<&[usize]> = vec![&orders];
-
-    let blocks = compute_blocks(
-        &dims,
-        &costs,
-        &byte_strides,
-        &stride_orders,
-        BLOCK_MEMORY_SIZE,
-    );
-
-    // Should behave same as positive strides
-    assert_eq!(blocks.len(), 2);
-    assert!(blocks[0] >= 1 && blocks[0] <= 10);
-    assert!(blocks[1] >= 1 && blocks[1] <= 10);
+    // Negative strides are handled via their magnitude: same blocks as the
+    // positive layout.
+    let dims = [100usize, 100];
+    let positive = compute_block_sizes(&dims, &[&[1, 100], &[100, 1]], 8);
+    let negative = compute_block_sizes(&dims, &[&[-1, -100], &[-100, 1]], 8);
+    assert_eq!(negative, positive);
 }
 
 #[test]
@@ -435,11 +420,10 @@ fn test_compute_block_sizes_4d_column_major() {
     // Full pipeline test for 4D arrays (Issue #5)
     // Column-major layout: first dim has smallest stride
     let dims = [32usize, 32, 32, 32];
-    let order = [0usize, 1, 2, 3]; // Natural order
     let strides = [1isize, 32, 1024, 32768]; // Column-major
     let strides_list: Vec<&[isize]> = vec![&strides];
 
-    let blocks = compute_block_sizes(&dims, &order, &strides_list, 8);
+    let blocks = compute_block_sizes(&dims, &strides_list, 8);
 
     assert_eq!(blocks.len(), 4);
     // Verify blocks are valid
@@ -450,18 +434,205 @@ fn test_compute_block_sizes_4d_column_major() {
 
 #[test]
 fn test_compute_block_sizes_4d_permuted_strides() {
-    // Full pipeline test for 4D arrays with permuted strides
-    // This exercises the halving/decrementing reduction path
+    // Row-major strides [32768, 1024, 32, 1] in the reversed iteration order
+    // [3, 2, 1, 0]: the caller passes the metadata already in that order, so
+    // the strides strictly increase and every axis is kept whole.
     let dims = [32usize, 32, 32, 32];
-    let order = [3usize, 2, 1, 0]; // Reversed order
-                                   // Permuted strides: smallest stride is in last position of original
-    let strides = [32768isize, 1024, 32, 1];
+    let strides = [1isize, 32, 1024, 32768];
     let strides_list: Vec<&[isize]> = vec![&strides];
 
-    let blocks = compute_block_sizes(&dims, &order, &strides_list, 8);
+    let blocks = compute_block_sizes(&dims, &strides_list, 8);
 
-    assert_eq!(blocks.len(), 4);
-    for (i, &b) in blocks.iter().enumerate() {
-        assert!(b >= 1, "Block {} must be >= 1", i);
+    assert_eq!(blocks.as_slice(), [32, 32, 32, 32]);
+}
+
+// ========== Exact arithmetic contract ==========
+
+#[path = "oracle.rs"]
+mod oracle;
+
+use crate::kernel::{build_plan, build_plan_fused};
+use oracle::{legacy_blocks, model_blocks, LegacyCosts};
+
+fn refs(strides: &[Vec<isize>]) -> Vec<&[isize]> {
+    strides.iter().map(|s| s.as_slice()).collect()
+}
+
+#[test]
+fn compute_block_sizes_equals_the_exact_model_on_the_sweep() {
+    let (mut fits, mut overflows) = (0, 0);
+    for (dims, strides, elem_size) in oracle::sweep() {
+        let strides = refs(&strides);
+        let model = model_blocks(&dims, &strides, elem_size);
+        let blocks = compute_block_sizes(&dims, &strides, elem_size);
+        assert_eq!(
+            blocks.as_slice(),
+            model,
+            "{dims:?} {strides:?} e={elem_size}"
+        );
+        if elem_size == 0 {
+            assert_eq!(model, dims, "a zero element size keeps every axis");
+        }
+        match legacy_blocks(&dims, &strides, elem_size, LegacyCosts::Saturating) {
+            Some(legacy) => {
+                assert_eq!(legacy, model, "{dims:?} {strides:?} e={elem_size}");
+                fits += 1;
+            }
+            None => overflows += 1,
+        }
     }
+    assert!(
+        fits > 0 && overflows > 0,
+        "{fits} fitting, {overflows} overflowing"
+    );
+    // Rank 0 returns before any conversion of the element size.
+    assert!(compute_block_sizes(&[], &[&[]], usize::MAX).is_empty());
+    assert_eq!(
+        legacy_blocks(&[], &[&[]], usize::MAX, LegacyCosts::Saturating),
+        Some(vec![])
+    );
+}
+
+#[test]
+fn a_zip_reduce_region_beyond_usize_is_exact() {
+    // R1-A: two f64 operands over 1024^6, whose region 2^66 per operand
+    // wrapped to 0 ("fits") before the exact contract.
+    let dims = [1024usize; 6];
+    let a = [8isize, 16, 8, 8, 8, 8];
+    let b = [16isize, 8, 8, 8, 8, 8];
+    let (dims, strides, plan) = build_plan_fused(&dims, &[&a, &b], None, 8);
+    assert_eq!(dims.as_slice(), [1024; 6]);
+    assert_eq!(strides[0].as_slice(), [8, 8, 8, 8, 8, 16]);
+    assert_eq!(strides[1].as_slice(), [8, 8, 8, 8, 16, 8]);
+    assert_eq!(plan.block.as_slice(), [1024, 1024, 1024, 1024, 16, 16]);
+    let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+    assert_eq!(model_blocks(&dims, &strides, 8), plan.block.as_slice());
+    assert_eq!(
+        legacy_blocks(&dims, &strides, 8, LegacyCosts::Saturating),
+        None
+    );
+}
+
+/// Zero-sized source element for the mixed-size `map_into` fixture.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Zst;
+
+impl crate::ElementOpApply for Zst {}
+
+static ZSTS: [Zst; 1 << 62] = [Zst; 1 << 62];
+
+#[test]
+fn a_zero_sized_source_byte_stride_beyond_isize_is_exact() {
+    // R1-B: f64 destination from a zero-sized source. The planner converts
+    // both with the larger element size, so the source byte stride
+    // 2^61 * 8 = 2^64 wrapped to 0 before the exact contract.
+    let dims = [2usize, 8192];
+    let dst_strides = [1isize, 2];
+    let src_strides = [1isize << 61, 1];
+    let (_, _, plan) = build_plan_fused(&dims, &[&dst_strides, &src_strides], Some(0), 8);
+    assert_eq!(plan.block.as_slice(), [2, 1024]);
+    assert_eq!(
+        legacy_blocks(
+            &dims,
+            &[&dst_strides, &src_strides],
+            8,
+            LegacyCosts::Saturating
+        ),
+        None
+    );
+
+    let src = crate::StridedView::<Zst>::new(&ZSTS[..], &dims, &src_strides, 0).unwrap();
+    let mut data = vec![0.0f64; 2 * 8192];
+    let mut dst = crate::StridedViewMut::new(&mut data, &dims, &dst_strides, 0).unwrap();
+    crate::map_into(&mut dst, &src, |_: Zst| 1.5f64, crate::Exec::serial()).unwrap();
+    assert!(data.iter().all(|&x| x == 1.5));
+}
+
+#[test]
+fn a_zero_element_size_keeps_every_axis_for_any_operand_count() {
+    // R3-1: 513 operands, region 513 * 64 = 32832 above the budget, but every
+    // byte stride is 0, so every stride order is 1 and both axes are kept.
+    let dims = [2usize, 2];
+    let mut strides = vec![vec![1isize, 2]; 512];
+    strides.push(vec![2, 1]);
+    let strides = refs(&strides);
+    assert_eq!(compute_block_sizes(&dims, &strides, 0).as_slice(), [2, 2]);
+    assert_eq!(model_blocks(&dims, &strides, 0), [2, 2]);
+    assert_eq!(
+        legacy_blocks(&dims, &strides, 0, LegacyCosts::Saturating),
+        Some(vec![2, 2])
+    );
+    // Stride orders taken from the element strides instead would shrink both.
+    let orders: Vec<InlineVec<usize>> = strides.iter().map(|s| index_order(s)).collect();
+    let orders: Vec<&[usize]> = orders.iter().map(|o| o.as_slice()).collect();
+    let zeros = [0u128; 2];
+    let byte_strides = vec![&zeros[..]; 513];
+    let costs = compute_costs(&strides);
+    assert_eq!(
+        compute_blocks(&dims, &costs, &byte_strides, &orders, BLOCK_MEMORY_SIZE).as_slice(),
+        [1, 1]
+    );
+}
+
+#[test]
+fn a_halving_score_beyond_isize_selects_the_exact_maximum() {
+    // R3-3: costs [2^62, 2]; the score (3 - 1) * 2^62 = 2^63 wrapped to
+    // -2^63, which made the old core shrink axis 1 to [3, 3616].
+    let dims = [3usize, 8192];
+    let a = [1isize << 61, 1];
+    let b = [1isize << 61, 2];
+    assert_eq!(compute_costs(&[&a, &b]).as_slice(), [1 << 62, 2]);
+    // Regions 73728 -> 49152 (halved) -> 24576 (decremented).
+    assert_eq!(
+        compute_block_sizes(&dims, &[&a, &b], 1).as_slice(),
+        [1, 8192]
+    );
+    assert_eq!(model_blocks(&dims, &[&a, &b], 1), [1, 8192]);
+    assert_eq!(
+        legacy_blocks(&dims, &[&a, &b], 1, LegacyCosts::Saturating),
+        None
+    );
+}
+
+#[test]
+fn tied_strides_run_the_full_core() {
+    // F1: the source ties (or is broadcast on) the destination's leading axes,
+    // so the strictly increasing exit does not apply.
+    let dims = [64usize, 64, 64];
+    let dst = [1isize, 64, 4096];
+    for src in [[0isize, 1, 1], [1, 1, 1]] {
+        assert_eq!(
+            compute_block_sizes(&dims, &[&dst, &src], 8).as_slice(),
+            [64, 31, 16]
+        );
+        assert_eq!(model_blocks(&dims, &[&dst, &src], 8), [64, 31, 16]);
+    }
+}
+
+#[test]
+fn strictly_increasing_strides_keep_every_axis_in_the_model() {
+    // crop r2 and reverse r2: the model without exits keeps every axis, as
+    // the strictly increasing exit does.
+    let cases: [(&[usize], [isize; 2], [isize; 2]); 2] = [
+        (&[3840, 4096], [1, 3840], [1, 4096]),
+        (&[4096, 4096], [1, 4096], [-1, 4096]),
+    ];
+    for (dims, dst, src) in cases {
+        assert_eq!(model_blocks(dims, &[&dst, &src], 8), dims);
+        assert_eq!(compute_block_sizes(dims, &[&dst, &src], 8).as_slice(), dims);
+    }
+}
+
+#[test]
+fn build_plan_forwards_ordered_dims_and_strides() {
+    // R3-5: [3, 5] row-major iterates in order [1, 0], so the block core
+    // sees dims [5, 3] and strides [1, 5].
+    let plan = build_plan(&[3, 5], &[&[5, 1]], Some(0), 8);
+    assert_eq!(plan.order.as_slice(), [1, 0]);
+    assert_eq!(plan.block.as_slice(), [5, 3]);
+    // [3, 1000]: forwarded strides [1, 1000] fit (region 24000); unreordered
+    // strides [1000, 1] would not (64000) and give blocks [512, 3].
+    let plan = build_plan(&[3, 1000], &[&[1000, 1]], Some(0), 8);
+    assert_eq!(plan.order.as_slice(), [1, 0]);
+    assert_eq!(plan.block.as_slice(), [1000, 3]);
 }

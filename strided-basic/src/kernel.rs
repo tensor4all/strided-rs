@@ -16,15 +16,16 @@ pub const SMALL_TENSOR_THRESHOLD: usize = 1024;
 #[derive(Debug)]
 pub struct KernelPlan {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) order: InlineVec<usize>, // outer -> inner
+    pub(crate) order: InlineVec<usize>, // inner -> outer
     pub block: InlineVec<usize>,
 }
 
 /// Build an execution plan for strided iteration (used only in tests).
 ///
-/// This follows Julia's `_mapreduce_fuse!` -> `_mapreduce_order!` -> `_mapreduce_block!` pipeline:
-/// 1. Fuse contiguous dimensions
-/// 2. Compute optimal iteration order
+/// This follows Julia's `_mapreduce_order!` -> `_mapreduce_block!` pipeline
+/// without fusion:
+/// 1. Compute optimal iteration order
+/// 2. Reorder dims and strides into that order
 /// 3. Compute block sizes for cache efficiency
 #[cfg(test)]
 pub(crate) fn build_plan(
@@ -34,7 +35,14 @@ pub(crate) fn build_plan(
     elem_size: usize,
 ) -> KernelPlan {
     let order = order::compute_order(dims, strides_list, dest_index);
-    let block = block::compute_block_sizes(dims, &order, strides_list, elem_size);
+    let ordered_dims: InlineVec<usize> = order.iter().map(|&d| dims[d]).collect();
+    let ordered_strides: OperandVec<InlineVec<isize>> = strides_list
+        .iter()
+        .map(|strides| order.iter().map(|&d| strides[d]).collect())
+        .collect();
+    let ordered_strides_refs: OperandVec<&[isize]> =
+        ordered_strides.iter().map(|s| s.as_slice()).collect();
+    let block = block::compute_block_sizes(&ordered_dims, &ordered_strides_refs, elem_size);
     KernelPlan { order, block }
 }
 
@@ -75,14 +83,9 @@ pub(crate) fn build_plan_fused(
     let compressed_strides_refs: OperandVec<&[isize]> =
         compressed_strides.iter().map(|s| s.as_slice()).collect();
 
-    // 5. Compute blocks with identity ordering (already ordered)
+    // 5. Compute blocks on the already ordered axes
     let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
-    let block = block::compute_block_sizes(
-        &compressed_dims,
-        &identity,
-        &compressed_strides_refs,
-        elem_size,
-    );
+    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_size);
 
     (
         compressed_dims,
