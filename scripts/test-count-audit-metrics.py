@@ -44,6 +44,13 @@ def count_sources(files: dict[str, str]) -> dict[str, int]:
         return mod.count(pathlib.Path(tmp))
 
 
+def char_literal_is_blanked(literal: str) -> bool:
+    """True when the scanner blanks `literal` out of the code rows."""
+    mod = load_module()
+    rows = mod.scan_file(f"const C: char = {literal};\n")
+    return literal not in "".join(str(row["code_no_strings"]) for row in rows)
+
+
 def test_block_comment_is_not_code() -> None:
     """A block comment holds no production `unsafe`, `// SAFETY:` or `// INVARIANT:`."""
     counts = count_sources({"only_comment.rs": "/* unsafe {} // SAFETY: x // INVARIANT: y */\n"})
@@ -352,8 +359,9 @@ def test_a_test_only_module_directory_is_not_production() -> None:
 
 
 def test_an_escaped_char_literal_does_not_open_a_string() -> None:
-    r"""`'\"'`, `'\\''` and `'\u{1F600}'` are char literals, not the start of a string."""
-    for literal in ("'\\\"'", "'\\\\''", "'\\u{1F600}'"):
+    r"""`'\"'`, `'\''`, `'\\'` and `'\u{1F600}'` are char literals, blanked like any string."""
+    for literal in (r"'\"'", r"'\''", r"'\\'", r"'\u{1F600}'", "'a'", "b'\"'"):
+        assert char_literal_is_blanked(literal), literal
         counts = count_sources(
             {
                 "fixture.rs": (
@@ -364,6 +372,86 @@ def test_an_escaped_char_literal_does_not_open_a_string() -> None:
         )
         assert counts["unsafe"] == 1, (literal, counts)
         assert counts["pub_result"] == 1, (literal, counts)
+
+
+def test_a_module_declaration_resolves_in_its_own_file() -> None:
+    """`mod helpers;` in `foo.rs` means `foo/helpers.rs`, not the sibling `helpers.rs`."""
+    counts = count_sources(
+        {
+            "lib.rs": "mod foo;\nmod helpers;\n",
+            "foo.rs": "#[cfg(test)]\nmod helpers;\n",
+            "foo/helpers.rs": "\n",
+            "helpers.rs": "pub fn live() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 1, counts
+    assert counts["pub_result"] == 1, counts
+
+
+def test_test_only_exclusion_covers_the_module_subtree() -> None:
+    """An ordinary `mod deep;` below a test-only module is test-only too."""
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod helpers;\n",
+            "helpers/mod.rs": "mod deep;\n",
+            "helpers/deep.rs": "pub fn deep() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_where_clause_callback_is_not_the_items_return_type() -> None:
+    """A bound's arrow sits past a top-level `where`, not in the item's return type."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "pub fn accepts<F>(f: F) where F: Fn() -> Result<(), ()> {\n"
+                "    let _ = f;\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 0, counts
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "pub fn returns<F>(f: F) -> Result<(), ()> where F: Fn() -> () {\n"
+                "    let _ = f;\n"
+                "    Ok(())\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+
+
+def test_a_doc_shaped_line_inside_a_block_comment_is_not_a_doc_line() -> None:
+    """`///` inside `/* */` is block-comment text, and the terminator on that line counts."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "/*\n"
+                "/// */\n"
+                'const S: &str = "*/ unsafe {} // SAFETY: x // INVARIANT: y";\n'
+            )
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["safety"] == 0, counts
+    assert counts["invariant"] == 0, counts
+
+
+def test_a_raw_string_continuation_is_not_code() -> None:
+    """A raw string's closing line is string content, so it cannot start a `pub fn`."""
+    counts = count_sources(
+        {"fixture.rs": 'const S: &str = r#"\npub fn ghost() -> Result<(), ()> {}"#;\n'}
+    )
+    assert counts["pub_result"] == 0, counts
+    counts = count_sources(
+        {"fixture.rs": 'const S: &str = r#"\npub fn ghost() { unsafe {} }"#;\n'}
+    )
+    assert counts["unsafe"] == 0, counts
 
 
 def main() -> int:

@@ -132,23 +132,29 @@ else. These cases are known to be miscounted, and they are **not** fixed here:
 
 Consequences for reading a row:
 
-- The `// INVARIANT:`, `// SAFETY:` and `unsafe {` rows are a **lower bound**: text
-  the scanner mistakes for a comment or a string is dropped from the code rows and
-  never invented, so the true count is at least the printed one.
+- The `// INVARIANT:`, `// SAFETY:` and `unsafe {` rows count text the scan
+  believes is code, and text it misclassifies is dropped rather than invented, so
+  they are a **lower bound** for the source text in scope: the true count is at
+  least the printed one.
 - The `Result` rows are a lower bound in the same way, except that the
-  comparison-operator limit above can also hide or add one item.
+  comparison-operator limit above can move an item either way.
+- This direction was falsified once: a `///` line inside a block comment made all
+  three rows over-count (item 11). Treat a future over-count as a counter bug to
+  fix, not as a licence to read a row as exact.
 - A zero means "the scan found none", not "none exists". Where a row matters,
   measure the thing itself: `cargo test --doc` for the doctest row, a per-block
   read for a `// SAFETY:` audit.
 
 ### Counting defects found in review, and what each fix changed
 
-Thirteen defects, all reproduced with a fixture before the fix and pinned by a
-test after it. `scripts/test-count-audit-metrics.py` fails on the pre-fix counter
-for every one of them except item 5 (`# Errors` across attributes), which an
-earlier round had already fixed and which keeps its own test. Items 1-6 came from
-the first review round; items 7-10 from the second (`2026-11-08T05:25Z`, head
-`96dc462`), where item 10 is an attribution error rather than a scanner defect.
+Eighteen findings. Items 1-9 and 11-15 are scanner defects, each reproduced with
+a fixture before the fix and pinned by a test after it; the suite fails on the
+pre-fix counter for every one of them except item 2 (`# Errors` across
+attributes), which an earlier round had already fixed and which keeps its own
+test. Items 1-6 came from the first review round, 7-10 from the second
+(`2026-11-08T05:25Z`, head `96dc462`) and 11-15 from the third (head `274372d`).
+Item 10 is an attribution error rather than a scanner defect, so it has no
+regression test.
 
 1. **The signature window.** The scan stopped after eight lines, so a `fn` whose
    return type sat past that window counted in neither the denominator nor the
@@ -208,7 +214,7 @@ the first review round; items 7-10 from the second (`2026-11-08T05:25Z`, head
    `pub fn live() -> Result<(), ()> { unsafe {} Ok(()) }` counted as
    `unsafe 0, pub_result 0` instead of `1, 1`. Char literals are now matched as
    `'(\\.|[^\\'])'` together with the `\u{…}` form, which covers `'\"'`,
-   `'\\''` and `'\u{1F600}'`.
+   `'\''` and `'\u{1F600}'`.
 10. **The table quoted the counter's numbers under the source revision alone.**
     The baseline above said "measured on `ac8f744`" and that a later recount
     differs only when Rust changes, but the counter itself changed afterwards: the
@@ -216,3 +222,33 @@ the first review round; items 7-10 from the second (`2026-11-08T05:25Z`, head
     print `302, 534` here. Both revisions are now recorded, and the earlier
     `561/303` under `ac8f744` is what finding 4 of the previous round had already
     removed.
+11. **A `///` line inside a block comment was taken as a doc line.** The doc fast
+    path skipped the line without updating the scanner state, so the real `*/` on
+    that line was lost and the following
+    `const S: &str = "*/ unsafe {} // SAFETY: x // INVARIANT: y";` was read as code:
+    `unsafe 1, safety 1, invariant 1` instead of `0, 0, 0`. This is the one case
+    found so far where the rows *over*-count. The doc path now requires no open
+    block comment, raw string or ordinary string, as the ordinary-comment path
+    already did.
+12. **A raw string's closing line was code.** The continuation span up to `"#` was
+    kept in the comment-preserving field that `FUNCTION_RE` matches, so
+    `const S: &str = r#"` on one line and `pub fn ghost() -> Result<(), ()> {}"#;`
+    on the next counted a public `Result` function: `pub_result 1`, expected 0. The
+    span is now blanked in both fields, as the ordinary-string continuation already
+    was.
+13. **A `where`-clause bound's arrow became the item's return type.**
+    `pub fn accepts<F>(f: F) where F: Fn() -> Result<(), ()>` counted as
+    `pub_result 1`, because the bound's arrow sits at bracket depth zero once the
+    parameter list closes. A top-level `where` now ends the search for the item's
+    own arrow.
+14. **A test-only module's declaration resolved against the wrong directory.**
+    `mod helpers;` in `strided-x/src/foo.rs` was resolved to `src/helpers.rs`
+    instead of `src/foo/helpers.rs`, so a production `src/helpers.rs` could be
+    dropped: the fixture reported `unsafe 0, pub_result 0` where production held
+    one of each. Declarations now resolve in the declaring module's directory
+    (`foo/` for `foo.rs`, the containing directory for `lib.rs`/`mod.rs`).
+15. **A test-only module's subtree was not excluded.** Only the declared file was
+    dropped, so an ordinary `mod deep;` inside a test-only `helpers/mod.rs` kept
+    `helpers/deep.rs` in the totals (`unsafe 1, pub_result 1`, expected 0). The
+    whole subtree (`NAME.rs`, `NAME/mod.rs`, `NAME/**`) is excluded now, which also
+    makes the old repeated-rescan loop unnecessary.

@@ -25,13 +25,15 @@ literals including `r#"…"#` and ordinary `"…"` across lines. Everything else
 line-oriented, and the following are known to be miscounted. Do not read a row as
 exact, and do not quote one as proof that a file or a tree is clean.
 
-The `unsafe`, `// SAFETY:` and `// INVARIANT:` rows are a **lower bound**: text the
-scanner mistakes for a comment or a string is dropped from the code rows and never
-invented, so the true count is at least what is printed. The `Result` row is a
-lower bound in the same way, except that a `<` or `>` used as a comparison
-operator inside a signature can also misplace the signature's end (see the last
-limit below). A count of zero therefore means "the scan found none", not "none
-exists".
+The `// INVARIANT:`, `// SAFETY:` and `unsafe {` rows count text the scan believes
+is code, and text it misclassifies is dropped rather than invented, so they are a
+**lower bound** for the source text in scope: the true count is at least what is
+printed. The `Result` rows are a lower bound in the same way, except that a `<` or
+`>` used as a comparison operator inside a signature can move an item either way
+(see the last limit below). This direction was falsified once — a `///` line
+inside a block comment made all three rows over-count — so treat an over-count as
+a bug here, not as a licence to read a row as exact. A count of zero therefore
+means "the scan found none", not "none exists".
 
 - `///` at the start of a line inside a block comment or a line-spanning
   `r#"…"#` starts a *doc* line for this scanner, so a following `# Errors` can be
@@ -126,7 +128,7 @@ def scan_line(raw: str, state: dict[str, object]) -> tuple[str, str, str]:
                 i = len(raw)
                 continue
             span = raw[i:end + len(closing)]
-            no_comments.append(span)
+            no_comments.append(" " * len(span))
             no_strings.append(" " * len(span))
             i = end + len(closing)
             raw_hashes = None
@@ -201,7 +203,9 @@ def scan_file(text: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for raw in text.splitlines():
         head = raw.lstrip()
-        if (head.startswith("///") or head.startswith("//!")) and not state["plain_string"]:
+        if (head.startswith("///") or head.startswith("//!")) and not (
+            state["plain_string"] or state["block_comment"] or state["raw_string"] is not None
+        ):
             rows.append(
                 {
                     "code": " " * len(raw),
@@ -330,6 +334,12 @@ def returns_result(flat: str) -> bool:
                 return rest.startswith("Result<")
             index += 2
             continue
+        if depth == 0 and flat.startswith("where", index) and not (
+            index + 5 < len(flat) and (flat[index + 5].isalnum() or flat[index + 5] == "_")
+        ):
+            # Past a top-level `where`, an arrow belongs to a bound
+            # (`F: Fn() -> ..`), not to the item.
+            return False
         char = flat[index]
         if char in "([<":
             depth += 1
@@ -377,29 +387,47 @@ def test_only_module_names(rows: list[dict[str, object]]) -> set[str]:
     return names
 
 
-def production_files(root: Path) -> list[Path]:
-    """Production sources, minus the files a test-only `mod NAME;` owns.
+def declared_module_dir(path: Path) -> Path:
+    """The directory Rust looks in for a `mod NAME;` declared in `path`.
 
-    A path exclusion cannot see `#[cfg(test)] mod NAME;` in the declaring file,
-    so the files it names (`NAME.rs`, `NAME/mod.rs`) are removed here and the
-    scan repeats until no kept file declares another one.
+    `src/lib.rs`, `src/main.rs` and `src/foo/mod.rs` own their own directory;
+    `src/foo.rs` owns `src/foo/`, not `src/`.
     """
-    kept = [
+    if path.stem in {"lib", "main", "mod"}:
+        return path.parent
+    return path.parent / path.stem
+
+
+def production_files(root: Path) -> list[Path]:
+    """Production sources, minus the module subtree of every test-only `mod NAME;`.
+
+    A path exclusion cannot see `#[cfg(test)] mod NAME;` in the declaring file, so
+    the declaration is resolved the way Rust resolves it — relative to the
+    declaring module's directory — and the whole subtree (`NAME.rs`, `NAME/mod.rs`
+    and anything below `NAME/`) is excluded. A declaration inside an excluded file
+    always names a path inside that same subtree, so one pass over the candidates
+    is enough.
+    """
+    candidates = [
         p
         for p in sorted(root.glob(PRODUCTION_GLOB))
         if "tests" not in relative_parts(p, root) and p.name != "tests.rs"
     ]
-    while True:
-        dropped = {
-            target
-            for p in kept
-            for name in test_only_module_names(scan_file(p.read_text(encoding="utf-8")))
-            for target in (p.parent / f"{name}.rs", p.parent / name / "mod.rs")
-            if target in kept
-        }
-        if not dropped:
-            return kept
-        kept = [p for p in kept if p not in dropped]
+    excluded = {
+        declared_module_dir(p) / name
+        for p in candidates
+        for name in test_only_module_names(scan_file(p.read_text(encoding="utf-8")))
+    }
+    if not excluded:
+        return candidates
+
+    def is_excluded(path: Path) -> bool:
+        for target in excluded:
+            if path == target.with_name(f"{target.name}.rs") or target in path.parents:
+                return True
+        return False
+
+    return [p for p in candidates if not is_excluded(p)]
 
 
 def count(root: Path) -> dict[str, int]:
