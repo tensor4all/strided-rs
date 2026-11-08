@@ -20,13 +20,14 @@ Run it as `python3 scripts/count-audit-metrics.py .` from the repository root;
 # This is an approximation, not a Rust parser
 
 The scanner tracks `/* */` (nested), line comments, char literals and string
-literals including `r#"…"#` across lines. Everything else is line-oriented, and
-the following are known to be miscounted. Do not read a row as exact, and do not
+literals including `r#"…"#` and ordinary `"…"` across lines. Everything else is
+line-oriented, and the following are known to be miscounted. Do not read a row as exact, and do not
 quote one as proof that a file or a tree is clean:
 
-- `///` inside a string or inside a block comment starts a *doc* line for this
-  scanner, so a following `# Errors` can be credited to an item that does not
-  have one, and the text is dropped from the code rows.
+- `///` at the start of a line inside a block comment or a line-spanning
+  `r#"…"#` starts a *doc* line for this scanner, so a following `# Errors` can be
+  credited to an item that does not have one, and the text is dropped from the
+  code rows.
 - A string literal inside an attribute or a macro invocation is blanked as a
   string, so an item whose `pub` is produced by a macro is not seen at all.
 - Braces inside a macro body that the scanner reads as code (not as a string)
@@ -186,7 +187,7 @@ def scan_file(text: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for raw in text.splitlines():
         head = raw.lstrip()
-        if head.startswith("///") or head.startswith("//!"):
+        if (head.startswith("///") or head.startswith("//!")) and not state["plain_string"]:
             rows.append(
                 {
                     "code": " " * len(raw),
@@ -196,7 +197,12 @@ def scan_file(text: str) -> list[dict[str, object]]:
                 }
             )
             continue
-        if head.startswith("//") and not state["block_comment"] and state["raw_string"] is None:
+        if (
+            head.startswith("//")
+            and not state["block_comment"]
+            and state["raw_string"] is None
+            and not state["plain_string"]
+        ):
             rows.append(
                 {
                     "code": " " * len(raw),

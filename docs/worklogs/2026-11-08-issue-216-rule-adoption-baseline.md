@@ -44,8 +44,9 @@ for the doctest row, a file read for a per-block `// SAFETY:` audit.
 Three of the rows are already at or near their target because the work landed
 between the issue's opening count and this baseline: the `# Errors` row reads
 186/186 (the sweep of #381 left no public `Result`-returning `fn` without the
-section — but the counter cannot see items a macro expands, so this is "no
-item the scan can read", not an exhaustive claim), the doctests are the same
+section — but an item whose `pub` a macro produces is dropped with the string
+literal around it, `scripts/count-audit-metrics.py:31-32`, so this is "no item
+the scan can read", not an exhaustive claim), the doctests are the same
 sweep, and the inline-test drop is the move
 of the inline unit test modules into `*/tests/` directories (#362) — every
 `src/` file now carries a `mod tests;` declaration, and the one remaining inline
@@ -66,7 +67,7 @@ per block, so the per-block audit is the next measurement, not this one.
 wrong:
 
 ```bash
-python3 scripts/test-count-audit-metrics.py     # 8 tests
+python3 scripts/test-count-audit-metrics.py     # 17 tests
 ```
 
 Production scope is `strided-*/src/**/*.rs` with a `tests/` path component and
@@ -121,10 +122,11 @@ round had already fixed and which keeps its own test.
    `#[cfg(test)] mod tests;` declaration. Nineteen such files held 27 `unsafe`
    blocks and one `SAFETY` comment, and the totals were 561/303 until they were
    excluded. Counting braces over the string-blanked line, tracking an ordinary
-   `"` string left open across lines, and reading the item's own return type
-   instead of the first `->` in its signature (a callback parameter's) are the
-   other three cases the counters got wrong; `scripts/test-count-audit-metrics.py`
-   pins all four.
+   `"` string left open across lines — including a `//` or `///` line that begins
+   inside it, which was still read as a comment or a doc line — and reading the
+   item's own return type instead of the first `->` in its signature (a callback
+   parameter's) are the other three cases the counters got wrong;
+   `scripts/test-count-audit-metrics.py` pins all four.
 5. **`#[cfg(test)] mod tests;` swallowed the rest of the file.** The skip jumped
    to the next `{`, so production code after a declaration disappeared: the
    fixture's `pub fn retained() -> Result<(), ()> { unsafe {} … }` counted as

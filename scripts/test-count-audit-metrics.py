@@ -272,6 +272,24 @@ def test_line_spanning_ordinary_string_is_not_code() -> None:
     assert counts["invariant"] == 0, counts
 
 
+def test_a_comment_shaped_line_inside_an_open_string_is_not_a_comment() -> None:
+    """A `//` or `///` line that begins inside a `"…"` is string content, not a comment or doc line."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                'const NOTE: &str = "\n'
+                "// SAFETY: x\n"
+                "// INVARIANT: y\n"
+                '";\n'
+                "pub fn live() {\n    unsafe {}\n}\n"
+            )
+        }
+    )
+    assert counts["safety"] == 0, counts
+    assert counts["invariant"] == 0, counts
+    assert counts["unsafe"] == 1, counts
+
+
 def test_a_callback_return_type_is_not_the_items_return_type() -> None:
     counts = count_sources(
         {"fixture.rs": "pub fn accepts(f: fn() -> Result<(), ()>) {\n    let _ = f;\n}\n"}
