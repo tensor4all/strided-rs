@@ -575,6 +575,17 @@ def test_a_path_attribute_moves_the_test_only_file() -> None:
     )
     assert counts["unsafe"] == 1, counts
     assert counts["pub_result"] == 1, counts
+    # A `..` component is resolved lexically, because the candidates come from a
+    # glob and never carry one.
+    counts = count_sources(
+        {
+            "lib.rs": "mod foo;\n",
+            "foo.rs": '#[cfg(test)]\n#[path = "sub/../helper.rs"]\nmod checks;\n',
+            "helper.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
     # A `#[path]` in `foo.rs` resolves against `src/`, not `src/foo/`.
     counts = count_sources(
         {

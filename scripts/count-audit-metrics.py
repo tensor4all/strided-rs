@@ -60,6 +60,7 @@ Where a row matters, measure the thing itself instead of this script: run
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -475,8 +476,10 @@ def production_files(root: Path) -> list[Path]:
         for name in test_only_module_names(rows):
             if name.startswith("@"):
                 # A `#[path = "..."]` target is relative to the file's own
-                # directory, even when the declaration sits in `foo.rs`.
-                excluded.add(p.parent / name[1:])
+                # directory, even when the declaration sits in `foo.rs`. A `..`
+                # component is resolved here, because the candidates come from a
+                # glob and never carry one.
+                excluded.add(Path(os.path.normpath(p.parent / name[1:])))
             else:
                 excluded.add(module_dir / name)
         for name in inline_test_module_names(rows):
@@ -485,6 +488,7 @@ def production_files(root: Path) -> list[Path]:
         return candidates
 
     def is_excluded(path: Path) -> bool:
+        path = Path(os.path.normpath(path))
         for target in excluded:
             if path == target or path == target.with_name(f"{target.name}.rs") or target in path.parents:
                 return True
