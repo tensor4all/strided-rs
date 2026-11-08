@@ -412,11 +412,18 @@ def test_a_differently_named_test_only_module_is_not_production() -> None:
     counts = count_sources(
         {
             "lib.rs": "#[cfg(test)]\nmod helpers;\n",
-            "helpers.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+            "helpers.rs": (
+                "/// # Errors\n"
+                "/// Never fails.\n"
+                "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n"
+            ),
         }
     )
     assert counts["unsafe"] == 0, counts
     assert counts["pub_result"] == 0, counts
+    # The excluded helper is documented with `# Errors`: a numerator taken from
+    # unfiltered files would report 1 here.
+    assert counts["with_errors"] == 0, counts
 
 
 def test_a_test_only_module_directory_is_not_production() -> None:
