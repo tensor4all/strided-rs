@@ -212,9 +212,11 @@ fn a_serial_token_runs_the_observed_entries_on_the_calling_thread() {
 /// assertion above is not vacuous.
 ///
 /// The shapes are four times the work of the shape that failed under this
-/// assertion in CI (#382) and 151x the element count at which the fork gate
-/// opens; the run also waits for the second thread rather than racing it, which
-/// is what makes the outcome independent of the host.
+/// assertion in CI (#382) and 87x the generic element count at which the fork
+/// gate opens (151x the AVX-512 one); the run also waits for the second thread
+/// rather than racing it, so the outcome no longer depends on how fast the host
+/// wakes a worker. The wait is bounded ([`SECOND_THREAD_LIMIT`]): a call that
+/// never fanned out fails, and so does one whose worker arrives after the bound.
 #[cfg(feature = "parallel")]
 #[test]
 fn a_pooled_token_opens_a_second_worker() {
