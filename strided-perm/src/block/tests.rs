@@ -152,7 +152,11 @@ fn test_compute_blocks_first_stride_order_matches() {
 
 // ========== Exact arithmetic contract ==========
 
-#[path = "../../../strided-basic/src/block/tests/oracle.rs"]
+// Copy, not a `#[path]` into the sibling crate: a path outside this package is
+// absent from the published `.crate`, so `cargo test` failed in the unpacked
+// package (and a distro packager running tests saw it). Keep it identical to
+// `strided-basic/src/block/tests/oracle.rs` — `scripts/check-oracle-copy.sh`
+// diffs the two.
 mod oracle;
 
 use oracle::{legacy_blocks, model_blocks, model_costs, LegacyCosts};
