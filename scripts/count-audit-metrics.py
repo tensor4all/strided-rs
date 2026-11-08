@@ -241,40 +241,41 @@ def scan_file(text: str) -> list[dict[str, object]]:
             )
             continue
         no_comments, no_strings, comment = scan_line(raw, state)
+        # A `///` or `//!` encountered mid-line (a trailing doc comment) is still
+        # documentation, not an ordinary comment.
+        is_doc = comment.startswith("///") or comment.startswith("//!")
         rows.append(
             {
                 "code": no_comments,
                 "code_no_strings": no_strings,
-                "comment": comment,
-                "doc": "",
+                "comment": "" if is_doc else comment,
+                "doc": comment if is_doc else "",
             }
         )
     return rows
 
 
 def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Remove `#[cfg(test)] mod name { .. }` bodies; a `mod name;` declaration removes nothing."""
-    kept: list[dict[str, object]] = []
+    """Remove `#[cfg(test)] mod name { .. }` bodies and the documentation they own.
+
+    A `mod name;` declaration removes nothing here: its body lives in another file,
+    and the module graph handles that file. Documentation and further attributes
+    that precede the `#[cfg(test)]` line belong to the same item, so they are
+    dropped with it -- otherwise the module's `# Errors` would be credited to the
+    next production `fn`.
+    """
+    dropped: set[int] = set()
     i = 0
     while i < len(rows):
-        code = str(rows[i]["code"]).strip()
-        if code != "#[cfg(test)]":
-            kept.append(rows[i])
+        if str(rows[i]["code"]).strip() != "#[cfg(test)]":
             i += 1
             continue
         j = skip_attributes(rows, i + 1)
         if j == len(rows):
-            kept.append(rows[i])
             i += 1
             continue
-        item = str(rows[j]["code"])
-        if INLINE_TEST_DECL_RE.match(item.strip()):
-            # `#[cfg(test)] mod tests;` — the body lives in another file, nothing to skip.
-            kept.append(rows[i])
-            i += 1
-            continue
-        if not INLINE_TEST_MOD_RE.match(item.strip()):
-            kept.append(rows[i])
+        item = str(rows[j]["code"]).strip()
+        if INLINE_TEST_DECL_RE.match(item) or not INLINE_TEST_MOD_RE.match(item):
             i += 1
             continue
         depth = 0
@@ -285,8 +286,14 @@ def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             k += 1
             if depth <= 0 and "}" in str(rows[k - 1]["code"]):
                 break
+        start = i
+        while start > 0 and (
+            rows[start - 1]["doc"] or str(rows[start - 1]["code"]).strip().startswith("#[")
+        ):
+            start -= 1
+        dropped.update(range(start, k))
         i = k
-    return kept
+    return [row for index, row in enumerate(rows) if index not in dropped]
 
 
 def read_signature(rows: list[dict[str, object]], start: int) -> str:
@@ -398,48 +405,64 @@ def skip_attributes(rows: list[dict[str, object]], i: int) -> int:
     return i
 
 
-def inline_test_module_names(rows: list[dict[str, object]]) -> set[str]:
-    """Module names a `#[cfg(test)] mod NAME { .. }` declares inline."""
-    names: set[str] = set()
-    i = 0
-    while i < len(rows):
-        if str(rows[i]["code"]).strip() != "#[cfg(test)]":
-            i += 1
-            continue
-        j = skip_attributes(rows, i + 1)
-        if j < len(rows):
-            match = INLINE_TEST_MOD_RE.match(str(rows[j]["code"]).strip())
-            if match:
-                names.add(match.group(1))
-        i += 1
-    return names
+def attribute_block(
+    rows: list[dict[str, object]], i: int
+) -> tuple[int, bool, str | None]:
+    """Read the attribute list at `i`: (item row, `#[cfg(test)]` present, `#[path]` value)."""
+    j = skip_attributes(rows, i)
+    cfg_test = False
+    path_value = None
+    for k in range(i, j):
+        text = str(rows[k]["code"]).strip()
+        if re.fullmatch(r"#\[cfg\(test\)\]", text):
+            cfg_test = True
+        match = PATH_ATTR_RE.search(text)
+        if match:
+            path_value = match.group(1)
+    return j, cfg_test, path_value
 
 
-def test_only_module_names(rows: list[dict[str, object]]) -> set[str]:
-    """Module names a `#[cfg(test)] mod NAME;` declaration moves to another file.
+def module_declarations(
+    rows: list[dict[str, object]],
+) -> list[tuple[tuple[str, ...], str, str | None, bool]]:
+    """Every `mod NAME;` of a file as (inline prefix, name, `#[path]` value, test-only).
 
-    Further attributes may sit between the `#[cfg(test)]` line and the
-    declaration, as in `strided-perm/src/lib.rs`'s `mod kernel;`.
+    The inline prefix is the chain of `mod X { .. }` blocks the declaration sits in,
+    because Rust resolves a declaration inside them as a subdirectory of the
+    declaring module's directory. `test-only` is true when the declaration carries
+    `#[cfg(test)]` or sits inside an inline module that does.
     """
-    names: set[str] = set()
+    declarations: list[tuple[tuple[str, ...], str, str | None, bool]] = []
+    stack: list[tuple[str, int, bool]] = []
+    depth = 0
+    pending: tuple[bool, str | None] | None = None
     i = 0
     while i < len(rows):
-        if str(rows[i]["code"]).strip() != "#[cfg(test)]":
-            i += 1
+        code = str(rows[i]["code_no_strings"])
+        stripped = code.strip()
+        if stripped.startswith("#["):
+            j, cfg_test, path_value = attribute_block(rows, i)
+            pending = (cfg_test, path_value)
+            # The item line is processed next so its braces move `depth`.
+            i = j if j < len(rows) else len(rows)
             continue
-        j = skip_attributes(rows, i + 1)
-        if j < len(rows):
-            match = INLINE_TEST_DECL_RE.match(str(rows[j]["code"]).strip())
-            if match:
-                explicit = None
-                for k in range(i + 1, j):
-                    path_match = PATH_ATTR_RE.search(str(rows[k]["code"]))
-                    if path_match:
-                        explicit = path_match.group(1)
-                # `@relative/path` marks a `#[path = "..."]` target.
-                names.add(f"@{explicit}" if explicit else match.group(1))
+        cfg_test, path_value = pending if pending is not None else (False, None)
+        pending = None
+        prefix = tuple(name for name, _, _ in stack)
+        enclosing_test = any(test for _, _, test in stack)
+        inline = INLINE_TEST_MOD_RE.match(stripped)
+        declaration = INLINE_TEST_DECL_RE.match(stripped)
+        if inline:
+            stack.append((inline.group(1), depth, cfg_test or enclosing_test))
+        elif declaration:
+            declarations.append(
+                (prefix, declaration.group(1), path_value, cfg_test or enclosing_test)
+            )
+        depth += code.count("{") - code.count("}")
+        while stack and depth <= stack[-1][1]:
+            stack.pop()
         i += 1
-    return names
+    return declarations
 
 
 def declared_module_dir(path: Path) -> Path:
@@ -454,47 +477,57 @@ def declared_module_dir(path: Path) -> Path:
 
 
 def production_files(root: Path) -> list[Path]:
-    """Production sources, minus the module subtree of every test-only `mod NAME;`.
+    """Production sources, minus every file the test-only module graph owns.
 
-    A path exclusion cannot see `#[cfg(test)] mod NAME;` in the declaring file, so
-    the declaration is resolved the way Rust resolves it — relative to the
-    declaring module's directory — and the whole subtree (`NAME.rs`, `NAME/mod.rs`
-    and anything below `NAME/`) is excluded. A `#[path = "..."]` attribute instead
-    names its file relative to the declaring file's own directory, so it can point
-    outside that subtree. The exclusion set is collected from every candidate,
-    including candidates that are themselves excluded, so one pass is enough.
+    Test-only files seed the graph (`tests/` path components, `tests.rs`, and any
+    target of a `#[cfg(test)] mod` declaration). A declaration inside a test-only
+    file is test-only too, so the graph is closed to a fixed point over all
+    sources: a test module's ordinary children (`support.rs` declaring
+    `mod child;`) and its explicitly pathed children follow it out of production.
+    Declarations resolve relative to the declaring module's directory plus the
+    enclosing inline modules, and a `#[path = "..."]` resolves against the same
+    directory, which is how Rust resolves it.
     """
-    candidates = [
+    sources = [
+        p for p in sorted(root.glob(ALL_SOURCE_GLOB)) if "target" not in relative_parts(p, root)
+    ]
+    parsed = {p: module_declarations(scan_file(p.read_text(encoding="utf-8"))) for p in sources}
+    test_only = {
+        p for p in sources if "tests" in relative_parts(p, root) or p.name == "tests.rs"
+    }
+    # A file loaded through `#[path]` resolves its own children beside itself, not
+    # in a directory named after it.
+    module_dirs: dict[Path, Path] = {}
+    changed = True
+    while changed:
+        changed = False
+        for p in sources:
+            file_is_test_only = p in test_only
+            base = module_dirs.get(p, declared_module_dir(p))
+            for prefix, name, explicit, cfg_test in parsed[p]:
+                if explicit:
+                    # `#[path]` is relative to the containing file's directory plus
+                    # the enclosing inline modules, whatever the file is called.
+                    target = Path(os.path.normpath(p.parent.joinpath(*prefix) / explicit))
+                    owned = {target}
+                    if module_dirs.get(target) != target.parent:
+                        module_dirs[target] = target.parent
+                        changed = True
+                else:
+                    module = base.joinpath(*prefix) / name
+                    owned = {module.with_name(f"{name}.rs")}
+                    owned.update(q for q in sources if module in q.parents)
+                if not (cfg_test or file_is_test_only):
+                    continue
+                for q in owned:
+                    if q in sources and q not in test_only:
+                        test_only.add(q)
+                        changed = True
+    return [
         p
         for p in sorted(root.glob(PRODUCTION_GLOB))
-        if "tests" not in relative_parts(p, root) and p.name != "tests.rs"
+        if p in sources and p not in test_only
     ]
-    excluded: set[Path] = set()
-    for p in candidates:
-        rows = scan_file(p.read_text(encoding="utf-8"))
-        module_dir = declared_module_dir(p)
-        for name in test_only_module_names(rows):
-            if name.startswith("@"):
-                # A `#[path = "..."]` target is relative to the file's own
-                # directory, even when the declaration sits in `foo.rs`. A `..`
-                # component is resolved here, because the candidates come from a
-                # glob and never carry one.
-                excluded.add(Path(os.path.normpath(p.parent / name[1:])))
-            else:
-                excluded.add(module_dir / name)
-        for name in inline_test_module_names(rows):
-            excluded.add(module_dir / name)
-    if not excluded:
-        return candidates
-
-    def is_excluded(path: Path) -> bool:
-        path = Path(os.path.normpath(path))
-        for target in excluded:
-            if path == target or path == target.with_name(f"{target.name}.rs") or target in path.parents:
-                return True
-        return False
-
-    return [p for p in candidates if not is_excluded(p)]
 
 
 def count(root: Path) -> dict[str, int]:

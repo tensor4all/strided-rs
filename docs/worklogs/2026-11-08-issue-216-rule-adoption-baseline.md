@@ -9,31 +9,35 @@ baseline: the gap counts the rule-remediation issues check themselves against.
 
 Measured over the maintained crates (`strided-traits`, `strided-view`,
 `strided-basic`, `strided-kernel`, `strided-fused`, `strided-nn`,
-`strided-perm`) on the Rust sources this branch was rebased onto (`f7f9c5b`,
-#386) — unchanged from `ac8f744` through this head, `git diff ac8f744 HEAD --
-'strided-*/**/*.rs'` is empty — **with the counter at this branch's head**:
+`strided-perm`) on the Rust sources **at this branch's head** — `c3b8999`, which
+includes the merge of `main` — with the counter at the same head:
 
 ```bash
 python3 scripts/count-audit-metrics.py .   # the seven source rows
-cargo test --doc --workspace               # the doctest row, 123 passed, 0 ignored
+cargo test --doc --workspace               # the doctest row, 127 passed, 0 ignored
 ```
 
 ```
-invariant 52
-safety 302
-unsafe 534
-pub_result 185 with_errors 185
+invariant 59
+safety 339
+unsafe 537
+pub_result 189 with_errors 189
 inline_mods 1
 files_over_1000 21
 ```
 
-**The counter's revision is part of the measurement.** A row is only reproducible
-with the pair (Rust sources, counter), because scanner fixes move the counts
-without any Rust change: the counter at `ac8f744` prints `safety 303, unsafe 561`
-on these same sources, and the earlier table in this file quoted those values
-under the source revision alone. Record both, e.g.
-`git log -1 --format=%h -- scripts/count-audit-metrics.py` for the counter and
-`git diff ac8f744 HEAD -- 'strided-*/**/*.rs'` to show the sources did not move.
+**A row is reproducible only with the pair (Rust sources, counter).** Both moved
+since the first version of this table, which is why it now carries its own head:
+
+- The counter changed: scanner fixes move the counts with no Rust change at all —
+  the counter at `ac8f744` prints `safety 303, unsafe 561` on the sources that
+  print `339, 537` here.
+- The sources changed: the merge of `main` into this branch touched 36 Rust files,
+  so the earlier `52 / 302 / 534 / 185 / 185 / 123` is a **historical** measurement
+  at `f7f9c5b` (#386), not evidence for this tree.
+
+Record both when quoting a row: `git log -1 --format=%h -- scripts/count-audit-metrics.py`
+for the counter and `git log -1 --format=%h` for the sources.
 
 The counter is a line-oriented approximation, not a Rust parser. It is accurate
 enough for a trend, and it is not evidence that a file or a tree is clean: the
@@ -44,18 +48,18 @@ for the doctest row, a file read for a per-block `// SAFETY:` audit.
 
 | Metric | Count | #216's opening count |
 |--------|-------|----------------------|
-| `// INVARIANT:` markers | 52 | 0 |
-| `// SAFETY:` comments | 302 | 29 |
-| production `unsafe {` occurrences | 534 | 418 |
-| public `Result`-returning `fn` | 185 | 172 |
-| …of those with a `# Errors` section | 185 | 9 |
-| runnable doctests | 123 | 5 |
+| `// INVARIANT:` markers | 59 | 0 |
+| `// SAFETY:` comments | 339 | 29 |
+| production `unsafe {` occurrences | 537 | 418 |
+| public `Result`-returning `fn` | 189 | 172 |
+| …of those with a `# Errors` section | 189 | 9 |
+| runnable doctests | 127 | 5 |
 | inline `#[cfg(test)] mod` blocks with a body | 1 | 53 |
 | files over 1000 lines | 21 | 13 |
 
 Three of the rows are already at or near their target because the work landed
 between the issue's opening count and this baseline: the `# Errors` row reads
-185/185 (the sweep of #381 left no public `Result`-returning `fn` without the
+189/189 (the sweep of #381 left no public `Result`-returning `fn` without the
 section — but a macro invocation is not expanded (see Known limits), so this is
 "no item the scan can read", not an exhaustive claim), the doctests are the same
 sweep, and the inline-test drop is the move
@@ -67,8 +71,8 @@ block with a body is `strided-basic/benches/support/mod.rs:208`. The gap the
 remediation issues should take next is `SAFETY` coverage, and 21 files are over
 1000 lines. Read the old numbers as history and these as the baseline.
 
-`SAFETY` is counted as two independent totals, not as a coverage ratio: 534
-production `unsafe` occurrences and 302 `// SAFETY:` comments. A ratio would
+`SAFETY` is counted as two independent totals, not as a coverage ratio: 537
+production `unsafe` occurrences and 339 `// SAFETY:` comments. A ratio would
 claim that each of those comments documents one of those occurrences, and this
 counter does not establish that pairing; the shared rule requires one comment
 per block, so the per-block audit is the next measurement, not this one.
@@ -104,7 +108,7 @@ reading of `rules/rust/index.md:23` ("skip `// SAFETY:` comments, doc comments,
 string literals, tests"); it is an approximation with the limits listed in
 `scripts/count-audit-metrics.py`. The doctest row is not in the counter: it is
 `cargo test --doc`, which is the definition of "runnable"; the recorded value is
-the command's own output at this tree (123 passed, 0 ignored).
+the command's own output at this tree (127 passed, 0 ignored).
 
 | Row | Rule |
 |-----|------|
@@ -153,12 +157,13 @@ Consequences for reading a row:
 
 ### Counting defects found in review, and what each fix changed
 
-Fifteen findings. Items 1-9 and 11-15 are scanner defects, each reproduced with
+Twenty-one findings. Items 1-9 and 11-20 are scanner or attribution defects, each reproduced with
 a fixture before the fix and pinned by a test after it; the suite fails on the
 pre-fix counter for every one of them except item 2 (`# Errors` across
 attributes), which an earlier round had already fixed and which keeps its own
 test. Items 1-6 came from the first review round, 7-10 from the second
-(`2026-11-08T05:25Z`, head `96dc462`) and 11-15 from the third (head `274372d`).
+(`2026-11-08T05:25Z`, head `96dc462`), 11-15 from the third (head `274372d`) and
+16-21 from the fourth (`2026-11-08T09:36Z`, head `c3b8999`).
 Item 10 is an attribution error rather than a scanner defect, so it has no
 regression test.
 
@@ -260,3 +265,33 @@ regression test.
     `helpers/deep.rs` in the totals (`unsafe 1, pub_result 1`, expected 0). The
     whole subtree (`NAME.rs`, `NAME/mod.rs`, `NAME/**`) is excluded now, which also
     makes the old repeated-rescan loop unnecessary.
+
+
+16. **A removed test module's documentation was credited to the next `fn`.** The
+    doc rows above a `#[cfg(test)] mod checks { .. }` were left behind, so the
+    module's `# Errors` documented the production `fn` below it:
+    `with_errors 1`, expected 0. `drop_test_bodies` now drops the documentation and
+    the further attributes that belong to the dropped item.
+17. **A test-only module's ordinary children stayed production.** `support.rs`,
+    reached through `#[path = "support.rs"]`, declares `mod child;`, and Rust
+    resolves that beside `support.rs`; the counter resolved it beside the module
+    directory. Declarations are now collected from every source, including files
+    the path filters drop, and test-only-ness is closed to a fixed point over the
+    module graph (`unsafe 1, pub_result 1`, expected 0/0).
+18. **A declaration inside an inline module excluded an unrelated file.**
+    `mod outer { #[cfg(test)] mod helpers; }` in `lib.rs` names
+    `outer/helpers.rs`, but the counter used the file's module directory and
+    dropped production `helpers.rs` instead (`unsafe 1`, expected 2). The inline
+    module chain is part of the resolved path now.
+19. **`#[path]` before `#[cfg(test)]` defeated the exclusion.** The attribute
+    search started after `#[cfg(test)]`, so the whole attribute list is inspected
+    now, in either order (`unsafe 1, pub_result 1`, expected 0/0).
+20. **A trailing doc comment counted as an ordinary comment.**
+    `pub struct S; /// // SAFETY: example` put the doc text in the comment row
+    (`safety 1, invariant 1`, expected 0/0). A `///` or `//!` encountered mid-line
+    is documentation now.
+21. **The table's source attribution went stale when `main` was merged in.** The
+    table was measured at `f7f9c5b` and claimed to be unchanged through the head;
+    the merge touched 36 Rust files. The table is re-measured at `c3b8999`
+    (`59 / 339 / 537 / 189 / 189 / 127 / 1 / 21`) and the earlier values are
+    labelled historical.

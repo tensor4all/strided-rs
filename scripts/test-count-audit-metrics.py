@@ -668,6 +668,80 @@ def test_a_c_raw_string_is_not_code() -> None:
     assert counts["invariant"] == 0, counts
 
 
+def test_docs_of_a_removed_test_module_do_not_credit_the_next_function() -> None:
+    """A test module's `# Errors` docs are removed with it, not credited to the next `fn`."""
+    counts = count_sources(
+        {
+            "lib.rs": (
+                "/// # Errors\n"
+                "/// These docs belong to the test module.\n"
+                "#[cfg(test)]\n"
+                "mod checks {}\n"
+                "pub fn undocumented() -> Result<(), ()> { Ok(()) }\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    assert counts["with_errors"] == 0, counts
+
+
+def test_a_test_only_explicit_path_keeps_its_ordinary_children_test_only() -> None:
+    """Rust resolves `mod child;` beside the explicitly located `support.rs`."""
+    counts = count_sources(
+        {
+            "lib.rs": '#[cfg(test)]\n#[path = "support.rs"]\nmod checks;\n',
+            "support.rs": "mod child;\n",
+            "child.rs": "pub fn f() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+    # The same through a `tests.rs` that the name filter drops.
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod tests;\n",
+            "tests.rs": '#[path = "child.rs"]\nmod child;\n',
+            "child.rs": "pub fn f() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_declaration_inside_an_inline_module_does_not_exclude_a_production_file() -> None:
+    """`mod helpers;` inside `mod outer { .. }` names `outer/helpers.rs`, not `helpers.rs`."""
+    counts = count_sources(
+        {
+            "lib.rs": "mod helpers;\nmod outer {\n    #[cfg(test)]\n    mod helpers;\n}\n",
+            "helpers.rs": "pub fn live() -> Result<(), ()> {\n    unsafe {}\n    unsafe {}\n    Ok(())\n}\n",
+            "outer/helpers.rs": "pub fn test_only() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 2, counts
+    assert counts["pub_result"] == 1, counts
+
+
+def test_a_path_attribute_before_cfg_test_still_excludes_the_file() -> None:
+    """Attribute order does not change the module; the whole attribute list is inspected."""
+    counts = count_sources(
+        {
+            "lib.rs": '#[path = "support.rs"]\n#[cfg(test)]\nmod checks;\n',
+            "support.rs": "pub fn f() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_trailing_doc_comment_is_not_an_ordinary_comment() -> None:
+    """`///` after an item on the same line is documentation, so its markers do not count."""
+    counts = count_sources(
+        {"lib.rs": "pub struct S; /// // SAFETY: example // INVARIANT: example\npub fn f() {}\n"}
+    )
+    assert counts["safety"] == 0, counts
+    assert counts["invariant"] == 0, counts
+
+
 def main() -> int:
     tests = [
         value
