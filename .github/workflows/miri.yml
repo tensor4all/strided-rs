@@ -16,16 +16,16 @@ env:
   CARGO_TERM_COLOR: always
   MIRIFLAGS: -Zmiri-disable-isolation
 
-# 同じ target を 2 本同時に走らせない（「既存 issue なし」を両方が読んで二重起票する競合を消す）。
-concurrency:
-  group: miri-${{ matrix.target }}
-  cancel-in-progress: false
-
 jobs:
   miri:
     name: cargo miri (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # workflow 階層では matrix を参照できない（actionlint: context "matrix" is not allowed here）。
+    # job 階層なら参照できる。同じ target を 2 本同時に走らせない。
+    concurrency:
+      group: miri-${{ matrix.target }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +46,7 @@ jobs:
           key: miri-${{ matrix.target }}
 
       - name: cargo miri setup
+        timeout-minutes: 30
         run: cargo miri setup
 
       - name: cargo miri test
@@ -55,24 +56,33 @@ jobs:
         continue-on-error: true
         run: cargo miri test ${{ matrix.args }}
 
-      # `steps.run.outcome` だけでなく **job の失敗全般**を拾う（setup 失敗・timeout でも起票する）。
-      # main 以外（作業ブランチでの workflow_dispatch）では起票しない。
+      # `continue-on-error` の step は conclusion が success になるので `failure()` では拾えない。
+      # **always()** で必ず到達させ、outcome を env で受け取って自分で判定する
+      # （setup 失敗・timeout で `run` が走らなかった場合も RUN_OUTCOME は空＝失敗扱い）。
       - name: File an issue when Miri fails
-        if: failure() && github.ref == 'refs/heads/main'
+        if: always() && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
           TARGET: ${{ matrix.target }}
           ARGS: ${{ matrix.args }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
         run: |
           set -euo pipefail
+          if [ "${RUN_OUTCOME}" = "success" ]; then
+            echo "Miri passed (${TARGET}); nothing to file."
+            exit 0
+          fi
           MARK="<!-- miri-failure:${TARGET} -->"
-          # 既存 issue の検索は **タイトル**で絞る（open を 100 件取る方式は、issue が増えると
-          # 既存を見落として重複起票する）。HTML コメントは GitHub の検索に索引されない。
-          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open \
-            --search 'miri in:title' --json number,title --limit 50 \
-            --jq "[.[] | select(.title == \"miri: ${ARGS} fails on main\")] | .[0].number // empty")
+          # 既存判定は **ラベル**で行う（タイトル編集や検索の件数上限に依存しない）。
+          # ラベルは冪等に作る（既にあれば 422 が返るだけなので握り潰してよい）。
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/labels" \
+            -f name=miri-failure -f color=B60205 \
+            -f description="Miri failed on main (filed by the Miri workflow)" >/dev/null 2>&1 || true
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label miri-failure \
+            --json number,body --limit 100 \
+            --jq "[.[] | select(.body | contains(\"${MARK}\"))] | .[0].number // empty")
           body=$(mktemp)
           {
             echo "$MARK"
@@ -91,6 +101,7 @@ jobs:
             # 失敗を握り潰さない: 起票できなければ **この step を赤くする**（通知が消えるのを防ぐ）
             gh issue create -R "$GITHUB_REPOSITORY" \
               --title "miri: ${ARGS} fails on main" \
+              --label miri-failure \
               --body-file "$body"
           fi
           rm -f "$body"
