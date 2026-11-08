@@ -191,6 +191,8 @@ jobs:
         run: python3 scripts/test-check-runtime-simd-dispatch.py
       - name: Test the audit baseline counter
         run: python3 scripts/test-count-audit-metrics.py
+      - name: Test the published content identity check
+        run: python3 scripts/test-published-identity.py
       - name: Test the review waiver script
         run: node --test scripts/test-review-waiver.js
       - name: Check the two oracle copies are identical

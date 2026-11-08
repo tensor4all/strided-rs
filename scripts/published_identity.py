@@ -167,7 +167,10 @@ def git_files(repo: str, ref: str, crate_dir: str, wanted: set[str]) -> dict[str
         r = subprocess.run(["git", "show", f"{ref}:{crate_dir}/{rel}"],
                            capture_output=True, cwd=repo, timeout=60)
         if r.returncode != 0:
-            continue
+            # `cargo package --list` says this path ships. Dropping it here
+            # would hide a real difference, so a failed read fails the check.
+            raise CheckError(f"git show {ref}:{crate_dir}/{rel} failed: "
+                             f"{r.stderr.decode(errors='replace')[:200]}")
         files[rel] = hashlib.sha256(r.stdout).hexdigest()
     return files
 
@@ -178,7 +181,10 @@ def check_crate(repo: str, ref: str, crate: dict) -> tuple[str, list[str]]:
     if blob is None:
         return "unpublished", [f"{name} {ver} is not on crates.io (release in progress?)"]
     wanted = shipped_paths(repo, crate)
-    pub = {k: v for k, v in crate_files(blob).items() if k in wanted}
+    # The published side is NOT filtered by `wanted`: a file that shipped in
+    # the .crate but is gone from the tree (a deleted build.rs, say) changes
+    # what users build, and must show up as "only in published .crate".
+    pub = crate_files(blob)
     tree = git_files(repo, ref, cdir, wanted)
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
@@ -201,11 +207,14 @@ def main() -> int:
     ap.add_argument("--crate", action="append", default=[])
     a = ap.parse_args()
 
-    ref = a.ref
-    rc, out = run(["git", "rev-parse", "--verify", ref], cwd=a.repo)
+    # Resolve once, in the caller's repository, and use the commit SHA from
+    # here on. A relative revision such as `HEAD~1` would otherwise name a
+    # different commit inside the temporary worktree.
+    rc, out = run(["git", "rev-parse", "--verify", f"{a.ref}^{{commit}}"], cwd=a.repo)
     if rc != 0:
-        print(f"cannot resolve {ref}: {out[:200]}")
+        print(f"cannot resolve {a.ref}: {out[:200]}")
         return 2
+    ref = out.strip()
     tree, tmp = checkout_ref(a.repo, ref)
     if tmp is None:
         print(f"could not check out {ref}")
