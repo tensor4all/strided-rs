@@ -30,15 +30,10 @@ is code, and text it misclassifies is dropped rather than invented, so they are 
 **lower bound** for the source text in scope: the true count is at least what is
 printed. The `Result` rows are a lower bound in the same way, except that a `<` or
 `>` used as a comparison operator inside a signature can move an item either way
-(see the last limit below). This direction was falsified once — a `///` line
-inside a block comment made all three rows over-count — so treat an over-count as
-a bug here, not as a licence to read a row as exact. A count of zero therefore
-means "the scan found none", not "none exists".
+(see the last limit below); an over-count anywhere else is a bug here, not a
+licence to read a row as exact. A count of zero therefore means "the scan found
+none", not "none exists".
 
-- `///` at the start of a line inside a block comment or a line-spanning
-  `r#"…"#` starts a *doc* line for this scanner, so a following `# Errors` can be
-  credited to an item that does not have one, and the text is dropped from the
-  code rows.
 - A string literal inside an attribute or a macro invocation is blanked as a
   string, so an item whose `pub` is produced by a macro is not seen at all.
 - Braces inside a macro body that the scanner reads as code (not as a string)
@@ -48,6 +43,8 @@ means "the scan found none", not "none exists".
   to `unsafe {` are not distinguished.
 - `read_signature` treats `<` and `>` as brackets, so a signature with a
   comparison operator reads to the wrong place.
+- A `mod NAME;` whose declaration is itself produced by a macro is not followed,
+  and a `#[path = "..."]` given through a macro is not seen.
 
 Where a row matters, measure the thing itself instead of this script: run
 `cargo test --doc` for the doctest row, and read a file for a per-block
@@ -64,9 +61,10 @@ PRODUCTION_GLOB = "strided-*/src/**/*.rs"
 ALL_SOURCE_GLOB = "strided-*/**/*.rs"
 
 FUNCTION_RE = re.compile(r'\s*pub (?:[\w"\']+ )*fn ')
-INLINE_TEST_MOD_RE = re.compile(r"(?:pub\s+)?mod\s+\w+\s*\{")
+INLINE_TEST_MOD_RE = re.compile(r"(?:pub\s+)?mod\s+(\w+)\s*\{")
+PATH_ATTR_RE = re.compile(r'#\[path\s*=\s*"([^"]+)"\s*\]')
 INLINE_TEST_DECL_RE = re.compile(r"(?:pub\s+)?mod\s+(\w+)\s*;")
-RAW_STRING_PREFIX_RE = re.compile(r"\b(?:br|r)(#*)\"")
+RAW_STRING_PREFIX_RE = re.compile(r"\b(?:br|cr|r)(#*)\"")
 # A char literal, including the escaped forms `'\"'`, `'\\'` and `'\u{1F600}'`.
 # A lifetime (`'a`) has no closing quote and does not match.
 CHAR_LITERAL_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'])'")
@@ -252,11 +250,7 @@ def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             kept.append(rows[i])
             i += 1
             continue
-        j = i + 1
-        while j < len(rows) and (
-            not str(rows[j]["code"]).strip() or str(rows[j]["code"]).strip().startswith("#[")
-        ):
-            j += 1
+        j = skip_attributes(rows, i + 1)
         if j == len(rows):
             kept.append(rows[i])
             i += 1
@@ -294,7 +288,8 @@ def read_signature(rows: list[dict[str, object]], start: int) -> str:
     depth = 0
     parts: list[str] = []
     for row in rows[start:]:
-        code = str(row["code"])
+        # Character literals such as `b'>'` are data, not brackets.
+        code = str(row["code_no_strings"])
         index = 0
         while index < len(code):
             if code.startswith("->", index):
@@ -334,8 +329,11 @@ def returns_result(flat: str) -> bool:
                 return rest.startswith("Result<")
             index += 2
             continue
-        if depth == 0 and flat.startswith("where", index) and not (
-            index + 5 < len(flat) and (flat[index + 5].isalnum() or flat[index + 5] == "_")
+        if (
+            depth == 0
+            and flat.startswith("where", index)
+            and not (index > 0 and (flat[index - 1].isalnum() or flat[index - 1] == "_"))
+            and not (index + 5 < len(flat) and (flat[index + 5].isalnum() or flat[index + 5] == "_"))
         ):
             # Past a top-level `where`, an arrow belongs to a bound
             # (`F: Fn() -> ..`), not to the item.
@@ -361,6 +359,50 @@ def relative_parts(path: Path, root: Path) -> tuple[str, ...]:
         return path.parts
 
 
+def skip_attributes(rows: list[dict[str, object]], i: int) -> int:
+    """Index of the first row after the attribute list starting at `i`.
+
+    An attribute can span lines (`#[allow(` / `dead_code` / `)]`), so its brackets
+    are balanced instead of only lines starting with `#[` being skipped.
+    """
+    while i < len(rows):
+        stripped = str(rows[i]["code"]).strip()
+        if not stripped:
+            i += 1
+            continue
+        if not stripped.startswith("#["):
+            return i
+        balance = stripped.count("[") + stripped.count("(") - stripped.count("]") - stripped.count(")")
+        i += 1
+        while balance > 0 and i < len(rows):
+            continuation = str(rows[i]["code"]).strip()
+            balance += (
+                continuation.count("[")
+                + continuation.count("(")
+                - continuation.count("]")
+                - continuation.count(")")
+            )
+            i += 1
+    return i
+
+
+def inline_test_module_names(rows: list[dict[str, object]]) -> set[str]:
+    """Module names a `#[cfg(test)] mod NAME { .. }` declares inline."""
+    names: set[str] = set()
+    i = 0
+    while i < len(rows):
+        if str(rows[i]["code"]).strip() != "#[cfg(test)]":
+            i += 1
+            continue
+        j = skip_attributes(rows, i + 1)
+        if j < len(rows):
+            match = INLINE_TEST_MOD_RE.match(str(rows[j]["code"]).strip())
+            if match:
+                names.add(match.group(1))
+        i += 1
+    return names
+
+
 def test_only_module_names(rows: list[dict[str, object]]) -> set[str]:
     """Module names a `#[cfg(test)] mod NAME;` declaration moves to another file.
 
@@ -373,16 +415,17 @@ def test_only_module_names(rows: list[dict[str, object]]) -> set[str]:
         if str(rows[i]["code"]).strip() != "#[cfg(test)]":
             i += 1
             continue
-        j = i + 1
-        while j < len(rows) and (
-            not str(rows[j]["code"]).strip()
-            or str(rows[j]["code"]).strip().startswith("#[")
-        ):
-            j += 1
+        j = skip_attributes(rows, i + 1)
         if j < len(rows):
             match = INLINE_TEST_DECL_RE.match(str(rows[j]["code"]).strip())
             if match:
-                names.add(match.group(1))
+                explicit = None
+                for k in range(i + 1, j):
+                    path_match = PATH_ATTR_RE.search(str(rows[k]["code"]))
+                    if path_match:
+                        explicit = path_match.group(1)
+                # `@relative/path` marks a `#[path = "..."]` target.
+                names.add(f"@{explicit}" if explicit else match.group(1))
         i += 1
     return names
 
@@ -413,17 +456,20 @@ def production_files(root: Path) -> list[Path]:
         for p in sorted(root.glob(PRODUCTION_GLOB))
         if "tests" not in relative_parts(p, root) and p.name != "tests.rs"
     ]
-    excluded = {
-        declared_module_dir(p) / name
-        for p in candidates
-        for name in test_only_module_names(scan_file(p.read_text(encoding="utf-8")))
-    }
+    excluded: set[Path] = set()
+    for p in candidates:
+        rows = scan_file(p.read_text(encoding="utf-8"))
+        module_dir = declared_module_dir(p)
+        for name in test_only_module_names(rows):
+            excluded.add(module_dir / name[1:] if name.startswith("@") else module_dir / name)
+        for name in inline_test_module_names(rows):
+            excluded.add(module_dir / name)
     if not excluded:
         return candidates
 
     def is_excluded(path: Path) -> bool:
         for target in excluded:
-            if path == target.with_name(f"{target.name}.rs") or target in path.parents:
+            if path == target or path == target.with_name(f"{target.name}.rs") or target in path.parents:
                 return True
         return False
 
@@ -481,11 +527,7 @@ def count(root: Path) -> dict[str, int]:
             if str(row["code"]).strip() != "#[cfg(test)]":
                 continue
             j = i + 1
-            while j < len(rows) and (
-                not str(rows[j]["code"]).strip()
-                or str(rows[j]["code"]).strip().startswith("#[")
-            ):
-                j += 1
+            j = skip_attributes(rows, i + 1)
             if j < len(rows) and INLINE_TEST_MOD_RE.match(str(rows[j]["code"]).strip()):
                 inline_mods += 1
     files_over_1000 = sum(

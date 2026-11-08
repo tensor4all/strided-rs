@@ -61,8 +61,9 @@ section — but an item whose `pub` a macro produces is dropped with the string
 literal around it, `scripts/count-audit-metrics.py:31-32`, so this is "no item
 the scan can read", not an exhaustive claim), the doctests are the same
 sweep, and the inline-test drop is the move
-of the inline unit test modules into `*/tests/` directories (#362) — every
-`src/` file now carries a `mod tests;` declaration, and the one remaining inline
+of the inline unit test modules into `*/tests/` directories (#362) — the files
+that have unit tests carry a `mod tests;` declaration (30 of the 60 production
+files have none, having no unit tests of their own), and the one remaining inline
 block with a body is `strided-basic/benches/support/mod.rs:208`. The gap the
 remediation issues should take next is `SAFETY` coverage, and 21 files are over
 1000 lines. Read the old numbers as history and these as the baseline.
@@ -80,14 +81,18 @@ per block, so the per-block audit is the next measurement, not this one.
 wrong:
 
 ```bash
-python3 scripts/test-count-audit-metrics.py     # 21 tests
+python3 scripts/test-count-audit-metrics.py     # 32 tests
 ```
 
 Production scope is `strided-*/src/**/*.rs` with a `tests/` path component, a
-`tests.rs` file, and every file a `#[cfg(test)] mod NAME;` declaration makes
-test-only (`NAME.rs` or `NAME/mod.rs`, applied to a fixed point so a dropped
-file's own test-only modules follow) excluded, and inline `#[cfg(test)] mod NAME
-{ .. }` bodies skipped for the first five rows; the doc-comment, inline-module and
+`tests.rs` file, and the module subtree of every test-only declaration excluded —
+`#[cfg(test)] mod NAME;` excludes `NAME.rs`, `NAME/mod.rs` and everything below
+`NAME/`, an inline `#[cfg(test)] mod NAME { .. }` excludes `NAME/` as well, and a
+`#[path = "..."]` attribute names its file directly. Declarations resolve in the
+declaring module's directory (`foo/` for `foo.rs`, the containing directory for
+`lib.rs`/`mod.rs`), one pass over the candidates is enough because a declaration
+inside an excluded file always names a path inside that same subtree, and inline
+`#[cfg(test)] mod NAME { .. }` bodies are skipped for the first five rows; the doc-comment, inline-module and
 file rows scan all of `strided-*/**/*.rs` with a `target/` component excluded.
 Both exclusions compare repo-relative path components. The scanner blanks block
 comments (nested), line comments, char literals (including escaped ones such as
@@ -116,9 +121,6 @@ The counter is not a Rust parser. It blanks block comments (nested), line
 comments, char literals and string literals, and is line-oriented everywhere
 else. These cases are known to be miscounted, and they are **not** fixed here:
 
-- A `///` line inside a block comment or a line-spanning `r#"…"#` starts a *doc*
-  line, so a following `# Errors` can be credited to an item that does not have
-  one.
 - An item whose `pub` is produced by a macro invocation is not seen at all: the
   string literal around it is blanked with the macro's tokens.
 - Braces inside a macro body that the scanner reads as code still move the
@@ -197,9 +199,10 @@ regression test.
    and `mod order;` kept `strided-perm/src/{block,kernel,order}.rs` in the totals.
    The fixture `#[cfg(test)] mod helpers;` plus `helpers.rs` reported
    `unsafe 1, pub_result 1` where production holds neither. The declaration is now
-   followed (`NAME.rs` and `NAME/mod.rs`, to a fixed point): three files left the
-   scope and the `Result` denominator went 186 → 185. No `unsafe` or `SAFETY`
-   occurrence moved, so those rows stay 534/302.
+   followed (`NAME.rs` and `NAME/mod.rs`; item 15 replaces the fixed-point pass
+   with subtree exclusion): three files left the scope and the `Result`
+   denominator went 186 → 185. No `unsafe` or `SAFETY` occurrence moved, so those
+   rows stay 534/302.
 8. **Two callback arrows moved the item's return type.** `read_signature` and
    `returns_result` counted the `>` of `->` as a closing bracket, so the first
    callback's arrow closed the parameter list and the second one stood where the

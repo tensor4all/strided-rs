@@ -184,7 +184,7 @@ def test_doc_block_survives_attributes() -> None:
     """`# Errors` above `#[inline]` / `#[must_use]` still documents the item."""
     counts = count_sources(
         {
-            "documented.rs": (
+            "fixture.rs": (
                 "/// # Errors\n"
                 "///\n"
                 "/// Never returns an error.\n"
@@ -193,8 +193,8 @@ def test_doc_block_survives_attributes() -> None:
                 "pub fn documented() -> Result<(), ()> {\n"
                 "    Ok(())\n"
                 "}\n"
+                "pub fn undocumented() -> Result<(), ()> {\n    Ok(())\n}\n"
             ),
-            "undocumented.rs": "pub fn undocumented() -> Result<(), ()> {\n    Ok(())\n}\n",
         }
     )
     assert counts["pub_result"] == 2, counts
@@ -247,9 +247,11 @@ def test_a_tests_rs_sibling_of_a_mod_declaration_is_test_only() -> None:
     counts = count_sources(
         {
             "lib.rs": "#[cfg(test)]\nmod tests;\n\npub fn live() {\n    unsafe {}\n}\n",
-            "tests.rs": "#[test]\nfn test_only() {\n    unsafe {}\n}\n",
+            "tests.rs": "#[test]\nfn test_only() {\n    unsafe {}\n    unsafe {}\n}\n",
         }
     )
+    # One unsafe block in `lib.rs`, two in the test file: keeping `tests.rs`
+    # instead of dropping it reports 3, not 1.
     assert counts["unsafe"] == 1, counts
 
 
@@ -380,11 +382,19 @@ def test_a_module_declaration_resolves_in_its_own_file() -> None:
         {
             "lib.rs": "mod foo;\nmod helpers;\n",
             "foo.rs": "#[cfg(test)]\nmod helpers;\n",
-            "foo/helpers.rs": "\n",
-            "helpers.rs": "pub fn live() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+            "foo/helpers.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+            "helpers.rs": (
+                "pub fn live() -> Result<(), ()> {\n"
+                "    unsafe {}\n"
+                "    unsafe {}\n"
+                "    Ok(())\n"
+                "}\n"
+            ),
         }
     )
-    assert counts["unsafe"] == 1, counts
+    # Two unsafe blocks in the production file, one in the excluded child: an
+    # implementation that drops the wrong file reports 1, not 2.
+    assert counts["unsafe"] == 2, counts
     assert counts["pub_result"] == 1, counts
 
 
@@ -452,6 +462,97 @@ def test_a_raw_string_continuation_is_not_code() -> None:
         {"fixture.rs": 'const S: &str = r#"\npub fn ghost() { unsafe {} }"#;\n'}
     )
     assert counts["unsafe"] == 0, counts
+
+
+def test_a_path_attribute_moves_the_test_only_file() -> None:
+    """`#[path = "..."] mod NAME;` names the file directly, not `NAME.rs`."""
+    counts = count_sources(
+        {
+            "lib.rs": '#[cfg(test)]\n#[path = "test-support.rs"]\nmod helpers;\n',
+            "test-support.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+    counts = count_sources(
+        {
+            "lib.rs": 'mod live;\n',
+            "live.rs": '#[path = "helpers.rs"]\nmod inner;\n',
+            "helpers.rs": "pub fn live() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 1, counts
+    assert counts["pub_result"] == 1, counts
+
+
+def test_an_inline_test_module_owns_its_directory() -> None:
+    """`#[cfg(test)] mod checks { mod helpers; }` owns `checks/helpers.rs`."""
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\nmod checks {\n    mod helpers;\n}\n",
+            "checks/helpers.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_multiline_attribute_does_not_hide_a_test_only_declaration() -> None:
+    """An attribute spanning lines still sits between `#[cfg(test)]` and the `mod`."""
+    counts = count_sources(
+        {
+            "lib.rs": "#[cfg(test)]\n#[allow(\n    dead_code\n)]\nmod helpers;\n",
+            "helpers.rs": "pub fn helper() -> Result<(), ()> {\n    unsafe {}\n    Ok(())\n}\n",
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_function_name_ending_in_where_is_not_a_where_clause() -> None:
+    """`somewhere` contains `where`; only a standalone keyword ends the return search."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "/// # Errors\n"
+                "/// Never fails.\n"
+                "pub fn somewhere() -> Result<(), ()> {\n    Ok(())\n}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+    assert counts["with_errors"] == 1, counts
+
+
+def test_a_char_literal_in_a_signature_does_not_move_bracket_depth() -> None:
+    """`b'>'` in an array length is data, so the callback's arrow stays nested."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                "pub fn accepts(\n"
+                "    _: [u8; b'>' as usize],\n"
+                "    _: fn() -> Result<(), ()>,\n"
+                ") {}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 0, counts
+
+
+def test_a_c_raw_string_is_not_code() -> None:
+    """`cr##"..."##` is a C string literal, blanked like any other raw string."""
+    counts = count_sources(
+        {
+            "fixture.rs": (
+                'const S: &core::ffi::CStr = cr##"\n'
+                '" unsafe {} // SAFETY: x // INVARIANT: y\n'
+                '"##;\n'
+            )
+        }
+    )
+    assert counts["unsafe"] == 0, counts
+    assert counts["safety"] == 0, counts
+    assert counts["invariant"] == 0, counts
 
 
 def main() -> int:
