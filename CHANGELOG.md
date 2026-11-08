@@ -13,8 +13,9 @@ downstream that runs `cargo update` without a version constraint change.
 Bumped to 0.13.0: `strided-basic`, `strided-perm`, `strided-kernel`,
 `strided-fused`, `strided-nn`. `strided-traits` keeps 0.7.0 (nothing in it changed).
 `strided-view` goes to **0.7.2**: the published 0.7.1 still multiplies strides with
-wrapping `isize` arithmetic, while this tree panics where the product would overflow
-(a zero-extent shape still saturates at `isize::MAX` instead of panicking).
+wrapping `isize` arithmetic, while this tree uses checked arithmetic and panics where
+a stride product or the element count would overflow (a zero-extent shape still
+saturates at `isize::MAX` instead of panicking).
 
 ### Breaking changes
 
@@ -56,7 +57,17 @@ cargo build   # then fix the remaining call sites the compiler names
 ```
 
 Code that only calls `strided-traits` / `strided-view` needs no source change;
-`strided-view` 0.7.2 only replaces a silently wrapping stride with a panic.
+`strided-view` 0.7.2 replaces silently wrapping stride arithmetic with checked arithmetic.
+A stride product that does not fit `isize`, or an element count that does not fit
+(a shape whose strides exceed the allocation), now panics instead of returning a
+wrapped value; `StridedView::new` with such a shape panics too, where it used to
+build a view whose `len()` was 0. A zero-extent shape still saturates instead of
+panicking.
+
+
+
+
+
 
 ### Additive
 
