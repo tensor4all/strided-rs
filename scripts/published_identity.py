@@ -27,9 +27,16 @@ Caveats, stated rather than hidden:
     checked-out commit, so every packaging rule is Cargo's own. Packaging
     resolves dependencies on crates.io; a published crate whose tree needs an
     unpublished dependency version cannot be packaged and exits 2.
-  * Cargo.toml, Cargo.toml.orig, Cargo.lock and .cargo_vcs_info.json are
-    excluded: Cargo generates or rewrites them at package time. The version
-    string selects which .crate is compared, so it is not compared itself.
+  * Cargo.toml, Cargo.lock and .cargo_vcs_info.json are excluded: Cargo
+    generates or rewrites them at package time. Cargo.toml.orig, the crate's
+    manifest exactly as written, IS compared, so a same-version change to
+    features, dependencies or build settings in the crate's own manifest is a
+    MISMATCH.
+  * Manifest comparison covers Cargo.toml.orig only; workspace-level
+    inheritance is out of scope. A field written as `{ workspace = true }` (or
+    `x.workspace = true`) reads the same in Cargo.toml.orig whatever the
+    workspace root says, so a change made only in the root Cargo.toml's
+    `[workspace.package]` / `[workspace.dependencies]` is not seen here.
   * The comparison is byte-for-byte: a comment-only change under the same
     version is a MISMATCH. That is intended — the published source is what
     a user reads and builds.
@@ -40,6 +47,7 @@ Caveats, stated rather than hidden:
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -57,7 +65,8 @@ UA = "tensor4all-published-identity/1.0 (maintainer check)"
 # Both sides are .crate archives built by Cargo (the published one, and one
 # built from the tree with `cargo package`), so the file set is Cargo's. Only
 # the files Cargo generates or rewrites at package time are left out.
-SKIP_ALWAYS = {".cargo_vcs_info.json", "Cargo.lock", "Cargo.toml", "Cargo.toml.orig"}
+# Cargo.toml.orig is NOT in this set: it is the author's manifest verbatim.
+SKIP_ALWAYS = {".cargo_vcs_info.json", "Cargo.lock", "Cargo.toml"}
 
 
 class CheckError(Exception):
@@ -134,8 +143,13 @@ def published(name: str, ver: str) -> bytes | None:
 
 def crate_files(blob: bytes) -> dict[str, str]:
     """path-inside-crate -> sha256 for the files worth comparing."""
+    # Decompress the whole stream first: tarfile over a gzip stream stops at
+    # the tar end marker and never checks the gzip trailer, so a truncated or
+    # CRC-damaged download would otherwise read as valid. gzip.decompress
+    # raises (BadGzipFile / EOFError), which main() turns into exit 2.
+    raw = gzip.decompress(blob)
     out: dict[str, str] = {}
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
         for m in tf.getmembers():
             if not m.isfile():
                 continue

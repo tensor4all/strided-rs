@@ -243,6 +243,47 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ok          demo 0.1.0", out)
 
+    def test_crc_damaged_archive_is_not_green(self) -> None:
+        # GPT review on #411 (round 5): flip one bit of the gzip CRC32 trailer.
+        blob = self.fx.package()
+        damaged = blob[:-8] + bytes([blob[-8] ^ 1]) + blob[-7:]
+        rc, out = self.fx.run("HEAD", lambda n, v: damaged)
+        self.assertEqual(rc, 2, out)
+
+    def test_truncated_archive_is_not_green(self) -> None:
+        # GPT review on #411 (round 5): drop the 8-byte gzip trailer.
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob[:-8])
+        self.assertEqual(rc, 2, out)
+
+    def test_default_feature_flip_under_same_version_is_red(self) -> None:
+        # GPT review on #411 (round 5): a manifest-only change that flips
+        # `value()` from 0 to 1 must be a MISMATCH (seen via Cargo.toml.orig).
+        self.fx.write("src/lib.rs",
+                      'pub fn value() -> u32 { cfg!(feature = "alternate") as u32 }\n')
+        manifest = CRATE_MANIFEST + '\n[features]\nalternate = []\ndefault = []\n'
+        self.fx.write("Cargo.toml", manifest)
+        self.fx.commit("published feature configuration")
+        blob = self.fx.package()
+        self.fx.write("Cargo.toml", manifest.replace('default = []', 'default = ["alternate"]'))
+        self.fx.commit("change behavior without bump")
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("differs: Cargo.toml.orig", out)
+
+    def test_workspace_inherited_change_is_out_of_scope(self) -> None:
+        # Documented limitation: a change made only in the workspace root's
+        # [workspace.package] is invisible in Cargo.toml.orig. This pins the
+        # limitation so that a future fix updates the docstring and this test.
+        (self.fx.root / "Cargo.toml").write_text(MANIFEST + '\n[workspace.package]\nedition = "2021"\n')
+        self.fx.write("Cargo.toml", CRATE_MANIFEST.replace('edition = "2021"', 'edition.workspace = true'))
+        self.fx.commit("inherit edition")
+        blob = self.fx.package()
+        (self.fx.root / "Cargo.toml").write_text(MANIFEST + '\n[workspace.package]\nedition = "2018"\n')
+        self.fx.commit("root-only change, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+
     def test_missing_cargo_is_not_a_mismatch(self) -> None:
         real = subprocess.run
 
