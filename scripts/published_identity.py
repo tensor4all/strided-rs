@@ -112,10 +112,13 @@ def workspace_crates(repo: str) -> list[dict]:
     return crates
 
 
-def fetch(url: str) -> tuple[int, bytes]:
+def fetch(url: str, opener=None) -> tuple[int, bytes]:
+    """(status, body). `opener` defaults to urllib.request.urlopen, looked up
+    at call time; tests inject one that raises HTTPError like urllib does."""
     req = urllib.request.Request(url, headers={"User-Agent": UA})
+    open_url = opener or urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=60) as f:
+        with open_url(req, timeout=60) as f:
             return f.status, f.read()
     except urllib.error.HTTPError as e:
         return e.code, b""
@@ -123,19 +126,19 @@ def fetch(url: str) -> tuple[int, bytes]:
         raise CheckError(f"GET {url}: {e}") from e
 
 
-def published(name: str, ver: str) -> bytes | None:
+def published(name: str, ver: str, opener=None) -> bytes | None:
     """The published .crate, or None when crates.io has no such version.
 
     Only a 404 from the API counts as "not published". Any other failure is a
     failure to check: treating a network error as `unpublished` would turn an
     outage into a green run.
     """
-    code, _ = fetch(f"https://crates.io/api/v1/crates/{name}/{ver}")
+    code, _ = fetch(f"https://crates.io/api/v1/crates/{name}/{ver}", opener)
     if code == 404:
         return None
     if code != 200:
         raise CheckError(f"crates.io API returned {code} for {name} {ver}")
-    code, blob = fetch(f"https://static.crates.io/crates/{name}/{name}-{ver}.crate")
+    code, blob = fetch(f"https://static.crates.io/crates/{name}/{name}-{ver}.crate", opener)
     if code != 200 or not blob:
         raise CheckError(f"download of {name}-{ver}.crate returned {code}")
     return blob

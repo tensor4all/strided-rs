@@ -13,6 +13,7 @@ import importlib.util
 import io
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -332,10 +333,12 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertNotIn("unpublished", out)
 
-    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None):
-        """A urlopen replacement: the API URL answers `api_status`, the static
-        download answers 200 with `crate_blob`. Non-2xx statuses are raised as
-        HTTPError, exactly as urllib does, so fetch()'s HTTPError branch runs."""
+    @staticmethod
+    def _opener(api_status: int, crate_blob: bytes | None = None):
+        """A urlopen-compatible opener: the API URL answers `api_status`, the
+        static download answers 200 with `crate_blob`. Non-2xx statuses are
+        raised as HTTPError, exactly as urllib does, so fetch()'s HTTPError
+        branch runs."""
         import urllib.error
 
         class Resp(io.BytesIO):
@@ -353,7 +356,13 @@ class PublishedIdentityTest(unittest.TestCase):
                 return Resp(crate_blob)
             raise urllib.error.HTTPError(url, 404, "not found", {}, None)
 
-        return mock.patch.object(pi.urllib.request, "urlopen", urlopen)
+        return urlopen
+
+    def _fake_crates_io(self, api_status: int, crate_blob: bytes | None = None):
+        """For main()-level runs: the default opener (urllib.request.urlopen,
+        looked up at call time) is replaced by `_opener(...)`."""
+        return mock.patch.object(pi.urllib.request, "urlopen",
+                                 self._opener(api_status, crate_blob))
 
     def test_api_503_through_urlopen_is_not_green(self) -> None:
         # GPT review on #411 (round 6): an HTTPError 503 from the API must be
@@ -363,12 +372,15 @@ class PublishedIdentityTest(unittest.TestCase):
             rc, out = self.fx.run("HEAD", real_network=True)
         self.assertEqual(rc, 2, out)
         self.assertNotIn("unpublished", out)
+        self.assertNotIn("MISMATCH", out)
 
     def test_api_404_through_urlopen_is_unpublished(self) -> None:
         with self._fake_crates_io(404):
             rc, out = self.fx.run("HEAD", real_network=True)
         self.assertEqual(rc, 0, out)
         self.assertIn("unpublished demo 0.1.0", out)
+        self.assertNotIn("MISMATCH", out)
+        self.assertNotIn("ok          demo", out)
 
     def test_published_archive_with_different_source_through_urlopen_is_red(self) -> None:
         # GPT review on #411 (round 6): API 200, then a valid archive whose
@@ -381,7 +393,22 @@ class PublishedIdentityTest(unittest.TestCase):
         with self._fake_crates_io(200, blob):
             rc, out = self.fx.run("HEAD", real_network=True)
         self.assertEqual(rc, 1, out)
+        self.assertIn("MISMATCH    demo 0.1.0", out)
         self.assertIn("differs: src/lib.rs", out)
+        self.assertNotIn("unpublished", out)
+
+    def test_injected_opener_503_from_published_is_a_check_error(self) -> None:
+        # The opener is injected into published() directly; HTTPError(503) is
+        # raised by the opener itself, not by a mocked fetch().
+        with self.assertRaises(pi.CheckError):
+            pi.published("demo", "0.1.0", opener=self._opener(503))
+
+    def test_injected_opener_404_from_published_is_unpublished(self) -> None:
+        self.assertIsNone(pi.published("demo", "0.1.0", opener=self._opener(404)))
+
+    def test_injected_opener_200_from_published_returns_the_archive(self) -> None:
+        blob = self.fx.package()
+        self.assertEqual(pi.published("demo", "0.1.0", opener=self._opener(200, blob)), blob)
 
     def test_whitespace_in_a_shipped_name_is_kept(self) -> None:
         # GPT review on #411 (round 3): "notes" and "notes " are two files.
@@ -407,9 +434,9 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertIn("ok          demo 0.1.0", out)
 
     def test_only_404_means_unpublished(self) -> None:
-        with mock.patch.object(pi, "fetch", lambda url: (404, b"")):
+        with mock.patch.object(pi, "fetch", lambda url, opener=None: (404, b"")):
             self.assertIsNone(pi.published("demo", "0.1.0"))
-        with mock.patch.object(pi, "fetch", lambda url: (403, b"")):
+        with mock.patch.object(pi, "fetch", lambda url, opener=None: (403, b"")):
             with self.assertRaises(pi.CheckError):
                 pi.published("demo", "0.1.0")
 
@@ -419,6 +446,44 @@ class PublishedIdentityTest(unittest.TestCase):
         with mock.patch("sys.argv", argv), contextlib.redirect_stdout(out):
             self.assertEqual(pi.main(), 2, out.getvalue())
 
+
+
+class MutationTest(unittest.TestCase):
+    """The transport tests must catch the two mutations named in the round-6
+    review on #411. Each mutation is applied to a copy of the script, and the
+    targeted tests are run against that copy in a subprocess; they must fail."""
+
+    MUTATIONS = {
+        # Comparison disabled after a successful status check.
+        "none_after_api_200": (
+            '    code, blob = fetch(f"https://static.crates.io',
+            '    return None\n    code, blob = fetch(f"https://static.crates.io',
+            ["PublishedIdentityTest.test_published_archive_with_different_source_through_urlopen_is_red",
+             "PublishedIdentityTest.test_injected_opener_200_from_published_returns_the_archive"],
+        ),
+        # `return 404` in place of the HTTP error code.
+        "http_error_as_404": (
+            '        return e.code, b""',
+            '        return 404, b""',
+            ["PublishedIdentityTest.test_api_503_through_urlopen_is_not_green",
+             "PublishedIdentityTest.test_injected_opener_503_from_published_is_a_check_error"],
+        ),
+    }
+
+    def test_each_mutation_turns_its_tests_red(self) -> None:
+        src = (HERE / "published_identity.py").read_text()
+        for name, (old, new, tests) in self.MUTATIONS.items():
+            with self.subTest(mutation=name):
+                self.assertEqual(src.count(old), 1, f"{name}: mutation site moved")
+                with tempfile.TemporaryDirectory() as d:
+                    (pathlib.Path(d) / "published_identity.py").write_text(src.replace(old, new))
+                    (pathlib.Path(d) / "test-published-identity.py").write_text(
+                        pathlib.Path(__file__).read_text())
+                    for test in tests:
+                        r = subprocess.run([sys.executable, f"{d}/test-published-identity.py", test],
+                                           capture_output=True, text=True)
+                        self.assertNotEqual(r.returncode, 0,
+                                            f"{name}: {test} stayed green\n{r.stderr[-500:]}")
 
 if __name__ == "__main__":
     unittest.main()
