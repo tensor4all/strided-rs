@@ -96,7 +96,19 @@ def workspace_crates(repo: str, ref: str) -> list[dict]:
             continue
         man = pathlib.Path(os.path.realpath(p["manifest_path"])).parent
         rel = man.relative_to(pathlib.Path(os.path.realpath(repo)))
-        crates.append({"name": p["name"], "version": p["version"], "dir": str(rel)})
+        # Files that live outside the crate directory but ship inside the
+        # .crate at the root under their own name (`readme = "../README.md"`,
+        # `license-file = "../LICENSE"`). Map the packaged name to the source.
+        relocated: dict[str, str] = {}
+        for key in ("readme", "license_file"):
+            v = p.get(key)
+            if not v:
+                continue
+            src = pathlib.Path(os.path.realpath(man / v))
+            if man not in src.parents:
+                relocated[src.name] = str(src)
+        crates.append({"name": p["name"], "version": p["version"], "dir": str(rel),
+                       "relocated": relocated})
     return crates
 
 
@@ -156,22 +168,23 @@ def shipped_paths(repo: str, crate: dict) -> set[str]:
             if line.strip() and line.strip() not in SKIP_ALWAYS}
 
 
-def git_files(repo: str, ref: str, crate_dir: str, wanted: set[str]) -> dict[str, str]:
-    """path-inside-crate -> sha256 for the files the crate actually ships.
+def tree_files(repo: str, crate: dict, wanted: set[str]) -> dict[str, str]:
+    """path-inside-crate -> sha256 of what `cargo package` would archive.
 
-    Blobs are read as bytes: decoding them as text would fail on, or rewrite,
-    any file that is not UTF-8.
+    `repo` is a clean checkout of the resolved commit, so the files are read
+    from disk the way Cargo reads them: symlinks are followed (Cargo archives
+    the target's bytes, not the link text) and a readme / license file outside
+    the crate directory is read from where the manifest points. A shipped path
+    that cannot be read fails the check rather than dropping out of it.
     """
+    base = pathlib.Path(repo) / crate["dir"]
     files: dict[str, str] = {}
     for rel in wanted:
-        r = subprocess.run(["git", "show", f"{ref}:{crate_dir}/{rel}"],
-                           capture_output=True, cwd=repo, timeout=60)
-        if r.returncode != 0:
-            # `cargo package --list` says this path ships. Dropping it here
-            # would hide a real difference, so a failed read fails the check.
-            raise CheckError(f"git show {ref}:{crate_dir}/{rel} failed: "
-                             f"{r.stderr.decode(errors='replace')[:200]}")
-        files[rel] = hashlib.sha256(r.stdout).hexdigest()
+        src = pathlib.Path(crate["relocated"].get(rel, base / rel))
+        try:
+            files[rel] = hashlib.sha256(src.read_bytes()).hexdigest()
+        except OSError as e:
+            raise CheckError(f"cannot read shipped file {crate['name']}/{rel}: {e}") from e
     return files
 
 
@@ -185,7 +198,7 @@ def check_crate(repo: str, ref: str, crate: dict) -> tuple[str, list[str]]:
     # the .crate but is gone from the tree (a deleted build.rs, say) changes
     # what users build, and must show up as "only in published .crate".
     pub = crate_files(blob)
-    tree = git_files(repo, ref, cdir, wanted)
+    tree = tree_files(repo, crate, wanted)
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
         if rel not in pub:
@@ -200,7 +213,7 @@ def check_crate(repo: str, ref: str, crate: dict) -> tuple[str, list[str]]:
     return "ok", []
 
 
-def main() -> int:
+def _main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("--ref", default="HEAD")
@@ -252,6 +265,17 @@ def main() -> int:
     print()
     print(f"{len(crates)} crate(s) checked at {ref}: {bad} mismatch(es)")
     return 1 if bad else 0
+
+
+def main() -> int:
+    """Exit 1 is reserved for a content MISMATCH. Anything that stops the check
+    from running (missing cargo/git, a timeout, a malformed archive, bad JSON)
+    is exit 2, so it can never be read as either green or a mismatch."""
+    try:
+        return _main()
+    except Exception as e:  # noqa: BLE001 - the contract is "could not check"
+        print(f"could not check: {type(e).__name__}: {e}")
+        return 2
 
 
 if __name__ == "__main__":

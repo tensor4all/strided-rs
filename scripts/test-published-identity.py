@@ -122,19 +122,72 @@ class PublishedIdentityTest(unittest.TestCase):
         rc_rel, out_rel = self.fx.run("HEAD~1", lambda n, v: blob)
         self.assertEqual((rc_sha, rc_rel), (0, 0), out_sha + out_rel)
 
-    def test_failed_git_read_is_not_green(self) -> None:
+    def test_failed_read_of_a_shipped_file_is_not_green(self) -> None:
+        # GPT review on #411 (round 1): a new shipped file whose read fails must
+        # not drop out of the comparison and leave the run green.
         blob = self.fx.package()
         self.fx.write("src/new.rs", "pub fn extra() {}\n")
         self.fx.commit("new shipped file, same version")
+        real = pathlib.Path.read_bytes
+
+        def flaky(path):
+            if str(path).endswith("src/new.rs"):
+                raise OSError("unable to read")
+            return real(path)
+
+        with mock.patch.object(pi.pathlib.Path, "read_bytes", flaky):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+
+    def test_unchanged_symlink_is_ok(self) -> None:
+        # GPT review on #411 (round 2): Cargo archives the symlink target.
+        (self.fx.root / "demo" / "src" / "alias.rs").symlink_to("lib.rs")
+        self.fx.commit("add symlink")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_unchanged_external_readme_is_ok(self) -> None:
+        # GPT review on #411 (round 2): `readme = "../README.md"` ships as README.md.
+        (self.fx.root / "README.md").write_text("# shared readme\n")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("shared readme")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        (self.fx.root / "README.md").write_text("# changed\n")
+        self.fx.commit("readme changed, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("differs: README.md", out)
+
+    def test_missing_cargo_is_not_a_mismatch(self) -> None:
         real = subprocess.run
 
-        def flaky(cmd, *args, **kwargs):
-            if cmd[:2] == ["git", "show"] and cmd[2].endswith("src/new.rs"):
-                return subprocess.CompletedProcess(cmd, 128, b"", b"fatal: unable to read\n")
+        def no_cargo(cmd, *args, **kwargs):
+            if cmd[0] == "cargo":
+                raise FileNotFoundError(2, "No such file or directory", "cargo")
             return real(cmd, *args, **kwargs)
 
-        with mock.patch.object(pi.subprocess, "run", flaky):
-            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        with mock.patch.object(pi.subprocess, "run", no_cargo):
+            rc, out = self.fx.run("HEAD")
+        self.assertEqual(rc, 2, out)
+
+    def test_cargo_metadata_timeout_is_not_a_mismatch(self) -> None:
+        real = subprocess.run
+
+        def slow(cmd, *args, **kwargs):
+            if cmd[:2] == ["cargo", "metadata"]:
+                raise subprocess.TimeoutExpired(cmd, 120)
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(pi.subprocess, "run", slow):
+            rc, out = self.fx.run("HEAD")
+        self.assertEqual(rc, 2, out)
+
+    def test_malformed_archive_is_not_a_mismatch(self) -> None:
+        rc, out = self.fx.run("HEAD", lambda n, v: b"not a gzip")
         self.assertEqual(rc, 2, out)
 
     def test_network_failure_is_not_green(self) -> None:
