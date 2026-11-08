@@ -60,7 +60,11 @@ def repack(blob: bytes, replace: dict[str, bytes | None]) -> bytes:
             info = tarfile.TarInfo(m.name)
             info.size, info.mtime = len(data), m.mtime
             dst.addfile(info, io.BytesIO(data))
-    return gzip.compress(buf.getvalue())
+    body = buf.getvalue()
+    # tarfile pads to a 10240-byte record; Cargo stops after the two
+    # end-of-archive zero blocks, and the checker pins that.
+    end = -(-len(body.rstrip(b"\0")) // 512) * 512
+    return gzip.compress(body[:end + 1024])
 
 
 class Fixture:
@@ -337,10 +341,65 @@ class PublishedIdentityTest(unittest.TestCase):
 
     VCS = "demo-0.1.0/.cargo_vcs_info.json"
 
+    def test_zeroed_tree_member_header_is_not_green(self) -> None:
+        # GPT review on #416 (critical, tree side): the same zeroed-header trick
+        # against the archive *we* build. The registered checksum guards the
+        # published side only, so the tree archive is judged by the length of its
+        # end-of-archive blocks and by the file list `cargo package --list`
+        # names, both independently of its headers.
+        published = self.fx.package()
+        self.fx.write("zz.txt", "\0" * 512)
+        self.fx.commit("add shipped file without bumping version")
+        real = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real(*args)))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                offset = tf.getmember("demo-0.1.0/zz.txt").offset
+            raw[offset:offset + 512] = b"\0" * 512
+            return gzip.compress(bytes(raw))
+
+        with self._fake_crates_io(200, published):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 1, out)  # control: the added file is seen
+        self.assertIn("only in", out)
+        with self._fake_crates_io(200, published), \
+                mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", real_network=True)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("archive is not complete", out)  # the pinned end blocks
+        self.assertNotIn("ok          demo", out)
+
     def _repacked(self, vcs: dict | None) -> bytes:
         """The published blob with its .cargo_vcs_info.json replaced (None: dropped)."""
         body = None if vcs is None else json.dumps(vcs).encode()
         return repack(self.fx.package(), {self.VCS: body})
+
+    def test_tree_archive_missing_a_member_is_not_green(self) -> None:
+        # #416, in the form the tar reader cannot see: a structurally complete
+        # tree archive (both end-of-archive blocks, nothing behind them) that
+        # simply lacks a member. Only the independent `cargo package --list`
+        # comparison catches it.
+        blob = self.fx.package()
+        real = pi.package_tree
+
+        def shorter(*args):
+            return repack(real(*args), {"demo-0.1.0/src/lib.rs": None})
+
+        with mock.patch.object(pi, "package_tree", shorter):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not the file list Cargo shipped", out)
+
+    def test_unchanged_file_with_a_carriage_return_in_its_name_is_ok(self) -> None:
+        # GPT review on #416 (post-review): text-mode stdout turns a CR in a
+        # name into an LF, which would report an unchanged file as changed.
+        self.fx.write("notes\rmore", "x\n")
+        self.fx.commit("file name with a carriage return")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
 
     def test_published_from_a_dirty_worktree_is_red(self) -> None:
         # #415: cargo records the worktree state it packaged. dirty=true means
@@ -660,7 +719,7 @@ class MutationTest(unittest.TestCase):
         # The completeness check reduced to "nothing follows the last member",
         # which a stream cut at a member boundary also satisfies (#415).
         "tail_only_completeness": (
-            "    if len(raw) - end < 1024 or any(raw[end:]):",
+            "    if len(raw) - end != 1024 or any(raw[end:]):",
             "    if any(raw[end:]):",
             ["PublishedIdentityTest.test_archive_cut_at_a_member_boundary_is_not_green"],
         ),
@@ -689,6 +748,22 @@ class MutationTest(unittest.TestCase):
             '    if out.strip() != "false":',
             "    if False:",
             ["PublishedIdentityTest.test_unrecognised_shallow_answer_is_not_green"],
+        ),
+        # The tree archive's member list not compared with `cargo package
+        # --list`: a complete archive that lost a member goes green (#416,
+        # tree side).
+        "tree_member_list_not_checked": (
+            "    if listed is not None and",
+            "    if False and",
+            ["PublishedIdentityTest.test_tree_archive_missing_a_member_is_not_green"],
+        ),
+        # The end-of-archive check back to "something is there": a zeroed last
+        # member header then leaves its own header and payload behind two
+        # blocks that are already zeros (#416, tree side).
+        "end_blocks_not_pinned": (
+            "    if len(raw) - end != 1024 or any(raw[end:]):",
+            "    if len(raw) - end < 1024 or any(raw[end:]):",
+            ["PublishedIdentityTest.test_zeroed_tree_member_header_is_not_green"],
         ),
     }
 

@@ -45,14 +45,31 @@ Caveats, stated rather than hidden:
     whatever a tar reader makes of it. A .crate whose final member header is
     zeroed reads as a complete, SHORTER archive (tarfile takes the zero header
     for the end-of-archive marker, and the zero payload and padding behind it
-    pass a tail-is-zero check), which is the #415 false green; only the
-    registered checksum sees that.
-  * Both archives must parse completely, down to the end-of-archive zero
-    blocks. tarfile silently ends the member list at a damaged header after the
-    first block, so a damaged .crate reads as a SHORTER one and a shipped file
-    that is gone from the tree compares as absent on both sides (#415). A
-    stream cut off exactly at a member boundary reads as shorter without any
-    error at all. Either way the run is exit 2.
+    pass a tail-is-zero check), which is the #415 false green; on the published
+    side only the registered checksum sees that (the tree side, below, is caught
+    by its pinned end blocks and its file list instead).
+  * Both archives must parse completely: the parse must be followed by exactly
+    the 1024 bytes of the two end-of-archive zero blocks (tar-rs writes those
+    and no record padding behind them; a writer that padded further would fail
+    loudly rather than silently). tarfile silently ends the member list at a
+    damaged header after the first block, so a damaged .crate reads as a SHORTER
+    one and a shipped file that is gone from the tree compares as absent on both
+    sides (#415). A stream cut off exactly at a member boundary leaves nothing
+    behind the last member. A zeroed last header leaves the two end blocks *and*
+    that header and its payload behind, so an all-zero payload does not hide it
+    (#416). Either way the run is exit 2.
+  * The tree side does not rest on the tar reader for its member list: `cargo
+    package --list` names the files Cargo ships, and the tree archive's member
+    list must be that same text, in the same order (Cargo writes the tar in that
+    order; a Cargo that listed in another order would fail the run loudly, not
+    silently). Names are compared as bytes, so a CR or a name that is not UTF-8
+    is not rewritten on the way. That catches a structurally valid archive that
+    simply lacks a member. The published side has no such list — its tree is not
+    checked out here — and rests on the registered checksum instead. Residual
+    limit: the list is newline-delimited, so a name containing a newline is
+    indistinguishable from that name split in two. Damage cannot split a header,
+    only end the list, and the archive is built here, so that needs a replaced
+    archive rather than a corrupted one.
   * Manifest comparison covers Cargo.toml.orig only; workspace-level
     inheritance is out of scope. A field written as `{ workspace = true }` (or
     `x.workspace = true`) reads the same in Cargo.toml.orig whatever the
@@ -183,9 +200,14 @@ def published(name: str, ver: str, opener=None) -> bytes | None:
     return blob
 
 
-def crate_archive(blob: bytes) -> tuple[dict[str, str], dict | None]:
+def crate_archive(blob: bytes, listed: bytes | None = None) -> tuple[dict[str, str], dict | None]:
     """(path-inside-crate -> sha256 for the files worth comparing, the archive's
-    .cargo_vcs_info.json or None)."""
+    .cargo_vcs_info.json or None).
+
+    `listed` is that same archive's file list from `cargo package --list`, in
+    bytes, which the tree side passes so that a structurally valid archive
+    cannot lose a member unnoticed (see the caveats at the top of this file).
+    """
     # Decompress the whole stream first: tarfile over a gzip stream stops at
     # the tar end marker and never checks the gzip trailer, so a truncated or
     # CRC-damaged download would otherwise read as valid. gzip.decompress
@@ -201,12 +223,14 @@ def crate_archive(blob: bytes) -> tuple[dict[str, str], dict | None]:
         # ...and tarfile ENDS the list silently at other damaged headers (an
         # invalid checksum after the first block), which would let a file that
         # shipped and is now gone compare as absent on both sides (#415). A
-        # complete read is proved only by the end-of-archive marker.
+        # complete read is proved only by what follows the last member, below.
         end = tf.offset
+        names: list[str] = []
         for m in entries:
             if not m.isfile():
                 continue
             rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
+            names.append(rel)
             f = tf.extractfile(m)
             if f is None:
                 continue
@@ -215,14 +239,23 @@ def crate_archive(blob: bytes) -> tuple[dict[str, str], dict | None]:
                 vcs = json.loads(body)
             elif rel not in SKIP_ALWAYS:
                 out[rel] = hashlib.sha256(body).hexdigest()
-    # Two zero blocks are what a complete tar ends with. A stream cut off
-    # exactly at a member boundary also parses without an error and leaves an
-    # empty tail, so "nothing follows" is not completeness either.
-    if len(raw) - end < 1024 or any(raw[end:]):
+    # Two zero blocks are what a complete tar ends with, and tar-rs writes
+    # nothing behind them. A stream cut off exactly at a member boundary leaves
+    # an empty tail, and a stream cut off at a damage point leaves the rest of
+    # the archive there, so "nothing follows" is not completeness either. A
+    # zeroed last header leaves the two end blocks plus that header and its
+    # payload behind, which is why the length is pinned and not just the bytes.
+    if len(raw) - end != 1024 or any(raw[end:]):
         raise CheckError(
             f"archive is not complete: {end} of {len(raw)} bytes parsed, and"
-            f" the {len(raw) - end} bytes after them are not the two"
+            f" the {len(raw) - end} bytes after them are not exactly the two"
             " end-of-archive zero blocks a complete tar ends with")
+    if listed is not None and "".join(n + "\n" for n in names).encode(
+            sys.getfilesystemencoding(), "surrogateescape") != listed:
+        raise CheckError(
+            "the tree archive is not the file list Cargo shipped (`cargo package"
+            f" --list`): it parses as {len(names)} member(s), and they are not"
+            " the files Cargo named")
     return out, vcs
 
 
@@ -299,6 +332,25 @@ def package_tree(repo: str, crate: dict, target_dir: str) -> bytes:
         raise CheckError(f"cargo package produced no {path.name}: {e}") from e
 
 
+def package_list(repo: str, crate: dict) -> bytes:
+    """The files `cargo package` ships, one name per line, from Cargo itself but
+    through a channel other than the archive's headers.
+
+    The bytes agree, so this is no independent packaging implementation: it is
+    the same list, read from stdout instead of from a tar a damaged header can
+    end early. stdout is taken as bytes, because text mode would rewrite a CR
+    in a name into an LF and make an unchanged file look changed.
+    """
+    name = crate["name"]
+    r = subprocess.run(["cargo", "package", "--list", "-p", name, "--no-verify", "-q",
+                        "--manifest-path", f"{repo}/Cargo.toml"],
+                       capture_output=True, cwd=repo, timeout=600)
+    if r.returncode != 0:
+        raise CheckError(f"cargo package --list failed for {name}:"
+                         f" {r.stderr.decode('utf-8', 'replace')[:300]}")
+    return r.stdout
+
+
 def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str, list[str]]:
     name, ver = crate["name"], crate["version"]
     blob = published(name, ver)
@@ -308,7 +360,7 @@ def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str,
     # SKIP_ALWAYS are left out. A file that shipped but is gone from the tree
     # (a deleted build.rs, say) shows as "only in published .crate".
     pub, vcs = crate_archive(blob)
-    tree, _ = crate_archive(package_tree(repo, crate, target_dir))
+    tree, _ = crate_archive(package_tree(repo, crate, target_dir), package_list(repo, crate))
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
         if rel not in pub:
