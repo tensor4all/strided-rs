@@ -43,7 +43,8 @@ fn fan_out_token(team: &Team, n: usize) -> (Exec<'_>, u64) {
 /// and, with the `parallel` feature, the replay was split into more than one
 /// chunk. The chunk count, not `max_live`, proves the split: a chunk may finish
 /// before the next one starts, so the live high-water mark can stay at one.
-fn assert_fanned_out(root: u64) {
+fn assert_fanned_out(root: Option<u64>) {
+    let Some(root) = root else { return };
     assert!(ledger::max_live(root) <= 4);
     let chunks = crate::threading::take_dispatched_chunks();
     #[cfg(feature = "parallel")]
@@ -266,10 +267,8 @@ fn check_rows<'e, T: Value>(
         exec,
         "copy",
     );
-    if let Some(root) = root {
-        assert_fanned_out(root);
-    }
-    let (exec, _) = exec_for();
+    assert_fanned_out(root);
+    let (exec, root) = exec_for();
     run(
         &|d| {
             copy.execute_scale(d, &source, scale, Exec::serial())
@@ -279,19 +278,21 @@ fn check_rows<'e, T: Value>(
         exec,
         "scale",
     );
-    let (exec, _) = exec_for();
+    assert_fanned_out(root);
+    let (exec, root) = exec_for();
     run(
         &|d| copy.execute_conj(d, &source, Exec::serial()).unwrap(),
         &|d, e| replay_map_raw(d, &source, |d: &mut T, s: T| *d = s.conj(), e).unwrap(),
         exec,
         "conj",
     );
+    assert_fanned_out(root);
     for (alpha, beta) in [
         (T::one(), T::zero()),
         (T::scalar(2.5, 0.5), T::zero()),
         (T::scalar(2.5, 0.5), T::scalar(-0.5, 0.25)),
     ] {
-        let (exec, _) = exec_for();
+        let (exec, root) = exec_for();
         run(
             &|d| {
                 update
@@ -317,6 +318,7 @@ fn check_rows<'e, T: Value>(
             exec,
             "update",
         );
+        assert_fanned_out(root);
     }
 
     // Uninitialized destinations: equal to the plan, and the holes keep the
@@ -343,15 +345,16 @@ fn check_rows<'e, T: Value>(
             }
         }
     };
-    let (exec, _) = exec_for();
+    let (exec, root) = exec_for();
     run_uninit(
         &|d| copy.execute_uninit(d, &source, Exec::serial()).unwrap(),
         &|d, e| replay_copy_raw_uninit(d, &source, e).unwrap(),
         exec,
         "copy uninit",
     );
+    assert_fanned_out(root);
     for alpha in [T::one(), T::scalar(2.5, 0.5)] {
-        let (exec, _) = exec_for();
+        let (exec, root) = exec_for();
         run_uninit(
             &|d| {
                 update
@@ -369,6 +372,7 @@ fn check_rows<'e, T: Value>(
             exec,
             "update uninit",
         );
+        assert_fanned_out(root);
     }
 }
 

@@ -499,29 +499,47 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
 
     run_composites(&pool);
     check_reduce_axis(&pool);
-    check_parallel_threshold(&pool);
+    check_parallel_threshold();
     check_full_reduction(&pool);
     check_plans(&pool);
     record_rank9_spill(&pool);
     check_replay_rank9_spill_is_bounded();
 }
 
-/// Tensor-sized cases above the 32768-element threading threshold, so the
-/// two-worker counting windows exercise the real parallel branches rather than
-/// the serial fallback that the `large` shapes (1025..1152 elements) take.
-fn check_parallel_threshold(pool: &Pool) {
+/// Tensor-sized cases that must reach the parallel branches. The default
+/// dispatch costs of the shared pool keep these sizes serial, so they run on a
+/// pool with cheap dispatch costs, and the replay width is asserted so the
+/// counting windows cannot fall back to the serial path unnoticed.
+fn check_parallel_threshold() {
+    use strided_basic::execution::{parallel_width, KernelClass};
+    use threadteam::{DispatchCosts, DispatchKind, HostClass, WidthCosts};
+
+    let cheap = WidthCosts::flat(std::time::Duration::from_nanos(100));
+    let pool = Pool::builder()
+        .threads(2)
+        .dispatch_costs(
+            DispatchCosts::for_class(HostClass::Generic)
+                .with(DispatchKind::Team, cheap)
+                .with(DispatchKind::InPool, cheap)
+                .with(DispatchKind::Outside, cheap),
+        )
+        .build()
+        .unwrap();
     let shapes: [&[usize]; 3] = [
         &[33, 33, 33],
         &[3, 3, 3, 3, 3, 3, 3, 21],
         &[5, 4, 4, 4, 4, 4, 4, 2],
     ];
     for dims in shapes {
-        assert!(
-            total(dims) > 32_768,
-            "threshold case {dims:?} is not tensor-sized"
-        );
-        run_map_entries(dims, pool);
-        run_replay_entries(dims, pool);
+        let width = on_worker(&pool, |pool| {
+            parallel_width(&Exec::new(pool, 2).unwrap(), KernelClass::Copy, total(dims)).get()
+        });
+        #[cfg(feature = "parallel")]
+        assert!(width >= 2, "replay case {dims:?} runs at width {width}");
+        #[cfg(not(feature = "parallel"))]
+        let _ = width;
+        run_map_entries(dims, &pool);
+        run_replay_entries(dims, &pool);
     }
 }
 
