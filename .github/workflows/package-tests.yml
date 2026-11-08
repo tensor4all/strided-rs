@@ -1,0 +1,107 @@
+name: Packaged crate tests
+
+# `cargo package` はパッケージの **ビルド** を検証するが、**テストは実行しない**。
+# そのため、パッケージの外を読むテスト（`#[path = "../../sibling/..."]`、兄弟
+# クレートの `include_str!`、`..` 配下の fixture）はクリーンに package され、
+# クリーンに publish され、`.crate` を展開した人（distro packager、vendored
+# build、`cargo install --path`）の `cargo test` で初めて落ちる（#399、#397 → #398）。
+#
+# コスト: matrix の各ジョブが自分の依存グラフを一からビルドするので、1 回の run で
+# 共有クレート（strided-traits など）をジョブの数だけコンパイルし直す。なので PR ごとの
+# 必須レーンには置かない。週次 schedule + `workflow_dispatch` と、リリースブランチへの
+# push のときだけ回す。失敗は run の色だけで示す（miri のように issue は起票しない。
+# PR を止めない週次の信号なので、まず色を見る）。
+#
+# 対象クレートはハードコードしない。ここは workspace の Cargo.toml の publish 設定
+# から機械的に決める（`cargo metadata` の `publish` が `[]` のクレート＝
+# `publish = false` を除く）。
+
+on:
+  schedule:
+    - cron: "0 18 * * 1"   # 月曜 18:00 UTC = 火曜 03:00 JST（週 1 回）
+  # リリースブランチ（リポジトリの慣行は `release/<...>`、例 `release/strided-0.4.2`）
+  push:
+    branches:
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  # schedule と手動 dispatch が重なっても、同じ ref の run を積み上げない
+  group: package-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  list:
+    name: published crates
+    runs-on: ubuntu-latest
+    outputs:
+      crates: ${{ steps.list.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the publish settings
+        id: list
+        run: |
+          set -euo pipefail
+          # publish = false のクレート（`[]`）を除いた workspace member 名
+          crates=$(cargo metadata --no-deps --format-version 1 \
+            | jq -c '[.packages[]
+                      | select(.publish == null or (.publish | length) > 0)
+                      | .name] | sort')
+          if [ "$crates" = "[]" ] || [ -z "$crates" ]; then
+            echo "::error::No publishable crate found; the publish settings moved."
+            exit 1
+          fi
+          echo "$crates"
+          echo "crates=$crates" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: cargo test in the .crate (${{ matrix.crate }})
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJSON(needs.list.outputs.crates) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-tests-${{ matrix.crate }}
+
+      - name: Package and unpack
+        id: package
+        env:
+          CRATE: ${{ matrix.crate }}
+        run: |
+          set -euo pipefail
+          # 依存クレートは path を落として crates.io から解決される（Cargo の仕様）。
+          # まだ publish していない新バージョンに依存している間は、依存側のこの
+          # ステップが解決に失敗する。依存順に publish してから回すこと。
+          cargo package -p "${CRATE}" --no-verify
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg c "${CRATE}" '.packages[] | select(.name == $c) | .version')
+          # `--no-verify` は展開ディレクトリを作らない（展開は検証ビルドの一部）。
+          # テストはクリーンな .crate の中身に対して回すので、自分で展開する。
+          # 展開先は checkout の **外**（$RUNNER_TEMP）。中で展開すると、cargo の
+          # parent 探索から `git rev-parse --show-toplevel` でリポジトリ root に
+          # 届き、パッケージ外の fixture を読むテストが緑のまま通ってしまう。
+          dir="${RUNNER_TEMP}/package/${CRATE}-${version}"
+          mkdir -p "$dir"
+          tar xzf "target/package/${CRATE}-${version}.crate" -C "$dir"
+          dir="${dir}/${CRATE}-${version}"
+          test -d "$dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # ここが本題: 展開した .crate の中でテストを走らせる。`cargo package` の
+      # 検証ビルドでは通ってしまう、パッケージ外への参照を捕まえる。
+      - name: Test the unpacked package
+        working-directory: ${{ steps.package.outputs.dir }}
+        run: cargo test --all-features
