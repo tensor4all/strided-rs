@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -339,6 +340,51 @@ class PublishedIdentityTest(unittest.TestCase):
 
     def test_unchanged_external_license_file_behind_an_excluded_local_namesake_is_ok(self) -> None:
         self._assert_unchanged_external_file_is_ok("LICENSE", LICENSE_FILE_MANIFEST)
+
+    def test_the_probe_keeps_the_entry_spelling_a_case_insensitive_fs_has(self) -> None:
+        # README.md and Readme.md are one directory entry on a case-insensitive
+        # filesystem. The probe must move aside and recreate the entry whose
+        # spelling exists: writing the archive member spelling changes Cargo's
+        # collision decision and can pick the wrong witness (#421 review).
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "README.md").write_text("x")
+            if not (directory / "readme.md").exists():
+                self.skipTest("case-sensitive filesystem")
+            self.assertEqual(pi.real_entry(directory / "Readme.md").name, "README.md")
+
+    def test_the_probe_keeps_a_unicode_spelling_the_filesystem_folded(self) -> None:
+        # APFS is also normalization-insensitive, so looking a canonically
+        # equivalent spelling up succeeds while its lowercased name matches no
+        # directory entry (`core.precomposeunicode=false` keeps the decomposed
+        # one on disk). The entry itself is what the probe has to write back
+        # (#421 review).
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            on_disk = unicodedata.normalize("NFD", "R\u00e9adme.md")
+            (directory / on_disk).write_text("x")
+            requested = directory / unicodedata.normalize("NFC", "R\u00e9adme.md")
+            if not requested.exists():
+                self.skipTest("filesystem does not fold Unicode spellings")
+            self.assertEqual(pi.real_entry(requested).name, on_disk)
+
+    def test_unchanged_package_with_a_case_mismatched_crate_local_namesake_is_ok(self) -> None:
+        # The probe moves the crate-local file aside and writes it back. On a
+        # case-insensitive filesystem `Readme.md` and `README.md` are one entry,
+        # so writing the archive member's spelling renames the file for good, and
+        # the probe's own packaging then sees a different layout from the one it
+        # was asked about: an unchanged package came out exit 2. real_entry()
+        # keeps the entry's spelling (#421 review).
+        (self.fx.root / "README.md").write_text("# external\n")
+        self.fx.write("Readme.md", "# crate-local\n")
+        if not (self.fx.root / "demo" / "README.md").exists():
+            self.skipTest("case-sensitive filesystem")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("external readme, case-mismatched crate-local namesake")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
 
     def test_external_readme_next_to_a_shipped_crate_local_namesake_is_ok(self) -> None:
         # No `exclude`: Cargo ships the crate-local copy and warns about the

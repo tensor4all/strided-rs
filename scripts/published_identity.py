@@ -232,6 +232,26 @@ def published(name: str, ver: str, opener=None) -> bytes | None:
     return blob
 
 
+def real_entry(local: pathlib.Path) -> pathlib.Path:
+    """`local`, with the spelling its directory actually has.
+
+    On a case-insensitive filesystem `README.md` and `Readme.md` name the same
+    file, and writing a path spelled differently does not change the entry's
+    spelling. The probe below moves the crate-local file aside to ask Cargo
+    which namesake it archives; recreating it under the archive member's
+    spelling would change Cargo's collision decision and pick the wrong witness
+    (#421 review). A filesystem also folds canonically equivalent Unicode
+    spellings (APFS does), so the entry is the one the filesystem resolved, not
+    the one whose lowercased name matches.
+    """
+    names = os.listdir(local.parent)
+    if local.name in names:
+        return local
+    entry = os.lstat(local)
+    matches = [n for n in names if os.path.samestat(os.lstat(local.parent / n), entry)]
+    return local.parent / matches[0] if len(matches) == 1 else local
+
+
 def ships_local_namesake(repo: str, crate: dict, rel: str, target_dir: str,
                          declared: pathlib.Path) -> bool:
     """Whether Cargo archives the crate-local file `rel` rather than the copy the
@@ -248,7 +268,7 @@ def ships_local_namesake(repo: str, crate: dict, rel: str, target_dir: str,
     marker, so no file content can be mistaken for the marker. No packaging rule
     is re-implemented here, and the worktree is this script's own temporary one.
     """
-    local = pathlib.Path(crate["root"]) / rel
+    local = real_entry(pathlib.Path(crate["root"]) / rel)
     # The probe removes the entry and writes a new one, so the checkout has to own
     # both the entry's target and the directory the new entry lands in: a
     # workspace member that is a symlink elsewhere, or a file symlink whose target
