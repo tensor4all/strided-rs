@@ -120,3 +120,25 @@ fn test_compute_importance_accumulates_every_array() {
         vec![256, 32]
     );
 }
+
+/// The short-row case `fuse.rs:114` documents, with the orders the only caller
+/// actually builds: `index_order` returns one-based ranks
+/// (`strided-view/src/auxiliary.rs:36`), so a 1-dim row carries `1`.
+///
+/// `dims = [2, 2]` with strides `[1, 2]`, `[1, 2]`, `[0]` gives the orders
+/// `[[1, 2], [1, 2], [1]]`: the third row contributes to dimension 0 only. The
+/// loop this one replaced read `index_orders[2][1]` and panicked here. Both tests
+/// above stay inside `n`-long rows, so this is the only pin on the prefix case.
+#[test]
+fn test_compute_importance_short_row_contributes_its_prefix() {
+    let dims = [2, 2];
+    let full = [1isize, 2];
+    let broadcast = [0isize];
+    let all_strides: Vec<&[isize]> = vec![&full, &full, &broadcast];
+    let index_orders = vec![vec![1usize, 2], vec![1, 2], vec![1]];
+
+    assert_eq!(
+        compute_importance(&dims, &all_strides, &index_orders),
+        vec![32, 3]
+    );
+}
