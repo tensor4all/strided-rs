@@ -249,12 +249,17 @@ def ships_local_namesake(repo: str, crate: dict, rel: str, target_dir: str,
     is re-implemented here, and the worktree is this script's own temporary one.
     """
     local = pathlib.Path(crate["root"]) / rel
-    # The probe writes into the tree, so the file has to be one of this
-    # checkout's own files: a workspace member that is a symlink elsewhere would
-    # put a live file outside the throwaway worktree (#421 review).
-    if not local.resolve().is_relative_to(pathlib.Path(repo).resolve()):
-        raise CheckError(f"the tree archive's {rel} resolves to {local.resolve()}, outside"
-                         f" the temporary checkout {repo}: not writing there to ask Cargo")
+    # The probe removes the entry and writes a new one, so the checkout has to own
+    # both the entry's target and the directory the new entry lands in: a
+    # workspace member that is a symlink elsewhere, or a file symlink whose target
+    # points back inside, would otherwise put a live file outside the throwaway
+    # worktree (#421 review). Refuse before writing and before packaging anything.
+    checkout = pathlib.Path(repo).resolve()
+    for path in (local.parent, local):
+        if not path.resolve().is_relative_to(checkout):
+            raise CheckError(f"the tree archive's {rel} is {path}, resolving to"
+                             f" {path.resolve()}, outside the temporary checkout {repo}:"
+                             " not writing there to ask Cargo")
     marker = os.urandom(32)
     # The backup goes to a temporary directory outside the package (Cargo ships a
     # file left beside the crate-local one), and the restore below runs even when

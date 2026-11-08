@@ -437,6 +437,27 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertIn("outside the temporary checkout", str(raised.exception))
         self.assertEqual((outer / "README.md").read_text(), "# live file\n")
 
+    def test_probe_refuses_an_outside_directory_whose_file_symlinks_back_inside(self) -> None:
+        # GPT review on #421 (round 2, critical): the target check alone passed
+        # when an outside member directory held a README.md symlink pointing back
+        # into the checkout. Removing the link and writing a new file would then
+        # create it in the outside directory. The entry's directory has to be
+        # inside the checkout as well.
+        outer = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        wt = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (wt / "owned.md").write_text("# inside\n")
+        (outer / "demo").mkdir()
+        (outer / "demo" / "README.md").symlink_to(wt / "owned.md")
+        crate = {"name": "demo", "version": "0.1.0", "root": str(outer / "demo"),
+                 "readme": "../README.md", "license_file": None}
+        with mock.patch.object(pi, "package_tree",
+                               side_effect=AssertionError("probe wrote into a live tree")):
+            with self.assertRaises(pi.CheckError) as raised:
+                pi.ships_local_namesake(str(wt), crate, "README.md", str(wt),
+                                        outer / "README.md")
+        self.assertIn("outside the temporary checkout", str(raised.exception))
+        self.assertTrue((outer / "demo" / "README.md").is_symlink())
+
     def test_probe_puts_the_file_back_when_the_marker_write_fails(self) -> None:
         # GPT review on #421 (critical): a failed marker write used to leave the
         # original behind under the backup name. It must be restored instead.
@@ -1094,9 +1115,10 @@ class MutationTest(unittest.TestCase):
         # The probe writing through a symlinked workspace member, outside the
         # throwaway checkout (#421 review, critical).
         "probe_path_escape_allowed": (
-            "    if not local.resolve().is_relative_to(pathlib.Path(repo).resolve()):",
-            "    if False:",
-            ["PublishedIdentityTest.test_probe_refuses_a_crate_outside_the_temporary_checkout"],
+            "        if not path.resolve().is_relative_to(checkout):",
+            "        if False:",
+            ["PublishedIdentityTest.test_probe_refuses_a_crate_outside_the_temporary_checkout",
+             "PublishedIdentityTest.test_probe_refuses_an_outside_directory_whose_file_symlinks_back_inside"],
         ),
         # The restore after a failed marker write skipped, which leaves the
         # original behind under the backup name (#421 review, critical).
