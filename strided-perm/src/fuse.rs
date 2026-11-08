@@ -159,16 +159,18 @@ pub fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> Vec<isize> {
     for strides in all_strides {
         let strides = strides.as_ref();
         for i in 0..n {
-            costs[i] = costs[i].min(strides[i].abs());
+            costs[i] = costs[i].min(strides[i].checked_abs().unwrap_or(isize::MAX));
         }
     }
 
-    // Transform: zero -> 1, nonzero -> 2*abs
+    // Transform: zero -> 1, nonzero -> 2*abs. Costs only rank axes, so a
+    // stride beyond isize::MAX / 2 (reachable with zero-sized elements)
+    // saturates instead of overflowing.
     for cost in &mut costs {
         if *cost == 0 {
             *cost = 1;
         } else {
-            *cost *= 2;
+            *cost = cost.saturating_mul(2);
         }
     }
 

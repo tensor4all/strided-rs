@@ -308,12 +308,13 @@ pub(crate) fn copy_permuted_uninit<T: Copy + Send + Sync + 'static>(
 ///
 /// Ties break towards the last index, matching Julia's `_lastargmax`. A
 /// dimension is not split when its cost is zero or it fits in one block
-/// (`dims[i] <= min(blocks[i], 1024)`).
+/// (`dims[i] <= min(blocks[i], 1024)`). Costs are nonnegative, as
+/// `compute_costs` produces them, and the score is exact in `u128`.
 fn split_axis(dims: &[usize], blocks: &[usize], costs: &[isize]) -> Option<usize> {
     let (i, _) = dims.iter().zip(costs.iter()).enumerate().fold(
-        (0, isize::MIN),
+        (0, 0u128),
         |(best_i, best_v), (idx, (&d, &c))| {
-            let score = (d as isize - 1) * c;
+            let score = d.saturating_sub(1) as u128 * c as u128;
             if score >= best_v {
                 (idx, score)
             } else {
