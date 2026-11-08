@@ -222,8 +222,11 @@ impl<'a> ErasedRawStridedPtr<'a> {
     /// not aligned for `dtype`. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
-    /// an extent or a scaled stride does not fit `isize`, the offset
-    /// arithmetic overflows, or a reached offset lies outside the storage.
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
     /// Bool bytes are not checked here;
     /// [`Self::try_as_ref_after_no_overlap`] does that.
     pub unsafe fn from_raw_parts(
@@ -383,9 +386,12 @@ impl<'a> ErasedRawStridedRef<'a> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`. The byte-length and alignment checks
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check. The
+    /// byte-length and alignment checks
     /// cannot fail for a typed `&[T]`.
     pub fn from_slice<T: KernelStorageElement>(
         data: &'a [T],
@@ -428,8 +434,11 @@ impl<'a> ErasedRawStridedRef<'a> {
     /// not aligned for `dtype`. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
-    /// an extent or a scaled stride does not fit `isize`, the offset
-    /// arithmetic overflows, or a reached offset lies outside the storage.
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
     /// Bool bytes are the caller's responsibility here, per the safety
     /// contract.
     pub unsafe fn from_raw_parts(
@@ -526,9 +535,12 @@ impl<'a> ErasedRawStridedMut<'a> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`. The byte-length and alignment checks
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check. The
+    /// byte-length and alignment checks
     /// cannot fail for a typed `&mut [T]`.
     pub fn from_slice_mut<T: KernelStorageElement>(
         data: &'a mut [T],
@@ -575,8 +587,11 @@ impl<'a> ErasedRawStridedMut<'a> {
     /// of the extent is neither 0 nor 1. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
-    /// an extent or a scaled stride does not fit `isize`, the offset
-    /// arithmetic overflows, or a reached offset lies outside the storage.
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
     pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
@@ -696,9 +711,12 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`. The byte-length and alignment checks
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check. The
+    /// byte-length and alignment checks
     /// cannot fail for a typed `&mut [MaybeUninit<T>]`.
     pub fn from_uninit_slice<T: KernelStorageElement>(
         data: &'a mut [MaybeUninit<T>],
@@ -746,8 +764,11 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     /// not aligned for `dtype`. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
-    /// an extent or a scaled stride does not fit `isize`, the offset
-    /// arithmetic overflows, or a reached offset lies outside the storage.
+    /// a reachable offset is not representable: `dim - 1` of a non-unit
+    /// extent does not fit `isize`, a stride times that last index or the
+    /// accumulated offsets overflow `isize` or go negative, or the highest
+    /// reachable offset is not below the storage length. A layout with a zero
+    /// extent skips this check.
     pub unsafe fn from_raw_parts(
         dtype: KernelDType,
         data: NonNull<u8>,
@@ -854,9 +875,11 @@ impl<'a, T> RawStridedRef<'a, T> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`.
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn new(
         data: &'a [T],
         dims: &'a [usize],
@@ -961,9 +984,11 @@ impl<'a, T> RawStridedMut<'a, T> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`.
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn new(
         data: &'a mut [T],
         dims: &'a [usize],

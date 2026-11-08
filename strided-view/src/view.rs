@@ -473,9 +473,11 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`.
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     ///
     /// # Examples
     ///
@@ -851,9 +853,11 @@ impl<'a, T> StridedViewMut<'a, T> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`.
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     ///
     /// # Examples
     ///
@@ -1276,9 +1280,11 @@ impl<T> StridedArray<T> {
     ///
     /// Returns [`StridedError::StrideLengthMismatch`] when `dims` and
     /// `strides` have different lengths, and
-    /// [`StridedError::OffsetOverflow`] when an extent or a scaled stride
-    /// does not fit `isize`, the offset arithmetic overflows, or a reached
-    /// offset lies outside `data`.
+    /// [`StridedError::OffsetOverflow`] when a reachable offset is not
+    /// representable: `dim - 1` of a non-unit extent does not fit `isize`, a
+    /// stride times that last index or the accumulated offsets overflow
+    /// `isize` or go negative, or the highest reachable offset is not below
+    /// the buffer length. A layout with a zero extent skips this check.
     pub fn from_parts(
         data: Vec<T>,
         dims: &[usize],

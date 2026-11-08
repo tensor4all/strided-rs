@@ -1022,7 +1022,10 @@ where
 ///
 /// Returns [`StridedError::RankMismatch`] when `src` is not rank 2,
 /// [`StridedError::NonSquare`] when its two extents differ, and
-/// [`StridedError::ScalarConversion`] when `T` cannot represent `0.5`.
+/// [`StridedError::ScalarConversion`] only when `T::from_f64(0.5)` returns
+/// `None`. `num_traits::FromPrimitive::from_f64` truncates for the primitive
+/// integer types (`i32::from_f64(0.5) == Some(0)`), so an integer `T` is not
+/// rejected: it scales by zero, and the result is zero rather than a half.
 /// Writing through [`zip_map2_into`](crate::zip_map2_into) adds
 /// [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`] when
 /// `dest` and the transposed `src` describe different extents, and
@@ -1065,7 +1068,10 @@ where
 ///
 /// Returns [`StridedError::RankMismatch`] when `src` is not rank 2,
 /// [`StridedError::NonSquare`] when its two extents differ, and
-/// [`StridedError::ScalarConversion`] when `T` cannot represent `0.5`.
+/// [`StridedError::ScalarConversion`] only when `T::from_f64(0.5)` returns
+/// `None`. `num_traits::FromPrimitive::from_f64` truncates for the primitive
+/// integer types (`i32::from_f64(0.5) == Some(0)`), so an integer `T` is not
+/// rejected: it scales by zero, and the result is zero rather than a half.
 /// Writing through [`zip_map2_into`](crate::zip_map2_into) adds
 /// [`StridedError::RankMismatch`] or [`StridedError::ShapeMismatch`] when
 /// `dest` and the adjoint of `src` describe different extents, and
