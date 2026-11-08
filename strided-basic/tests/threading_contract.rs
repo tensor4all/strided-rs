@@ -106,8 +106,8 @@ impl Seen {
     /// Without the wait this test raced the pool instead of measuring
     /// placement. The shape that failed in CI (257x257, 66049 elements) runs
     /// 9.0 us on one thread at the 0.137 ns per element measured on an AVX-512
-    /// host, so its first leaf is about 4.5 us of work, while a worker needed
-    /// 7-40 us to pick up the sibling (p50 8, p90 14, max 40 over 40 fresh pools
+    /// host, so even a quarter of it is only ~2-3 us of work per leaf, while a
+    /// worker needed 7-40 us to pick up the sibling (p50 8, p90 14, max 40 over 40 fresh pools
     /// on a loaded 32-core host): the calling thread could finish the whole
     /// region itself, and the same commit passed or failed with the host state.
     /// Waiting makes "a four-slot token opens a second worker" an assertion
