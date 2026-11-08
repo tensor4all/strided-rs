@@ -400,6 +400,33 @@ class PublishedIdentityTest(unittest.TestCase):
         rc, out = self.fx.run("HEAD", lambda n, v: blob)
         self.assertEqual(rc, 0, out)
         self.assertIn("ok          demo 0.1.0", out)
+    def test_size_field_edited_with_the_checksum_intact_is_not_green(self) -> None:
+        # GPT review on #416 (21:10Z): move one bit between the size and the UID
+        # fields of a member header of the TREE-built archive, so the header
+        # checksum still matches while tarfile reads a one-byte-shorter member.
+        # The real content leftover byte stays in the padding, which no header
+        # or end-of-archive check can see, so the padding has to be checked.
+        self.fx.write("zz.txt", "ab")
+        self.fx.commit("published two-byte file")
+        published = self.fx.package()
+        self.fx.write("zz.txt", "abc")
+        self.fx.commit("changed content without a version bump")
+        real_package = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real_package(*args)))
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/zz.txt").offset
+            self.assertEqual(raw[o + 134], ord("3"))
+            self.assertEqual(raw[o + 114], ord("0"))
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the checksum is unchanged
+            return gzip.compress(raw)
+
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("zero padding", out)
 
     def test_published_from_a_dirty_worktree_is_red(self) -> None:
         # #415: cargo records the worktree state it packaged. dirty=true means

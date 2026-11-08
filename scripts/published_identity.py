@@ -70,6 +70,11 @@ Caveats, stated rather than hidden:
     indistinguishable from that name split in two. Damage cannot split a header,
     only end the list, and the archive is built here, so that needs a replaced
     archive rather than a corrupted one.
+  * A header edited so its checksum still matches (one bit moved between the
+    size and UID fields) reads as a shorter member with no error from any of
+    the checks above or from the file list; the leftover bytes of the real
+    content then sit in the zero padding, which is checked for every member of
+    both archives (#416 review).
   * Manifest comparison covers Cargo.toml.orig only; workspace-level
     inheritance is out of scope. A field written as `{ workspace = true }` (or
     `x.workspace = true`) reads the same in Cargo.toml.orig whatever the
@@ -235,6 +240,20 @@ def crate_archive(blob: bytes, listed: bytes | None = None) -> tuple[dict[str, s
             if f is None:
                 continue
             body = f.read()
+            # The tar format pads the payload to a 512-byte boundary with
+            # zeros, and tarfile truncates at the size in the header. A
+            # checksum-preserving edit of that field reads as a shorter member
+            # with no error from the parse, the header checksum or the
+            # end-of-archive check (#416 review), and the real content leftover
+            # bytes stay in the padding. Padding is the only place a shortened
+            # size can show.
+            pad_start = m.offset + 512 + m.size
+            pad_end = m.offset + 512 + -(-m.size // 512) * 512
+            if any(raw[pad_start:pad_end]):
+                raise CheckError(
+                    f"{m.name}: the bytes after the declared content are not"
+                    " the zero padding a complete member ends with, so the"
+                    " size field does not describe what the archive wrote")
             if rel == VCS_INFO:
                 vcs = json.loads(body)
             elif rel not in SKIP_ALWAYS:
