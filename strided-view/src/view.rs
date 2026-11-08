@@ -1098,7 +1098,7 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
         // `index < dims[i]`, so the offset stays inside the reachable extent
         // that `validate_bounds` (view.rs:186) accepted for this view. That is
         // all this establishes: the cached `ptr` is invalidated by an earlier
-        // `data_mut` (view.rs:961) reborrow, so reading through it afterwards is
+        // `data_mut` (view.rs:1001) reborrow, so reading through it afterwards is
         // unsound and is tracked in tensor4all/strided-rs#383.
         unsafe { *self.ptr.offset(offset) }
     }
@@ -1115,7 +1115,7 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
         // every index, so the store stays inside the extent the view was built
         // for. `&mut self` rules out a concurrent `&mut self` access, but it does
         // not refresh the cached `ptr`: a reborrow through `data_mut`
-        // (view.rs:961) before this call invalidates it, so only the bound, not
+        // (view.rs:1001) before this call invalidates it, so only the bound, not
         // the pointer's validity, is established here
         // (tensor4all/strided-rs#383).
         unsafe {
@@ -1418,7 +1418,7 @@ impl<T> StridedArray<T> {
             empty_const_ptr()
         } else {
             // SAFETY: `offset` is either 0 from a constructor or was accepted by
-            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1285), so
+            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1341), so
             // `data.as_ptr() + offset` stays inside `data`. The empty branch
             // above excludes a zero-sized layout, whose offset need not be
             // reachable.
