@@ -47,7 +47,7 @@ Caveats, stated rather than hidden:
     for the end-of-archive marker, and the zero payload and padding behind it
     pass a tail-is-zero check), which is the #415 false green; on the published
     side only the registered checksum sees that (the tree side, below, is caught
-    by its pinned end blocks and its file list instead).
+    by its pinned end blocks, its file list and its bytes on disk instead).
   * Both archives must parse completely: the parse must be followed by exactly
     the 1024 bytes of the two end-of-archive zero blocks (tar-rs writes those
     and no record padding behind them; a writer that padded further would fail
@@ -68,13 +68,27 @@ Caveats, stated rather than hidden:
     checked out here — and rests on the registered checksum instead. Residual
     limit: the list is newline-delimited, so a name containing a newline is
     indistinguishable from that name split in two. Damage cannot split a header,
-    only end the list, and the archive is built here, so that needs a replaced
-    archive rather than a corrupted one.
+    only end the list or shorten a member (which the two caveats below catch),
+    and the archive is built here, so that needs a replaced archive rather than a
+    corrupted one.
   * A header edited so its checksum still matches (one bit moved between the
     size and UID fields) reads as a shorter member with no error from any of
-    the checks above or from the file list; the leftover bytes of the real
-    content then sit in the zero padding, which is checked for every member of
-    both archives (#416 review).
+    the checks above or from the file list. The tar format pads a payload to a
+    512-byte boundary with zeros, so the leftover bytes of the real content can
+    only sit in that padding, which is checked for every member of both
+    archives (#416 review). Residue: a member whose last bytes are zeros loses
+    nothing visible when such an edit drops one of them, which is why the next
+    caveat does not rest on the padding alone.
+  * Nor does the tree side rest on the tar reader for a member's content: the
+    bytes read out of the archive are compared with the bytes of the file Cargo
+    archived, on disk (a readme / license-file from outside the crate is read
+    where the manifest points, since Cargo archives it at the package root under
+    its own name). A member list and a set of end blocks say nothing about a
+    member's length: a header whose size field is edited can still pass its own
+    checksum — flip a bit in the size and one in the UID and the two cancel — so
+    tarfile reads the member shorter and the padding swallows the rest (#416).
+    A member whose bytes are not the file's bytes, or which names no file on
+    disk to compare with, is exit 2.
   * Manifest comparison covers Cargo.toml.orig only; workspace-level
     inheritance is out of scope. A field written as `{ workspace = true }` (or
     `x.workspace = true`) reads the same in Cargo.toml.orig whatever the
@@ -145,6 +159,9 @@ def checkout_ref(repo: str, ref: str) -> tuple[str, str | None]:
 
 
 def workspace_crates(repo: str) -> list[dict]:
+    """The publishable crates, with the crate root and the declared readme /
+    license-file: those say where each archived member's bytes live on disk
+    (see member_bytes())."""
     rc, out, err = run(["cargo", "metadata", "--no-deps", "--format-version", "1",
                         "--manifest-path", f"{repo}/Cargo.toml"], cwd=repo)
     if rc != 0:
@@ -154,7 +171,9 @@ def workspace_crates(repo: str) -> list[dict]:
     for p in meta["packages"]:
         if p.get("publish") == []:
             continue
-        crates.append({"name": p["name"], "version": p["version"]})
+        crates.append({"name": p["name"], "version": p["version"],
+                       "root": str(pathlib.Path(p["manifest_path"]).parent),
+                       "readme": p.get("readme"), "license_file": p.get("license_file")})
     return crates
 
 
@@ -205,13 +224,43 @@ def published(name: str, ver: str, opener=None) -> bytes | None:
     return blob
 
 
-def crate_archive(blob: bytes, listed: bytes | None = None) -> tuple[dict[str, str], dict | None]:
+def member_bytes(crate: dict, rel: str, body: bytes) -> None:
+    """The tree archive's member `rel` must be the file Cargo archived, byte for
+    byte. Neither the member list nor the end blocks see a member's length, and
+    a size field edited with a compensating UID bit keeps the header checksum,
+    so tarfile reads the member shorter and the padding swallows the rest: only
+    an independent copy of the bytes, the file on disk, catches that (#416).
+    """
+    root = pathlib.Path(crate["root"])
+    # Cargo.toml.orig is the crate's manifest verbatim.
+    source = root / ("Cargo.toml" if rel == "Cargo.toml.orig" else rel)
+    if not source.is_file():
+        # Cargo archives a readme / license-file from outside the crate at the
+        # package root, under its own file name.
+        for key in ("readme", "license_file"):
+            declared = crate.get(key)
+            if declared and pathlib.Path(declared).name == rel:
+                source = root / declared
+    try:
+        on_disk = source.read_bytes()
+    except OSError as e:
+        raise CheckError(f"the tree archive has {rel}, and there is no file on disk"
+                         f" to compare it with: {e}") from e
+    if on_disk != body:
+        raise CheckError(
+            f"the tree archive's {rel} is {len(body)} byte(s) and is not {source}"
+            f" ({len(on_disk)} byte(s)): the member does not carry the bytes on disk")
+
+
+def crate_archive(blob: bytes, listed: bytes | None = None,
+                  crate: dict | None = None) -> tuple[dict[str, str], dict | None]:
     """(path-inside-crate -> sha256 for the files worth comparing, the archive's
     .cargo_vcs_info.json or None).
 
     `listed` is that same archive's file list from `cargo package --list`, in
-    bytes, which the tree side passes so that a structurally valid archive
-    cannot lose a member unnoticed (see the caveats at the top of this file).
+    bytes, and `crate` the crate the tree side was packaged from; passing both
+    means a structurally valid archive cannot lose a member or shorten one
+    unnoticed (see the caveats at the top of this file).
     """
     # Decompress the whole stream first: tarfile over a gzip stream stops at
     # the tar end marker and never checks the gzip trailer, so a truncated or
@@ -245,8 +294,9 @@ def crate_archive(blob: bytes, listed: bytes | None = None) -> tuple[dict[str, s
             # checksum-preserving edit of that field reads as a shorter member
             # with no error from the parse, the header checksum or the
             # end-of-archive check (#416 review), and the real content leftover
-            # bytes stay in the padding. Padding is the only place a shortened
-            # size can show.
+            # bytes stay in the padding, so a nonzero leftover shows here; a
+            # member that ends in zeros shows nothing, which is why member_bytes()
+            # does not rest on the padding.
             pad_start = m.offset + 512 + m.size
             pad_end = m.offset + 512 + -(-m.size // 512) * 512
             if any(raw[pad_start:pad_end]):
@@ -258,6 +308,8 @@ def crate_archive(blob: bytes, listed: bytes | None = None) -> tuple[dict[str, s
                 vcs = json.loads(body)
             elif rel not in SKIP_ALWAYS:
                 out[rel] = hashlib.sha256(body).hexdigest()
+                if crate is not None:
+                    member_bytes(crate, rel, body)
     # Two zero blocks are what a complete tar ends with, and tar-rs writes
     # nothing behind them. A stream cut off exactly at a member boundary leaves
     # an empty tail, and a stream cut off at a damage point leaves the rest of
@@ -379,7 +431,8 @@ def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str,
     # SKIP_ALWAYS are left out. A file that shipped but is gone from the tree
     # (a deleted build.rs, say) shows as "only in published .crate".
     pub, vcs = crate_archive(blob)
-    tree, _ = crate_archive(package_tree(repo, crate, target_dir), package_list(repo, crate))
+    tree, _ = crate_archive(package_tree(repo, crate, target_dir),
+                            package_list(repo, crate), crate)
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
         if rel not in pub:

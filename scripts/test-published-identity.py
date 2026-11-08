@@ -391,6 +391,69 @@ class PublishedIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("not the file list Cargo shipped", out)
 
+    def test_tree_member_size_field_lie_is_not_green(self) -> None:
+        # GPT review on #416 (critical, third round): flip one bit of a tree
+        # member's size field ('3' -> '2') and one of its UID ('0' -> '1'); the
+        # two cancel in the header checksum, so tarfile accepts the header, reads
+        # 'ab' out of 'abc' and takes the remaining 'c' for padding. Both sizes
+        # sit in one 512-byte block, so the end blocks and the `cargo package
+        # --list` comparison are unchanged, and the short member matched the
+        # published two-byte file: only the bytes on disk disagree.
+        self.fx.write("zz.txt", "ab")
+        self.fx.commit("published two-byte file")
+        published = self.fx.package()
+        self.fx.write("zz.txt", "abc")
+        self.fx.commit("changed content without version bump")
+        real = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real(*args)))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/zz.txt").offset
+            assert raw[o + 134] == ord("3") and raw[o + 114] == ord("0")
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the two cancel in the checksum
+            return gzip.compress(bytes(raw))
+
+        rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 1, out)  # control: the changed byte is seen
+        self.assertIn("differs: zz.txt", out)
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        # The nonzero leftover is caught by the padding check first; the NUL
+        # variant below is the one only the bytes on disk catch.
+        self.assertIn("the size field does not describe what the archive wrote", out)
+        self.assertNotIn("ok          demo", out)
+
+    def test_tree_member_size_lie_over_a_zero_byte_is_not_green(self) -> None:
+        # The same edit, but the byte the shortened size drops is a NUL: the
+        # leftover looks exactly like the padding, so the padding check alone
+        # stays green here and only the bytes on disk disagree.
+        self.fx.write("zz.txt", "ab")
+        self.fx.commit("published two-byte file")
+        published = self.fx.package()
+        self.fx.write("zz.txt", "ab\0")
+        self.fx.commit("grew by one NUL byte without a version bump")
+        real = pi.package_tree
+
+        def corrupted(*args):
+            raw = bytearray(gzip.decompress(real(*args)))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/zz.txt").offset
+            assert raw[o + 134] == ord("3") and raw[o + 114] == ord("0")
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the two cancel in the checksum
+            return gzip.compress(bytes(raw))
+
+        rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 1, out)  # control: the added NUL is seen
+        self.assertIn("differs: zz.txt", out)
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("the member does not carry the bytes on disk", out)
+
     def test_unchanged_file_with_a_carriage_return_in_its_name_is_ok(self) -> None:
         # GPT review on #416 (post-review): text-mode stdout turns a CR in a
         # name into an LF, which would report an unchanged file as changed.
@@ -783,6 +846,15 @@ class MutationTest(unittest.TestCase):
             "    if listed is not None and",
             "    if False and",
             ["PublishedIdentityTest.test_tree_archive_missing_a_member_is_not_green"],
+        ),
+        # The tree archive's member bytes not compared with the file on disk: a
+        # member shortened by a size-field edit that keeps the header checksum
+        # then goes green against a published file of that shorter length
+        # (#416, tree side).
+        "tree_member_bytes_not_checked": (
+            "    if on_disk != body:",
+            "    if False:",
+            ["PublishedIdentityTest.test_tree_member_size_lie_over_a_zero_byte_is_not_green"],
         ),
         # The end-of-archive check back to "something is there": a zeroed last
         # member header then leaves its own header and payload behind two
