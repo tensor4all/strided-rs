@@ -1,22 +1,44 @@
 #!/usr/bin/env python3
-"""Count the strided-rs audit baseline rows (docs/worklogs/2026-11-08-issue-216-*-baseline.md).
+"""Approximate the strided-rs audit baseline rows with a line-oriented scan.
 
-The worklog states one rule per row; this file is the only implementation of
-those rules. Run it as `python3 scripts/count-audit-metrics.py .` from the
-repository root. `scripts/test-count-audit-metrics.py` pins the cases a naive
-line scan gets wrong: block comments, line-spanning raw strings, `#[cfg(test)]
-mod name;` declarations, and `pub extern "C" fn`.
+Rows, as printed (production scope = `strided-*/src/**/*.rs`, a `tests/`
+component excluded, inline `#[cfg(test)] mod name { .. }` bodies skipped):
 
-Rows (production scope = `strided-*/src/**/*.rs`, `*/tests/` excluded, inline
-`#[cfg(test)] mod name { .. }` bodies skipped):
-
-  invariant               `//` line comments (doc comments excluded) containing the marker
+  invariant               `//` line comments containing the marker
   safety                  the same for `// SAFETY:`; an independent total, not paired with `unsafe`
-  unsafe                  occurrences of `unsafe` + `{` in code
-  pub_result / with_errors a `pub` `fn` whose signature (to the first `{` or `;`) returns `Result<`,
-                          and how many of those carry a `/// # Errors` line
-  inline_mods             `#[cfg(test)] mod name { .. }` blocks (declarations with `;` do not count)
+  unsafe                  occurrences of `unsafe` + `{` in the scanned text
+  pub_result / with_errors a `pub` `fn` whose signature (to the first `{` or `;` outside
+                          brackets) returns `Result<`, and how many of those carry a
+                          `/// # Errors` line
+  inline_mods             `#[cfg(test)] mod name { .. }` blocks (a `mod name;` declaration is 0)
   files_over_1000         `wc -l` over `strided-*/**/*.rs`
+
+Run it as `python3 scripts/count-audit-metrics.py .` from the repository root;
+`scripts/test-count-audit-metrics.py` pins the cases a plain line scan gets wrong.
+
+# This is an approximation, not a Rust parser
+
+The scanner tracks `/* */` (nested), line comments, char literals and string
+literals including `r#"…"#` across lines. Everything else is line-oriented, and
+the following are known to be miscounted. Do not read a row as exact, and do not
+quote one as proof that a file or a tree is clean:
+
+- `///` inside a string or inside a block comment starts a *doc* line for this
+  scanner, so a following `# Errors` can be credited to an item that does not
+  have one, and the text is dropped from the code rows.
+- A string literal inside an attribute or a macro invocation is blanked as a
+  string, so an item whose `pub` is produced by a macro is not seen at all.
+- Braces inside a macro body that the scanner reads as code still move the
+  `#[cfg(test)] mod` skip and the inline-module count.
+- `unsafe` is counted as the text `unsafe` + `{`, so `unsafe extern` blocks,
+  `unsafe fn` bodies whose brace sits on another item, and a macro that expands
+  to `unsafe {` are not distinguished.
+- `read_signature` treats `<` and `>` as brackets, so a signature with a
+  comparison operator reads to the wrong place.
+
+Where a row matters, measure the thing itself instead of this script: run
+`cargo test --doc` for the doctest row, and read a file for a per-block
+`// SAFETY:` audit.
 """
 
 from __future__ import annotations
@@ -211,11 +233,54 @@ def drop_test_bodies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return kept
 
 
+def read_signature(rows: list[dict[str, object]], start: int) -> str:
+    """Read a `fn` signature to its first `{` or `;` outside brackets.
+
+    A `;` inside `[u8; 4]`, a generic parameter list or a `where`-clause
+    lifetime is not the end of the item; only a `;` at bracket depth zero is.
+    """
+    depth = 0
+    parts: list[str] = []
+    for row in rows[start:]:
+        code = str(row["code"])
+        for index, char in enumerate(code):
+            if char in "([<{":
+                if char == "{" and depth == 0:
+                    parts.append(code[:index])
+                    return " ".join(parts)
+                depth += 1
+                continue
+            if char in ")]>}":
+                depth = max(depth - 1, 0)
+                continue
+            if char == ";" and depth == 0:
+                parts.append(code[:index])
+                return " ".join(parts)
+        parts.append(code)
+    return " ".join(parts)
+
+
+def relative_parts(path: Path, root: Path) -> tuple[str, ...]:
+    """Repo-relative path components.
+
+    The exclusions below must not look at the absolute path: a checkout under
+    `~/target/...` or `~/tests/...` would otherwise drop every file.
+    """
+    try:
+        return path.relative_to(root).parts
+    except ValueError:
+        return path.parts
+
+
 def count(root: Path) -> dict[str, int]:
     production = [
-        p for p in sorted(root.glob(PRODUCTION_GLOB)) if "/tests/" not in str(p)
+        p
+        for p in sorted(root.glob(PRODUCTION_GLOB))
+        if "tests" not in relative_parts(p, root)
     ]
-    all_source = [p for p in sorted(root.glob(ALL_SOURCE_GLOB)) if "/target/" not in str(p)]
+    all_source = [
+        p for p in sorted(root.glob(ALL_SOURCE_GLOB)) if "target" not in relative_parts(p, root)
+    ]
     rows = {p: drop_test_bodies(scan_file(p.read_text(encoding="utf-8"))) for p in production}
 
     invariant = safety = unsafe = 0
@@ -224,7 +289,10 @@ def count(root: Path) -> dict[str, int]:
             comment = str(row["comment"])
             invariant += comment.count("// INVARIANT:")
             safety += comment.count("// SAFETY:")
-            unsafe += len(UNSAFE_RE.findall(str(row["code_no_strings"])))
+        # Join the stripped lines before matching: `unsafe` and its `{` are often
+        # split across lines, and a per-line match loses every such block.
+        code = "\n".join(str(row["code_no_strings"]) for row in rows[p])
+        unsafe += len(UNSAFE_RE.findall(code))
 
     pub_result = with_errors = 0
     for p in production:
@@ -247,12 +315,7 @@ def count(root: Path) -> dict[str, int]:
             if not stripped:
                 continue
             if FUNCTION_RE.match(code):
-                signature = []
-                for part in rows[p][i:]:
-                    signature.append(re.split(r"[{;]", str(part["code"]), 1)[0])
-                    if re.search(r"[{;]", str(part["code"])):
-                        break
-                flat = " ".join(signature)
+                flat = read_signature(rows[p], i)
                 if "->" in flat and "Result<" in flat.split("->", 1)[1]:
                     pub_result += 1
                     with_errors += has_errors
@@ -264,7 +327,10 @@ def count(root: Path) -> dict[str, int]:
             if str(row["code"]).strip() != "#[cfg(test)]":
                 continue
             j = i + 1
-            while j < len(rows) and str(rows[j]["code"]).strip().startswith("#["):
+            while j < len(rows) and (
+                not str(rows[j]["code"]).strip()
+                or str(rows[j]["code"]).strip().startswith("#[")
+            ):
                 j += 1
             if j < len(rows) and INLINE_TEST_MOD_RE.match(str(rows[j]["code"]).strip()):
                 inline_mods += 1

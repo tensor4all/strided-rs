@@ -109,6 +109,68 @@ def test_extern_c_function_is_in_the_result_denominator() -> None:
     assert counts["pub_result"] == 1, counts
 
 
+def test_unsafe_split_across_lines_is_counted() -> None:
+    """`unsafe` and its `{` may sit on different lines."""
+    counts = count_sources(
+        {
+            "split.rs": (
+                "pub fn f() {\n"
+                "    unsafe\n"
+                "    {\n"
+                "        core::hint::black_box(1);\n"
+                "    }\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["unsafe"] == 1, counts
+
+
+def test_array_semicolon_does_not_end_the_signature() -> None:
+    """`[u8; 4]` in a parameter list is not the end of the item."""
+    counts = count_sources(
+        {
+            "array_param.rs": (
+                "pub fn f(buf: [u8; 4]) -> Result<(), ()> {\n"
+                "    let _ = buf;\n"
+                "    Ok(())\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["pub_result"] == 1, counts
+
+
+def test_blank_line_between_cfg_test_and_mod_is_an_inline_block() -> None:
+    counts = count_sources(
+        {
+            "blanks.rs": (
+                "#[cfg(test)]\n"
+                "\n"
+                "mod tests {\n"
+                "    fn inner() {\n"
+                "        unsafe {}\n"
+                "    }\n"
+                "}\n"
+            )
+        }
+    )
+    assert counts["inline_mods"] == 1, counts
+    assert counts["unsafe"] == 0, counts
+
+
+def test_path_exclusions_use_repo_relative_components() -> None:
+    """A checkout under a directory named `target` or `tests` still counts its files."""
+    mod = load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "target" / "tests" / "checkout"
+        src = root / "strided-x" / "src"
+        src.mkdir(parents=True)
+        (src / "real.rs").write_text("pub fn f() {\n    unsafe {}\n}\n", encoding="utf-8")
+        counts = mod.count(root)
+    assert counts["unsafe"] == 1, counts
+
+
 def test_doc_block_survives_attributes() -> None:
     """`# Errors` above `#[inline]` / `#[must_use]` still documents the item."""
     counts = count_sources(
