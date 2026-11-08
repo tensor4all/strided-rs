@@ -1,0 +1,89 @@
+name: Miri
+
+# provenance 違反（Stacked Borrows / Tree Borrows）は Miri でしか観測できない。
+# ただし 1 回 15〜20 分かかるので **PR ごとの必須レーンには置かない**。週次で回し、
+# 失敗したら **issue を作る**（通知で終わらせない。issue なら手番と履歴が残る）。
+on:
+  schedule:
+    - cron: "0 18 * * 0"   # 日曜 18:00 UTC = 月曜 03:00 JST（週 1 回）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write        # 失敗時に issue を作るため
+
+env:
+  CARGO_TERM_COLOR: always
+  MIRIFLAGS: -Zmiri-disable-isolation
+
+jobs:
+  miri:
+    name: cargo miri (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: lib
+            args: -p strided-view --lib
+          - target: provenance
+            args: -p strided-view --test view_mut_ptr_provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.target }}
+
+      - name: cargo miri setup
+        run: cargo miri setup
+
+      - name: cargo miri test
+        id: run
+        continue-on-error: true
+        run: cargo miri test ${{ matrix.args }}
+
+      - name: File an issue when Miri fails
+        if: steps.run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          TARGET: ${{ matrix.target }}
+          ARGS: ${{ matrix.args }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          MARK="<!-- miri-failure:${TARGET} -->"
+          # 同じ target の open issue があればコメントで積む（毎週 issue を増やさない）。
+          # GitHub の検索は HTML コメントを索引しないことがあるので、open を取って本文で照合する。
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --json number,body --limit 100 \
+            --jq "[.[] | select(.body | contains(\"${MARK}\"))] | .[0].number // empty")
+          body=$(mktemp)
+          {
+            echo "$MARK"
+            echo "Miri (\`${ARGS}\`) が main で失敗しました。"
+            echo
+            echo "- commit: \`${SHA}\`"
+            echo "- 実行: \`${RUN_URL}\`"
+            echo "- 再現: \`MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test ${ARGS}\`"
+            echo
+            echo "provenance 違反は通常の \`cargo test\` では検出できません（このレーンだけが見ます）。"
+          } > "$body"
+          if [ -n "${existing}" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file "$body"
+            echo "commented on #${existing}"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "miri: ${ARGS} fails on main" \
+              --body-file "$body" || true
+          fi
+          rm -f "$body"
+
+      - name: Fail the job if Miri failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1
