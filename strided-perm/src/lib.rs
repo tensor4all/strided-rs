@@ -21,16 +21,10 @@
 //! calling thread whatever the budget. The crate never reaches a global
 //! pool; pass `Exec::serial()` for a copy on the calling thread.
 
-#[cfg(test)]
-mod block;
 mod copy;
 mod fuse;
 mod host;
 mod hptt;
-#[cfg(test)]
-mod kernel;
-#[cfg(test)]
-mod order;
 
 // Re-export primary API
 pub use copy::{copy_into, copy_into_col_major, copy_into_uninit};

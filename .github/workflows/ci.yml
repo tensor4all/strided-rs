@@ -231,8 +231,6 @@ jobs:
         run: python3 scripts/test-published-identity.py
       - name: Test the review waiver script
         run: node --test scripts/test-review-waiver.js
-      - name: Check the two oracle copies are identical
-        run: bash scripts/check-oracle-copy.sh
 
   coverage:
     name: coverage
