@@ -500,19 +500,22 @@ fn test_compute_importance_matches_exact_reference() {
         let powers: Vec<isize> = (0..n).map(|i| 1isize << i).collect();
         let perms = permutations(&powers);
 
-        // Every size-1 variant: none, each single axis, and the non-adjacent
-        // pair that makes `[2, 1, 2]` reachable.
+        // Every size-1 variant with at most two singleton axes: none, each
+        // single axis, and every axis pair (including the non-adjacent
+        // `[2, 1, 2]` shape).
         let mut dim_grids: Vec<Vec<usize>> = vec![vec![2usize; n]];
         for i in 0..n {
             let mut dims = vec![2usize; n];
             dims[i] = 1;
             dim_grids.push(dims);
         }
-        if n >= 3 {
-            let mut dims = vec![2usize; n];
-            dims[0] = 1;
-            dims[n - 1] = 1;
-            dim_grids.push(dims);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut dims = vec![2usize; n];
+                dims[i] = 1;
+                dims[j] = 1;
+                dim_grids.push(dims);
+            }
         }
 
         for m in 1..=4usize {
