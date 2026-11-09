@@ -364,7 +364,7 @@ pub(crate) struct PairTiles {
 /// size exactly as the view path does. Tiles are returned only when they
 /// change the visit order (the first axis whose block is smaller than its
 /// extent is followed by an axis with a block above 1) and when that change can
-/// reuse a cache line (see [`slabs_share_no_line`]).
+/// reuse a cache line (see [`crate::block::declines_tiles`]).
 ///
 /// The extents of `layout` must have a product that fits `usize` (every
 /// constructor of a [`FusedPairLayout`] checks it).
@@ -424,10 +424,12 @@ fn tile_blocks<D, S>(
     }
     // The axes before `first_cut` are walked whole inside every tile, so each
     // operand is judged with its own element size, as the model now does.
-    if first_cut > 0
-        && slabs_share_no_line(dims, dst, first_cut, core::mem::size_of::<D>())
-        && slabs_share_no_line(dims, src, first_cut, core::mem::size_of::<S>())
-    {
+    if crate::block::declines_tiles(
+        dims,
+        &[dst, src],
+        &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
+        &model,
+    ) {
         return None;
     }
     Some(model)
@@ -507,76 +509,6 @@ fn without_unit_axes(layout: &FusedPairLayout) -> FusedPairLayout {
     }
     compressed.rank = rank;
     compressed
-}
-
-/// Whether one operand's *slabs*, its sub-boxes over the leading `prefix`
-/// axes at each coordinate of the other axes, provably share no cache line,
-/// so that no visit order of the other axes can reuse a line across slabs.
-///
-/// Both walks visit every slab contiguously in the same internal order, so a
-/// tiled walk can save traffic only on a line touched by two slabs. With the
-/// byte span `w` of a slab's bounding interval and the tail byte strides all
-/// multiples of the cache line, and the tail strides nested (each, in
-/// ascending order, at least `w` plus the spans of the smaller ones), the
-/// bounding intervals of distinct slabs are disjoint and congruent modulo the
-/// line. The helper sees no base address and assumes the lowest address of
-/// each bounding interval is line-aligned. An aligned coordinate-zero pointer
-/// is not enough when a prefix stride is negative. Under that assumption every
-/// slab has lines of its own. Otherwise address-adjacent slabs can share one
-/// boundary line, so declining forgoes at most one reuse per adjacent pair,
-/// `S - 1` for `S` slabs. That is a large share of the touched lines for
-/// sparse or line-sized slabs. A zero-sized operand moves no line. Arithmetic
-/// is checked, and an unrepresentable quantity answers `false`, which keeps
-/// the tiles.
-///
-/// Strided.jl's `_computeblocks` has no such exit: it tiles these layouts
-/// because the kept prefix's region exceeds its budget, although the tile
-/// only reorders slabs that share nothing.
-fn slabs_share_no_line(dims: &[usize], strides: &[isize], prefix: usize, elem_size: usize) -> bool {
-    if elem_size == 0 {
-        return true;
-    }
-    let line = crate::CACHE_LINE_SIZE as u128;
-    let elem = elem_size as u128;
-    // `|s| * elem < 2^127`; only the products with extents and the sums can
-    // overflow.
-    let byte = |axis: usize| strides[axis].unsigned_abs() as u128 * elem;
-    let reach = |axis: usize| ((dims[axis] - 1) as u128).checked_mul(byte(axis));
-    let Some(width) = (0..prefix).try_fold(elem, |width, axis| width.checked_add(reach(axis)?))
-    else {
-        return false;
-    };
-    if width % line != 0 {
-        return false;
-    }
-    // Inline up to `RAW_FUSED_RANK_LIMIT`, heap above it: the spilled route
-    // reaches this with more axes (issue #425), and the inline route must stay
-    // allocation-free.
-    let count = dims.len() - prefix;
-    let mut inline = [(0u128, 0usize); RAW_FUSED_RANK_LIMIT];
-    let mut spilled = Vec::new();
-    let tail: &mut [(u128, usize)] = if count <= RAW_FUSED_RANK_LIMIT {
-        let tail = &mut inline[..count];
-        for (slot, axis) in tail.iter_mut().zip(prefix..dims.len()) {
-            *slot = (byte(axis), axis);
-        }
-        tail
-    } else {
-        spilled.extend((prefix..dims.len()).map(|axis| (byte(axis), axis)));
-        &mut spilled
-    };
-    tail.sort_unstable();
-    let mut span = width;
-    for &(stride, axis) in tail.iter() {
-        if stride % line != 0 || stride < span {
-            return false;
-        }
-        let Some(next) = reach(axis).and_then(|reach| span.checked_add(reach)) else {
-            return false;
-        };
-        span = next;
-    }
-    true
 }
 
 /// Replay every logical index of `tile_box` tile by tile: the tiles of extents
