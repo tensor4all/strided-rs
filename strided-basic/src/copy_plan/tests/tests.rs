@@ -831,8 +831,29 @@ fn a_reversed_dense_buffer_keeps_the_copy_row() {
         crate::cost::KernelClass::Copy.ns_per_element(),
         "the copy row is the calibrated rate of a streamed copy"
     );
+    // Above the inline rank the traversal spills with every axis kept, and the
+    // dense reversed run must keep the row there too: 4^9 f64 at -1, -4, ... .
+    let dims = [4usize; 9];
+    let mut stride = -1isize;
+    let nine_strides: Vec<isize> = (0..9)
+        .map(|_| {
+            let this = stride;
+            stride *= 4;
+            this
+        })
+        .collect();
+    let plan = CopyPlan::compile(&dims, &nine_strides, &nine_strides).unwrap();
+    assert!(
+        plan.is_contiguous_run(),
+        "a dense reversed buffer above the inline rank is one streamed run"
+    );
+    assert_eq!(
+        plan.ns_per_element::<f64, f64>(),
+        crate::cost::KernelClass::Copy.ns_per_element(),
+        "the copy row covers a reversed dense run at every rank"
+    );
     // A sign flip between the axes makes the walk jump: two runs, priced as strided.
-    let mixed = CopyPlan::compile(&dims, &[-1isize, 512], &strides).unwrap();
+    let mixed = CopyPlan::compile(&[512usize, 512], &[-1isize, 512], &[-1isize, -512]).unwrap();
     assert!(!mixed.is_contiguous_run(), "mixed signs are not one run");
 }
 

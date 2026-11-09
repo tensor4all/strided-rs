@@ -372,11 +372,13 @@ fn main() {
         println!("copy_into {n}x{n} transpose={r:7.3} ns/el");
     }
 
-    // The width the flat row asks for, for the two acceptance sizes.
+    // The width the flat row asks for, at the pool width: `Exec::new(&pool, 96)`
+    // clamps to the 16 slots the builder made, so the budget is 16 here.
     let exec = Exec::new(&pool, 96).unwrap();
+    assert_eq!(exec.width(), 16, "the pool in this harness has 16 slots");
     for (label, total) in [("512x512", 512usize * 512), ("4096", 4096)] {
         println!(
-            "{label} flat width at budget 96 = {}",
+            "{label} flat width at budget 16 (the pool width) = {}",
             parallel_width(&exec, KernelClass::Copy, total).get()
         );
     }
