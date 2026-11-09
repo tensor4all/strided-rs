@@ -251,7 +251,9 @@ fn dispatch_ten_tanh_f32(values: &[f32]) -> Vec<f32> {
         let mut uninit = vec![MaybeUninit::<f32>::uninit(); current.len()];
         elem_simd_math::f32::tanh(&current, &mut uninit).unwrap();
         for (slot, value) in next.iter_mut().zip(uninit) {
-            // SAFETY: the kernel writes every element before returning `Ok`.
+            // SAFETY: the `tanh` call above returned `Ok` (it is unwrapped) with `uninit` and
+            // `current` of equal length, and it writes every `dst[i]` on success (elem-simd-math
+            // 0.1.1 `src/dispatch.rs:3`).
             *slot = unsafe { value.assume_init() };
         }
         std::mem::swap(&mut current, &mut next);
@@ -489,7 +491,10 @@ fn erased_uninitialized_replay_matches_per_instruction_dispatch() {
 
     let reference = dispatch_ten_tanh_f32(&values);
     for (index, (slot, expected)) in output.iter().zip(&reference).enumerate() {
-        // SAFETY: `execute_uninit` writes every reachable element.
+        // SAFETY: `output` has `length` slots under `dims` `[length]` with stride `[1]`, so the
+        // layout reaches every slot, and `execute_uninit` returned `Ok`; the erased fused plan
+        // documents that every logical destination element is then initialized
+        // (strided-fused/src/erased.rs:221).
         let got = unsafe { slot.assume_init() };
         assert_eq!(got.to_bits(), expected.to_bits(), "element {index}");
     }
@@ -964,9 +969,11 @@ fn chunked_replay_parallel_pool_matches_reference() {
     assert!(threadteam::ledger::max_live(root) <= 2);
 
     for index in 0..len {
-        // SAFETY: `execute_outputs_uninit` writes every reachable element.
+        // SAFETY: both destinations have `len` slots under `[len]`/`[1]`, so their layouts reach
+        // every slot, and `execute_outputs_uninit` returned `Ok`, which initializes every logical
+        // destination element (strided-fused/src/erased.rs:221).
         let pass = unsafe { pass_through[index].assume_init() };
-        // SAFETY: as above.
+        // SAFETY: as for `pass_through` above.
         let value = unsafe { product[index].assume_init() };
         assert_eq!(pass, a[0], "pass-through element {index}");
         assert_eq!(value, a[0] * b[index], "product element {index}");

@@ -220,12 +220,28 @@ fn ping_pong_mul<T: BenchScalar>(
         // SAFETY: `first`/`second` are distinct buffers; the raw read of one and
         // the mutable borrow of the other do not overlap.
         if pass % 2 == 1 {
+            // SAFETY: this reads `len` initialized `T`s from `first`. The previous call (the
+            // pass-0 `mul_into_uninit` above, or the previous even pass) wrote `first` through
+            // `dims`/`strides` are `[rows, cols]`/`[1, rows]` (fused_chunked_replay.rs:391,
+            // passed as `b_strides` at fused_chunked_replay.rs:482), which reaches all `len =
+            // rows * cols` slots, and `mul_into_uninit` returns `Ok` only with every logical
+            // destination element initialized (strided-basic/src/map_view.rs:2178).
+            // `MaybeUninit<T>` has the layout of `T`. While the shared slice lives, `first` is
+            // not written: only `second` is borrowed mutably, and the two are distinct buffers.
             let src_data: &[T] =
                 unsafe { std::slice::from_raw_parts(first.as_ptr().cast::<T>(), len) };
             let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
             let mut dest = StridedViewMut::new(second, dims, strides, 0).unwrap();
             mul_into_uninit(&mut dest, &src, b_view, place.exec()).unwrap();
         } else {
+            // SAFETY: this reads `len` initialized `T`s from `second`. The previous odd pass
+            // wrote `second` through `dims`/`strides` are `[rows, cols]`/`[1, rows]`
+            // (fused_chunked_replay.rs:391, passed as `b_strides` at
+            // fused_chunked_replay.rs:482), which reaches all `len = rows * cols` slots, and
+            // `mul_into_uninit` returns `Ok` only with every logical destination element
+            // initialized (strided-basic/src/map_view.rs:2178). `MaybeUninit<T>` has the layout
+            // of `T`. While the shared slice lives, `second` is not written: only `first` is
+            // borrowed mutably, and the two are distinct buffers.
             let src_data: &[T] =
                 unsafe { std::slice::from_raw_parts(second.as_ptr().cast::<T>(), len) };
             let src = StridedView::<T>::new(src_data, dims, strides, 0).unwrap();
@@ -270,7 +286,16 @@ fn ping_pong_unary<T: BenchScalar>(
     };
     map(first, a_view);
     for pass in 1..10 {
-        // SAFETY: as for `ping_pong_mul`.
+        // SAFETY: this reads `len` initialized `T`s from the buffer the previous pass wrote
+        // (`first` on odd passes, `second` on even ones). That pass's `map` wrote it through
+        // `dims`/`strides` are `[rows, cols]`/`[1, rows]` (fused_chunked_replay.rs:391, passed
+        // as `b_strides` at fused_chunked_replay.rs:482), which reaches all `len = rows *
+        // cols` slots, and `map_into_uninit_with_kernel` writes every destination element exactly
+        // once (strided-basic/src/map_view.rs:1357), given a kernel that writes a whole run or
+        // returns `false` (strided-basic/src/map_view.rs:1349); `tanh_slice` unwraps the
+        // elem-simd-math call, so it writes every element or panics. `MaybeUninit<T>` has the
+        // layout of `T`. The buffer is not written while the shared slice lives, because `map`
+        // borrows only the other buffer mutably.
         let src_data: &[T] = unsafe {
             let pointer = if pass % 2 == 1 {
                 first.as_ptr()
@@ -328,8 +353,15 @@ fn per_instruction<T: BenchScalar>(
             ping_pong_mul(
                 &a_view, &b_view, dims, b_strides, len, buffer0, buffer1, place,
             );
-            // SAFETY: `buffer1` is read through a raw pointer while `buffer2`
-            // is written; they are distinct buffers.
+            // SAFETY: this reads `len` initialized `T`s from `buffer1`. `ping_pong_mul` ends its
+            // tenth pass in its second buffer, which is `buffer1` here, so its last
+            // `mul_into_uninit` wrote `buffer1` through `dims`/`strides` are `[rows, cols]`/`[1,
+            // rows]` (fused_chunked_replay.rs:391, passed as `b_strides` at
+            // fused_chunked_replay.rs:482), which reaches all `len = rows * cols` slots, and
+            // `mul_into_uninit` returns `Ok` only with every logical destination element
+            // initialized (strided-basic/src/map_view.rs:2178). `MaybeUninit<T>` has the layout
+            // of `T`. While the shared slice lives, `buffer1` is not written: only `buffer2` is
+            // borrowed mutably, and the two are distinct buffers.
             let chain_data: &[T] =
                 unsafe { std::slice::from_raw_parts(buffer1.as_ptr().cast::<T>(), len) };
             let chain = StridedView::<T>::new(chain_data, dims, b_strides, 0).unwrap();
