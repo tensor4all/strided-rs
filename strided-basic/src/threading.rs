@@ -242,6 +242,26 @@ pub(crate) fn record_tile_boxes(count: usize) {
     TILE_BOXES.with(|n| n.set(n.get() + count));
 }
 
+// Dispatched ranges of the whole-plan concatenate replay that walked at least
+// one cache tile, recorded on the calling thread after the dispatch.
+#[cfg(test)]
+thread_local! {
+    static TILED_RANGES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Records `count` dispatched ranges that walked at least one tile.
+#[cfg(test)]
+pub(crate) fn record_tiled_ranges(count: usize) {
+    TILED_RANGES.with(|n| n.set(n.get() + count));
+}
+
+/// The dispatched ranges that walked tiles, recorded on this thread since the
+/// last call, and resets the count.
+#[cfg(test)]
+pub(crate) fn take_tiled_ranges() -> usize {
+    TILED_RANGES.with(|n| n.replace(0))
+}
+
 /// The cache-tile boxes visited on this thread since the last call, and resets
 /// the count.
 #[cfg(test)]

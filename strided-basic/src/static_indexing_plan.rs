@@ -1603,19 +1603,22 @@ impl ConcatenatePlan {
         let segment_tiles = &segment_tiles;
         #[cfg(test)]
         let walked_tiles = core::sync::atomic::AtomicUsize::new(0);
+        #[cfg(test)]
+        let tiled_ranges = core::sync::atomic::AtomicUsize::new(0);
+        // The tile walk records each tile it visits on the thread that walks
+        // it. Each dispatched range moves its tiles from that thread's count
+        // to `walked_tiles`, and counts itself in `tiled_ranges` when it walked
+        // any, keeping what the thread had counted before; both reach the
+        // caller's counters after the dispatch.
+        #[cfg(test)]
+        let count_range = || MoveTileCount {
+            counted_before: crate::threading::take_tile_boxes(),
+            walked: &walked_tiles,
+            tiled_ranges: &tiled_ranges,
+        };
         // Replay the elements `local_start..local_end` of one segment: the
         // tiles whose share starts in them, or the flat range.
         let replay_segment = |position: usize, local_start: usize, local_end: usize| {
-            // The tile walk records each tile it visits on the thread that
-            // walks it. Move this call's tiles from the worker's count to the
-            // caller's (below), keeping what the thread had counted before.
-            #[cfg(test)]
-            let counted_before = crate::threading::take_tile_boxes();
-            #[cfg(test)]
-            let _move_tiles = MoveTileCount {
-                counted_before,
-                walked: &walked_tiles,
-            };
             // The whole-plan guard above proved every segment has an inline
             // fused layout; skip one only if a future caller relaxes that
             // check.
@@ -1675,6 +1678,8 @@ impl ConcatenatePlan {
             // drew contiguous segments idle (#427).
             let width = exec.budget().get();
             crate::threading::parallel_for_each(0..width, exec, &|slots| {
+                #[cfg(test)]
+                let _count = count_range();
                 for position in 0..inputs.len() {
                     let segment_len = starts[position + 1] - starts[position];
                     if segment_len == 0 {
@@ -1689,6 +1694,8 @@ impl ConcatenatePlan {
             });
         } else {
             crate::threading::parallel_for_each(0..total, exec, &|range| {
+                #[cfg(test)]
+                let _count = count_range();
                 // First segment whose end lies past the range start.
                 let mut position = starts[1..].partition_point(|&end| end <= range.start);
                 while position < inputs.len() && starts[position] < range.end {
@@ -1700,7 +1707,10 @@ impl ConcatenatePlan {
             });
         }
         #[cfg(test)]
-        crate::threading::record_tile_boxes(walked_tiles.into_inner());
+        {
+            crate::threading::record_tile_boxes(walked_tiles.into_inner());
+            crate::threading::record_tiled_ranges(tiled_ranges.into_inner());
+        }
         Ok(true)
     }
 
@@ -1852,11 +1862,13 @@ impl ConcatenatePlan {
 }
 
 /// Moves the tile boxes the current thread recorded since it was built into
-/// `walked`, and restores the count the thread had before, when dropped.
+/// `walked`, counts one range in `tiled_ranges` when there were any, and
+/// restores the count the thread had before, when dropped.
 #[cfg(test)]
 struct MoveTileCount<'a> {
     counted_before: usize,
     walked: &'a core::sync::atomic::AtomicUsize,
+    tiled_ranges: &'a core::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1865,6 +1877,10 @@ impl Drop for MoveTileCount<'_> {
         let walked = crate::threading::take_tile_boxes();
         self.walked
             .fetch_add(walked, core::sync::atomic::Ordering::Relaxed);
+        if walked > 0 {
+            self.tiled_ranges
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         crate::threading::record_tile_boxes(self.counted_before);
     }
 }

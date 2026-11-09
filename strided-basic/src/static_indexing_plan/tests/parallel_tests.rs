@@ -533,6 +533,8 @@ struct ConcatRun {
     values: Vec<i64>,
     tiles: usize,
     chunks: usize,
+    /// Dispatched ranges of this call that walked at least one tile.
+    tiled_ranges: usize,
 }
 
 /// Run `plan` once through `execute` and once through `execute_uninit` on
@@ -551,9 +553,11 @@ fn concat_runs(
     let mut dest = RawStridedMut::new(&mut init, dest_dims, dest_strides, base).unwrap();
     crate::threading::take_tile_boxes();
     crate::threading::take_dispatched_chunks();
+    crate::threading::take_tiled_ranges();
     plan.execute(&mut dest, inputs, exec.reborrow()).unwrap();
     let init_tiles = crate::threading::take_tile_boxes();
     let init_chunks = crate::threading::take_dispatched_chunks();
+    let init_tiled_ranges = crate::threading::take_tiled_ranges();
 
     let mut storage = vec![MaybeUninit::new(-1i64); len];
     let mut dest = RawStridedMut::new(&mut storage, dest_dims, dest_strides, base).unwrap();
@@ -561,6 +565,7 @@ fn concat_runs(
         .unwrap();
     let uninit_tiles = crate::threading::take_tile_boxes();
     let uninit_chunks = crate::threading::take_dispatched_chunks();
+    let uninit_tiled_ranges = crate::threading::take_tiled_ranges();
     // SAFETY: every slot was initialized to -1 before execution.
     let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
     [
@@ -569,12 +574,14 @@ fn concat_runs(
             values: read_logical(&init, dest_dims, dest_strides, base),
             tiles: init_tiles,
             chunks: init_chunks,
+            tiled_ranges: init_tiled_ranges,
         },
         ConcatRun {
             entry: "execute_uninit",
             values: read_logical(&uninit, dest_dims, dest_strides, base),
             tiles: uninit_tiles,
             chunks: uninit_chunks,
+            tiled_ranges: uninit_tiled_ranges,
         },
     ]
 }
@@ -647,6 +654,14 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
             "{entry}: the whole-plan replay must dispatch the tiled segments across the budget (dispatched {} chunks)",
             parallel.chunks
         );
+        // And the tiles themselves must be spread: a split that hands every
+        // tile of a segment to one range keeps the values, the tile count and
+        // the chunk count, so count the ranges that actually walked tiles.
+        assert!(
+            parallel.tiled_ranges >= 2,
+            "{entry}: the tiles must be walked by at least two dispatched ranges (walked by {})",
+            parallel.tiled_ranges
+        );
     }
 
     // Contiguous segments only: no tiles on either path, and the whole plan
@@ -683,6 +698,7 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
         let entry = parallel.entry;
         assert_eq!(parallel.values, serial.values, "{entry}: values");
         assert_eq!((serial.tiles, parallel.tiles), (0, 0), "{entry}: tiles");
+        assert_eq!(parallel.tiled_ranges, 0, "{entry}: no range walks tiles");
         assert!(
             parallel.chunks >= 2,
             "{entry}: the contiguous concatenation must keep the flat split (dispatched {} chunks)",
