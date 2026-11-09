@@ -814,7 +814,7 @@ impl UpdatePlan {
 ///
 /// `ns_per_element` is the serial rate the untiled replay prices itself at; a plan
 /// whose footprint is past its class's L2 passes its own
-/// ([`CopyPlan::ns_per_element`]), every other caller passes the rate of
+/// ([`CopyPlan::ns_per_element_on`]), every other caller passes the rate of
 /// `KernelClass::Copy` ([`crate::cost::KernelClass::ns_per_element`]). The tiled
 /// replay keeps its own gating.
 pub(crate) unsafe fn replay_fused<D, S, Apply>(
