@@ -604,7 +604,17 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
         plan.prefers_whole_plan(&exec),
         "the case must reach the whole-plan parallel replay"
     );
+    crate::threading::take_dispatched_chunks();
     let parallel = concat_runs(&plan, &inputs, &dest_dims, &dest_strides, exec);
+    // The tiled segments must be split across the budget here, not walked as
+    // one chunk: a single invocation of the tiled closure over `0..width`
+    // preserves the values and the aggregate tile count, so only the dispatch
+    // count tells the two apart.
+    let dispatched = crate::threading::take_dispatched_chunks();
+    assert!(
+        dispatched > 2,
+        "the whole-plan replay must dispatch the tiled segments across the budget (dispatched {dispatched} chunks)"
+    );
     for (entry, (serial, parallel)) in ["execute", "execute_uninit"]
         .iter()
         .zip(serial.iter().zip(&parallel))

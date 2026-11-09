@@ -146,6 +146,11 @@ fn case(
 fn main() {
     let threads = env_usize("CONCAT_BENCH_THREADS", 4);
     let reps = env_usize("CONCAT_BENCH_REPS", 41);
+    assert!(threads > 0, "CONCAT_BENCH_THREADS must be at least 1");
+    assert!(
+        reps > 0,
+        "CONCAT_BENCH_REPS must be at least 1: zero reps leaves every sample vector empty, so the median would index an empty slice"
+    );
     let pool = Pool::builder().threads(threads).build().expect("a pool");
     println!("threads {threads}, median of {reps} reps after {WARMUP} warm-up");
     case(
