@@ -328,7 +328,6 @@ fn a_mixed_size_map_writes_every_element_of_the_transposed_layout() {
     }
 }
 
-
 /// tensor4all/strided-rs#431 review: the value assertions above cannot tell the
 /// per-operand tiling from the uniform one, so pin the traversal itself. With
 /// the caller sizing each operand by its own element size the same fixture is
