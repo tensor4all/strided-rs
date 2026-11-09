@@ -360,11 +360,11 @@ pub(crate) struct PairTiles {
 /// order, and an unvalidated stride on such an axis never reaches the block
 /// arithmetic. Fewer than two remaining axes form one run, whose order no
 /// block vector can change. The blocks come from the shared model
-/// (`block::compute_block_sizes`) with the view path's element-size
-/// convention, the larger of the two element sizes. Tiles are returned only
-/// when they change the visit order (the first axis whose block is smaller
-/// than its extent is followed by an axis with a block above 1) and when that
-/// change can reuse a cache line (see [`slabs_share_no_line`]).
+/// (`block::compute_block_sizes`), which sizes each operand by its own element
+/// size exactly as the view path does. Tiles are returned only when they
+/// change the visit order (the first axis whose block is smaller than its
+/// extent is followed by an axis with a block above 1) and when that change can
+/// reuse a cache line (see [`slabs_share_no_line`]).
 ///
 /// The extents of `layout` must have a product that fits `usize` (every
 /// constructor of a [`FusedPairLayout`] checks it).
@@ -416,14 +416,14 @@ fn tile_blocks<D, S>(
     let model = crate::block::reduced_block_sizes(
         dims,
         &[dst, src],
-        core::mem::size_of::<D>().max(core::mem::size_of::<S>()),
+        &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
     )?;
     let first_cut = (0..dims.len()).find(|&axis| model[axis] < dims[axis])?;
     if model[first_cut + 1..].iter().all(|&block| block == 1) {
         return None;
     }
-    // The axes before `first_cut` are walked whole inside every tile; each
-    // operand is judged with its own element size, not the model's.
+    // The axes before `first_cut` are walked whole inside every tile, so each
+    // operand is judged with its own element size, as the model now does.
     if first_cut > 0
         && slabs_share_no_line(dims, dst, first_cut, core::mem::size_of::<D>())
         && slabs_share_no_line(dims, src, first_cut, core::mem::size_of::<S>())
@@ -466,12 +466,12 @@ pub(crate) fn spilled_pair_tiles<D, S>(axes: &[FusedAxis]) -> Option<Tiles> {
     // The exits the model decides before its metadata are answered from the axes,
     // before any slice is materialized: a call it declines allocates nothing
     // ([#425]).
-    let elem_size = core::mem::size_of::<D>().max(core::mem::size_of::<S>());
     if crate::block::exits_before_metadata(
         axes.iter()
             .filter(|axis| axis.dim != 1)
             .map(|axis| (axis.dim, axis.dst, axis.src)),
-        elem_size,
+        core::mem::size_of::<D>(),
+        core::mem::size_of::<S>(),
     ) {
         return None;
     }

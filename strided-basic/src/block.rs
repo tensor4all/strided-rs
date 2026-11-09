@@ -4,10 +4,25 @@
 //! It uses Julia's `totalmemoryregion` for accurate memory region estimation
 //! and `_computeblocks` for iterative block size reduction.
 //!
+//! # Element sizes
+//!
+//! Every operand carries its own element size, as Strided.jl forms byte
+//! strides per array (`sizeof.(eltype.(arrays))`, `src/mapreduce.jl`). A
+//! zero-size operand (a ZST, or an operand whose type has no storage) has a
+//! zero byte stride on every axis, so every one of its stride orders is `1`.
+//! It therefore contributes one cache line to the region and never shrinks a
+//! block by itself, but it is *not* neutral: its constant order `1` is the
+//! global minimum at every recursion level, so another operand's larger order
+//! no longer matches it and the keep-first recursion stops. Byte-stride
+//! strict increase, and with it the exit that keeps every axis, therefore
+//! requires every element size to be positive. When every operand has size
+//! zero, all orders are `1` everywhere and the model keeps the full
+//! dimensions.
+//!
 //! # Arithmetic contract
 //!
 //! Byte strides, memory regions and halving scores are evaluated in `u128`
-//! from exact byte magnitudes `|s| · elem_size`; a memory region is first
+//! from exact byte magnitudes `|s| · elem_size[k]`; a memory region is first
 //! attempted in checked `u64`, which gives the same exact value when no step
 //! overflows and otherwise defers to `u128`. For extents `d ≥ 1` whose
 //! product fits in `usize` (callers check it with `kernel::total_len`), every
@@ -33,14 +48,14 @@ use strided_view::auxiliary::index_order;
 type Scratch<T> = tinyvec::TinyVec<[T; OPERAND_CAP * strided_view::INLINE_RANK]>;
 
 /// The core's per-operand metadata. Byte strides are formed on the fly from
-/// the element strides (`|s| * elem_size`, exact in `u128`) rather than
+/// the element strides (`|s| * elem_size[k]`, exact in `u128`) rather than
 /// stored; the stride orders sit in one flat table where row `k` holds
 /// operand `k` at a pitch of the original rank on every recursion level, so
 /// the suffix at `offset` is `[k * pitch + offset .. (k + 1) * pitch]`.
 struct Rows<'a> {
     pitch: usize,
     strides: &'a [&'a [isize]],
-    elem_size: usize,
+    elem_sizes: &'a [usize],
     orders: &'a [usize],
 }
 
@@ -65,37 +80,40 @@ impl Rows<'_> {
 /// * `dims` - The dimensions, in iteration order, each at least 1
 /// * `strides_list` - Slice of element stride arrays, one per array, in the
 ///   same order as `dims`
-/// * `elem_size` - Size of each element in bytes
+/// * `elem_sizes` - Element size in bytes of each operand, in the same order
 ///
 /// # Returns
 /// Block sizes in iteration order
 pub(crate) fn compute_block_sizes(
     dims: &[usize],
     strides_list: &[&[isize]],
-    elem_size: usize,
+    elem_sizes: &[usize],
 ) -> InlineVec<usize> {
-    reduced_block_sizes(dims, strides_list, elem_size).unwrap_or_else(|| InlineVec::from(dims))
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    reduced_block_sizes(dims, strides_list, elem_sizes).unwrap_or_else(|| InlineVec::from(dims))
 }
 
 /// The model's block vector, or `None` when one of its sufficient exits keeps
-/// the full dimensions before any metadata is built: rank zero, a zero
-/// `elem_size` (every byte stride is 0, so every stride order is 1 and every
-/// axis is kept), a memory region within the budget, or operands whose
-/// strides are all nonzero and strictly increasing in magnitude (each
-/// operand's stride order is `1..=r`, so every axis is kept). The checked
-/// stride-order table length also answers `None` (full dimensions) when it
-/// overflows. `Some` may still hold the full dimensions when the core keeps
-/// every axis.
+/// the full dimensions before any metadata is built: rank zero, a memory
+/// region within the budget, or operands whose byte strides are all nonzero
+/// and strictly increasing in magnitude (each operand's stride order is
+/// `1..=r`, so every axis is kept). The checked stride-order table length also
+/// answers `None` (full dimensions) when it overflows. `Some` may still hold
+/// the full dimensions when the core keeps every axis.
 pub(crate) fn reduced_block_sizes(
     dims: &[usize],
     strides_list: &[&[isize]],
-    elem_size: usize,
+    elem_sizes: &[usize],
 ) -> Option<InlineVec<usize>> {
-    if dims.is_empty() || elem_size == 0 {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    if dims.is_empty() {
         return None;
     }
-    if memory_region(dims, strides_list, 0, elem_size) <= BLOCK_MEMORY_SIZE as u128
-        || strides_list.iter().all(|s| strictly_increasing(s))
+    if memory_region(dims, strides_list, 0, elem_sizes) <= BLOCK_MEMORY_SIZE as u128
+        || strides_list
+            .iter()
+            .zip(elem_sizes)
+            .all(|(strides, &elem_size)| elem_size > 0 && strictly_increasing(strides))
     {
         return None;
     }
@@ -105,16 +123,21 @@ pub(crate) fn reduced_block_sizes(
     // valid block vector, though not the model's result in general.
     let len = strides_list.len().checked_mul(pitch)?;
     let mut orders: Scratch<usize> = Scratch::with_capacity(len);
-    for strides in strides_list {
-        // With `elem_size > 0` the byte strides are an exact positive
-        // multiple of the element strides, so both have the same stride order.
-        orders.extend_from_slice(&index_order(strides));
+    for (strides, &elem_size) in strides_list.iter().zip(elem_sizes) {
+        if elem_size == 0 {
+            // Every byte stride is 0, so every axis has stride order 1.
+            orders.extend(std::iter::repeat_n(1usize, pitch));
+        } else {
+            // With `elem_size > 0` the byte strides are an exact positive
+            // multiple of the element strides, so both have the same order.
+            orders.extend_from_slice(&index_order(strides));
+        }
     }
     let costs = compute_costs(strides_list);
     let rows = Rows {
         pitch,
         strides: strides_list,
-        elem_size,
+        elem_sizes,
         orders: &orders,
     };
     let mut blocks = InlineVec::from(dims);
@@ -160,6 +183,8 @@ fn compute_blocks(
     }
     let strides = byte_rows(byte_strides);
     let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+    // The byte strides are already formed, so every element size is 1.
+    let elem_sizes = vec![1usize; strides.len()];
     let flat_orders: Vec<usize> = stride_orders
         .iter()
         .flat_map(|s| s.iter().copied())
@@ -167,7 +192,7 @@ fn compute_blocks(
     let rows = Rows {
         pitch: dims.len(),
         strides: &strides,
-        elem_size: 1,
+        elem_sizes: &elem_sizes,
         orders: &flat_orders,
     };
     compute_blocks_at(&mut blocks, 0, costs, &rows, block_size);
@@ -198,7 +223,7 @@ fn compute_blocks_at(
         return;
     }
     let block_size_bytes = block_size as u128;
-    let region = |blocks: &[usize]| memory_region(blocks, rows.strides, offset, rows.elem_size);
+    let region = |blocks: &[usize]| memory_region(blocks, rows.strides, offset, rows.elem_sizes);
 
     // If everything fits in cache, use full dims
     if region(&blocks[offset..]) <= block_size_bytes {
@@ -219,14 +244,14 @@ fn compute_blocks_at(
     }
 
     // Check if minimum stride is larger than block size
-    let elem_size = rows.elem_size as u128;
     let min_stride = rows
         .strides
         .iter()
-        .filter_map(|s| {
+        .zip(rows.elem_sizes)
+        .filter_map(|(s, &elem_size)| {
             s[offset..]
                 .iter()
-                .map(|&s| s.unsigned_abs() as u128 * elem_size)
+                .map(|&s| s.unsigned_abs() as u128 * elem_size as u128)
                 .min()
         })
         .min()
@@ -333,18 +358,18 @@ impl RegionInt for u128 {
 /// ```
 ///
 /// Evaluated over `dims` against each operand's strides from `offset`, with
-/// byte magnitudes `|s| · elem_size`. The checked `u64` evaluation is exact
-/// when it completes; otherwise the saturating `u128` one runs, which is exact
-/// whenever the extents' product fits in `usize`. Both are [`region_in`].
+/// byte magnitudes `|s| · elem_sizes[k]`. The checked `u64` evaluation is
+/// exact when it completes; otherwise the saturating `u128` one runs, which is
+/// exact whenever the extents' product fits in `usize`. Both are [`region_in`].
 fn memory_region(
     dims: &[usize],
     strides_list: &[&[isize]],
     offset: usize,
-    elem_size: usize,
+    elem_sizes: &[usize],
 ) -> u128 {
-    match region_in::<u64>(dims, strides_list, offset, elem_size) {
+    match region_in::<u64>(dims, strides_list, offset, elem_sizes) {
         Some(region) => u128::from(region),
-        None => region_in::<u128>(dims, strides_list, offset, elem_size).unwrap_or(u128::MAX),
+        None => region_in::<u128>(dims, strides_list, offset, elem_sizes).unwrap_or(u128::MAX),
     }
 }
 
@@ -354,10 +379,10 @@ fn region_in<T: RegionInt>(
     dims: &[usize],
     strides_list: &[&[isize]],
     offset: usize,
-    elem_size: usize,
+    elem_sizes: &[usize],
 ) -> Option<T> {
     let mut memory_region = T::ZERO;
-    for strides in strides_list {
+    for (strides, &elem_size) in strides_list.iter().zip(elem_sizes) {
         let region = region_of::<T>(
             dims.iter().copied().zip(strides[offset..].iter().copied()),
             elem_size,
@@ -420,27 +445,27 @@ fn axes_increasing<I: Iterator<Item = isize>>(mut axes: I) -> bool {
 }
 
 /// Whether [`reduced_block_sizes`] answers `None` from the axes alone, before
-/// it builds any metadata: a zero `elem_size`, a memory region within
-/// [`BLOCK_MEMORY_SIZE`], or every operand strides nonzero and strictly
-/// increasing in magnitude.
+/// it builds any metadata: a memory region within [`BLOCK_MEMORY_SIZE`], or
+/// both operands' byte strides nonzero and strictly increasing in magnitude
+/// (which needs both element sizes positive).
 ///
 /// A caller that would have to materialize `dims` and stride slices for the
 /// model asks this first, over the axes it already holds, so that an exit
 /// costs no allocation. The answer is what the model itself decides.
-pub(crate) fn exits_before_metadata<I>(axes: I, elem_size: usize) -> bool
+pub(crate) fn exits_before_metadata<I>(axes: I, dst_elem_size: usize, src_elem_size: usize) -> bool
 where
     I: Iterator<Item = (usize, isize, isize)> + Clone,
 {
-    if elem_size == 0 {
-        return true;
-    }
-    let total = axes_region(axes.clone().map(|(d, dst, _)| (d, dst)), elem_size).saturating_add(
-        axes_region(axes.clone().map(|(d, _, src)| (d, src)), elem_size),
-    );
+    let total =
+        axes_region(axes.clone().map(|(d, dst, _)| (d, dst)), dst_elem_size).saturating_add(
+            axes_region(axes.clone().map(|(d, _, src)| (d, src)), src_elem_size),
+        );
     if total <= BLOCK_MEMORY_SIZE as u128 {
         return true;
     }
-    axes_increasing(axes.clone().map(|(_, dst, _)| dst))
+    dst_elem_size > 0
+        && src_elem_size > 0
+        && axes_increasing(axes.clone().map(|(_, dst, _)| dst))
         && axes_increasing(axes.map(|(_, _, src)| src))
 }
 
@@ -449,7 +474,7 @@ where
 fn total_memory_region(dims: &[usize], byte_strides: &[&[u128]]) -> u128 {
     let strides = byte_rows(byte_strides);
     let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
-    memory_region(dims, &strides, 0, 1)
+    memory_region(dims, &strides, 0, &vec![1usize; strides.len()])
 }
 
 /// Find the last index with maximum (value - 1) * cost.

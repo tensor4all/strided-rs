@@ -45,6 +45,10 @@ use crate::{ElementOp, Exec, InlineVec, OperandVec, Result, StridedView, Strided
 
 /// Prevalidated build plan fused for kernel-family implementations.
 ///
+/// `elem_size` is the element size in bytes of *every* operand. The typed
+/// entries whose operands differ in size plan through one crate-internal
+/// helper that passes each operand's own size to the block model instead.
+///
 /// # Safety
 /// All rank-indexed arrays must have matching lengths and a valid destination
 /// index (when present). Shape products, stride magnitudes, cost arithmetic,
@@ -71,7 +75,10 @@ pub unsafe fn build_plan_fused(
     elem_size: usize,
 ) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // SAFETY: the caller supplies the same invariants as the owning checked entry.
-    crate::kernel::build_plan_fused(dims, strides_list, dest_index, elem_size)
+    // A uniform slice: inline up to `INLINE_RANK` operands, no heap allocation.
+    let mut elem_sizes: InlineVec<usize> = InlineVec::new();
+    elem_sizes.resize(strides_list.len(), elem_size);
+    crate::kernel::build_plan_fused(dims, strides_list, dest_index, &elem_sizes)
 }
 
 /// Prevalidated build plan fused small for kernel-family implementations.

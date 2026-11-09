@@ -19,8 +19,8 @@
 //! follows the budget of the [`Exec`](crate::Exec) token each entry takes).
 
 use crate::kernel::{
-    build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
-    sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
+    ensure_same_shape, for_each_inner_block_preordered, pointwise_plan,
+    sequential_contiguous_layout, total_len,
 };
 use crate::layout_check::is_injective_layout;
 use crate::simd;
@@ -76,7 +76,7 @@ fn validate_destination(dims: &[usize], strides: &[isize]) -> Result<()> {
 fn run_update(
     dims: &[usize],
     strides_list: &[&[isize]],
-    elem_size: usize,
+    elem_sizes: &[usize],
     body: Body<'_>,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -100,12 +100,8 @@ fn run_update(
         body(&zeros, 1, &zeros);
         return Ok(());
     }
-    // Small tensor fast path: skip compute_order and compute_block_sizes
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dims, strides_list)
-    } else {
-        build_plan_fused(dims, strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) =
+        pointwise_plan(dims, strides_list, Some(0), elem_sizes, total);
 
     {
         let total = total_len(&fused_dims)?;
@@ -286,7 +282,7 @@ where
     run_update(
         dest.dims(),
         &[dest.strides()],
-        std::mem::size_of::<D>(),
+        &[std::mem::size_of::<D>()],
         &|offsets, len, strides| {
             // SAFETY: the destination is injective and in bounds; blocks are disjoint.
             unsafe {
@@ -336,7 +332,7 @@ where
     run_update(
         dest.dims(),
         &[dest.strides(), a.strides()],
-        std::mem::size_of::<D>().max(std::mem::size_of::<A>()),
+        &[std::mem::size_of::<D>(), std::mem::size_of::<A>()],
         &|offsets, len, strides| {
             // SAFETY: bounds are the views'; `a` is a distinct borrow from `dest`.
             unsafe {
@@ -401,9 +397,11 @@ where
     run_update(
         dest.dims(),
         &[dest.strides(), a.strides(), b.strides()],
-        std::mem::size_of::<D>()
-            .max(std::mem::size_of::<A>())
-            .max(std::mem::size_of::<B>()),
+        &[
+            std::mem::size_of::<D>(),
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<B>(),
+        ],
         &|offsets, len, strides| {
             // SAFETY: bounds are the views'; `a`, `b` are distinct borrows from `dest`.
             unsafe {

@@ -7,8 +7,8 @@
 //! [`StridedError::NonInjectiveOutputLayout`].
 
 use crate::kernel::{
-    build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
-    sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
+    ensure_same_shape, for_each_inner_block_preordered, pointwise_plan,
+    sequential_contiguous_layout, total_len,
 };
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -1550,15 +1550,14 @@ fn map_parts_into_validated<
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
-    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<A>());
     let total = total_len(dst_dims)?;
-
-    // Small tensor fast path: skip compute_order and compute_block_sizes
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[std::mem::size_of::<D>(), std::mem::size_of::<A>()],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(class, total, &exec) {
@@ -1918,17 +1917,18 @@ fn zip_map2_parts_into_validated<
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
-    let elem_size = std::mem::size_of::<D>()
-        .max(std::mem::size_of::<A>())
-        .max(std::mem::size_of::<B>());
     let total = total_len(dst_dims)?;
-
-    // Small tensor fast path: skip compute_order and compute_block_sizes
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[
+            std::mem::size_of::<D>(),
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<B>(),
+        ],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -2035,9 +2035,6 @@ fn mul_identity_into_raw<
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
-    let elem_size = std::mem::size_of::<D>()
-        .max(std::mem::size_of::<A>())
-        .max(std::mem::size_of::<B>());
     let total = total_len(dst_dims)?;
 
     if try_contiguous_range_mul::<O, D, A, B>(
@@ -2053,11 +2050,17 @@ fn mul_identity_into_raw<
         return Ok(());
     }
 
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[
+            std::mem::size_of::<D>(),
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<B>(),
+        ],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -2496,18 +2499,19 @@ pub(crate) fn zip_map3_into_validated<
     }
 
     let strides_list: [&[isize]; 4] = [dst_strides, a.strides(), b.strides(), c.strides()];
-    let elem_size = std::mem::size_of::<D>()
-        .max(std::mem::size_of::<A>())
-        .max(std::mem::size_of::<B>())
-        .max(std::mem::size_of::<C>());
     let total = total_len(dst_dims)?;
-
-    // Small tensor fast path: skip compute_order and compute_block_sizes
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[
+            std::mem::size_of::<D>(),
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<B>(),
+            std::mem::size_of::<C>(),
+        ],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -2685,19 +2689,20 @@ pub(crate) fn zip_map4_into_validated<
         c.strides(),
         e.strides(),
     ];
-    let elem_size = std::mem::size_of::<D>()
-        .max(std::mem::size_of::<A>())
-        .max(std::mem::size_of::<B>())
-        .max(std::mem::size_of::<C>())
-        .max(std::mem::size_of::<E>());
     let total = total_len(dst_dims)?;
-
-    // Small tensor fast path: skip compute_order and compute_block_sizes
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[
+            std::mem::size_of::<D>(),
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<B>(),
+            std::mem::size_of::<C>(),
+            std::mem::size_of::<E>(),
+        ],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {

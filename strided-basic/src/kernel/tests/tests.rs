@@ -7,7 +7,7 @@ fn test_kernel_inner_block() {
     let strides1 = vec![4isize, 1];
     let strides2 = vec![4isize, 1];
     let strides_list: Vec<&[isize]> = vec![&strides1, &strides2];
-    let plan = build_plan(&dims, &strides_list, Some(0), 8);
+    let plan = build_plan(&dims, &strides_list, Some(0), &[8, 8]);
 
     let mut total_elements = 0usize;
     for_each_inner_block(&dims, &plan, &strides_list, |_offsets, len, _strides| {
@@ -166,7 +166,7 @@ fn test_build_plan_fused_compresses() {
     let dims = [2usize, 3];
     let strides = [1isize, 2];
     let strides_list: Vec<&[isize]> = vec![&strides];
-    let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), 8);
+    let (fused_dims, fused_strides, plan) = build_plan_fused(&dims, &strides_list, Some(0), &[8]);
     // After fusion + compression, should be 1D
     assert_eq!(fused_dims.as_slice(), vec![6]);
     assert_eq!(fused_strides.len(), 1);
@@ -182,7 +182,7 @@ fn test_build_plan_fused_keeps_broadcast_compact_inner_loop() {
     let rhs = [0isize, 0, 1, 64];
     let strides_list: Vec<&[isize]> = vec![&out, &lhs, &rhs];
 
-    let (fused_dims, fused_strides, _) = build_plan_fused(&dims, &strides_list, Some(0), 8);
+    let (fused_dims, fused_strides, _) = build_plan_fused(&dims, &strides_list, Some(0), &[8; 3]);
 
     assert_eq!(fused_dims[0], 256);
     assert_eq!(fused_strides[0][0], 1);
