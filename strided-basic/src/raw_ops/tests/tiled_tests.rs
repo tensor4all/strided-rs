@@ -139,6 +139,18 @@ fn layouts() -> Vec<(&'static str, Layout)> {
         ("4^8 reversed", reversed(&[4; 8])),
         // Fused rank above the inline limit: the spilled walk.
         ("4^9 reversed", reversed(&[4; 9])),
+        // The spilled walk with a negative source axis and a nonzero base: a
+        // walker that drops the sign still matches the positive case above.
+        (
+            "4^9 reversed source, negative last axis, cropped base",
+            {
+                let dims = [4usize; 9];
+                let dst: Vec<isize> = (0..9).map(|axis| 1isize << (2 * axis)).collect();
+                let mut src: Vec<isize> = (0..9).map(|axis| 1isize << (2 * (8 - axis))).collect();
+                src[8] = -1;
+                Layout::new(&dims, &dst, &src, 8)
+            },
+        ),
         (
             "rank 12 reversed",
             reversed(&[2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4, 4]),
@@ -373,6 +385,29 @@ fn spilled_layouts_tile_as_their_compressed_rank_would() {
         "the padded rank-9 copy must visit cache tiles, got {boxes} boxes"
     );
 
+    // The spilled walk with a negative source axis and a nonzero base reaches
+    // the tiles too, and only a sign-preserving offset reproduces the oracle.
+    let cropped = layouts()
+        .into_iter()
+        .find(|(label, _)| label.starts_with("4^9 reversed source"))
+        .expect("the negative spilled layout");
+    assert!(matches!(cropped.1.tiles::<f64, f64>(), Some(Tiles::Spilled(_))));
+    let (dst_len, src_len) = cropped.1.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let mut expected = vec![0.0f64; dst_len];
+    oracle(&cropped.1, &mut expected, &src, |d, s| *d = s);
+    let mut actual = vec![0.0f64; dst_len];
+    crate::threading::take_tile_boxes();
+    replay_copy_raw(
+        &mut cropped.1.dst_view(&mut actual),
+        &cropped.1.src_view(&src),
+        Exec::serial(),
+    )
+    .unwrap();
+    assert_eq!(bits(&actual), bits(&expected), "{}", cropped.0);
+    let boxes = crate::threading::take_tile_boxes();
+    assert!(boxes >= 16, "the negative spilled copy must visit tiles, got {boxes}");
+
     // A layout whose column-major walk is kept stays on it: one box count of
     // zero is the same answer the inline route gives the rank-8 layout.
     let dense = Layout::new(&[4096, 512], &[1, 4096], &[1, 4096], 0);
@@ -480,11 +515,18 @@ fn tiled_replays_equal_the_column_major_oracle() {
             check_f64_rows(&layout, exec, label);
         }
     }
+    let layout = |prefix: &str| {
+        layouts()
+            .into_iter()
+            .find(|(label, _)| label.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no layout named {prefix}"))
+            .1
+    };
     // One clipped tile: 67 = 43 + 24 and 45 = 42 + 3.
-    let tiles = layouts()[0].1.inline_tiles::<f64, f64>().unwrap();
+    let tiles = layout("67x45").inline_tiles::<f64, f64>().unwrap();
     assert_eq!(tiles.blocks[..2], [43, 42]);
     // The extent-1 axis is dropped before the model.
-    let tiles = layouts()[6].1.inline_tiles::<f64, f64>().unwrap();
+    let tiles = layout("[1, 65, 65]").inline_tiles::<f64, f64>().unwrap();
     assert_eq!(tiles.layout.rank, 2);
     assert_eq!(tiles.layout.dims[..2], [65, 65]);
 }
