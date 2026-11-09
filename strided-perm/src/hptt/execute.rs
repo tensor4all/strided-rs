@@ -756,6 +756,9 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
 /// `src_stride`/`dst_stride`) reach from `src`/`dst` must be valid for reads
 /// from `src` and writes to `dst`; the two extents must not overlap, and no
 /// other thread may write those destination elements during the call.
+/// `count` must be at least 1, so each leaf origin is itself an element and
+/// hence non-null and aligned, which `const_stride1_copy` needs even for an
+/// empty run.
 unsafe fn const_stride1_recursive<T: Copy>(
     src: *const T,
     dst: *mut T,
@@ -772,7 +775,8 @@ unsafe fn const_stride1_recursive<T: Copy>(
     for _ in 0..node.end {
         // SAFETY: `s`/`d` are the origins for this level's current index, so
         // the remaining levels and the inner run reach a subset of the elements
-        // this call's `# Safety` (execute.rs:755) covers.
+        // this call's `# Safety` (execute.rs:755) covers; with `count >= 1` the
+        // leaf origins are elements, so they are non-null and aligned.
         if rest.is_empty() {
             const_stride1_copy(s, d, count, src_stride, dst_stride);
         } else {
