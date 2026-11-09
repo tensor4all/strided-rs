@@ -247,7 +247,7 @@ impl<T: FusedScalar> pulp::WithSimd for ReplayBlockUninit<'_, T> {
     #[inline(always)]
     fn with_simd<S: pulp::Simd>(self, _simd: S) {
         // SAFETY: `ReplayBlockUninit` is private to this module and built only in
-        // `replay_chunked_uninit` (chunk.rs:337) from arguments that meet that function's
+        // `replay_chunked_uninit` (chunk.rs:339) from arguments that meet that function's
         // contract, which `replay_block_uninit` shares.
         unsafe {
             replay_block_uninit(
@@ -282,8 +282,10 @@ unsafe fn replay_block<T: FusedScalar>(
     regs: &mut [T],
 ) {
     let output_count = dst_ptrs.len();
-    // SAFETY: `fill_broadcast_inputs` reads each stride-0 input once, at its block offset, which
-    // the contract (chunk.rs:137) makes readable.
+    // SAFETY: `fill_broadcast_inputs` (chunk.rs:443) needs each stride-0 input readable at its
+    // block offset and no operand element inside `regs`. This function's contract (chunk.rs:137)
+    // gives both: a stride-0 input addresses one readable element at its offset, and neither
+    // input nor destination storage may overlap `regs`.
     unsafe { fill_broadcast_inputs(input_ptrs, offsets, output_count, strides, regs) };
     let mut done = 0;
     while done < len {
@@ -359,7 +361,7 @@ pub(super) unsafe fn replay_chunked_uninit<T: FusedScalar>(
     });
     // SAFETY: the caller upholds this function's contract, which the block body shares.
     #[cfg(not(feature = "simd"))]
-    // SAFETY: `replay_block_uninit` has this function's contract (chunk.rs:337), passed on
+    // SAFETY: `replay_block_uninit` has this function's contract (chunk.rs:339), passed on
     // unchanged.
     unsafe {
         replay_block_uninit(
@@ -386,8 +388,10 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
     regs: &mut [T],
 ) {
     let output_count = dst_ptrs.len();
-    // SAFETY: `fill_broadcast_inputs` reads each stride-0 input once, at its block offset, which
-    // the contract (chunk.rs:137) makes readable.
+    // SAFETY: `fill_broadcast_inputs` (chunk.rs:443) needs each stride-0 input readable at its
+    // block offset and no operand element inside `regs`. This function's contract (chunk.rs:137)
+    // gives both: a stride-0 input addresses one readable element at its offset, and neither
+    // input nor destination storage may overlap `regs`.
     unsafe { fill_broadcast_inputs(input_ptrs, offsets, output_count, strides, regs) };
     let mut done = 0;
     while done < len {
@@ -436,7 +440,9 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
 /// `input_count..`, so the filled input register survives every later chunk.
 ///
 /// # Safety
-/// Every operand must address a readable element at its block offset.
+/// Every operand must address a readable element at its block offset, and no
+/// operand element may lie inside `regs`: this function writes `regs` through
+/// `&mut` while it reads the operands through raw pointers.
 #[inline]
 unsafe fn fill_broadcast_inputs<T: FusedScalar>(
     input_ptrs: &[*const T],
@@ -449,8 +455,9 @@ unsafe fn fill_broadcast_inputs<T: FusedScalar>(
         if strides[first_operand + index] != 0 {
             continue;
         }
-        // SAFETY: this function's contract (chunk.rs:439): the operand addresses a readable
-        // element at its block offset.
+        // SAFETY: this function's contract (chunk.rs:443): the operand addresses a readable
+        // element at its block offset, outside `regs`, so this read does not alias the `&mut`
+        // register file.
         let value = unsafe { *ptr.offset(offsets[first_operand + index]) };
         regs[index * FUSED_CHUNK_ELEMS..][..FUSED_CHUNK_ELEMS].fill(value);
     }
@@ -722,7 +729,7 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
     }
 
     if TypeId::of::<T>() == TypeId::of::<f32>() {
-        // SAFETY: `cast_chunk`'s contract (chunk.rs:756) is `T == U`, which the `TypeId`
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:763) is `T == U`, which the `TypeId`
         // comparison just above proves for `f32`.
         let (src, dst) = unsafe { cast_chunk::<T, f32>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
@@ -736,7 +743,7 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
         });
     }
     if TypeId::of::<T>() == TypeId::of::<f64>() {
-        // SAFETY: `cast_chunk`'s contract (chunk.rs:756) is `T == U`, which the `TypeId`
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:763) is `T == U`, which the `TypeId`
         // comparison just above proves for `f64`.
         let (src, dst) = unsafe { cast_chunk::<T, f64>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
@@ -762,7 +769,7 @@ unsafe fn cast_chunk<'a, T: 'static, U: 'static>(
     debug_assert_eq!(TypeId::of::<T>(), TypeId::of::<U>());
     debug_assert_eq!(size_of::<T>(), size_of::<U>());
     debug_assert_eq!(align_of::<T>(), align_of::<U>());
-    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:756), so the
+    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:763), so the
     // pointer, length and lifetime describe the same elements.
     let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<U>(), src.len()) };
     // SAFETY: as for `src`; `dst` keeps its exclusive borrow.

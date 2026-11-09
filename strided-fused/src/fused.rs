@@ -1892,7 +1892,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
             let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
                 if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
                 {
-                    // SAFETY: `replay_chunked_uninit` (chunk.rs:337): `block_replay_eligible`
+                    // SAFETY: `replay_chunked_uninit` (chunk.rs:339): `block_replay_eligible`
                     // just checked the strides (outputs 1, inputs 0 or 1). `offsets`, `len` and
                     // `strides` describe one block that `for_each_inner_block_preordered`
                     // generated over shapes checked equal, so each stride-1 operand's `offsets[i]
