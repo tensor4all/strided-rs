@@ -865,7 +865,7 @@ where
     // SAFETY: the source (`src`/`input`) is an erased descriptor built only by checked
     // constructors (`ErasedRawStridedRef::from_slice`/`from_raw_parts`,
     // strided-view/src/raw.rs:396/:449), which ran `validate_bounds`
-    // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+    // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
     // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count, so
     // every reachable offset is inside the buffer it hands to `new_unchecked`.
     let source = unsafe {
@@ -874,7 +874,7 @@ where
     // SAFETY: `dest` is an erased descriptor built only by checked
     // constructors (`ErasedRawStridedMut::from_slice_mut`/`from_raw_parts`,
     // strided-view/src/raw.rs:555/:610), which ran `validate_bounds`
-    // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+    // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
     // `data_as_mut::<T>` (raw.rs:663) re-checks the dtype at that element count,
     // and the `&mut` borrow keeps the storage unaliased for this call.
     let mut dest =
@@ -901,7 +901,7 @@ where
     // SAFETY: `dest` is an erased descriptor built only by checked
     // constructors (`ErasedRawStridedMut::from_slice_mut`/`from_raw_parts`,
     // strided-view/src/raw.rs:555/:610), which ran `validate_bounds`
-    // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+    // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
     // `data_as_mut::<T>` (raw.rs:663) re-checks the dtype at that element count,
     // and the `&mut` borrow keeps the storage unaliased for this call.
     let mut dest_ref =
@@ -913,7 +913,7 @@ where
         // SAFETY: the source (`src`/`input`) is an erased descriptor built only by checked
         // constructors (`ErasedRawStridedRef::from_slice`/`from_raw_parts`,
         // strided-view/src/raw.rs:396/:449), which ran `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count, so
         // every reachable offset is inside the buffer it hands to `new_unchecked`.
         let input_ref = unsafe {
@@ -934,7 +934,7 @@ where
         // SAFETY: the source (`src`/`input`) is an erased descriptor built only by checked
         // constructors (`ErasedRawStridedRef::from_slice`/`from_raw_parts`,
         // strided-view/src/raw.rs:396/:449), which ran `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count, so
         // every reachable offset is inside the buffer it hands to `new_unchecked`.
         let first = unsafe {
@@ -951,7 +951,7 @@ where
             // SAFETY: the source (`src`/`input`) is an erased descriptor built only by checked
             // constructors (`ErasedRawStridedRef::from_slice`/`from_raw_parts`,
             // strided-view/src/raw.rs:396/:449), which ran `validate_bounds`
-            // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+            // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
             // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count, so
             // every reachable offset is inside the buffer it hands to `new_unchecked`.
             *slot = unsafe {
@@ -970,7 +970,7 @@ where
         // SAFETY: the source (`src`/`input`) is an erased descriptor built only by checked
         // constructors (`ErasedRawStridedRef::from_slice`/`from_raw_parts`,
         // strided-view/src/raw.rs:396/:449), which ran `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count, so
         // every reachable offset is inside the buffer it hands to `new_unchecked`.
         let input_ref = unsafe {
@@ -997,7 +997,7 @@ where
     // SAFETY: `dest` is an erased descriptor built only by checked
     // constructors (`ErasedRawStridedUninitMut::from_uninit_slice`/
     // `from_raw_parts`, strided-view/src/raw.rs:745/:801), which ran
-    // `validate_bounds` (strided-view/src/view.rs:186) on exactly these
+    // `validate_bounds` (strided-view/src/view.rs:187) on exactly these
     // dims/strides/offset; `data_as_uninit_mut::<T>` (raw.rs:828) re-checks the
     // dtype at that element count, writes go through `MaybeUninit`, and the
     // `&mut` borrow keeps the storage unaliased.
@@ -1013,7 +1013,7 @@ where
         // `ErasedRawStridedPtr::try_as_ref_after_no_overlap` (raw.rs:288), which
         // re-ran the erased reference's raw constructor (`from_raw_parts`,
         // strided-view/src/raw.rs:449) → `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset, and
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset, and
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count.
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
@@ -1037,7 +1037,7 @@ where
         // `ErasedRawStridedPtr::try_as_ref_after_no_overlap` (raw.rs:288), which
         // re-ran the erased reference's raw constructor (`from_raw_parts`,
         // strided-view/src/raw.rs:449) → `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset, and
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset, and
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count.
         let first = unsafe {
             RawStridedRef::new_unchecked(
@@ -1054,7 +1054,7 @@ where
             // `ErasedRawStridedPtr::try_as_ref_after_no_overlap` (raw.rs:288), which
             // re-ran the erased reference's raw constructor (`from_raw_parts`,
             // strided-view/src/raw.rs:449) → `validate_bounds`
-            // (strided-view/src/view.rs:186) on exactly these dims/strides/offset, and
+            // (strided-view/src/view.rs:187) on exactly these dims/strides/offset, and
             // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count.
             *slot = unsafe {
                 RawStridedRef::new_unchecked(
@@ -1075,7 +1075,7 @@ where
         // `ErasedRawStridedPtr::try_as_ref_after_no_overlap` (raw.rs:288), which
         // re-ran the erased reference's raw constructor (`from_raw_parts`,
         // strided-view/src/raw.rs:449) → `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset, and
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset, and
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count.
         let input_ref = unsafe {
             RawStridedRef::new_unchecked(input_data, input.dims(), input.strides(), input.offset())
@@ -1207,7 +1207,7 @@ impl ErasedUpdatePlan {
         // SAFETY: the source (`src`/`input`) is an erased descriptor built only by checked
         // constructors (`ErasedRawStridedRef::from_slice`/`from_raw_parts`,
         // strided-view/src/raw.rs:396/:449), which ran `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count, so
         // every reachable offset is inside the buffer it hands to `new_unchecked`.
         let source = unsafe {
@@ -1216,7 +1216,7 @@ impl ErasedUpdatePlan {
         // SAFETY: `dest` is an erased descriptor built only by checked
         // constructors (`ErasedRawStridedMut::from_slice_mut`/`from_raw_parts`,
         // strided-view/src/raw.rs:555/:610), which ran `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset;
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset;
         // `data_as_mut::<T>` (raw.rs:663) re-checks the dtype at that element count,
         // and the `&mut` borrow keeps the storage unaliased for this call.
         let mut dest_ref = unsafe {
@@ -1304,7 +1304,7 @@ impl ErasedUpdatePlan {
         // `ErasedRawStridedPtr::try_as_ref_after_no_overlap` (raw.rs:288), which
         // re-ran the erased reference's raw constructor (`from_raw_parts`,
         // strided-view/src/raw.rs:449) → `validate_bounds`
-        // (strided-view/src/view.rs:186) on exactly these dims/strides/offset, and
+        // (strided-view/src/view.rs:187) on exactly these dims/strides/offset, and
         // `data_as::<T>` (raw.rs:475) re-checks the dtype at that element count.
         let source = unsafe {
             RawStridedRef::new_unchecked(source_data, src.dims(), src.strides(), src.offset())
@@ -1312,7 +1312,7 @@ impl ErasedUpdatePlan {
         // SAFETY: `dest` is an erased descriptor built only by checked
         // constructors (`ErasedRawStridedUninitMut::from_uninit_slice`/
         // `from_raw_parts`, strided-view/src/raw.rs:745/:801), which ran
-        // `validate_bounds` (strided-view/src/view.rs:186) on exactly these
+        // `validate_bounds` (strided-view/src/view.rs:187) on exactly these
         // dims/strides/offset; `data_as_uninit_mut::<T>` (raw.rs:828) re-checks the
         // dtype at that element count, writes go through `MaybeUninit`, and the
         // `&mut` borrow keeps the storage unaliased.

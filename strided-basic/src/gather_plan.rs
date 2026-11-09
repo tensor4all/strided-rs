@@ -1281,7 +1281,7 @@ impl DynamicSlicePlan {
         // (:1228), and `check_call` (:1341) proved the writer carries exactly the
         // compiled destination layout, whose reachable offsets `RawStridedMut::new`
         // validated (strided-view/src/raw.rs:1036, `validate_bounds` at :1042;
-        // strided-view/src/view.rs:186). `data_ptr()` (copy_plan.rs:41) is the
+        // strided-view/src/view.rs:187). `data_ptr()` (copy_plan.rs:41) is the
         // allocation base, so `dest.offset() .. dest.offset() + total` is inside the
         // writer's allocation and the chunked workers write disjoint slices of it.
         unsafe {
