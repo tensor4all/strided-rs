@@ -524,3 +524,135 @@ fn axis0_columns_single_pass_serial_and_parallel_contexts_agree() {
         );
     }
 }
+
+#[cfg(feature = "parallel")]
+/// Run `plan` once through `execute` and once through `execute_uninit` on
+/// `exec`, and return the two destinations in logical order with the cache
+/// tiles each run walked.
+fn concat_runs(
+    plan: &ConcatenatePlan,
+    inputs: &[RawStridedRef<'_, i64>],
+    dest_dims: &[usize],
+    dest_strides: &[isize],
+    mut exec: Exec<'_>,
+) -> [(Vec<i64>, usize); 2] {
+    let (len, base) = layout_extent(dest_dims, dest_strides);
+    let mut init = vec![-1i64; len];
+    let mut dest = RawStridedMut::new(&mut init, dest_dims, dest_strides, base).unwrap();
+    crate::threading::take_tile_boxes();
+    plan.execute(&mut dest, inputs, exec.reborrow()).unwrap();
+    let init_boxes = crate::threading::take_tile_boxes();
+
+    let mut storage = vec![MaybeUninit::new(-1i64); len];
+    let mut dest = RawStridedMut::new(&mut storage, dest_dims, dest_strides, base).unwrap();
+    plan.execute_uninit(&mut dest, inputs, exec.reborrow())
+        .unwrap();
+    let uninit_boxes = crate::threading::take_tile_boxes();
+    // SAFETY: every slot was initialized to -1 before execution.
+    let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+    [
+        (
+            read_logical(&init, dest_dims, dest_strides, base),
+            init_boxes,
+        ),
+        (
+            read_logical(&uninit, dest_dims, dest_strides, base),
+            uninit_boxes,
+        ),
+    ]
+}
+
+/// [#427]: the whole-plan parallel replay of a concatenation with permuted
+/// segments walks the same cache tiles as the serial per-segment replay
+/// (`CopyPlan::execute`), and a contiguous segment keeps its flat walk.
+///
+/// [#427]: https://github.com/tensor4all/strided-rs/issues/427
+#[cfg(feature = "parallel")]
+#[test]
+fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
+    let (rows, cols) = (384usize, 512usize);
+    let axis = 1;
+    let dest_dims = vec![rows, 3 * cols];
+    let dest_strides = col_major(&dest_dims);
+    // Two transposed sources around one contiguous one.
+    let input_dims = vec![vec![rows, cols]; 3];
+    let input_strides = vec![
+        vec![cols as isize, 1],
+        vec![1, rows as isize],
+        vec![cols as isize, 1],
+    ];
+    let dims_refs: Vec<&[usize]> = input_dims.iter().map(Vec::as_slice).collect();
+    let strides_refs: Vec<&[isize]> = input_strides.iter().map(Vec::as_slice).collect();
+    let plan = ConcatenatePlan::compile(&dims_refs, &strides_refs, &dest_dims, &dest_strides, axis)
+        .unwrap();
+    let storages: Vec<(Vec<i64>, isize)> = input_dims
+        .iter()
+        .zip(&input_strides)
+        .enumerate()
+        .map(|(k, (d, s))| operand(d, s, 1_000_000 * (k as i64 + 1)))
+        .collect();
+    let inputs: Vec<RawStridedRef<'_, i64>> = storages
+        .iter()
+        .zip(input_dims.iter().zip(&input_strides))
+        .map(|((data, base), (d, s))| RawStridedRef::new(data, d, s, *base).unwrap())
+        .collect();
+
+    let serial = concat_runs(&plan, &inputs, &dest_dims, &dest_strides, Exec::serial());
+    let pool = crate::threading::test_pool(4);
+    let exec = Exec::new(&pool, 4).unwrap();
+    assert!(
+        plan.prefers_whole_plan(&exec),
+        "the case must reach the whole-plan parallel replay"
+    );
+    let parallel = concat_runs(&plan, &inputs, &dest_dims, &dest_strides, exec);
+    for (entry, (serial, parallel)) in ["execute", "execute_uninit"]
+        .iter()
+        .zip(serial.iter().zip(&parallel))
+    {
+        assert!(
+            serial.1 > 0,
+            "{entry}: the serial per-segment replay must tile the permuted segments"
+        );
+        assert_eq!(parallel.0, serial.0, "{entry}: values");
+        assert_eq!(
+            parallel.1, serial.1,
+            "{entry}: the whole-plan replay must walk the serial path's tiles"
+        );
+    }
+
+    // Contiguous segments only: no tiles on either path, and the whole plan
+    // still splits the flat index space.
+    let flat_strides = vec![vec![1, rows as isize]; 3];
+    let flat_refs: Vec<&[isize]> = flat_strides.iter().map(Vec::as_slice).collect();
+    let flat_plan =
+        ConcatenatePlan::compile(&dims_refs, &flat_refs, &dest_dims, &dest_strides, axis).unwrap();
+    let flat_storages: Vec<(Vec<i64>, isize)> = input_dims
+        .iter()
+        .zip(&flat_strides)
+        .enumerate()
+        .map(|(k, (d, s))| operand(d, s, 1_000_000 * (k as i64 + 1)))
+        .collect();
+    let flat_inputs: Vec<RawStridedRef<'_, i64>> = flat_storages
+        .iter()
+        .zip(input_dims.iter().zip(&flat_strides))
+        .map(|((data, base), (d, s))| RawStridedRef::new(data, d, s, *base).unwrap())
+        .collect();
+    let serial = concat_runs(
+        &flat_plan,
+        &flat_inputs,
+        &dest_dims,
+        &dest_strides,
+        Exec::serial(),
+    );
+    crate::threading::take_dispatched_chunks();
+    let exec = Exec::new(&pool, 4).unwrap();
+    let parallel = concat_runs(&flat_plan, &flat_inputs, &dest_dims, &dest_strides, exec);
+    assert!(
+        crate::threading::take_dispatched_chunks() > 2,
+        "the contiguous concatenation must keep the flat split"
+    );
+    for (serial, parallel) in serial.iter().zip(&parallel) {
+        assert_eq!(parallel.0, serial.0);
+        assert_eq!((serial.1, parallel.1), (0, 0));
+    }
+}
