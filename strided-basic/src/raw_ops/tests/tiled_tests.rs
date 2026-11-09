@@ -548,6 +548,42 @@ fn tiled_replays_equal_the_column_major_oracle() {
     assert_eq!(tiles.layout.dims[..2], [65, 65]);
 }
 
+/// A spilled layout whose block does not divide every extent: the last tile of
+/// each such axis must be clipped to the remaining extent. The exact-division
+/// spilled fixtures cannot see that arithmetic — a `min` against the whole box
+/// extent instead of the remaining one still matches the oracle on them.
+#[test]
+fn spilled_tiles_clip_the_last_tile_to_the_remaining_extent() {
+    let team = team();
+    let layout = reversed(&[5; 9]);
+    let tiles = layout
+        .tiles::<f64, f64>()
+        .expect("5^9 reversed must take the tiled walk");
+    let Tiles::Spilled(tiles) = tiles else {
+        panic!("5^9 reversed must reach the spilled walk, not the inline one");
+    };
+    assert!(
+        tiles
+            .blocks
+            .iter()
+            .zip(&tiles.dims)
+            .any(|(&block, &dim)| dim % block != 0),
+        "the fixture must leave a clipped last tile: dims {:?} blocks {:?}",
+        tiles.dims,
+        tiles.blocks
+    );
+    for parallel in [false, true] {
+        let exec = || {
+            if parallel {
+                team.exec(4)
+            } else {
+                Exec::serial()
+            }
+        };
+        check_entries::<f64>(&layout, exec, "5^9 reversed clipped");
+    }
+}
+
 #[test]
 fn tiled_dynamic_slice_window_equals_the_oracle() {
     use crate::DynamicSlicePlan;
