@@ -256,8 +256,8 @@ pub(crate) fn record_tiled_ranges(count: usize) {
 }
 
 /// The dispatched ranges that walked tiles, recorded on this thread since the
-/// last call, and resets the count.
-#[cfg(test)]
+/// last call, and resets the count. Only the `parallel` tests read it.
+#[cfg(all(test, feature = "parallel"))]
 pub(crate) fn take_tiled_ranges() -> usize {
     TILED_RANGES.with(|n| n.replace(0))
 }

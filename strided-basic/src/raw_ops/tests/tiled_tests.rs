@@ -1144,12 +1144,16 @@ fn tile_odometer_stays_within_the_reachable_offsets() {
     }
 }
 
-/// [#427]: any cut of the tile grid into two ranges walks exactly the slots
-/// of the whole-box walk, tile for tile.
+/// [#427]: any cut of the tile grid into two ranges, walked first range
+/// first, visits exactly the slots of the whole-box walk in the same order:
+/// the visit sequence (destination slot of every element, in visit order) of
+/// `0..cut` followed by `cut..count` equals that of [`apply_tiled_box`].
 ///
 /// [#427]: https://github.com/tensor4all/strided-rs/issues/427
 #[test]
 fn tile_ranges_partition_the_tiled_box_walk() {
+    use core::cell::RefCell;
+
     let mut tiled = 0;
     for (label, layout) in layouts() {
         let Some(tiles) = layout.inline_tiles::<f64, f64>() else {
@@ -1162,10 +1166,42 @@ fn tile_ranges_partition_the_tiled_box_walk() {
         let src: Vec<f64> = (0..src_len).map(f64::value).collect();
         let mut expected = vec![0.0f64; dst_len];
         oracle(&layout, &mut expected, &src, |d, s| *d = s);
+
+        // The whole-box walk, recording the destination slot of each visit.
+        let mut whole = vec![0.0f64; dst_len];
+        let whole_base = whole.as_mut_ptr() as usize;
+        let reference = RefCell::new(Vec::with_capacity(layout.total()));
+        // SAFETY: `lens` sizes both buffers for every slot of the layout, the
+        // tiles are `pair_tiles` of it, and the destination is injective.
+        unsafe {
+            apply_tiled_box(
+                whole.as_mut_ptr(),
+                layout.dst_offset,
+                src.as_ptr(),
+                layout.src_offset,
+                &tiles.layout,
+                &tiles.blocks,
+                &|d: &mut f64, s: f64| {
+                    let slot = (d as *mut f64 as usize - whole_base) / size_of::<f64>();
+                    reference.borrow_mut().push(slot);
+                    *d = s;
+                },
+            );
+        }
+        let reference = reference.into_inner();
+        assert_eq!(bits(&whole), bits(&expected), "{label}: whole-box walk");
+        assert_eq!(
+            reference.len(),
+            layout.total(),
+            "{label}: one visit per element"
+        );
+
         let cuts = [0, 1, count / 3, count / 2, count - 1, count];
         for &cut in &cuts {
             let mut actual = vec![0.0f64; dst_len];
+            let base = actual.as_mut_ptr() as usize;
             let dst_ptr = actual.as_mut_ptr();
+            let visits = RefCell::new(Vec::with_capacity(layout.total()));
             crate::threading::take_tile_boxes();
             for (first, len) in [(0, cut), (cut, count - cut)] {
                 // SAFETY: `lens` sizes both buffers for every slot of the
@@ -1181,7 +1217,11 @@ fn tile_ranges_partition_the_tiled_box_walk() {
                         &tiles.blocks,
                         first,
                         len,
-                        &|d: &mut f64, s: f64| *d = s,
+                        &|d: &mut f64, s: f64| {
+                            let slot = (d as *mut f64 as usize - base) / size_of::<f64>();
+                            visits.borrow_mut().push(slot);
+                            *d = s;
+                        },
                     );
                 }
             }
@@ -1190,6 +1230,10 @@ fn tile_ranges_partition_the_tiled_box_walk() {
                 crate::threading::take_tile_boxes(),
                 count,
                 "{label}: cut at {cut} must walk every tile once"
+            );
+            assert!(
+                visits.into_inner() == reference,
+                "{label}: cut at {cut} must visit the slots in the whole-box order"
             );
         }
     }
