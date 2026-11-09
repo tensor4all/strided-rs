@@ -13,8 +13,11 @@
 //!   each segment may still split across the token itself;
 //! - `serial`: `ConcatenatePlan::execute` on `Exec::serial()`.
 //!
-//! Alternating the three in one loop keeps a drifting machine from biasing
-//! one path. Plans, inputs and the destination are built once, outside the
+//! The three run in one loop and their order rotates every repetition
+//! (whole/per-segment/serial, then per-segment/serial/whole, ...), so a
+//! drifting machine and the state a predecessor leaves in the caches and the
+//! pool are spread over all three paths instead of always falling on the same
+//! one. Plans, inputs and the destination are built once, outside the
 //! timed region. Each row prints the median of `REPS` samples (after
 //! `WARMUP` unrecorded ones), the bandwidth counting one read and one write
 //! per element, the element rate, and `whole/per-segment`.
@@ -89,42 +92,56 @@ fn case(
         .collect();
     let mut dest = vec![0.0f64; rows * count * cols];
 
-    let mut whole = Vec::with_capacity(reps);
-    let mut per_segment = Vec::with_capacity(reps);
-    let mut serial = Vec::with_capacity(reps);
+    // Time one path (0 whole-plan, 1 per-segment, 2 serial) once.
+    let mut time_path = |path: usize| -> f64 {
+        let elapsed = match path {
+            0 => {
+                let exec = Exec::new(pool, threads).expect("an idle pool");
+                let mut view =
+                    RawStridedMut::new(&mut dest, &dest_dims, &dest_strides, 0).expect("dest");
+                let start = Instant::now();
+                plan.execute(&mut view, &inputs, exec).expect("whole-plan");
+                start.elapsed()
+            }
+            1 => {
+                let mut exec = Exec::new(pool, threads).expect("an idle pool");
+                let start = Instant::now();
+                for (k, (copy, input)) in copies.iter().zip(&inputs).enumerate() {
+                    let offset = (k * rows * cols) as isize;
+                    let mut view = RawStridedMut::new(&mut dest, &dims, &dest_strides, offset)
+                        .expect("segment");
+                    copy.execute(&mut view, input, exec.reborrow())
+                        .expect("per-segment");
+                }
+                start.elapsed()
+            }
+            _ => {
+                let mut view =
+                    RawStridedMut::new(&mut dest, &dest_dims, &dest_strides, 0).expect("dest");
+                let start = Instant::now();
+                plan.execute(&mut view, &inputs, Exec::serial())
+                    .expect("serial");
+                start.elapsed()
+            }
+        };
+        black_box(&dest);
+        elapsed.as_secs_f64()
+    };
+
+    let mut samples: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(reps));
     for rep in 0..WARMUP + reps {
-        let exec = Exec::new(pool, threads).expect("an idle pool");
-        let mut view = RawStridedMut::new(&mut dest, &dest_dims, &dest_strides, 0).expect("dest");
-        let start = Instant::now();
-        plan.execute(&mut view, &inputs, exec).expect("whole-plan");
-        let a = start.elapsed().as_secs_f64();
-        black_box(&dest);
-
-        let mut exec = Exec::new(pool, threads).expect("an idle pool");
-        let start = Instant::now();
-        for (k, (copy, input)) in copies.iter().zip(&inputs).enumerate() {
-            let offset = (k * rows * cols) as isize;
-            let mut view =
-                RawStridedMut::new(&mut dest, &dims, &dest_strides, offset).expect("segment");
-            copy.execute(&mut view, input, exec.reborrow())
-                .expect("per-segment");
-        }
-        let b = start.elapsed().as_secs_f64();
-        black_box(&dest);
-
-        let mut view = RawStridedMut::new(&mut dest, &dest_dims, &dest_strides, 0).expect("dest");
-        let start = Instant::now();
-        plan.execute(&mut view, &inputs, Exec::serial())
-            .expect("serial");
-        let c = start.elapsed().as_secs_f64();
-        black_box(&dest);
-
-        if rep >= WARMUP {
-            whole.push(a);
-            per_segment.push(b);
-            serial.push(c);
+        // Rotate the order every repetition, so that each path runs first,
+        // second and third equally often (to within one repetition) and none
+        // always inherits the cache and pool state of the same predecessor.
+        for slot in 0..3 {
+            let path = (rep + slot) % 3;
+            let time = time_path(path);
+            if rep >= WARMUP {
+                samples[path].push(time);
+            }
         }
     }
+    let [whole, per_segment, serial] = samples;
     let elems = (rows * cols * count) as f64;
     let bytes = 2.0 * 8.0 * elems;
     let (whole, per_segment, serial) = (median(whole), median(per_segment), median(serial));

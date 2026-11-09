@@ -525,40 +525,57 @@ fn axis0_columns_single_pass_serial_and_parallel_contexts_agree() {
     }
 }
 
+/// One entry point's run in [`concat_runs`]: the destination in logical
+/// order, the cache tiles walked, and the chunks dispatched by that call alone.
 #[cfg(feature = "parallel")]
+struct ConcatRun {
+    entry: &'static str,
+    values: Vec<i64>,
+    tiles: usize,
+    chunks: usize,
+}
+
 /// Run `plan` once through `execute` and once through `execute_uninit` on
-/// `exec`, and return the two destinations in logical order with the cache
-/// tiles each run walked.
+/// `exec`. The tile and chunk counters are reset before each call and read
+/// right after it, so each run reports only its own work.
+#[cfg(feature = "parallel")]
 fn concat_runs(
     plan: &ConcatenatePlan,
     inputs: &[RawStridedRef<'_, i64>],
     dest_dims: &[usize],
     dest_strides: &[isize],
     mut exec: Exec<'_>,
-) -> [(Vec<i64>, usize); 2] {
+) -> [ConcatRun; 2] {
     let (len, base) = layout_extent(dest_dims, dest_strides);
     let mut init = vec![-1i64; len];
     let mut dest = RawStridedMut::new(&mut init, dest_dims, dest_strides, base).unwrap();
     crate::threading::take_tile_boxes();
+    crate::threading::take_dispatched_chunks();
     plan.execute(&mut dest, inputs, exec.reborrow()).unwrap();
-    let init_boxes = crate::threading::take_tile_boxes();
+    let init_tiles = crate::threading::take_tile_boxes();
+    let init_chunks = crate::threading::take_dispatched_chunks();
 
     let mut storage = vec![MaybeUninit::new(-1i64); len];
     let mut dest = RawStridedMut::new(&mut storage, dest_dims, dest_strides, base).unwrap();
     plan.execute_uninit(&mut dest, inputs, exec.reborrow())
         .unwrap();
-    let uninit_boxes = crate::threading::take_tile_boxes();
+    let uninit_tiles = crate::threading::take_tile_boxes();
+    let uninit_chunks = crate::threading::take_dispatched_chunks();
     // SAFETY: every slot was initialized to -1 before execution.
     let uninit: Vec<i64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
     [
-        (
-            read_logical(&init, dest_dims, dest_strides, base),
-            init_boxes,
-        ),
-        (
-            read_logical(&uninit, dest_dims, dest_strides, base),
-            uninit_boxes,
-        ),
+        ConcatRun {
+            entry: "execute",
+            values: read_logical(&init, dest_dims, dest_strides, base),
+            tiles: init_tiles,
+            chunks: init_chunks,
+        },
+        ConcatRun {
+            entry: "execute_uninit",
+            values: read_logical(&uninit, dest_dims, dest_strides, base),
+            tiles: uninit_tiles,
+            chunks: uninit_chunks,
+        },
     ]
 }
 
@@ -604,29 +621,30 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
         plan.prefers_whole_plan(&exec),
         "the case must reach the whole-plan parallel replay"
     );
-    crate::threading::take_dispatched_chunks();
     let parallel = concat_runs(&plan, &inputs, &dest_dims, &dest_strides, exec);
-    // The tiled segments must be split across the budget here, not walked as
-    // one chunk: a single invocation of the tiled closure over `0..width`
-    // preserves the values and the aggregate tile count, so only the dispatch
-    // count tells the two apart.
-    let dispatched = crate::threading::take_dispatched_chunks();
-    assert!(
-        dispatched > 2,
-        "the whole-plan replay must dispatch the tiled segments across the budget (dispatched {dispatched} chunks)"
-    );
-    for (entry, (serial, parallel)) in ["execute", "execute_uninit"]
-        .iter()
-        .zip(serial.iter().zip(&parallel))
-    {
+    for (serial, parallel) in serial.iter().zip(&parallel) {
+        let entry = parallel.entry;
         assert!(
-            serial.1 > 0,
+            serial.tiles > 0,
             "{entry}: the serial per-segment replay must tile the permuted segments"
         );
-        assert_eq!(parallel.0, serial.0, "{entry}: values");
         assert_eq!(
-            parallel.1, serial.1,
+            serial.chunks, 0,
+            "{entry}: the serial replay dispatches nothing"
+        );
+        assert_eq!(parallel.values, serial.values, "{entry}: values");
+        assert_eq!(
+            parallel.tiles, serial.tiles,
             "{entry}: the whole-plan replay must walk the serial path's tiles"
+        );
+        // Checked per entry point: the tiled segments must be split across the
+        // budget by this call itself. Walking the tiled closure once over
+        // `0..width` keeps the values and the tile count, so only this call's
+        // dispatch count tells the two apart.
+        assert!(
+            parallel.chunks >= 2,
+            "{entry}: the whole-plan replay must dispatch the tiled segments across the budget (dispatched {} chunks)",
+            parallel.chunks
         );
     }
 
@@ -654,15 +672,16 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
         &dest_strides,
         Exec::serial(),
     );
-    crate::threading::take_dispatched_chunks();
     let exec = Exec::new(&pool, 4).unwrap();
     let parallel = concat_runs(&flat_plan, &flat_inputs, &dest_dims, &dest_strides, exec);
-    assert!(
-        crate::threading::take_dispatched_chunks() > 2,
-        "the contiguous concatenation must keep the flat split"
-    );
     for (serial, parallel) in serial.iter().zip(&parallel) {
-        assert_eq!(parallel.0, serial.0);
-        assert_eq!((serial.1, parallel.1), (0, 0));
+        let entry = parallel.entry;
+        assert_eq!(parallel.values, serial.values, "{entry}: values");
+        assert_eq!((serial.tiles, parallel.tiles), (0, 0), "{entry}: tiles");
+        assert!(
+            parallel.chunks >= 2,
+            "{entry}: the contiguous concatenation must keep the flat split (dispatched {} chunks)",
+            parallel.chunks
+        );
     }
 }
