@@ -463,6 +463,17 @@ pub(crate) fn spilled_pair_tiles<D, S>(axes: &[FusedAxis]) -> Option<Tiles> {
         compressed.rank = rank;
         return pair_tiles::<D, S>(&compressed).map(Tiles::Inline);
     }
+    // The model own exits are decided from the axes, before any slice is
+    // materialized: a call it declines allocates nothing new ([#425]).
+    let elem_size = core::mem::size_of::<D>().max(core::mem::size_of::<S>());
+    if crate::block::exits_before_metadata(
+        axes.iter()
+            .filter(|axis| axis.dim != 1)
+            .map(|axis| (axis.dim, axis.dst, axis.src)),
+        elem_size,
+    ) {
+        return None;
+    }
     let mut dims = Vec::with_capacity(rank);
     let mut dst = Vec::with_capacity(rank);
     let mut src = Vec::with_capacity(rank);

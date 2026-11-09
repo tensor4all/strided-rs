@@ -402,6 +402,64 @@ fn spilled_layouts_tile_as_their_compressed_rank_would() {
     let _ = leaves;
 }
 
+/// [#425] review follow-up: every spilled plan entry, not only the raw replay,
+/// must reach the tiles. A mutation that suppresses tiles for
+/// `PairTraversal::Spilled` inside `CopyPlan` or `UpdatePlan` has to fail here.
+#[test]
+fn spilled_plan_entries_visit_tiles() {
+    let nine = reversed(&[4; 9]);
+    let (dst_len, src_len) = nine.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let source = nine.src_view(&src);
+    let copy = CopyPlan::compile(&nine.dims, &nine.dst, &nine.src).unwrap();
+    let update = UpdatePlan::compile(&nine.dims, &nine.dst, &nine.src).unwrap();
+
+    let run = |name: &str, f: &mut dyn FnMut(&mut RawStridedMut<'_, f64>)| {
+        let mut actual = vec![0.0f64; dst_len];
+        crate::threading::take_tile_boxes();
+        f(&mut nine.dst_view(&mut actual));
+        let boxes = crate::threading::take_tile_boxes();
+        assert!(
+            boxes >= 16,
+            "{name}: the spilled plan must visit cache tiles, got {boxes} boxes"
+        );
+    };
+    run("CopyPlan::execute", &mut |d| {
+        copy.execute(d, &source, Exec::serial()).unwrap()
+    });
+    run("CopyPlan::execute_scale", &mut |d| {
+        copy.execute_scale(d, &source, 2.0, Exec::serial()).unwrap()
+    });
+    run("CopyPlan::execute_conj", &mut |d| {
+        copy.execute_conj(d, &source, Exec::serial()).unwrap()
+    });
+    run("UpdatePlan::execute", &mut |d| {
+        update
+            .execute(d, &source, 2.0, 3.0, |x| x, Exec::serial())
+            .unwrap()
+    });
+
+    let run_uninit =
+        |name: &str, f: &mut dyn FnMut(&mut RawStridedMut<'_, MaybeUninit<f64>>)| {
+            let mut actual = vec![MaybeUninit::new(0.0f64); dst_len];
+            crate::threading::take_tile_boxes();
+            f(&mut nine.dst_view(&mut actual));
+            let boxes = crate::threading::take_tile_boxes();
+            assert!(
+                boxes >= 16,
+                "{name}: the spilled plan must visit cache tiles, got {boxes} boxes"
+            );
+        };
+    run_uninit("CopyPlan::execute_uninit", &mut |d| {
+        copy.execute_uninit(d, &source, Exec::serial()).unwrap()
+    });
+    run_uninit("UpdatePlan::execute_uninit", &mut |d| {
+        update
+            .execute_uninit(d, &source, 2.0, |x| x, Exec::serial())
+            .unwrap()
+    });
+}
+
 #[test]
 fn tiled_replays_equal_the_column_major_oracle() {
     let team = team();

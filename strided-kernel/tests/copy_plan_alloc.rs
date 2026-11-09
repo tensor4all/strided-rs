@@ -218,12 +218,13 @@ fn execute_is_allocation_free_up_to_rank_limit() {
                 .unwrap();
         }
     });
-    // Since #425 a spilled execution also asks the shared cache-block model,
-    // which takes the compressed dims and both stride slices: three rank-sized
-    // buffers beside the cursor, none of them scaling with the element count.
+    // Since #425 a spilled execution also asks the shared cache-block model.
+    // The model exits this layout (its region fits the block budget) before any
+    // slice is materialized, so the three rank-sized buffers are not allocated,
+    // and the cursor stays the only allocation ([#425], review follow-up).
     assert_eq!(
-        allocations, 128,
-        "a spilled rank-9 plan must allocate only rank-sized buffers per execution"
+        allocations, 32,
+        "a spilled rank-9 plan must allocate only the cursor when the model exits"
     );
 
     let dims = [4usize, 4];
