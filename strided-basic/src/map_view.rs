@@ -2290,11 +2290,11 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     // target axis to stride 0, rejects repeated and out-of-range target axes, and
     // requires `source_dims.len() == axes.len()`, so this view reaches a subset of
     // the offsets `view` reaches; `StridedView` construction (`new`,
-    // strided-view/src/view.rs:508 via `validate_bounds`, :186) already proved those
+    // strided-view/src/view.rs:509 via `validate_bounds`, :187) already proved those
     // in bounds, and `target_dims`/`strides` come from the caller's `dest.dims()`
     // and that validation. `new_unchecked` copies the metadata into owned
-    // storage, not inline: `ViewMeta::from_slices` (strided-view/src/view.rs:128)
-    // keeps it inline up to `INLINE_RANK` = 8 and boxes it above (strided-view/src/view.rs:140), which
+    // storage, not inline: `ViewMeta::from_slices` (strided-view/src/view.rs:129)
+    // keeps it inline up to `INLINE_RANK` = 8 and boxes it above (strided-view/src/view.rs:141), which
     // is why a rank-9 call allocates here.
     unsafe { StridedView::new_unchecked(view.data(), target_dims, strides, view.offset()) }
 }

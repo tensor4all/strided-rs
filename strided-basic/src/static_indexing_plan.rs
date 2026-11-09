@@ -249,7 +249,7 @@ impl SlicePlan {
         // `dest_dims == span.div_ceil(stride)`, so each index this view can reach is
         // an index the operand already reaches; `check_call` (:301) re-proved the
         // operand carries the compiled layout, its offsets were validated by
-        // `validate_bounds` (strided-view/src/view.rs:186) in `RawStridedRef::new`
+        // `validate_bounds` (strided-view/src/view.rs:187) in `RawStridedRef::new`
         // (strided-view/src/raw.rs:917), and the delta sum above is checked.
         let source = unsafe {
             RawStridedRef::new_unchecked(
@@ -290,7 +290,7 @@ impl SlicePlan {
         // `dest_dims == span.div_ceil(stride)`, so each index this view can reach is
         // an index the operand already reaches; `check_call` (:301) re-proved the
         // operand carries the compiled layout, its offsets were validated by
-        // `validate_bounds` (strided-view/src/view.rs:186) in `RawStridedRef::new`
+        // `validate_bounds` (strided-view/src/view.rs:187) in `RawStridedRef::new`
         // (strided-view/src/raw.rs:917), and the delta sum above is checked.
         let source = unsafe {
             RawStridedRef::new_unchecked(
