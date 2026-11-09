@@ -123,6 +123,11 @@ Other breaking changes:
 
 - `strided_perm::HostClass` is now a re-export of `threadteam::HostClass`
   instead of a copy; the variants and `HostClass::detect` are unchanged.
+- The four erased `from_raw_parts` constructors in `strided-view`
+  (`ErasedRawStridedPtr`, `ErasedRawStridedRef`, `ErasedRawStridedMut`,
+  `ErasedRawStridedUninitMut`) now return `StridedError::DataAlignmentMismatch`
+  for a zero-length buffer whose base is misaligned (#434). They used to return
+  `Ok`, leaving `data_as*` to form an unaligned `&[T]`, which is UB.
 
 Listed for completeness, not a downstream change: `strided-perm`'s own copy of
 `SMALL_TENSOR_THRESHOLD` (`src/kernel.rs`) is gone. That module was never public

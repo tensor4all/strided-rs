@@ -129,10 +129,10 @@ fn validate_erased_buffer_extent(dtype: KernelDType, data: &[u8]) -> Result<usiz
     }
 
     let element_count = data.len() / element_size;
-    if element_count == 0 {
-        return Ok(0);
-    }
-
+    // A zero-length extent still has to be aligned: `data_as` casts this base
+    // to `T`, and `slice::from_raw_parts` requires an aligned pointer even for
+    // length 0, so a misaligned empty buffer is rejected here rather than
+    // reaching the cast.
     let alignment = dtype.alignment();
     if !(data.as_ptr() as usize).is_multiple_of(alignment) {
         return Err(StridedError::DataAlignmentMismatch {
@@ -171,7 +171,7 @@ fn validate_erased_buffer_layout(
             element_size,
         });
     }
-    if byte_len != 0 && !(data.as_ptr() as usize).is_multiple_of(dtype.alignment()) {
+    if !(data.as_ptr() as usize).is_multiple_of(dtype.alignment()) {
         return Err(StridedError::DataAlignmentMismatch {
             dtype: dtype.label(),
             alignment: dtype.alignment(),
@@ -218,7 +218,7 @@ impl<'a> ErasedRawStridedPtr<'a> {
     ///
     /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
     /// a whole number of `dtype` elements, and
-    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// [`StridedError::DataAlignmentMismatch`] when `data` is
     /// not aligned for `dtype`. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
@@ -435,7 +435,7 @@ impl<'a> ErasedRawStridedRef<'a> {
     ///
     /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
     /// a whole number of `dtype` elements, and
-    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// [`StridedError::DataAlignmentMismatch`] when `data` is
     /// not aligned for `dtype`. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
@@ -596,7 +596,7 @@ impl<'a> ErasedRawStridedMut<'a> {
     ///
     /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
     /// a whole number of `dtype` elements, and
-    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// [`StridedError::DataAlignmentMismatch`] when `data` is
     /// not aligned for `dtype`. Returns
     /// [`StridedError::InvalidBoolByte`] when `dtype` is `Bool` and a byte
     /// of the extent is neither 0 nor 1. Returns
@@ -789,7 +789,7 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     ///
     /// Returns [`StridedError::ByteLengthMismatch`] when `byte_len` is not
     /// a whole number of `dtype` elements, and
-    /// [`StridedError::DataAlignmentMismatch`] when a non-empty `data` is
+    /// [`StridedError::DataAlignmentMismatch`] when `data` is
     /// not aligned for `dtype`. Returns
     /// [`StridedError::StrideLengthMismatch`] when `dims` and `strides`
     /// have different lengths, and [`StridedError::OffsetOverflow`] when
