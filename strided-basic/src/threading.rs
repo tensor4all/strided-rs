@@ -7,7 +7,7 @@
 //! state of its own.
 
 use crate::cost::KernelClass;
-pub(crate) use crate::cost::{for_len, is_parallel};
+pub(crate) use crate::cost::{for_len, is_parallel, is_parallel_at_rate};
 use crate::inline::InlineVec;
 use crate::kernel::for_each_inner_block_preordered;
 use crate::Result;
@@ -409,8 +409,38 @@ where
     // per leaf region. Borrowed per-operand stride slices are built once here
     // so the splitter and its leaves share them without owning a
     // `Vec<Vec<isize>>` (#306 P1).
+    mapreduce_threaded_at_rate(
+        dims,
+        blocks,
+        strides_list,
+        offsets,
+        costs,
+        class.ns_per_element(),
+        exec,
+        f,
+    )
+}
+
+/// [`mapreduce_threaded`] at an explicit serial rate per element instead of a
+/// class: the gates of the recursive splitter ask `exec.pays` at that rate, so a
+/// `CopyPlan` whose footprint is past its class's L2 splits at its own rate
+/// (strided-rs#364).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mapreduce_threaded_at_rate<S: AsRef<[isize]>, F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides_list: &[S],
+    offsets: &[isize],
+    costs: &[isize],
+    ns_per_element: f64,
+    exec: Exec<'_>,
+    f: &F,
+) -> Result<()>
+where
+    F: Fn(&[usize], &[usize], &[&[isize]], &[isize]) -> Result<()> + Sync,
+{
     let refs: SVec<&[isize]> = strided_slices(strides_list);
-    mapreduce_threaded_dyn(dims, blocks, &refs, offsets, costs, class, exec, f)
+    mapreduce_threaded_dyn(dims, blocks, &refs, offsets, costs, ns_per_element, exec, f)
 }
 
 fn strided_slices<S: AsRef<[isize]>>(strides_list: &[S]) -> SVec<&[isize]> {
@@ -429,7 +459,7 @@ fn mapreduce_threaded_dyn(
     strides_list: &[&[isize]],
     offsets: &[isize],
     costs: &[isize],
-    class: KernelClass,
+    ns_per_element: f64,
     exec: Exec<'_>,
     f: LeafFn<'_>,
 ) -> Result<()> {
@@ -442,7 +472,7 @@ fn mapreduce_threaded_dyn(
         blocks: &blocks,
         strides_list,
         costs,
-        class,
+        ns_per_element,
         operation: f,
     }
     .run(dims, offsets, exec)
@@ -452,7 +482,7 @@ struct ThreadedMapReduce<'a> {
     blocks: &'a [usize],
     strides_list: &'a [&'a [isize]],
     costs: &'a [isize],
-    class: KernelClass,
+    ns_per_element: f64,
     operation: LeafFn<'a>,
 }
 
@@ -461,7 +491,7 @@ impl ThreadedMapReduce<'_> {
         let total = crate::kernel::total_len(dims)?;
 
         // Base case: a single slot, or a fork of this region does not pay.
-        if !is_parallel(self.class, total, &exec) {
+        if !is_parallel_at_rate(total, self.ns_per_element, &exec) {
             return (self.operation)(dims, self.blocks, self.strides_list, offsets);
         }
         let Some(i) = split_axis(dims, self.blocks, self.costs) else {
