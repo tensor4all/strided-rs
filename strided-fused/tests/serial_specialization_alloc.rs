@@ -42,6 +42,24 @@ fn record_deallocation() {
     let _ = THREAD_FREES.try_with(|count| count.set(count.get().wrapping_add(1)));
 }
 
+/// The counters run inside `GlobalAlloc` methods, which must not unwind, so
+/// they wrap at `usize::MAX` instead of panicking under overflow checks.
+#[test]
+fn counters_wrap_at_usize_max_instead_of_panicking() {
+    // Set, record and restore with plain `Cell` operations only: nothing in
+    // between allocates, so no other count lands on the saturated counter,
+    // and both counters are back to their old values before anything is
+    // asserted (a failing assertion allocates).
+    let saved_allocations = THREAD_ALLOCATIONS.with(|count| count.replace(usize::MAX));
+    record_allocation();
+    let wrapped_allocations = THREAD_ALLOCATIONS.with(|count| count.replace(saved_allocations));
+    let saved_frees = THREAD_FREES.with(|count| count.replace(usize::MAX));
+    record_deallocation();
+    let wrapped_frees = THREAD_FREES.with(|count| count.replace(saved_frees));
+    assert_eq!(wrapped_allocations, 0);
+    assert_eq!(wrapped_frees, 0);
+}
+
 // SAFETY: each method forwards its arguments unchanged to `System`, which meets the `GlobalAlloc`
 // contract, and the counting side effects neither allocate nor unwind. `fetch_add` on the atomic
 // wraps on overflow. The thread-local `Cell`s are `const`-initialized and have no destructor, so
