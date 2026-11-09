@@ -436,6 +436,11 @@ where
         let offset = dests[0].offset();
         let data = dests[0].data_as_mut::<T>()?;
         let mut dest_views =
+            // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:957) needs every
+            // index combination in bounds. This descriptor checked exactly these dims, strides
+            // and offset against its element count when it was built (`validate_bounds`,
+            // strided-view/src/view.rs:187), and `data_as_mut` (strided-view/src/raw.rs:710)
+            // returned that count after checking the dtype. The `&mut` slice carries exclusivity.
             [unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) }];
         return execute_fused_inputs(&mut dest_views, inputs, plan, exec);
     }
@@ -443,14 +448,18 @@ where
     if dests.len() <= strided_basic::OPERAND_CAP {
         let mut storage =
             [const { MaybeUninit::<StridedViewMut<'_, T>>::uninit() }; strided_basic::OPERAND_CAP];
-        // SAFETY: `storage` has `OPERAND_CAP` writable slots and outlives the
-        // guard (declared after it); at most `OPERAND_CAP` views are pushed.
+        // SAFETY: `InitializedViewsMut::new` (fused.rs:38) needs `OPERAND_CAP` writable slots
+        // that outlive the guard: `storage` is an `OPERAND_CAP` array declared before `views`, so
+        // it is dropped after it, and this branch holds only when `dests.len() <= OPERAND_CAP`
+        // (erased.rs:448), which bounds the pushes.
         let mut views = unsafe { crate::fused::InitializedViewsMut::new(storage.as_mut_ptr()) };
         for dest in dests.iter_mut() {
             let dims = dest.dims();
             let strides = dest.strides();
             let offset = dest.offset();
             let data = dest.data_as_mut::<T>()?;
+            // SAFETY: as for the single-destination view above: this descriptor's
+            // construction-time `validate_bounds` covers these dims, strides and offset.
             views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
         }
         return execute_fused_inputs(views.as_mut_slice(), inputs, plan, exec);
@@ -462,6 +471,8 @@ where
         let strides = dest.strides();
         let offset = dest.offset();
         let data = dest.data_as_mut::<T>()?;
+        // SAFETY: as for the single-destination view above: this descriptor's construction-time
+        // `validate_bounds` covers these dims, strides and offset.
         dest_views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
     }
     execute_fused_inputs(&mut dest_views, inputs, plan, exec)
@@ -525,6 +536,12 @@ where
         let offset = dests[0].offset();
         let data = dests[0].data_as_uninit_mut::<T>()?;
         let mut dest_views =
+            // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:957) needs every
+            // index combination in bounds. This descriptor checked exactly these dims, strides
+            // and offset against its element count when it was built (`validate_bounds`,
+            // strided-view/src/view.rs:187), and `data_as_uninit_mut`
+            // (strided-view/src/raw.rs:882) returned that count after checking the dtype. The
+            // `&mut` slice carries exclusivity.
             [unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) }];
         return execute_fused_uninit_inputs(plan, &mut dest_views, inputs, validated, exec);
     }
@@ -532,14 +549,18 @@ where
     if dests.len() <= strided_basic::OPERAND_CAP {
         let mut storage = [const { MaybeUninit::<StridedViewMut<'_, MaybeUninit<T>>>::uninit() };
             strided_basic::OPERAND_CAP];
-        // SAFETY: `storage` has `OPERAND_CAP` writable slots and outlives the
-        // guard (declared after it); at most `OPERAND_CAP` views are pushed.
+        // SAFETY: `InitializedViewsMut::new` (fused.rs:38) needs `OPERAND_CAP` writable slots
+        // that outlive the guard: `storage` is an `OPERAND_CAP` array declared before `views`, so
+        // it is dropped after it, and this branch holds only when `dests.len() <= OPERAND_CAP`
+        // (erased.rs:549), which bounds the pushes.
         let mut views = unsafe { crate::fused::InitializedViewsMut::new(storage.as_mut_ptr()) };
         for dest in dests.iter_mut() {
             let dims = dest.dims();
             let strides = dest.strides();
             let offset = dest.offset();
             let data = dest.data_as_uninit_mut::<T>()?;
+            // SAFETY: as for the single-destination view above: this descriptor's
+            // construction-time `validate_bounds` covers these dims, strides and offset.
             views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
         }
         return execute_fused_uninit_inputs(plan, views.as_mut_slice(), inputs, validated, exec);
@@ -551,6 +572,8 @@ where
         let strides = dest.strides();
         let offset = dest.offset();
         let data = dest.data_as_uninit_mut::<T>()?;
+        // SAFETY: as for the single-destination view above: this descriptor's construction-time
+        // `validate_bounds` covers these dims, strides and offset.
         dest_views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
     }
     execute_fused_uninit_inputs(plan, &mut dest_views, inputs, validated, exec)
@@ -570,15 +593,28 @@ where
         // SAFETY: `ErasedFusedPlan::execute_outputs_uninit` checked every input
         // against every destination before this helper.
         [a] => {
+            // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs no
+            // mutable allocation overlapping `a`, its allocation contract still in force
+            // (strided-view/src/raw.rs:204), and no conflicting access while the result is used.
+            // This helper's only caller is `execute_fused_uninit_multi`, reached only from
+            // `ErasedFusedPlan::execute_outputs_uninit`, which checked every input against every
+            // destination with `validate_uninit_no_overlap` (erased.rs:319) before dispatching.
+            // The destinations stay borrowed `&mut` for the call.
             let refs = [unsafe { a.try_as_ref_after_no_overlap()? }];
             let views = [erased_view::<T>(&refs[0])?];
             crate::fused::fused_elementwise_into_uninit_multi(dests, &views, plan, validated, exec)
         }
         [a, b] => {
             let refs = [
-                // SAFETY: as above.
+                // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs no
+                // mutable allocation overlapping `a`, its allocation contract still in force
+                // (strided-view/src/raw.rs:204), and no conflicting access while the result is
+                // used. This helper's only caller is `execute_fused_uninit_multi`, reached only
+                // from `ErasedFusedPlan::execute_outputs_uninit`, which checked every input
+                // against every destination with `validate_uninit_no_overlap` (erased.rs:319)
+                // before dispatching. The destinations stay borrowed `&mut` for the call.
                 unsafe { a.try_as_ref_after_no_overlap()? },
-                // SAFETY: as above.
+                // SAFETY: as for `a`: the same overlap check covered `b`.
                 unsafe { b.try_as_ref_after_no_overlap()? },
             ];
             let views = [erased_view::<T>(&refs[0])?, erased_view::<T>(&refs[1])?];
@@ -586,11 +622,17 @@ where
         }
         [a, b, c] => {
             let refs = [
-                // SAFETY: as above.
+                // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs no
+                // mutable allocation overlapping `a`, its allocation contract still in force
+                // (strided-view/src/raw.rs:204), and no conflicting access while the result is
+                // used. This helper's only caller is `execute_fused_uninit_multi`, reached only
+                // from `ErasedFusedPlan::execute_outputs_uninit`, which checked every input
+                // against every destination with `validate_uninit_no_overlap` (erased.rs:319)
+                // before dispatching. The destinations stay borrowed `&mut` for the call.
                 unsafe { a.try_as_ref_after_no_overlap()? },
-                // SAFETY: as above.
+                // SAFETY: as for `a`: the same overlap check covered `b`.
                 unsafe { b.try_as_ref_after_no_overlap()? },
-                // SAFETY: as above.
+                // SAFETY: as for `a`: the same overlap check covered `c`.
                 unsafe { c.try_as_ref_after_no_overlap()? },
             ];
             let views = [
@@ -602,13 +644,19 @@ where
         }
         [a, b, c, d] => {
             let refs = [
-                // SAFETY: as above.
+                // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs no
+                // mutable allocation overlapping `a`, its allocation contract still in force
+                // (strided-view/src/raw.rs:204), and no conflicting access while the result is
+                // used. This helper's only caller is `execute_fused_uninit_multi`, reached only
+                // from `ErasedFusedPlan::execute_outputs_uninit`, which checked every input
+                // against every destination with `validate_uninit_no_overlap` (erased.rs:319)
+                // before dispatching. The destinations stay borrowed `&mut` for the call.
                 unsafe { a.try_as_ref_after_no_overlap()? },
-                // SAFETY: as above.
+                // SAFETY: as for `a`: the same overlap check covered `b`.
                 unsafe { b.try_as_ref_after_no_overlap()? },
-                // SAFETY: as above.
+                // SAFETY: as for `a`: the same overlap check covered `c`.
                 unsafe { c.try_as_ref_after_no_overlap()? },
-                // SAFETY: as above.
+                // SAFETY: as for `a`: the same overlap check covered `d`.
                 unsafe { d.try_as_ref_after_no_overlap()? },
             ];
             let views = [

@@ -42,17 +42,19 @@ impl<'a, T> InitializedViewsMut<'a, T> {
     /// Write the next initialized view into the prefix.
     pub(crate) fn push(&mut self, view: StridedViewMut<'a, T>) {
         debug_assert!(self.len < strided_basic::OPERAND_CAP);
-        // SAFETY: the caller reserved `OPERAND_CAP` slots and
-        // `len < OPERAND_CAP` holds.
+        // SAFETY: `storage` holds `OPERAND_CAP` writable slots by `new`'s contract
+        // (fused.rs:36), and `len < OPERAND_CAP`: both callers push at most `dests.len() <=
+        // OPERAND_CAP` views (erased.rs:448, erased.rs:549). The `debug_assert!` above checks
+        // that only in debug builds; this safe method relies on its two callers.
         unsafe { self.storage.add(self.len).write(MaybeUninit::new(view)) };
         self.len += 1;
     }
 
     /// Borrow the initialized prefix.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [StridedViewMut<'a, T>] {
-        // SAFETY: every slot below `len` was initialized by `push`, and
-        // `MaybeUninit<StridedViewMut>` has the same layout as
-        // `StridedViewMut`.
+        // SAFETY: `push` (fused.rs:43) initialized every slot below `len`,
+        // `MaybeUninit<StridedViewMut>` has the layout of `StridedViewMut`, and `&mut self` makes
+        // the slice the only access while it lives.
         unsafe {
             core::slice::from_raw_parts_mut(self.storage.cast::<StridedViewMut<'a, T>>(), self.len)
         }
@@ -62,7 +64,8 @@ impl<'a, T> InitializedViewsMut<'a, T> {
 impl<T> Drop for InitializedViewsMut<'_, T> {
     fn drop(&mut self) {
         for index in 0..self.len {
-            // SAFETY: every slot in the prefix was initialized by `push`.
+            // SAFETY: `push` initialized every slot below `len`, and each one is dropped exactly
+            // once, here.
             unsafe { (*self.storage.add(index)).assume_init_drop() };
         }
     }
@@ -83,9 +86,11 @@ impl<T> Default for OperandPtr<T> {
     }
 }
 
-// SAFETY: only used to move/copy validated operand addresses to worker threads;
-// the owning views establish liveness, aliasing and access at each use.
+// SAFETY: an `OperandPtr` only carries an address. Every dereference sits in an `unsafe` block
+// whose contract proves liveness and exclusivity (`interpret_inner_loop`, fused.rs:1301;
+// `replay_chunked`, chunk.rs:147), so sending or sharing the address is sound.
 unsafe impl<T> Send for OperandPtr<T> {}
+// SAFETY: as for `Send` above: sharing a reference only shares the address.
 unsafe impl<T> Sync for OperandPtr<T> {}
 
 impl<T> OperandPtr<T> {
@@ -98,15 +103,16 @@ impl<T> OperandPtr<T> {
 /// View an inline operand vector as a `&[*mut T]` slice.
 #[inline]
 fn operand_ptrs<T>(ptrs: &[OperandPtr<T>]) -> &[*mut T] {
-    // SAFETY: `OperandPtr<T>` is `repr(transparent)` over `*mut T`.
+    // SAFETY: `OperandPtr<T>` is `#[repr(transparent)]` over `*mut T` (fused.rs:79), so the
+    // slice reads as `ptrs.len()` raw pointers for the same borrow.
     unsafe { core::slice::from_raw_parts(ptrs.as_ptr().cast::<*mut T>(), ptrs.len()) }
 }
 
 /// View an inline operand vector as a `&[*const T]` slice.
 #[inline]
 fn operand_const_ptrs<T>(ptrs: &[OperandPtr<T>]) -> &[*const T] {
-    // SAFETY: `OperandPtr<T>` is `repr(transparent)` over `*mut T`, and
-    // `*mut T` and `*const T` have the same layout.
+    // SAFETY: as in `operand_ptrs`: `OperandPtr<T>` is `#[repr(transparent)]` over `*mut T`
+    // (fused.rs:79), and `*mut T` and `*const T` have the same layout.
     unsafe { core::slice::from_raw_parts(ptrs.as_ptr().cast::<*const T>(), ptrs.len()) }
 }
 
@@ -1091,8 +1097,16 @@ where
             // (tensor4all/strided-rs#305 item 2).
             macro_rules! unary {
                 ($apply:expr) => {{
-                    // SAFETY: matching shapes and this destination layout were
-                    // validated before specialization/replay.
+                    // SAFETY: `map_into_validated` (strided-basic/src/execution.rs:161) needs
+                    // three things. Every input shape equals `dest`'s: `validate_shapes` checked
+                    // it (fused.rs:857) on the initialized path, and
+                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1791) on the
+                    // uninitialized one. `validated` belongs to this `dest`'s geometry: here
+                    // `dest` is `dests[0]` of a single-destination call (fused.rs:1256,
+                    // fused.rs:1794), and the marker was made for `dests[0]` (fused.rs:851;
+                    // uninitialized entry: erased.rs:328). Bounds and aliasing hold for the
+                    // replay: every view keeps its construction-time bounds, `dest` is borrowed
+                    // `&mut`, and the inputs are shared views.
                     unsafe {
                         map_into_validated(
                             dest,
@@ -1124,8 +1138,9 @@ where
             // As above: one monomorphized kernel per `FusedOp`.
             macro_rules! binary {
                 ($apply:expr) => {{
-                    // SAFETY: matching shapes and this destination layout were
-                    // validated before specialization/replay.
+                    // SAFETY: as for the unary arm (fused.rs:1111): `zip_map2_into_validated`
+                    // (strided-basic/src/execution.rs:203) has the same contract, met the same
+                    // way.
                     unsafe {
                         zip_map2_into_validated(
                             dest,
@@ -1150,8 +1165,8 @@ where
         }
         StaticFusedKind::Ternary(op, a, b, c) => match op {
             FusedOp::Clamp => {
-                // SAFETY: matching shapes and this destination layout were
-                // validated before specialization/replay.
+                // SAFETY: as for the unary arm (fused.rs:1111): `zip_map3_into_validated`
+                // (strided-basic/src/execution.rs:251) has the same contract, met the same way.
                 unsafe {
                     zip_map3_into_validated(
                         dest,
@@ -1166,7 +1181,8 @@ where
             }
             _ => unreachable!("not a ternary fused op: {op:?}"),
         },
-        // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map2_into_validated`
+        // (strided-basic/src/execution.rs:203) has the same contract, met the same way.
         StaticFusedKind::AddMulLeft => unsafe {
             zip_map2_into_validated(
                 dest,
@@ -1177,7 +1193,8 @@ where
                 exec,
             )
         }?,
-        // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map2_into_validated`
+        // (strided-basic/src/execution.rs:203) has the same contract, met the same way.
         StaticFusedKind::AddMulRight => unsafe {
             zip_map2_into_validated(
                 dest,
@@ -1188,7 +1205,8 @@ where
                 exec,
             )
         }?,
-        // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map3_into_validated`
+        // (strided-basic/src/execution.rs:251) has the same contract, met the same way.
         StaticFusedKind::MulAddExp => unsafe {
             zip_map3_into_validated(
                 dest,
@@ -1200,7 +1218,8 @@ where
                 exec,
             )
         }?,
-        // SAFETY: matching shapes and this destination layout were validated before specialization/replay.
+        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map4_into_validated`
+        // (strided-basic/src/execution.rs:305) has the same contract, met the same way.
         StaticFusedKind::DivClampSqrtRsqrt => unsafe {
             zip_map4_into_validated(
                 dest,
@@ -1269,6 +1288,16 @@ fn try_static_specialization<T: FusedScalar>(
 /// the heap (#306 item 6).
 const INLINE_REGS: usize = 12;
 
+/// Run the per-element interpreter over one generated block.
+///
+/// # Safety
+/// `offsets` and `strides` hold one entry per operand, outputs first and then
+/// inputs, as `for_each_inner_block_preordered` hands them to its callback. With
+/// `n = dst_ptrs.len()`, for every `k < len` the element
+/// `dst_ptrs[i] + offsets[i] + k * strides[i]` must be writable and
+/// `input_ptrs[j] + offsets[n + j] + k * strides[n + j]` readable; no other
+/// thread may access those destination elements during the call; and `plan`
+/// must have passed `validate_plan` for these operand counts.
 unsafe fn interpret_inner_loop<T: FusedScalar>(
     dst_ptrs: &[*mut T],
     input_ptrs: &[*const T],
@@ -1281,12 +1310,17 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
     if len == 0 || register_count == 0 {
         return;
     }
-    // SAFETY: a validated plan with instructions has at least one input, and
-    // the enclosing kernel proved every operand addresses a readable element.
+    // SAFETY: `len > 0` (checked above), and `validate_plan` admits no plan without inputs: every
+    // output names a defined value (fused.rs:816) and instructions read only earlier values
+    // (fused.rs:805), so with `input_count == 0` there is no value to name and the plan is
+    // rejected. So `input_ptrs[0]` exists, and its element at `offsets[n]` (`k = 0`) is readable
+    // under this function's contract (fused.rs:1291).
     let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
-        // SAFETY: forwarded contract.
+        // SAFETY: `interpret_loop_body` has this function's contract (fused.rs:1291), passed on
+        // unchanged; `regs` holds `register_count` values, one per register `validate_plan`
+        // admits.
         unsafe {
             interpret_loop_body(
                 dst_ptrs,
@@ -1300,7 +1334,7 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: forwarded contract.
+        // SAFETY: as for the inline register file above.
         unsafe {
             interpret_loop_body(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
         };
@@ -1330,7 +1364,9 @@ unsafe fn interpret_loop_body<T: FusedScalar>(
         for (input_index, &input_ptr) in input_ptrs.iter().enumerate() {
             let stride_index = output_count + input_index;
             let stride = inner_stride(strides, stride_index);
-            // SAFETY: forwarded caller contract.
+            // SAFETY: element `i < len` of input `input_index`, at its block offset and inner
+            // stride, readable under the contract this body shares with `interpret_inner_loop`
+            // (fused.rs:1291).
             regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
         for (instruction, inst) in plan.ops.iter().enumerate() {
@@ -1339,7 +1375,8 @@ unsafe fn interpret_loop_body<T: FusedScalar>(
         }
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
-            // SAFETY: forwarded caller contract.
+            // SAFETY: element `i < len` of output `output_index`, writable under the same
+            // contract, and no other thread touches it.
             unsafe {
                 *dst_ptr.offset(offsets[output_index] + i * stride) =
                     regs[plan.outputs[output_index]];
@@ -1355,8 +1392,11 @@ fn chunk_seed<T: FusedScalar>(inputs: &[StridedView<'_, T>]) -> Option<T> {
     if inputs.is_empty() || !chunk::is_real_chunk_scalar::<T>() {
         return None;
     }
-    // SAFETY: callers reach this with a non-empty destination, and every input
-    // shares the destination shape, so the first input has a readable element.
+    // SAFETY: both interpreters call this only after returning early for an empty `dests[0]`
+    // (fused.rs:1461, fused.rs:1806) and after checking every input against its shape
+    // (fused.rs:857, fused.rs:1791), so `inputs[0]` is non-empty and `ptr()` is its element at
+    // the view offset (`base_ptr`, strided-view/src/view.rs:446). This safe helper relies on
+    // those two callers.
     Some(unsafe { *inputs[0].ptr() })
 }
 
@@ -1444,10 +1484,21 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
     let elem_size = std::mem::size_of::<T>();
     let total = dests[0].len();
     let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+        // SAFETY: `build_plan_fused_small` (strided-basic/src/execution.rs:87) needs matching
+        // rank-indexed lengths and representable shape, stride and offset arithmetic. `dims` is
+        // `dests[0]`'s, and every entry of `strides_list` has that rank, because each operand's
+        // shape was checked equal to it before this call. Every stride comes from a view whose
+        // construction bounded all reachable offsets (`validate_bounds`,
+        // strided-view/src/view.rs:187), so the arithmetic is representable.
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
-        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+        // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
+        // rank-indexed lengths, a valid destination index and representable shape, stride and
+        // offset arithmetic. `dims` is `dests[0]`'s, and every entry of `strides_list` has that
+        // rank, because each operand's shape was checked equal to it before this call. Every
+        // stride comes from a view whose construction bounded all reachable offsets
+        // (`validate_bounds`, strided-view/src/view.rs:187), so the arithmetic is representable.
+        // Index `0` is `dests[0]`.
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), elem_size) }
     };
 
@@ -1465,7 +1516,17 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
             let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
                 if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
                 {
-                    // SAFETY: validated shapes/layouts and the derived block bound every access.
+                    // SAFETY: `replay_chunked` (chunk.rs:147): `block_replay_eligible` just
+                    // checked the strides (outputs 1, inputs 0 or 1). `offsets`, `len` and
+                    // `strides` describe one block that `for_each_inner_block_preordered`
+                    // generated over shapes checked equal, so each stride-1 operand's `offsets[i]
+                    // .. + len` and each stride-0 input's `offsets[i]` are elements of that
+                    // operand, inside its bounds. `direct` came from `direct_inputs`, which keeps
+                    // only stride-1 inputs (fused.rs:1436). `regs` holds
+                    // `register_file_len(plan)` values, because `seed` is `Some`
+                    // (chunk.rs:108). The plan passed `validate_plan_for_scalar`, and only this
+                    // partition writes these destination elements (see `replay_partitions`,
+                    // fused.rs:1620).
                     unsafe {
                         chunk::replay_chunked(
                             operand_ptrs(&dst_ptrs),
@@ -1480,7 +1541,11 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                     }
                     return Ok(());
                 }
-                // SAFETY: validated shapes/layouts and the derived block bound every access.
+                // SAFETY: `interpret_inner_loop`'s contract (fused.rs:1291) holds: `offsets`,
+                // `len` and `strides` describe one generated block over shapes checked equal, so
+                // every element it reaches is inside each operand; only this partition writes
+                // those destination elements (see `replay_partitions`); and the plan passed
+                // `validate_plan_for_scalar`.
                 unsafe {
                     interpret_inner_loop(
                         operand_ptrs(&dst_ptrs),
@@ -1493,7 +1558,12 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                 }
                 Ok(())
             };
-            // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+            // SAFETY: `for_each_inner_block_preordered` (strided-basic/src/execution.rs:115)
+            // needs well-formed arrays, positive blocks, offsets that correspond to the layouts,
+            // and valid callback accesses. `dims`, `blocks` and `strides_list` are one partition
+            // of a `build_plan_fused*` result; `offsets` start at 0 relative to each operand's
+            // base pointer (`initial_offsets`); and `run_block` only touches the elements of the
+            // block it is handed (see the two calls inside it).
             unsafe {
                 for_each_inner_block_preordered(dims, blocks, strides_list, offsets, run_block)
             }
@@ -1561,9 +1631,18 @@ where
 {
     let total: usize = dims.iter().product();
     if parallel_width(&exec, class, total).get() > 1 {
-        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+        // SAFETY: `compute_costs` (strided-basic/src/execution.rs:467) only needs the
+        // rank-indexed `ordered_strides` of one `build_plan_fused*` result, which is what both
+        // callers pass.
         let costs = unsafe { compute_costs(ordered_strides) };
-        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+        // SAFETY: `mapreduce_threaded` (strided-basic/src/execution.rs:496). `dims`, `blocks`,
+        // `ordered_strides` and `initial_offsets` come from one `build_plan_fused*` result, and
+        // `costs` from `compute_costs` over it. Partitions run concurrently, so their mutable
+        // regions must be disjoint. Every destination layout is injective: the initialized path
+        // checks it with `validate_destination_layout` (fused.rs:851, fused.rs:853), and the
+        // uninitialized entry with its per-destination markers (erased.rs:328). The partitions
+        // cover disjoint index sets, so no two of them write one destination element, and
+        // distinct destinations are distinct exclusive borrows.
         return unsafe {
             mapreduce_threaded(
                 dims,
@@ -1582,6 +1661,11 @@ where
     run_partition(dims, blocks, &strides_refs, initial_offsets)
 }
 
+/// Uninitialized-destination sibling of [`interpret_inner_loop`].
+///
+/// # Safety
+/// As [`interpret_inner_loop`]; the destination elements may be uninitialized,
+/// and each one is written, never read.
 unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
     dst_ptrs: &[*mut MaybeUninit<T>],
     input_ptrs: &[*const T],
@@ -1594,12 +1678,16 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
     if len == 0 || register_count == 0 {
         return;
     }
-    // SAFETY: a validated plan with instructions has at least one input, and
-    // the enclosing kernel proved every operand addresses a readable element.
+    // SAFETY: `len > 0` (checked above), and `validate_plan` admits no plan without inputs: every
+    // output names a defined value (fused.rs:816) and instructions read only earlier values
+    // (fused.rs:805), so with `input_count == 0` there is no value to name and the plan is
+    // rejected. So `input_ptrs[0]` exists, and its element at `offsets[n]` (`k = 0`) is readable
+    // under this function's contract (fused.rs:1664).
     let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
-        // SAFETY: forwarded contract.
+        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1664),
+        // passed on unchanged; `regs` holds `register_count` values.
         unsafe {
             interpret_loop_body_uninit(
                 dst_ptrs,
@@ -1613,7 +1701,7 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: forwarded contract.
+        // SAFETY: as for the inline register file above.
         unsafe {
             interpret_loop_body_uninit(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
         };
@@ -1642,7 +1730,9 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
         for (input_index, &input_ptr) in input_ptrs.iter().enumerate() {
             let stride_index = output_count + input_index;
             let stride = inner_stride(strides, stride_index);
-            // SAFETY: forwarded caller contract.
+            // SAFETY: element `i < len` of input `input_index`, at its block offset and inner
+            // stride, readable under the contract this body shares with
+            // `interpret_inner_loop_uninit` (fused.rs:1664).
             regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
         for (instruction, inst) in plan.ops.iter().enumerate() {
@@ -1651,7 +1741,8 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
         }
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
-            // SAFETY: forwarded caller contract.
+            // SAFETY: element `i < len` of output `output_index`, writable under the same
+            // contract; it is written, never read.
             unsafe {
                 *dst_ptr.offset(offsets[output_index] + i * stride) =
                     MaybeUninit::new(regs[plan.outputs[output_index]]);
@@ -1743,10 +1834,21 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
     }
     let total = dests[0].len();
     let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+        // SAFETY: `build_plan_fused_small` (strided-basic/src/execution.rs:87) needs matching
+        // rank-indexed lengths and representable shape, stride and offset arithmetic. `dims` is
+        // `dests[0]`'s, and every entry of `strides_list` has that rank, because each operand's
+        // shape was checked equal to it before this call. Every stride comes from a view whose
+        // construction bounded all reachable offsets (`validate_bounds`,
+        // strided-view/src/view.rs:187), so the arithmetic is representable.
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
-        // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+        // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
+        // rank-indexed lengths, a valid destination index and representable shape, stride and
+        // offset arithmetic. `dims` is `dests[0]`'s, and every entry of `strides_list` has that
+        // rank, because each operand's shape was checked equal to it before this call. Every
+        // stride comes from a view whose construction bounded all reachable offsets
+        // (`validate_bounds`, strided-view/src/view.rs:187), so the arithmetic is representable.
+        // Index `0` is `dests[0]`.
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), core::mem::size_of::<T>()) }
     };
 
@@ -1764,7 +1866,17 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
             let run_block = |offsets: &[isize], len: usize, strides: &[isize]| -> Result<()> {
                 if seed.is_some() && chunk::block_replay_eligible(strides, dst_ptrs.len(), operands)
                 {
-                    // SAFETY: validated shapes/layouts and the derived block bound every access.
+                    // SAFETY: `replay_chunked_uninit` (chunk.rs:332): `block_replay_eligible`
+                    // just checked the strides (outputs 1, inputs 0 or 1). `offsets`, `len` and
+                    // `strides` describe one block that `for_each_inner_block_preordered`
+                    // generated over shapes checked equal, so each stride-1 operand's `offsets[i]
+                    // .. + len` and each stride-0 input's `offsets[i]` are elements of that
+                    // operand, inside its bounds. `direct` came from `direct_inputs`, which keeps
+                    // only stride-1 inputs (fused.rs:1436). `regs` holds
+                    // `register_file_len(plan)` values, because `seed` is `Some`
+                    // (chunk.rs:108). The plan passed `validate_plan_for_scalar`, and only this
+                    // partition writes these destination elements (see `replay_partitions`,
+                    // fused.rs:1620).
                     unsafe {
                         chunk::replay_chunked_uninit(
                             operand_ptrs(&dst_ptrs),
@@ -1779,7 +1891,11 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     }
                     return Ok(());
                 }
-                // SAFETY: validated shapes/layouts and the derived block bound every access.
+                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1664) holds:
+                // `offsets`, `len` and `strides` describe one generated block over shapes checked
+                // equal, so every element it reaches is inside each operand; only this partition
+                // writes those destination elements (see `replay_partitions`); and the plan
+                // passed `validate_plan_for_scalar`.
                 unsafe {
                     interpret_inner_loop_uninit(
                         operand_ptrs(&dst_ptrs),
@@ -1792,7 +1908,12 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                 }
                 Ok(())
             };
-            // SAFETY: the enclosing checked kernel supplies validated layout metadata and its derived partitions.
+            // SAFETY: `for_each_inner_block_preordered` (strided-basic/src/execution.rs:115)
+            // needs well-formed arrays, positive blocks, offsets that correspond to the layouts,
+            // and valid callback accesses. `dims`, `blocks` and `strides_list` are one partition
+            // of a `build_plan_fused*` result; `offsets` start at 0 relative to each operand's
+            // base pointer (`initial_offsets`); and `run_block` only touches the elements of the
+            // block it is handed (see the two calls inside it).
             unsafe {
                 for_each_inner_block_preordered(dims, blocks, strides_list, offsets, run_block)
             }
