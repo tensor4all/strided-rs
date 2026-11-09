@@ -1,6 +1,6 @@
 # 2026-11-09: #427 — whole-plan concatenate tiles its permuted segments
 
-Raw evidence for tensor4all/strided-rs#432. It covers the red-first and mutation runs of the regression test, and the timings of `strided-basic/benches/concat_parallel.rs` against the base `03a291b`. Section 1 interprets the timings; the appendices hold the unedited output.
+Raw evidence for tensor4all/strided-rs#432. It covers the red-first and mutation runs of the regression tests, and the timings of `strided-basic/benches/concat_parallel.rs` against the base `03a291b`. Section 1 interprets the timings; the appendices hold the unedited output.
 
 Machine: **Apple M5 Max** (18 logical CPUs, macOS 26.7.2), rustc 1.96.0, `cargo bench` profile, `--features parallel`. This is a shared interactive machine; nothing was pinned or isolated. The load average at the start of every session is recorded in Appendix A, and it was 5.0–6.2 throughout. The benchmark host evo2 was not used.
 
@@ -10,11 +10,13 @@ Command per session: `CONCAT_BENCH_REPS=201 <binary>`. Each session runs the fiv
 
 The three binaries:
 
-- `head`: built from `49ec66e`.
+- `head`: built from `49ec66e`. Later commits change only `#[cfg(test)]` code and tests, so this is the non-test code of the PR head.
 - `base`: built from `03a291b` with this branch's bench file and its `[[bench]]` entry copied in.
 - `base-again`: the same `base` binary run a second time. This is the A/A control, which measures what the machine alone moves.
 
-There were five rounds, and each round ran the three binaries in a rotated order. The table gives the median of the five session medians, with the min–max of the session medians:
+There were five rounds, and each round ran the three binaries in a rotated order.
+
+Table 1 gives, per case and binary, the median of the five session medians, with the min–max of the session medians. The `whole/per` column is the ratio of the medians, and the closing lines give the case-level ratio of those medians between binaries:
 
 ```
 case                     binary                 whole-plan 4T           per-segment 4T whole/per
@@ -42,29 +44,49 @@ ratio of session medians, median over the 5 rounds (whole-plan, per-segment):
 4x[1024x1024] all C      base-again/base 0.989 0.985   head/base 1.034 0.944
 ```
 
+Table 2 pairs the binaries **within each round** (the same round's sessions) and gives the min..max of the five per-round ratios, with their median in brackets:
+
+```
+per-round paired ratios (same round), min..max over the 5 rounds [median]:
+case                             A/A whole-plan        A/A per-segment        head/base whole      head/base per-seg
+4x[1024x1024] all T        0.807..1.323 [1.052]   0.960..1.181 [0.992]   0.250..0.328 [0.300]   0.836..0.959 [0.876]
+4x[1024x1024] T,C,T,C      0.864..1.046 [1.009]   0.913..1.011 [1.004]   0.222..0.251 [0.242]   0.755..0.832 [0.816]
+4x[256x256] all T          0.986..1.014 [1.000]   0.986..1.014 [1.007]   0.986..1.022 [1.007]   0.986..1.022 [1.014]
+8x[512x512] all T          0.949..1.154 [1.052]   0.908..1.005 [0.993]   0.520..0.571 [0.540]   0.960..1.095 [1.078]
+4x[1024x1024] all C        0.966..1.004 [0.996]   0.961..1.006 [0.981]   1.000..1.052 [1.038]   0.865..0.978 [0.952]
+```
+
 What this establishes:
 
-- **Permuted segments.** Head whole-plan is 0.29–0.95 of per-segment, and 0.25–0.53 of base whole-plan. The A/A control moves base whole-plan by at most 8.6% on these cases, so the gains are far outside the machine's own variation.
+- **Machine variation (A/A).** Running the same binary twice moves a case-level median by up to 8.6%: base-again/base whole-plan on `4x[1024x1024] all T`, which is 1.086 in Table 1. That figure is the largest **case-level ratio of medians**, not a bound on how far one session can move.
+  - Within a round, the same binary moved by much more: 0.807..1.323 on that case, which is −19% to +32%, in rounds 1 and 2 of Appendix A.
+  - Per-segment on that case moved by 0.960..1.181 within a round. On the other four cases, the within-round A/A range is 0.864..1.154 for whole-plan and 0.908..1.014 for per-segment.
+- **Permuted segments.** Head whole-plan is 0.29–0.95 of per-segment (Table 1). Paired within rounds, head/base whole-plan is 0.250..0.328, 0.222..0.251 and 0.520..0.571 on the three permuted cases that leave the serial gate. Every one of those per-round ratios lies below the smallest within-round A/A ratio of any case (0.807). So the gain is outside what the machine alone produced in these runs, round by round.
 - **4x[256x256].** The case stays under the serial gate on every binary.
-- **Contiguous only (`all C`).** Head whole-plan is 1.034 of base, with session medians of 0.263–0.283 ms against 0.253–0.269 ms. The A/A ratio on this case is 0.989, so the +3.4% is larger than what the machine alone moved here.
-  - The per-segment path is the same source in both binaries (`CopyPlan` is unchanged apart from two `pub(crate)` accessors). Even so, it moves by 0.944 (head/base) on this case, and by 0.814–1.065 across the cases.
-  - So differences of this size also appear between the two builds in code this change does not touch. These runs do not separate a +3.4% code effect from a build-layout effect.
-  - Since `233d23a`, the contiguous route is the pre-#427 loop (`replay_flat_parallel`), and the only added work per call is the stored `may_tile` flag test. **Equal contiguous throughput is not claimed.** The measured head/base ratio is 1.034, with a session-extreme bound of 0.283/0.253 = 1.12.
+- **Contiguous only (`all C`).**
+  - Head whole-plan is 1.034 of base by the case-level ratio of medians, and 1.000..1.052 (median 1.038) paired within rounds.
+  - The within-round A/A range on this case is 0.966..1.004. So head/base is above the A/A median, and in 4 of 5 rounds above its maximum.
+  - The per-segment path is the same source in both binaries (`CopyPlan` is unchanged apart from two `pub(crate)` accessors). Even so, it moves by 0.865..0.978 head/base on this case, and by 0.755..1.095 across cases, paired within rounds.
+  - So differences of this size also appear between the two builds in code this change does not touch. These runs do not separate a +3–5% code effect from a build-layout effect.
+  - Since `233d23a`, the contiguous route is the pre-#427 loop (`replay_flat_parallel`), and the only added work per call is the stored `may_tile` flag test. **Equal contiguous throughput is not claimed.** The measured head/base ratio is 1.034 at the case level and at most 1.052 in any round.
 
 An earlier set of five alternating sessions, at `233d23a` (the same non-test code as `49ec66e`), gave 1.044 for contiguous whole-plan and 0.946 for contiguous per-segment (head/base). That run is quoted, not reproduced here.
 
-## 2. Regression test: red first and the review mutants
+## 2. Regression tests: red first and the review mutants
 
-Appendix B was produced by the script in Appendix C, run on the committed tree `49ec66e`. Each step applies one mutation, runs the focused test, and restores the file. The "red first" step runs the test commit `80415f8`, where the test is present and the fix absent, in a temporary worktree.
+Appendix B was produced by the script in Appendix C, run on the committed tree `f2f8792`. Each step applies one mutation, runs the focused test, and restores the file. The "red first" step runs the test commit `80415f8`, where the test is present and the fix absent, in a temporary worktree.
 
-| run | expected | observed |
-|---|---|---|
-| head, unmutated | pass | ok |
-| r1: tiled branch → `apply_fused_range` over the element range | fail | `left: 0, right: 234` (tile count) |
-| r2: tiled dispatch serialized (closure once over `0..width`) | fail | `dispatched 0 chunks` |
-| r3: only `execute` serial, `execute_uninit` parallel | fail | `execute: ... dispatched 0 chunks` |
-| r5: every tile of a segment in the range that starts it | fail | `walked by 1` |
-| red first, `80415f8` | fail | `left: 0, right: 234` |
+| run | test | expected | observed |
+|---|---|---|---|
+| head, unmutated | whole-plan | pass | ok |
+| r1: tiled branch → `apply_fused_range` over the element range | whole-plan | fail | `left: 0, right: 234` (tile count) |
+| r2: tiled dispatch serialized (closure once over `0..width`) | whole-plan | fail | `dispatched 0 chunks` |
+| r3: only `execute` serial, `execute_uninit` parallel | whole-plan | fail | `execute: ... dispatched 0 chunks` |
+| r5: every tile of a segment in the range that starts it | whole-plan | fail | `walked by 1` |
+| r6: the two ranges of a cut walked second range first | `tile_ranges_partition_the_tiled_box_walk` | fail | `cut at 1 must visit the slots in the whole-box order` |
+| red first, `80415f8` | whole-plan | fail | `left: 0, right: 234` |
+
+"whole-plan" is `concatenate_whole_plan_tiles_permuted_segments_like_serial_segments`. `tile_ranges_partition_the_tiled_box_walk` records the destination slot of every visit. It requires the walk of `0..cut` followed by `cut..count` to give the same slot sequence as `apply_tiled_box` over the whole box, for every cut tried.
 
 ## Appendix A: raw benchmark output
 
@@ -412,15 +434,15 @@ threads 4, median of 201 reps after 3 warm-up
 ## Appendix B: raw mutation output
 
 ```
---- head 49ec66e, unmutated
+--- head f2f8792, unmutated
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.31s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.34s
 
 --- mutant r1: tiled branch -> apply_fused_range over the element range
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (145993374) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:644:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146247971) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:644:9:
 assertion `left == right` failed: execute: the whole-plan replay must walk the serial path's tiles
 left: 0
 right: 234
@@ -429,37 +451,44 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out
 --- mutant r2: tiled dispatch serialized
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (145994052) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:652:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146253404) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:652:9:
 execute: the whole-plan replay must dispatch the tiled segments across the budget (dispatched 0 chunks)
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.18s
 
 --- mutant r3: execute serial, execute_uninit parallel
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (145994564) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:653:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146254425) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:653:9:
 execute: the whole-plan replay must dispatch the tiled segments across the budget (dispatched 0 chunks)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.18s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.16s
 
 --- mutant r5: all tiles of a segment in its first range
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (145995040) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:660:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146255180) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:660:9:
 execute: the tiles must be walked by at least two dispatched ranges (walked by 1)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.18s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.16s
+
+--- mutant r6: the two ranges of each cut walked second range first
+$ cargo test -p strided-basic --lib tile_ranges_partition_the_tiled_box_walk
+test raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk ... FAILED
+thread 'raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk' (146256047) panicked at strided-basic/src/raw_ops/tests/tiled_tests.rs:1228:13:
+67x45 transpose: cut at 1 must visit the slots in the whole-box order
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 260 filtered out; finished in 0.00s
 
 --- red first: worktree at 80415f8 (test added, fix absent)
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (145995604) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:617:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146258046) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:617:9:
 assertion `left == right` failed: execute: the whole-plan replay must walk the serial path's tiles
 left: 0
 right: 234
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 269 filtered out; finished in 0.17s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 269 filtered out; finished in 0.16s
 ```
 
 ## Appendix C: the mutation script
 
-`python3 mutants.py <repo>`; it touches only the two files it mutates and restores them.
+`python3 mutants.py <repo>`; it touches only the files it mutates and restores them.
 
 ```python
 #!/usr/bin/env python3
@@ -520,6 +549,24 @@ mutate(HELP, [("    plan.execute(&mut dest, inputs, exec.reborrow()).unwrap();",
 mutate(SRC, [("let first = tile_share(local_start, count, segment_len);", "let first = if local_start == 0 { 0 } else { count };"),
              ("let end = tile_share(local_end, count, segment_len);", "let end = count; let _ = local_end;")],
        "mutant r5: all tiles of a segment in its first range")
+
+# 5. sixth review: the two tile ranges of a cut walked in reverse order.
+TILED = repo / "strided-basic/src/raw_ops/tests/tiled_tests.rs"
+P = "tile_ranges_partition_the_tiled_box_walk"
+orig = TILED.read_text()
+assert orig.count("for (first, len) in [(0, cut), (cut, count - cut)] {") == 1
+TILED.write_text(orig.replace("for (first, len) in [(0, cut), (cut, count - cut)] {",
+                              "for (first, len) in [(cut, count - cut), (0, cut)] {"))
+try:
+    print("--- mutant r6: the two ranges of each cut walked second range first", flush=True)
+    print(f"$ cargo test -p strided-basic --lib {P}", flush=True)
+    out = subprocess.run(["cargo", "test", "-p", "strided-basic", "--lib", P], cwd=repo, capture_output=True, text=True)
+    for line in (out.stdout + out.stderr).splitlines():
+        if line.startswith(("test ", "test result")) or "panicked at" in line or "must " in line:
+            print(line.strip())
+    print(flush=True)
+finally:
+    TILED.write_text(orig)
 
 # red first: the test commit 80415f8 with the fix absent.
 with tempfile.TemporaryDirectory() as tmp:
