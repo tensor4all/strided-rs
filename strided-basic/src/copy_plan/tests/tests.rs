@@ -606,3 +606,272 @@ fn update_plan_execute_uninit_leaves_gapped_holes_untouched() {
         assert!(storage[3].assume_init().is_nan());
     }
 }
+
+/// A `CopyPlan` prices itself by its footprint: past the class's L2 cache a
+/// strided (one-element-per-cache-line) plan costs the class's beyond-L2 copy
+/// rate, while a plan that is one unit-stride run keeps the `Copy` row at every
+/// size, so no contiguous caller's width moves (strided-rs#364).
+#[test]
+fn a_strided_plan_past_l2_prices_itself_above_the_contiguous_row() {
+    use crate::cost::parallel_width;
+    use threadteam::HostClass;
+    let row = KernelClass::Copy.ns_per_element();
+    let dims = [512usize, 512];
+    // 2 MiB of source and 2 MiB of destination, transposed / as one run.
+    let strided = CopyPlan::compile(&dims, &[512, 1], &[1, 512]).unwrap();
+    let contiguous = CopyPlan::compile(&dims, &[1, 512], &[1, 512]).unwrap();
+    let rate = strided.ns_per_element::<f64, f64>();
+
+    // Each side is counted at its own element size: 256 x 256 f64 is exactly the
+    // 1 MiB the class's L2 holds, so it stays on the row (twice 1 MiB would not).
+    let at_l2 = CopyPlan::compile(&[256usize, 256], &[256, 1], &[1, 256]).unwrap();
+    assert_eq!(at_l2.ns_per_element::<f64, f64>(), row);
+    // A streamed run keeps the row at every footprint, reversed included.
+    assert_eq!(contiguous.ns_per_element::<f64, f64>(), row);
+    let reversed = CopyPlan::compile(&[4096usize], &[-1], &[-1]).unwrap();
+    assert_eq!(reversed.ns_per_element::<f64, f64>(), row);
+    // An L2-resident transposing plan (128 x 128 f64 is 256 KiB) keeps the row.
+    let small = CopyPlan::compile(&[128usize, 128], &[128, 1], &[1, 128]).unwrap();
+    assert_eq!(small.ns_per_element::<f64, f64>(), row);
+
+    if HostClass::detect() == HostClass::X86_64Avx512 {
+        // The table of strided-rs#363 measures 3.09-3.24 ns per element for the
+        // 512 x 512 transposing case, so the plan must be within a factor of two
+        // of it; and one byte past the class's L2 is already priced there.
+        assert!(
+            (3.09 / 2.0..=3.24 * 2.0).contains(&rate),
+            "the plan prices itself at {rate} ns per element, outside a factor of two \
+             of the 3.09-3.24 measured for this case"
+        );
+        let just_over = CopyPlan::compile(&[257usize, 257], &[257, 1], &[1, 257]).unwrap();
+        assert!(
+            just_over.ns_per_element::<f64, f64>() > row,
+            "257 x 257 f64 is 1.01 MiB of source and destination, past the class's L2"
+        );
+    } else {
+        assert_eq!(rate, row, "this class has no beyond-L2 copy rate");
+    }
+
+    // The contiguous plan asks the gate for the width the class's public rule
+    // gives, so the footprint term cannot have moved a contiguous caller.
+    let pool = crate::threading::test_pool(4);
+    let total = 512 * 512;
+    let mut exec = Exec::new(&pool, 4).unwrap();
+    let plan_width = crate::cost::for_len_at_rate(
+        exec.reborrow(),
+        total,
+        contiguous.ns_per_element::<f64, f64>(),
+    )
+    .budget();
+    assert_eq!(
+        plan_width.get(),
+        parallel_width(&exec, KernelClass::Copy, total).get()
+    );
+}
+
+/// The working set of a layout pair in bytes, as the plan forms it, for the
+/// tests that must sit past the class's L2.
+fn plan_footprint(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    element: usize,
+) -> usize {
+    span_elements(dims, dst_strides) * element + span_elements(dims, src_strides) * element
+}
+
+/// A plan whose footprint is past its class's L2 forks at its own rate on the
+/// replay that is not tiled: 1024 elements of a 4 MiB working set are 175 ns at
+/// the `Copy` row, below the 300 ns this pool asks for a fork, and 3.07 us at the
+/// plan's beyond-L2 rate (strided-rs#364).
+///
+/// Executed, so the rate `CopyPlan::replay` computes is the one under test: a
+/// replay that passed the row here would install no worker and the assertion
+/// below fails. Without the `parallel` feature every token is serial, so there is
+/// no fork to observe.
+#[cfg(feature = "parallel")]
+#[test]
+fn a_strided_plan_past_l2_forks_untiled_at_its_own_rate() {
+    use threadteam::ledger;
+    // A class with no beyond-L2 copy rate prices every plan at the row, so there is
+    // no fork to attribute to the plan's rate. Which class that is depends on the
+    // machine; the policy is pinned host-independently by
+    // `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` and
+    // the mechanism by
+    // `the_splitter_asks_its_gate_at_the_rate_it_is_given`.
+    if crate::cost::copy_ns_per_element_for_footprint(
+        threadteam::HostClass::detect(),
+        usize::MAX >> 8,
+    ) == KernelClass::Copy.ns_per_element()
+    {
+        eprintln!("skipped: this class has no beyond-L2 copy rate");
+        return;
+    }
+    let pool = crate::threading::test_pool(4);
+    let dims = [1024usize];
+    let strides = [256isize];
+    let len = 1 + 1023 * 256;
+    // 8 bytes * 2 * 261889 = 4.0 MiB of source and destination.
+    assert!(
+        plan_footprint(&dims, &strides, &strides, 8) > (1 << 20),
+        "the case must sit past the class's L2 for the rate to differ"
+    );
+    let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
+    let src = vec![1.5f64; len];
+    let mut dst = vec![0.0f64; len];
+    let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+    let exec = Exec::new(&pool, 4).unwrap();
+    let root = exec.ledger_root().unwrap();
+    plan.execute(&mut dst_mut, &src_ref, exec).unwrap();
+    assert!(
+        ledger::installs(root) > 0,
+        "the plan forked nowhere: the replay priced it at the row, not at {:.3} ns per element",
+        plan.ns_per_element::<f64, f64>()
+    );
+    assert!(ledger::max_live(root) <= 4);
+    assert_eq!(dst[0], 1.5);
+    assert_eq!(dst[1023 * 256], 1.5);
+}
+
+/// The same, on the tiled replay of strided-rs#422: a 128 x 32 transposing copy
+/// (2.6 MiB) is 700 ns at the row and 12.3 us at the plan's rate, against a pool
+/// whose section costs 3 us for the first fork, so only the plan's rate opens the
+/// split at all.
+#[cfg(feature = "parallel")]
+#[test]
+fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
+    use threadteam::{DispatchCosts, DispatchKind, HostClass, Pool, WidthCosts};
+    // A class with no beyond-L2 copy rate prices every plan at the row, so there is
+    // no fork to attribute to the plan's rate. Which class that is depends on the
+    // machine; the policy is pinned host-independently by
+    // `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` and
+    // the mechanism by
+    // `the_splitter_asks_its_gate_at_the_rate_it_is_given`.
+    if crate::cost::copy_ns_per_element_for_footprint(
+        threadteam::HostClass::detect(),
+        usize::MAX >> 8,
+    ) == KernelClass::Copy.ns_per_element()
+    {
+        eprintln!("skipped: this class has no beyond-L2 copy rate");
+        return;
+    }
+    let micro = core::time::Duration::from_micros(1);
+    let flat = WidthCosts::flat(micro);
+    let costs = DispatchCosts::for_class(HostClass::Generic)
+        .with(DispatchKind::Team, flat)
+        .with(DispatchKind::InPool, flat)
+        .with(DispatchKind::Outside, flat);
+    let pool = Pool::builder()
+        .threads(4)
+        .dispatch_costs(costs)
+        .build()
+        .unwrap();
+    let dims = [128usize, 32];
+    let dst_strides = [1isize, 2048];
+    let src_strides = [2048isize, 1];
+    let len = 128 * 2048;
+    assert!(
+        plan_footprint(&dims, &dst_strides, &src_strides, 8) > (1 << 20),
+        "the case must sit past the class's L2 for the rate to differ"
+    );
+    let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
+    // The layout must reach the tiled replay, or this test proves nothing.
+    assert!(
+        plan.fused
+            .inline()
+            .and_then(pair_tiles::<f64, f64>)
+            .is_some(),
+        "the layout must have tiles for `replay_tiled` to see the rate"
+    );
+    let src = vec![1.5f64; len];
+    let mut dst = vec![0.0f64; len];
+    let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+    let exec = Exec::new(&pool, 4).unwrap();
+    let root = exec.ledger_root().unwrap();
+    crate::threading::take_tiled_leaves();
+    plan.execute(&mut dst_mut, &src_ref, exec).unwrap();
+    let leaves = crate::threading::take_tiled_leaves();
+    let installs = threadteam::ledger::installs(root);
+    // More than one leaf: the *splitter* forked at the plan's rate. One leaf is
+    // what a splitter gated at the row records, and an empty list is what a gate at
+    // the row records before it.
+    assert!(
+        leaves.len() > 1,
+        "the splitter did not fork: {} leaf/leaves and {} worker install(s) for a plan priced at \
+         {:.3} ns per element",
+        leaves.len(),
+        installs,
+        plan.ns_per_element::<f64, f64>()
+    );
+    assert!(
+        installs > 0,
+        "no worker was installed: the splitter asked at the row, not at {:.3} ns per element",
+        plan.ns_per_element::<f64, f64>()
+    );
+    assert_eq!(dst[0], 1.5);
+    assert_eq!(dst[127 + 31 * 2048], 1.5);
+}
+
+/// A reversed unit-stride run streams like a forward one, so it keeps the `Copy`
+/// row even when its working set is past the class's L2: 131072 `f64` at stride
+/// -1 on both sides is 2 MiB together. Treating it as strided would price it at
+/// 3.0 ns per element (strided-rs#364).
+#[test]
+fn a_reversed_run_past_l2_keeps_the_copy_row() {
+    let dims = [131_072usize];
+    let strides = [-1isize];
+    assert!(
+        plan_footprint(&dims, &strides, &strides, 8) > (1 << 20),
+        "the reversed case must sit past the class's L2 for the exemption to matter"
+    );
+    let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
+    assert_eq!(
+        plan.ns_per_element::<f64, f64>(),
+        KernelClass::Copy.ns_per_element(),
+        "a reversed single run is a streamed copy, not a strided one"
+    );
+}
+
+/// The splitter asks its forks at the rate it is given, not at a class's: 1024
+/// elements are 92-175 ns at any class's row (below the 300 ns this test pool asks
+/// for a fork) and 3.1 us at 3.0 ns per element (above it), on every host. This is
+/// the seam the tiled replay of strided-rs#422 uses, so it is pinned where
+/// the plans themselves cannot be (a class without a beyond-L2 rate prices every
+/// plan at the row).
+#[cfg(feature = "parallel")]
+#[test]
+fn the_splitter_asks_its_gate_at_the_rate_it_is_given() {
+    use threadteam::ledger;
+    let pool = crate::threading::test_pool(4);
+    let dims = [32usize, 32];
+    let blocks = [8usize, 8];
+    let strides = [vec![1isize, 4096], vec![4096isize, 1]];
+    let costs = crate::fuse::compute_costs(&[&strides[0][..], &strides[1][..]]);
+    let mut installs = Vec::new();
+    for rate in [KernelClass::Copy.ns_per_element(), 3.0] {
+        let exec = Exec::new(&pool, 4).unwrap();
+        let root = exec.ledger_root().unwrap();
+        crate::threading::mapreduce_threaded_at_rate(
+            &dims,
+            &blocks,
+            &strides,
+            &[0, 0],
+            &costs,
+            rate,
+            exec,
+            &|_, _, _, _| Ok(()),
+        )
+        .unwrap();
+        installs.push(ledger::installs(root));
+    }
+    assert_eq!(
+        installs[0], 0,
+        "1024 elements at the row must not pay this pool's fork"
+    );
+    assert!(
+        installs[1] > 0,
+        "1024 elements at 3.0 ns per element must split, whatever the class"
+    );
+}

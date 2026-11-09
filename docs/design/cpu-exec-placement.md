@@ -44,7 +44,13 @@ there. This page records only what is specific to the strided crates.
   The class of an element function rides with the function passed to `map_into`
   and its siblings: a closure is a `Map`, and a caller declares an expensive one
   with `KernelClass::Transcendental.with(f)` (`strided_basic::Classed`, trait
-  `MapFn`). The plan and leaf-kernel minimums select a plan or a leaf kernel, not
+  `MapFn`). A `CopyPlan` carries a rate of its own: past the class's L2 cache and
+  for a traversal that is not one contiguous run it prices itself at the class's
+  beyond-L2 copy rate (`strided-basic/src/cost.rs`
+  `copy_ns_per_element_for_footprint`; strided-rs#364), and that rate is the one
+  the replay's fork gate and splitter ask at (`is_parallel_at_rate`). A contiguous
+  run keeps the row at every size, which is why contiguous callers' widths did not
+  move. The plan and leaf-kernel minimums select a plan or a leaf kernel, not
   a gate: `SMALL_TENSOR_THRESHOLD`
   (`strided-basic/src/kernel.rs:13`, read at `strided-basic/src/map_view.rs:1528`)
   picks the blocking plan, and the axis minimums (`AXIS_SWEEP_MIN_LEN`,
