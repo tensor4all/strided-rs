@@ -1143,3 +1143,201 @@ fn tile_odometer_stays_within_the_reachable_offsets() {
         assert_eq!(visited.get(), dims.iter().product::<usize>(), "{dims:?}");
     }
 }
+
+/// The destination slots of `tiles` in the order the tiled walk is specified
+/// to visit them, built from the specification alone: the tile grid in
+/// column-major order (axis 0 fastest), tiles of extents `blocks` anchored at
+/// the origin and clipped to the box, and each tile in column-major order.
+/// Independent of `apply_tile_range` and `apply_tiled_box`.
+fn specified_tile_order(tiles: &PairTiles, dst_offset: isize) -> Vec<usize> {
+    let layout = &tiles.layout;
+    let rank = layout.rank;
+    let dims = &layout.dims[..rank];
+    let blocks = &tiles.blocks[..rank];
+    let grid: Vec<usize> = dims
+        .iter()
+        .zip(blocks)
+        .map(|(&d, &b)| d.div_ceil(b))
+        .collect();
+    let mut order = Vec::new();
+    for tile in 0..grid.iter().product::<usize>() {
+        let mut rest = tile;
+        let origin: Vec<usize> = (0..rank)
+            .map(|axis| {
+                let coord = rest % grid[axis];
+                rest /= grid[axis];
+                coord * blocks[axis]
+            })
+            .collect();
+        let extent: Vec<usize> = (0..rank)
+            .map(|axis| blocks[axis].min(dims[axis] - origin[axis]))
+            .collect();
+        for element in 0..extent.iter().product::<usize>() {
+            let mut rest = element;
+            let mut slot = dst_offset;
+            for axis in 0..rank {
+                let coord = origin[axis] + rest % extent[axis];
+                rest /= extent[axis];
+                slot += coord as isize * layout.dst_strides[axis];
+            }
+            order.push(slot as usize);
+        }
+    }
+    order
+}
+
+/// [#427]: any cut of the tile grid into two ranges, walked first range
+/// first, visits exactly the slots of the whole-box walk in the same order:
+/// the visit sequence (destination slot of every element, in visit order) of
+/// `0..cut` followed by `cut..count` equals that of [`apply_tiled_box`]. And
+/// that sequence is the specified one ([`specified_tile_order`], built without
+/// either walk), so the order is checked against an independent reference, not
+/// only between two walks that share `apply_tile_range`.
+///
+/// [#427]: https://github.com/tensor4all/strided-rs/issues/427
+#[test]
+fn tile_ranges_partition_the_tiled_box_walk() {
+    use core::cell::RefCell;
+
+    let mut tiled = 0;
+    for (label, layout) in layouts() {
+        let Some(tiles) = layout.inline_tiles::<f64, f64>() else {
+            continue;
+        };
+        tiled += 1;
+        let count = tile_count(&tiles.layout, &tiles.blocks);
+        assert!(count >= 2, "{label}: a tiled layout has several tiles");
+        let (dst_len, src_len) = layout.lens();
+        let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+        let mut expected = vec![0.0f64; dst_len];
+        oracle(&layout, &mut expected, &src, |d, s| *d = s);
+
+        // The whole-box walk, recording the destination slot of each visit.
+        let mut whole = vec![0.0f64; dst_len];
+        let whole_base = whole.as_mut_ptr() as usize;
+        let reference = RefCell::new(Vec::with_capacity(layout.total()));
+        // SAFETY: `lens` sizes both buffers for every slot of the layout, the
+        // tiles are `pair_tiles` of it, and the destination is injective.
+        unsafe {
+            apply_tiled_box(
+                whole.as_mut_ptr(),
+                layout.dst_offset,
+                src.as_ptr(),
+                layout.src_offset,
+                &tiles.layout,
+                &tiles.blocks,
+                &|d: &mut f64, s: f64| {
+                    let slot = (d as *mut f64 as usize - whole_base) / size_of::<f64>();
+                    reference.borrow_mut().push(slot);
+                    *d = s;
+                },
+            );
+        }
+        let reference = reference.into_inner();
+        assert_eq!(bits(&whole), bits(&expected), "{label}: whole-box walk");
+        assert!(
+            reference == specified_tile_order(&tiles, layout.dst_offset),
+            "{label}: the whole-box walk must visit the slots in the specified tile order"
+        );
+        assert_eq!(
+            reference.len(),
+            layout.total(),
+            "{label}: one visit per element"
+        );
+
+        let cuts = [0, 1, count / 3, count / 2, count - 1, count];
+        for &cut in &cuts {
+            let mut actual = vec![0.0f64; dst_len];
+            let base = actual.as_mut_ptr() as usize;
+            let dst_ptr = actual.as_mut_ptr();
+            let visits = RefCell::new(Vec::with_capacity(layout.total()));
+            crate::threading::take_tile_boxes();
+            for (first, len) in [(0, cut), (cut, count - cut)] {
+                // SAFETY: `lens` sizes both buffers for every slot of the
+                // layout, the tiles are `pair_tiles` of it, the destination
+                // is injective, and `first + len` is at most `count`.
+                unsafe {
+                    apply_tile_range(
+                        dst_ptr,
+                        layout.dst_offset,
+                        src.as_ptr(),
+                        layout.src_offset,
+                        &tiles.layout,
+                        &tiles.blocks,
+                        first,
+                        len,
+                        &|d: &mut f64, s: f64| {
+                            let slot = (d as *mut f64 as usize - base) / size_of::<f64>();
+                            visits.borrow_mut().push(slot);
+                            *d = s;
+                        },
+                    );
+                }
+            }
+            assert_eq!(bits(&actual), bits(&expected), "{label}: cut at {cut}");
+            assert_eq!(
+                crate::threading::take_tile_boxes(),
+                count,
+                "{label}: cut at {cut} must walk every tile once"
+            );
+            assert!(
+                visits.into_inner() == reference,
+                "{label}: cut at {cut} must visit the slots in the whole-box order"
+            );
+        }
+    }
+    assert!(tiled >= 2, "only {tiled} layouts tiled inline");
+}
+
+/// `may_tile` is the element-size-free part of the tiling decision: a
+/// traversal it rules out never tiles for any element types, and every
+/// traversal that tiles for one is admitted.
+#[test]
+fn may_tile_admits_every_traversal_that_tiles() {
+    let mut cases: Vec<(String, PairTraversal)> = layouts()
+        .into_iter()
+        .map(|(label, layout)| {
+            (
+                label.to_string(),
+                PairTraversal::given(&layout.dims, &layout.dst, &layout.src),
+            )
+        })
+        .collect();
+    for (label, dims, dst, src) in [
+        (
+            "contiguous run",
+            vec![4096usize, 512],
+            vec![1isize, 4096],
+            vec![1isize, 4096],
+        ),
+        (
+            "one moving axis",
+            vec![1, 4096, 1],
+            vec![7, 1, 9],
+            vec![3, -1, 2],
+        ),
+        ("one element", vec![1, 1], vec![5, 3], vec![2, 8]),
+        ("empty", vec![0, 64], vec![1, 0], vec![64, 1]),
+        ("transpose", vec![512, 512], vec![1, 512], vec![512, 1]),
+    ] {
+        cases.push((label.to_string(), fuse_pair_traversal(&dims, &dst, &src)));
+    }
+    let mut ruled_out = 0;
+    for (label, traversal) in &cases {
+        let tiles = [
+            traversal.tiles::<f64, f64>().is_some(),
+            traversal.tiles::<u8, f64>().is_some(),
+            traversal.tiles::<f64, u8>().is_some(),
+            traversal.tiles::<Complex64, f64>().is_some(),
+            traversal.tiles::<u8, u8>().is_some(),
+        ];
+        if !traversal.may_tile() {
+            ruled_out += 1;
+            assert_eq!(tiles, [false; 5], "{label}: ruled out but tiles");
+        }
+    }
+    assert!(ruled_out >= 3, "only {ruled_out} traversals were ruled out");
+    assert!(cases
+        .iter()
+        .any(|(_, t)| t.may_tile() && t.tiles::<f64, f64>().is_some()));
+}
