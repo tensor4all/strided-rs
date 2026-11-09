@@ -294,20 +294,24 @@ impl<'a> ErasedRawStridedPtr<'a> {
         // value.
         let bytes = core::slice::from_raw_parts(self.data.as_ptr(), self.byte_len);
         validate_erased_buffer(self.dtype, bytes)?;
-        // SAFETY: `ErasedRawStridedRef::from_raw_parts` (raw.rs:447) needs the
+        // SAFETY: `ErasedRawStridedRef::from_raw_parts` (raw.rs:451) needs the
         // start of an allocation aligned for `dtype`, `byte_len` initialized
         // bytes for `'a`, valid `dtype` values, and no mutable alias. Extent and
         // lifetime are this pointer's own `from_raw_parts` contract
         // (raw.rs:204); bool values were just checked by `validate_erased_buffer`
         // (raw.rs:109) via `validate_bool_bytes` (raw.rs:151); the absence of a
         // mutable alias is this function's contract. The result borrows `self`,
-        // so it cannot outlive `'a`. Alignment is proven only for a non-empty
-        // buffer, whose address `validate_erased_buffer_extent` (raw.rs:121)
-        // checked. NOT PROVEN for `byte_len == 0`: the pointer contract
-        // (raw.rs:204) asks only that `data` point *into* an aligned
-        // allocation, and both validators skip alignment for an empty buffer,
-        // so a misaligned interior pointer reaches this call and a later safe
-        // `data_as` forms a misaligned slice (tensor4all/strided-rs#434).
+        // so it cannot outlive `'a`. The "start of an allocation" wording is
+        // NOT met: the pointer contract (raw.rs:204) only asks that `data`
+        // point *into* an aligned allocation, so an interior pointer is
+        // forwarded as is. What the `Ref` relies on is narrower: `data` aligned
+        // for `dtype` with `byte_len` readable bytes. For a non-empty buffer
+        // that holds, because `validate_erased_buffer_extent` (raw.rs:121)
+        // checked the address; the mismatch is then in the contract text, not
+        // UB. For `byte_len == 0` both validators skip alignment, so a
+        // misaligned interior pointer gets through and a later safe `data_as`
+        // forms a misaligned slice, which is UB. Both are tracked in
+        // tensor4all/strided-rs#434.
         ErasedRawStridedRef::from_raw_parts(
             self.dtype,
             self.data,
@@ -476,7 +480,7 @@ impl<'a> ErasedRawStridedRef<'a> {
     ) -> Result<Self> {
         let count = validate_erased_buffer_layout(dtype, data, byte_len)?;
         // SAFETY: `data` is a `NonNull`, and this function's contract
-        // (raw.rs:447) makes `data..data + byte_len` one live allocation of
+        // (raw.rs:451) makes `data..data + byte_len` one live allocation of
         // initialized bytes for `'a` with no mutable alias, which also bounds
         // `byte_len` by `isize::MAX`. `u8` needs no alignment beyond 1.
         let bytes = core::slice::from_raw_parts(data.as_ptr(), byte_len);
@@ -509,8 +513,8 @@ impl<'a> ErasedRawStridedRef<'a> {
         // whole multiple of `size_of::<T>()` and the base is `T`-aligned, so
         // `len / size_of::<T>()` initialized `T` values are in bounds. Both
         // checks skip alignment for an empty buffer. There the base is
-        // `T`-aligned when it came from a `&[T]` (`from_slice`, raw.rs:416) or
-        // from a direct `from_raw_parts` call, whose contract (raw.rs:447)
+        // `T`-aligned when it came from a `&[T]` (`from_slice`, raw.rs:420) or
+        // from a direct `from_raw_parts` call, whose contract (raw.rs:451)
         // requires the start of an aligned allocation. NOT PROVEN for a
         // descriptor from `ErasedRawStridedPtr::try_as_ref_after_no_overlap`
         // (raw.rs:288): its pointer may be a misaligned interior pointer,
@@ -649,7 +653,7 @@ impl<'a> ErasedRawStridedMut<'a> {
     ) -> Result<Self> {
         let count = validate_erased_buffer_layout(dtype, data, byte_len)?;
         // SAFETY: `data` is a `NonNull`, and this function's contract
-        // (raw.rs:619) makes `data..data + byte_len` one live, writable,
+        // (raw.rs:623) makes `data..data + byte_len` one live, writable,
         // initialized allocation for `'a` held exclusively by the caller, which
         // also bounds `byte_len` by `isize::MAX`. `u8` needs no alignment
         // beyond 1.
@@ -684,8 +688,8 @@ impl<'a> ErasedRawStridedMut<'a> {
         // whole multiple of `size_of::<T>()` and the base is `T`-aligned, so
         // `len / size_of::<T>()` initialized `T` values are in bounds. Both
         // checks skip alignment for an empty buffer. There the base came from a
-        // `&mut [T]` (`from_slice_mut`, raw.rs:587) or from `from_raw_parts`, whose
-        // contract (raw.rs:619) makes `data..data + byte_len` itself the
+        // `&mut [T]` (`from_slice_mut`, raw.rs:591) or from `from_raw_parts`, whose
+        // contract (raw.rs:623) makes `data..data + byte_len` itself the
         // aligned allocation, so `data` is its aligned start. Unlike the `Ref`
         // (tensor4all/strided-rs#434), nothing in this crate builds this
         // descriptor from an interior pointer.
@@ -710,7 +714,7 @@ impl<'a> ErasedRawStridedMut<'a> {
                 actual: self.dtype.label(),
             });
         }
-        // SAFETY: as `data_as` (raw.rs:674) — the dtype check proves `T`, and the
+        // SAFETY: as `data_as` (raw.rs:678) — the dtype check proves `T`, and the
         // constructor's extent/layout check (raw.rs:161), or for an empty
         // buffer the `&mut [T]` origin / `from_raw_parts` contract (aligned
         // start, no interior-pointer path), makes the base `T`-aligned with a
@@ -853,7 +857,7 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
     ) -> Result<Self> {
         let count = validate_erased_buffer_layout(dtype, data, byte_len)?;
         // SAFETY: `data` is a `NonNull`, and this function's contract
-        // (raw.rs:822) makes `data..data + byte_len` one live, writable
+        // (raw.rs:826) makes `data..data + byte_len` one live, writable
         // allocation for `'a` held exclusively by the caller, which also bounds
         // `byte_len` by `isize::MAX`. `MaybeUninit<u8>` accepts every bit
         // pattern, so no initialization is asserted.
@@ -886,8 +890,8 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
         // `validate_erased_buffer_layout` (raw.rs:161) proved the base is
         // `T`-aligned with a whole multiple of `size_of::<T>()` bytes. It skips
         // alignment for an empty buffer; there the base came from a
-        // `&mut [MaybeUninit<T>]` (`from_uninit_slice`, raw.rs:790) or from
-        // `from_raw_parts`, whose contract (raw.rs:822) makes `data..data + byte_len`
+        // `&mut [MaybeUninit<T>]` (`from_uninit_slice`, raw.rs:794) or from
+        // `from_raw_parts`, whose contract (raw.rs:826) makes `data..data + byte_len`
         // the aligned allocation itself. As for `ErasedRawStridedMut`, no path
         // in this crate builds it from an interior pointer (contrast #434).
         // `MaybeUninit<T>` accepts every bit pattern, so the partially
