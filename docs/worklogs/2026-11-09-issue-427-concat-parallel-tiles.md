@@ -76,7 +76,7 @@ Earlier runs on the pre-rebase tree, at that time's base `03a291b`, gave the sam
 
 ## 2. Regression tests: red first and the review mutants
 
-Appendix B is the unedited output of the script in Appendix C, extracted from this file and run on `fcc9a86`. That tree differs from the PR head only in this worklog. The script enforces every outcome. The unmutated tests must return 0 with `1 passed`. Each mutant, and the red-first commit `22bde1b` (found by its subject and run in a temporary worktree), must return 101, show `1 failed` and the expected panic message in stdout, and show `error: test failed` and no compiler error in stderr. Otherwise the script restores the mutated file and exits 1. Appendix D shows it doing so for a syntax error in the tree and for a mutant that does not compile.
+Appendix B is the unedited output of the script in Appendix C, extracted from this file and run on `0309a97`. That tree differs from the PR head only in this worklog. The script enforces every outcome. The unmutated tests must return 0 with `1 passed`. Each mutant, and the red-first commit `22bde1b` (found by its subject and run in a temporary worktree), must return 101, show `1 failed` and the expected panic message in stdout, and show `error: test failed` and no compiler error in stderr. Otherwise the script restores the mutated file and exits 1. Appendix D shows it doing so for a syntax error in the tree and for a mutant that does not compile.
 
 | run | test | expected | observed |
 |---|---|---|---|
@@ -84,11 +84,19 @@ Appendix B is the unedited output of the script in Appendix C, extracted from th
 | r1: tiled branch → `apply_fused_range` over the element range | whole-plan | 101, tile-count assertion | 101, `must walk the serial path's tiles` |
 | r2: tiled dispatch serialized (closure once over `0..width`) | whole-plan | 101, dispatch assertion | 101, `dispatched 0 chunks` |
 | r3: only `execute` serial, `execute_uninit` parallel | whole-plan | 101, per-entry dispatch assertion | 101, `execute: ... dispatched 0 chunks` |
-| r5: every tile of a segment in the range that starts it | whole-plan | 101, tiled-range assertion | 101, `walked by 1` |
+| r5: every tile of each segment in the range that starts it | whole-plan | 101, per-segment tiled-range assertion | 101, `tiles of segment 0 ... (walked by 1)` |
+| r9: segment 0 whole in the first range, segment 2 whole in the last | whole-plan | 101, per-segment tiled-range assertion | 101, `tiles of segment 0 ... (walked by 1)` |
 | r6: the two ranges of a cut walked second range first | `tile_ranges_partition_the_tiled_box_walk` | 101, visit-order assertion | 101, `cut at 1 must visit the slots in the whole-box order` |
+| r7: `apply_tile_range` numbers and advances its tile grid last axis fastest (start decoding and odometer alike) | `tile_ranges_partition_the_tiled_box_walk` | 101, specified-order assertion | 101, `the whole-box walk must visit the slots in the specified tile order` |
 | red first, `22bde1b` | whole-plan | 101, tile-count assertion | 101, `must walk the serial path's tiles` |
 
-"whole-plan" is `concatenate_whole_plan_tiles_permuted_segments_like_serial_segments`. `tile_ranges_partition_the_tiled_box_walk` records the destination slot of every visit. It requires the walk of `0..cut` followed by `cut..count` to give the same slot sequence as `apply_tiled_box` over the whole box, for every cut tried. Because `apply_tiled_box` itself walks through `apply_tile_range`, this establishes agreement between split and whole-grid walks, not agreement with the walk before this change.
+"whole-plan" is `concatenate_whole_plan_tiles_permuted_segments_like_serial_segments`. Since `0309a97` it records, per segment, the dispatched ranges that walked that segment's tiles. It requires at least two for each of the two transposed segments, and none for the contiguous one. r9 is the counterexample from the review of `f62d82e`: it passes the earlier test, which summed the ranges over all segments, and fails this one (Appendix E).
+
+What the order checks establish, and what they do not:
+
+- `tile_ranges_partition_the_tiled_box_walk` compares the walk of `0..cut` followed by `cut..count` with `apply_tiled_box` over the whole box. That is a comparison **within the same implementation**: `apply_tiled_box` itself walks through `apply_tile_range`, so the check is not an independent reference. It shows that splitting the grid does not change the walk (r6).
+- Since `0309a97`, the test also compares the whole-box sequence with `specified_tile_order`. That reference is built from the documented order alone: the tile grid column-major with axis 0 fastest, tiles anchored at the origin and clipped, and each tile column-major. It catches a consistent change of the grid order in `apply_tile_range` (r7).
+- It is a reference built from the specification, not from the implementation before this change. That the pre-change `apply_tiled_box` walked exactly that order rests on its documentation, which this PR keeps unchanged, not on a test run against the old code.
 
 ## Appendix A: raw benchmark output
 
@@ -437,14 +445,14 @@ threads 4, median of 201 reps after 3 warm-up
 
 ```
 $ python3 mutants.py ~/work/strided-rs
---- head fcc9a86, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+--- head 0309a97, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 0
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... ok
-stdout| test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.32s
+stdout| test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.31s
 as expected
 
---- head fcc9a86, unmutated: tile_ranges_partition_the_tiled_box_walk
+--- head 0309a97, unmutated: tile_ranges_partition_the_tiled_box_walk
 $ cargo test -p strided-basic --lib tile_ranges_partition_the_tiled_box_walk
 returncode: 0
 stdout| test raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk ... ok
@@ -455,11 +463,11 @@ as expected
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 101
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147252538) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:644:9:
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147411781) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:645:9:
 stdout| assertion `left == right` failed: execute: the whole-plan replay must walk the serial path's tiles
 stdout| left: 0
 stdout| right: 234
-stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.17s
+stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 stderr| error: test failed, to rerun pass `-p strided-basic --lib`
 as expected
 
@@ -467,7 +475,7 @@ as expected
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 101
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147253338) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:652:9:
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147412538) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:653:9:
 stdout| execute: the whole-plan replay must dispatch the tiled segments across the budget (dispatched 0 chunks)
 stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.17s
 stderr| error: test failed, to rerun pass `-p strided-basic --lib`
@@ -477,9 +485,9 @@ as expected
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 101
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147254667) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:653:9:
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147413260) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:654:9:
 stdout| execute: the whole-plan replay must dispatch the tiled segments across the budget (dispatched 0 chunks)
-stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.16s
+stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 stderr| error: test failed, to rerun pass `-p strided-basic --lib`
 as expected
 
@@ -487,10 +495,20 @@ as expected
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 101
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147255422) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:660:9:
-stdout| execute: the tiles must be walked by at least two dispatched ranges (walked by 1)
-stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.17s
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147413850) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:677:17:
+stdout| execute: the tiles of segment 0 must be walked by at least two dispatched ranges (walked by 1)
+stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 stderr| warning: unused variable: `segment_len`
+stderr| error: test failed, to rerun pass `-p strided-basic --lib`
+as expected
+
+--- mutant r9: each tiled segment whole in one range, segments in different ranges
+$ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+returncode: 101
+stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147414390) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:677:17:
+stdout| execute: the tiles of segment 0 must be walked by at least two dispatched ranges (walked by 1)
+stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 stderr| error: test failed, to rerun pass `-p strided-basic --lib`
 as expected
 
@@ -498,8 +516,18 @@ as expected
 $ cargo test -p strided-basic --lib tile_ranges_partition_the_tiled_box_walk
 returncode: 101
 stdout| test raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk ... FAILED
-stdout| thread 'raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk' (147259060) panicked at strided-basic/src/raw_ops/tests/tiled_tests.rs:1234:13:
+stdout| thread 'raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk' (147414819) panicked at strided-basic/src/raw_ops/tests/tiled_tests.rs:1283:13:
 stdout| 67x45 transpose: cut at 1 must visit the slots in the whole-box order
+stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 261 filtered out; finished in 0.01s
+stderr| error: test failed, to rerun pass `-p strided-basic --lib`
+as expected
+
+--- mutant r7: tile grid last axis fastest in apply_tile_range
+$ cargo test -p strided-basic --lib tile_ranges_partition_the_tiled_box_walk
+returncode: 101
+stdout| test raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk ... FAILED
+stdout| thread 'raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk' (147415269) panicked at strided-basic/src/raw_ops/tests/tiled_tests.rs:1238:9:
+stdout| 67x45 transpose: the whole-box walk must visit the slots in the specified tile order
 stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 261 filtered out; finished in 0.00s
 stderr| error: test failed, to rerun pass `-p strided-basic --lib`
 as expected
@@ -508,7 +536,7 @@ as expected
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 101
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147261075) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:617:9:
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147416019) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:617:9:
 stdout| assertion `left == right` failed: execute: the whole-plan replay must walk the serial path's tiles
 stdout| left: 0
 stdout| right: 234
@@ -516,7 +544,7 @@ stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 270 filt
 stderr| error: test failed, to rerun pass `-p strided-basic --lib`
 as expected
 
-all expectations held: 2 unmutated passes, 5 mutants and red first failing in their assertions
+all expectations held: 2 unmutated passes, 7 mutants and red first failing in their assertions
 exit: 0
 ```
 
@@ -553,6 +581,7 @@ TILES = "tile_ranges_partition_the_tiled_box_walk"
 SRC = repo / "strided-basic/src/static_indexing_plan.rs"
 HELP = repo / "strided-basic/src/static_indexing_plan/tests/parallel_tests.rs"
 TILED = repo / "strided-basic/src/raw_ops/tests/tiled_tests.rs"
+RAW = repo / "strided-basic/src/raw_ops.rs"
 FEATURES = {WHOLE: ["--features", "parallel"], TILES: []}
 
 
@@ -678,13 +707,37 @@ def main():
                   ("let end = tile_share(local_end, count, segment_len);",
                    "let end = count; let _ = local_end;")],
             lambda: expect_fail("mutant r5: all tiles of a segment in its first range", WHOLE,
-                                "execute: the tiles must be walked by at least two dispatched ranges (walked by 1)"))
+                                "execute: the tiles of segment 0 must be walked by at least two dispatched ranges (walked by 1)"))
+
+    # r9: each tiled segment kept whole in one range, the two segments in two
+    # different ranges (segment 0 in the first range, segment 2 in the last),
+    # so that two ranges walk tiles in total but neither segment is split.
+    mutated(SRC, [("let first = tile_share(local_start, count, segment_len);",
+                   "let owner = if position % 4 == 0 { local_start == 0 } else { local_end == segment_len };\n"
+                   "                    let first = if owner { 0 } else { count };"),
+                  ("let end = tile_share(local_end, count, segment_len);",
+                   "let end = count;")],
+            lambda: expect_fail("mutant r9: each tiled segment whole in one range, segments in different ranges",
+                                WHOLE,
+                                "execute: the tiles of segment 0 must be walked by at least two dispatched ranges (walked by 1)"))
 
     # r6: the two ranges of each cut walked second range first.
     mutated(TILED, [("for (first, len) in [(0, cut), (cut, count - cut)] {",
                      "for (first, len) in [(cut, count - cut), (0, cut)] {")],
             lambda: expect_fail("mutant r6: the two ranges of each cut walked second range first", TILES,
                                 "cut at 1 must visit the slots in the whole-box order"))
+
+    # r7: the tile grid numbered and advanced last axis fastest, consistently in
+    # both the start decoding and the odometer of `apply_tile_range`, so that the
+    # whole-box and split walks still agree with each other.
+    mutated(RAW, [("    for axis in 0..rank {\n        let along = tile_box.dims[axis].div_ceil(blocks[axis]);",
+                   "    for axis in (0..rank).rev() {\n        let along = tile_box.dims[axis].div_ceil(blocks[axis]);"),
+                  ("        let mut axis = 0;\n        loop {\n            debug_assert!(axis < rank, \"tile range past the end of the grid\");",
+                   "        let mut axis = rank - 1;\n        loop {\n            debug_assert!(axis < rank, \"tile range past the end of the grid\");"),
+                  ("            origin[axis] = 0;\n            tile.dims[axis] = blocks[axis].min(tile_box.dims[axis]);\n            axis += 1;\n        }\n    }\n}\n\n/// Replay every logical index of `box_dims`",
+                   "            origin[axis] = 0;\n            tile.dims[axis] = blocks[axis].min(tile_box.dims[axis]);\n            axis -= 1;\n        }\n    }\n}\n\n/// Replay every logical index of `box_dims`")],
+            lambda: expect_fail("mutant r7: tile grid last axis fastest in apply_tile_range", TILES,
+                                "the whole-box walk must visit the slots in the specified tile order"))
 
     # Red first: the commit that added the test, before the fix, found by its
     # subject so that the script survives a rebase.
@@ -701,7 +754,7 @@ def main():
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo, check=True)
 
-    print("all expectations held: 2 unmutated passes, 5 mutants and red first failing in their assertions")
+    print("all expectations held: 2 unmutated passes, 7 mutants and red first failing in their assertions")
 
 
 if __name__ == "__main__":
@@ -721,27 +774,27 @@ $ printf '
 fn broken( {
 ' >> strided-basic/src/static_indexing_plan.rs   # syntax error
 $ python3 mutants.py ~/work/strided-rs
---- head fcc9a86, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+--- head 0309a97, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 101
 stderr| error: this file contains an unclosed delimiter
 stderr| error: could not compile `strided-basic` (lib test) due to 1 previous error
-UNEXPECTED (head fcc9a86, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments):
+UNEXPECTED (head 0309a97, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments):
   - return code 101, expected 0
   - no `test result: ok. 1 passed; 0 failed` in stdout
 stderr tail:
      Compiling strided-basic v0.14.0 (/Users/hiroshi/work/strided-rs/strided-basic)
   error: this file contains an unclosed delimiter
-      --> strided-basic/src/static_indexing_plan.rs:2577:14
+      --> strided-basic/src/static_indexing_plan.rs:2583:14
        |
-  2577 | fn broken( {
+  2583 | fn broken( {
        |          - -^
        |          | |
        |          | unclosed delimiter
        |          unclosed delimiter
   
   error: could not compile `strided-basic` (lib test) due to 1 previous error
-STOPPED: head fcc9a86, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+STOPPED: head 0309a97, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 exit: 1
 $ git checkout -- strided-basic/src/static_indexing_plan.rs   # restored
 ```
@@ -750,17 +803,17 @@ A copy of the script whose r1 mutant does not compile (`fn broken( {` added to t
 
 ```
 $ python3 mutants_with_r1_not_compiling.py ~/work/strided-rs   # copy whose r1 mutant has a syntax error
---- head fcc9a86, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+--- head 0309a97, unmutated: concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 returncode: 0
 stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... ok
 stdout| test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.32s
 as expected
---- head fcc9a86, unmutated: tile_ranges_partition_the_tiled_box_walk
+--- head 0309a97, unmutated: tile_ranges_partition_the_tiled_box_walk
 $ cargo test -p strided-basic --lib tile_ranges_partition_the_tiled_box_walk
 returncode: 0
 stdout| test raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk ... ok
-stdout| test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 261 filtered out; finished in 0.07s
+stdout| test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 261 filtered out; finished in 0.08s
 as expected
 --- mutant r1: tiled branch -> apply_fused_range over the element range
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
@@ -780,14 +833,57 @@ stderr tail:
   1566 |     {
        |     - unclosed delimiter
   ...
-  1649 |  fn broken( {{
+  1653 |  fn broken( {{
        |              - this delimiter might not be properly closed...
-  1650 |                 } else {
+  1654 |                 } else {
        |                 - ...as it matches this but it has different indentation
   ...
-  2567 | mod parallel_tests;
+  2573 | mod parallel_tests;
        |                    ^
   error: could not compile `strided-basic` (lib test) due to 2 previous errors
 STOPPED: mutant r1: tiled branch -> apply_fused_range over the element range
 exit: 1
+```
+
+## Appendix E: the r9 counterexample on the previous and the current test
+
+The same mutation (segment 0 whole in the first range, segment 2 whole in the last), applied to `f62d82e` in a temporary worktree and to `0309a97`:
+
+```
+--- counterexample on the previous test (f62d82e: tiled ranges summed over segments)
+$ git diff --stat; git diff -U0 strided-basic/src/static_indexing_plan.rs
+diff --git a/strided-basic/src/static_indexing_plan.rs b/strided-basic/src/static_indexing_plan.rs
+index 002e51f..3604c0d 100644
+--- a/strided-basic/src/static_indexing_plan.rs
++++ b/strided-basic/src/static_indexing_plan.rs
+@@ -1645,2 +1645,3 @@ impl ConcatenatePlan {
+-                    let first = tile_share(local_start, count, segment_len);
+-                    let end = tile_share(local_end, count, segment_len);
++                    let owner = if position % 4 == 0 { local_start == 0 } else { local_end == segment_len };
++                    let first = if owner { 0 } else { count };
++                    let end = count;
+$ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+returncode: 0
+stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... ok
+stdout| test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.32s
+
+--- counterexample on the new test (0309a97: tiled ranges per segment)
+$ git diff --stat; git diff -U0 strided-basic/src/static_indexing_plan.rs
+diff --git a/strided-basic/src/static_indexing_plan.rs b/strided-basic/src/static_indexing_plan.rs
+index b793f7b..7736ce6 100644
+--- a/strided-basic/src/static_indexing_plan.rs
++++ b/strided-basic/src/static_indexing_plan.rs
+@@ -1649,2 +1649,3 @@ impl ConcatenatePlan {
+-                    let first = tile_share(local_start, count, segment_len);
+-                    let end = tile_share(local_end, count, segment_len);
++                    let owner = if position % 4 == 0 { local_start == 0 } else { local_end == segment_len };
++                    let first = if owner { 0 } else { count };
++                    let end = count;
+$ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
+returncode: 101
+stdout| test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
+stdout| thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (147408893) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:677:17:
+stdout| execute: the tiles of segment 0 must be walked by at least two dispatched ranges (walked by 1)
+stdout| test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.17s
+stderr| error: test failed, to rerun pass `-p strided-basic --lib`
 ```
