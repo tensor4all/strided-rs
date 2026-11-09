@@ -52,8 +52,8 @@ const EMPTY_AXIS: FusedAxis = FusedAxis {
 pub(crate) struct FusedPairLayout {
     pub(crate) rank: usize,
     pub(crate) dims: [usize; RAW_FUSED_RANK_LIMIT],
-    dst_strides: [isize; RAW_FUSED_RANK_LIMIT],
-    src_strides: [isize; RAW_FUSED_RANK_LIMIT],
+    pub(crate) dst_strides: [isize; RAW_FUSED_RANK_LIMIT],
+    pub(crate) src_strides: [isize; RAW_FUSED_RANK_LIMIT],
 }
 
 impl FusedPairLayout {
@@ -288,6 +288,236 @@ pub(crate) fn fused_total(layout: &FusedPairLayout) -> usize {
 #[inline]
 fn spilled_total(axes: &[FusedAxis]) -> usize {
     axes.iter().map(|axis| axis.dim).product()
+}
+
+/// The cache tiles of a fused pair layout whose tiled walk visits the slots in
+/// a different order from the column-major walk.
+///
+/// Built by [`pair_tiles`]; `layout` addresses exactly the slots of the layout
+/// it was built from, in the same column-major order, without its extent-1
+/// axes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PairTiles {
+    pub(crate) layout: FusedPairLayout,
+    pub(crate) blocks: [usize; RAW_FUSED_RANK_LIMIT],
+}
+
+/// Cache tiles for replaying `layout` with destination element `D` and source
+/// element `S`, or `None` when the column-major walk is kept.
+///
+/// The extent-1 axes are dropped first: they address offset 0 whatever their
+/// stride, so the compressed layout addresses the same slots in the same
+/// order, and an unvalidated stride on such an axis never reaches the block
+/// arithmetic. Fewer than two remaining axes form one run, whose order no
+/// block vector can change. The blocks come from the shared model
+/// (`block::compute_block_sizes`) with the view path's element-size
+/// convention, the larger of the two element sizes. Tiles are returned only
+/// when they change the visit order (the first axis whose block is smaller
+/// than its extent is followed by an axis with a block above 1) and when that
+/// change can reuse a cache line (see [`slabs_share_no_line`]).
+///
+/// The extents of `layout` must have a product that fits `usize` (every
+/// constructor of a [`FusedPairLayout`] checks it).
+pub(crate) fn pair_tiles<D, S>(layout: &FusedPairLayout) -> Option<PairTiles> {
+    if fused_total(layout) <= 1 {
+        return None;
+    }
+    let moving = layout.dims[..layout.rank]
+        .iter()
+        .filter(|&&dim| dim != 1)
+        .count();
+    if moving < 2 {
+        return None;
+    }
+    let compressed;
+    let layout = if moving == layout.rank {
+        layout
+    } else {
+        compressed = without_unit_axes(layout);
+        &compressed
+    };
+    let rank = layout.rank;
+    let dims = &layout.dims[..rank];
+    let dst = &layout.dst_strides[..rank];
+    let src = &layout.src_strides[..rank];
+    // `None`: one of the model's exits keeps the full dimensions, which
+    // cannot change the visit order.
+    let model = crate::block::reduced_block_sizes(
+        dims,
+        &[dst, src],
+        core::mem::size_of::<D>().max(core::mem::size_of::<S>()),
+    )?;
+    let first_cut = (0..rank).find(|&axis| model[axis] < dims[axis])?;
+    if model[first_cut + 1..].iter().all(|&block| block == 1) {
+        return None;
+    }
+    // The axes before `first_cut` are walked whole inside every tile; each
+    // operand is judged with its own element size, not the model's.
+    if first_cut > 0
+        && slabs_share_no_line(dims, dst, first_cut, core::mem::size_of::<D>())
+        && slabs_share_no_line(dims, src, first_cut, core::mem::size_of::<S>())
+    {
+        return None;
+    }
+    let mut blocks = [1; RAW_FUSED_RANK_LIMIT];
+    blocks[..rank].copy_from_slice(&model);
+    Some(PairTiles {
+        layout: *layout,
+        blocks,
+    })
+}
+
+/// `layout` without its extent-1 axes, in the given order.
+fn without_unit_axes(layout: &FusedPairLayout) -> FusedPairLayout {
+    let mut compressed = FusedPairLayout::empty();
+    let mut rank = 0;
+    for axis in 0..layout.rank {
+        if layout.dims[axis] == 1 {
+            continue;
+        }
+        compressed.dims[rank] = layout.dims[axis];
+        compressed.dst_strides[rank] = layout.dst_strides[axis];
+        compressed.src_strides[rank] = layout.src_strides[axis];
+        rank += 1;
+    }
+    compressed.rank = rank;
+    compressed
+}
+
+/// Whether one operand's *slabs*, its sub-boxes over the leading `prefix`
+/// axes at each coordinate of the other axes, provably share no cache line,
+/// so that no visit order of the other axes can reuse a line across slabs.
+///
+/// Both walks visit every slab contiguously in the same internal order, so a
+/// tiled walk can save traffic only on a line touched by two slabs. With the
+/// byte span `w` of a slab's bounding interval and the tail byte strides all
+/// multiples of the cache line, and the tail strides nested (each, in
+/// ascending order, at least `w` plus the spans of the smaller ones), the
+/// bounding intervals of distinct slabs are disjoint and congruent modulo the
+/// line. The helper sees no base address and assumes the lowest address of
+/// each bounding interval is line-aligned. An aligned coordinate-zero pointer
+/// is not enough when a prefix stride is negative. Under that assumption every
+/// slab has lines of its own. Otherwise address-adjacent slabs can share one
+/// boundary line, so declining forgoes at most one reuse per adjacent pair,
+/// `S - 1` for `S` slabs. That is a large share of the touched lines for
+/// sparse or line-sized slabs. A zero-sized operand moves no line. Arithmetic
+/// is checked, and an unrepresentable quantity answers `false`, which keeps
+/// the tiles.
+///
+/// Strided.jl's `_computeblocks` has no such exit: it tiles these layouts
+/// because the kept prefix's region exceeds its budget, although the tile
+/// only reorders slabs that share nothing.
+fn slabs_share_no_line(dims: &[usize], strides: &[isize], prefix: usize, elem_size: usize) -> bool {
+    if elem_size == 0 {
+        return true;
+    }
+    let line = crate::CACHE_LINE_SIZE as u128;
+    let elem = elem_size as u128;
+    // `|s| * elem < 2^127`; only the products with extents and the sums can
+    // overflow.
+    let byte = |axis: usize| strides[axis].unsigned_abs() as u128 * elem;
+    let reach = |axis: usize| ((dims[axis] - 1) as u128).checked_mul(byte(axis));
+    let Some(width) = (0..prefix).try_fold(elem, |width, axis| width.checked_add(reach(axis)?))
+    else {
+        return false;
+    };
+    if width % line != 0 {
+        return false;
+    }
+    let mut tail = [(0u128, 0usize); RAW_FUSED_RANK_LIMIT];
+    let count = dims.len() - prefix;
+    for (slot, axis) in tail.iter_mut().zip(prefix..dims.len()) {
+        *slot = (byte(axis), axis);
+    }
+    let tail = &mut tail[..count];
+    tail.sort_unstable();
+    let mut span = width;
+    for &(stride, axis) in tail.iter() {
+        if stride % line != 0 || stride < span {
+            return false;
+        }
+        let Some(next) = reach(axis).and_then(|reach| span.checked_add(reach)) else {
+            return false;
+        };
+        span = next;
+    }
+    true
+}
+
+/// Replay every logical index of `tile_box` tile by tile: the tiles of extents
+/// `blocks`, anchored at the box origin and clipped to the box, are visited in
+/// column-major order of the tile grid, and each tile is walked in
+/// column-major order by [`apply_fused_range`].
+///
+/// Kept out of line so that the untiled replay keeps its code shape.
+///
+/// # Safety
+///
+/// The [`apply_fused_range`] contract for the whole of `tile_box`, and every
+/// `blocks[axis]` for `axis < tile_box.rank` is at least 1.
+#[inline(never)]
+pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    tile_box: &FusedPairLayout,
+    blocks: &[usize; RAW_FUSED_RANK_LIMIT],
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    let rank = tile_box.rank;
+    let mut tile = *tile_box;
+    for (dim, &block) in tile.dims[..rank].iter_mut().zip(blocks) {
+        *dim = block.min(*dim);
+    }
+    // `origin[axis]` is the first box coordinate of the current tile along
+    // `axis`; `dst_tile`/`src_tile` are the offsets of the tile origin.
+    let mut origin = [0usize; RAW_FUSED_RANK_LIMIT];
+    let mut dst_tile = dst_base;
+    let mut src_tile = src_base;
+    loop {
+        // SAFETY: the tile is a sub-box of `tile_box` at a reachable origin, so
+        // the caller's contract covers every logical index of the tile.
+        unsafe {
+            apply_fused_range(
+                dst_ptr,
+                dst_tile,
+                src_ptr,
+                src_tile,
+                &tile,
+                0,
+                fused_total(&tile),
+                apply,
+            );
+        }
+        // Column-major odometer over the tile grid. An axis advances only
+        // when another tile follows along it, so `blocks[axis]` is at most
+        // its last box coordinate, and it rewinds by its current origin:
+        // every intermediate offset is a reachable offset of the box.
+        let mut axis = 0;
+        loop {
+            if axis == rank {
+                return;
+            }
+            let next = origin[axis] + blocks[axis];
+            if next < tile_box.dims[axis] {
+                origin[axis] = next;
+                dst_tile += blocks[axis] as isize * tile_box.dst_strides[axis];
+                src_tile += blocks[axis] as isize * tile_box.src_strides[axis];
+                tile.dims[axis] = blocks[axis].min(tile_box.dims[axis] - next);
+                break;
+            }
+            dst_tile -= origin[axis] as isize * tile_box.dst_strides[axis];
+            src_tile -= origin[axis] as isize * tile_box.src_strides[axis];
+            origin[axis] = 0;
+            tile.dims[axis] = blocks[axis].min(tile_box.dims[axis]);
+            axis += 1;
+        }
+    }
 }
 
 /// Serial replay of a fused pair layout over borrowed raw views.
@@ -798,37 +1028,60 @@ where
         return Ok(());
     }
     let traversal = PairTraversal::given(dest.dims(), dest.strides(), src.strides());
-    let mut exec = crate::cost::for_len(exec, KernelClass::Copy, total);
-    if !exec.is_serial()
-        && !crate::layout_check::is_injective_layout_without_alloc(dest.dims(), dest.strides())
-    {
-        // A destination not proven injective replays as one sequential walk,
-        // which is also its defined semantics; the budget-one token cannot be
-        // widened again by the replay's own width rule.
-        exec = exec.limit(NonZeroUsize::MIN);
+    let injective =
+        || crate::layout_check::is_injective_layout_without_alloc(dest.dims(), dest.strides());
+    let mut tiles = traversal.inline().and_then(pair_tiles::<D, S>);
+    let mut proven = None;
+    if tiles.is_some() {
+        let holds = injective();
+        proven = Some(holds);
+        if !holds {
+            tiles = None;
+        }
     }
+    let exec = if tiles.is_some() {
+        // The tiled tree gates every node on the caller's token itself; the
+        // flat width rule would cap it at the width of one flat dispatch.
+        exec
+    } else {
+        let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+        if !exec.is_serial() && !proven.unwrap_or_else(injective) {
+            // A destination not proven injective replays as one sequential
+            // column-major walk, which is also its defined semantics; the
+            // budget-one token cannot be widened again by the replay's own
+            // width rule.
+            exec.limit(NonZeroUsize::MIN)
+        } else {
+            exec
+        }
+    };
     // SAFETY: `traversal` is built from exactly the views' dims and strides
     // (`ensure_same_dims` proved the dims agree), so the views' bounds proofs
     // cover every replayed offset; `total_len` checked the nonzero product;
-    // a non-serial `exec` is left only for a destination proven injective;
+    // `tiles` is `pair_tiles` of the inline traversal, and tiles or a
+    // non-serial `exec` are left only for a destination proven injective;
     // the exclusive and shared borrows cannot overlap.
-    unsafe { crate::copy_plan::replay_fused(dest, src, &traversal, apply, exec) };
+    unsafe { crate::copy_plan::replay_fused(dest, src, &traversal, tiles.as_ref(), apply, exec) };
     Ok(())
 }
 
 /// `dest = src`, replaying the axes of the two views exactly as given.
 ///
 /// The views carry already-fused dims: no axis is reordered, dropped or
-/// merged, and no plan is compiled. Axis 0 is the inner run. Bounds were validated when the views were built
+/// merged, and no plan is compiled. Axis 0 is the inner run of the
+/// column-major walk; when the shared cache-block model finds tiles that change
+/// the visit order and can reuse a cache line, the walk goes tile by tile
+/// instead, each tile column-major over the given axes. Bounds were validated when the views were built
 /// ([`RawStridedRef::new`], [`RawStridedMut::new`]). On a successful call the
 /// replay itself (validation, traversal and dispatch) allocates nothing for a
 /// rank at most [`RAW_FUSED_RANK_LIMIT`]; above it, the axis list and the cursor
 /// of each replayed range are stored in rank-sized buffers. An error may
 /// allocate its payload.
 ///
-/// The width comes from the repository rule on `exec`. A parallel replay runs
-/// only on a destination proven injective without allocating; any other
-/// destination is replayed serially in column-major order of the given axes.
+/// The width comes from the repository rule on `exec`. A parallel or tiled
+/// replay runs only on a destination proven injective without allocating; any
+/// other destination is replayed serially in column-major order of the given
+/// axes.
 ///
 /// # Errors
 ///
@@ -1004,3 +1257,7 @@ mod tests;
 #[cfg(test)]
 #[path = "raw_ops/tests/replay_tests.rs"]
 mod replay_tests;
+
+#[cfg(test)]
+#[path = "raw_ops/tests/tiled_tests.rs"]
+mod tiled_tests;

@@ -10,6 +10,7 @@ use core::{mem::MaybeUninit, ops::Add};
 use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
 use crate::cost::KernelClass;
 use crate::inline::InlineVec;
+use crate::raw_ops::pair_tiles;
 use crate::raw_ops::{fuse_pair_layout, FusedPairLayout};
 use crate::{Exec, RawStridedMut, RawStridedRef, Result, StridedError, RAW_FUSED_RANK_LIMIT};
 
@@ -1208,6 +1209,7 @@ impl DynamicSlicePlan {
         let dest_base = dest.offset();
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = unsafe { dest.data_ptr() }.cast::<MaybeUninit<T>>();
+        let tiles = pair_tiles::<MaybeUninit<T>, T>(window);
         // SAFETY: `window` fuses `slice_sizes` with the checked destination
         // and operand strides. The clamped window `start + slice_sizes` lies
         // inside `operand_dims`, so every source offset from `source_base` is
@@ -1216,7 +1218,8 @@ impl DynamicSlicePlan {
         // destination offset. Compile proved the destination injective, and
         // the exclusive writer borrow does not overlap the shared operand.
         // Writing `MaybeUninit::new` is valid for both initialized and
-        // uninitialized destination slots.
+        // uninitialized destination slots. The injective destination lets the
+        // window replay its tiles.
         unsafe {
             replay_fused_raw(
                 dest_ptr,
@@ -1224,6 +1227,7 @@ impl DynamicSlicePlan {
                 operand.data().as_ptr(),
                 source_base,
                 window,
+                tiles.as_ref(),
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
                 exec,
             );
@@ -1611,13 +1615,15 @@ impl DynamicUpdateSlicePlan {
     {
         // SAFETY: the validated writer owns the destination allocation.
         let dest_ptr = unsafe { dest.data_ptr() }.cast::<MaybeUninit<T>>();
+        let tiles = pair_tiles::<MaybeUninit<T>, T>(window);
         // SAFETY: `window` fuses `update_dims` with the checked destination
         // and update strides. The update view has exactly `update_dims` and
         // its validated layout reaches every source offset; the clamped window
         // lies inside `dest_dims`, so every destination offset from
         // `dest_base` is reachable through the validated destination layout.
         // Compile proved the destination injective, and the exclusive writer
-        // borrow does not overlap the shared update.
+        // borrow does not overlap the shared update. The injective destination
+        // lets the window replay its tiles.
         unsafe {
             replay_fused_raw(
                 dest_ptr,
@@ -1625,6 +1631,7 @@ impl DynamicUpdateSlicePlan {
                 update.data().as_ptr(),
                 update.offset(),
                 window,
+                tiles.as_ref(),
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
                 exec,
             );
