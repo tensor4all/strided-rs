@@ -189,11 +189,13 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     if !strided_view::is_injective_layout(raw.dims, raw.dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
-    // SAFETY: `execute_permute_blocked` (execute.rs:127) needs `src`/`dst` valid at
+    // SAFETY: `execute_permute_blocked` (execute.rs:131) needs `src`/`dst` valid at
     // every offset of the layout `plan` was built from, no overlap, no other
     // access to the destination, and an injective destination when `exec` fans
-    // out. `plan` is `build_permute_plan` over exactly `raw.dims` and the two
-    // stride runs; validity and non-overlap are this function's `# Safety`
+    // out, over a layout with no zero extent. `plan` is `build_permute_plan`
+    // over exactly `raw.dims` and the two stride runs, and `raw` is a
+    // `RawCopy`, which only `prepare` builds and only after returning `None`
+    // for a zero extent (copy.rs:100); validity and non-overlap are this function's `# Safety`
     // (copy.rs:116); the callers hold `&mut StridedViewMut` for the whole call, so
     // nothing else touches the destination; injectivity was checked just
     // above. `dst_ptr` is `raw.dst` cast from `U` to `T`, the same layout for
@@ -277,7 +279,7 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
-        // SAFETY: as `copy_into` (copy.rs:241) — `prepare` matched the shapes and
+        // SAFETY: as `copy_into` (copy.rs:243) — `prepare` matched the shapes and
         // both views proved their bounds at construction. `MaybeUninit<T>` has `T`'s
         // size and alignment, and the engine only stores into the destination, so
         // the uninitialized extent is never read.
