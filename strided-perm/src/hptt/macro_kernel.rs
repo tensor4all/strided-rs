@@ -171,7 +171,9 @@ pub unsafe fn macro_kernel_f32(
 ///
 /// `src` must be valid for reads at `k * src_stride` and `dst` for writes at
 /// `k * dst_stride` for every `k < count`, and the two extents must not
-/// overlap.
+/// overlap. Both pointers must be non-null and aligned for `T` even when
+/// `count == 0`, because the contiguous branch hands them to
+/// `copy_nonoverlapping`.
 #[inline(always)]
 pub unsafe fn const_stride1_copy<T: Copy>(
     src: *const T,
@@ -182,7 +184,8 @@ pub unsafe fn const_stride1_copy<T: Copy>(
 ) {
     // SAFETY: (covers all four branches) under this function's `# Safety`
     // (macro_kernel.rs:172) both runs of `count` elements are valid and disjoint,
-    // which is what `copy_nonoverlapping` needs when both strides are 1. The
+    // and the pointers are non-null and aligned even for `count == 0`, which
+    // is what `copy_nonoverlapping` needs when both strides are 1. The
     // loops dereference only the cursors for `k < count`; the advance after
     // the last copy may leave the allocation, so it uses `wrapping_offset`
     // and is never dereferenced.
@@ -236,7 +239,7 @@ pub unsafe fn macro_kernel_fallback<T: Copy>(
     block_b: usize,
 ) {
     // SAFETY: `i < block_a` and `j < block_b`, so both accesses are tile
-    // elements under this function's `# Safety` (macro_kernel.rs:228).
+    // elements under this function's `# Safety` (macro_kernel.rs:231).
     for j in 0..block_b as isize {
         for i in 0..block_a as isize {
             *dst.offset(j + i * ldb) = *src.offset(i + j * lda);

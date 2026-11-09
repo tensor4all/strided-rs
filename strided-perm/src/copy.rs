@@ -189,7 +189,7 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     if !strided_view::is_injective_layout(raw.dims, raw.dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
-    // SAFETY: `execute_permute_blocked` (execute.rs:126) needs `src`/`dst` valid at
+    // SAFETY: `execute_permute_blocked` (execute.rs:127) needs `src`/`dst` valid at
     // every offset of the layout `plan` was built from, no overlap, no other
     // access to the destination, and an injective destination when `exec` fans
     // out. `plan` is `build_permute_plan` over exactly `raw.dims` and the two
