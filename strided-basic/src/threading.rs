@@ -236,6 +236,12 @@ pub(crate) fn record_tile_box() {
     TILE_BOXES.with(|n| n.set(n.get() + 1));
 }
 
+/// Records `count` visited cache-tile boxes.
+#[cfg(test)]
+pub(crate) fn record_tile_boxes(count: usize) {
+    TILE_BOXES.with(|n| n.set(n.get() + count));
+}
+
 /// The cache-tile boxes visited on this thread since the last call, and resets
 /// the count.
 #[cfg(test)]

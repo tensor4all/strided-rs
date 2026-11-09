@@ -8,6 +8,7 @@
 use core::mem::MaybeUninit;
 
 use crate::cost::KernelClass;
+use crate::raw_ops::PairTiles;
 use crate::{CopyPlan, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 
 type AxisVec<T> = crate::inline::InlineVec<T>;
@@ -1530,7 +1531,17 @@ impl ConcatenatePlan {
     /// the destination is at most the repository threshold, the budget
     /// allows one thread, or a segment exceeds the fused-rank limit.
     ///
+    /// A segment whose layout tiles ([`CopyPlan::tiles`], the decision its
+    /// serial replay [`CopyPlan::execute`] takes) is walked tile by tile: a
+    /// worker range over the segment's elements owns the tiles whose share of
+    /// the segment starts in it, so the tiles are split across the token whole
+    /// and every tile is the one the serial replay walks ([#427]). A segment
+    /// that declines keeps the flat walk of its element range. Each worker
+    /// replays its part serially, so nothing is split twice.
+    ///
     /// The caller must have validated every input layout and segment offset.
+    ///
+    /// [#427]: https://github.com/tensor4all/strided-rs/issues/427
     fn try_execute_parallel<D, T, Apply>(
         &self,
         dest: &mut RawStridedMut<'_, D>,
@@ -1548,25 +1559,38 @@ impl ConcatenatePlan {
         if exec.is_serial() {
             return Ok(false);
         }
-        // Precompute each segment's destination base offset once into an
-        // inline operand vector (allocation-free within the operand bound);
-        // the per-segment descriptors are read straight from `self`/`inputs`
-        // inside the loop, so the parallel replay allocates nothing.
+        // Precompute each segment's destination base offset and cache tiles
+        // once into inline operand vectors (allocation-free within the operand
+        // bound); the per-segment descriptors are read straight from
+        // `self`/`inputs` inside the loop, so the parallel replay allocates
+        // nothing.
         let mut dest_offsets: crate::inline::OperandVec<isize> =
+            crate::inline::OperandVec::with_capacity(inputs.len());
+        let mut segment_tiles: crate::inline::OperandVec<Option<PairTiles>> =
             crate::inline::OperandVec::with_capacity(inputs.len());
         for position in 0..inputs.len() {
             if self.copy_plans[position].fused_layout().is_none() {
                 return Ok(false);
             }
             dest_offsets.push(self.segment_offset(position, dest.offset())?);
+            // An inline traversal only ever tiles inline.
+            segment_tiles.push(
+                self.copy_plans[position]
+                    .tiles::<D, T>()
+                    .and_then(|tiles| tiles.inline().copied()),
+            );
         }
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         let starts = &self.segment_starts;
         let dest_offsets = &dest_offsets;
+        let segment_tiles = &segment_tiles;
+        #[cfg(test)]
+        let walked_tiles = core::sync::atomic::AtomicUsize::new(0);
         crate::threading::parallel_for_each(0..total, exec, &|range| {
             // First segment whose end lies past the range start.
             let mut position = starts[1..].partition_point(|&end| end <= range.start);
             while position < inputs.len() && starts[position] < range.end {
+                let segment_len = starts[position + 1] - starts[position];
                 let local_start = range.start.max(starts[position]) - starts[position];
                 let local_end = range.end.min(starts[position + 1]) - starts[position];
                 // The whole-plan guard above proved every segment has an
@@ -1585,22 +1609,47 @@ impl ConcatenatePlan {
                 // injective and the segments occupy disjoint ranges of the
                 // concatenation axis, so disjoint logical ranges write
                 // disjoint slots; inputs are shared borrows that cannot alias
-                // the exclusive destination borrow.
+                // the exclusive destination borrow. The tiles of a segment are
+                // `pair_tiles` of its layout, which address exactly its slots,
+                // and disjoint worker ranges own disjoint tile ranges within
+                // the grid (`tile_share` is monotone and maps the segment end
+                // to the tile count).
                 unsafe {
-                    crate::raw_ops::apply_fused_range(
-                        dest_ptr.as_ptr(),
-                        dest_offsets[position],
-                        input.data().as_ptr(),
-                        input.offset(),
-                        layout,
-                        local_start,
-                        local_end - local_start,
-                        &apply,
-                    );
+                    if let Some(tiles) = &segment_tiles[position] {
+                        let count = crate::raw_ops::tile_count(&tiles.layout, &tiles.blocks);
+                        let first = tile_share(local_start, count, segment_len);
+                        let end = tile_share(local_end, count, segment_len);
+                        crate::raw_ops::apply_tile_range(
+                            dest_ptr.as_ptr(),
+                            dest_offsets[position],
+                            input.data().as_ptr(),
+                            input.offset(),
+                            &tiles.layout,
+                            &tiles.blocks,
+                            first,
+                            end - first,
+                            &apply,
+                        );
+                        #[cfg(test)]
+                        walked_tiles.fetch_add(end - first, core::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        crate::raw_ops::apply_fused_range(
+                            dest_ptr.as_ptr(),
+                            dest_offsets[position],
+                            input.data().as_ptr(),
+                            input.offset(),
+                            layout,
+                            local_start,
+                            local_end - local_start,
+                            &apply,
+                        );
+                    }
                 }
                 position += 1;
             }
         });
+        #[cfg(test)]
+        crate::threading::record_tile_boxes(walked_tiles.into_inner());
         Ok(true)
     }
 
@@ -1688,6 +1737,17 @@ impl ConcatenatePlan {
         };
         self.copy_plans[position].execute_uninit(&mut segment, input, exec)
     }
+}
+
+/// The first tile owned by the worker range of a segment that starts at
+/// element `local` of `len`: `ceil(local * count / len)`, so element 0 owns
+/// tile 0, the segment end owns `count`, and the map is monotone. A tile thus
+/// goes to the range holding its proportional start, which keeps the split
+/// balanced by elements while handing out whole tiles.
+fn tile_share(local: usize, count: usize, len: usize) -> usize {
+    debug_assert!(local <= len && len > 0);
+    // `count <= len`, so the quotient fits `usize`; the product needs u128.
+    ((local as u128 * count as u128).div_ceil(len as u128)) as usize
 }
 
 impl ReversePlan {

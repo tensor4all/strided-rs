@@ -1143,3 +1143,49 @@ fn tile_odometer_stays_within_the_reachable_offsets() {
         assert_eq!(visited.get(), dims.iter().product::<usize>(), "{dims:?}");
     }
 }
+
+/// [#427]: any cut of the tile grid into two ranges walks exactly the slots
+/// of the whole-box walk, tile for tile.
+///
+/// [#427]: https://github.com/tensor4all/strided-rs/issues/427
+#[test]
+fn tile_ranges_partition_the_tiled_box_walk() {
+    let mut tiled = 0;
+    for (label, layout) in layouts() {
+        let Some(tiles) = layout.inline_tiles::<f64, f64>() else {
+            continue;
+        };
+        tiled += 1;
+        let count = tile_count(&tiles.layout, &tiles.blocks);
+        assert!(count >= 2, "{label}: a tiled layout has several tiles");
+        let (dst_len, src_len) = layout.lens();
+        let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+        let mut expected = vec![0.0f64; dst_len];
+        oracle(&layout, &mut expected, &src, |d, s| *d = s);
+        let cuts = [0, 1, count / 3, count / 2, count - 1, count];
+        for &cut in &cuts {
+            let mut actual = vec![0.0f64; dst_len];
+            let dst_ptr = actual.as_mut_ptr();
+            for (first, len) in [(0, cut), (cut, count - cut)] {
+                // SAFETY: `lens` sizes both buffers for every slot of the
+                // layout, the tiles are `pair_tiles` of it, the destination
+                // is injective, and `first + len` is at most `count`.
+                unsafe {
+                    apply_tile_range(
+                        dst_ptr,
+                        layout.dst_offset,
+                        src.as_ptr(),
+                        layout.src_offset,
+                        &tiles.layout,
+                        &tiles.blocks,
+                        first,
+                        len,
+                        &|d: &mut f64, s: f64| *d = s,
+                    );
+                }
+            }
+            assert_eq!(bits(&actual), bits(&expected), "{label}: cut at {cut}");
+        }
+    }
+    assert!(tiled >= 2, "only {tiled} layouts tiled inline");
+}
