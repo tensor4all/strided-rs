@@ -1,17 +1,19 @@
 # 2026-11-09: #427 — whole-plan concatenate tiles its permuted segments
 
-Raw evidence for tensor4all/strided-rs#432. It covers the red-first and mutation runs of the regression tests, and the timings of `strided-basic/benches/concat_parallel.rs` against the base `03a291b`. Section 1 interprets the timings; the appendices hold the unedited output.
+Raw evidence for tensor4all/strided-rs#432. It covers the red-first and mutation runs of the regression tests, and the timings of `strided-basic/benches/concat_parallel.rs` against the PR's base. Section 1 interprets the timings; the appendices hold the unedited output.
 
-Machine: **Apple M5 Max** (18 logical CPUs, macOS 26.7.2), rustc 1.96.0, `cargo bench` profile, `--features parallel`. This is a shared interactive machine; nothing was pinned or isolated. The load average at the start of every session is recorded in Appendix A, and it was 5.0–6.2 throughout. The benchmark host evo2 was not used.
+The SHAs below are those of the branch rebased onto `31099b8` (origin/main on 2026-11-10). Measurements and mutation runs were taken on the rebased tree `f43e2a1`, whose non-test code is that of the PR head: later commits on the branch change only this worklog.
+
+Machine: **Apple M5 Max** (18 logical CPUs, macOS 26.7.2), rustc 1.96.0, `cargo bench` profile, `--features parallel`. This is a shared interactive machine; nothing was pinned or isolated. The load average at the start of every session is recorded in Appendix A, and it was 5.4–7.0 throughout. The benchmark host evo2 was not used.
 
 ## 1. Timings
 
-Command per session: `CONCAT_BENCH_REPS=201 <binary>`. Each session runs the five cases. Within a case, every rep times the three paths in an order that rotates per rep. Each row reports the median of 201 reps after 3 warm-up reps.
+Command per session: `CONCAT_BENCH_REPS=201 <binary>`. Each session runs the five cases. Within a case, every rep times the three paths in an order that rotates per rep, with tokens and destination views built before the timer. Each row reports the median of 201 reps after 3 warm-up reps.
 
 The three binaries:
 
-- `head`: built from `49ec66e`. Later commits change only `#[cfg(test)]` code and tests, so this is the non-test code of the PR head.
-- `base`: built from `03a291b` with this branch's bench file and its `[[bench]]` entry copied in.
+- `head`: built from `f43e2a1`.
+- `base`: built from `31099b8`, which includes #428 and #436, with this branch's bench file and its `[[bench]]` entry copied in.
 - `base-again`: the same `base` binary run a second time. This is the A/A control, which measures what the machine alone moves.
 
 There were five rounds, and each round ran the three binaries in a rotated order.
@@ -20,28 +22,28 @@ Table 1 gives, per case and binary, the median of the five session medians, with
 
 ```
 case                     binary                 whole-plan 4T           per-segment 4T whole/per
-4x[1024x1024] all T      base          4.057 (3.676-4.849)   1.498 (1.299-1.513)     2.708
-4x[1024x1024] all T      base-again    4.406 (3.836-5.100)   1.482 (1.445-1.534)     2.973
-4x[1024x1024] all T      head          1.217 (1.187-1.243)   1.281 (1.246-1.319)     0.950
-4x[1024x1024] T,C,T,C    base          3.043 (2.958-3.449)   0.986 (0.974-1.064)     3.086
-4x[1024x1024] T,C,T,C    base-again    3.069 (2.950-3.575)   0.985 (0.971-0.995)     3.116
-4x[1024x1024] T,C,T,C    head          0.752 (0.734-0.766)   0.803 (0.795-0.830)     0.936
-4x[256x256] all T        base          0.138 (0.138-0.142)   0.138 (0.138-0.142)     1.000
-4x[256x256] all T        base-again    0.140 (0.138-0.140)   0.140 (0.138-0.140)     1.000
-4x[256x256] all T        head          0.140 (0.139-0.141)   0.140 (0.139-0.141)     1.000
-8x[512x512] all T        base          0.888 (0.825-0.914)   1.558 (1.530-1.713)     0.570
-8x[512x512] all T        base-again    0.943 (0.867-0.952)   1.543 (1.519-1.571)     0.611
-8x[512x512] all T        head          0.474 (0.466-0.496)   1.660 (1.645-1.704)     0.286
-4x[1024x1024] all C      base          0.263 (0.253-0.269)   0.324 (0.314-0.334)     0.812
-4x[1024x1024] all C      base-again    0.260 (0.254-0.265)   0.319 (0.309-0.324)     0.815
-4x[1024x1024] all C      head          0.272 (0.263-0.283)   0.306 (0.288-0.317)     0.889
+4x[1024x1024] all T      base          4.167 (3.502-4.788)   1.474 (1.270-1.489)     2.827
+4x[1024x1024] all T      base-again    4.391 (3.450-5.221)   1.483 (1.240-1.500)     2.961
+4x[1024x1024] all T      head          1.206 (1.192-1.214)   1.269 (1.249-1.274)     0.950
+4x[1024x1024] T,C,T,C    base          3.127 (2.978-3.217)   0.985 (0.963-0.993)     3.175
+4x[1024x1024] T,C,T,C    base-again    2.966 (2.917-3.017)   0.981 (0.968-0.995)     3.023
+4x[1024x1024] T,C,T,C    head          0.732 (0.726-0.752)   0.787 (0.778-0.818)     0.930
+4x[256x256] all T        base          0.137 (0.137-0.139)   0.138 (0.137-0.139)     0.993
+4x[256x256] all T        base-again    0.138 (0.136-0.146)   0.138 (0.137-0.146)     1.000
+4x[256x256] all T        head          0.137 (0.137-0.138)   0.138 (0.137-0.138)     0.993
+8x[512x512] all T        base          0.909 (0.883-0.956)   1.478 (1.474-1.571)     0.615
+8x[512x512] all T        base-again    0.929 (0.895-0.938)   1.519 (1.481-1.610)     0.612
+8x[512x512] all T        head          0.458 (0.455-0.472)   1.586 (1.577-1.627)     0.289
+4x[1024x1024] all C      base          0.251 (0.248-0.265)   0.316 (0.310-0.326)     0.794
+4x[1024x1024] all C      base-again    0.256 (0.251-0.262)   0.315 (0.312-0.321)     0.813
+4x[1024x1024] all C      head          0.264 (0.263-0.270)   0.290 (0.285-0.293)     0.910
 
-ratio of session medians, median over the 5 rounds (whole-plan, per-segment):
-4x[1024x1024] all T      base-again/base 1.086 0.989   head/base 0.300 0.855
-4x[1024x1024] T,C,T,C    base-again/base 1.009 0.999   head/base 0.247 0.814
-4x[256x256] all T        base-again/base 1.014 1.014   head/base 1.014 1.014
-8x[512x512] all T        base-again/base 1.062 0.990   head/base 0.534 1.065
-4x[1024x1024] all C      base-again/base 0.989 0.985   head/base 1.034 0.944
+case-level ratio of medians (whole-plan, per-segment):
+4x[1024x1024] all T      base-again/base 1.054 1.006   head/base 0.289 0.861
+4x[1024x1024] T,C,T,C    base-again/base 0.949 0.996   head/base 0.234 0.799
+4x[256x256] all T        base-again/base 1.007 1.000   head/base 1.000 1.000
+8x[512x512] all T        base-again/base 1.022 1.028   head/base 0.504 1.073
+4x[1024x1024] all C      base-again/base 1.020 0.997   head/base 1.052 0.918
 ```
 
 Table 2 pairs the binaries **within each round** (the same round's sessions) and gives the min..max of the five per-round ratios, with their median in brackets:
@@ -49,32 +51,32 @@ Table 2 pairs the binaries **within each round** (the same round's sessions) and
 ```
 per-round paired ratios (same round), min..max over the 5 rounds [median]:
 case                             A/A whole-plan        A/A per-segment        head/base whole      head/base per-seg
-4x[1024x1024] all T        0.807..1.323 [1.052]   0.960..1.181 [0.992]   0.250..0.328 [0.300]   0.836..0.959 [0.876]
-4x[1024x1024] T,C,T,C      0.864..1.046 [1.009]   0.913..1.011 [1.004]   0.222..0.251 [0.242]   0.755..0.832 [0.816]
-4x[256x256] all T          0.986..1.014 [1.000]   0.986..1.014 [1.007]   0.986..1.022 [1.007]   0.986..1.022 [1.014]
-8x[512x512] all T          0.949..1.154 [1.052]   0.908..1.005 [0.993]   0.520..0.571 [0.540]   0.960..1.095 [1.078]
-4x[1024x1024] all C        0.966..1.004 [0.996]   0.961..1.006 [0.981]   1.000..1.052 [1.038]   0.865..0.978 [0.952]
+4x[1024x1024] all T        0.721..1.453 [0.984]   0.841..1.168 [1.009]   0.252..0.344 [0.286]   0.847..1.003 [0.854]
+4x[1024x1024] T,C,T,C      0.914..0.995 [0.965]   0.978..1.022 [0.996]   0.227..0.252 [0.232]   0.790..0.841 [0.799]
+4x[256x256] all T          0.993..1.066 [1.007]   0.993..1.058 [1.007]   0.986..1.007 [1.000]   0.986..1.007 [1.000]
+8x[512x512] all T          0.976..1.059 [1.008]   1.005..1.066 [1.027]   0.494..0.515 [0.504]   1.036..1.075 [1.067]
+4x[1024x1024] all C        0.985..1.032 [1.008]   0.966..1.035 [0.991]   0.996..1.089 [1.048]   0.890..0.945 [0.908]
 ```
 
 What this establishes:
 
-- **Machine variation (A/A).** Running the same binary twice moves a case-level median by up to 8.6%: base-again/base whole-plan on `4x[1024x1024] all T`, which is 1.086 in Table 1. That figure is the largest **case-level ratio of medians**, not a bound on how far one session can move.
-  - Within a round, the same binary moved by much more: 0.807..1.323 on that case, which is −19% to +32%, in rounds 1 and 2 of Appendix A.
-  - Per-segment on that case moved by 0.960..1.181 within a round. On the other four cases, the within-round A/A range is 0.864..1.154 for whole-plan and 0.908..1.014 for per-segment.
-- **Permuted segments.** Head whole-plan is 0.29–0.95 of per-segment (Table 1). Paired within rounds, head/base whole-plan is 0.250..0.328, 0.222..0.251 and 0.520..0.571 on the three permuted cases that leave the serial gate. Every one of those per-round ratios lies below the smallest within-round A/A ratio of any case (0.807). So the gain is outside what the machine alone produced in these runs, round by round.
-- **4x[256x256].** The case stays under the serial gate on every binary.
+- **Machine variation (A/A).** The largest **case-level ratio of medians** for the same binary run twice is 1.054 (whole-plan, `4x[1024x1024] all T`), with 0.949 the smallest. That figure is not a bound on how far one session moves.
+  - Paired within rounds, the same binary moved whole-plan by 0.721..1.453 on `all T`, which is −28% to +45%, and by 0.914..1.066 on the other four cases.
+  - Per-segment moved by 0.841..1.168 on `all T`, and by 0.966..1.066 on the other cases.
+- **Permuted segments.** Head whole-plan is 0.29–0.95 of per-segment (Table 1). Paired within rounds, head/base whole-plan is 0.252..0.344, 0.227..0.252 and 0.494..0.515 on the three permuted cases that leave the serial gate. Every one of those per-round ratios lies below the smallest within-round A/A ratio of any case (0.721). So the gain is outside what the machine alone produced in these runs, round by round.
+- **4x[256x256].** The case stays under the serial gate on every binary (head/base 0.986..1.007).
 - **Contiguous only (`all C`).**
-  - Head whole-plan is 1.034 of base by the case-level ratio of medians, and 1.000..1.052 (median 1.038) paired within rounds.
-  - The within-round A/A range on this case is 0.966..1.004. So head/base is above the A/A median, and in 4 of 5 rounds above its maximum.
-  - The per-segment path is the same source in both binaries (`CopyPlan` is unchanged apart from two `pub(crate)` accessors). Even so, it moves by 0.865..0.978 head/base on this case, and by 0.755..1.095 across cases, paired within rounds.
-  - So differences of this size also appear between the two builds in code this change does not touch. These runs do not separate a +3–5% code effect from a build-layout effect.
-  - Since `233d23a`, the contiguous route is the pre-#427 loop (`replay_flat_parallel`), and the only added work per call is the stored `may_tile` flag test. **Equal contiguous throughput is not claimed.** The measured head/base ratio is 1.034 at the case level and at most 1.052 in any round.
+  - Head whole-plan is 1.052 of base by the case-level ratio of medians, and 0.996..1.089 (median 1.048) paired within rounds.
+  - The within-round A/A range on this case is 0.985..1.032, which head/base exceeds in 3 of 5 rounds.
+  - The per-segment path is the same source in both binaries (`CopyPlan` is unchanged apart from two `pub(crate)` accessors). Even so, it moves by 0.890..0.945 head/base on this case, and by 0.790..1.075 across cases, paired within rounds.
+  - So differences of this size also appear between the two builds in code this change does not touch. These runs do not separate a +5% code effect from a build-layout effect.
+  - Since `c8046e3`, the contiguous route is the pre-#427 loop (`replay_flat_parallel`), and the only added work per call is the stored `may_tile` flag test. **Equal contiguous throughput is not claimed.** The measured head/base ratio is 1.052 at the case level and at most 1.089 in any round.
 
-An earlier set of five alternating sessions, at `233d23a` (the same non-test code as `49ec66e`), gave 1.044 for contiguous whole-plan and 0.946 for contiguous per-segment (head/base). That run is quoted, not reproduced here.
+Earlier runs on the pre-rebase tree, at that time's base `03a291b`, gave the same picture: permuted whole-plan at 0.22–0.57 of base per round, and contiguous whole-plan at 1.034 of base. They are superseded by the run above and not reproduced here.
 
 ## 2. Regression tests: red first and the review mutants
 
-Appendix B was produced by the script in Appendix C, run on the committed tree `f2f8792`. Each step applies one mutation, runs the focused test, and restores the file. The "red first" step runs the test commit `80415f8`, where the test is present and the fix absent, in a temporary worktree.
+Appendix B was produced by the script in Appendix C, run on the committed tree `f43e2a1`. Each step applies one mutation, runs the focused test, and restores the file. The "red first" step runs the test commit `22bde1b`, where the test is present and the fix absent, in a temporary worktree; the script finds that commit by its subject.
 
 | run | test | expected | observed |
 |---|---|---|---|
@@ -84,406 +86,406 @@ Appendix B was produced by the script in Appendix C, run on the committed tree `
 | r3: only `execute` serial, `execute_uninit` parallel | whole-plan | fail | `execute: ... dispatched 0 chunks` |
 | r5: every tile of a segment in the range that starts it | whole-plan | fail | `walked by 1` |
 | r6: the two ranges of a cut walked second range first | `tile_ranges_partition_the_tiled_box_walk` | fail | `cut at 1 must visit the slots in the whole-box order` |
-| red first, `80415f8` | whole-plan | fail | `left: 0, right: 234` |
+| red first, `22bde1b` | whole-plan | fail | `left: 0, right: 234` |
 
-"whole-plan" is `concatenate_whole_plan_tiles_permuted_segments_like_serial_segments`. `tile_ranges_partition_the_tiled_box_walk` records the destination slot of every visit. It requires the walk of `0..cut` followed by `cut..count` to give the same slot sequence as `apply_tiled_box` over the whole box, for every cut tried.
+"whole-plan" is `concatenate_whole_plan_tiles_permuted_segments_like_serial_segments`. `tile_ranges_partition_the_tiled_box_walk` records the destination slot of every visit. It requires the walk of `0..cut` followed by `cut..count` to give the same slot sequence as `apply_tiled_box` over the whole box, for every cut tried. Because `apply_tiled_box` itself walks through `apply_tile_range`, this establishes agreement between split and whole-grid walks, not agreement with the walk before this change.
 
 ## Appendix A: raw benchmark output
 
 ```
-# date: 2026-11-09 23:32:42 +0900
+# date: 2026-11-10 01:08:06 +0900
 # host: Apple M5 Max, 18 logical CPUs, macOS 26.7.2
 # rustc 1.96.0 (ac68faa20 2026-05-25)
 # cargo 1.96.0 (30a34c682 2026-05-25)
-# head binary: strided-basic at 49ec66e (cargo bench profile, --features parallel), sha256 d6d93da859d26572
-# base binary: strided-basic at 03a291b + benches/concat_parallel.rs and Cargo.toml [[bench]] from 49ec66e, sha256 3bb82e8cffd27014
+# head binary: strided-basic at f43e2a1 (cargo bench profile, --features parallel), sha256 59ade9d6fa32d935
+# base binary: strided-basic at 31099b8 (origin/main) + benches/concat_parallel.rs and its Cargo.toml [[bench]] entry from f43e2a1, sha256 cc7e3b4fd3b96e6c
 # A/A: the base binary run a second time in each round (label base-again)
 # CONCAT_BENCH_REPS=201, CONCAT_BENCH_THREADS=4 (default); 5 rounds, order rotated per round
-## round 1 base  load: 5.26 6.12 6.27
+## round 1 base  load: 6.95 5.88 5.23
 threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       4.755 ms    14.1 GB/s   0.882 Gelem/s  p10..p90 3.057..6.146 ms
-4x[1024x1024] all T      per-segment 4T      1.299 ms    51.6 GB/s   3.228 Gelem/s  p10..p90 1.213..1.549 ms
-4x[1024x1024] all T      serial 1T           4.012 ms    16.7 GB/s   1.046 Gelem/s  p10..p90 3.900..4.197 ms
-4x[1024x1024] all T      whole/per-segment = 3.659
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.036 ms    22.1 GB/s   1.381 Gelem/s  p10..p90 1.430..3.966 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.986 ms    68.0 GB/s   4.252 Gelem/s  p10..p90 0.801..1.169 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.212 ms    30.3 GB/s   1.896 Gelem/s  p10..p90 2.097..2.337 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.078
-4x[256x256] all T        whole-plan 4T       0.138 ms    30.3 GB/s   1.896 Gelem/s  p10..p90 0.136..0.143 ms
-4x[256x256] all T        per-segment 4T      0.138 ms    30.3 GB/s   1.894 Gelem/s  p10..p90 0.136..0.142 ms
-4x[256x256] all T        serial 1T           0.138 ms    30.3 GB/s   1.896 Gelem/s  p10..p90 0.136..0.142 ms
+4x[1024x1024] all T      whole-plan 4T       4.073 ms    16.5 GB/s   1.030 Gelem/s  p10..p90 2.842..5.559 ms
+4x[1024x1024] all T      per-segment 4T      1.487 ms    45.1 GB/s   2.821 Gelem/s  p10..p90 1.242..1.605 ms
+4x[1024x1024] all T      serial 1T           3.992 ms    16.8 GB/s   1.051 Gelem/s  p10..p90 3.864..4.221 ms
+4x[1024x1024] all T      whole/per-segment = 2.740
+4x[1024x1024] T,C,T,C    whole-plan 4T       2.982 ms    22.5 GB/s   1.406 Gelem/s  p10..p90 1.482..3.601 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.986 ms    68.1 GB/s   4.254 Gelem/s  p10..p90 0.872..1.152 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.119 ms    31.7 GB/s   1.979 Gelem/s  p10..p90 2.034..2.264 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.025
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.5 GB/s   1.907 Gelem/s  p10..p90 0.129..0.144 ms
+4x[256x256] all T        per-segment 4T      0.138 ms    30.5 GB/s   1.905 Gelem/s  p10..p90 0.129..0.145 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.7 GB/s   1.916 Gelem/s  p10..p90 0.129..0.144 ms
 4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.883 ms    38.0 GB/s   2.374 Gelem/s  p10..p90 0.801..0.971 ms
-8x[512x512] all T        per-segment 4T      1.530 ms    21.9 GB/s   1.371 Gelem/s  p10..p90 1.458..1.669 ms
-8x[512x512] all T        serial 1T           1.551 ms    21.6 GB/s   1.352 Gelem/s  p10..p90 1.490..1.681 ms
-8x[512x512] all T        whole/per-segment = 0.578
-4x[1024x1024] all C      whole-plan 4T       0.253 ms   264.9 GB/s  16.554 Gelem/s  p10..p90 0.228..0.277 ms
-4x[1024x1024] all C      per-segment 4T      0.314 ms   213.5 GB/s  13.343 Gelem/s  p10..p90 0.275..0.372 ms
-4x[1024x1024] all C      serial 1T           0.533 ms   126.0 GB/s   7.872 Gelem/s  p10..p90 0.516..0.544 ms
-4x[1024x1024] all C      whole/per-segment = 0.806
-## round 1 head  load: 5.00 6.06 6.25
+8x[512x512] all T        whole-plan 4T       0.956 ms    35.1 GB/s   2.194 Gelem/s  p10..p90 0.829..1.206 ms
+8x[512x512] all T        per-segment 4T      1.571 ms    21.4 GB/s   1.335 Gelem/s  p10..p90 1.470..1.686 ms
+8x[512x512] all T        serial 1T           1.583 ms    21.2 GB/s   1.325 Gelem/s  p10..p90 1.494..1.723 ms
+8x[512x512] all T        whole/per-segment = 0.609
+4x[1024x1024] all C      whole-plan 4T       0.248 ms   270.4 GB/s  16.901 Gelem/s  p10..p90 0.217..0.288 ms
+4x[1024x1024] all C      per-segment 4T      0.310 ms   216.3 GB/s  13.521 Gelem/s  p10..p90 0.271..0.353 ms
+4x[1024x1024] all C      serial 1T           0.525 ms   127.9 GB/s   7.992 Gelem/s  p10..p90 0.505..0.543 ms
+4x[1024x1024] all C      whole/per-segment = 0.800
+## round 1 head  load: 6.72 5.85 5.22
 threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       1.187 ms    56.6 GB/s   3.535 Gelem/s  p10..p90 1.154..1.226 ms
-4x[1024x1024] all T      per-segment 4T      1.246 ms    53.8 GB/s   3.365 Gelem/s  p10..p90 1.214..1.280 ms
-4x[1024x1024] all T      serial 1T           3.998 ms    16.8 GB/s   1.049 Gelem/s  p10..p90 3.897..4.087 ms
-4x[1024x1024] all T      whole/per-segment = 0.952
-4x[1024x1024] T,C,T,C    whole-plan 4T       0.734 ms    91.5 GB/s   5.717 Gelem/s  p10..p90 0.705..0.794 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.795 ms    84.4 GB/s   5.277 Gelem/s  p10..p90 0.760..0.927 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.245 ms    29.9 GB/s   1.868 Gelem/s  p10..p90 2.178..2.338 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 0.923
-4x[256x256] all T        whole-plan 4T       0.140 ms    29.9 GB/s   1.870 Gelem/s  p10..p90 0.139..0.145 ms
-4x[256x256] all T        per-segment 4T      0.140 ms    29.9 GB/s   1.870 Gelem/s  p10..p90 0.139..0.144 ms
-4x[256x256] all T        serial 1T           0.140 ms    29.9 GB/s   1.871 Gelem/s  p10..p90 0.139..0.144 ms
-4x[256x256] all T        whole/per-segment = 1.000
-8x[512x512] all T        whole-plan 4T       0.477 ms    70.3 GB/s   4.396 Gelem/s  p10..p90 0.449..0.516 ms
-8x[512x512] all T        per-segment 4T      1.675 ms    20.0 GB/s   1.252 Gelem/s  p10..p90 1.597..1.750 ms
-8x[512x512] all T        serial 1T           1.676 ms    20.0 GB/s   1.251 Gelem/s  p10..p90 1.610..1.750 ms
-8x[512x512] all T        whole/per-segment = 0.285
-4x[1024x1024] all C      whole-plan 4T       0.263 ms   255.4 GB/s  15.966 Gelem/s  p10..p90 0.247..0.278 ms
-4x[1024x1024] all C      per-segment 4T      0.288 ms   233.0 GB/s  14.564 Gelem/s  p10..p90 0.275..0.317 ms
-4x[1024x1024] all C      serial 1T           0.549 ms   122.1 GB/s   7.634 Gelem/s  p10..p90 0.540..0.565 ms
-4x[1024x1024] all C      whole/per-segment = 0.912
-## round 1 base-again  load: 5.96 6.24 6.31
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       3.836 ms    17.5 GB/s   1.094 Gelem/s  p10..p90 2.910..5.195 ms
-4x[1024x1024] all T      per-segment 4T      1.534 ms    43.7 GB/s   2.733 Gelem/s  p10..p90 1.442..2.231 ms
-4x[1024x1024] all T      serial 1T           4.180 ms    16.1 GB/s   1.003 Gelem/s  p10..p90 3.981..4.947 ms
-4x[1024x1024] all T      whole/per-segment = 2.500
-4x[1024x1024] T,C,T,C    whole-plan 4T       2.993 ms    22.4 GB/s   1.401 Gelem/s  p10..p90 2.370..3.447 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.995 ms    67.4 GB/s   4.214 Gelem/s  p10..p90 0.831..1.171 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.156 ms    31.1 GB/s   1.945 Gelem/s  p10..p90 2.089..2.266 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.008
-4x[256x256] all T        whole-plan 4T       0.138 ms    30.5 GB/s   1.905 Gelem/s  p10..p90 0.135..0.143 ms
-4x[256x256] all T        per-segment 4T      0.138 ms    30.5 GB/s   1.905 Gelem/s  p10..p90 0.135..0.143 ms
-4x[256x256] all T        serial 1T           0.137 ms    30.6 GB/s   1.911 Gelem/s  p10..p90 0.135..0.142 ms
-4x[256x256] all T        whole/per-segment = 1.000
-8x[512x512] all T        whole-plan 4T       0.944 ms    35.6 GB/s   2.223 Gelem/s  p10..p90 0.824..1.081 ms
-8x[512x512] all T        per-segment 4T      1.519 ms    22.1 GB/s   1.380 Gelem/s  p10..p90 1.467..1.592 ms
-8x[512x512] all T        serial 1T           1.535 ms    21.9 GB/s   1.366 Gelem/s  p10..p90 1.477..1.621 ms
-8x[512x512] all T        whole/per-segment = 0.621
-4x[1024x1024] all C      whole-plan 4T       0.254 ms   264.3 GB/s  16.516 Gelem/s  p10..p90 0.220..0.297 ms
-4x[1024x1024] all C      per-segment 4T      0.309 ms   217.0 GB/s  13.561 Gelem/s  p10..p90 0.269..0.361 ms
-4x[1024x1024] all C      serial 1T           0.530 ms   126.6 GB/s   7.913 Gelem/s  p10..p90 0.516..0.546 ms
-4x[1024x1024] all C      whole/per-segment = 0.821
-## round 2 head  load: 5.96 6.24 6.31
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       1.206 ms    55.6 GB/s   3.477 Gelem/s  p10..p90 1.173..1.255 ms
-4x[1024x1024] all T      per-segment 4T      1.265 ms    53.1 GB/s   3.316 Gelem/s  p10..p90 1.230..1.344 ms
-4x[1024x1024] all T      serial 1T           4.074 ms    16.5 GB/s   1.029 Gelem/s  p10..p90 4.000..4.178 ms
-4x[1024x1024] all T      whole/per-segment = 0.954
-4x[1024x1024] T,C,T,C    whole-plan 4T       0.752 ms    89.2 GB/s   5.576 Gelem/s  p10..p90 0.718..0.812 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.803 ms    83.6 GB/s   5.223 Gelem/s  p10..p90 0.772..0.877 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.279 ms    29.4 GB/s   1.840 Gelem/s  p10..p90 2.228..2.351 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 0.937
-4x[256x256] all T        whole-plan 4T       0.141 ms    29.8 GB/s   1.862 Gelem/s  p10..p90 0.140..0.144 ms
-4x[256x256] all T        per-segment 4T      0.141 ms    29.7 GB/s   1.857 Gelem/s  p10..p90 0.140..0.145 ms
-4x[256x256] all T        serial 1T           0.141 ms    29.7 GB/s   1.858 Gelem/s  p10..p90 0.140..0.144 ms
-4x[256x256] all T        whole/per-segment = 0.997
-8x[512x512] all T        whole-plan 4T       0.471 ms    71.3 GB/s   4.456 Gelem/s  p10..p90 0.451..0.504 ms
-8x[512x512] all T        per-segment 4T      1.660 ms    20.2 GB/s   1.263 Gelem/s  p10..p90 1.598..1.740 ms
-8x[512x512] all T        serial 1T           1.666 ms    20.1 GB/s   1.258 Gelem/s  p10..p90 1.597..1.745 ms
-8x[512x512] all T        whole/per-segment = 0.284
-4x[1024x1024] all C      whole-plan 4T       0.263 ms   255.2 GB/s  15.948 Gelem/s  p10..p90 0.249..0.280 ms
-4x[1024x1024] all C      per-segment 4T      0.289 ms   232.0 GB/s  14.499 Gelem/s  p10..p90 0.276..0.318 ms
-4x[1024x1024] all C      serial 1T           0.539 ms   124.5 GB/s   7.782 Gelem/s  p10..p90 0.529..0.551 ms
-4x[1024x1024] all C      whole/per-segment = 0.909
-## round 2 base-again  load: 6.12 6.27 6.32
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       4.864 ms    13.8 GB/s   0.862 Gelem/s  p10..p90 2.929..6.163 ms
-4x[1024x1024] all T      per-segment 4T      1.452 ms    46.2 GB/s   2.889 Gelem/s  p10..p90 1.197..1.576 ms
-4x[1024x1024] all T      serial 1T           4.018 ms    16.7 GB/s   1.044 Gelem/s  p10..p90 3.879..4.189 ms
-4x[1024x1024] all T      whole/per-segment = 3.350
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.069 ms    21.9 GB/s   1.367 Gelem/s  p10..p90 1.448..3.724 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.971 ms    69.1 GB/s   4.320 Gelem/s  p10..p90 0.802..1.143 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.165 ms    31.0 GB/s   1.937 Gelem/s  p10..p90 2.088..2.284 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.161
-4x[256x256] all T        whole-plan 4T       0.140 ms    29.9 GB/s   1.869 Gelem/s  p10..p90 0.136..0.148 ms
-4x[256x256] all T        per-segment 4T      0.140 ms    29.9 GB/s   1.871 Gelem/s  p10..p90 0.136..0.148 ms
-4x[256x256] all T        serial 1T           0.140 ms    29.9 GB/s   1.871 Gelem/s  p10..p90 0.137..0.148 ms
-4x[256x256] all T        whole/per-segment = 1.001
-8x[512x512] all T        whole-plan 4T       0.952 ms    35.3 GB/s   2.204 Gelem/s  p10..p90 0.822..1.269 ms
-8x[512x512] all T        per-segment 4T      1.543 ms    21.7 GB/s   1.359 Gelem/s  p10..p90 1.484..1.648 ms
-8x[512x512] all T        serial 1T           1.555 ms    21.6 GB/s   1.349 Gelem/s  p10..p90 1.497..1.674 ms
-8x[512x512] all T        whole/per-segment = 0.617
-4x[1024x1024] all C      whole-plan 4T       0.254 ms   263.9 GB/s  16.491 Gelem/s  p10..p90 0.223..0.294 ms
-4x[1024x1024] all C      per-segment 4T      0.321 ms   208.9 GB/s  13.054 Gelem/s  p10..p90 0.279..0.375 ms
-4x[1024x1024] all C      serial 1T           0.533 ms   125.8 GB/s   7.864 Gelem/s  p10..p90 0.517..0.548 ms
-4x[1024x1024] all C      whole/per-segment = 0.792
-## round 2 base  load: 6.19 6.28 6.32
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       3.676 ms    18.3 GB/s   1.141 Gelem/s  p10..p90 2.874..4.932 ms
-4x[1024x1024] all T      per-segment 4T      1.513 ms    44.4 GB/s   2.773 Gelem/s  p10..p90 1.414..1.604 ms
-4x[1024x1024] all T      serial 1T           4.026 ms    16.7 GB/s   1.042 Gelem/s  p10..p90 3.936..4.168 ms
-4x[1024x1024] all T      whole/per-segment = 2.430
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.043 ms    22.1 GB/s   1.378 Gelem/s  p10..p90 1.390..3.521 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      1.064 ms    63.1 GB/s   3.942 Gelem/s  p10..p90 0.959..1.227 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.179 ms    30.8 GB/s   1.925 Gelem/s  p10..p90 2.088..2.293 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 2.860
-4x[256x256] all T        whole-plan 4T       0.138 ms    30.4 GB/s   1.901 Gelem/s  p10..p90 0.133..0.143 ms
-4x[256x256] all T        per-segment 4T      0.138 ms    30.4 GB/s   1.899 Gelem/s  p10..p90 0.134..0.144 ms
-4x[256x256] all T        serial 1T           0.137 ms    30.5 GB/s   1.908 Gelem/s  p10..p90 0.134..0.142 ms
-4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.825 ms    40.7 GB/s   2.541 Gelem/s  p10..p90 0.769..0.875 ms
-8x[512x512] all T        per-segment 4T      1.540 ms    21.8 GB/s   1.362 Gelem/s  p10..p90 1.484..1.630 ms
-8x[512x512] all T        serial 1T           1.556 ms    21.6 GB/s   1.348 Gelem/s  p10..p90 1.493..1.641 ms
-8x[512x512] all T        whole/per-segment = 0.536
-4x[1024x1024] all C      whole-plan 4T       0.263 ms   255.5 GB/s  15.971 Gelem/s  p10..p90 0.231..0.329 ms
-4x[1024x1024] all C      per-segment 4T      0.334 ms   200.9 GB/s  12.556 Gelem/s  p10..p90 0.287..0.472 ms
-4x[1024x1024] all C      serial 1T           0.517 ms   129.8 GB/s   8.115 Gelem/s  p10..p90 0.499..0.537 ms
-4x[1024x1024] all C      whole/per-segment = 0.786
-## round 3 base-again  load: 6.01 6.24 6.31
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       4.406 ms    15.2 GB/s   0.952 Gelem/s  p10..p90 2.883..5.923 ms
-4x[1024x1024] all T      per-segment 4T      1.482 ms    45.3 GB/s   2.831 Gelem/s  p10..p90 1.262..1.615 ms
-4x[1024x1024] all T      serial 1T           4.109 ms    16.3 GB/s   1.021 Gelem/s  p10..p90 3.965..4.280 ms
-4x[1024x1024] all T      whole/per-segment = 2.974
-4x[1024x1024] T,C,T,C    whole-plan 4T       2.950 ms    22.7 GB/s   1.422 Gelem/s  p10..p90 1.412..4.015 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.985 ms    68.1 GB/s   4.258 Gelem/s  p10..p90 0.810..1.152 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.197 ms    30.6 GB/s   1.909 Gelem/s  p10..p90 2.089..2.319 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 2.995
-4x[256x256] all T        whole-plan 4T       0.140 ms    30.1 GB/s   1.879 Gelem/s  p10..p90 0.138..0.143 ms
-4x[256x256] all T        per-segment 4T      0.140 ms    30.1 GB/s   1.879 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        serial 1T           0.139 ms    30.1 GB/s   1.880 Gelem/s  p10..p90 0.138..0.143 ms
-4x[256x256] all T        whole/per-segment = 1.000
-8x[512x512] all T        whole-plan 4T       0.867 ms    38.7 GB/s   2.418 Gelem/s  p10..p90 0.798..0.960 ms
-8x[512x512] all T        per-segment 4T      1.522 ms    22.0 GB/s   1.378 Gelem/s  p10..p90 1.470..1.605 ms
-8x[512x512] all T        serial 1T           1.535 ms    21.9 GB/s   1.366 Gelem/s  p10..p90 1.482..1.636 ms
-8x[512x512] all T        whole/per-segment = 0.570
-4x[1024x1024] all C      whole-plan 4T       0.260 ms   258.4 GB/s  16.153 Gelem/s  p10..p90 0.232..0.284 ms
-4x[1024x1024] all C      per-segment 4T      0.318 ms   210.9 GB/s  13.181 Gelem/s  p10..p90 0.281..0.370 ms
-4x[1024x1024] all C      serial 1T           0.535 ms   125.5 GB/s   7.842 Gelem/s  p10..p90 0.521..0.546 ms
-4x[1024x1024] all C      whole/per-segment = 0.816
-## round 3 base  load: 5.69 6.17 6.28
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       3.779 ms    17.8 GB/s   1.110 Gelem/s  p10..p90 2.788..5.219 ms
-4x[1024x1024] all T      per-segment 4T      1.494 ms    44.9 GB/s   2.808 Gelem/s  p10..p90 1.407..1.648 ms
-4x[1024x1024] all T      serial 1T           4.103 ms    16.4 GB/s   1.022 Gelem/s  p10..p90 3.970..4.376 ms
-4x[1024x1024] all T      whole/per-segment = 2.530
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.415 ms    19.6 GB/s   1.228 Gelem/s  p10..p90 1.512..4.224 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      1.012 ms    66.3 GB/s   4.144 Gelem/s  p10..p90 0.830..1.208 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.290 ms    29.3 GB/s   1.832 Gelem/s  p10..p90 2.180..2.485 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.374
-4x[256x256] all T        whole-plan 4T       0.139 ms    30.1 GB/s   1.882 Gelem/s  p10..p90 0.138..0.141 ms
-4x[256x256] all T        per-segment 4T      0.139 ms    30.1 GB/s   1.882 Gelem/s  p10..p90 0.138..0.141 ms
-4x[256x256] all T        serial 1T           0.139 ms    30.1 GB/s   1.884 Gelem/s  p10..p90 0.138..0.141 ms
-4x[256x256] all T        whole/per-segment = 1.000
-8x[512x512] all T        whole-plan 4T       0.914 ms    36.7 GB/s   2.293 Gelem/s  p10..p90 0.820..1.010 ms
-8x[512x512] all T        per-segment 4T      1.558 ms    21.5 GB/s   1.346 Gelem/s  p10..p90 1.521..1.653 ms
-8x[512x512] all T        serial 1T           1.578 ms    21.3 GB/s   1.329 Gelem/s  p10..p90 1.522..1.694 ms
-8x[512x512] all T        whole/per-segment = 0.587
-4x[1024x1024] all C      whole-plan 4T       0.269 ms   249.6 GB/s  15.597 Gelem/s  p10..p90 0.234..0.319 ms
-4x[1024x1024] all C      per-segment 4T      0.324 ms   207.3 GB/s  12.959 Gelem/s  p10..p90 0.285..0.381 ms
-4x[1024x1024] all C      serial 1T           0.536 ms   125.2 GB/s   7.825 Gelem/s  p10..p90 0.524..0.553 ms
-4x[1024x1024] all C      whole/per-segment = 0.831
-## round 3 head  load: 5.48 6.12 6.26
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       1.240 ms    54.1 GB/s   3.383 Gelem/s  p10..p90 1.207..1.307 ms
-4x[1024x1024] all T      per-segment 4T      1.319 ms    50.9 GB/s   3.180 Gelem/s  p10..p90 1.267..1.530 ms
-4x[1024x1024] all T      serial 1T           4.140 ms    16.2 GB/s   1.013 Gelem/s  p10..p90 4.061..4.259 ms
-4x[1024x1024] all T      whole/per-segment = 0.940
-4x[1024x1024] T,C,T,C    whole-plan 4T       0.766 ms    87.6 GB/s   5.474 Gelem/s  p10..p90 0.732..0.817 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.830 ms    80.9 GB/s   5.056 Gelem/s  p10..p90 0.782..0.935 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.306 ms    29.1 GB/s   1.819 Gelem/s  p10..p90 2.249..2.378 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 0.924
-4x[256x256] all T        whole-plan 4T       0.139 ms    30.1 GB/s   1.883 Gelem/s  p10..p90 0.138..0.141 ms
-4x[256x256] all T        per-segment 4T      0.139 ms    30.1 GB/s   1.881 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        serial 1T           0.139 ms    30.1 GB/s   1.881 Gelem/s  p10..p90 0.138..0.141 ms
-4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.496 ms    67.6 GB/s   4.226 Gelem/s  p10..p90 0.456..0.558 ms
-8x[512x512] all T        per-segment 4T      1.704 ms    19.7 GB/s   1.231 Gelem/s  p10..p90 1.616..1.804 ms
-8x[512x512] all T        serial 1T           1.715 ms    19.6 GB/s   1.223 Gelem/s  p10..p90 1.611..1.811 ms
-8x[512x512] all T        whole/per-segment = 0.291
-4x[1024x1024] all C      whole-plan 4T       0.283 ms   236.7 GB/s  14.797 Gelem/s  p10..p90 0.259..0.309 ms
-4x[1024x1024] all C      per-segment 4T      0.317 ms   211.8 GB/s  13.240 Gelem/s  p10..p90 0.282..0.365 ms
-4x[1024x1024] all C      serial 1T           0.537 ms   125.0 GB/s   7.815 Gelem/s  p10..p90 0.525..0.550 ms
-4x[1024x1024] all C      whole/per-segment = 0.895
-## round 4 base  load: 5.48 6.12 6.26
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       4.849 ms    13.8 GB/s   0.865 Gelem/s  p10..p90 3.298..6.629 ms
-4x[1024x1024] all T      per-segment 4T      1.498 ms    44.8 GB/s   2.800 Gelem/s  p10..p90 1.378..1.620 ms
-4x[1024x1024] all T      serial 1T           4.265 ms    15.7 GB/s   0.983 Gelem/s  p10..p90 4.111..4.388 ms
-4x[1024x1024] all T      whole/per-segment = 3.238
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.449 ms    19.5 GB/s   1.216 Gelem/s  p10..p90 1.468..4.332 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.978 ms    68.7 GB/s   4.291 Gelem/s  p10..p90 0.821..1.142 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.261 ms    29.7 GB/s   1.855 Gelem/s  p10..p90 2.172..2.353 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.528
-4x[256x256] all T        whole-plan 4T       0.142 ms    29.6 GB/s   1.850 Gelem/s  p10..p90 0.139..0.158 ms
-4x[256x256] all T        per-segment 4T      0.142 ms    29.6 GB/s   1.852 Gelem/s  p10..p90 0.139..0.159 ms
-4x[256x256] all T        serial 1T           0.142 ms    29.6 GB/s   1.850 Gelem/s  p10..p90 0.139..0.162 ms
-4x[256x256] all T        whole/per-segment = 1.001
-8x[512x512] all T        whole-plan 4T       0.888 ms    37.8 GB/s   2.360 Gelem/s  p10..p90 0.784..1.122 ms
-8x[512x512] all T        per-segment 4T      1.713 ms    19.6 GB/s   1.224 Gelem/s  p10..p90 1.533..2.047 ms
-8x[512x512] all T        serial 1T           1.740 ms    19.3 GB/s   1.205 Gelem/s  p10..p90 1.544..2.144 ms
-8x[512x512] all T        whole/per-segment = 0.519
-4x[1024x1024] all C      whole-plan 4T       0.262 ms   255.9 GB/s  15.994 Gelem/s  p10..p90 0.232..0.322 ms
-4x[1024x1024] all C      per-segment 4T      0.317 ms   212.0 GB/s  13.250 Gelem/s  p10..p90 0.284..0.384 ms
-4x[1024x1024] all C      serial 1T           0.531 ms   126.4 GB/s   7.899 Gelem/s  p10..p90 0.521..0.542 ms
-4x[1024x1024] all C      whole/per-segment = 0.828
-## round 4 head  load: 5.60 6.13 6.27
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       1.243 ms    54.0 GB/s   3.375 Gelem/s  p10..p90 1.201..1.314 ms
-4x[1024x1024] all T      per-segment 4T      1.312 ms    51.1 GB/s   3.196 Gelem/s  p10..p90 1.263..1.506 ms
-4x[1024x1024] all T      serial 1T           4.143 ms    16.2 GB/s   1.012 Gelem/s  p10..p90 4.055..4.329 ms
-4x[1024x1024] all T      whole/per-segment = 0.947
-4x[1024x1024] T,C,T,C    whole-plan 4T       0.765 ms    87.7 GB/s   5.483 Gelem/s  p10..p90 0.738..0.810 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.814 ms    82.4 GB/s   5.152 Gelem/s  p10..p90 0.785..0.897 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.291 ms    29.3 GB/s   1.831 Gelem/s  p10..p90 2.244..2.358 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 0.940
-4x[256x256] all T        whole-plan 4T       0.140 ms    30.0 GB/s   1.878 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        per-segment 4T      0.140 ms    30.0 GB/s   1.875 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        serial 1T           0.140 ms    30.1 GB/s   1.879 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.474 ms    70.9 GB/s   4.428 Gelem/s  p10..p90 0.450..0.513 ms
-8x[512x512] all T        per-segment 4T      1.645 ms    20.4 GB/s   1.275 Gelem/s  p10..p90 1.592..1.735 ms
-8x[512x512] all T        serial 1T           1.656 ms    20.3 GB/s   1.266 Gelem/s  p10..p90 1.591..1.740 ms
-8x[512x512] all T        whole/per-segment = 0.288
-4x[1024x1024] all C      whole-plan 4T       0.272 ms   246.6 GB/s  15.411 Gelem/s  p10..p90 0.260..0.293 ms
-4x[1024x1024] all C      per-segment 4T      0.306 ms   219.2 GB/s  13.701 Gelem/s  p10..p90 0.282..0.354 ms
-4x[1024x1024] all C      serial 1T           0.528 ms   127.1 GB/s   7.943 Gelem/s  p10..p90 0.521..0.541 ms
-4x[1024x1024] all C      whole/per-segment = 0.889
-## round 4 base-again  load: 5.55 6.11 6.26
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       5.100 ms    13.2 GB/s   0.822 Gelem/s  p10..p90 3.245..6.573 ms
-4x[1024x1024] all T      per-segment 4T      1.445 ms    46.5 GB/s   2.903 Gelem/s  p10..p90 1.235..1.593 ms
-4x[1024x1024] all T      serial 1T           4.089 ms    16.4 GB/s   1.026 Gelem/s  p10..p90 3.962..4.251 ms
-4x[1024x1024] all T      whole/per-segment = 3.531
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.575 ms    18.8 GB/s   1.173 Gelem/s  p10..p90 1.553..4.813 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.982 ms    68.3 GB/s   4.269 Gelem/s  p10..p90 0.849..1.132 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.258 ms    29.7 GB/s   1.858 Gelem/s  p10..p90 2.147..2.346 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.639
-4x[256x256] all T        whole-plan 4T       0.140 ms    30.0 GB/s   1.877 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        per-segment 4T      0.140 ms    30.0 GB/s   1.876 Gelem/s  p10..p90 0.138..0.143 ms
-4x[256x256] all T        serial 1T           0.139 ms    30.1 GB/s   1.880 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.900 ms    37.3 GB/s   2.331 Gelem/s  p10..p90 0.805..0.988 ms
-8x[512x512] all T        per-segment 4T      1.556 ms    21.6 GB/s   1.348 Gelem/s  p10..p90 1.516..1.649 ms
-8x[512x512] all T        serial 1T           1.572 ms    21.3 GB/s   1.334 Gelem/s  p10..p90 1.521..1.703 ms
-8x[512x512] all T        whole/per-segment = 0.578
-4x[1024x1024] all C      whole-plan 4T       0.263 ms   255.3 GB/s  15.956 Gelem/s  p10..p90 0.231..0.304 ms
-4x[1024x1024] all C      per-segment 4T      0.319 ms   210.1 GB/s  13.133 Gelem/s  p10..p90 0.282..0.380 ms
-4x[1024x1024] all C      serial 1T           0.532 ms   126.0 GB/s   7.878 Gelem/s  p10..p90 0.522..0.544 ms
-4x[1024x1024] all C      whole/per-segment = 0.823
-## round 5 head  load: 5.51 6.09 6.25
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       1.217 ms    55.1 GB/s   3.447 Gelem/s  p10..p90 1.180..1.275 ms
-4x[1024x1024] all T      per-segment 4T      1.281 ms    52.4 GB/s   3.275 Gelem/s  p10..p90 1.239..1.460 ms
-4x[1024x1024] all T      serial 1T           4.063 ms    16.5 GB/s   1.032 Gelem/s  p10..p90 3.976..4.194 ms
+4x[1024x1024] all T      whole-plan 4T       1.206 ms    55.6 GB/s   3.477 Gelem/s  p10..p90 1.168..1.269 ms
+4x[1024x1024] all T      per-segment 4T      1.270 ms    52.8 GB/s   3.303 Gelem/s  p10..p90 1.228..1.335 ms
+4x[1024x1024] all T      serial 1T           4.029 ms    16.7 GB/s   1.041 Gelem/s  p10..p90 3.892..4.159 ms
 4x[1024x1024] all T      whole/per-segment = 0.950
-4x[1024x1024] T,C,T,C    whole-plan 4T       0.743 ms    90.4 GB/s   5.648 Gelem/s  p10..p90 0.718..0.785 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.795 ms    84.4 GB/s   5.277 Gelem/s  p10..p90 0.766..0.853 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.239 ms    30.0 GB/s   1.873 Gelem/s  p10..p90 2.191..2.303 ms
+4x[1024x1024] T,C,T,C    whole-plan 4T       0.752 ms    89.3 GB/s   5.579 Gelem/s  p10..p90 0.711..0.822 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.818 ms    82.0 GB/s   5.126 Gelem/s  p10..p90 0.766..0.960 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.288 ms    29.3 GB/s   1.833 Gelem/s  p10..p90 2.185..2.394 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 0.919
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.6 GB/s   1.915 Gelem/s  p10..p90 0.129..0.141 ms
+4x[256x256] all T        per-segment 4T      0.137 ms    30.6 GB/s   1.911 Gelem/s  p10..p90 0.130..0.142 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.6 GB/s   1.911 Gelem/s  p10..p90 0.130..0.142 ms
+4x[256x256] all T        whole/per-segment = 0.998
+8x[512x512] all T        whole-plan 4T       0.472 ms    71.1 GB/s   4.446 Gelem/s  p10..p90 0.446..0.538 ms
+8x[512x512] all T        per-segment 4T      1.627 ms    20.6 GB/s   1.289 Gelem/s  p10..p90 1.528..1.748 ms
+8x[512x512] all T        serial 1T           1.627 ms    20.6 GB/s   1.289 Gelem/s  p10..p90 1.540..1.750 ms
+8x[512x512] all T        whole/per-segment = 0.290
+4x[1024x1024] all C      whole-plan 4T       0.270 ms   248.9 GB/s  15.556 Gelem/s  p10..p90 0.254..0.292 ms
+4x[1024x1024] all C      per-segment 4T      0.293 ms   228.7 GB/s  14.297 Gelem/s  p10..p90 0.275..0.343 ms
+4x[1024x1024] all C      serial 1T           0.535 ms   125.5 GB/s   7.841 Gelem/s  p10..p90 0.516..0.555 ms
+4x[1024x1024] all C      whole/per-segment = 0.919
+## round 1 base-again  load: 6.42 5.81 5.21
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       3.718 ms    18.1 GB/s   1.128 Gelem/s  p10..p90 2.826..5.008 ms
+4x[1024x1024] all T      per-segment 4T      1.500 ms    44.7 GB/s   2.796 Gelem/s  p10..p90 1.424..1.603 ms
+4x[1024x1024] all T      serial 1T           3.977 ms    16.9 GB/s   1.055 Gelem/s  p10..p90 3.813..4.216 ms
+4x[1024x1024] all T      whole/per-segment = 2.479
+4x[1024x1024] T,C,T,C    whole-plan 4T       2.966 ms    22.6 GB/s   1.414 Gelem/s  p10..p90 1.991..3.619 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.968 ms    69.3 GB/s   4.334 Gelem/s  p10..p90 0.858..1.161 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.109 ms    31.8 GB/s   1.988 Gelem/s  p10..p90 2.006..2.234 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.064
+4x[256x256] all T        whole-plan 4T       0.136 ms    30.8 GB/s   1.923 Gelem/s  p10..p90 0.129..0.140 ms
+4x[256x256] all T        per-segment 4T      0.137 ms    30.7 GB/s   1.916 Gelem/s  p10..p90 0.129..0.141 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.7 GB/s   1.917 Gelem/s  p10..p90 0.129..0.142 ms
+4x[256x256] all T        whole/per-segment = 0.996
+8x[512x512] all T        whole-plan 4T       0.938 ms    35.8 GB/s   2.237 Gelem/s  p10..p90 0.832..1.180 ms
+8x[512x512] all T        per-segment 4T      1.602 ms    20.9 GB/s   1.309 Gelem/s  p10..p90 1.464..1.798 ms
+8x[512x512] all T        serial 1T           1.620 ms    20.7 GB/s   1.294 Gelem/s  p10..p90 1.471..1.837 ms
+8x[512x512] all T        whole/per-segment = 0.585
+4x[1024x1024] all C      whole-plan 4T       0.256 ms   262.6 GB/s  16.411 Gelem/s  p10..p90 0.224..0.295 ms
+4x[1024x1024] all C      per-segment 4T      0.321 ms   209.0 GB/s  13.063 Gelem/s  p10..p90 0.272..0.373 ms
+4x[1024x1024] all C      serial 1T           0.531 ms   126.4 GB/s   7.897 Gelem/s  p10..p90 0.517..0.545 ms
+4x[1024x1024] all C      whole/per-segment = 0.796
+## round 2 head  load: 6.42 5.81 5.21
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       1.214 ms    55.3 GB/s   3.454 Gelem/s  p10..p90 1.174..1.272 ms
+4x[1024x1024] all T      per-segment 4T      1.274 ms    52.7 GB/s   3.292 Gelem/s  p10..p90 1.229..1.382 ms
+4x[1024x1024] all T      serial 1T           4.035 ms    16.6 GB/s   1.039 Gelem/s  p10..p90 3.905..4.187 ms
+4x[1024x1024] all T      whole/per-segment = 0.953
+4x[1024x1024] T,C,T,C    whole-plan 4T       0.751 ms    89.4 GB/s   5.587 Gelem/s  p10..p90 0.704..0.807 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.810 ms    82.8 GB/s   5.175 Gelem/s  p10..p90 0.757..0.896 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.275 ms    29.5 GB/s   1.844 Gelem/s  p10..p90 2.164..2.376 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 0.926
+4x[256x256] all T        whole-plan 4T       0.138 ms    30.4 GB/s   1.902 Gelem/s  p10..p90 0.131..0.144 ms
+4x[256x256] all T        per-segment 4T      0.138 ms    30.4 GB/s   1.900 Gelem/s  p10..p90 0.133..0.142 ms
+4x[256x256] all T        serial 1T           0.138 ms    30.4 GB/s   1.903 Gelem/s  p10..p90 0.131..0.143 ms
+4x[256x256] all T        whole/per-segment = 0.998
+8x[512x512] all T        whole-plan 4T       0.458 ms    73.3 GB/s   4.583 Gelem/s  p10..p90 0.440..0.493 ms
+8x[512x512] all T        per-segment 4T      1.599 ms    21.0 GB/s   1.312 Gelem/s  p10..p90 1.534..1.689 ms
+8x[512x512] all T        serial 1T           1.604 ms    20.9 GB/s   1.307 Gelem/s  p10..p90 1.525..1.689 ms
+8x[512x512] all T        whole/per-segment = 0.286
+4x[1024x1024] all C      whole-plan 4T       0.264 ms   254.1 GB/s  15.883 Gelem/s  p10..p90 0.249..0.291 ms
+4x[1024x1024] all C      per-segment 4T      0.293 ms   229.3 GB/s  14.329 Gelem/s  p10..p90 0.276..0.347 ms
+4x[1024x1024] all C      serial 1T           0.542 ms   123.9 GB/s   7.745 Gelem/s  p10..p90 0.522..0.555 ms
+4x[1024x1024] all C      whole/per-segment = 0.902
+## round 2 base-again  load: 6.14 5.76 5.20
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       4.391 ms    15.3 GB/s   0.955 Gelem/s  p10..p90 3.038..5.882 ms
+4x[1024x1024] all T      per-segment 4T      1.483 ms    45.3 GB/s   2.829 Gelem/s  p10..p90 1.349..1.591 ms
+4x[1024x1024] all T      serial 1T           4.132 ms    16.2 GB/s   1.015 Gelem/s  p10..p90 3.867..4.249 ms
+4x[1024x1024] all T      whole/per-segment = 2.961
+4x[1024x1024] T,C,T,C    whole-plan 4T       2.917 ms    23.0 GB/s   1.438 Gelem/s  p10..p90 1.457..4.102 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.984 ms    68.2 GB/s   4.261 Gelem/s  p10..p90 0.815..1.167 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.252 ms    29.8 GB/s   1.863 Gelem/s  p10..p90 2.176..2.335 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 2.964
+4x[256x256] all T        whole-plan 4T       0.146 ms    28.8 GB/s   1.798 Gelem/s  p10..p90 0.139..0.155 ms
+4x[256x256] all T        per-segment 4T      0.146 ms    28.7 GB/s   1.796 Gelem/s  p10..p90 0.140..0.156 ms
+4x[256x256] all T        serial 1T           0.145 ms    28.9 GB/s   1.804 Gelem/s  p10..p90 0.139..0.154 ms
+4x[256x256] all T        whole/per-segment = 0.999
+8x[512x512] all T        whole-plan 4T       0.929 ms    36.1 GB/s   2.257 Gelem/s  p10..p90 0.838..1.007 ms
+8x[512x512] all T        per-segment 4T      1.610 ms    20.8 GB/s   1.303 Gelem/s  p10..p90 1.573..1.677 ms
+8x[512x512] all T        serial 1T           1.623 ms    20.7 GB/s   1.292 Gelem/s  p10..p90 1.579..1.717 ms
+8x[512x512] all T        whole/per-segment = 0.577
+4x[1024x1024] all C      whole-plan 4T       0.260 ms   257.7 GB/s  16.106 Gelem/s  p10..p90 0.227..0.304 ms
+4x[1024x1024] all C      per-segment 4T      0.321 ms   209.4 GB/s  13.085 Gelem/s  p10..p90 0.281..0.396 ms
+4x[1024x1024] all C      serial 1T           0.550 ms   122.1 GB/s   7.629 Gelem/s  p10..p90 0.533..0.573 ms
+4x[1024x1024] all C      whole/per-segment = 0.812
+## round 2 base  load: 6.45 5.83 5.22
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       4.463 ms    15.0 GB/s   0.940 Gelem/s  p10..p90 3.017..5.949 ms
+4x[1024x1024] all T      per-segment 4T      1.270 ms    52.8 GB/s   3.302 Gelem/s  p10..p90 1.190..1.496 ms
+4x[1024x1024] all T      serial 1T           4.039 ms    16.6 GB/s   1.038 Gelem/s  p10..p90 3.835..4.228 ms
+4x[1024x1024] all T      whole/per-segment = 3.514
+4x[1024x1024] T,C,T,C    whole-plan 4T       2.978 ms    22.5 GB/s   1.409 Gelem/s  p10..p90 1.408..3.591 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.963 ms    69.7 GB/s   4.357 Gelem/s  p10..p90 0.792..1.145 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.067 ms    32.5 GB/s   2.029 Gelem/s  p10..p90 1.979..2.192 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.093
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.5 GB/s   1.909 Gelem/s  p10..p90 0.129..0.141 ms
+4x[256x256] all T        per-segment 4T      0.138 ms    30.5 GB/s   1.905 Gelem/s  p10..p90 0.129..0.142 ms
+4x[256x256] all T        serial 1T           0.138 ms    30.4 GB/s   1.902 Gelem/s  p10..p90 0.130..0.143 ms
+4x[256x256] all T        whole/per-segment = 0.998
+8x[512x512] all T        whole-plan 4T       0.909 ms    36.9 GB/s   2.307 Gelem/s  p10..p90 0.794..1.015 ms
+8x[512x512] all T        per-segment 4T      1.511 ms    22.2 GB/s   1.388 Gelem/s  p10..p90 1.433..1.667 ms
+8x[512x512] all T        serial 1T           1.528 ms    22.0 GB/s   1.372 Gelem/s  p10..p90 1.437..1.692 ms
+8x[512x512] all T        whole/per-segment = 0.602
+4x[1024x1024] all C      whole-plan 4T       0.264 ms   253.8 GB/s  15.865 Gelem/s  p10..p90 0.227..0.310 ms
+4x[1024x1024] all C      per-segment 4T      0.324 ms   207.2 GB/s  12.947 Gelem/s  p10..p90 0.286..0.383 ms
+4x[1024x1024] all C      serial 1T           0.533 ms   126.0 GB/s   7.874 Gelem/s  p10..p90 0.522..0.547 ms
+4x[1024x1024] all C      whole/per-segment = 0.816
+## round 3 base-again  load: 6.26 5.80 5.22
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       3.450 ms    19.5 GB/s   1.216 Gelem/s  p10..p90 2.831..4.898 ms
+4x[1024x1024] all T      per-segment 4T      1.493 ms    44.9 GB/s   2.809 Gelem/s  p10..p90 1.413..1.629 ms
+4x[1024x1024] all T      serial 1T           4.018 ms    16.7 GB/s   1.044 Gelem/s  p10..p90 3.879..4.190 ms
+4x[1024x1024] all T      whole/per-segment = 2.310
+4x[1024x1024] T,C,T,C    whole-plan 4T       3.017 ms    22.2 GB/s   1.390 Gelem/s  p10..p90 1.386..3.890 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.981 ms    68.4 GB/s   4.276 Gelem/s  p10..p90 0.821..1.160 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.149 ms    31.2 GB/s   1.952 Gelem/s  p10..p90 2.045..2.282 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.076
+4x[256x256] all T        whole-plan 4T       0.140 ms    29.9 GB/s   1.870 Gelem/s  p10..p90 0.138..0.143 ms
+4x[256x256] all T        per-segment 4T      0.141 ms    29.8 GB/s   1.865 Gelem/s  p10..p90 0.139..0.144 ms
+4x[256x256] all T        serial 1T           0.140 ms    29.9 GB/s   1.870 Gelem/s  p10..p90 0.139..0.143 ms
+4x[256x256] all T        whole/per-segment = 0.997
+8x[512x512] all T        whole-plan 4T       0.895 ms    37.5 GB/s   2.342 Gelem/s  p10..p90 0.796..0.988 ms
+8x[512x512] all T        per-segment 4T      1.516 ms    22.1 GB/s   1.383 Gelem/s  p10..p90 1.434..1.629 ms
+8x[512x512] all T        serial 1T           1.531 ms    21.9 GB/s   1.370 Gelem/s  p10..p90 1.446..1.627 ms
+8x[512x512] all T        whole/per-segment = 0.590
+4x[1024x1024] all C      whole-plan 4T       0.251 ms   267.4 GB/s  16.713 Gelem/s  p10..p90 0.226..0.285 ms
+4x[1024x1024] all C      per-segment 4T      0.315 ms   213.2 GB/s  13.326 Gelem/s  p10..p90 0.275..0.366 ms
+4x[1024x1024] all C      serial 1T           0.522 ms   128.6 GB/s   8.038 Gelem/s  p10..p90 0.502..0.540 ms
+4x[1024x1024] all C      whole/per-segment = 0.797
+## round 3 base  load: 6.31 5.82 5.23
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       4.788 ms    14.0 GB/s   0.876 Gelem/s  p10..p90 2.879..5.921 ms
+4x[1024x1024] all T      per-segment 4T      1.331 ms    50.4 GB/s   3.151 Gelem/s  p10..p90 1.200..1.573 ms
+4x[1024x1024] all T      serial 1T           3.945 ms    17.0 GB/s   1.063 Gelem/s  p10..p90 3.824..4.108 ms
+4x[1024x1024] all T      whole/per-segment = 3.596
+4x[1024x1024] T,C,T,C    whole-plan 4T       3.127 ms    21.5 GB/s   1.341 Gelem/s  p10..p90 1.469..3.672 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.985 ms    68.1 GB/s   4.258 Gelem/s  p10..p90 0.821..1.153 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.152 ms    31.2 GB/s   1.949 Gelem/s  p10..p90 2.040..2.295 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.174
+4x[256x256] all T        whole-plan 4T       0.139 ms    30.1 GB/s   1.880 Gelem/s  p10..p90 0.138..0.144 ms
+4x[256x256] all T        per-segment 4T      0.139 ms    30.1 GB/s   1.881 Gelem/s  p10..p90 0.138..0.142 ms
+4x[256x256] all T        serial 1T           0.139 ms    30.1 GB/s   1.881 Gelem/s  p10..p90 0.138..0.142 ms
+4x[256x256] all T        whole/per-segment = 1.000
+8x[512x512] all T        whole-plan 4T       0.917 ms    36.6 GB/s   2.286 Gelem/s  p10..p90 0.820..1.017 ms
+8x[512x512] all T        per-segment 4T      1.476 ms    22.7 GB/s   1.420 Gelem/s  p10..p90 1.426..1.544 ms
+8x[512x512] all T        serial 1T           1.497 ms    22.4 GB/s   1.401 Gelem/s  p10..p90 1.430..1.561 ms
+8x[512x512] all T        whole/per-segment = 0.621
+4x[1024x1024] all C      whole-plan 4T       0.249 ms   269.8 GB/s  16.862 Gelem/s  p10..p90 0.223..0.285 ms
+4x[1024x1024] all C      per-segment 4T      0.311 ms   215.8 GB/s  13.485 Gelem/s  p10..p90 0.271..0.363 ms
+4x[1024x1024] all C      serial 1T           0.525 ms   127.9 GB/s   7.994 Gelem/s  p10..p90 0.507..0.542 ms
+4x[1024x1024] all C      whole/per-segment = 0.800
+## round 3 head  load: 5.89 5.74 5.20
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       1.207 ms    55.6 GB/s   3.476 Gelem/s  p10..p90 1.174..1.271 ms
+4x[1024x1024] all T      per-segment 4T      1.269 ms    52.9 GB/s   3.305 Gelem/s  p10..p90 1.230..1.392 ms
+4x[1024x1024] all T      serial 1T           4.046 ms    16.6 GB/s   1.037 Gelem/s  p10..p90 3.897..4.204 ms
+4x[1024x1024] all T      whole/per-segment = 0.951
+4x[1024x1024] T,C,T,C    whole-plan 4T       0.726 ms    92.4 GB/s   5.776 Gelem/s  p10..p90 0.703..0.764 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.778 ms    86.3 GB/s   5.392 Gelem/s  p10..p90 0.756..0.820 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.220 ms    30.2 GB/s   1.889 Gelem/s  p10..p90 2.148..2.305 ms
 4x[1024x1024] T,C,T,C    whole/per-segment = 0.934
-4x[256x256] all T        whole-plan 4T       0.139 ms    30.1 GB/s   1.880 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        per-segment 4T      0.140 ms    30.1 GB/s   1.879 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        serial 1T           0.140 ms    30.1 GB/s   1.879 Gelem/s  p10..p90 0.138..0.142 ms
-4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.466 ms    72.0 GB/s   4.501 Gelem/s  p10..p90 0.444..0.505 ms
-8x[512x512] all T        per-segment 4T      1.646 ms    20.4 GB/s   1.274 Gelem/s  p10..p90 1.587..1.727 ms
-8x[512x512] all T        serial 1T           1.651 ms    20.3 GB/s   1.270 Gelem/s  p10..p90 1.583..1.750 ms
-8x[512x512] all T        whole/per-segment = 0.283
-4x[1024x1024] all C      whole-plan 4T       0.275 ms   243.9 GB/s  15.243 Gelem/s  p10..p90 0.259..0.300 ms
-4x[1024x1024] all C      per-segment 4T      0.316 ms   212.1 GB/s  13.254 Gelem/s  p10..p90 0.288..0.383 ms
-4x[1024x1024] all C      serial 1T           0.536 ms   125.2 GB/s   7.827 Gelem/s  p10..p90 0.526..0.552 ms
-4x[1024x1024] all C      whole/per-segment = 0.870
-## round 5 base-again  load: 5.51 6.09 6.25
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.6 GB/s   1.909 Gelem/s  p10..p90 0.129..0.144 ms
+4x[256x256] all T        per-segment 4T      0.137 ms    30.6 GB/s   1.914 Gelem/s  p10..p90 0.129..0.141 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.6 GB/s   1.912 Gelem/s  p10..p90 0.129..0.142 ms
+4x[256x256] all T        whole/per-segment = 1.002
+8x[512x512] all T        whole-plan 4T       0.455 ms    73.7 GB/s   4.608 Gelem/s  p10..p90 0.441..0.487 ms
+8x[512x512] all T        per-segment 4T      1.586 ms    21.2 GB/s   1.322 Gelem/s  p10..p90 1.514..1.685 ms
+8x[512x512] all T        serial 1T           1.605 ms    20.9 GB/s   1.307 Gelem/s  p10..p90 1.531..1.702 ms
+8x[512x512] all T        whole/per-segment = 0.287
+4x[1024x1024] all C      whole-plan 4T       0.263 ms   255.0 GB/s  15.938 Gelem/s  p10..p90 0.247..0.278 ms
+4x[1024x1024] all C      per-segment 4T      0.285 ms   235.3 GB/s  14.704 Gelem/s  p10..p90 0.273..0.325 ms
+4x[1024x1024] all C      serial 1T           0.542 ms   123.8 GB/s   7.737 Gelem/s  p10..p90 0.524..0.559 ms
+4x[1024x1024] all C      whole/per-segment = 0.923
+## round 4 base  load: 5.89 5.74 5.20
 threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       4.138 ms    16.2 GB/s   1.014 Gelem/s  p10..p90 2.881..5.532 ms
-4x[1024x1024] all T      per-segment 4T      1.515 ms    44.3 GB/s   2.768 Gelem/s  p10..p90 1.290..1.634 ms
-4x[1024x1024] all T      serial 1T           4.097 ms    16.4 GB/s   1.024 Gelem/s  p10..p90 3.988..4.219 ms
-4x[1024x1024] all T      whole/per-segment = 2.731
-4x[1024x1024] T,C,T,C    whole-plan 4T       3.093 ms    21.7 GB/s   1.356 Gelem/s  p10..p90 1.610..3.719 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.985 ms    68.2 GB/s   4.260 Gelem/s  p10..p90 0.875..1.166 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.219 ms    30.2 GB/s   1.890 Gelem/s  p10..p90 2.129..2.306 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.142
-4x[256x256] all T        whole-plan 4T       0.138 ms    30.3 GB/s   1.893 Gelem/s  p10..p90 0.136..0.145 ms
-4x[256x256] all T        per-segment 4T      0.139 ms    30.3 GB/s   1.892 Gelem/s  p10..p90 0.137..0.145 ms
-4x[256x256] all T        serial 1T           0.139 ms    30.3 GB/s   1.892 Gelem/s  p10..p90 0.137..0.146 ms
-4x[256x256] all T        whole/per-segment = 0.999
-8x[512x512] all T        whole-plan 4T       0.943 ms    35.6 GB/s   2.224 Gelem/s  p10..p90 0.837..1.112 ms
-8x[512x512] all T        per-segment 4T      1.571 ms    21.4 GB/s   1.335 Gelem/s  p10..p90 1.515..1.683 ms
-8x[512x512] all T        serial 1T           1.591 ms    21.1 GB/s   1.318 Gelem/s  p10..p90 1.520..1.719 ms
-8x[512x512] all T        whole/per-segment = 0.600
-4x[1024x1024] all C      whole-plan 4T       0.265 ms   252.9 GB/s  15.805 Gelem/s  p10..p90 0.233..0.308 ms
-4x[1024x1024] all C      per-segment 4T      0.324 ms   207.4 GB/s  12.960 Gelem/s  p10..p90 0.281..0.381 ms
-4x[1024x1024] all C      serial 1T           0.537 ms   125.0 GB/s   7.815 Gelem/s  p10..p90 0.526..0.551 ms
-4x[1024x1024] all C      whole/per-segment = 0.820
-## round 5 base  load: 5.38 6.06 6.24
-threads 4, median of 201 reps after 3 warm-up
-4x[1024x1024] all T      whole-plan 4T       4.057 ms    16.5 GB/s   1.034 Gelem/s  p10..p90 2.879..5.239 ms
-4x[1024x1024] all T      per-segment 4T      1.509 ms    44.5 GB/s   2.779 Gelem/s  p10..p90 1.426..1.611 ms
-4x[1024x1024] all T      serial 1T           4.125 ms    16.3 GB/s   1.017 Gelem/s  p10..p90 4.004..4.261 ms
-4x[1024x1024] all T      whole/per-segment = 2.688
-4x[1024x1024] T,C,T,C    whole-plan 4T       2.958 ms    22.7 GB/s   1.418 Gelem/s  p10..p90 1.420..3.468 ms
-4x[1024x1024] T,C,T,C    per-segment 4T      0.974 ms    68.9 GB/s   4.306 Gelem/s  p10..p90 0.817..1.158 ms
-4x[1024x1024] T,C,T,C    serial 1T           2.209 ms    30.4 GB/s   1.899 Gelem/s  p10..p90 2.130..2.313 ms
-4x[1024x1024] T,C,T,C    whole/per-segment = 3.036
-4x[256x256] all T        whole-plan 4T       0.138 ms    30.4 GB/s   1.898 Gelem/s  p10..p90 0.136..0.144 ms
-4x[256x256] all T        per-segment 4T      0.138 ms    30.4 GB/s   1.901 Gelem/s  p10..p90 0.136..0.143 ms
-4x[256x256] all T        serial 1T           0.138 ms    30.5 GB/s   1.905 Gelem/s  p10..p90 0.136..0.144 ms
+4x[1024x1024] all T      whole-plan 4T       4.167 ms    16.1 GB/s   1.006 Gelem/s  p10..p90 2.894..5.750 ms
+4x[1024x1024] all T      per-segment 4T      1.474 ms    45.5 GB/s   2.846 Gelem/s  p10..p90 1.237..1.570 ms
+4x[1024x1024] all T      serial 1T           3.986 ms    16.8 GB/s   1.052 Gelem/s  p10..p90 3.836..4.207 ms
+4x[1024x1024] all T      whole/per-segment = 2.828
+4x[1024x1024] T,C,T,C    whole-plan 4T       3.217 ms    20.9 GB/s   1.304 Gelem/s  p10..p90 1.464..4.357 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.993 ms    67.6 GB/s   4.224 Gelem/s  p10..p90 0.819..1.167 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.228 ms    30.1 GB/s   1.882 Gelem/s  p10..p90 2.054..2.347 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.239
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.6 GB/s   1.913 Gelem/s  p10..p90 0.129..0.142 ms
+4x[256x256] all T        per-segment 4T      0.137 ms    30.7 GB/s   1.916 Gelem/s  p10..p90 0.130..0.141 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.7 GB/s   1.916 Gelem/s  p10..p90 0.129..0.141 ms
 4x[256x256] all T        whole/per-segment = 1.001
-8x[512x512] all T        whole-plan 4T       0.896 ms    37.5 GB/s   2.342 Gelem/s  p10..p90 0.811..0.978 ms
-8x[512x512] all T        per-segment 4T      1.563 ms    21.5 GB/s   1.341 Gelem/s  p10..p90 1.512..1.666 ms
-8x[512x512] all T        serial 1T           1.577 ms    21.3 GB/s   1.330 Gelem/s  p10..p90 1.510..1.708 ms
-8x[512x512] all T        whole/per-segment = 0.573
-4x[1024x1024] all C      whole-plan 4T       0.266 ms   252.6 GB/s  15.785 Gelem/s  p10..p90 0.232..0.340 ms
-4x[1024x1024] all C      per-segment 4T      0.332 ms   202.3 GB/s  12.643 Gelem/s  p10..p90 0.283..0.435 ms
-4x[1024x1024] all C      serial 1T           0.535 ms   125.4 GB/s   7.835 Gelem/s  p10..p90 0.522..0.550 ms
-4x[1024x1024] all C      whole/per-segment = 0.801
+8x[512x512] all T        whole-plan 4T       0.899 ms    37.3 GB/s   2.331 Gelem/s  p10..p90 0.795..0.976 ms
+8x[512x512] all T        per-segment 4T      1.478 ms    22.7 GB/s   1.419 Gelem/s  p10..p90 1.423..1.586 ms
+8x[512x512] all T        serial 1T           1.504 ms    22.3 GB/s   1.394 Gelem/s  p10..p90 1.433..1.607 ms
+8x[512x512] all T        whole/per-segment = 0.609
+4x[1024x1024] all C      whole-plan 4T       0.265 ms   252.9 GB/s  15.808 Gelem/s  p10..p90 0.234..0.319 ms
+4x[1024x1024] all C      per-segment 4T      0.326 ms   206.1 GB/s  12.882 Gelem/s  p10..p90 0.289..0.384 ms
+4x[1024x1024] all C      serial 1T           0.535 ms   125.4 GB/s   7.839 Gelem/s  p10..p90 0.522..0.550 ms
+4x[1024x1024] all C      whole/per-segment = 0.815
+## round 4 head  load: 5.82 5.72 5.20
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       1.192 ms    56.3 GB/s   3.520 Gelem/s  p10..p90 1.160..1.247 ms
+4x[1024x1024] all T      per-segment 4T      1.249 ms    53.7 GB/s   3.359 Gelem/s  p10..p90 1.220..1.322 ms
+4x[1024x1024] all T      serial 1T           3.988 ms    16.8 GB/s   1.052 Gelem/s  p10..p90 3.868..4.141 ms
+4x[1024x1024] all T      whole/per-segment = 0.954
+4x[1024x1024] T,C,T,C    whole-plan 4T       0.732 ms    91.7 GB/s   5.729 Gelem/s  p10..p90 0.707..0.783 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.784 ms    85.6 GB/s   5.349 Gelem/s  p10..p90 0.758..0.839 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.218 ms    30.3 GB/s   1.891 Gelem/s  p10..p90 2.146..2.311 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 0.934
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.5 GB/s   1.907 Gelem/s  p10..p90 0.130..0.144 ms
+4x[256x256] all T        per-segment 4T      0.138 ms    30.5 GB/s   1.904 Gelem/s  p10..p90 0.130..0.144 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.6 GB/s   1.911 Gelem/s  p10..p90 0.130..0.145 ms
+4x[256x256] all T        whole/per-segment = 0.998
+8x[512x512] all T        whole-plan 4T       0.459 ms    73.1 GB/s   4.567 Gelem/s  p10..p90 0.442..0.493 ms
+8x[512x512] all T        per-segment 4T      1.577 ms    21.3 GB/s   1.330 Gelem/s  p10..p90 1.507..1.677 ms
+8x[512x512] all T        serial 1T           1.596 ms    21.0 GB/s   1.314 Gelem/s  p10..p90 1.510..1.682 ms
+8x[512x512] all T        whole/per-segment = 0.291
+4x[1024x1024] all C      whole-plan 4T       0.264 ms   253.8 GB/s  15.863 Gelem/s  p10..p90 0.248..0.284 ms
+4x[1024x1024] all C      per-segment 4T      0.290 ms   231.7 GB/s  14.482 Gelem/s  p10..p90 0.274..0.318 ms
+4x[1024x1024] all C      serial 1T           0.543 ms   123.7 GB/s   7.730 Gelem/s  p10..p90 0.523..0.555 ms
+4x[1024x1024] all C      whole/per-segment = 0.913
+## round 4 base-again  load: 5.51 5.66 5.18
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       5.221 ms    12.9 GB/s   0.803 Gelem/s  p10..p90 3.143..6.652 ms
+4x[1024x1024] all T      per-segment 4T      1.240 ms    54.1 GB/s   3.382 Gelem/s  p10..p90 1.175..1.476 ms
+4x[1024x1024] all T      serial 1T           3.916 ms    17.1 GB/s   1.071 Gelem/s  p10..p90 3.753..4.090 ms
+4x[1024x1024] all T      whole/per-segment = 4.210
+4x[1024x1024] T,C,T,C    whole-plan 4T       2.939 ms    22.8 GB/s   1.427 Gelem/s  p10..p90 1.341..3.369 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.971 ms    69.1 GB/s   4.320 Gelem/s  p10..p90 0.779..1.150 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.062 ms    32.5 GB/s   2.034 Gelem/s  p10..p90 1.977..2.183 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.027
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.6 GB/s   1.912 Gelem/s  p10..p90 0.129..0.146 ms
+4x[256x256] all T        per-segment 4T      0.137 ms    30.6 GB/s   1.909 Gelem/s  p10..p90 0.129..0.144 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.6 GB/s   1.915 Gelem/s  p10..p90 0.129..0.143 ms
+4x[256x256] all T        whole/per-segment = 0.998
+8x[512x512] all T        whole-plan 4T       0.906 ms    37.0 GB/s   2.314 Gelem/s  p10..p90 0.819..0.978 ms
+8x[512x512] all T        per-segment 4T      1.519 ms    22.1 GB/s   1.381 Gelem/s  p10..p90 1.440..1.587 ms
+8x[512x512] all T        serial 1T           1.524 ms    22.0 GB/s   1.376 Gelem/s  p10..p90 1.440..1.613 ms
+8x[512x512] all T        whole/per-segment = 0.597
+4x[1024x1024] all C      whole-plan 4T       0.262 ms   256.3 GB/s  16.022 Gelem/s  p10..p90 0.231..0.289 ms
+4x[1024x1024] all C      per-segment 4T      0.315 ms   213.2 GB/s  13.328 Gelem/s  p10..p90 0.283..0.367 ms
+4x[1024x1024] all C      serial 1T           0.537 ms   125.0 GB/s   7.815 Gelem/s  p10..p90 0.521..0.553 ms
+4x[1024x1024] all C      whole/per-segment = 0.832
+## round 5 head  load: 5.47 5.65 5.18
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       1.205 ms    55.7 GB/s   3.481 Gelem/s  p10..p90 1.167..1.271 ms
+4x[1024x1024] all T      per-segment 4T      1.264 ms    53.1 GB/s   3.318 Gelem/s  p10..p90 1.229..1.404 ms
+4x[1024x1024] all T      serial 1T           4.040 ms    16.6 GB/s   1.038 Gelem/s  p10..p90 3.914..4.219 ms
+4x[1024x1024] all T      whole/per-segment = 0.953
+4x[1024x1024] T,C,T,C    whole-plan 4T       0.728 ms    92.2 GB/s   5.764 Gelem/s  p10..p90 0.699..0.782 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.787 ms    85.3 GB/s   5.330 Gelem/s  p10..p90 0.755..0.859 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.216 ms    30.3 GB/s   1.893 Gelem/s  p10..p90 2.150..2.318 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 0.925
+4x[256x256] all T        whole-plan 4T       0.138 ms    30.4 GB/s   1.902 Gelem/s  p10..p90 0.130..0.144 ms
+4x[256x256] all T        per-segment 4T      0.138 ms    30.3 GB/s   1.896 Gelem/s  p10..p90 0.131..0.143 ms
+4x[256x256] all T        serial 1T           0.138 ms    30.4 GB/s   1.902 Gelem/s  p10..p90 0.131..0.143 ms
+4x[256x256] all T        whole/per-segment = 0.996
+8x[512x512] all T        whole-plan 4T       0.455 ms    73.7 GB/s   4.609 Gelem/s  p10..p90 0.436..0.484 ms
+8x[512x512] all T        per-segment 4T      1.582 ms    21.2 GB/s   1.326 Gelem/s  p10..p90 1.502..1.676 ms
+8x[512x512] all T        serial 1T           1.607 ms    20.9 GB/s   1.305 Gelem/s  p10..p90 1.517..1.692 ms
+8x[512x512] all T        whole/per-segment = 0.288
+4x[1024x1024] all C      whole-plan 4T       0.263 ms   255.0 GB/s  15.940 Gelem/s  p10..p90 0.248..0.276 ms
+4x[1024x1024] all C      per-segment 4T      0.287 ms   234.2 GB/s  14.638 Gelem/s  p10..p90 0.274..0.314 ms
+4x[1024x1024] all C      serial 1T           0.541 ms   124.0 GB/s   7.747 Gelem/s  p10..p90 0.524..0.557 ms
+4x[1024x1024] all C      whole/per-segment = 0.918
+## round 5 base-again  load: 5.47 5.65 5.18
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       5.087 ms    13.2 GB/s   0.825 Gelem/s  p10..p90 3.043..6.253 ms
+4x[1024x1024] all T      per-segment 4T      1.264 ms    53.1 GB/s   3.319 Gelem/s  p10..p90 1.199..1.525 ms
+4x[1024x1024] all T      serial 1T           3.956 ms    17.0 GB/s   1.060 Gelem/s  p10..p90 3.826..4.130 ms
+4x[1024x1024] all T      whole/per-segment = 4.025
+4x[1024x1024] T,C,T,C    whole-plan 4T       2.999 ms    22.4 GB/s   1.399 Gelem/s  p10..p90 2.641..3.632 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.995 ms    67.4 GB/s   4.215 Gelem/s  p10..p90 0.871..1.174 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.107 ms    31.9 GB/s   1.991 Gelem/s  p10..p90 2.021..2.266 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.014
+4x[256x256] all T        whole-plan 4T       0.138 ms    30.4 GB/s   1.902 Gelem/s  p10..p90 0.130..0.146 ms
+4x[256x256] all T        per-segment 4T      0.138 ms    30.5 GB/s   1.907 Gelem/s  p10..p90 0.130..0.143 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.5 GB/s   1.908 Gelem/s  p10..p90 0.130..0.144 ms
+4x[256x256] all T        whole/per-segment = 1.002
+8x[512x512] all T        whole-plan 4T       0.935 ms    35.9 GB/s   2.243 Gelem/s  p10..p90 0.821..1.059 ms
+8x[512x512] all T        per-segment 4T      1.481 ms    22.7 GB/s   1.416 Gelem/s  p10..p90 1.430..1.569 ms
+8x[512x512] all T        serial 1T           1.501 ms    22.4 GB/s   1.398 Gelem/s  p10..p90 1.437..1.592 ms
+8x[512x512] all T        whole/per-segment = 0.631
+4x[1024x1024] all C      whole-plan 4T       0.253 ms   265.3 GB/s  16.581 Gelem/s  p10..p90 0.223..0.291 ms
+4x[1024x1024] all C      per-segment 4T      0.312 ms   215.4 GB/s  13.463 Gelem/s  p10..p90 0.272..0.359 ms
+4x[1024x1024] all C      serial 1T           0.526 ms   127.6 GB/s   7.976 Gelem/s  p10..p90 0.510..0.543 ms
+4x[1024x1024] all C      whole/per-segment = 0.812
+## round 5 base  load: 5.35 5.62 5.17
+threads 4, median of 201 reps after 3 warm-up
+4x[1024x1024] all T      whole-plan 4T       3.502 ms    19.2 GB/s   1.198 Gelem/s  p10..p90 2.804..4.678 ms
+4x[1024x1024] all T      per-segment 4T      1.489 ms    45.1 GB/s   2.816 Gelem/s  p10..p90 1.400..1.636 ms
+4x[1024x1024] all T      serial 1T           3.932 ms    17.1 GB/s   1.067 Gelem/s  p10..p90 3.795..4.061 ms
+4x[1024x1024] all T      whole/per-segment = 2.352
+4x[1024x1024] T,C,T,C    whole-plan 4T       3.212 ms    20.9 GB/s   1.306 Gelem/s  p10..p90 1.408..3.944 ms
+4x[1024x1024] T,C,T,C    per-segment 4T      0.985 ms    68.1 GB/s   4.259 Gelem/s  p10..p90 0.823..1.161 ms
+4x[1024x1024] T,C,T,C    serial 1T           2.188 ms    30.7 GB/s   1.917 Gelem/s  p10..p90 2.039..2.290 ms
+4x[1024x1024] T,C,T,C    whole/per-segment = 3.261
+4x[256x256] all T        whole-plan 4T       0.137 ms    30.5 GB/s   1.907 Gelem/s  p10..p90 0.129..0.142 ms
+4x[256x256] all T        per-segment 4T      0.137 ms    30.5 GB/s   1.908 Gelem/s  p10..p90 0.130..0.142 ms
+4x[256x256] all T        serial 1T           0.137 ms    30.5 GB/s   1.908 Gelem/s  p10..p90 0.129..0.141 ms
+4x[256x256] all T        whole/per-segment = 1.000
+8x[512x512] all T        whole-plan 4T       0.883 ms    38.0 GB/s   2.374 Gelem/s  p10..p90 0.793..0.958 ms
+8x[512x512] all T        per-segment 4T      1.474 ms    22.8 GB/s   1.423 Gelem/s  p10..p90 1.426..1.540 ms
+8x[512x512] all T        serial 1T           1.498 ms    22.4 GB/s   1.400 Gelem/s  p10..p90 1.437..1.583 ms
+8x[512x512] all T        whole/per-segment = 0.599
+4x[1024x1024] all C      whole-plan 4T       0.251 ms   267.5 GB/s  16.719 Gelem/s  p10..p90 0.225..0.282 ms
+4x[1024x1024] all C      per-segment 4T      0.316 ms   212.4 GB/s  13.277 Gelem/s  p10..p90 0.269..0.365 ms
+4x[1024x1024] all C      serial 1T           0.522 ms   128.6 GB/s   8.038 Gelem/s  p10..p90 0.505..0.539 ms
+4x[1024x1024] all C      whole/per-segment = 0.794
 ```
 
 ## Appendix B: raw mutation output
 
 ```
---- head f2f8792, unmutated
+--- head f43e2a1, unmutated
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.34s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.34s
 
 --- mutant r1: tiled branch -> apply_fused_range over the element range
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146247971) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:644:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146906925) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:644:9:
 assertion `left == right` failed: execute: the whole-plan replay must walk the serial path's tiles
 left: 0
 right: 234
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.17s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.17s
 
 --- mutant r2: tiled dispatch serialized
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146253404) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:652:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146907542) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:652:9:
 execute: the whole-plan replay must dispatch the tiled segments across the budget (dispatched 0 chunks)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.18s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 
 --- mutant r3: execute serial, execute_uninit parallel
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146254425) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:653:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146908337) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:653:9:
 execute: the whole-plan replay must dispatch the tiled segments across the budget (dispatched 0 chunks)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.16s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 
 --- mutant r5: all tiles of a segment in its first range
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146255180) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:660:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146909056) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:660:9:
 execute: the tiles must be walked by at least two dispatched ranges (walked by 1)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.16s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 272 filtered out; finished in 0.18s
 
 --- mutant r6: the two ranges of each cut walked second range first
 $ cargo test -p strided-basic --lib tile_ranges_partition_the_tiled_box_walk
 test raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk ... FAILED
-thread 'raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk' (146256047) panicked at strided-basic/src/raw_ops/tests/tiled_tests.rs:1228:13:
+thread 'raw_ops::tiled_tests::tile_ranges_partition_the_tiled_box_walk' (146909579) panicked at strided-basic/src/raw_ops/tests/tiled_tests.rs:1234:13:
 67x45 transpose: cut at 1 must visit the slots in the whole-box order
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 260 filtered out; finished in 0.00s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 261 filtered out; finished in 0.01s
 
---- red first: worktree at 80415f8 (test added, fix absent)
+--- red first: worktree at 22bde1b (test added, fix absent)
 $ cargo test -p strided-basic --features parallel --lib concatenate_whole_plan_tiles_permuted_segments_like_serial_segments
 test static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments ... FAILED
-thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146258046) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:617:9:
+thread 'static_indexing_plan::parallel_tests::concatenate_whole_plan_tiles_permuted_segments_like_serial_segments' (146910514) panicked at strided-basic/src/static_indexing_plan/tests/parallel_tests.rs:617:9:
 assertion `left == right` failed: execute: the whole-plan replay must walk the serial path's tiles
 left: 0
 right: 234
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 269 filtered out; finished in 0.16s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 270 filtered out; finished in 0.17s
 ```
 
 ## Appendix C: the mutation script
@@ -568,12 +570,18 @@ try:
 finally:
     TILED.write_text(orig)
 
-# red first: the test commit 80415f8 with the fix absent.
+# red first: the commit that added the test, before the fix (found by its subject,
+# so that the script survives a rebase).
+red = subprocess.run(["git", "log", "--format=%h", "--fixed-strings",
+                      "--grep=test: whole-plan concatenate must tile permuted segments like the serial segments",
+                      "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.split()
+assert len(red) == 1, red
+red = red[0]
 with tempfile.TemporaryDirectory() as tmp:
     wt = pathlib.Path(tmp) / "wt"
-    subprocess.run(["git", "worktree", "add", "-q", str(wt), "80415f8"], cwd=repo, check=True)
+    subprocess.run(["git", "worktree", "add", "-q", str(wt), red], cwd=repo, check=True)
     try:
-        run("red first: worktree at 80415f8 (test added, fix absent)", cwd=wt)
+        run(f"red first: worktree at {red} (test added, fix absent)", cwd=wt)
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo)
 ```
