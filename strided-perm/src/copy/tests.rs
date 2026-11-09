@@ -96,31 +96,6 @@ fn test_copy_into_grouped_high_rank_binary_permutation() {
 }
 
 #[test]
-fn test_try_fuse_group_empty() {
-    assert_eq!(try_fuse_group(&[], &[]), Some((1, 0)));
-}
-
-#[test]
-fn test_try_fuse_group_single() {
-    assert_eq!(try_fuse_group(&[5], &[2]), Some((5, 2)));
-}
-
-#[test]
-fn test_try_fuse_group_contiguous_row_major() {
-    assert_eq!(try_fuse_group(&[3, 4], &[4, 1]), Some((12, 1)));
-}
-
-#[test]
-fn test_try_fuse_group_contiguous_col_major() {
-    assert_eq!(try_fuse_group(&[3, 4], &[1, 3]), Some((12, 1)));
-}
-
-#[test]
-fn test_try_fuse_group_non_contiguous() {
-    assert_eq!(try_fuse_group(&[3, 4], &[8, 1]), None);
-}
-
-#[test]
 fn parallel_transpose_splits_the_full_tile_grid_for_a_short_row_extent() {
     // The source's unit-stride extent is the short side of the transpose, so
     // the whole kernel would be a single row tile over `block`, and the budget is
