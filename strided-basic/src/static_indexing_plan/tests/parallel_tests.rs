@@ -614,6 +614,7 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
         .map(|((data, base), (d, s))| RawStridedRef::new(data, d, s, *base).unwrap())
         .collect();
 
+    assert!(plan.may_tile, "the transposed segments can tile");
     let serial = concat_runs(&plan, &inputs, &dest_dims, &dest_strides, Exec::serial());
     let pool = crate::threading::test_pool(4);
     let exec = Exec::new(&pool, 4).unwrap();
@@ -654,6 +655,10 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
     let flat_refs: Vec<&[isize]> = flat_strides.iter().map(Vec::as_slice).collect();
     let flat_plan =
         ConcatenatePlan::compile(&dims_refs, &flat_refs, &dest_dims, &dest_strides, axis).unwrap();
+    assert!(
+        !flat_plan.may_tile,
+        "contiguous segments fuse to one run, which never tiles"
+    );
     let flat_storages: Vec<(Vec<i64>, isize)> = input_dims
         .iter()
         .zip(&flat_strides)

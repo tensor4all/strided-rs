@@ -135,6 +135,10 @@ pub struct ConcatenatePlan {
     /// (segment totals prefix sums); the last entry is the destination total.
     segment_starts: crate::inline::OperandVec<usize>,
     copy_plans: crate::inline::OperandVec<CopyPlan>,
+    /// Whether any segment can tile for some element types
+    /// ([`CopyPlan::may_tile`]). Without one, the whole-plan replay is the flat
+    /// split of the concatenated index space and asks no tiling question.
+    may_tile: bool,
 }
 
 impl SlicePlan {
@@ -1428,6 +1432,7 @@ impl ConcatenatePlan {
             dest_strides: dest_strides.into(),
             dest_offset_deltas,
             segment_starts,
+            may_tile: copy_plans.iter().any(CopyPlan::may_tile),
             copy_plans,
         })
     }
@@ -1536,8 +1541,10 @@ impl ConcatenatePlan {
     /// worker range over the segment's elements owns the tiles whose share of
     /// the segment starts in it, so the tiles are split across the token whole
     /// and every tile is the one the serial replay walks ([#427]). A segment
-    /// that declines keeps the flat walk of its element range. When any
-    /// segment tiles, every segment is divided across the whole budget, as
+    /// that declines keeps the flat walk of its element range. A plan none of
+    /// whose segments can tile for any element types (`may_tile`, decided at
+    /// compile time) skips the per-call tiling question and takes the flat
+    /// split below unchanged. When any segment tiles, every segment is divided across the whole budget, as
     /// its serial replay divides it, instead of cutting the concatenated
     /// space; without tiles the concatenated space is cut as before. Each
     /// worker replays its part serially, so nothing is split twice.
@@ -1562,24 +1569,31 @@ impl ConcatenatePlan {
         if exec.is_serial() {
             return Ok(false);
         }
-        // Precompute each segment's destination base offset and cache tiles
-        // once into inline operand vectors (allocation-free within the operand
-        // bound); the per-segment descriptors are read straight from
-        // `self`/`inputs` inside the loop, so the parallel replay allocates
-        // nothing.
+        // Precompute each segment's destination base offset once into an
+        // inline operand vector (allocation-free within the operand bound);
+        // the per-segment descriptors are read straight from `self`/`inputs`
+        // inside the loop, so the parallel replay allocates nothing.
         let mut dest_offsets: crate::inline::OperandVec<isize> =
-            crate::inline::OperandVec::with_capacity(inputs.len());
-        let mut segment_tiles: crate::inline::OperandVec<Option<PairTiles>> =
             crate::inline::OperandVec::with_capacity(inputs.len());
         for position in 0..inputs.len() {
             if self.copy_plans[position].fused_layout().is_none() {
                 return Ok(false);
             }
             dest_offsets.push(self.segment_offset(position, dest.offset())?);
+        }
+        if !self.may_tile {
+            // No segment can tile, whatever the element types: the flat split
+            // of the concatenated index space, with no tiling question asked.
+            self.replay_flat_parallel(dest, inputs, &dest_offsets, apply, exec);
+            return Ok(true);
+        }
+        // The cache tiles of each segment, in an inline operand vector too.
+        let mut segment_tiles: crate::inline::OperandVec<Option<PairTiles>> =
+            crate::inline::OperandVec::with_capacity(inputs.len());
+        for plan in &self.copy_plans {
             // An inline traversal only ever tiles inline.
             segment_tiles.push(
-                self.copy_plans[position]
-                    .tiles::<D, T>()
+                plan.tiles::<D, T>()
                     .and_then(|tiles| tiles.inline().copied()),
             );
         }
@@ -1688,6 +1702,67 @@ impl ConcatenatePlan {
         #[cfg(test)]
         crate::threading::record_tile_boxes(walked_tiles.into_inner());
         Ok(true)
+    }
+
+    /// The whole-plan replay of a plan none of whose segments can tile: the
+    /// concatenated index space `0..total` split into contiguous worker
+    /// ranges, each segment window walked flat.
+    ///
+    /// The caller must have validated every input layout and segment offset,
+    /// passed the segments' destination base offsets, proved every segment
+    /// has an inline fused layout, and narrowed `exec` for `total`.
+    fn replay_flat_parallel<D, T, Apply>(
+        &self,
+        dest: &mut RawStridedMut<'_, D>,
+        inputs: &[RawStridedRef<'_, T>],
+        dest_offsets: &crate::inline::OperandVec<isize>,
+        apply: Apply,
+        exec: Exec<'_>,
+    ) where
+        D: Copy + Send + Sync,
+        T: Copy + Send + Sync,
+        Apply: Fn(&mut D, T) + Send + Sync,
+    {
+        let total = self.segment_starts[self.segment_starts.len() - 1];
+        let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
+        let starts = &self.segment_starts;
+        crate::threading::parallel_for_each(0..total, exec, &|range| {
+            // First segment whose end lies past the range start.
+            let mut position = starts[1..].partition_point(|&end| end <= range.start);
+            while position < inputs.len() && starts[position] < range.end {
+                let local_start = range.start.max(starts[position]) - starts[position];
+                let local_end = range.end.min(starts[position + 1]) - starts[position];
+                // The caller proved every segment has an inline fused layout;
+                // skip one only if a future caller relaxes that check.
+                let Some(layout) = self.copy_plans[position].fused_layout() else {
+                    position += 1;
+                    continue;
+                };
+                let input = &inputs[position];
+                // SAFETY: `check_dest_layout`/`check_input_layout` proved the
+                // views carry the compiled layouts, so each segment window
+                // (input dims, destination strides, checked segment offset) is
+                // a sub-layout of the validated destination and each input
+                // layout is in-bounds of its data. The destination layout is
+                // injective and the segments occupy disjoint ranges of the
+                // concatenation axis, so disjoint logical ranges write
+                // disjoint slots; inputs are shared borrows that cannot alias
+                // the exclusive destination borrow.
+                unsafe {
+                    crate::raw_ops::apply_fused_range(
+                        dest_ptr.as_ptr(),
+                        dest_offsets[position],
+                        input.data().as_ptr(),
+                        input.offset(),
+                        layout,
+                        local_start,
+                        local_end - local_start,
+                        &apply,
+                    );
+                }
+                position += 1;
+            }
+        });
     }
 
     pub(crate) fn check_dest_layout<T>(&self, dest: &RawStridedMut<'_, T>) -> Result<()> {

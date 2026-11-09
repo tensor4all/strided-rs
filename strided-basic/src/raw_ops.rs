@@ -134,6 +134,28 @@ impl PairTraversal {
         }
     }
 
+    /// Whether [`Self::tiles`] can return tiles for any element types: `false`
+    /// when the traversal covers at most one element or has fewer than two
+    /// axes of extent above 1, the exits [`pair_tiles`] and
+    /// [`spilled_pair_tiles`] take before they look at an element size. Such
+    /// a traversal is one run, whose order no block vector can change.
+    pub(crate) fn may_tile(&self) -> bool {
+        let (total, moving) = match self {
+            Self::Inline(layout) => (
+                fused_total(layout),
+                layout.dims[..layout.rank]
+                    .iter()
+                    .filter(|&&dim| dim != 1)
+                    .count(),
+            ),
+            Self::Spilled(axes) => (
+                spilled_total(axes),
+                axes.iter().filter(|axis| axis.dim != 1).count(),
+            ),
+        };
+        total > 1 && moving >= 2
+    }
+
     /// The inline layout, or `None` when the traversal spilled.
     #[inline]
     pub(crate) fn inline(&self) -> Option<&FusedPairLayout> {

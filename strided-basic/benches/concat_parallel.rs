@@ -17,10 +17,13 @@
 //! (whole/per-segment/serial, then per-segment/serial/whole, ...), so a
 //! drifting machine and the state a predecessor leaves in the caches and the
 //! pool are spread over all three paths instead of always falling on the same
-//! one. Plans, inputs and the destination are built once, outside the
-//! timed region. Each row prints the median of `REPS` samples (after
-//! `WARMUP` unrecorded ones), the bandwidth counting one read and one write
-//! per element, the element rate, and `whole/per-segment`.
+//! one. Plans, inputs and the destination are built once, and every path
+//! builds its token and destination views before its timer starts (the
+//! per-segment path one view per disjoint segment chunk), so the timed
+//! region holds only the replay. Each row prints the median of `REPS` samples
+//! (after `WARMUP` unrecorded ones), the bandwidth counting one read and one
+//! write per element, the element rate and the 10th to 90th percentile, then
+//! `whole/per-segment` of the medians.
 //!
 //! ```text
 //! cargo bench -p strided-basic --features parallel --bench concat_parallel
@@ -41,9 +44,11 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn median(mut samples: Vec<f64>) -> f64 {
+/// The 10th percentile, median and 90th percentile of `samples` (nearest rank).
+fn quantiles(mut samples: Vec<f64>) -> [f64; 3] {
     samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+    [at(0.1), at(0.5), at(0.9)]
 }
 
 /// One concatenation of `transposed.len()` segments of `[rows, cols]`.
@@ -105,15 +110,24 @@ fn case(
             }
             1 => {
                 let mut exec = Exec::new(pool, threads).expect("an idle pool");
+                // Segment `k` occupies the destination elements
+                // `k * rows * cols..(k + 1) * rows * cols` (column-major,
+                // axis 1), so its view is built on that disjoint chunk at
+                // offset 0, before the timer, as the other paths build theirs.
+                let mut views: Vec<RawStridedMut<'_, f64>> = dest
+                    .chunks_mut(rows * cols)
+                    .map(|chunk| {
+                        RawStridedMut::new(chunk, &dims, &dest_strides, 0).expect("segment")
+                    })
+                    .collect();
                 let start = Instant::now();
-                for (k, (copy, input)) in copies.iter().zip(&inputs).enumerate() {
-                    let offset = (k * rows * cols) as isize;
-                    let mut view = RawStridedMut::new(&mut dest, &dims, &dest_strides, offset)
-                        .expect("segment");
-                    copy.execute(&mut view, input, exec.reborrow())
+                for ((copy, input), view) in copies.iter().zip(&inputs).zip(&mut views) {
+                    copy.execute(view, input, exec.reborrow())
                         .expect("per-segment");
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                drop(views);
+                elapsed
             }
             _ => {
                 let mut view =
@@ -144,19 +158,23 @@ fn case(
     let [whole, per_segment, serial] = samples;
     let elems = (rows * cols * count) as f64;
     let bytes = 2.0 * 8.0 * elems;
-    let (whole, per_segment, serial) = (median(whole), median(per_segment), median(serial));
-    for (label, time) in [
+    let (whole, per_segment, serial) =
+        (quantiles(whole), quantiles(per_segment), quantiles(serial));
+    for (label, [p10, time, p90]) in [
         (format!("whole-plan {threads}T"), whole),
         (format!("per-segment {threads}T"), per_segment),
         ("serial 1T".to_string(), serial),
     ] {
         println!(
-            "{name:<24} {label:<16} {:>8.3} ms {:>7.1} GB/s {:>7.3} Gelem/s",
+            "{name:<24} {label:<16} {:>8.3} ms {:>7.1} GB/s {:>7.3} Gelem/s  p10..p90 {:.3}..{:.3} ms",
             time * 1e3,
             bytes / time / 1e9,
-            elems / time / 1e9
+            elems / time / 1e9,
+            p10 * 1e3,
+            p90 * 1e3
         );
     }
+    let (whole, per_segment) = (whole[1], per_segment[1]);
     println!("{name:<24} whole/per-segment = {:.3}", whole / per_segment);
 }
 

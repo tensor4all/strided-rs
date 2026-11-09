@@ -229,6 +229,13 @@ impl CopyPlan {
         self.fused.tiles::<D, S>()
     }
 
+    /// Whether [`Self::tiles`] can return tiles for any element types; known
+    /// at compile time ([`PairTraversal::may_tile`]).
+    #[inline]
+    pub(crate) fn may_tile(&self) -> bool {
+        self.fused.may_tile()
+    }
+
     /// Copy into uninitialized storage, then lend the initialized destination to `f`.
     ///
     /// [`Self::execute_uninit`] initializes every reachable logical destination

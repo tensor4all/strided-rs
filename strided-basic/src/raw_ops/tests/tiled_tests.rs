@@ -1195,3 +1195,56 @@ fn tile_ranges_partition_the_tiled_box_walk() {
     }
     assert!(tiled >= 2, "only {tiled} layouts tiled inline");
 }
+
+/// `may_tile` is the element-size-free part of the tiling decision: a
+/// traversal it rules out never tiles for any element types, and every
+/// traversal that tiles for one is admitted.
+#[test]
+fn may_tile_admits_every_traversal_that_tiles() {
+    let mut cases: Vec<(String, PairTraversal)> = layouts()
+        .into_iter()
+        .map(|(label, layout)| {
+            (
+                label.to_string(),
+                PairTraversal::given(&layout.dims, &layout.dst, &layout.src),
+            )
+        })
+        .collect();
+    for (label, dims, dst, src) in [
+        (
+            "contiguous run",
+            vec![4096usize, 512],
+            vec![1isize, 4096],
+            vec![1isize, 4096],
+        ),
+        (
+            "one moving axis",
+            vec![1, 4096, 1],
+            vec![7, 1, 9],
+            vec![3, -1, 2],
+        ),
+        ("one element", vec![1, 1], vec![5, 3], vec![2, 8]),
+        ("empty", vec![0, 64], vec![1, 0], vec![64, 1]),
+        ("transpose", vec![512, 512], vec![1, 512], vec![512, 1]),
+    ] {
+        cases.push((label.to_string(), fuse_pair_traversal(&dims, &dst, &src)));
+    }
+    let mut ruled_out = 0;
+    for (label, traversal) in &cases {
+        let tiles = [
+            traversal.tiles::<f64, f64>().is_some(),
+            traversal.tiles::<u8, f64>().is_some(),
+            traversal.tiles::<f64, u8>().is_some(),
+            traversal.tiles::<Complex64, f64>().is_some(),
+            traversal.tiles::<u8, u8>().is_some(),
+        ];
+        if !traversal.may_tile() {
+            ruled_out += 1;
+            assert_eq!(tiles, [false; 5], "{label}: ruled out but tiles");
+        }
+    }
+    assert!(ruled_out >= 3, "only {ruled_out} traversals were ruled out");
+    assert!(cases
+        .iter()
+        .any(|(_, t)| t.may_tile() && t.tiles::<f64, f64>().is_some()));
+}
