@@ -2,7 +2,10 @@
 
 Raw evidence for tensor4all/strided-rs#432. It covers the red-first and mutation runs of the regression tests, and the timings of `strided-basic/benches/concat_parallel.rs` against the PR's base. Section 1 interprets the timings; the appendices hold the unedited output.
 
-The SHAs below are those of the branch rebased onto `31099b8` (origin/main on 2026-11-10). Measurements and mutation runs were taken on the rebased tree `f43e2a1`, whose non-test code is that of the PR head: later commits on the branch change only this worklog.
+The SHAs below are those of the branch rebased onto `31099b8` (origin/main on 2026-11-10). The two kinds of evidence come from different revisions:
+
+- **Timings (Section 1, Appendix A)** were measured on `f43e2a1`. Between it and the PR head, `0309a97` changes the regression tests, and changes `strided-basic/src/static_indexing_plan.rs` and `strided-basic/src/threading.rs` only inside `#[cfg(test)]` items and comments (`git diff f43e2a1 HEAD -- strided-basic/src`). The other commits change this worklog. So the non-test source the timings ran is that of the head. The release bench binary built at the head is **not** byte-identical to the measured one (sha256 `5fb4f50e…` against `59ade9d6…`), presumably because the moved comments shift line numbers embedded in it. It was not re-timed.
+- **Mutation runs (Section 2, Appendices B, D and E)** were taken on `0309a97`, the revision that introduced the current tests. Later commits change only this worklog.
 
 Machine: **Apple M5 Max** (18 logical CPUs, macOS 26.7.2), rustc 1.96.0, `cargo bench` profile, `--features parallel`. This is a shared interactive machine; nothing was pinned or isolated. The load average at the start of every session is recorded in Appendix A, and it was 5.4–7.0 throughout. The benchmark host evo2 was not used.
 
@@ -14,7 +17,7 @@ The three binaries:
 
 - `head`: built from `f43e2a1`.
 - `base`: built from `31099b8`, which includes #428 and #436, with this branch's bench file and its `[[bench]]` entry copied in.
-- `base-again`: the same `base` binary run a second time. This is the A/A control, which measures what the machine alone moves.
+- `base-again`: the same `base` binary run a second time. This is the A/A control. It measures how far the same base binary moved between sessions in these runs; it is not a bound on host effects for the head binary.
 
 There were five rounds, and each round ran the three binaries in a rotated order.
 
@@ -63,7 +66,7 @@ What this establishes:
 - **Machine variation (A/A).** The largest **case-level ratio of medians** for the same binary run twice is 1.054 (whole-plan, `4x[1024x1024] all T`), with 0.949 the smallest. That figure is not a bound on how far one session moves.
   - Paired within rounds, the same binary moved whole-plan by 0.721..1.453 on `all T`, which is −28% to +45%, and by 0.914..1.066 on the other four cases.
   - Per-segment moved by 0.841..1.168 on `all T`, and by 0.966..1.066 on the other cases.
-- **Permuted segments.** Head whole-plan is 0.29–0.95 of per-segment (Table 1). Paired within rounds, head/base whole-plan is 0.252..0.344, 0.227..0.252 and 0.494..0.515 on the three permuted cases that leave the serial gate. Every one of those per-round ratios lies below the smallest within-round A/A ratio of any case (0.721). So the gain is outside what the machine alone produced in these runs, round by round.
+- **Permuted segments.** Head whole-plan is 0.29–0.95 of per-segment (Table 1). Paired within rounds, head/base whole-plan is 0.252..0.344, 0.227..0.252 and 0.494..0.515 on the three permuted cases that leave the serial gate. Every one of those per-round ratios lies below the smallest within-round A/A ratio of any case (0.721). So, round by round, the head/base ratios lie outside the variation the base binary showed against itself in these runs. On an unpinned, shared host this is an observed separation, not a controlled attribution: scheduling, cache placement and build layout are not isolated, and the per-segment path, unchanged in source, also shifts between the two builds.
 - **4x[256x256].** The case stays under the serial gate on every binary (head/base 0.986..1.007).
 - **Contiguous only (`all C`).**
   - Head whole-plan is 1.052 of base by the case-level ratio of medians, and 0.996..1.089 (median 1.048) paired within rounds.
