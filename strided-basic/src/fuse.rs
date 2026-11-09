@@ -211,32 +211,35 @@ pub fn sort_by_importance(importance: &[u64]) -> InlineVec<usize> {
 ///
 /// Julia: `costs = map(a -> ifelse(iszero(a), 1, a << 1), map(min, strides...))`
 pub(crate) fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<isize> {
-    if all_strides.is_empty() {
+    let Some(first) = all_strides.first() else {
         return InlineVec::new();
-    }
-
-    let n = all_strides[0].as_ref().len();
-    let mut costs: InlineVec<isize> = (0..n).map(|_| isize::MAX).collect();
-
-    for strides in all_strides {
-        let strides = strides.as_ref();
-        for i in 0..n {
-            costs[i] = costs[i].min(strides[i].checked_abs().unwrap_or(isize::MAX));
-        }
-    }
-
-    // Transform: zero -> 1, nonzero -> 2*abs. Costs only rank axes, so a
-    // stride beyond isize::MAX / 2 (reachable with zero-sized elements)
-    // saturates instead of overflowing.
-    for cost in &mut costs {
-        if *cost == 0 {
-            *cost = 1;
+    };
+    let n = first.as_ref().len();
+    // Zero -> 1, nonzero -> 2*abs. Costs only rank axes, so a stride beyond
+    // isize::MAX / 2 (reachable with zero-sized elements) saturates instead
+    // of overflowing, and `isize::MIN`'s magnitude counts as `isize::MAX`.
+    let cost = |axis: usize| {
+        let min = all_strides
+            .iter()
+            .map(|strides| strides.as_ref()[axis].checked_abs().unwrap_or(isize::MAX))
+            .min()
+            .unwrap_or(isize::MAX);
+        if min == 0 {
+            1
         } else {
-            *cost = cost.saturating_mul(2);
+            min.saturating_mul(2)
         }
+    };
+    // Filled in place at the inline rank: collecting element by element
+    // through the inline vector measured as most of this function's cost.
+    if n <= strided_view::INLINE_RANK {
+        let mut costs = [0isize; strided_view::INLINE_RANK];
+        for (axis, slot) in costs[..n].iter_mut().enumerate() {
+            *slot = cost(axis);
+        }
+        return InlineVec::from_array_len(costs, n);
     }
-
-    costs
+    (0..n).map(cost).collect()
 }
 
 #[cfg(test)]

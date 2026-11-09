@@ -75,7 +75,19 @@ provides a separately validated non-overlap contract; it remains a benchmark
 target. Raw `CopyPlan` / `UpdatePlan` replay and the plan-free `replay_*_raw`
 entries split their logical index range across the token's budget under the
 same copy-class rule, on a destination proven injective; the plan-free entries
-replay any other destination serially in column-major order.
+replay any other destination serially in column-major order. A layout whose
+shared cache-block model changes the visit order is walked tile by tile
+instead, and splits with the view path's tree splitter (gated per node, on the
+caller's token), each leaf walking its sub-box with the same tiles. Layouts
+whose regrouped runs provably occupy separate address ranges whose spans and
+offsets are whole cache lines, such as a permutation of whole contiguous runs,
+keep the flat walk, and the flat split stays balanced. The rule sees no base
+address, so it assumes the lowest address of each run's range is line-aligned.
+Then no line is shared and tiling cannot save traffic. Otherwise
+address-adjacent runs can share one boundary line, and declining forgoes at
+most one reuse per adjacent pair (`S - 1` for `S` runs). That is a small fraction only
+when each run touches many lines; for sparse or line-sized runs it can be a
+large share of the lines they touch.
 
 ### Reduction evaluation order and the deterministic route
 
