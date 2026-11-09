@@ -182,6 +182,12 @@ fn assert_clamp_bits_match<T: BitKey + Copy + strided_kernel::KernelStorageEleme
     let dims = [x.len()];
     let strides = [1isize];
     let init = |values: Vec<MaybeUninit<T>>| -> Vec<T> {
+        // SAFETY: `assume_init` needs every value initialized. Both buffers this closure receives
+        // were filled by a successful call through `dims = [x.len()]`, `strides = [1]` over
+        // `x.len()` slots, a layout that reaches every slot: `erased_clamp_into_uninit` documents
+        // that a successful call initializes every reachable element
+        // (strided-kernel/src/erased/uninit.rs:418), and `ErasedFusedPlan::execute_uninit` that
+        // every logical destination element is initialized (strided-fused/src/erased.rs:221).
         values
             .into_iter()
             .map(|value| unsafe { value.assume_init() })
@@ -734,6 +740,13 @@ fn one_shot_rejects_overlap_before_forming_input_reference() {
     let strides = [1isize];
     let mut storage = [1.0f64, 2.0];
     let ptr = NonNull::new(storage.as_mut_ptr().cast::<u8>()).unwrap();
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: `ptr` heads the live `[f64; 2]` `storage` (`f64`-aligned, 16 initialized
+    // bytes). The descriptor overlaps the destination built from `storage` below, which its
+    // contract allows (strided-view/src/raw.rs:211); `erased_map_into` rejects that overlap
+    // before converting or reading it (strided-kernel/src/erased.rs:90), so nothing is ever read
+    // through `ptr`, and forming `&mut storage` afterwards does not conflict.
     let input = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::F64,

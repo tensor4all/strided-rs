@@ -494,7 +494,12 @@ fn maximum_minimum_signed_zero_ties_return_lhs() {
 }
 
 fn init<T: Copy>(values: Vec<MaybeUninit<T>>) -> Vec<T> {
-    // SAFETY: callers only pass storage that a successful call initialized.
+    // SAFETY: `assume_init` needs every value initialized. Each caller (lines 548, 586, 618)
+    // passes a buffer that a successful `erased_compare_into_uninit`, `erased_select_into_uninit`
+    // or `erased_clamp_into_uninit` just filled through the dense column-major layout
+    // `dest_layout` builds (`[1, dims[0]]` over all `dims[0] * dims[1]` slots); those entries
+    // document that a successful call initializes every reachable element
+    // (strided-kernel/src/erased/uninit.rs:230, :320, :418).
     values
         .into_iter()
         .map(|v| unsafe { v.assume_init() })

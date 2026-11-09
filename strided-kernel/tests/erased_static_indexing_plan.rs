@@ -20,11 +20,27 @@ use strided_kernel::{
 };
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
+    // SAFETY: `slice::from_raw_parts` needs `size_of_val(data)` initialized, readable bytes at
+    // `data`'s address for the borrow. `data` is a live `&[T]` covering exactly those bytes, and
+    // `u8` needs no alignment. The bytes are all initialized only if `T` has no padding: every
+    // call in this file (lines 200, 438, 474, 554, 569, 597, 648, 697, 715, 746, 774, 968, 981)
+    // passes an `i32` or `f64` array, or a one-element array of a `KernelStorageElement` (`f32`,
+    // `f64`, `i32`, `i64`, `bool`, `Complex32`, `Complex64`), none of which has padding. This
+    // generic safe helper would expose padding bytes for a padded `T`.
     unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), core::mem::size_of_val(data)) }
 }
 
 fn assume_init_vec<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
     let mut data = core::mem::ManuallyDrop::new(data);
+    // SAFETY: `Vec::from_raw_parts` needs the pointer, length and capacity of a `Vec` allocated
+    // for the target type, with the first `len` values initialized. `MaybeUninit<T>` has the size
+    // and alignment of `T`, and `ManuallyDrop` hands over `data`'s own allocation exactly once.
+    // Initialization is the callers': (lines 82, 163, 243, 984) pass buffers that a successful
+    // `ErasedSlicePlan`, `ErasedReversePlan` or `ErasedConcatenatePlan` `execute_uninit` filled
+    // through a layout that reaches every slot (`[len]`/`[1]`, `[2; 9]` column-major over 512
+    // slots, `[4]`/`[1]`), each documented to overwrite every reachable slot
+    // (strided-kernel/src/erased.rs:291, :418, strided-basic/src/erased.rs:230), or a buffer
+    // created as `MaybeUninit::new(f64::NAN)` in every slot.
     unsafe { Vec::from_raw_parts(data.as_mut_ptr().cast::<T>(), data.len(), data.capacity()) }
 }
 
@@ -51,6 +67,9 @@ where
     let operand_ref = ErasedRawStridedRef::from_slice(&operand, &dims, &strides, 0).unwrap();
     let operand_ptr = ErasedRawStridedPtr::from_ref(&operand_ref);
     let mut dest = Vec::<MaybeUninit<T>>::with_capacity(operand.len());
+    // SAFETY: `set_len` needs `new_len <= capacity` and the first `new_len` values initialized.
+    // The capacity is `operand.len()` from `with_capacity` just above, and `MaybeUninit<T>` needs
+    // no initialization.
     unsafe {
         dest.set_len(operand.len());
     }
@@ -182,6 +201,10 @@ fn erased_pad_and_concatenate_uninit_cover_noncontiguous_and_multi_input_outputs
         Exec::serial(),
     )
     .unwrap();
+    // SAFETY: `padded` has 7 slots under `padded_dims` `[4]` with stride `[2]`, so the layout
+    // reaches exactly slots 0, 2, 4 and 6, the ones read here, and the successful
+    // `ErasedPadPlan::execute_uninit` above overwrote every reachable slot
+    // (strided-kernel/src/erased.rs:567).
     assert_eq!(
         [0usize, 2, 4, 6].map(|index| unsafe { padded[index].assume_init() }),
         [-1, 10, 20, -1]
@@ -239,6 +262,12 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
     )
     .unwrap();
     let mut storage = vec![MaybeUninit::new(7i32), MaybeUninit::new(9i32)];
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: the pointer heads the live `storage` (`i32`-aligned, both slots created
+    // initialized). The descriptor overlaps the destination built from `storage` below, which its
+    // contract allows (strided-view/src/raw.rs:211); `ErasedSlicePlan::execute_uninit` rejects
+    // that overlap before converting or reading it (strided-kernel/src/erased.rs:318).
     let input_ptr = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::I32,
@@ -261,6 +290,9 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
         error,
         StridedError::OverlappingInputOutput { input: 0 }
     ));
+    // SAFETY: both slots of `storage` were created as `MaybeUninit::new`, and the failed call
+    // wrote nothing; the uninitialized-destination path only ever stores initialized values
+    // anyway.
     assert_eq!(
         storage
             .into_iter()
@@ -308,6 +340,9 @@ fn erased_concatenate_validates_all_segment_offsets_before_writing() {
         .unwrap_err();
 
     assert!(matches!(error, StridedError::OffsetOverflow));
+    // SAFETY: both slots of `dest` were created as `MaybeUninit::new`, and the
+    // uninitialized-destination path only ever stores initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert_eq!(
         dest.map(|value| unsafe { value.assume_init() }),
         [3, 7],

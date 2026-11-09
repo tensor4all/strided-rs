@@ -144,7 +144,7 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
             // that its reachable offsets stay inside its own slice:
             // `validate_bounds` (strided-view/src/view.rs:187), or for a
             // `StridedArray` view the dense layout argued at `StridedArray::view`
-            // (strided-view/src/view.rs:1456). A contiguous layout
+            // (strided-view/src/view.rs:1461). A contiguous layout
             // reaches exactly `total_len(dims)` consecutive elements from that
             // origin, so both ranges are live for `len` elements; the caller holds
             // `&mut StridedViewMut` against a shared `&StridedView`, so they do not

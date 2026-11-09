@@ -25,6 +25,14 @@ fn assert_initialized_eq<T: PartialEq + core::fmt::Debug>(
 ) {
     assert_eq!(actual.len(), expected.len());
     for (actual, expected) in actual.iter().zip(expected) {
+        // SAFETY: `assume_init_ref` needs every value initialized. Each caller (lines 73, 305,
+        // 455, 480, 526, 836, 1021, 1080, 1276, 1404, 1433, 1472, 1565, 1602, 1647, 1690) passes
+        // a buffer that a successful `execute_uninit` filled through a rank-1, stride-1 layout
+        // whose extent is the whole buffer, so every slot is reachable. `ErasedGatherPlan`,
+        // `ErasedDynamicSlicePlan`, `ErasedDynamicUpdateSlicePlan`, `ErasedScatterPlan` and
+        // `ErasedReducePlan` document that success overwrites every reachable slot
+        // (strided-kernel/src/erased.rs:815, :1073, :1336, :1612,
+        // strided-basic/src/erased.rs:709).
         assert_eq!(unsafe { actual.assume_init_ref() }, expected);
     }
 }
@@ -220,6 +228,13 @@ fn bool_gather_invalid_operand_rejects_before_mutation() {
     )
     .unwrap();
     let bad = [2u8, 0];
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: the pointer heads the live `bad` array (`bool` is one aligned byte, `2`
+    // initialized bytes). The invalid bool byte is allowed until conversion
+    // (strided-view/src/raw.rs:207), and `try_as_ref_after_no_overlap` validates bool bytes
+    // before any typed access (strided-view/src/raw.rs:275), which is the rejection this test
+    // expects. The `*mut` cast is never written through.
     let operand = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
@@ -243,6 +258,9 @@ fn bool_gather_invalid_operand_rejects_before_mutation() {
         Exec::serial(),
     );
     assert!(result.is_err());
+    // SAFETY: every slot of `raw` (and of its clone `before`) was created as `MaybeUninit::new`,
+    // and the uninitialized-destination path only ever stores initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert_eq!(unsafe { raw[0].assume_init_ref() }, unsafe {
         before[0].assume_init_ref()
     });
@@ -326,6 +344,10 @@ fn gather_generic_window_offset_negative_stride_and_holes() {
         .unwrap();
     }
     for (offset, expected) in [(3usize, 10.0f64), (6, 11.0), (2, 12.0), (5, 13.0)] {
+        // SAFETY: `raw` is laid out as `dd` `[2, 2]` with strides `[-1, 3]` and offset 3, which
+        // reaches exactly offsets 3, 2, 6 and 5, the ones read here, and the successful
+        // `ErasedGatherPlan::execute_uninit` above overwrote every reachable slot
+        // (strided-kernel/src/erased.rs:815).
         assert_eq!(unsafe { raw[offset].assume_init_ref() }, &expected);
     }
 }
@@ -368,6 +390,9 @@ fn gather_validation_errors_preserve_sentinel() {
             Exec::serial()
         )
         .is_err());
+    // SAFETY: every slot of `raw`, which `out` views, (and of its clone `before`) was created as
+    // `MaybeUninit::new`, and the uninitialized-destination path only ever stores initialized
+    // values, so each slot is initialized whatever the failed call did.
     assert_eq!(
         unsafe { out.data_as_uninit_mut::<f32>().unwrap()[0].assume_init_ref() },
         unsafe { before[0].assume_init_ref() }
@@ -674,6 +699,13 @@ fn dynamic_update_invalid_bool_update_and_layout_preserve_sentinel() {
     .unwrap();
     let source = ErasedRawStridedRef::from_slice(&operand, &dims, &[1], 0).unwrap();
     let start = ErasedRawStridedRef::from_slice(&starts, &sd, &[1], 0).unwrap();
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: the pointer heads the live `bad_update` array (`bool` is one aligned
+    // byte, `2` initialized bytes). The invalid bool byte is allowed until conversion
+    // (strided-view/src/raw.rs:207), and `try_as_ref_after_no_overlap` validates bool bytes
+    // before any typed access (strided-view/src/raw.rs:275), which is the rejection this test
+    // expects. The `*mut` cast is never written through.
     let update = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
@@ -697,6 +729,9 @@ fn dynamic_update_invalid_bool_update_and_layout_preserve_sentinel() {
             Exec::serial()
         )
         .is_err());
+    // SAFETY: every slot of `raw` (and of its clone `before`) was created as `MaybeUninit::new`,
+    // and the uninitialized-destination path only ever stores initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert_eq!(unsafe { raw[0].assume_init_ref() }, unsafe {
         before[0].assume_init_ref()
     });
@@ -745,9 +780,14 @@ fn dynamic_update_hole_layout_preserves_unreachable_bytes() {
         (6, reachable[3]),
         (8, reachable[4]),
     ] {
+        // SAFETY: every slot of `raw` was created as `MaybeUninit::new(0xa5)`. The successful
+        // call overwrote the reachable even slots (strided-kernel/src/erased.rs:1336); the holes
+        // keep their initial value.
         assert_eq!(unsafe { raw[slot].assume_init_ref() }, &expected);
     }
     for slot in [1usize, 3, 5, 7, 9] {
+        // SAFETY: as above; `raw` and its clone `before` were initialized in every slot at
+        // creation.
         assert_eq!(unsafe { raw[slot].assume_init_ref() }, unsafe {
             before[slot].assume_init_ref()
         });
@@ -1465,8 +1505,13 @@ fn dynamic_update_uninitialized_holes_are_never_read() {
         Exec::serial(),
     )
     .unwrap();
+    // SAFETY: `storage` has 5 slots under `dims` `[3]` with stride `[2]`, so the layout reaches
+    // slots 0, 2 and 4, and the successful `ErasedDynamicUpdateSlicePlan::execute_uninit` above
+    // overwrote every reachable slot (strided-kernel/src/erased.rs:1336).
     assert_eq!(unsafe { storage[0].assume_init_ref() }, &1);
+    // SAFETY: slot 2 is reachable; see above.
     assert_eq!(unsafe { storage[2].assume_init_ref() }, &9);
+    // SAFETY: slot 4 is reachable; see above.
     assert_eq!(unsafe { storage[4].assume_init_ref() }, &3);
 }
 

@@ -55,7 +55,16 @@ fn i64_values(seed: u64) -> Vec<i64> {
 }
 
 fn init<T: Copy>(values: Vec<MaybeUninit<T>>) -> Vec<T> {
-    // SAFETY: every caller only passes storage a successful call initialized.
+    // SAFETY: `assume_init` needs every value initialized. Each caller (lines 103, 165, 233, 316,
+    // 350, 431, 483, 588) passes either a buffer that a successful entry
+    // (`erased_map_into_uninit`, `erased_zip_into_uninit`, `erased_compare_into_uninit`,
+    // `erased_select_into_uninit`, `erased_clamp_into_uninit` or
+    // `erased_broadcast_mul_into_uninit`) filled through a layout that reaches every slot (`DIMS`
+    // `[3, 4]` with `C_STRIDES` `[1, 3]` over 12 slots, `[n]`/`[1]` over `n`, or for
+    // `broadcast_mul` an injective layout of exactly `out_len` elements over `out_len` slots,
+    // injectivity being checked by the entry before writing), documented to initialize every
+    // reachable element (strided-kernel/src/erased/uninit.rs:49, :138, :230, :320, :418, :514),
+    // or the buffer created as `MaybeUninit::new(-1)` in every slot whose call failed.
     values
         .into_iter()
         .map(|v| unsafe { v.assume_init() })
@@ -183,6 +192,8 @@ fn complex_sign_keeps_unit_phase_for_tiny_magnitudes() {
         Exec::serial(),
     )
     .unwrap();
+    // SAFETY: `out` has one slot under `[1]`/`[1]`, and the successful `erased_map_into_uninit`
+    // above initialized every reachable element (strided-kernel/src/erased/uninit.rs:49).
     let got = unsafe { out[0].assume_init() };
     assert!((got.re - 0.6).abs() < 1e-6 && (got.im + 0.8).abs() < 1e-6);
 }
@@ -801,8 +812,13 @@ fn uninit_entries_reject_overlap_and_dtype_mismatch_before_writes() {
     let strides = [1isize];
     let mut output = vec![MaybeUninit::new(99.0f64); 4];
     let ptr = NonNull::new(output.as_mut_ptr().cast::<u8>()).unwrap();
-    // SAFETY: the pointer covers `output`, which outlives the descriptor, and
-    // the entry under test must reject the overlap before reading it.
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: `ptr` heads the live `output` (`f64`-aligned, every slot created
+    // initialized). The descriptor overlaps the destination built from `output`, which its
+    // contract allows (strided-view/src/raw.rs:211); every entry called below rejects that
+    // overlap before converting or reading it (strided-kernel/src/erased/uninit.rs:75, :168,
+    // :258, :348, :448, :546).
     let overlapping = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::F64,

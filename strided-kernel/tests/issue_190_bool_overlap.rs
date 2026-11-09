@@ -23,6 +23,12 @@ fn concatenate_checks_all_overlaps_before_deferred_bool_validation() {
     .unwrap();
 
     let mut invalid = vec![2u8];
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: the pointer heads the live `invalid` vector (one aligned byte). The
+    // invalid bool byte is allowed until conversion (strided-view/src/raw.rs:207), and conversion
+    // never happens: `ErasedConcatenatePlan::execute_uninit` checks every input's overlap before
+    // converting any of them (strided-basic/src/erased.rs:267), and input 1 overlaps.
     let invalid_ptr = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
@@ -36,6 +42,13 @@ fn concatenate_checks_all_overlaps_before_deferred_bool_validation() {
     .unwrap();
 
     let mut destination = vec![2u8; 2];
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: the pointer heads the live `destination` vector (one aligned, initialized
+    // byte). It overlaps the destination below, which its contract allows
+    // (strided-view/src/raw.rs:211); `ErasedConcatenatePlan::execute_uninit` checks every input's
+    // overlap before converting any of them (strided-basic/src/erased.rs:267), so it is rejected
+    // by address and never read.
     let overlapping_ptr = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
@@ -47,6 +60,11 @@ fn concatenate_checks_all_overlaps_before_deferred_bool_validation() {
         )
     }
     .unwrap();
+    // SAFETY: `ErasedRawStridedUninitMut::from_raw_parts` (strided-view/src/raw.rs:826) needs an
+    // aligned, writable allocation of `byte_len` bytes, alive and exclusively accessed while the
+    // descriptor is used: `destination` is a live vector of `len` one-byte slots. The only other
+    // handle is `overlapping_ptr`, a raw pointer that is compared by address and never
+    // dereferenced, because the call fails on that overlap before any write.
     let mut output = unsafe {
         ErasedRawStridedUninitMut::from_raw_parts(
             KernelDType::Bool,
@@ -87,6 +105,11 @@ fn bool_mutation_after_raw_pointer_handoff_is_validated_before_writes() {
 
     let mut input = [1u8];
     let input_ptr = input.as_mut_ptr();
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: `input_ptr` heads the live `[u8; 1]` `input`. The owner may mutate it
+    // through this same raw pointer before conversion (strided-view/src/raw.rs:212), which the
+    // next statement does.
     let handed_off = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
@@ -100,9 +123,16 @@ fn bool_mutation_after_raw_pointer_handoff_is_validated_before_writes() {
     .unwrap();
     // The raw contract permits sequential mutation through the original
     // pointer before execution; no access through `handed_off` occurs here.
+    // SAFETY: offset 0 of the one-byte `input`, written through `input_ptr`, the pointer
+    // `handed_off` was built from; the descriptor contract allows this sequential mutation before
+    // conversion (strided-view/src/raw.rs:212), and no reference to `input` is live.
     unsafe { *input_ptr = 2 };
 
     let mut destination = [MaybeUninit::new(7u8)];
+    // SAFETY: `ErasedRawStridedUninitMut::from_raw_parts` (strided-view/src/raw.rs:826) needs an
+    // aligned, writable allocation of `byte_len` bytes, alive and exclusively accessed while the
+    // descriptor is used: `destination` is a live array of 1 one-byte `MaybeUninit` slots, and
+    // nothing else refers to it.
     let mut output = unsafe {
         ErasedRawStridedUninitMut::from_raw_parts(
             KernelDType::Bool,
@@ -116,6 +146,8 @@ fn bool_mutation_after_raw_pointer_handoff_is_validated_before_writes() {
     .unwrap();
     let result = plan.execute_uninit(&mut output, &[handed_off], Exec::serial());
     assert!(matches!(result, Err(StridedError::InvalidBoolByte { .. })));
+    // SAFETY: `destination[0]` was created as `MaybeUninit::new(7)`, and the call failed on the
+    // invalid bool byte before any write.
     assert_eq!(unsafe { destination[0].assume_init() }, 7);
 }
 
@@ -136,6 +168,10 @@ fn bool_uninitialized_replay_does_not_read_strided_holes() {
     .unwrap();
 
     let input = [1u8, 0u8];
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: the pointer heads the live `[u8; 2]` `input` (valid bools, one aligned
+    // byte each). The `*mut` cast is never written through; the plan only reads inputs.
     let input_ptr = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::Bool,
@@ -152,6 +188,10 @@ fn bool_uninitialized_replay_does_not_read_strided_holes() {
         MaybeUninit::<u8>::uninit(),
         MaybeUninit::<u8>::uninit(),
     ];
+    // SAFETY: `ErasedRawStridedUninitMut::from_raw_parts` (strided-view/src/raw.rs:826) needs an
+    // aligned, writable allocation of `byte_len` bytes, alive and exclusively accessed while the
+    // descriptor is used: `destination` is a live array of 3 one-byte `MaybeUninit` slots, and
+    // nothing else refers to it.
     let mut output = unsafe {
         ErasedRawStridedUninitMut::from_raw_parts(
             KernelDType::Bool,
@@ -168,7 +208,11 @@ fn bool_uninitialized_replay_does_not_read_strided_holes() {
         .unwrap();
     // Only offsets 0 and 2 are reachable. The hole at offset 1 remains
     // MaybeUninit and is deliberately never read or assumed initialized.
+    // SAFETY: `destination` is laid out as `[2]` with stride `[2]`, which reaches slots 0 and 2,
+    // and the successful `ErasedConcatenatePlan::execute_uninit` above overwrote every reachable
+    // slot (strided-basic/src/erased.rs:230). Slot 1 is a hole and is not read.
     assert_eq!(unsafe { destination[0].assume_init() }, 1);
+    // SAFETY: slot 2 is reachable; see above.
     assert_eq!(unsafe { destination[2].assume_init() }, 0);
 }
 
