@@ -1229,6 +1229,7 @@ impl DynamicSlicePlan {
                 window,
                 tiles.as_ref(),
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
+                KernelClass::Copy.ns_per_element(),
                 exec,
             );
         }
@@ -1633,6 +1634,7 @@ impl DynamicUpdateSlicePlan {
                 window,
                 tiles.as_ref(),
                 |slot: &mut MaybeUninit<T>, value: T| *slot = MaybeUninit::new(value),
+                KernelClass::Copy.ns_per_element(),
                 exec,
             );
         }

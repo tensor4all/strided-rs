@@ -1313,7 +1313,17 @@ where
     // `tiles` is `PairTraversal::tiles` of `traversal`, and tiles or a
     // non-serial `exec` are left only for a destination proven injective;
     // the exclusive and shared borrows cannot overlap.
-    unsafe { crate::copy_plan::replay_fused(dest, src, &traversal, tiles.as_ref(), apply, exec) };
+    unsafe {
+        crate::copy_plan::replay_fused(
+            dest,
+            src,
+            &traversal,
+            tiles.as_ref(),
+            apply,
+            KernelClass::Copy.ns_per_element(),
+            exec,
+        )
+    };
     Ok(())
 }
 
