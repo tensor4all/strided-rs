@@ -840,10 +840,16 @@ fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
     );
 }
 
-/// #364's scheduling criterion on its transposing acceptance rows past L2: the
-/// width the plan's replay asks for at budget 96 is within one step (one
-/// participant) of the width `Exec::width_for(measured_serial, 1)` picks for the
-/// measured serial time. The rows are the `n` = 512 and 1024 rows of #364's table
+/// #364's width criterion on its transposing acceptance rows past L2, applied to
+/// the plan's *rate*: the width rule `for_len_at_rate` gives at budget 96 for the
+/// plan's estimate is within one step (one participant) of the width
+/// `Exec::width_for(measured_serial, 1)` picks for the measured serial time.
+///
+/// This is the width of the replay that is **not** tiled. These transposing
+/// layouts take the tiled replay of strided-rs#422, which does not narrow the
+/// budget: its splitter forks down to the budget (96 leaves at budget 96 for both
+/// rows, measured with `take_tiled_leaves`), so this test does not establish the
+/// criterion for the tiled placement; that is an open item of #364. The rows are the `n` = 512 and 1024 rows of #364's table
 /// (Xeon Platinum 9242, `x86_64-avx512`, serial and warm, `f64`), quoted as
 /// recorded constants because that host is not available here; the pool carries
 /// that class's dispatch costs, and the root token dispatches from outside the
@@ -851,7 +857,7 @@ fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
 /// and are #364 item 1, which this change does not implement.
 #[cfg(feature = "parallel")]
 #[test]
-fn a_transposing_plan_past_l2_asks_for_the_width_of_its_measured_time() {
+fn a_transposing_plan_rate_past_l2_gives_the_width_of_its_measured_time() {
     use core::time::Duration;
     use threadteam::{DispatchCosts, HostClass, Pool};
     let class = HostClass::X86_64Avx512;
