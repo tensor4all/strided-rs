@@ -256,3 +256,195 @@ fn test_compress_dims_empty() {
     assert!(cd.is_empty());
     assert!(cs.is_empty());
 }
+
+#[test]
+fn test_compute_importance_high_rank_levels_fit_in_u64() {
+    // tensor4all/strided-rs#450: `g * (n - order)` reached 93 bits at rank 32
+    // with 3 operands, so `1u64 << shift` panicked in debug and wrapped in
+    // release. Weights must stay exact enough to keep the level order.
+    let mut dims = vec![1usize; 32];
+    dims[0] = 2048;
+    let mut strides0 = vec![2048isize; 32];
+    strides0[0] = 1;
+    let strides = [strides0.clone(), strides0.clone(), strides0];
+    let all_strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+    let index_orders: Vec<Vec<usize>> = strides.iter().map(|s| index_order(s).into_vec()).collect();
+
+    let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+    assert!(importance[0] > 0);
+    // Singleton axes carry no ordering information.
+    assert!(importance[1..].iter().all(|&w| w == 0));
+}
+
+#[test]
+fn test_compute_importance_high_rank_keeps_level_order() {
+    // Column-major strides on 32 live axes with 3 operands: 97 bits naive, so a
+    // wrapping shift scrambles the level order instead of panicking (#450).
+    let n = 32;
+    let dims = vec![2usize; n];
+    let strides: Vec<isize> = (0..n).map(|i| 1isize << i).collect();
+    let all_strides: Vec<&[isize]> = (0..3).map(|_| strides.as_slice()).collect();
+    let index_orders: Vec<Vec<usize>> = (0..3).map(|_| index_order(&strides).into_vec()).collect();
+
+    let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+    // Importance drops with the stride order, so it must be strictly decreasing.
+    for i in 1..n {
+        assert!(
+            importance[i - 1] > importance[i],
+            "axis {} ({}) is not above axis {} ({})",
+            i - 1,
+            importance[i - 1],
+            i,
+            importance[i]
+        );
+    }
+}
+
+#[test]
+fn test_compute_importance_keeps_the_original_width_when_it_fits() {
+    // Rank 32, two operands, striding only in the input array: the original
+    // arithmetic fits (2^62), so the per-level width must stay `g` and the
+    // weight must stay exact. Narrowing here would reorder the plan (review of
+    // #450: a width of 1 bit gives 2^31).
+    let n = 32;
+    let mut dims = vec![1usize; n];
+    dims[0] = 2048;
+    let out_strides = vec![0isize; n];
+    let mut in_strides = vec![2048isize; n];
+    in_strides[0] = 2;
+    let all_strides: [&[isize]; 2] = [&out_strides, &in_strides];
+    let index_orders: Vec<Vec<usize>> = [&out_strides[..], &in_strides[..]]
+        .iter()
+        .map(|s| index_order(s).into_vec())
+        .collect();
+
+    let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+    assert_eq!(importance[0], 1u64 << 62);
+    assert!(importance[1..].iter().all(|&w| w == 0));
+}
+
+#[test]
+fn test_compute_importance_rank_64_shares_the_top_weight() {
+    // Past rank ~61 even one bit per level overflows, so the top levels share a
+    // weight: the plan still runs, and the two live axes come out equal.
+    let n = 64;
+    let mut dims = vec![1usize; n];
+    dims[0] = 1024;
+    dims[1] = 2;
+    let mut strides = vec![4096isize; n];
+    strides[0] = 4;
+    strides[1] = 1;
+    let all_strides: Vec<&[isize]> = (0..3).map(|_| strides.as_slice()).collect();
+    let index_orders: Vec<Vec<usize>> = (0..3).map(|_| index_order(&strides).into_vec()).collect();
+
+    let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+    // The widest cap that fits is 61: 4 * 2^61 from the output plus 2 * 2^61.
+    assert_eq!(importance[0], 6u64 << 61);
+    assert_eq!(importance[0], importance[1]);
+    assert!(importance[2..].iter().all(|&w| w == 0));
+}
+
+#[test]
+fn test_compute_importance_matches_exact_reference() {
+    // The original formula evaluated without overflow (u128). Wherever it fits,
+    // the 64-bit weights must be identical, so the plan order is unchanged.
+    fn reference(dims: &[usize], strides: &[&[isize]], orders: &[Vec<usize>]) -> Vec<u128> {
+        let (n, m) = (dims.len(), strides.len());
+        if n == 0 || m == 0 {
+            return Vec::new();
+        }
+        let g = 64 - (m as u64 + 1).leading_zeros();
+        let mut weights = vec![0u128; n];
+        for i in 0..n {
+            if strides[0][i] != 0 {
+                let shift = g * (n - orders[0][i]) as u32;
+                weights[i] = (1u128 << (g + 1)) * (1u128 << shift);
+            }
+        }
+        for k in 1..m {
+            for i in 0..n {
+                if strides[k][i] != 0 {
+                    weights[i] += 1u128 << (g * (n - orders[k][i]) as u32);
+                }
+            }
+        }
+        for i in 0..n {
+            if dims[i] <= 1 {
+                weights[i] = 0;
+            }
+        }
+        weights
+    }
+
+    fn permute(items: &mut [isize], pos: usize, out: &mut Vec<Vec<isize>>) {
+        if pos == items.len() {
+            out.push(items.to_vec());
+            return;
+        }
+        for i in pos..items.len() {
+            items.swap(pos, i);
+            permute(items, pos + 1, out);
+            items.swap(pos, i);
+        }
+    }
+
+    for n in 1..=4usize {
+        let mut powers: Vec<isize> = (0..n).map(|i| 1isize << i).collect();
+        let mut perms = Vec::new();
+        permute(&mut powers, 0, &mut perms);
+
+        let dim_grids = [vec![2usize; n], {
+            let mut d = vec![2usize; n];
+            d[0] = 1;
+            d
+        }];
+
+        for dims in &dim_grids {
+            for m in 1..=4usize {
+                // Every operand gets its own stride permutation; keeping the
+                // grid bounded at the top rank is what limits this to m <= 2.
+                if n == 4 && m > 2 {
+                    continue;
+                }
+                for mut pick in 0..perms.len().pow(m as u32) {
+                    let mut strides: Vec<Vec<isize>> = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        strides.push(perms[pick % perms.len()].clone());
+                        pick /= perms.len();
+                    }
+                    // Broadcast a subset of the output axes with a zero stride.
+                    for zero_mask in 0..(1u32 << n) {
+                        let mut strides = strides.clone();
+                        for (i, s) in strides[0].iter_mut().enumerate() {
+                            if zero_mask & (1 << i) != 0 {
+                                *s = 0;
+                            }
+                        }
+                        let all_strides: Vec<&[isize]> =
+                            strides.iter().map(|s| s.as_slice()).collect();
+                        let orders: Vec<Vec<usize>> =
+                            strides.iter().map(|s| index_order(s).into_vec()).collect();
+
+                        let got: Vec<u128> = compute_importance(dims, &all_strides, &orders)
+                            .as_slice()
+                            .iter()
+                            .map(|&w| w as u128)
+                            .collect();
+                        let want = reference(dims, &all_strides, &orders);
+                        assert_eq!(
+                            got.as_slice(),
+                            want.as_slice(),
+                            "dims {:?} strides {:?}",
+                            dims,
+                            strides
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

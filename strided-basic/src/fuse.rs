@@ -135,9 +135,18 @@ pub fn compress_dims<S: AsRef<[isize]>>(
 /// Compute the "importance" of each dimension for loop ordering.
 ///
 /// This encodes stride order information into importance scores that determine
-/// the optimal iteration order. Zero-stride broadcast axes do not contribute to
-/// importance, and the output array gets strong weight so contiguous stores
-/// remain in the inner loop.
+/// the optimal iteration order. Zero-stride broadcast axes and size-1 axes do
+/// not contribute to importance, and the output array gets strong weight so
+/// contiguous stores remain in the inner loop.
+///
+/// Each array's level `n - order` is packed `g = ceil(log2(m + 2))` bits apart,
+/// with the output's level carrying `g + 1` bits on top. That packing is used
+/// whenever it fits in the 64-bit score, so the plan order is the same as it
+/// always was. At high rank `g * n` does not fit (tensor4all/strided-rs#450),
+/// and the per-level width narrows to the widest one that does: every level
+/// stays distinct and only the weight between levels changes. From rank ~62 on
+/// one bit per level still overflows, and the levels above the cap share the
+/// top weight.
 ///
 /// # Arguments
 /// * `dims` - The dimensions
@@ -161,41 +170,59 @@ pub fn compute_importance<I: AsRef<[usize]>>(
     // g = ceil(log2(M + 2)) = number of bits needed to encode array count
     let g = (64 - (m as u64 + 1).leading_zeros()) as u64;
 
-    let mut importance: InlineVec<u64> = (0..n).map(|_| 0u64).collect();
+    // Weights for one per-level width and level cap, or `None` if any shift,
+    // product or sum would overflow. `(g, u64::MAX)` is the original packing.
+    let weights = |bits: u64, level_cap: u64| -> Option<InlineVec<u64>> {
+        // 2^(bits * level), or `None` when that shift or width is too large.
+        let term = |k: usize, i: usize| -> Option<u64> {
+            let level = (n - index_orders[k].as_ref()[i]) as u64;
+            let shift = level.min(level_cap).checked_mul(bits)?;
+            1u64.checked_shl(u32::try_from(shift).ok()?)
+        };
+        let output_weight = 1u64.checked_shl((bits + 1) as u32)?;
 
-    let output_weight = 1u64 << (g + 1);
-
-    // First array (output) gets a strong weight. For elementwise kernels the
-    // store stream determines whether the inner loop can be emitted as a
-    // contiguous vector loop, so a broadcasted input's local stride should not
-    // break a contiguous output group.
-    for i in 0..n {
-        if all_strides[0][i] != 0 {
-            let shift = g * (n - index_orders[0].as_ref()[i]) as u64;
-            importance[i] = output_weight * (1u64 << shift);
-        }
-    }
-
-    // Add contributions from remaining arrays
-    // `k` also indexes the per-array stride and order tables, not just the loop range.
-    #[allow(clippy::needless_range_loop)]
-    for k in 1..m {
+        let mut weights: InlineVec<u64> = (0..n).map(|_| 0u64).collect();
         for i in 0..n {
-            if all_strides[k][i] != 0 {
-                let shift = g * (n - index_orders[k].as_ref()[i]) as u64;
-                importance[i] += 1u64 << shift;
+            // Size-1 axes carry no ordering information; skipping them keeps
+            // their strides out of the weights.
+            if dims[i] <= 1 {
+                continue;
+            }
+            // The first array (output) gets a strong weight. For elementwise
+            // kernels the store stream determines whether the inner loop can be
+            // emitted as a contiguous vector loop, so a broadcasted input's
+            // local stride should not break a contiguous output group.
+            if all_strides[0][i] != 0 {
+                weights[i] = term(0, i)?.checked_mul(output_weight)?;
+            }
+            for (k, strides) in all_strides.iter().enumerate().skip(1) {
+                if strides[i] != 0 {
+                    weights[i] = weights[i].checked_add(term(k, i)?)?;
+                }
             }
         }
+        Some(weights)
+    };
+
+    // Keep the original packing whenever it fits, so no plan order changes;
+    // narrow the per-level width only on an actual overflow (#450).
+    let mut bits = g;
+    let mut packed = weights(bits, u64::MAX);
+    while packed.is_none() && bits > 1 {
+        bits -= 1;
+        packed = weights(bits, u64::MAX);
     }
 
-    // Zero importance for size-1 dimensions (put them at the back)
-    for i in 0..n {
-        if dims[i] <= 1 {
-            importance[i] = 0;
-        }
-    }
-
-    importance
+    packed
+        .or_else(|| {
+            // One bit per level still overflows from rank ~62 on: share the top
+            // weight, with the widest level cap that fits.
+            (1..=61u64)
+                .rev()
+                .find_map(|level_cap| weights(1, level_cap))
+        })
+        // Unreachable for any operand count a slice can hold; ties every axis.
+        .unwrap_or_else(|| (0..n).map(|_| 0u64).collect())
 }
 
 /// Get the permutation that sorts by importance (descending).
