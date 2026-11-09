@@ -814,6 +814,28 @@ fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
     assert_eq!(dst[127 + 31 * 2048], 1.5);
 }
 
+/// A dense reversed buffer over several axes streams as one run too: fusion
+/// sorts by signed destination stride, so `[-1, -512]` over `[512, 512]` keeps
+/// two axes and the rank-one check alone priced it as strided ([#364]).
+#[test]
+fn a_reversed_dense_buffer_keeps_the_copy_row() {
+    let dims = [512usize, 512];
+    let strides = [-1isize, -512];
+    let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
+    assert!(
+        plan.is_contiguous_run(),
+        "a dense reversed buffer is one streamed run"
+    );
+    assert_eq!(
+        plan.ns_per_element::<f64, f64>(),
+        crate::cost::KernelClass::Copy.ns_per_element(),
+        "the copy row is the calibrated rate of a streamed copy"
+    );
+    // A sign flip between the axes makes the walk jump: two runs, priced as strided.
+    let mixed = CopyPlan::compile(&dims, &[-1isize, 512], &strides).unwrap();
+    assert!(!mixed.is_contiguous_run(), "mixed signs are not one run");
+}
+
 /// A reversed unit-stride run streams like a forward one, so it keeps the `Copy`
 /// row even when its working set is past the class's L2: 131072 `f64` at stride
 /// -1 on both sides is 2 MiB together. Treating it as strided would price it at
