@@ -281,9 +281,74 @@ fn test_try_constructors_reject_overflowing_shapes() {
         ));
         assert_overflow(unsafe { StridedArray::<f64>::try_col_major_uninit(dims) });
         assert_overflow(unsafe {
-            StridedArray::<f64>::try_col_major_from_buffer_uninit(vec![1.0; 3], dims)
+            StridedArray::<f64>::try_col_major_from_buffer_uninit(Vec::new(), dims)
         });
     }
+}
+
+#[test]
+fn uninit_col_major_writes_bool_slots_before_reading_them() {
+    // `bool` is the element `set_len` storage could not hold: a byte that is
+    // neither 0 nor 1 is not a `bool`, so an uninitialized slot in a `Vec<bool>`
+    // was already invalid before the caller wrote anything (#413).
+    let dims = [2usize, 3];
+    let mut a = unsafe { StridedArray::<bool>::try_col_major_uninit(&dims).unwrap() };
+    for j in 0..dims[1] {
+        for i in 0..dims[0] {
+            a.set(&[i, j], MaybeUninit::new((i + j) % 2 == 0));
+        }
+    }
+    for j in 0..dims[1] {
+        for i in 0..dims[0] {
+            // SAFETY: every slot was written above, before this read.
+            let got = unsafe { a.get(&[i, j]).assume_init() };
+            assert_eq!(got, (i + j) % 2 == 0, "slot ({i}, {j})");
+        }
+    }
+}
+
+#[test]
+fn uninit_from_buffer_holds_reference_elements() {
+    // `&u32` is the other element `set_len` storage broke, and this drives the
+    // buffer constructor: the empty buffer grows to the shape.
+    let values = [11u32, 22, 33];
+    let mut a = unsafe {
+        StridedArray::<&u32>::try_col_major_from_buffer_uninit(Vec::new(), &[3]).unwrap()
+    };
+    for (i, v) in values.iter().enumerate() {
+        a.set(&[i], MaybeUninit::new(v));
+    }
+    for (i, v) in values.iter().enumerate() {
+        // SAFETY: every slot was written above, before this read.
+        let got = unsafe { a.get(&[i]).assume_init() };
+        assert!(std::ptr::eq(got, v), "slot {i} does not point at {v}");
+    }
+}
+
+#[test]
+fn uninit_from_buffer_resizes_without_touching_retained_slots() {
+    // Spare capacity: the slot the caller already wrote survives the call.
+    let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(6);
+    buf.push(MaybeUninit::new(7));
+    let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[2, 3]).unwrap() };
+    assert_eq!((a.len(), a.data().len()), (6, 6));
+    // SAFETY: slot 0 was written before the call; the others are never read.
+    assert_eq!(unsafe { a.data()[0].assume_init() }, 7);
+
+    // A longer buffer is truncated to the shape.
+    let buf = vec![MaybeUninit::new(1u8); 10];
+    let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[2, 3]).unwrap() };
+    assert_eq!(a.data().len(), 6);
+
+    // A zero extent makes the array empty whatever the other extents.
+    let buf = vec![MaybeUninit::new(1u8); 3];
+    let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[0, 4]).unwrap() };
+    assert!(a.is_empty() && a.data().is_empty());
+
+    // A zero-sized element still tracks its element count.
+    let a =
+        unsafe { StridedArray::<()>::try_col_major_from_buffer_uninit(Vec::new(), &[3]).unwrap() };
+    assert_eq!(a.data().len(), 3);
 }
 
 #[test]
