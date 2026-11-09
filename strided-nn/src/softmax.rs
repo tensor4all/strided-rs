@@ -155,6 +155,9 @@ fn fan_out<F: Fn(usize) + Sync>(tasks: usize, exec: Exec<'_>, body: F) {
 /// # Safety
 /// Every element of `chunk` must have been written.
 unsafe fn initialized<T>(chunk: &mut [MaybeUninit<T>]) -> &mut [T] {
+    // SAFETY: `MaybeUninit<T>` has the size and alignment of `T`, so `chunk`'s pointer and length
+    // describe the same memory as `chunk.len()` values of `T`, reborrowed from `chunk` for its
+    // lifetime. Every one of them is initialized by this function's contract (softmax.rs:156).
     unsafe { core::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<T>(), chunk.len()) }
 }
 
@@ -202,12 +205,26 @@ macro_rules! softmax_axis0 {
                 let start = task * plan.task;
                 let end = (start + plan.task).min(plan.len);
                 let len = end - start;
-                // SAFETY: the task spans partition `0..len`, so this task writes
-                // only its own output elements.
+                // SAFETY: `out_ptr` is `output.as_mut_ptr()`, and `Plan::new` rejected
+                // `output.len() != input.len()` (softmax.rs:97), so `output` has `plan.len`
+                // slots. `start = task * plan.task` with `task < plan.tasks =
+                // plan.len.div_ceil(plan.task)` (softmax.rs:133), so `start < plan.len` and
+                // `start + len = end <= plan.len`: the slice lies inside `output`. Distinct
+                // `task` values give disjoint `start..end` spans, and `fan_out` hands each index
+                // to exactly one call, because `parallel_map_reduce`
+                // (strided-basic/src/threading.rs:134) splits `0..tasks` into disjoint halves.
+                // `output` is borrowed `&mut` for the whole call, so nothing else aliases these
+                // slots.
                 let out_task =
                     unsafe { core::slice::from_raw_parts_mut(out_ptr.as_ptr().add(start), len) };
-                // SAFETY: as above, for the task's own scratch region; the plan
-                // capped `tasks` by the scratch length, so `group <= temp` fits.
+                // SAFETY: the region is `task * plan.group` plus `min(plan.group, len)` elements
+                // of `scratch`. `Plan::new` sets `capacity = scratch.len() / plan.group`
+                // (softmax.rs:117) and keeps at most `tasks <= capacity` tasks (softmax.rs:125);
+                // with `task = min(group * groups_per_task, len)` (softmax.rs:127), `plan.tasks =
+                // ceil(len / task) <= ceil(groups / groups_per_task) <= tasks`. So `task <
+                // capacity` and the region ends at or before `capacity * plan.group <=
+                // scratch.len()`. Regions of distinct tasks are disjoint, `scratch` is borrowed
+                // `&mut` for the call, and its elements are initialized `T`.
                 let temp = unsafe {
                     core::slice::from_raw_parts_mut(
                         scratch_ptr.as_ptr().add(task * plan.group),
@@ -221,7 +238,13 @@ macro_rules! softmax_axis0 {
                     let temp = &mut temp[..in_chunk.len()];
                     $shift(in_chunk, temp, plan.axis_len);
                     $exp_into(temp, out_chunk);
-                    // SAFETY: `$exp_into` wrote every element of the chunk.
+                    // SAFETY: `$exp_into` wrote every element of `out_chunk`. `out_chunk` and
+                    // `temp` both hold `in_chunk.len()` elements, since the output and input
+                    // spans have the same length and are chunked by `plan.group` alike. The
+                    // vector `exp` writes `dst[i]` for every `i` when the lengths match
+                    // (elem-simd-math 0.1.1 `src/dispatch.rs:3`), and the scalar fallback writes
+                    // the same pairs otherwise. That is `initialized`'s contract
+                    // (softmax.rs:156).
                     let out_chunk = unsafe { initialized(out_chunk) };
                     $scale(out_chunk, plan.axis_len);
                 }
