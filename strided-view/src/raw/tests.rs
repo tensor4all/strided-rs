@@ -43,10 +43,18 @@ fn raw_bool_descriptor_reports_the_first_invalid_byte() {
     let dims = [bytes.len()];
     let strides = [1isize];
     let ptr = NonNull::new(bytes.as_mut_ptr()).unwrap();
+    // SAFETY: `from_raw_parts` (raw.rs:204) wants a `bool`-aligned (align 1)
+    // allocation of `bytes.len()` initialized bytes alive for the descriptor's
+    // use: `ptr` heads the live `Vec<u8>` `bytes`, which outlives `erased` and
+    // is accessed only through `ptr` from here on. Invalid bool bytes are
+    // allowed until `try_as_ref_after_no_overlap` validates them.
     let erased = unsafe {
         ErasedRawStridedPtr::from_raw_parts(KernelDType::Bool, ptr, bytes.len(), &dims, &strides, 0)
     }
     .unwrap();
+    // SAFETY: (raw.rs:270) nothing else is borrowed from `bytes`, so no mutable
+    // allocation overlaps it and nothing writes during the call; the
+    // allocation contract above still holds.
     assert!(matches!(
         unsafe { erased.try_as_ref_after_no_overlap() },
         Err(crate::StridedError::InvalidBoolByte { value: 3 })
@@ -54,10 +62,15 @@ fn raw_bool_descriptor_reports_the_first_invalid_byte() {
 
     // Write through the handed off pointer so no reborrow of `bytes`
     // invalidates it.
+    // SAFETY: indices 4000 and 4001 are below `bytes.len() == 4096`, `ptr`
+    // carries the `Vec`'s write provenance, and the descriptor contract
+    // (raw.rs:212) allows the owner's sequential mutation through
+    // that same pointer before the next conversion.
     unsafe {
         *ptr.as_ptr().add(4000) = 0;
         *ptr.as_ptr().add(4001) = 1;
     }
+    // SAFETY: as the first conversion above; the writes have finished.
     assert!(unsafe { erased.try_as_ref_after_no_overlap() }.is_ok());
 }
 
@@ -85,6 +98,10 @@ fn rejects_usize_max_dimension_before_isize_truncation() {
         Err(crate::StridedError::OffsetOverflow)
     ));
     let ptr = NonNull::new(data.as_mut_ptr()).unwrap();
+    // SAFETY: `from_raw_parts` (raw.rs:204) wants an aligned allocation of
+    // `data.len()` initialized bytes: `ptr` heads the live `[bool; 1]`
+    // `data`, and `bool` is one aligned byte. The call returns the bounds
+    // error before any byte is read.
     assert!(matches!(
         unsafe {
             ErasedRawStridedPtr::from_raw_parts(
