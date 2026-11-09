@@ -54,13 +54,26 @@ that regime at.
   beyond-L2 copy rate past it: on `x86_64-avx512` 3.0 ns per element past 1 MiB
   (the L2 of both hosts behind the row), the row at every size on every class
   without such a measurement.
-- A plan that streams as one dense run keeps the row at every footprint. Fusion
-  folds a forward dense run into one axis; a reversed buffer is not folded
-  (`[-1, -512]` over `[512, 512]` stays rank two, because fusion sorts by signed
-  destination stride), so the test is dense-by-ascending-stride with one sign per
-  operand, and a sign flip between axes is not one run. Measured here: 0.176 at
-  2 MiB and 0.177 at 16 MiB (`n` = 512, 1024), which is the row within 4%. That is
-  #364 item 3: the row stays the class of contiguous runs.
+- A plan that the replay *walks* as one dense run keeps the row at every
+  footprint. The test reads the fused axes in the order both replays walk them
+  (axis 0 fastest, `apply_fused_range` / `apply_spilled_range`): the strides must
+  be the running products of the extents, with one sign per operand. Fusion folds
+  every such pair, so in practice this is a fused rank of one at unit stride,
+  forward or reversed (`-1`), on either side. Measured here: 0.176 at 2 MiB and
+  0.177 at 16 MiB (`n` = 512, 1024), which is the row within 4%. That is #364
+  item 3: the row stays the class of contiguous runs.
+- A dense reversed buffer of rank two or more is **not** exempt. Fusion sorts by
+  signed destination stride and does not fold it, so `[-1, -512]` over
+  `[512, 512]` is walked with `-512` fastest and the rank-9 `[-1, -4, ..., -65536]`
+  (spilled) with `-65536` fastest. An earlier revision of this branch (`d70b8c6`)
+  exempted it by matching the strides in ascending magnitude, i.e. a walk the
+  layout allows rather than the one the replay takes; it is now priced as the
+  strided walk it is. Re-sorting fusion by magnitude would make it one run, but
+  that sort is shared by `UpdatePlan`, both gather plans and the
+  `copy_scale/conj/axpy(_conj)_raw` entries (`raw_ops.rs:271,898-991`,
+  `gather_plan.rs:1084,1453`), so it is a traversal change of every one of those
+  families, with its own benchmark obligation, and not part of a costing change
+  (sec. 6).
 - The rate reaches every scheduling decision the replay makes: the width of the
   replay that is not tiled (`cost::for_len_at_rate`, `copy_plan.rs`'s
   `replay_fused_raw` / `replay_spilled_raw`) and both the fork gate and every node
@@ -133,18 +146,21 @@ ledger installed), `a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_ra
 (executes a 128x32 transposing plan of 2.6 MiB against a pool whose first fork asks
 3 us, and requires **more than one** recorded splitter leaf and at least one worker
 install), `a_reversed_run_past_l2_keeps_the_copy_row` (131072 elements at stride -1
-on both sides, 2 MiB together), `a_reversed_dense_buffer_keeps_the_copy_row` (512 x
-512 over `[-1, -512]`, with a mixed-sign control), plus
+on both sides, 2 MiB together), `the_contiguous_exemption_is_the_walk_the_replay_takes`
+(replaces `a_reversed_dense_buffer_keeps_the_copy_row`, sec. 5b),
+`a_transposing_plan_past_l2_asks_for_the_width_of_its_measured_time` (budget 96,
+sec. 3), plus
 `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` (the
 AVX-512 branch, `HostClass::X86_64Avx512` given explicitly, so it runs everywhere)
 and `the_splitter_asks_its_gate_at_the_rate_it_is_given` (drives
 `mapreduce_threaded_at_rate` with an explicit rate, so it runs everywhere too).
 
-The two executed forwarding tests need a class that *has* a beyond-L2 rate, so they
-skip with a printed line on a host class that prices everything at the row
-(`x86_64-avx2`, `aarch64-apple`, the hosted runners): a one-row class cannot
-exercise a size-dependent price, and the forwarding *is* that price. The policy and
-the splitter seam are what run on every host.
+The two executed forwarding tests replay through `CopyPlan::replay_on` with the
+class named (`HostClass::X86_64Avx512`, and `HostClass::Generic` as the control
+that must not fork), so they run, and can fail, on every host. An earlier revision
+returned early with a printed skip on a class without a beyond-L2 rate, which
+libtest counted as a pass (sec. 5b). The mutation records below are of that earlier
+revision, run on the Zen 5 host, and their line numbers are of that revision.
 
 **Missing footprint branch (the pre-change state)** — the acceptance test:
 
@@ -197,6 +213,73 @@ With all three restored, the module is green (`cargo test --release --lib
 workspace is green (`cargo test --workspace`: 78 test binaries, 1144 passed, 0
 failed).
 
+## 5b. Round of the review of `08895fd`
+
+Two findings, both reproduced before fixing (Apple M-series, `aarch64-apple`,
+2026-11-09, `cargo test -p strided-basic --features parallel --lib`).
+
+**The dense-reversed exemption described a possible walk.** The new test
+`the_contiguous_exemption_is_the_walk_the_replay_takes` replays seven layouts
+serially through an `apply` closure that records each (destination slot, source
+slot) pair, and asserts that `is_contiguous_run` equals "the recorded walk is one
+unit-step run on each side", and that the plan is priced at the row exactly when it
+is. Against `08895fd`'s `is_contiguous_run`:
+
+```
+assertion `left == right` failed: dense reversed: the plan claims one streamed run = true, but the replay walked 262017 run(s) (first visits [(262143, 262143), (261631, 261631), (261119, 261119), (260607, 260607)])
+test result: FAILED. 0 passed; 1 failed
+```
+
+and, with the spilled case put first:
+
+```
+assertion `left == right` failed: dense reversed, spilled: the plan claims one streamed run = true, but the replay walked 262144 run(s) (first visits [(262143, 262143), (196607, 196607), (131071, 131071), (65535, 65535)])
+test result: FAILED. 0 passed; 1 failed
+```
+
+The visits step by -512 and -65536, which is the walk the review traced. With the
+exemption read in walk order it passes (`1 passed; 0 failed`).
+
+**The forwarding tests were skips counted as passes.** The rate `replay` hands
+to `replay_fused` pinned to `KernelClass::Copy.ns_per_element()`, run on `08895fd`
+on this host:
+
+```
+skipped: this class has no beyond-L2 copy rate
+test copy_plan::tests::a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate ... ok
+skipped: this class has no beyond-L2 copy rate
+test copy_plan::tests::a_strided_plan_past_l2_forks_untiled_at_its_own_rate ... ok
+test result: ok. 3 passed; 0 failed
+```
+
+The same mutation in `replay_on` after the change:
+
+```
+the plan forked nowhere: the replay priced it at the row, not at 3.000 ns per element
+the splitter did not fork: 0 leaf/leaves and 0 worker install(s) for a plan priced at 3.000 ns per element
+test result: FAILED. 36 passed; 2 failed
+```
+
+And the footprint branch removed (`copy_ns_per_element_for_footprint` answers the
+row): five tests fail, among them the budget-96 width test with `512 x 512: the plan
+asks for width 6 at 0.171 ns per element, the measured 3.09 ns per element wants 24`.
+
+**Budget 96.** #364 asks that the width at budget 96 land within one step of
+`width_for(measured_serial, 1)`. With the `x86_64-avx512` dispatch costs and a root
+token dispatching from outside the pool, the plan's replay asks for:
+
+| n | plan rate | plan width | `width_for(measured)` | row width |
+|---|---|---|---|---|
+| 64 | 0.171 | 1 | 1, 1 (0.65, 0.68) | 1 |
+| 128 | 0.171 | 1 | 1 (0.78) | 1 |
+| 256 | 0.171 | 1 | 6, 7 (0.90, 0.94) | 1 |
+| 512 | 3.0 | 23 | 24, 24 (3.09, 3.24) | 6 |
+| 1024 | 3.0 | 47 | 46, 47 (2.91, 3.07) | 11 |
+
+The 512 and 1024 rows are pinned by the test. The 256 row misses (1 against 6-7):
+it fits L2 and keeps the row, which is #364 item 1, not in this change. The 64 and
+128 rows agree only because no width pays there at either rate.
+
 ## 6. Residual
 
 - One rate per class, not per layout. The calibration is the *tiled* transposing
@@ -208,6 +291,17 @@ failed).
 - A transposing plan inside L2 keeps the row and is 2.7-7.8x low (sec. 3). #364 item
   1 (a per-segment term) is what interpolates between the two regimes; it is not in
   this change.
+- A dense reversed buffer of rank two or more is walked with its largest stride
+  fastest (fusion sorts by signed destination stride), on `main` as here. It is now
+  priced as that strided walk; making it one run is a change of the shared fusion
+  sort (sec. 2) and has not been made or measured.
+- The parallel `CopyPlan` scheduling this change moves (the width of the untiled
+  replay, the tiled replay's fork gate and splitter) has **not been measured**
+  against `main`: the appendix harness times every `CopyPlan` row with
+  `Exec::serial()`. On `aarch64-apple` and `x86_64-avx2`, the classes without a
+  beyond-L2 rate, the scheduling is `main`'s by construction (every plan keeps the
+  row); only `x86_64-avx512` changes, and no such host was measured with a parallel
+  `CopyPlan` for this change.
 - The beyond-L2 rate is calibrated on two hosts (2.32-2.76 here, 2.91-3.24 on the
   reporting Xeon, quoted) and is 3.2-4.2x low against the 9.6-12.7 above and the
   7.2-9.7 this host measured before #422 tiled the transposed path (quoted).

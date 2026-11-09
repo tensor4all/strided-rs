@@ -615,52 +615,68 @@ fn update_plan_execute_uninit_leaves_gapped_holes_untouched() {
 fn a_strided_plan_past_l2_prices_itself_above_the_contiguous_row() {
     use crate::cost::parallel_width;
     use threadteam::HostClass;
-    let row = KernelClass::Copy.ns_per_element();
+    // The class is named, not detected: the beyond-L2 rate is a property of the
+    // class, and a detected one would turn the assertions below into a different
+    // test on every runner (strided-rs#364 review).
+    let avx512 = HostClass::X86_64Avx512;
+    let row = KernelClass::Copy.ns_per_element_of(avx512);
     let dims = [512usize, 512];
     // 2 MiB of source and 2 MiB of destination, transposed / as one run.
     let strided = CopyPlan::compile(&dims, &[512, 1], &[1, 512]).unwrap();
     let contiguous = CopyPlan::compile(&dims, &[1, 512], &[1, 512]).unwrap();
-    let rate = strided.ns_per_element::<f64, f64>();
+    let rate = strided.ns_per_element_on::<f64, f64>(avx512);
 
+    // The table of strided-rs#363 measures 3.09-3.24 ns per element for the
+    // 512 x 512 transposing case, so the plan must be within a factor of two of
+    // it.
+    assert!(
+        (3.09 / 2.0..=3.24 * 2.0).contains(&rate),
+        "the plan prices itself at {rate} ns per element, outside a factor of two \
+         of the 3.09-3.24 measured for this case"
+    );
     // Each side is counted at its own element size: 256 x 256 f64 is exactly the
-    // 1 MiB the class's L2 holds, so it stays on the row (twice 1 MiB would not).
+    // 1 MiB the class's L2 holds, so it stays on the row (twice 1 MiB would not),
+    // and one byte past it is already priced above.
     let at_l2 = CopyPlan::compile(&[256usize, 256], &[256, 1], &[1, 256]).unwrap();
-    assert_eq!(at_l2.ns_per_element::<f64, f64>(), row);
+    assert_eq!(at_l2.ns_per_element_on::<f64, f64>(avx512), row);
+    let just_over = CopyPlan::compile(&[257usize, 257], &[257, 1], &[1, 257]).unwrap();
+    assert!(
+        just_over.ns_per_element_on::<f64, f64>(avx512) > row,
+        "257 x 257 f64 is 1.01 MiB of source and destination, past the class's L2"
+    );
     // A streamed run keeps the row at every footprint, reversed included.
-    assert_eq!(contiguous.ns_per_element::<f64, f64>(), row);
+    assert_eq!(contiguous.ns_per_element_on::<f64, f64>(avx512), row);
     let reversed = CopyPlan::compile(&[4096usize], &[-1], &[-1]).unwrap();
-    assert_eq!(reversed.ns_per_element::<f64, f64>(), row);
+    assert_eq!(reversed.ns_per_element_on::<f64, f64>(avx512), row);
     // An L2-resident transposing plan (128 x 128 f64 is 256 KiB) keeps the row.
     let small = CopyPlan::compile(&[128usize, 128], &[128, 1], &[1, 128]).unwrap();
-    assert_eq!(small.ns_per_element::<f64, f64>(), row);
-
-    if HostClass::detect() == HostClass::X86_64Avx512 {
-        // The table of strided-rs#363 measures 3.09-3.24 ns per element for the
-        // 512 x 512 transposing case, so the plan must be within a factor of two
-        // of it; and one byte past the class's L2 is already priced there.
-        assert!(
-            (3.09 / 2.0..=3.24 * 2.0).contains(&rate),
-            "the plan prices itself at {rate} ns per element, outside a factor of two \
-             of the 3.09-3.24 measured for this case"
+    assert_eq!(small.ns_per_element_on::<f64, f64>(avx512), row);
+    // A class without a beyond-L2 measurement prices the same plan at its row.
+    for class in [
+        HostClass::Aarch64Apple,
+        HostClass::X86_64Avx2,
+        HostClass::X86_64Scalar,
+        HostClass::Aarch64,
+        HostClass::Generic,
+    ] {
+        assert_eq!(
+            strided.ns_per_element_on::<f64, f64>(class),
+            KernelClass::Copy.ns_per_element_of(class),
+            "{} has no beyond-L2 copy rate",
+            class.name()
         );
-        let just_over = CopyPlan::compile(&[257usize, 257], &[257, 1], &[1, 257]).unwrap();
-        assert!(
-            just_over.ns_per_element::<f64, f64>() > row,
-            "257 x 257 f64 is 1.01 MiB of source and destination, past the class's L2"
-        );
-    } else {
-        assert_eq!(rate, row, "this class has no beyond-L2 copy rate");
     }
 
     // The contiguous plan asks the gate for the width the class's public rule
-    // gives, so the footprint term cannot have moved a contiguous caller.
+    // gives on this host, so the footprint term cannot have moved a contiguous
+    // caller.
     let pool = crate::threading::test_pool(4);
     let total = 512 * 512;
     let mut exec = Exec::new(&pool, 4).unwrap();
     let plan_width = crate::cost::for_len_at_rate(
         exec.reborrow(),
         total,
-        contiguous.ns_per_element::<f64, f64>(),
+        contiguous.ns_per_element_on::<f64, f64>(HostClass::detect()),
     )
     .budget();
     assert_eq!(
@@ -682,31 +698,20 @@ fn plan_footprint(
 
 /// A plan whose footprint is past its class's L2 forks at its own rate on the
 /// replay that is not tiled: 1024 elements of a 4 MiB working set are 175 ns at
-/// the `Copy` row, below the 300 ns this pool asks for a fork, and 3.07 us at the
-/// plan's beyond-L2 rate (strided-rs#364).
+/// the `x86_64-avx512` `Copy` row, below the 300 ns this pool asks for a fork,
+/// and 3.07 us at the plan's beyond-L2 rate (strided-rs#364).
 ///
-/// Executed, so the rate `CopyPlan::replay` computes is the one under test: a
-/// replay that passed the row here would install no worker and the assertion
-/// below fails. Without the `parallel` feature every token is serial, so there is
-/// no fork to observe.
+/// Executed through `CopyPlan::replay_on` with the class named, so the rate the
+/// replay computes is the one under test on every host: a replay that handed the
+/// row to `replay_fused` instead of the plan's rate would install no worker and
+/// the assertion below fails, whichever class the runner detects. The control
+/// replays the same plan priced for a class without a beyond-L2 rate, which must
+/// not fork, so the fork is the rate's and not the pool's. Without the
+/// `parallel` feature every token is serial, so there is no fork to observe.
 #[cfg(feature = "parallel")]
 #[test]
 fn a_strided_plan_past_l2_forks_untiled_at_its_own_rate() {
-    use threadteam::ledger;
-    // A class with no beyond-L2 copy rate prices every plan at the row, so there is
-    // no fork to attribute to the plan's rate. Which class that is depends on the
-    // machine; the policy is pinned host-independently by
-    // `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` and
-    // the mechanism by
-    // `the_splitter_asks_its_gate_at_the_rate_it_is_given`.
-    if crate::cost::copy_ns_per_element_for_footprint(
-        threadteam::HostClass::detect(),
-        usize::MAX >> 8,
-    ) == KernelClass::Copy.ns_per_element()
-    {
-        eprintln!("skipped: this class has no beyond-L2 copy rate");
-        return;
-    }
+    use threadteam::{ledger, HostClass};
     let pool = crate::threading::test_pool(4);
     let dims = [1024usize];
     let strides = [256isize];
@@ -717,45 +722,58 @@ fn a_strided_plan_past_l2_forks_untiled_at_its_own_rate() {
         "the case must sit past the class's L2 for the rate to differ"
     );
     let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
-    let src = vec![1.5f64; len];
-    let mut dst = vec![0.0f64; len];
-    let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
-    let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
-    let exec = Exec::new(&pool, 4).unwrap();
-    let root = exec.ledger_root().unwrap();
-    plan.execute(&mut dst_mut, &src_ref, exec).unwrap();
     assert!(
-        ledger::installs(root) > 0,
-        "the plan forked nowhere: the replay priced it at the row, not at {:.3} ns per element",
-        plan.ns_per_element::<f64, f64>()
+        plan.fused
+            .inline()
+            .and_then(pair_tiles::<f64, f64>)
+            .is_none(),
+        "the layout must take the replay that is not tiled"
     );
-    assert!(ledger::max_live(root) <= 4);
-    assert_eq!(dst[0], 1.5);
-    assert_eq!(dst[1023 * 256], 1.5);
+    // The row of every class leaves this pool serial, so only the plan's own rate
+    // can fork it.
+    let gate = Exec::new(&pool, 4).unwrap();
+    for class in [HostClass::X86_64Avx512, HostClass::Generic] {
+        assert!(!crate::cost::is_parallel_at_rate(
+            dims[0],
+            KernelClass::Copy.ns_per_element_of(class),
+            &gate
+        ));
+    }
+    let mut installs = Vec::new();
+    for class in [HostClass::X86_64Avx512, HostClass::Generic] {
+        let src = vec![1.5f64; len];
+        let mut dst = vec![0.0f64; len];
+        let src_ref = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+        let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+        let exec = Exec::new(&pool, 4).unwrap();
+        let root = exec.ledger_root().unwrap();
+        plan.replay_on(class, &mut dst_mut, &src_ref, |d: &mut f64, s| *d = s, exec)
+            .unwrap();
+        assert!(ledger::max_live(root) <= 4);
+        assert_eq!(dst[0], 1.5);
+        assert_eq!(dst[1023 * 256], 1.5);
+        installs.push(ledger::installs(root));
+    }
+    assert!(
+        installs[0] > 0,
+        "the plan forked nowhere: the replay priced it at the row, not at {:.3} ns per element",
+        plan.ns_per_element_on::<f64, f64>(HostClass::X86_64Avx512)
+    );
+    assert_eq!(
+        installs[1], 0,
+        "priced for a class without a beyond-L2 rate the plan must stay serial"
+    );
 }
 
 /// The same, on the tiled replay of strided-rs#422: a 128 x 32 transposing copy
-/// (2.6 MiB) is 700 ns at the row and 12.3 us at the plan's rate, against a pool
-/// whose section costs 3 us for the first fork, so only the plan's rate opens the
-/// split at all.
+/// (2.6 MiB) is 700 ns at the `x86_64-avx512` row and 12.3 us at the plan's rate,
+/// against a pool whose section costs 3 us for the first fork, so only the plan's
+/// rate opens the split at all. The class is named, as above, and the control is
+/// the same plan priced for a class without a beyond-L2 rate.
 #[cfg(feature = "parallel")]
 #[test]
 fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
     use threadteam::{DispatchCosts, DispatchKind, HostClass, Pool, WidthCosts};
-    // A class with no beyond-L2 copy rate prices every plan at the row, so there is
-    // no fork to attribute to the plan's rate. Which class that is depends on the
-    // machine; the policy is pinned host-independently by
-    // `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` and
-    // the mechanism by
-    // `the_splitter_asks_its_gate_at_the_rate_it_is_given`.
-    if crate::cost::copy_ns_per_element_for_footprint(
-        threadteam::HostClass::detect(),
-        usize::MAX >> 8,
-    ) == KernelClass::Copy.ns_per_element()
-    {
-        eprintln!("skipped: this class has no beyond-L2 copy rate");
-        return;
-    }
     let micro = core::time::Duration::from_micros(1);
     let flat = WidthCosts::flat(micro);
     let costs = DispatchCosts::for_class(HostClass::Generic)
@@ -784,77 +802,97 @@ fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
             .is_some(),
         "the layout must have tiles for `replay_tiled` to see the rate"
     );
-    let src = vec![1.5f64; len];
-    let mut dst = vec![0.0f64; len];
-    let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
-    let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
-    let exec = Exec::new(&pool, 4).unwrap();
-    let root = exec.ledger_root().unwrap();
-    crate::threading::take_tiled_leaves();
-    plan.execute(&mut dst_mut, &src_ref, exec).unwrap();
-    let leaves = crate::threading::take_tiled_leaves();
-    let installs = threadteam::ledger::installs(root);
+    let mut observed = Vec::new();
+    for class in [HostClass::X86_64Avx512, HostClass::Generic] {
+        let src = vec![1.5f64; len];
+        let mut dst = vec![0.0f64; len];
+        let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+        let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+        let exec = Exec::new(&pool, 4).unwrap();
+        let root = exec.ledger_root().unwrap();
+        crate::threading::take_tiled_leaves();
+        plan.replay_on(class, &mut dst_mut, &src_ref, |d: &mut f64, s| *d = s, exec)
+            .unwrap();
+        let leaves = crate::threading::take_tiled_leaves();
+        assert_eq!(dst[0], 1.5);
+        assert_eq!(dst[127 + 31 * 2048], 1.5);
+        observed.push((leaves.len(), threadteam::ledger::installs(root)));
+    }
+    let (leaves, installs) = observed[0];
     // More than one leaf: the *splitter* forked at the plan's rate. One leaf is
     // what a splitter gated at the row records, and an empty list is what a gate at
     // the row records before it.
     assert!(
-        leaves.len() > 1,
-        "the splitter did not fork: {} leaf/leaves and {} worker install(s) for a plan priced at \
-         {:.3} ns per element",
-        leaves.len(),
-        installs,
-        plan.ns_per_element::<f64, f64>()
+        leaves > 1,
+        "the splitter did not fork: {leaves} leaf/leaves and {installs} worker install(s) for a \
+         plan priced at {:.3} ns per element",
+        plan.ns_per_element_on::<f64, f64>(HostClass::X86_64Avx512)
     );
     assert!(
         installs > 0,
         "no worker was installed: the splitter asked at the row, not at {:.3} ns per element",
-        plan.ns_per_element::<f64, f64>()
+        plan.ns_per_element_on::<f64, f64>(HostClass::X86_64Avx512)
     );
-    assert_eq!(dst[0], 1.5);
-    assert_eq!(dst[127 + 31 * 2048], 1.5);
+    assert_eq!(
+        observed[1],
+        (0, 0),
+        "priced for a class without a beyond-L2 rate the tiled replay must not open the split"
+    );
 }
 
-/// A dense reversed buffer over several axes streams as one run too: fusion
-/// sorts by signed destination stride, so `[-1, -512]` over `[512, 512]` keeps
-/// two axes and the rank-one check alone priced it as strided ([#364]).
+/// #364's scheduling criterion on its transposing acceptance rows past L2: the
+/// width the plan's replay asks for at budget 96 is within one step (one
+/// participant) of the width `Exec::width_for(measured_serial, 1)` picks for the
+/// measured serial time. The rows are the `n` = 512 and 1024 rows of #364's table
+/// (Xeon Platinum 9242, `x86_64-avx512`, serial and warm, `f64`), quoted as
+/// recorded constants because that host is not available here; the pool carries
+/// that class's dispatch costs, and the root token dispatches from outside the
+/// pool as a caller's thread does. The rows that fit L2 (`n` <= 256) keep the row
+/// and are #364 item 1, which this change does not implement.
+#[cfg(feature = "parallel")]
 #[test]
-fn a_reversed_dense_buffer_keeps_the_copy_row() {
-    let dims = [512usize, 512];
-    let strides = [-1isize, -512];
-    let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
-    assert!(
-        plan.is_contiguous_run(),
-        "a dense reversed buffer is one streamed run"
-    );
-    assert_eq!(
-        plan.ns_per_element::<f64, f64>(),
-        crate::cost::KernelClass::Copy.ns_per_element(),
-        "the copy row is the calibrated rate of a streamed copy"
-    );
-    // Above the inline rank the traversal spills with every axis kept, and the
-    // dense reversed run must keep the row there too: 4^9 f64 at -1, -4, ... .
-    let dims = [4usize; 9];
-    let mut stride = -1isize;
-    let nine_strides: Vec<isize> = (0..9)
-        .map(|_| {
-            let this = stride;
-            stride *= 4;
-            this
-        })
-        .collect();
-    let plan = CopyPlan::compile(&dims, &nine_strides, &nine_strides).unwrap();
-    assert!(
-        plan.is_contiguous_run(),
-        "a dense reversed buffer above the inline rank is one streamed run"
-    );
-    assert_eq!(
-        plan.ns_per_element::<f64, f64>(),
-        crate::cost::KernelClass::Copy.ns_per_element(),
-        "the copy row covers a reversed dense run at every rank"
-    );
-    // A sign flip between the axes makes the walk jump: two runs, priced as strided.
-    let mixed = CopyPlan::compile(&[512usize, 512], &[-1isize, 512], &[-1isize, -512]).unwrap();
-    assert!(!mixed.is_contiguous_run(), "mixed signs are not one run");
+fn a_transposing_plan_past_l2_asks_for_the_width_of_its_measured_time() {
+    use core::time::Duration;
+    use threadteam::{DispatchCosts, HostClass, Pool};
+    let class = HostClass::X86_64Avx512;
+    let pool = Pool::builder()
+        .threads(96)
+        .dispatch_costs(DispatchCosts::for_class(class))
+        .build()
+        .unwrap();
+    for (n, measured) in [(512usize, [3.09, 3.24]), (1024, [2.91, 3.07])] {
+        let side = n as isize;
+        let plan = CopyPlan::compile(&[n, n], &[side, 1], &[1, side]).unwrap();
+        let total = n * n;
+        let mut exec = Exec::new(&pool, 96).unwrap();
+        assert_eq!(exec.budget().get(), 96);
+        let rate = plan.ns_per_element_on::<f64, f64>(class);
+        let planned = crate::cost::for_len_at_rate(exec.reborrow(), total, rate)
+            .budget()
+            .get();
+        for ns in measured {
+            let wanted = exec
+                .width_for(Duration::from_secs_f64(total as f64 * ns * 1e-9), 1)
+                .get();
+            assert!(
+                planned.abs_diff(wanted) <= 1,
+                "{n} x {n}: the plan asks for width {planned} at {rate} ns per element, \
+                 the measured {ns} ns per element wants {wanted}"
+            );
+        }
+        // The row it replaced would have asked for a width far from it.
+        let at_row = crate::cost::for_len_at_rate(
+            exec.reborrow(),
+            total,
+            KernelClass::Copy.ns_per_element_of(class),
+        )
+        .budget()
+        .get();
+        assert!(
+            at_row + 1 < planned,
+            "{n} x {n}: the row asks for {at_row}, the plan {planned}"
+        );
+    }
 }
 
 /// A reversed unit-stride run streams like a forward one, so it keeps the `Copy`
@@ -871,7 +909,7 @@ fn a_reversed_run_past_l2_keeps_the_copy_row() {
     );
     let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
     assert_eq!(
-        plan.ns_per_element::<f64, f64>(),
+        plan.ns_per_element_on::<f64, f64>(threadteam::HostClass::detect()),
         KernelClass::Copy.ns_per_element(),
         "a reversed single run is a streamed copy, not a strided one"
     );
@@ -917,4 +955,156 @@ fn the_splitter_asks_its_gate_at_the_rate_it_is_given() {
         installs[1] > 0,
         "1024 elements at 3.0 ns per element must split, whatever the class"
     );
+}
+
+/// The slots a serial replay of `plan` visits, in visit order, as pairs of
+/// (destination slot, source slot) counted from the start of each buffer. The
+/// source is filled with its own slot numbers, so the value each `apply` call
+/// receives names the source slot the replay read.
+fn replay_walk(
+    plan: &CopyPlan,
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+) -> Vec<(isize, isize)> {
+    // Buffer length and base offset that make every reachable slot of a side
+    // in-bounds, negative strides included.
+    let reach = |strides: &[isize]| {
+        let (low, high) =
+            dims.iter()
+                .zip(strides)
+                .fold((0isize, 0isize), |(low, high), (&dim, &stride)| {
+                    let extent = (dim as isize - 1) * stride;
+                    (low + extent.min(0), high + extent.max(0))
+                });
+        ((high - low + 1) as usize, -low)
+    };
+    let (dst_len, dst_base) = reach(dst_strides);
+    let (src_len, src_base) = reach(src_strides);
+    let src: Vec<f64> = (0..src_len).map(|slot| slot as f64).collect();
+    let mut dst = vec![-1.0f64; dst_len];
+    let dst_start = dst.as_ptr() as usize;
+    let src_ref = RawStridedRef::new(&src, dims, src_strides, src_base).unwrap();
+    let mut dst_mut = RawStridedMut::new(&mut dst, dims, dst_strides, dst_base).unwrap();
+    let walk = std::sync::Mutex::new(Vec::new());
+    plan.replay_on(
+        threadteam::HostClass::Generic,
+        &mut dst_mut,
+        &src_ref,
+        |slot: &mut f64, value: f64| {
+            let dst_slot = (slot as *mut f64 as usize - dst_start) / size_of::<f64>();
+            walk.lock()
+                .unwrap()
+                .push((dst_slot as isize, value as isize));
+            *slot = value;
+        },
+        Exec::serial(),
+    )
+    .unwrap();
+    walk.into_inner().unwrap()
+}
+
+/// Whether a walk is one run of consecutive slots on each side: the same unit
+/// step (forward or backward, chosen per side) between every two visits.
+fn walk_streams(walk: &[(isize, isize)]) -> bool {
+    let step = |pair: &[(isize, isize)]| (pair[1].0 - pair[0].0, pair[1].1 - pair[0].1);
+    let Some(first) = walk.windows(2).next().map(step) else {
+        return true;
+    };
+    first.0.abs() == 1 && first.1.abs() == 1 && walk.windows(2).all(|pair| step(pair) == first)
+}
+
+/// The exemption from footprint pricing describes the walk the replay takes,
+/// not a walk the layout would allow: each layout is replayed, its visits are
+/// recorded, and `is_contiguous_run` must answer whether *that* walk was one
+/// streamed run. A dense reversed buffer of rank above one is the case it once
+/// got wrong: fusion sorts by signed destination stride, so `[-1, -512]` over
+/// `[512, 512]` is walked with `-512` fastest (one slot per 4 KiB) and the
+/// rank-9 `[-1, -4, ..., -65536]` with `-65536` fastest, and both were priced
+/// at the contiguous row past the class's L2 (strided-rs#364 review).
+#[test]
+fn the_contiguous_exemption_is_the_walk_the_replay_takes() {
+    use threadteam::HostClass;
+    let avx512 = HostClass::X86_64Avx512;
+    let row = KernelClass::Copy.ns_per_element_of(avx512);
+    let dense = |count: usize, extent: usize, sign: isize| -> Vec<isize> {
+        (0..count as u32)
+            .map(|axis| sign * (extent as isize).pow(axis))
+            .collect()
+    };
+    // Name, extents, destination strides, source strides.
+    type Case = (&'static str, Vec<usize>, Vec<isize>, Vec<isize>);
+    let cases: [Case; 7] = [
+        (
+            "dense forward",
+            vec![512, 512],
+            dense(2, 512, 1),
+            dense(2, 512, 1),
+        ),
+        ("reversed rank one", vec![131_072], vec![-1], vec![-1]),
+        (
+            "dense reversed",
+            vec![512, 512],
+            dense(2, 512, -1),
+            dense(2, 512, -1),
+        ),
+        (
+            "dense reversed, spilled",
+            vec![4; 9],
+            dense(9, 4, -1),
+            dense(9, 4, -1),
+        ),
+        (
+            "forward into reversed",
+            vec![512, 512],
+            dense(2, 512, 1),
+            dense(2, 512, -1),
+        ),
+        ("mixed signs", vec![512, 512], vec![-1, 512], vec![-1, -512]),
+        ("transpose", vec![512, 512], vec![512, 1], vec![1, 512]),
+    ];
+    for (name, dims, dst_strides, src_strides) in &cases {
+        // Every case is past the class's L2, so the exemption is what decides.
+        assert!(
+            plan_footprint(dims, dst_strides, src_strides, 8) > (1 << 20),
+            "{name}: the case must sit past the class's L2"
+        );
+        let plan = CopyPlan::compile(dims, dst_strides, src_strides).unwrap();
+        let walk = replay_walk(&plan, dims, dst_strides, src_strides);
+        assert_eq!(
+            walk.len(),
+            dims.iter().product::<usize>(),
+            "{name}: visit count"
+        );
+        let streams = walk_streams(&walk);
+        let breaks = walk
+            .windows(2)
+            .filter(|pair| (pair[1].0 - pair[0].0).abs() != 1 || (pair[1].1 - pair[0].1).abs() != 1)
+            .count();
+        assert_eq!(
+            plan.is_contiguous_run(),
+            streams,
+            "{name}: the plan claims one streamed run = {}, but the replay walked {} run(s) \
+             (first visits {:?})",
+            plan.is_contiguous_run(),
+            breaks + 1,
+            &walk[..4]
+        );
+        let rate = plan.ns_per_element_on::<f64, f64>(avx512);
+        if streams {
+            assert_eq!(rate, row, "{name}: a streamed walk keeps the row");
+        } else {
+            assert_eq!(
+                rate, 3.0,
+                "{name}: a walk that is not one run pays the footprint"
+            );
+        }
+    }
+    // The spilled case really is the spilled replay.
+    let dims = [4usize; 9];
+    let strides = dense(9, 4, -1);
+    assert!(matches!(
+        CopyPlan::compile(&dims, &strides, &strides).unwrap().fused,
+        PairTraversal::Spilled(_)
+    ));
 }
