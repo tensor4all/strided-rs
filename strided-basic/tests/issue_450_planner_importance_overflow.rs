@@ -3,7 +3,8 @@
 //!
 //! `compute_importance` packs one level per axis, `g = ceil(log2(m + 2))` bits
 //! apart, so the four planner operands of `zip_map3_into` (destination plus
-//! three inputs, `g = 3`) need 97 bits at rank 32 where the score holds 64. The
+//! three inputs, `g = 3`) need 98 bits at rank 32 where the score holds 64: the
+//! highest term is `2^97`, a 93-bit level shift times the `2^4` output weight. The
 //! case below is the reported layout: 2048 elements over 32 axes with a gapped
 //! inner stride, so it takes the fused plan (above `SMALL_TENSOR_THRESHOLD`)
 //! rather than the contiguous fast path.

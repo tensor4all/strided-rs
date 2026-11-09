@@ -98,7 +98,8 @@ missing version for a dependent to meet; the order was (`traits`, `view`,
 ### The fused planner no longer overflows its ordering weights (#450)
 
 `compute_importance` packs each array's axis level `n - order` `g = ceil(log2(m + 2))` bits
-apart, which needs 97 bits at rank 32 with four planner operands. `1u64 << shift` panicked in
+apart, which needs 98 bits at rank 32 with four planner operands (the highest term is
+`2^97`: a 93-bit level shift times the `2^4` output weight). `1u64 << shift` panicked in
 debug ("attempt to shift left with overflow") and wrapped in release, where the plan order for a
 high-rank pointwise call came out scrambled. The packing is now tried first under checked
 arithmetic and kept whenever it fits, so weights and plan order are unchanged wherever the old

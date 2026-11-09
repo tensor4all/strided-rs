@@ -279,7 +279,8 @@ fn test_compute_importance_high_rank_levels_fit_in_u64() {
 
 #[test]
 fn test_compute_importance_high_rank_keeps_level_order() {
-    // Column-major strides on 32 live axes with 3 operands: 97 bits naive, so a
+    // Column-major strides on 32 live axes with 3 operands: 98 bits naive (the
+    // highest term is 2^97), so a
     // wrapping shift scrambles the level order instead of panicking (#450).
     let n = 32;
     let dims = vec![2usize; n];
