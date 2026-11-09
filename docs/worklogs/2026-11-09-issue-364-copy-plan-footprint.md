@@ -54,10 +54,13 @@ that regime at.
   beyond-L2 copy rate past it: on `x86_64-avx512` 3.0 ns per element past 1 MiB
   (the L2 of both hosts behind the row), the row at every size on every class
   without such a measurement.
-- A plan that is one unit-stride run keeps the row at every footprint, a reversed
-  run (`-1` on both sides) included. Measured here: 0.176 at 2 MiB and 0.177 at
-  16 MiB (`n` = 512, 1024), which is the row within 4%. That is #364 item 3: the
-  row stays the class of contiguous runs.
+- A plan that streams as one dense run keeps the row at every footprint. Fusion
+  folds a forward dense run into one axis; a reversed buffer is not folded
+  (`[-1, -512]` over `[512, 512]` stays rank two, because fusion sorts by signed
+  destination stride), so the test is dense-by-ascending-stride with one sign per
+  operand, and a sign flip between axes is not one run. Measured here: 0.176 at
+  2 MiB and 0.177 at 16 MiB (`n` = 512, 1024), which is the row within 4%. That is
+  #364 item 3: the row stays the class of contiguous runs.
 - The rate reaches every scheduling decision the replay makes: the width of the
   replay that is not tiled (`cost::for_len_at_rate`, `copy_plan.rs`'s
   `replay_fused_raw` / `replay_spilled_raw`) and both the fork gate and every node
@@ -130,7 +133,8 @@ ledger installed), `a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_ra
 (executes a 128x32 transposing plan of 2.6 MiB against a pool whose first fork asks
 3 us, and requires **more than one** recorded splitter leaf and at least one worker
 install), `a_reversed_run_past_l2_keeps_the_copy_row` (131072 elements at stride -1
-on both sides, 2 MiB together), plus
+on both sides, 2 MiB together), `a_reversed_dense_buffer_keeps_the_copy_row` (512 x
+512 over `[-1, -512]`, with a mixed-sign control), plus
 `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` (the
 AVX-512 branch, `HostClass::X86_64Avx512` given explicitly, so it runs everywhere)
 and `the_splitter_asks_its_gate_at_the_rate_it_is_given` (drives
