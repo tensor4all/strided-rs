@@ -183,7 +183,10 @@ fn replay_all_static_families<'p>(mint: impl Fn() -> Exec<'p>, mut collect: impl
                 validate_destination_layout_without_alloc(dest.dims(), dest.strides()).unwrap();
             fused_elementwise_into_uninit(&mut dest, &inputs, &plan, validated, mint()).unwrap();
         }
-        // SAFETY: every plan here has a single output and fully overwrites the destination.
+        // SAFETY: `output` has `arrays[0].len()` slots under `arrays[0].dims()` with stride `[1]`
+        // (rank 1), so the layout reaches every slot, and `fused_elementwise_into_uninit`
+        // returned `Ok`; its implementation documents fully overwriting the destination
+        // (fused.rs:1792).
         collect(
             &output
                 .iter()

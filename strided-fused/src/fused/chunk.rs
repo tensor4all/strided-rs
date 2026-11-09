@@ -113,16 +113,19 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
         // INITIALIZATION: initialize through `MaybeUninit` first, then form
         // the live slice. Forming `&mut [T]` over uninitialized storage (even
         // to fill it) violates `from_raw_parts_mut`'s validity requirement.
-        // SAFETY: the `u128` buffer is aligned for `T` (the chunk path only
-        // reaches f32/f64) and the allocation covers `len * size_of::<T>()`
-        // bytes.
+        // SAFETY: the buffer holds `words * 16` bytes, at least `len * size_of::<T>()`
+        // (chunk.rs:109), and its `u128` alignment covers `T`: a `Some` seed, the only way
+        // here, comes from `chunk_seed` (fused.rs:1396), which declines every scalar but `f32`
+        // and `f64` (chunk.rs:82). `MaybeUninit<T>` needs no initialization, and the `RefCell`
+        // borrow makes this the only access.
         let uninit = unsafe {
             core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<MaybeUninit<T>>(), len)
         };
         for slot in uninit.iter_mut() {
             slot.write(seed);
         }
-        // SAFETY: every slot was initialized just above.
+        // SAFETY: every one of the `len` slots was written by the loop just above, so the `T`
+        // view is initialized; it reborrows `uninit`.
         let regs = unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<T>(), len) };
         f(regs)
     })
@@ -131,11 +134,18 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
 /// Replay one eligible block into initialized destinations.
 ///
 /// # Safety
-/// Each entry of `dst_ptrs` and `input_ptrs` must address `offsets[i]` plus
-/// `len` contiguous readable (inputs) or writable (outputs) elements, the plan
-/// must be validated for these operand counts, `strides` must satisfy
-/// [`block_replay_eligible`], and `regs` must hold [`register_file_len`]
-/// elements.
+/// Each entry of `dst_ptrs`, and each stride-1 entry of `input_ptrs`, must
+/// address `offsets[i]` plus `len` contiguous writable (outputs) or readable
+/// (inputs) elements; a stride-0 input need only address one readable element
+/// at `offsets[i]`. No other thread may access those destination elements
+/// during the call. Neither the input nor the destination storage may overlap
+/// `regs`: the replay holds `&mut` chunks of `regs` while it reads direct input
+/// slices and writes destination slices. The plan must be validated for these
+/// operand counts, `strides` must satisfy [`block_replay_eligible`], and `regs`
+/// must hold [`register_file_len`] elements. `direct` may mark only stride-1
+/// inputs that no entry of `plan.outputs` names: the replay neither loads nor
+/// computes a direct input's register, so a destination naming it would store
+/// the register's stale contents instead of the input.
 // Chunk replay: pointer tables, plan, offsets, the block length, strides, direct
 // flags and registers.
 #[allow(clippy::too_many_arguments)]
@@ -164,6 +174,7 @@ pub(super) unsafe fn replay_chunked<T: FusedScalar>(
     });
     // SAFETY: the caller upholds this function's contract, which the block body shares.
     #[cfg(not(feature = "simd"))]
+    // SAFETY: `replay_block` has this function's contract (chunk.rs:152), passed on unchanged.
     unsafe {
         replay_block(
             dst_ptrs, input_ptrs, plan, offsets, len, strides, direct, regs,
@@ -198,7 +209,9 @@ impl<T: FusedScalar> pulp::WithSimd for ReplayBlock<'_, T> {
 
     #[inline(always)]
     fn with_simd<S: pulp::Simd>(self, _simd: S) {
-        // SAFETY: built only by `replay_chunked`, whose caller upholds the contract.
+        // SAFETY: `ReplayBlock` is private to this module and built only in `replay_chunked`
+        // (chunk.rs:152) from arguments that meet that function's contract, which
+        // `replay_block` shares.
         unsafe {
             replay_block(
                 self.dst_ptrs,
@@ -233,7 +246,9 @@ impl<T: FusedScalar> pulp::WithSimd for ReplayBlockUninit<'_, T> {
 
     #[inline(always)]
     fn with_simd<S: pulp::Simd>(self, _simd: S) {
-        // SAFETY: built only by `replay_chunked_uninit`, whose caller upholds the contract.
+        // SAFETY: `ReplayBlockUninit` is private to this module and built only in
+        // `replay_chunked_uninit` (chunk.rs:339) from arguments that meet that function's
+        // contract, which `replay_block_uninit` shares.
         unsafe {
             replay_block_uninit(
                 self.dst_ptrs,
@@ -267,14 +282,17 @@ unsafe fn replay_block<T: FusedScalar>(
     regs: &mut [T],
 ) {
     let output_count = dst_ptrs.len();
-    // SAFETY: the caller proved every operand addresses this block's `len`
-    // contiguous elements, so the broadcast value is readable.
+    // SAFETY: `fill_broadcast_inputs` (chunk.rs:443) needs each stride-0 input readable at its
+    // block offset and no operand element inside `regs`. This function's contract (chunk.rs:137)
+    // gives both: a stride-0 input addresses one readable element at its offset, and neither
+    // input nor destination storage may overlap `regs`.
     unsafe { fill_broadcast_inputs(input_ptrs, offsets, output_count, strides, regs) };
     let mut done = 0;
     while done < len {
         let chunk = (len - done).min(FUSED_CHUNK_ELEMS);
-        // SAFETY: the caller proved every operand addresses this block's `len`
-        // contiguous elements, so the chunk is inside the operand.
+        // SAFETY: `load_input_chunks` copies `done .. done + chunk` of each stride-1 input that
+        // is not direct; `done + chunk <= len`, so the range lies inside the `len` contiguous
+        // elements the contract (chunk.rs:137) promises.
         unsafe {
             load_input_chunks(
                 input_ptrs,
@@ -287,7 +305,9 @@ unsafe fn replay_block<T: FusedScalar>(
                 regs,
             )
         };
-        // SAFETY: as for the load.
+        // SAFETY: `run_chunks` reads direct inputs over the same `done .. done + chunk` range,
+        // and `direct` marks only stride-1 inputs (contract and `direct_inputs`, fused.rs:1441),
+        // so the range lies inside their `len` elements.
         unsafe {
             run_chunks(
                 plan,
@@ -300,7 +320,9 @@ unsafe fn replay_block<T: FusedScalar>(
                 regs,
             )
         };
-        // SAFETY: as for the load.
+        // SAFETY: `store_output_chunks` writes `done .. done + chunk` of each output, inside the
+        // `len` contiguous writable elements the contract (chunk.rs:137) promises; no other
+        // thread writes them.
         unsafe { store_output_chunks(dst_ptrs, plan, offsets, done, chunk, regs) };
         done += chunk;
     }
@@ -339,6 +361,8 @@ pub(super) unsafe fn replay_chunked_uninit<T: FusedScalar>(
     });
     // SAFETY: the caller upholds this function's contract, which the block body shares.
     #[cfg(not(feature = "simd"))]
+    // SAFETY: `replay_block_uninit` has this function's contract (chunk.rs:339), passed on
+    // unchanged.
     unsafe {
         replay_block_uninit(
             dst_ptrs, input_ptrs, plan, offsets, len, strides, direct, regs,
@@ -364,14 +388,17 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
     regs: &mut [T],
 ) {
     let output_count = dst_ptrs.len();
-    // SAFETY: the caller proved every operand addresses this block's `len`
-    // contiguous elements, so the broadcast value is readable.
+    // SAFETY: `fill_broadcast_inputs` (chunk.rs:443) needs each stride-0 input readable at its
+    // block offset and no operand element inside `regs`. This function's contract (chunk.rs:137)
+    // gives both: a stride-0 input addresses one readable element at its offset, and neither
+    // input nor destination storage may overlap `regs`.
     unsafe { fill_broadcast_inputs(input_ptrs, offsets, output_count, strides, regs) };
     let mut done = 0;
     while done < len {
         let chunk = (len - done).min(FUSED_CHUNK_ELEMS);
-        // SAFETY: the caller proved every operand addresses this block's `len`
-        // contiguous elements, so the chunk is inside the operand.
+        // SAFETY: `load_input_chunks` copies `done .. done + chunk` of each stride-1 input that
+        // is not direct; `done + chunk <= len`, so the range lies inside the `len` contiguous
+        // elements the contract (chunk.rs:137) promises.
         unsafe {
             load_input_chunks(
                 input_ptrs,
@@ -384,7 +411,9 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
                 regs,
             )
         };
-        // SAFETY: as for the load.
+        // SAFETY: `run_chunks` reads direct inputs over the same `done .. done + chunk` range,
+        // and `direct` marks only stride-1 inputs (contract and `direct_inputs`, fused.rs:1441),
+        // so the range lies inside their `len` elements.
         unsafe {
             run_chunks(
                 plan,
@@ -397,7 +426,8 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
                 regs,
             )
         };
-        // SAFETY: as for the load, and the destination chunks are writable.
+        // SAFETY: as for the initialized store: `done .. done + chunk` lies inside each output's
+        // `len` writable `MaybeUninit` elements (chunk.rs:137).
         unsafe { store_output_chunks_uninit(dst_ptrs, plan, offsets, done, chunk, regs) };
         done += chunk;
     }
@@ -410,7 +440,9 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
 /// `input_count..`, so the filled input register survives every later chunk.
 ///
 /// # Safety
-/// Every operand must address a readable element at its block offset.
+/// Every operand must address a readable element at its block offset, and no
+/// operand element may lie inside `regs`: this function writes `regs` through
+/// `&mut` while it reads the operands through raw pointers.
 #[inline]
 unsafe fn fill_broadcast_inputs<T: FusedScalar>(
     input_ptrs: &[*const T],
@@ -423,7 +455,9 @@ unsafe fn fill_broadcast_inputs<T: FusedScalar>(
         if strides[first_operand + index] != 0 {
             continue;
         }
-        // SAFETY: the caller proved the operand addresses this block.
+        // SAFETY: this function's contract (chunk.rs:443): the operand addresses a readable
+        // element at its block offset, outside `regs`, so this read does not alias the `&mut`
+        // register file.
         let value = unsafe { *ptr.offset(offsets[first_operand + index]) };
         regs[index * FUSED_CHUNK_ELEMS..][..FUSED_CHUNK_ELEMS].fill(value);
     }
@@ -452,7 +486,9 @@ unsafe fn load_input_chunks<T: FusedScalar>(
         if direct[index] || strides[first_operand + index] == 0 {
             continue;
         }
-        // SAFETY: the caller proved the block is contiguous for this operand.
+        // SAFETY: this input has stride 1 (stride 0 was skipped above) and is not direct, so by
+        // the contract (chunk.rs:137) `offsets + done .. + chunk` lies inside its `len`
+        // contiguous readable elements, which nothing writes during the call.
         let src = unsafe {
             std::slice::from_raw_parts(
                 ptr.offset(offsets[first_operand + index] + done as isize),
@@ -475,7 +511,9 @@ unsafe fn store_output_chunks<T: FusedScalar>(
     regs: &[T],
 ) {
     for (index, &ptr) in dst_ptrs.iter().enumerate() {
-        // SAFETY: the caller proved the block is contiguous for this operand.
+        // SAFETY: by the contract (chunk.rs:137) each output has `len` contiguous writable
+        // elements from its offset, `done + chunk <= len`, and no other thread accesses them, so
+        // this `&mut` slice is exclusive.
         let dst = unsafe {
             std::slice::from_raw_parts_mut(ptr.offset(offsets[index] + done as isize), chunk)
         };
@@ -497,7 +535,9 @@ unsafe fn store_output_chunks_uninit<T: FusedScalar>(
     regs: &[T],
 ) {
     for (index, &ptr) in dst_ptrs.iter().enumerate() {
-        // SAFETY: the caller proved the block is contiguous for this operand.
+        // SAFETY: by the contract (chunk.rs:137) each output has `len` contiguous writable
+        // elements from its offset, `done + chunk <= len`, and no other thread accesses them, so
+        // this `&mut` slice is exclusive.
         let dst = unsafe {
             std::slice::from_raw_parts_mut(ptr.offset(offsets[index] + done as isize), chunk)
         };
@@ -533,8 +573,10 @@ unsafe fn run_chunks<T: FusedScalar>(
         let dest = &mut rest[..chunk];
         let read = |index: usize| -> &[T] {
             if index < plan.input_count && direct[index] {
-                // SAFETY: the caller proved the block is contiguous for this
-                // operand, and a single-use input has not been written over.
+                // SAFETY: `direct[index]` holds only for stride-1 inputs (contract,
+                // chunk.rs:137; `direct_inputs`, fused.rs:1441), so `offsets + done .. +
+                // chunk` lies inside the input's `len` contiguous readable elements. Inputs are
+                // never written during the call.
                 return unsafe {
                     std::slice::from_raw_parts(
                         input_ptrs[index].offset(offsets[first_operand + index] + done as isize),
@@ -676,8 +718,10 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
         dst: &mut [U],
         kernels: impl Fn(FusedOp, &[U], &mut [MaybeUninit<U>]) -> bool,
     ) -> bool {
-        // SAFETY: `MaybeUninit<U>` and `U` have the same layout, and every
-        // element is written exactly once before it is read back as `U`.
+        // SAFETY: `MaybeUninit<U>` has the layout of `U`. Viewing the initialized `dst` as
+        // `MaybeUninit<U>` is sound as long as nothing writes an uninitialized value through it:
+        // the kernels write only computed values (elem-simd-math 0.1.1 `src/dispatch.rs:3`), and
+        // on a length mismatch or an unsupported op they write nothing.
         let uninit = unsafe {
             std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<U>>(), dst.len())
         };
@@ -685,7 +729,8 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
     }
 
     if TypeId::of::<T>() == TypeId::of::<f32>() {
-        // SAFETY: the `TypeId` guard proves `T` is `f32`.
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:763) is `T == U`, which the `TypeId`
+        // comparison just above proves for `f32`.
         let (src, dst) = unsafe { cast_chunk::<T, f32>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
             FusedOp::Exp => elem_simd_math::f32::exp(src, dst).is_ok(),
@@ -698,7 +743,8 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
         });
     }
     if TypeId::of::<T>() == TypeId::of::<f64>() {
-        // SAFETY: the `TypeId` guard proves `T` is `f64`.
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:763) is `T == U`, which the `TypeId`
+        // comparison just above proves for `f64`.
         let (src, dst) = unsafe { cast_chunk::<T, f64>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
             FusedOp::Exp => elem_simd_math::f64::exp(src, dst).is_ok(),
@@ -723,7 +769,10 @@ unsafe fn cast_chunk<'a, T: 'static, U: 'static>(
     debug_assert_eq!(TypeId::of::<T>(), TypeId::of::<U>());
     debug_assert_eq!(size_of::<T>(), size_of::<U>());
     debug_assert_eq!(align_of::<T>(), align_of::<U>());
+    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:763), so the
+    // pointer, length and lifetime describe the same elements.
     let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<U>(), src.len()) };
+    // SAFETY: as for `src`; `dst` keeps its exclusive borrow.
     let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<U>(), dst.len()) };
     (src, dst)
 }
