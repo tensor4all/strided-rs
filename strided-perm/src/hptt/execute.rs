@@ -148,7 +148,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                 // SAFETY: a rootless Transpose plan is the whole `size_a` x
                 // `size_b` tile at `src`/`dst`, with unit inner strides
                 // (plan.rs:166) and `lda_inner`/`ldb_inner` across, which is the
-                // region `dispatch_blocked_2d_par` (execute.rs:674) requires. `exec`
+                // region `dispatch_blocked_2d_par` (execute.rs:676) requires. `exec`
                 // fans out only over an injective destination, per this
                 // function's `# Safety`.
                 dispatch_blocked_2d_par(
@@ -432,6 +432,7 @@ unsafe fn walk_outer<T>(
 /// `src`/`dst` (the tile as in [`dispatch_blocked_2d`]) must be valid for
 /// reads from `src` and writes to `dst`; the two extents must not overlap,
 /// and no other thread may write those destination elements during the call.
+/// `block` must be non-zero, as [`dispatch_blocked_2d`] requires.
 #[allow(clippy::too_many_arguments)] // INVARIANT: raw cursors plus the tile geometry the leaf needs.
 unsafe fn transpose_recursive<T: Copy + 'static>(
     src: *const T,
@@ -451,7 +452,8 @@ unsafe fn transpose_recursive<T: Copy + 'static>(
     for _ in 0..node.end {
         // SAFETY: `s`/`d` are the origins for this level's current index, so
         // the remaining levels and the tile reach a subset of the elements this
-        // call's `# Safety` (execute.rs:431) covers.
+        // call's `# Safety` (execute.rs:431) covers. `block` is the plan's
+        // `block_for_elem_size` (plan.rs:266), 16 or 32, so it is non-zero.
         if rest.is_empty() {
             dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
         } else {
@@ -536,7 +538,7 @@ unsafe fn blocked_transpose_2d_f64(
             let ba = block.min(size_a - ia);
             // SAFETY: `ia < size_a` and `ib < size_b`, and `ba`/`bb` clamp the
             // tile to the grid, so both `offset`s land on an element of this
-            // call's region (execute.rs:476) and the `ba` x `bb` sub-tile is
+            // call's region (execute.rs:478) and the `ba` x `bb` sub-tile is
             // inside it, as `macro_kernel_f64` (macro_kernel.rs:26) requires.
             macro_kernel_f64(
                 src.offset(ia as isize + ib as isize * lda),
@@ -573,7 +575,7 @@ unsafe fn blocked_transpose_2d_f32(
             let ba = block.min(size_a - ia);
             // SAFETY: `ia < size_a` and `ib < size_b`, and `ba`/`bb` clamp the
             // tile to the grid, so both `offset`s land on an element of this
-            // call's region (execute.rs:476) and the `ba` x `bb` sub-tile is
+            // call's region (execute.rs:478) and the `ba` x `bb` sub-tile is
             // inside it, as `macro_kernel_f32` (macro_kernel.rs:101) requires.
             macro_kernel_f32(
                 src.offset(ia as isize + ib as isize * lda),
@@ -610,7 +612,7 @@ unsafe fn blocked_transpose_2d_fallback<T: Copy>(
             let ba = block.min(size_a - ia);
             // SAFETY: `ia < size_a` and `ib < size_b`, and `ba`/`bb` clamp the
             // tile to the grid, so both `offset`s land on an element of this
-            // call's region (execute.rs:476) and the `ba` x `bb` sub-tile is
+            // call's region (execute.rs:478) and the `ba` x `bb` sub-tile is
             // inside it, as `macro_kernel_fallback` (macro_kernel.rs:233) requires.
             macro_kernel_fallback(
                 src.offset(ia as isize + ib as isize * lda),
@@ -695,7 +697,7 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
     match native_float_kind::<T>() {
         // SAFETY: the closures rebuild the pointers from `as usize` casts of the
         // live `src`/`dst` (exposed provenance, recovered by the casts back).
-        // `for_each_tile_par` (execute.rs:642) hands out tile origins in
+        // `for_each_tile_par` (execute.rs:644) hands out tile origins in
         // `0..size_a` x `0..size_b` with extents clamped to the grid, so each
         // sub-tile stays inside the `size_a` x `size_b` region whose validity the
         // caller proved under `execute_permute_blocked`'s `# Safety`
@@ -775,7 +777,7 @@ unsafe fn const_stride1_recursive<T: Copy>(
     for _ in 0..node.end {
         // SAFETY: `s`/`d` are the origins for this level's current index, so
         // the remaining levels and the inner run reach a subset of the elements
-        // this call's `# Safety` (execute.rs:755) covers; with `count >= 1` the
+        // this call's `# Safety` (execute.rs:757) covers; with `count >= 1` the
         // leaf origins are elements, so they are non-null and aligned.
         if rest.is_empty() {
             const_stride1_copy(s, d, count, src_stride, dst_stride);
