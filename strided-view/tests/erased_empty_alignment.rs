@@ -27,7 +27,8 @@ fn empty_erased_buffers_must_still_be_aligned() {
         ($constructor:expr) => {
             assert!(matches!(
                 $constructor,
-                Err(strided_view::StridedError::DataAlignmentMismatch { alignment: 8, .. })
+                Err(strided_view::StridedError::DataAlignmentMismatch { alignment, .. })
+                    if alignment == core::mem::align_of::<f64>()
             ))
         };
     }
