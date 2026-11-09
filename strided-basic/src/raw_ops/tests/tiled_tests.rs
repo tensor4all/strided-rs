@@ -1166,6 +1166,7 @@ fn tile_ranges_partition_the_tiled_box_walk() {
         for &cut in &cuts {
             let mut actual = vec![0.0f64; dst_len];
             let dst_ptr = actual.as_mut_ptr();
+            crate::threading::take_tile_boxes();
             for (first, len) in [(0, cut), (cut, count - cut)] {
                 // SAFETY: `lens` sizes both buffers for every slot of the
                 // layout, the tiles are `pair_tiles` of it, the destination
@@ -1185,6 +1186,11 @@ fn tile_ranges_partition_the_tiled_box_walk() {
                 }
             }
             assert_eq!(bits(&actual), bits(&expected), "{label}: cut at {cut}");
+            assert_eq!(
+                crate::threading::take_tile_boxes(),
+                count,
+                "{label}: cut at {cut} must walk every tile once"
+            );
         }
     }
     assert!(tiled >= 2, "only {tiled} layouts tiled inline");

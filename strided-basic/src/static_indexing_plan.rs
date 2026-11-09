@@ -1592,6 +1592,16 @@ impl ConcatenatePlan {
         // Replay the elements `local_start..local_end` of one segment: the
         // tiles whose share starts in them, or the flat range.
         let replay_segment = |position: usize, local_start: usize, local_end: usize| {
+            // The tile walk records each tile it visits on the thread that
+            // walks it. Move this call's tiles from the worker's count to the
+            // caller's (below), keeping what the thread had counted before.
+            #[cfg(test)]
+            let counted_before = crate::threading::take_tile_boxes();
+            #[cfg(test)]
+            let _move_tiles = MoveTileCount {
+                counted_before,
+                walked: &walked_tiles,
+            };
             // The whole-plan guard above proved every segment has an inline
             // fused layout; skip one only if a future caller relaxes that
             // check.
@@ -1628,8 +1638,6 @@ impl ConcatenatePlan {
                         end - first,
                         &apply,
                     );
-                    #[cfg(test)]
-                    walked_tiles.fetch_add(end - first, core::sync::atomic::Ordering::Relaxed);
                 } else {
                     crate::raw_ops::apply_fused_range(
                         dest_ptr.as_ptr(),
@@ -1765,6 +1773,24 @@ impl ConcatenatePlan {
             )
         };
         self.copy_plans[position].execute_uninit(&mut segment, input, exec)
+    }
+}
+
+/// Moves the tile boxes the current thread recorded since it was built into
+/// `walked`, and restores the count the thread had before, when dropped.
+#[cfg(test)]
+struct MoveTileCount<'a> {
+    counted_before: usize,
+    walked: &'a core::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Drop for MoveTileCount<'_> {
+    fn drop(&mut self) {
+        let walked = crate::threading::take_tile_boxes();
+        self.walked
+            .fetch_add(walked, core::sync::atomic::Ordering::Relaxed);
+        crate::threading::record_tile_boxes(self.counted_before);
     }
 }
 

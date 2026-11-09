@@ -543,8 +543,6 @@ pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
             dst_ptr, dst_base, src_ptr, src_base, tile_box, blocks, 0, tiles, apply,
         );
     }
-    #[cfg(test)]
-    crate::threading::record_tile_boxes(tiles);
 }
 
 /// Number of tiles of extents `blocks` that cover `tile_box`; at most its
@@ -612,6 +610,10 @@ pub(crate) unsafe fn apply_tile_range<D, S, Apply>(
     }
     let mut left = count;
     loop {
+        // Counted here, where the tile is walked, so that a test sees the
+        // walk itself and not the range a caller asked for.
+        #[cfg(test)]
+        crate::threading::record_tile_box();
         // SAFETY: the tile is a sub-box of `tile_box` at a reachable origin, so
         // the caller's contract covers every logical index of the tile.
         unsafe {
