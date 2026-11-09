@@ -449,7 +449,7 @@ fn base_ptr<T>(data: &[T], dims: &[usize], offset: isize) -> *const T {
     } else {
         // SAFETY: every caller reaches `base_ptr` from `from_meta`, whose
         // `dims`/`strides`/`offset` were either accepted by `validate_bounds`
-        // (view.rs:186) — `StridedView::new`, `StridedViewMut::new`, the
+        // (view.rs:187) — `StridedView::new`, `StridedViewMut::new`, the
         // re-validated diagonal path, or a metadata transform that only reorders
         // axes or zeroes strides and therefore cannot enlarge the reachable
         // offset set — or were supplied under the `new_unchecked` contract. The
@@ -522,6 +522,8 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     /// use strided_view::StridedView;
     ///
     /// let data = [1.0f64, 2.0, 3.0, 4.0];
+    /// // SAFETY: the largest reachable offset, 1 * 1 + 1 * 2 = 3, is below
+    /// // `data.len() == 4`.
     /// let view = unsafe { StridedView::<f64>::new_unchecked(&data, &[2, 2], &[1, 2], 0) };
     /// assert_eq!(view.ndim(), 2);
     /// ```
@@ -798,10 +800,12 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
     /// bounds, or the indexed offset does not fit `isize`.
     pub fn get(&self, indices: &[usize]) -> T {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
-        // SAFETY: `indexed_offset` (view.rs:239) asserts the index count and
+        // SAFETY: `indexed_offset` (view.rs:240) asserts the index count and
         // `index < dims[i]`, so the offset it returns lies within the reachable
-        // extent that `validate_bounds` (view.rs:186) proved stays inside
-        // `data` for this view's construction.
+        // extent that `validate_bounds` (view.rs:187) proved stays inside
+        // `data` for this view's construction (or that the `new_unchecked`
+        // contract promised). A view from `StridedArray::view`
+        // (view.rs:1451) carries the same proof; see the comment there.
         Op::apply(unsafe { *self.ptr.offset(offset) })
     }
 
@@ -815,6 +819,13 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
         for (i, &index) in indices.iter().enumerate() {
             idx += index as isize * self.strides()[i];
         }
+        // SAFETY: this function's contract (view.rs:815) puts every index
+        // in bounds, so `idx` is an offset the view's construction proved
+        // reachable: by `validate_bounds` (view.rs:187), the dense
+        // constructors (see `StridedArray::view`, view.rs:1451), or the
+        // `new_unchecked` contract. `ptr` is the view's base, so
+        // `ptr + idx` stays inside `data`. An extra index past the rank panics
+        // on `strides()[i]` before this line; a missing one counts as 0.
         Op::apply(*self.ptr.offset(idx))
     }
 }
@@ -877,7 +888,7 @@ impl<'a, T> StridedViewMut<'a, T> {
             empty_mut_ptr()
         } else {
             // SAFETY: as `base_ptr` above — `offset` was accepted by
-            // `validate_bounds` (view.rs:186) in `StridedViewMut::new`, or by a
+            // `validate_bounds` (view.rs:187) in `StridedViewMut::new`, or by a
             // metadata transform that only reorders axes or zeroes strides, or
             // came from the `new_unchecked` contract. `base` is this view's own
             // live handle on `data` and the empty-layout branch above excludes
@@ -941,6 +952,8 @@ impl<'a, T> StridedViewMut<'a, T> {
     /// use strided_view::StridedViewMut;
     ///
     /// let mut data = [0.0f64; 4];
+    /// // SAFETY: the largest reachable offset, 1 * 1 + 1 * 2 = 3, is below
+    /// // `data.len() == 4`.
     /// let view = unsafe { StridedViewMut::<f64>::new_unchecked(&mut data, &[2, 2], &[1, 2], 0) };
     /// assert_eq!(view.ndim(), 2);
     /// ```
@@ -1117,9 +1130,9 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
         // slice from `base` and never rewrites `ptr`, and offsetting a raw
         // pointer keeps `base`'s provenance. (An empty layout caches a dangling
         // `ptr`, but no index satisfies `index < dims[i]` there, so this access
-        // is unreachable.) `indexed_offset` (view.rs:239) asserts the index
+        // is unreachable.) `indexed_offset` (view.rs:240) asserts the index
         // count and `index < dims[i]`, so the relative offset it returns keeps
-        // `ptr + offset` inside the extent `validate_bounds` (view.rs:186)
+        // `ptr + offset` inside the extent `validate_bounds` (view.rs:187)
         // proved reachable, i.e. inside `base..base + src_len`, where every
         // element is initialized because the view borrows an initialized
         // `&'a mut [T]` and no method shortens that borrow.
@@ -1135,7 +1148,7 @@ impl<'a, T: Copy> StridedViewMut<'a, T> {
     pub fn set(&mut self, indices: &[usize], value: T) {
         let offset = indexed_offset(self.dims(), self.strides(), indices, 0);
         // SAFETY: as `get` above — the same `ptr` survives an earlier `data_mut`
-        // reborrow, and `indexed_offset` (view.rs:239) bounds-checks every index,
+        // reborrow, and `indexed_offset` (view.rs:240) bounds-checks every index,
         // so the store lands inside `base..base + src_len`. `&mut self` makes
         // this the only access through the view for the call, and the view holds
         // the sole `&'a mut [T]` borrow of that storage, so nothing else can
@@ -1440,10 +1453,18 @@ impl<T> StridedArray<T> {
             empty_const_ptr()
         } else {
             // SAFETY: `offset` is either 0 from a constructor or was accepted by
-            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1374), so
+            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1388), so
             // `data.as_ptr() + offset` stays inside `data`. The empty branch
             // above excludes a zero-sized layout, whose offset need not be
-            // reachable.
+            // reachable. The view built below also needs the whole reachable
+            // extent inside `data` (its `get` relies on it): `from_parts` proved
+            // that with `validate_bounds`, and every dense constructor
+            // (`try_col_major`, view.rs:1237, and its row-major, `from_fn`,
+            // `from_buffer` and uninit siblings) stores exactly
+            // `checked_element_count(dims)` (view.rs:266) elements under
+            // `checked_dense_strides` (view.rs:292), whose highest offset is that
+            // count minus one. `permuted` only reorders axes, and `data_mut`
+            // hands out a slice, which cannot change the length.
             unsafe { self.data.as_ptr().offset(self.offset) }
         };
         StridedView {
@@ -1465,9 +1486,11 @@ impl<T> StridedArray<T> {
         } else {
             // SAFETY: as `view` above — `self.offset` is either 0 from a
             // constructor or was accepted by `validate_bounds` in
-            // `StridedArray::from_parts` (view.rs:1374), and `&mut self` keeps
+            // `StridedArray::from_parts` (view.rs:1388), and `&mut self` keeps
             // this reborrow exclusive. The empty branch above excludes a
-            // zero-sized layout, whose offset need not be reachable.
+            // zero-sized layout, whose offset need not be reachable. The whole
+            // reachable extent stays inside `data` for the same reasons given in
+            // `view`, which `StridedViewMut::get`/`set` rely on.
             unsafe { base.offset(self.offset) }
         };
         StridedViewMut {
@@ -1599,6 +1622,7 @@ impl<T: Copy> StridedArray<T> {
     /// use std::mem::MaybeUninit;
     /// use strided_view::StridedArray;
     ///
+    /// // SAFETY: each slot is written below before it is read.
     /// let mut a = unsafe { StridedArray::<bool>::col_major_uninit(&[2]) };
     /// a.set(&[0], MaybeUninit::new(true));
     /// a.set(&[1], MaybeUninit::new(false));
