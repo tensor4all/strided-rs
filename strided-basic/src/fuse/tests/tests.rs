@@ -548,9 +548,9 @@ fn test_compute_importance_matches_exact_reference() {
             // position: the output, each input in turn, and all operands at
             // once. This sweep multiplies by `1 + (2^n - 1) * (m + 1)`, so it
             // keeps full permutation independence only up to `(n!)^m <= 600`
-            // and permutes one operand at a time above that. The size-1
-            // variants rotate across the grid, so every broadcast case is also
-            // checked against several dims shapes.
+            // and permutes one operand at a time above that. Each case gets one
+            // dims shape, taken from the grid in rotation, so the sweep covers
+            // every shape but no single case sees more than one.
             let broadcast_tuples: Vec<Vec<Vec<isize>>> = if perms.len().pow(m as u32) <= 600 {
                 tuples.clone()
             } else {
