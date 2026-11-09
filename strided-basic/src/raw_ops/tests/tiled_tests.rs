@@ -324,11 +324,11 @@ fn tiled_replays_equal_the_column_major_oracle() {
 #[test]
 fn tiled_dynamic_slice_window_equals_the_oracle() {
     use crate::DynamicSlicePlan;
-    // A transposing window of a [100, 90] operand at runtime start (7, 11).
-    let operand_dims = [100usize, 90];
-    let operand_strides = [90isize, 1];
-    let sizes = [67usize, 45];
-    let dest_strides = [1isize, 67];
+    // A transposing window of a [220, 200] operand at runtime start (7, 11).
+    let operand_dims = [220usize, 200];
+    let operand_strides = [200isize, 1];
+    let sizes = [197usize, 185];
+    let dest_strides = [1isize, 197];
     assert!(pair_tiles::<MaybeUninit<f64>, f64>(
         &fuse_pair_layout(&sizes, &dest_strides, &operand_strides).unwrap()
     )
@@ -343,19 +343,20 @@ fn tiled_dynamic_slice_window_equals_the_oracle() {
         &sizes,
     )
     .unwrap();
-    let data: Vec<f64> = (0..9000).map(f64::value).collect();
+    let data: Vec<f64> = (0..44_000).map(f64::value).collect();
     let operand = RawStridedRef::new(&data, &operand_dims, &operand_strides, 0).unwrap();
     let starts_data = [7i64, 11];
     let starts = RawStridedRef::new(&starts_data, &[2], &[1], 0).unwrap();
-    let mut expected = vec![0.0f64; 67 * 45];
-    for j in 0..45 {
-        for i in 0..67 {
-            expected[i + 67 * j] = data[(i + 7) * 90 + (j + 11)];
+    let mut expected = vec![0.0f64; 197 * 185];
+    for j in 0..185 {
+        for i in 0..197 {
+            expected[i + 197 * j] = data[(i + 7) * 200 + (j + 11)];
         }
     }
     let team = team();
+    crate::threading::take_tiled_leaves();
     for exec in [Exec::serial(), team.exec(4)] {
-        let mut out = vec![0.0f64; 67 * 45];
+        let mut out = vec![0.0f64; 197 * 185];
         plan.execute(
             &mut RawStridedMut::new(&mut out, &sizes, &dest_strides, 0).unwrap(),
             &operand,
@@ -365,6 +366,80 @@ fn tiled_dynamic_slice_window_equals_the_oracle() {
         .unwrap();
         assert_eq!(bits(&out), bits(&expected));
     }
+    let leaves = crate::threading::take_tiled_leaves();
+    #[cfg(feature = "parallel")]
+    {
+        let window = Layout::new(&sizes, &dest_strides, &operand_strides, 7 * 200 + 11);
+        assert!(!leaves.is_empty());
+        assert!(leaf_visits(&window, &leaves).iter().all(|&v| v == 1));
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = leaves;
+}
+
+#[test]
+fn tiled_dynamic_update_slice_window_equals_the_oracle() {
+    use crate::DynamicUpdateSlicePlan;
+    // A transposing [197, 185] update into a dense [220, 200] operand at runtime
+    // start (7, 11); the operand copy is contiguous and does not tile.
+    let dims = [220usize, 200];
+    let strides = [200isize, 1];
+    let sizes = [197usize, 185];
+    let update_strides = [1isize, 197];
+    assert!(pair_tiles::<MaybeUninit<f64>, f64>(
+        &fuse_pair_layout(&sizes, &strides, &update_strides).unwrap()
+    )
+    .is_some());
+    let plan = DynamicUpdateSlicePlan::compile(
+        &dims,
+        &strides,
+        &[2],
+        &[1],
+        &sizes,
+        &update_strides,
+        &dims,
+        &strides,
+    )
+    .unwrap();
+    let data: Vec<f64> = (0..44_000).map(f64::value).collect();
+    let operand = RawStridedRef::new(&data, &dims, &strides, 0).unwrap();
+    let update_data: Vec<f64> = (44_000..44_000 + 197 * 185).map(f64::value).collect();
+    let update = RawStridedRef::new(&update_data, &sizes, &update_strides, 0).unwrap();
+    let starts_data = [7i64, 11];
+    let starts = RawStridedRef::new(&starts_data, &[2], &[1], 0).unwrap();
+    let mut expected = data.clone();
+    for j in 0..185 {
+        for i in 0..197 {
+            expected[(i + 7) * 200 + (j + 11)] = update_data[i + 197 * j];
+        }
+    }
+    let team = team();
+    crate::threading::take_tiled_leaves();
+    for exec in [Exec::serial(), team.exec(4)] {
+        let mut out = vec![0.0f64; 44_000];
+        plan.execute(
+            &mut RawStridedMut::new(&mut out, &dims, &strides, 0).unwrap(),
+            &operand,
+            &update,
+            &starts,
+            exec,
+        )
+        .unwrap();
+        assert_eq!(bits(&out), bits(&expected));
+    }
+    let leaves = crate::threading::take_tiled_leaves();
+    #[cfg(feature = "parallel")]
+    {
+        // The fused window walks its axes in destination-stride order.
+        let window = Layout {
+            dst_offset: 7 * 200 + 11,
+            ..Layout::new(&[185, 197], &[1, 200], &[197, 1], 0)
+        };
+        assert!(!leaves.is_empty());
+        assert!(leaf_visits(&window, &leaves).iter().all(|&v| v == 1));
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = leaves;
 }
 
 #[test]
@@ -614,8 +689,9 @@ fn tiled_replay_keeps_the_callers_budget() {
     let src: Vec<f64> = (0..src_len).map(f64::value).collect();
     let mut expected = vec![0.0f64; dst_len];
     oracle(&layout, &mut expected, &src, |d, s| *d = s);
+    let copy = CopyPlan::compile(&layout.dims, &layout.dst, &layout.src).unwrap();
     let update = UpdatePlan::compile(&layout.dims, &layout.dst, &layout.src).unwrap();
-    for entry in ["replay_map_raw", "UpdatePlan::execute"] {
+    for entry in ["replay_map_raw", "CopyPlan::execute", "UpdatePlan::execute"] {
         let mut actual = vec![0.0f64; dst_len];
         crate::threading::take_tiled_leaves();
         if entry == "replay_map_raw" {
@@ -623,6 +699,13 @@ fn tiled_replay_keeps_the_callers_budget() {
                 &mut layout.dst_view(&mut actual),
                 &layout.src_view(&src),
                 |d: &mut f64, s| *d = s,
+                team.exec(4),
+            )
+            .unwrap();
+        } else if entry == "CopyPlan::execute" {
+            copy.execute(
+                &mut layout.dst_view(&mut actual),
+                &layout.src_view(&src),
                 team.exec(4),
             )
             .unwrap();
