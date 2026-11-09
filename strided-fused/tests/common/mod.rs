@@ -62,10 +62,21 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 pub(crate) static GLOBAL: CountingAllocator = CountingAllocator;
 
+/// Modular delta between two readings of a counter that may have wrapped.
+///
+/// This is the only place a counter reading is turned into a delta. Keeping it
+/// in one function means no call site can reintroduce a plain subtraction, and
+/// `counter_delta_wraps_instead_of_underflowing` covers the wrap
+/// deterministically, without depending on the harness making no allocation
+/// between a saturation and a snapshot.
+pub(crate) fn counter_delta(after: usize, before: usize) -> usize {
+    after.wrapping_sub(before)
+}
+
 pub(crate) fn count_allocations(run: impl FnOnce()) -> usize {
     let before = THREAD_ALLOCATIONS.with(Cell::get);
     run();
-    THREAD_ALLOCATIONS.with(Cell::get).wrapping_sub(before)
+    counter_delta(THREAD_ALLOCATIONS.with(Cell::get), before)
 }
 
 /// Net live allocations (allocations minus frees) made by the calling thread
@@ -78,8 +89,8 @@ pub(crate) fn count_net_allocations(run: impl FnOnce()) -> isize {
     let after_free = THREAD_FREES.with(Cell::get);
     // Wrap in `usize` before the cast, so a window that crosses the wrap still
     // yields the small true delta (1) instead of a huge or negative one.
-    let alloc_delta = after_alloc.wrapping_sub(before_alloc) as isize;
-    let free_delta = after_free.wrapping_sub(before_free) as isize;
+    let alloc_delta = counter_delta(after_alloc, before_alloc) as isize;
+    let free_delta = counter_delta(after_free, before_free) as isize;
     alloc_delta.wrapping_sub(free_delta)
 }
 
@@ -96,9 +107,7 @@ pub(crate) fn count_global_allocations(mut run: impl FnMut()) -> usize {
         .map(|_| {
             let before = GLOBAL_ALLOCATIONS.load(Ordering::SeqCst);
             run();
-            GLOBAL_ALLOCATIONS
-                .load(Ordering::SeqCst)
-                .wrapping_sub(before)
+            counter_delta(GLOBAL_ALLOCATIONS.load(Ordering::SeqCst), before)
         })
         .min()
         .unwrap_or(0)

@@ -26,8 +26,8 @@ use strided_fused::{fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp,
 #[cfg(feature = "parallel")]
 use common::count_global_allocations;
 use common::{
-    count_allocations, count_net_allocations, record_allocation, record_deallocation,
-    THREAD_ALLOCATIONS, THREAD_FREES,
+    count_allocations, count_net_allocations, counter_delta, record_allocation,
+    record_deallocation, THREAD_ALLOCATIONS, THREAD_FREES,
 };
 
 /// The counters run inside `GlobalAlloc` methods, which must not unwind, so
@@ -71,6 +71,19 @@ fn counted_deltas_wrap_instead_of_underflowing() {
     let net_frees = count_net_allocations(record_deallocation);
     THREAD_FREES.with(|count| count.set(saved));
     assert_eq!(net_frees, -1);
+}
+
+/// The modular delta on its own, with no counter involved: a window that crosses
+/// the wrap reports the small true delta. Deterministic by construction — no
+/// allocation can land between the two readings, unlike the process-wide atomic
+/// window in `global_counter_wrap.rs`, where an intervening allocation from
+/// another thread turns the window into an ordinary increasing one.
+#[test]
+fn counter_delta_wraps_instead_of_underflowing() {
+    assert_eq!(counter_delta(0, usize::MAX), 1);
+    assert_eq!(counter_delta(1, usize::MAX), 2);
+    assert_eq!(counter_delta(usize::MAX, 0), usize::MAX);
+    assert_eq!(counter_delta(4, 4), 0);
 }
 
 /// The signed combination wraps as well. Saturating both counters leaves an
