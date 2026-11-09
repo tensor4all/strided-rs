@@ -279,7 +279,10 @@ fn test_try_constructors_reject_overflowing_shapes() {
             vec![1.0; 3],
             dims,
         ));
+        // SAFETY: the uninit constructors' only contract (view.rs:1613) is
+        // to read a slot after writing it; these calls fail and read nothing.
         assert_overflow(unsafe { StridedArray::<f64>::try_col_major_uninit(dims) });
+        // SAFETY: as above.
         assert_overflow(unsafe {
             StridedArray::<f64>::try_col_major_from_buffer_uninit(Vec::new(), dims)
         });
@@ -292,6 +295,7 @@ fn uninit_col_major_writes_bool_slots_before_reading_them() {
     // neither 0 nor 1 is not a `bool`, so an uninitialized slot in a `Vec<bool>`
     // was already invalid before the caller wrote anything (#413).
     let dims = [2usize, 3];
+    // SAFETY: (view.rs:1613) every slot is written below before it is read.
     let mut a = unsafe { StridedArray::<bool>::try_col_major_uninit(&dims).unwrap() };
     for j in 0..dims[1] {
         for i in 0..dims[0] {
@@ -312,6 +316,7 @@ fn uninit_from_buffer_holds_reference_elements() {
     // `&u32` is the other element `set_len` storage broke, and this drives the
     // buffer constructor: the empty buffer grows to the shape.
     let values = [11u32, 22, 33];
+    // SAFETY: (view.rs:1613) every slot is written below before it is read.
     let mut a = unsafe {
         StridedArray::<&u32>::try_col_major_from_buffer_uninit(Vec::new(), &[3]).unwrap()
     };
@@ -330,6 +335,7 @@ fn uninit_from_buffer_resizes_without_touching_retained_slots() {
     // Spare capacity: the slot the caller already wrote survives the call.
     let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(6);
     buf.push(MaybeUninit::new(7));
+    // SAFETY: (view.rs:1613) only slot 0, written above, is read.
     let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[2, 3]).unwrap() };
     assert_eq!((a.len(), a.data().len()), (6, 6));
     // SAFETY: slot 0 was written before the call; the others are never read.
@@ -337,15 +343,18 @@ fn uninit_from_buffer_resizes_without_touching_retained_slots() {
 
     // A longer buffer is truncated to the shape.
     let buf = vec![MaybeUninit::new(1u8); 10];
+    // SAFETY: (view.rs:1613) no slot is read.
     let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[2, 3]).unwrap() };
     assert_eq!(a.data().len(), 6);
 
     // A zero extent makes the array empty whatever the other extents.
     let buf = vec![MaybeUninit::new(1u8); 3];
+    // SAFETY: (view.rs:1613) no slot is read.
     let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[0, 4]).unwrap() };
     assert!(a.is_empty() && a.data().is_empty());
 
     // A zero-sized element still tracks its element count.
+    // SAFETY: (view.rs:1613) no slot is read.
     let a =
         unsafe { StridedArray::<()>::try_col_major_from_buffer_uninit(Vec::new(), &[3]).unwrap() };
     assert_eq!(a.data().len(), 3);
