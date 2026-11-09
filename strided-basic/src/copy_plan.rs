@@ -301,12 +301,40 @@ impl CopyPlan {
     fn is_contiguous_run(&self) -> bool {
         match &self.fused {
             PairTraversal::Inline(layout) => {
-                layout.rank == 1
-                    && layout.dst_strides[0].unsigned_abs() == 1
-                    && layout.src_strides[0].unsigned_abs() == 1
+                let rank = layout.rank;
+                // Fusion sorts the axes by signed destination stride, so a dense
+                // reversed buffer keeps more than one axis: [-1, -512] over
+                // [512, 512] stays rank two although it streams as one run.
+                // In ascending magnitude the strides must be the running
+                // products of the extents, with one sign per operand.
+                let mut used = 0u32;
+                let mut step = 1usize;
+                let mut dst_sign = 0i8;
+                let mut src_sign = 0i8;
+                for _ in 0..rank {
+                    let Some(axis) = (0..rank).find(|&axis| {
+                        used & (1 << axis) == 0
+                            && layout.dst_strides[axis].unsigned_abs() == step
+                            && layout.src_strides[axis].unsigned_abs() == step
+                    }) else {
+                        return false;
+                    };
+                    used |= 1 << axis;
+                    let axis_dst_sign = if layout.dst_strides[axis] < 0 { -1 } else { 1 };
+                    let axis_src_sign = if layout.src_strides[axis] < 0 { -1 } else { 1 };
+                    if (dst_sign != 0 && dst_sign != axis_dst_sign)
+                        || (src_sign != 0 && src_sign != axis_src_sign)
+                    {
+                        return false;
+                    }
+                    dst_sign = axis_dst_sign;
+                    src_sign = axis_src_sign;
+                    step = step.saturating_mul(layout.dims[axis]);
+                }
+                true
             }
-            // Fusion turns one run into one axis, so a spilled traversal is
-            // never a single run.
+            // Fusion turns a dense run of at most eight axes into one axis; above
+            // that the traversal spills and is priced as strided.
             PairTraversal::Spilled(_) => false,
         }
     }
