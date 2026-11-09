@@ -2285,7 +2285,7 @@ fn broadcast_view_with_strides<'a, T, Op: ElementOp<T>>(
     target_dims: &[usize],
     strides: &[isize],
 ) -> StridedView<'a, T, Op> {
-    // SAFETY: `broadcast_strides_for_axes` (:2192) keeps a source stride only on
+    // SAFETY: `broadcast_strides_for_axes` (:2231) keeps a source stride only on
     // axes where `source_dims[src_axis] == target_dims[dst_axis]`, sets every other
     // target axis to stride 0, rejects repeated and out-of-range target axes, and
     // requires `source_dims.len() == axes.len()`, so this view reaches a subset of
