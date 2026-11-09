@@ -323,7 +323,10 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
 
 /// Copy elements from `src` to `dst`, optimized for col-major destination.
 ///
-/// Delegates to the centralized permutation-copy dispatch for the actual work.
+/// Delegates to the centralized permutation-copy dispatch for the actual work,
+/// inside the budget of `exec`: the same explicit-token contract as
+/// [`copy_into`], so a large copy splits across the token's slots instead of
+/// always staying on the calling thread (strided-rs#212).
 ///
 /// # Errors
 ///
@@ -337,8 +340,9 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
 pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
     dst: &mut StridedViewMut<T>,
     src: &StridedView<T>,
+    exec: Exec<'_>,
 ) -> Result<()> {
-    strided_perm::copy_into_col_major(dst, src, Exec::serial())
+    strided_perm::copy_into_col_major(dst, src, exec)
 }
 
 /// Accumulating element-wise addition: `dest[i] += src[i]`.

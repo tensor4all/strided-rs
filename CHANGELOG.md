@@ -95,6 +95,24 @@ failure the version number has to announce, and one no workspace test can see, b
 missing version for a dependent to meet; the order was (`traits`, `view`,
 `perm`, `basic`, `fused`, `nn`, `kernel`).
 
+### `strided-basic`: `copy_into_col_major` takes its `Exec` token
+
+`strided_basic::copy_into_col_major(dst, src)` hard-coded `Exec::serial()` and handed that to the permutation engine, so a
+4096x4096 transpose asked for on a four-slot pool ran on one core and the signature said nothing about it (#212). It now
+takes the token last, like `copy_into` and every other entry that can fan out ([`docs/threading-contract.md`]), and
+forwards the caller's token unchanged.
+
+```rust
+// before
+copy_into_col_major(&mut dst, &src)?;
+// after
+copy_into_col_major(&mut dst, &src, exec)?;   // Exec::serial() restores the old route
+```
+
+Same result, same layout rules; only the route changes. `strided-perm::copy_into_col_major` already took an `Exec`.
+
+[`docs/threading-contract.md`]: https://github.com/tensor4all/strided-rs/blob/main/docs/threading-contract.md
+
 ### The unpublished 0.13.1 batch
 
 `strided-view` 0.7.3, `strided-basic`/`strided-perm`/`strided-kernel` 0.13.1 and `strided-traits` 0.7.2 were staged and
