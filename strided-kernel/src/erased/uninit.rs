@@ -73,7 +73,15 @@ pub fn erased_map_into_uninit(
     check_dtype(input_dtype, input.dtype())?;
     check_dtype(map_output_dtype(input_dtype, op)?, dest.dtype())?;
     validate_uninit_no_overlap(dest, input, 0)?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
+    // mutable allocation may overlap `input`'s byte extent: `dest` is the only one in this call,
+    // and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18) checked `input`
+    // against it at erased/uninit.rs:75 by comparing whole byte ranges (`overlaps_uninit_mut`,
+    // strided-view/src/raw.rs:355). The allocation contract `input` was built under
+    // (strided-view/src/raw.rs:204) must still hold; that is the obligation of whoever built
+    // `input`. No conflicting access may happen while the result is used: within this call the
+    // only writer is `dest`, which does not overlap, and the `input` contract
+    // (strided-view/src/raw.rs:212) rules out concurrent mutation from outside.
     let input = unsafe { input.try_as_ref_after_no_overlap() }?;
 
     match (input_dtype, op) {
@@ -159,9 +167,18 @@ pub fn erased_zip_into_uninit(
     check_dtype(dtype, rhs.dtype())?;
     validate_uninit_no_overlap(dest, lhs, 0)?;
     validate_uninit_no_overlap(dest, rhs, 1)?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
+    // mutable allocation may overlap `lhs`'s byte extent: `dest` is the only one in this call,
+    // and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18) checked `lhs`
+    // against it at erased/uninit.rs:168 by comparing whole byte ranges (`overlaps_uninit_mut`,
+    // strided-view/src/raw.rs:355). The allocation contract `lhs` was built under
+    // (strided-view/src/raw.rs:204) must still hold; that is the obligation of whoever built
+    // `lhs`. No conflicting access may happen while the result is used: within this call the only
+    // writer is `dest`, which does not overlap, and the `lhs` contract
+    // (strided-view/src/raw.rs:212) rules out concurrent mutation from outside.
     let lhs = unsafe { lhs.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `lhs` above: `validate_uninit_no_overlap` checked `rhs` against `dest` at
+    // erased/uninit.rs:169, and the same allocation contract and exclusive `dest` borrow apply.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
     match dtype {
@@ -240,9 +257,18 @@ pub fn erased_compare_into_uninit(
     check_dtype(dtype, rhs.dtype())?;
     validate_uninit_no_overlap(dest, lhs, 0)?;
     validate_uninit_no_overlap(dest, rhs, 1)?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
+    // mutable allocation may overlap `lhs`'s byte extent: `dest` is the only one in this call,
+    // and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18) checked `lhs`
+    // against it at erased/uninit.rs:258 by comparing whole byte ranges (`overlaps_uninit_mut`,
+    // strided-view/src/raw.rs:355). The allocation contract `lhs` was built under
+    // (strided-view/src/raw.rs:204) must still hold; that is the obligation of whoever built
+    // `lhs`. No conflicting access may happen while the result is used: within this call the only
+    // writer is `dest`, which does not overlap, and the `lhs` contract
+    // (strided-view/src/raw.rs:212) rules out concurrent mutation from outside.
     let lhs = unsafe { lhs.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `lhs` above: `validate_uninit_no_overlap` checked `rhs` against `dest` at
+    // erased/uninit.rs:259, and the same allocation contract and exclusive `dest` borrow apply.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
     match dtype {
@@ -322,11 +348,23 @@ pub fn erased_select_into_uninit(
     validate_uninit_no_overlap(dest, pred, 0)?;
     validate_uninit_no_overlap(dest, on_true, 1)?;
     validate_uninit_no_overlap(dest, on_false, 2)?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
+    // mutable allocation may overlap `pred`'s byte extent: `dest` is the only one in this call,
+    // and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18) checked `pred`
+    // against it at erased/uninit.rs:348 by comparing whole byte ranges (`overlaps_uninit_mut`,
+    // strided-view/src/raw.rs:355). The allocation contract `pred` was built under
+    // (strided-view/src/raw.rs:204) must still hold; that is the obligation of whoever built
+    // `pred`. No conflicting access may happen while the result is used: within this call the
+    // only writer is `dest`, which does not overlap, and the `pred` contract
+    // (strided-view/src/raw.rs:212) rules out concurrent mutation from outside.
     let pred = unsafe { pred.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `pred` above: `validate_uninit_no_overlap` checked `on_true` against `dest`
+    // at erased/uninit.rs:349, and the same allocation contract and exclusive `dest` borrow
+    // apply.
     let on_true = unsafe { on_true.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `pred` above: `validate_uninit_no_overlap` checked `on_false` against `dest`
+    // at erased/uninit.rs:350, and the same allocation contract and exclusive `dest` borrow
+    // apply.
     let on_false = unsafe { on_false.try_as_ref_after_no_overlap() }?;
 
     match dtype {
@@ -410,11 +448,21 @@ pub fn erased_clamp_into_uninit(
     validate_uninit_no_overlap(dest, x, 0)?;
     validate_uninit_no_overlap(dest, lo, 1)?;
     validate_uninit_no_overlap(dest, hi, 2)?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
+    // mutable allocation may overlap `x`'s byte extent: `dest` is the only one in this call, and
+    // `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18) checked `x` against it
+    // at erased/uninit.rs:448 by comparing whole byte ranges (`overlaps_uninit_mut`,
+    // strided-view/src/raw.rs:355). The allocation contract `x` was built under
+    // (strided-view/src/raw.rs:204) must still hold; that is the obligation of whoever built `x`.
+    // No conflicting access may happen while the result is used: within this call the only writer
+    // is `dest`, which does not overlap, and the `x` contract (strided-view/src/raw.rs:212) rules
+    // out concurrent mutation from outside.
     let x = unsafe { x.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `x` above: `validate_uninit_no_overlap` checked `lo` against `dest` at
+    // erased/uninit.rs:449, and the same allocation contract and exclusive `dest` borrow apply.
     let lo = unsafe { lo.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `x` above: `validate_uninit_no_overlap` checked `hi` against `dest` at
+    // erased/uninit.rs:450, and the same allocation contract and exclusive `dest` borrow apply.
     let hi = unsafe { hi.try_as_ref_after_no_overlap() }?;
 
     match dtype {
@@ -497,9 +545,18 @@ pub fn erased_broadcast_mul_into_uninit(
     check_dtype(dtype, rhs.dtype())?;
     validate_uninit_no_overlap(dest, lhs, 0)?;
     validate_uninit_no_overlap(dest, rhs, 1)?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
+    // mutable allocation may overlap `lhs`'s byte extent: `dest` is the only one in this call,
+    // and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18) checked `lhs`
+    // against it at erased/uninit.rs:546 by comparing whole byte ranges (`overlaps_uninit_mut`,
+    // strided-view/src/raw.rs:355). The allocation contract `lhs` was built under
+    // (strided-view/src/raw.rs:204) must still hold; that is the obligation of whoever built
+    // `lhs`. No conflicting access may happen while the result is used: within this call the only
+    // writer is `dest`, which does not overlap, and the `lhs` contract
+    // (strided-view/src/raw.rs:212) rules out concurrent mutation from outside.
     let lhs = unsafe { lhs.try_as_ref_after_no_overlap() }?;
-    // SAFETY: input/output overlap was rejected before forming references.
+    // SAFETY: as for `lhs` above: `validate_uninit_no_overlap` checked `rhs` against `dest` at
+    // erased/uninit.rs:547, and the same allocation contract and exclusive `dest` borrow apply.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
     match dtype {
@@ -548,8 +605,15 @@ fn uninit_raw_mut<'a, T: KernelStorageElement>(
     let strides = dest.strides();
     let offset = dest.offset();
     let data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: the uninit descriptor validated every reachable offset against
-    // its storage at construction.
+    // SAFETY: `RawStridedMut::new_unchecked` (strided-view/src/raw.rs:1115) needs every index
+    // reachable from `offset` through `dims`/`strides` inside `data`, and no alias that breaks
+    // mutable access. When `dest` was built (`from_uninit_slice`, strided-view/src/raw.rs:794, or
+    // `from_raw_parts`, strided-view/src/raw.rs:850), `validate_bounds`
+    // (strided-view/src/view.rs:187) checked exactly these dims, strides and offset against its
+    // slot count, `byte_len / size_of::<T>()`, which is the length `data_as_uninit_mut`
+    // (strided-view/src/raw.rs:882) returns after checking the dtype. `data_as_uninit_mut`
+    // reborrows `dest` through `&mut`, and the result keeps that borrow (`'a`), so `data` is the
+    // only access to those `MaybeUninit<T>` slots.
     Ok(unsafe { RawStridedMut::new_unchecked(data, dims, strides, offset) })
 }
 
@@ -560,8 +624,10 @@ fn uninit_view_mut<'a, T: KernelStorageElement>(
     let strides = dest.strides();
     let offset = dest.offset();
     let data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: the uninit descriptor validated every reachable offset against
-    // its storage at construction.
+    // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:952) needs every index
+    // combination in bounds: the same `validate_bounds` argument as in `uninit_raw_mut`
+    // (erased/uninit.rs:601) covers these dims, strides and offset over `data`; the `&mut` slice
+    // type carries the exclusivity.
     Ok(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) })
 }
 
@@ -569,7 +635,13 @@ fn erased_view<'a, T: KernelStorageElement>(
     src: &'a ErasedRawStridedRef<'a>,
 ) -> Result<StridedView<'a, T>> {
     let data = src.data_as::<T>()?;
-    // SAFETY: the descriptor validated every reachable offset at construction.
+    // SAFETY: `StridedView::new_unchecked` (strided-view/src/view.rs:517) needs every index
+    // combination in bounds. When `src` was built (`from_slice`, strided-view/src/raw.rs:420, or
+    // `from_raw_parts`, strided-view/src/raw.rs:473, which `try_as_ref_after_no_overlap` also
+    // uses), `validate_bounds` (strided-view/src/view.rs:187) checked exactly these dims, strides
+    // and offset against its element count, `byte_len / size_of::<T>()`. `data_as::<T>`
+    // (strided-view/src/raw.rs:503) checked that the dtype is `T` and returns exactly that many
+    // elements.
     Ok(unsafe { StridedView::new_unchecked(data, src.dims(), src.strides(), src.offset()) })
 }
 
@@ -621,8 +693,16 @@ where
     };
     let input = erased_raw_ref::<A>(input)?;
     let mut dest = uninit_raw_mut::<D>(dest)?;
-    // SAFETY: matching shapes and this destination layout were validated above,
-    // and the caller rejected input/output overlap.
+    // SAFETY: `map_raw_into_validated` (strided-basic/src/execution.rs:365) requires three
+    // things. Every input shape matches the destination, and `validated` belongs to this
+    // destination's geometry: `prepare_destination` (erased/uninit.rs:586) ran
+    // `ensure_same_shape` on `input.dims()` and produced `validated` from
+    // `dest.dims()`/`dest.strides()`, the geometry `uninit_raw_mut` rebuilds `dest` with. Bounds
+    // and aliasing hold throughout the replay: the inputs come from `erased_raw_ref`, bounded by
+    // their descriptors' `validate_bounds` (strided-view/src/view.rs:187), `dest` is bounded as
+    // argued in `uninit_raw_mut` (erased/uninit.rs:601), and the public entry rejected
+    // input/output overlap before converting the inputs (erased/uninit.rs:75). The closure only
+    // writes `MaybeUninit::new(..)`, so no uninitialized slot is read.
     unsafe {
         map_raw_into_validated::<MaybeUninit<D>, A, Identity>(
             &mut dest,
@@ -663,8 +743,17 @@ fn uninit_zip<T: OneShotScalar>(
     // closure is monomorphic and the inner loop can vectorize.
     macro_rules! replay {
         ($op:ident) => {
-            // SAFETY: matching shapes and this destination layout were
-            // validated above, and the caller rejected input/output overlap.
+            // SAFETY: `zip_map2_raw_into_validated` (strided-basic/src/execution.rs:413) requires
+            // three things. Every input shape matches the destination, and `validated` belongs to
+            // this destination's geometry: `prepare_destination` (erased/uninit.rs:586) ran
+            // `ensure_same_shape` on both input shapes and produced `validated` from
+            // `dest.dims()`/`dest.strides()`, the geometry `uninit_raw_mut` rebuilds `dest` with.
+            // Bounds and aliasing hold throughout the replay: the inputs come from
+            // `erased_raw_ref`, bounded by their descriptors' `validate_bounds`
+            // (strided-view/src/view.rs:187), `dest` is bounded as argued in `uninit_raw_mut`
+            // (erased/uninit.rs:601), and the public entry rejected input/output overlap before
+            // converting the inputs (erased/uninit.rs:168 and erased/uninit.rs:169). The closure
+            // only writes `MaybeUninit::new(..)`, so no uninitialized slot is read.
             unsafe {
                 zip_map2_raw_into_validated::<MaybeUninit<T>, T, T, Identity, Identity>(
                     &mut dest,
@@ -704,8 +793,17 @@ where
     let lhs = erased_raw_ref::<T>(lhs)?;
     let rhs = erased_raw_ref::<T>(rhs)?;
     let mut dest = uninit_raw_mut::<bool>(dest)?;
-    // SAFETY: matching shapes and this destination layout were validated above,
-    // and the caller rejected input/output overlap.
+    // SAFETY: `zip_map2_raw_into_validated` (strided-basic/src/execution.rs:413) requires three
+    // things. Every input shape matches the destination, and `validated` belongs to this
+    // destination's geometry: `prepare_destination` (erased/uninit.rs:586) ran
+    // `ensure_same_shape` on both input shapes and produced `validated` from
+    // `dest.dims()`/`dest.strides()`, the geometry `uninit_raw_mut` rebuilds `dest` with. Bounds
+    // and aliasing hold throughout the replay: the inputs come from `erased_raw_ref`, bounded by
+    // their descriptors' `validate_bounds` (strided-view/src/view.rs:187), `dest` is bounded as
+    // argued in `uninit_raw_mut` (erased/uninit.rs:601), and the public entry rejected
+    // input/output overlap before converting the inputs (erased/uninit.rs:258 and
+    // erased/uninit.rs:259). The closure only writes `MaybeUninit::new(..)`, so no uninitialized
+    // slot is read.
     unsafe {
         zip_map2_raw_into_validated::<MaybeUninit<bool>, T, T, Identity, Identity>(
             &mut dest,
@@ -856,8 +954,11 @@ where
 {
     let lhs_data = wrapping_slice(lhs.data_as::<T>()?);
     let rhs_data = wrapping_slice(rhs.data_as::<T>()?);
-    // SAFETY: the descriptors validated every reachable offset at construction,
-    // and the reinterpreted slices keep their element count.
+    // SAFETY: `StridedView::new_unchecked` (strided-view/src/view.rs:517) needs every index
+    // combination in bounds. `lhs` validated these dims, strides and offset against its element
+    // count when it was built (`validate_bounds`, strided-view/src/view.rs:187); `data_as::<T>`
+    // (strided-view/src/raw.rs:503) returned exactly that many elements, and `wrapping_slice`
+    // (erased/uninit.rs:1003) keeps the count.
     let lhs = unsafe {
         StridedView::<Wrapping<T>, Identity>::new_unchecked(
             lhs_data,
@@ -866,7 +967,7 @@ where
             lhs.offset(),
         )
     };
-    // SAFETY: as above.
+    // SAFETY: as for `lhs` above, with `rhs`'s own construction-time `validate_bounds`.
     let rhs = unsafe {
         StridedView::<Wrapping<T>, Identity>::new_unchecked(
             rhs_data,
@@ -879,22 +980,30 @@ where
     let strides = dest.strides();
     let offset = dest.offset();
     let data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: `Wrapping<T>` is `repr(transparent)` over `T`, so
-    // `MaybeUninit<Wrapping<T>>` has the layout of `MaybeUninit<T>`, and the
-    // slice keeps its element count and exclusive borrow.
+    // SAFETY: `slice::from_raw_parts_mut` needs a pointer valid for `data.len()` elements of the
+    // new type, properly aligned, with no other access for the slice's lifetime. `Wrapping<T>` is
+    // documented `#[repr(transparent)]` over `T`, so `MaybeUninit<Wrapping<T>>` has the size and
+    // alignment of `MaybeUninit<T>`, and every bit pattern stays valid. The pointer and length
+    // come from the exclusive slice `data_as_uninit_mut` returned, which is shadowed here and not
+    // used again.
     let data = unsafe {
         core::slice::from_raw_parts_mut(
             data.as_mut_ptr().cast::<MaybeUninit<Wrapping<T>>>(),
             data.len(),
         )
     };
-    // SAFETY: the uninit descriptor validated every reachable offset.
+    // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:952) needs every index
+    // combination in bounds: `dest` validated these dims, strides and offset against its slot
+    // count when it was built (`validate_bounds`, strided-view/src/view.rs:187), and the
+    // reinterpreted slice above keeps that count.
     let mut dest = unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) };
     broadcast_mul_into_uninit(&mut dest, &lhs, lhs_axes, &rhs, rhs_axes, exec)
 }
 
 fn wrapping_slice<T>(data: &[T]) -> &[Wrapping<T>] {
-    // SAFETY: `Wrapping<T>` is `repr(transparent)` over `T`; the slice keeps
-    // its element count and shared borrow.
+    // SAFETY: `slice::from_raw_parts` needs a pointer valid for `data.len()` elements of the new
+    // type, properly aligned, for the borrow's lifetime. `Wrapping<T>` is documented
+    // `#[repr(transparent)]` over `T`, so it has `T`'s size, alignment and valid bit patterns;
+    // the result reborrows `data` with the same lifetime and count.
     unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<Wrapping<T>>(), data.len()) }
 }
