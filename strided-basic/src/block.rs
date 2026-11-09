@@ -434,8 +434,9 @@ where
     if elem_size == 0 {
         return true;
     }
-    let total = axes_region(axes.clone().map(|(d, dst, _)| (d, dst)), elem_size)
-        .saturating_add(axes_region(axes.clone().map(|(d, _, src)| (d, src)), elem_size));
+    let total = axes_region(axes.clone().map(|(d, dst, _)| (d, dst)), elem_size).saturating_add(
+        axes_region(axes.clone().map(|(d, _, src)| (d, src)), elem_size),
+    );
     if total <= BLOCK_MEMORY_SIZE as u128 {
         return true;
     }

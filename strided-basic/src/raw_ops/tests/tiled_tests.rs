@@ -439,17 +439,16 @@ fn spilled_plan_entries_visit_tiles() {
             .unwrap()
     });
 
-    let run_uninit =
-        |name: &str, f: &mut dyn FnMut(&mut RawStridedMut<'_, MaybeUninit<f64>>)| {
-            let mut actual = vec![MaybeUninit::new(0.0f64); dst_len];
-            crate::threading::take_tile_boxes();
-            f(&mut nine.dst_view(&mut actual));
-            let boxes = crate::threading::take_tile_boxes();
-            assert!(
-                boxes >= 16,
-                "{name}: the spilled plan must visit cache tiles, got {boxes} boxes"
-            );
-        };
+    let run_uninit = |name: &str, f: &mut dyn FnMut(&mut RawStridedMut<'_, MaybeUninit<f64>>)| {
+        let mut actual = vec![MaybeUninit::new(0.0f64); dst_len];
+        crate::threading::take_tile_boxes();
+        f(&mut nine.dst_view(&mut actual));
+        let boxes = crate::threading::take_tile_boxes();
+        assert!(
+            boxes >= 16,
+            "{name}: the spilled plan must visit cache tiles, got {boxes} boxes"
+        );
+    };
     run_uninit("CopyPlan::execute_uninit", &mut |d| {
         copy.execute_uninit(d, &source, Exec::serial()).unwrap()
     });
