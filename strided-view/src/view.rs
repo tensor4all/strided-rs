@@ -1630,6 +1630,9 @@ impl<T: Copy> StridedArray<T> {
     /// assert!(unsafe { a.get(&[0]).assume_init() });
     /// ```
     pub unsafe fn col_major_uninit(dims: &[usize]) -> StridedArray<MaybeUninit<T>> {
+        // SAFETY: `try_col_major_uninit` has the same contract as this function
+        // (view.rs:1608), which our caller accepted: read a slot only after
+        // writing it. This call reads nothing.
         Self::try_col_major_uninit(dims).expect("col_major_uninit: shape overflows isize")
     }
 
@@ -1673,6 +1676,9 @@ impl<T: Copy> StridedArray<T> {
         buf: Vec<MaybeUninit<T>>,
         dims: &[usize],
     ) -> StridedArray<MaybeUninit<T>> {
+        // SAFETY: `try_col_major_from_buffer_uninit` has the same contract as
+        // this function (view.rs:1608), which our caller accepted: read a slot
+        // only after writing it. This call reads nothing.
         Self::try_col_major_from_buffer_uninit(buf, dims)
             .expect("col_major_from_buffer_uninit: shape overflows isize")
     }
