@@ -34,6 +34,18 @@ fn uninit_view<'a, T>(
 
 fn assume_init<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
     let mut data = core::mem::ManuallyDrop::new(data);
+    // SAFETY: `Vec::from_raw_parts` needs the pointer, length and capacity of a `Vec` allocated
+    // for the target type, with the first `len` values initialized. `MaybeUninit<T>` has the size
+    // and alignment of `T`, and `ManuallyDrop` hands over `data`'s own allocation exactly once.
+    // Initialization is the callers': (lines 74, 108, 130, 155, 190, 220, 239, 250, 262, 279,
+    // 522) pass buffers that a successful call filled through a layout that reaches every slot
+    // (rank 1 with stride 1 over the whole buffer, `[2, 2]`/`[1, 2]`, or `[2, 3]`/`[1, 2]`).
+    // `mul_into_uninit` (strided-basic/src/map_view.rs:2178), `compare_into_uninit`
+    // (strided-basic/src/map_view.rs:1737), `broadcast_mul_into_uninit`
+    // (strided-basic/src/map_view.rs:2361), `batched_outer_product_into_uninit`
+    // (strided-basic/src/outer_product.rs:65) and `ErasedFusedPlan::execute_uninit`
+    // (strided-fused/src/erased.rs:221) document that success initializes every logical
+    // destination element.
     unsafe { Vec::from_raw_parts(data.as_mut_ptr().cast(), data.len(), data.capacity()) }
 }
 
@@ -529,6 +541,9 @@ fn typed_uninitialized_validation_errors_leave_sentinels_untouched() {
         err,
         strided_kernel::StridedError::NonInjectiveOutputLayout
     ));
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == 99 }));
@@ -555,6 +570,12 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
 
     let mut output = vec![MaybeUninit::new(99i32); 4];
     let ptr = NonNull::new(output.as_mut_ptr().cast::<u8>()).unwrap();
+    // SAFETY: `from_raw_parts` (strided-view/src/raw.rs:204) needs a pointer into an allocation
+    // aligned for the dtype with `byte_len` initialized bytes that stay alive for the
+    // descriptor's use: `ptr` heads the live `output` (`i32`-aligned, every slot created
+    // initialized). The descriptor overlaps the destination built from `output` below, which its
+    // contract allows (strided-view/src/raw.rs:211); `ErasedFusedPlan::execute_uninit` rejects
+    // that overlap before converting or reading it (strided-fused/src/erased.rs:319).
     let overlapping = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::I32,
@@ -572,6 +593,9 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         plan.execute_uninit(&mut dest, &[overlapping], Exec::serial()),
         Err(StridedError::OverlappingInputOutput { input: 0 })
     ));
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == 99 }));
@@ -590,6 +614,9 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         ),
         Err(StridedError::DTypeMismatch { .. })
     ));
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == 99 }));
@@ -609,6 +636,9 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         ),
         Err(StridedError::ShapeMismatch(_, _))
     ));
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == 99 }));
@@ -623,6 +653,9 @@ fn erased_fused_validation_errors_precede_writes_and_overlap_precedes_shared_ref
         plan.execute_uninit(&mut noninjective, &[input_ptr], Exec::serial()),
         Err(StridedError::NonInjectiveOutputLayout)
     ));
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the failed call did.
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == 99 }));
@@ -662,8 +695,17 @@ fn partial_write_panic_leaves_maybe_uninit_destination_safe_to_drop() {
         .unwrap();
     }));
     assert!(result.is_err());
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the panicking call wrote before it unwound.
     assert_eq!(unsafe { output[0].assume_init() }, 6);
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the panicking call wrote before it unwound.
     assert_eq!(unsafe { output[1].assume_init() }, 6);
+    // SAFETY: every slot of `output` was created as `MaybeUninit::new(99)`, and the
+    // uninitialized-destination paths only ever store initialized values, so each slot is
+    // initialized whatever the panicking call wrote before it unwound.
     assert_eq!(unsafe { output[3].assume_init() }, 99);
     drop(output);
 }
@@ -699,6 +741,9 @@ fn erased_fused_uninitialized_parallel_replay_preserves_wrapping_integer_semanti
         ErasedRawStridedUninitMut::from_uninit_slice(&mut output, &dims, &strides, 0).unwrap();
     let inputs = inputs.map(|input| ErasedRawStridedPtr::from_ref(&input));
     plan.execute_uninit(&mut dest, &inputs, bounded(2)).unwrap();
+    // SAFETY: `output` has `len` slots under `[len]`/`[1]`, so the layout reaches every slot, and
+    // the successful `ErasedFusedPlan::execute_uninit` above initialized every logical
+    // destination element (strided-fused/src/erased.rs:221).
     assert!(output
         .iter()
         .all(|value| unsafe { value.assume_init() == -2 }));

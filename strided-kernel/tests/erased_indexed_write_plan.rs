@@ -548,6 +548,12 @@ fn assert_uninitialized_layout(
     for linear in 0..logical_total(dims) {
         let coords = decode_col_major(linear, dims);
         let slot = layout_offset(offset, strides, &coords);
+        // SAFETY: `assume_init_ref` needs `actual[slot]` initialized. `slot` is `layout_offset`
+        // of an in-range coordinate, so the layout reaches it. Each caller (lines 681, 767, 929,
+        // 1099) passes a buffer that a successful `execute_uninit` of `ErasedDynamicSlicePlan`,
+        // `ErasedDynamicUpdateSlicePlan` or `ErasedScatterPlan` filled with these same dims,
+        // strides and offset, and each documents that success overwrites every reachable slot
+        // (strided-kernel/src/erased.rs:1073, :1336, :1612). Unreachable holes are never read.
         assert_eq!(unsafe { actual[slot].assume_init_ref() }, &expected[slot]);
     }
 }
@@ -824,6 +830,10 @@ fn erased_dynamic_update_zero_window_still_copies_operand() {
     )
     .unwrap();
     for (actual, expected) in raw.iter().zip(operand) {
+        // SAFETY: `raw` has 4 slots under `operand_dims` `[2, 2]` with strides `[1, 2]`, so the
+        // layout reaches every slot, and the successful
+        // `ErasedDynamicUpdateSlicePlan::execute_uninit` above overwrote every reachable slot
+        // (strided-kernel/src/erased.rs:1336).
         assert_eq!(unsafe { *actual.assume_init_ref() }, expected);
     }
 }

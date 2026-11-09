@@ -25,6 +25,11 @@ use strided_kernel::{
 const LARGE_LEN: usize = (1 << 15) + 65;
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
+    // SAFETY: `slice::from_raw_parts` needs `size_of_val(data)` initialized, readable bytes at
+    // `data`'s address for the borrow. `data` is a live `&[T]` covering exactly those bytes, and
+    // `u8` needs no alignment. The bytes are all initialized only if `T` has no padding: every
+    // call in this file (lines 474, 508) passes an `i32` array, none of which has padding. This
+    // generic safe helper would expose padding bytes for a padded `T`.
     unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), core::mem::size_of_val(data)) }
 }
 
@@ -277,6 +282,10 @@ fn generic_gather_matches_across_threshold_for_initialized_and_uninit_outputs() 
         )
         .unwrap();
         for (actual, expected) in raw.iter().zip(&expected) {
+            // SAFETY: `raw` has `len` slots under `dest_dims` `[2, len / 2]` with strides `[1,
+            // 2]`; every `len` here is even, so the layout reaches every slot, and the successful
+            // `ErasedGatherPlan::execute_uninit` above overwrote every reachable slot
+            // (strided-kernel/src/erased.rs:815).
             assert_eq!(unsafe { actual.assume_init_ref() }, expected);
         }
     }
@@ -623,8 +632,10 @@ fn large_erased_concatenate_matches_serial_for_initialized_and_uninit_outputs() 
         )
         .unwrap();
         plan.execute_uninit(&mut dest, &ptrs, ctx).unwrap();
-        // SAFETY: the dense destination reaches every slot and a successful
-        // uninit execute initializes every reachable slot.
+        // SAFETY: `storage` has `total` slots under `dest_dims` `[total]` with stride `[1]`, so
+        // the layout reaches every slot, and the successful
+        // `ErasedConcatenatePlan::execute_uninit` above overwrote every reachable slot
+        // (strided-basic/src/erased.rs:230).
         storage
             .iter()
             .map(|value| unsafe { value.assume_init() })
