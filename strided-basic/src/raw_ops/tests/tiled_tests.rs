@@ -1144,10 +1144,55 @@ fn tile_odometer_stays_within_the_reachable_offsets() {
     }
 }
 
+/// The destination slots of `tiles` in the order the tiled walk is specified
+/// to visit them, built from the specification alone: the tile grid in
+/// column-major order (axis 0 fastest), tiles of extents `blocks` anchored at
+/// the origin and clipped to the box, and each tile in column-major order.
+/// Independent of `apply_tile_range` and `apply_tiled_box`.
+fn specified_tile_order(tiles: &PairTiles, dst_offset: isize) -> Vec<usize> {
+    let layout = &tiles.layout;
+    let rank = layout.rank;
+    let dims = &layout.dims[..rank];
+    let blocks = &tiles.blocks[..rank];
+    let grid: Vec<usize> = dims
+        .iter()
+        .zip(blocks)
+        .map(|(&d, &b)| d.div_ceil(b))
+        .collect();
+    let mut order = Vec::new();
+    for tile in 0..grid.iter().product::<usize>() {
+        let mut rest = tile;
+        let origin: Vec<usize> = (0..rank)
+            .map(|axis| {
+                let coord = rest % grid[axis];
+                rest /= grid[axis];
+                coord * blocks[axis]
+            })
+            .collect();
+        let extent: Vec<usize> = (0..rank)
+            .map(|axis| blocks[axis].min(dims[axis] - origin[axis]))
+            .collect();
+        for element in 0..extent.iter().product::<usize>() {
+            let mut rest = element;
+            let mut slot = dst_offset;
+            for axis in 0..rank {
+                let coord = origin[axis] + rest % extent[axis];
+                rest /= extent[axis];
+                slot += coord as isize * layout.dst_strides[axis];
+            }
+            order.push(slot as usize);
+        }
+    }
+    order
+}
+
 /// [#427]: any cut of the tile grid into two ranges, walked first range
 /// first, visits exactly the slots of the whole-box walk in the same order:
 /// the visit sequence (destination slot of every element, in visit order) of
-/// `0..cut` followed by `cut..count` equals that of [`apply_tiled_box`].
+/// `0..cut` followed by `cut..count` equals that of [`apply_tiled_box`]. And
+/// that sequence is the specified one ([`specified_tile_order`], built without
+/// either walk), so the order is checked against an independent reference, not
+/// only between two walks that share `apply_tile_range`.
 ///
 /// [#427]: https://github.com/tensor4all/strided-rs/issues/427
 #[test]
@@ -1190,6 +1235,10 @@ fn tile_ranges_partition_the_tiled_box_walk() {
         }
         let reference = reference.into_inner();
         assert_eq!(bits(&whole), bits(&expected), "{label}: whole-box walk");
+        assert!(
+            reference == specified_tile_order(&tiles, layout.dst_offset),
+            "{label}: the whole-box walk must visit the slots in the specified tile order"
+        );
         assert_eq!(
             reference.len(),
             layout.total(),

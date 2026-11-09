@@ -1603,22 +1603,26 @@ impl ConcatenatePlan {
         let segment_tiles = &segment_tiles;
         #[cfg(test)]
         let walked_tiles = core::sync::atomic::AtomicUsize::new(0);
+        // Per segment, the dispatched ranges that walked at least one of its
+        // tiles.
         #[cfg(test)]
-        let tiled_ranges = core::sync::atomic::AtomicUsize::new(0);
-        // The tile walk records each tile it visits on the thread that walks
-        // it. Each dispatched range moves its tiles from that thread's count
-        // to `walked_tiles`, and counts itself in `tiled_ranges` when it walked
-        // any, keeping what the thread had counted before; both reach the
-        // caller's counters after the dispatch.
-        #[cfg(test)]
-        let count_range = || MoveTileCount {
-            counted_before: crate::threading::take_tile_boxes(),
-            walked: &walked_tiles,
-            tiled_ranges: &tiled_ranges,
-        };
+        let tiled_ranges: Vec<core::sync::atomic::AtomicUsize> = (0..inputs.len())
+            .map(|_| core::sync::atomic::AtomicUsize::new(0))
+            .collect();
         // Replay the elements `local_start..local_end` of one segment: the
         // tiles whose share starts in them, or the flat range.
         let replay_segment = |position: usize, local_start: usize, local_end: usize| {
+            // The tile walk records each tile it visits on the thread that
+            // walks it. Move this range's tiles of this segment from that
+            // thread's count to `walked_tiles`, count the range for the segment
+            // when it walked any, and keep what the thread had counted before;
+            // both reach the caller's counters after the dispatch.
+            #[cfg(test)]
+            let _count = MoveTileCount {
+                counted_before: crate::threading::take_tile_boxes(),
+                walked: &walked_tiles,
+                tiled_ranges: &tiled_ranges[position],
+            };
             // The whole-plan guard above proved every segment has an inline
             // fused layout; skip one only if a future caller relaxes that
             // check.
@@ -1678,8 +1682,6 @@ impl ConcatenatePlan {
             // drew contiguous segments idle (#427).
             let width = exec.budget().get();
             crate::threading::parallel_for_each(0..width, exec, &|slots| {
-                #[cfg(test)]
-                let _count = count_range();
                 for position in 0..inputs.len() {
                     let segment_len = starts[position + 1] - starts[position];
                     if segment_len == 0 {
@@ -1694,8 +1696,6 @@ impl ConcatenatePlan {
             });
         } else {
             crate::threading::parallel_for_each(0..total, exec, &|range| {
-                #[cfg(test)]
-                let _count = count_range();
                 // First segment whose end lies past the range start.
                 let mut position = starts[1..].partition_point(|&end| end <= range.start);
                 while position < inputs.len() && starts[position] < range.end {
@@ -1709,7 +1709,12 @@ impl ConcatenatePlan {
         #[cfg(test)]
         {
             crate::threading::record_tile_boxes(walked_tiles.into_inner());
-            crate::threading::record_tiled_ranges(tiled_ranges.into_inner());
+            crate::threading::record_tiled_ranges(
+                tiled_ranges
+                    .into_iter()
+                    .map(core::sync::atomic::AtomicUsize::into_inner)
+                    .collect(),
+            );
         }
         Ok(true)
     }
@@ -1862,8 +1867,9 @@ impl ConcatenatePlan {
 }
 
 /// Moves the tile boxes the current thread recorded since it was built into
-/// `walked`, counts one range in `tiled_ranges` when there were any, and
-/// restores the count the thread had before, when dropped.
+/// `walked`, counts one range in `tiled_ranges` (the counter of the segment
+/// being replayed) when there were any, and restores the count the thread had
+/// before, when dropped.
 #[cfg(test)]
 struct MoveTileCount<'a> {
     counted_before: usize,

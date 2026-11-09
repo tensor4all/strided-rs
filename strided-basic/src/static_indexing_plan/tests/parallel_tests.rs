@@ -533,8 +533,9 @@ struct ConcatRun {
     values: Vec<i64>,
     tiles: usize,
     chunks: usize,
-    /// Dispatched ranges of this call that walked at least one tile.
-    tiled_ranges: usize,
+    /// Per segment, the dispatched ranges of this call that walked at least
+    /// one of its tiles (empty when no whole-plan replay ran).
+    tiled_ranges: Vec<usize>,
 }
 
 /// Run `plan` once through `execute` and once through `execute_uninit` on
@@ -654,13 +655,38 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
             "{entry}: the whole-plan replay must dispatch the tiled segments across the budget (dispatched {} chunks)",
             parallel.chunks
         );
-        // And the tiles themselves must be spread: a split that hands every
-        // tile of a segment to one range keeps the values, the tile count and
-        // the chunk count, so count the ranges that actually walked tiles.
+        // And each tiled segment's own tiles must be spread: a split that
+        // keeps every tile of a segment in one range keeps the values, the
+        // tile count, the chunk count and even the number of ranges that walk
+        // some tiles (two segments in two different ranges), so count the
+        // tile-bearing ranges per segment.
+        assert_eq!(
+            parallel.tiled_ranges.len(),
+            input_dims.len(),
+            "{entry}: one tiled-range count per segment"
+        );
+        let mut tiled_segments = 0;
+        for (position, &ranges) in parallel.tiled_ranges.iter().enumerate() {
+            if input_strides[position] == [1, rows as isize] {
+                assert_eq!(
+                    ranges, 0,
+                    "{entry}: contiguous segment {position} walks no tiles"
+                );
+            } else {
+                tiled_segments += 1;
+                assert!(
+                    ranges >= 2,
+                    "{entry}: the tiles of segment {position} must be walked by at least two dispatched ranges (walked by {ranges})"
+                );
+            }
+        }
+        assert_eq!(
+            tiled_segments, 2,
+            "{entry}: both transposed segments checked"
+        );
         assert!(
-            parallel.tiled_ranges >= 2,
-            "{entry}: the tiles must be walked by at least two dispatched ranges (walked by {})",
-            parallel.tiled_ranges
+            serial.tiled_ranges.is_empty(),
+            "{entry}: no whole-plan replay on the serial token"
         );
     }
 
@@ -698,7 +724,11 @@ fn concatenate_whole_plan_tiles_permuted_segments_like_serial_segments() {
         let entry = parallel.entry;
         assert_eq!(parallel.values, serial.values, "{entry}: values");
         assert_eq!((serial.tiles, parallel.tiles), (0, 0), "{entry}: tiles");
-        assert_eq!(parallel.tiled_ranges, 0, "{entry}: no range walks tiles");
+        assert!(
+            parallel.tiled_ranges.iter().all(|&ranges| ranges == 0),
+            "{entry}: no range walks tiles ({:?})",
+            parallel.tiled_ranges
+        );
         assert!(
             parallel.chunks >= 2,
             "{entry}: the contiguous concatenation must keep the flat split (dispatched {} chunks)",

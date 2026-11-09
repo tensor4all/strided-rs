@@ -242,24 +242,27 @@ pub(crate) fn record_tile_boxes(count: usize) {
     TILE_BOXES.with(|n| n.set(n.get() + count));
 }
 
-// Dispatched ranges of the whole-plan concatenate replay that walked at least
-// one cache tile, recorded on the calling thread after the dispatch.
+// Per segment, the dispatched ranges of the last whole-plan concatenate replay
+// on this thread that walked at least one of that segment's tiles, recorded on
+// the calling thread after the dispatch.
 #[cfg(test)]
 thread_local! {
-    static TILED_RANGES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static TILED_RANGES: core::cell::RefCell<Vec<usize>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
-/// Records `count` dispatched ranges that walked at least one tile.
+/// Records, per segment, the dispatched ranges that walked its tiles,
+/// replacing what an earlier replay recorded.
 #[cfg(test)]
-pub(crate) fn record_tiled_ranges(count: usize) {
-    TILED_RANGES.with(|n| n.set(n.get() + count));
+pub(crate) fn record_tiled_ranges(per_segment: Vec<usize>) {
+    TILED_RANGES.with(|all| *all.borrow_mut() = per_segment);
 }
 
-/// The dispatched ranges that walked tiles, recorded on this thread since the
-/// last call, and resets the count. Only the `parallel` tests read it.
+/// The per-segment tiled ranges recorded on this thread since the last call
+/// (empty when no whole-plan replay ran), and clears them. Only the `parallel`
+/// tests read it.
 #[cfg(all(test, feature = "parallel"))]
-pub(crate) fn take_tiled_ranges() -> usize {
-    TILED_RANGES.with(|n| n.replace(0))
+pub(crate) fn take_tiled_ranges() -> Vec<usize> {
+    TILED_RANGES.with(|all| all.take())
 }
 
 /// The cache-tile boxes visited on this thread since the last call, and resets
