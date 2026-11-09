@@ -463,8 +463,8 @@ pub(crate) fn spilled_pair_tiles<D, S>(axes: &[FusedAxis]) -> Option<Tiles> {
         compressed.rank = rank;
         return pair_tiles::<D, S>(&compressed).map(Tiles::Inline);
     }
-    // The model own exits are decided from the axes, before any slice is
-    // materialized: a call it declines allocates nothing new ([#425]).
+    // The exits the model decides before its metadata are answered from the axes,
+    // before any slice is materialized: a call it declines allocates nothing ([#425]).
     let elem_size = core::mem::size_of::<D>().max(core::mem::size_of::<S>());
     if crate::block::exits_before_metadata(
         axes.iter()
