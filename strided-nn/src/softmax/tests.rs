@@ -12,7 +12,13 @@ fn run<T: Copy>(
 ) -> Vec<T> {
     let mut output = vec![MaybeUninit::<T>::uninit(); len];
     call(&mut output).expect("valid call");
-    // SAFETY: the kernel wrote every element.
+    // SAFETY: `MaybeUninit<T>` has the layout of `T`, so this reads `len` values of `T` from
+    // `output`, which requires all of them initialized. Every caller passes a non-empty input
+    // with `len == input.len()` as the output length, and `call` returned `Ok`. For a non-empty
+    // input, an `Ok` entry rejected a length mismatch (softmax.rs:97), ran tasks whose spans
+    // cover `0..len` (softmax.rs:133), and fully wrote every chunk (softmax.rs:248). An empty
+    // input returns `Ok` before any check, so this helper would be wrong for an empty input with
+    // a non-empty `len`; no caller does that.
     unsafe { core::slice::from_raw_parts(output.as_ptr().cast::<T>(), len) }.to_vec()
 }
 
