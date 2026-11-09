@@ -519,7 +519,7 @@ impl<'a> ErasedRawStridedRef<'a> {
         // direct `from_raw_parts` caller owes the start of an aligned
         // allocation (raw.rs:451). A zero-length slice requires only a
         // non-null aligned pointer, so a dangling aligned base is accepted
-        // here and an interior or misaligned one was already rejected.
+        // here, and so is an aligned interior base; only misaligned ones are rejected.
         Ok(unsafe {
             core::slice::from_raw_parts(
                 self.data.as_ptr().cast::<T>(),
