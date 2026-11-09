@@ -834,8 +834,8 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
         // (see `StridedArray::view`, view.rs:1461), or the `new_unchecked`
         // contract. `ptr` is the view's base, so `ptr + idx` stays inside
         // `data`. A view with a zero-extent axis has no in-bounds index tuple,
-        // so the arity check above keeps its dangling `ptr` unreached; an extra
-        // index panics on `strides()[i]`.
+        // so the arity check above keeps its dangling `ptr` unreached; a longer
+        // `indices` panics on that check (debug) or on `strides()[i]` (release).
         Op::apply(*self.ptr.offset(idx))
     }
 }
