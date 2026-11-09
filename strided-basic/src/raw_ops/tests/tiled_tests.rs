@@ -443,6 +443,20 @@ fn spilled_layouts_tile_as_their_compressed_rank_would() {
 /// [#425] review follow-up: every spilled plan entry, not only the raw replay,
 /// must reach the tiles. A mutation that suppresses tiles for
 /// `PairTraversal::Spilled` inside `CopyPlan` or `UpdatePlan` has to fail here.
+/// The model cuts after axis 0 here and reads a **nine**-entry tail in
+/// `slabs_share_no_line`; the fixed eight-entry buffer this replaced panicked
+/// on it, and no other fixture in the file produces a tail above eight (#425).
+#[test]
+fn a_tail_above_eight_entries_is_decided_without_panicking() {
+    let dims = [8usize, 256, 2, 2, 2, 2, 2, 2, 2, 2];
+    let dst = [
+        1isize, 8, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+    ];
+    let src = [1isize, 2048, 1024, 512, 256, 128, 64, 32, 16, 8];
+    let layout = Layout::new(&dims, &dst, &src, 0);
+    assert!(layout.tiles::<f64, f64>().is_none());
+}
+
 #[test]
 fn spilled_plan_entries_visit_tiles() {
     let nine = reversed(&[4; 9]);
