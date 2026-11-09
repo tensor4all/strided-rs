@@ -1536,8 +1536,11 @@ impl ConcatenatePlan {
     /// worker range over the segment's elements owns the tiles whose share of
     /// the segment starts in it, so the tiles are split across the token whole
     /// and every tile is the one the serial replay walks ([#427]). A segment
-    /// that declines keeps the flat walk of its element range. Each worker
-    /// replays its part serially, so nothing is split twice.
+    /// that declines keeps the flat walk of its element range. When any
+    /// segment tiles, every segment is divided across the whole budget, as
+    /// its serial replay divides it, instead of cutting the concatenated
+    /// space; without tiles the concatenated space is cut as before. Each
+    /// worker replays its part serially, so nothing is split twice.
     ///
     /// The caller must have validated every input layout and segment offset.
     ///
@@ -1586,68 +1589,94 @@ impl ConcatenatePlan {
         let segment_tiles = &segment_tiles;
         #[cfg(test)]
         let walked_tiles = core::sync::atomic::AtomicUsize::new(0);
-        crate::threading::parallel_for_each(0..total, exec, &|range| {
-            // First segment whose end lies past the range start.
-            let mut position = starts[1..].partition_point(|&end| end <= range.start);
-            while position < inputs.len() && starts[position] < range.end {
-                let segment_len = starts[position + 1] - starts[position];
-                let local_start = range.start.max(starts[position]) - starts[position];
-                let local_end = range.end.min(starts[position + 1]) - starts[position];
-                // The whole-plan guard above proved every segment has an
-                // inline fused layout; skip one only if a future caller
-                // relaxes that check.
-                let Some(layout) = self.copy_plans[position].fused_layout() else {
-                    position += 1;
-                    continue;
-                };
-                let input = &inputs[position];
-                // SAFETY: `check_dest_layout`/`check_input_layout` proved the
-                // views carry the compiled layouts, so each segment window
-                // (input dims, destination strides, checked segment offset) is
-                // a sub-layout of the validated destination and each input
-                // layout is in-bounds of its data. The destination layout is
-                // injective and the segments occupy disjoint ranges of the
-                // concatenation axis, so disjoint logical ranges write
-                // disjoint slots; inputs are shared borrows that cannot alias
-                // the exclusive destination borrow. The tiles of a segment are
-                // `pair_tiles` of its layout, which address exactly its slots,
-                // and disjoint worker ranges own disjoint tile ranges within
-                // the grid (`tile_share` is monotone and maps the segment end
-                // to the tile count).
-                unsafe {
-                    if let Some(tiles) = &segment_tiles[position] {
-                        let count = crate::raw_ops::tile_count(&tiles.layout, &tiles.blocks);
-                        let first = tile_share(local_start, count, segment_len);
-                        let end = tile_share(local_end, count, segment_len);
-                        crate::raw_ops::apply_tile_range(
-                            dest_ptr.as_ptr(),
-                            dest_offsets[position],
-                            input.data().as_ptr(),
-                            input.offset(),
-                            &tiles.layout,
-                            &tiles.blocks,
-                            first,
-                            end - first,
-                            &apply,
-                        );
-                        #[cfg(test)]
-                        walked_tiles.fetch_add(end - first, core::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        crate::raw_ops::apply_fused_range(
-                            dest_ptr.as_ptr(),
-                            dest_offsets[position],
-                            input.data().as_ptr(),
-                            input.offset(),
-                            layout,
-                            local_start,
-                            local_end - local_start,
-                            &apply,
-                        );
-                    }
+        // Replay the elements `local_start..local_end` of one segment: the
+        // tiles whose share starts in them, or the flat range.
+        let replay_segment = |position: usize, local_start: usize, local_end: usize| {
+            // The whole-plan guard above proved every segment has an inline
+            // fused layout; skip one only if a future caller relaxes that
+            // check.
+            let Some(layout) = self.copy_plans[position].fused_layout() else {
+                return;
+            };
+            let input = &inputs[position];
+            // SAFETY: `check_dest_layout`/`check_input_layout` proved the
+            // views carry the compiled layouts, so each segment window (input
+            // dims, destination strides, checked segment offset) is a
+            // sub-layout of the validated destination and each input layout is
+            // in-bounds of its data. The destination layout is injective and
+            // the segments occupy disjoint ranges of the concatenation axis,
+            // so disjoint element ranges write disjoint slots; inputs are
+            // shared borrows that cannot alias the exclusive destination
+            // borrow. The tiles of a segment are `pair_tiles` of its layout,
+            // which address exactly its slots, and disjoint element ranges own
+            // disjoint tile ranges within the grid (`tile_share` is monotone
+            // and maps the segment end to the tile count).
+            unsafe {
+                if let Some(tiles) = &segment_tiles[position] {
+                    let segment_len = starts[position + 1] - starts[position];
+                    let count = crate::raw_ops::tile_count(&tiles.layout, &tiles.blocks);
+                    let first = tile_share(local_start, count, segment_len);
+                    let end = tile_share(local_end, count, segment_len);
+                    crate::raw_ops::apply_tile_range(
+                        dest_ptr.as_ptr(),
+                        dest_offsets[position],
+                        input.data().as_ptr(),
+                        input.offset(),
+                        &tiles.layout,
+                        &tiles.blocks,
+                        first,
+                        end - first,
+                        &apply,
+                    );
+                    #[cfg(test)]
+                    walked_tiles.fetch_add(end - first, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    crate::raw_ops::apply_fused_range(
+                        dest_ptr.as_ptr(),
+                        dest_offsets[position],
+                        input.data().as_ptr(),
+                        input.offset(),
+                        layout,
+                        local_start,
+                        local_end - local_start,
+                        &apply,
+                    );
                 }
-                position += 1;
             }
-        });
+        };
+        if segment_tiles.iter().any(Option::is_some) {
+            // Every segment is divided across the whole budget, as its serial
+            // replay divides it: slot `w` of `width` owns the share
+            // `w/width..(w+1)/width` of each segment. A tiled segment's elements
+            // cost several times a contiguous one's, so cutting the
+            // concatenated space by element count would leave the slots that
+            // drew contiguous segments idle (#427).
+            let width = exec.budget().get();
+            crate::threading::parallel_for_each(0..width, exec, &|slots| {
+                for position in 0..inputs.len() {
+                    let segment_len = starts[position + 1] - starts[position];
+                    if segment_len == 0 {
+                        continue;
+                    }
+                    replay_segment(
+                        position,
+                        slot_share(slots.start, segment_len, width),
+                        slot_share(slots.end, segment_len, width),
+                    );
+                }
+            });
+        } else {
+            crate::threading::parallel_for_each(0..total, exec, &|range| {
+                // First segment whose end lies past the range start.
+                let mut position = starts[1..].partition_point(|&end| end <= range.start);
+                while position < inputs.len() && starts[position] < range.end {
+                    let local_start = range.start.max(starts[position]) - starts[position];
+                    let local_end = range.end.min(starts[position + 1]) - starts[position];
+                    replay_segment(position, local_start, local_end);
+                    position += 1;
+                }
+            });
+        }
         #[cfg(test)]
         crate::threading::record_tile_boxes(walked_tiles.into_inner());
         Ok(true)
@@ -1748,6 +1777,15 @@ fn tile_share(local: usize, count: usize, len: usize) -> usize {
     debug_assert!(local <= len && len > 0);
     // `count <= len`, so the quotient fits `usize`; the product needs u128.
     ((local as u128 * count as u128).div_ceil(len as u128)) as usize
+}
+
+/// The first element of a segment of `len` elements owned by slot `slot` of
+/// `width`: `slot * len / width`, so slot 0 starts at 0, slot `width` at `len`,
+/// and the map is monotone.
+fn slot_share(slot: usize, len: usize, width: usize) -> usize {
+    debug_assert!(slot <= width && width > 0);
+    // The quotient is at most `len`; the product needs u128.
+    (slot as u128 * len as u128 / width as u128) as usize
 }
 
 impl ReversePlan {
