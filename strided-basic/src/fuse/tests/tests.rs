@@ -349,6 +349,42 @@ fn test_compute_importance_rank_64_shares_the_top_weight() {
 }
 
 #[test]
+fn test_compute_importance_rank_65_broadcast_output_keeps_live_axes_distinct() {
+    // Review of #450: the fallback searched level caps only up to 61, so a
+    // shape whose live axes are on the input side (zero-strided output) lost a
+    // distinction that does fit: cap 63 gives 2^63 and 2^62 here, cap 61 gives
+    // 2^61 and 2^61. The cap must be chosen per shape, not capped at 61.
+    let n = 65;
+    let mut dims = vec![1usize; n];
+    dims[0] = 2;
+    dims[2] = 2;
+    let out_strides = vec![0isize; n];
+    let in_strides: Vec<isize> = (0..n).map(|i| i as isize + 1).collect();
+    let all_strides: [&[isize]; 2] = [&out_strides, &in_strides];
+    let index_orders: Vec<Vec<usize>> = [&out_strides[..], &in_strides[..]]
+        .iter()
+        .map(|s| index_order(s).into_vec())
+        .collect();
+
+    let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+    assert_eq!(
+        importance[0],
+        1u64 << 63,
+        "axis 0 (stride 1) takes the top level"
+    );
+    assert_eq!(
+        importance[2],
+        1u64 << 62,
+        "axis 2 (stride 3) keeps the level below it"
+    );
+    assert!(importance
+        .iter()
+        .enumerate()
+        .all(|(i, &w)| i == 0 || i == 2 || w == 0));
+}
+
+#[test]
 fn test_compute_importance_matches_exact_reference() {
     // The original formula evaluated without overflow (u128). Wherever it fits,
     // the 64-bit weights must be identical, so the plan order is unchanged.

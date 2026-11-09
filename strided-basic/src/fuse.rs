@@ -216,8 +216,12 @@ pub fn compute_importance<I: AsRef<[usize]>>(
     packed
         .or_else(|| {
             // One bit per level still overflows from rank ~62 on: share the top
-            // weight, with the widest level cap that fits.
-            (1..=61u64)
+            // weight, with the widest level cap that fits. The bound is `u64`,
+            // not a fixed 61: the cap that fits depends on the shape (a cap of
+            // 61 is forced only when the output stream is live, because its
+            // weight is `4 * 2^cap`; with an all-zero output stride `63` fits),
+            // so let the checked arithmetic choose per shape.
+            (1..=63u64)
                 .rev()
                 .find_map(|level_cap| weights(1, level_cap))
         })
