@@ -4,7 +4,30 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
-## 0.14.0 (unreleased) — breaking
+## 0.14.1 (unreleased) — patch
+
+`0.14.0` shipped on crates.io on 2026-11-08. Since then `main` has changed shipped files in all six
+crates, so the weekly `Packaged crate tests` job's `published content identity` step (#409) reports
+`6 mismatch(es)` at `34ec19c` (run 42670871078); the same check run locally
+(`python3 scripts/published_identity.py .`) reports the same six. The version number no longer
+identified one body of content, so this patch moves it.
+
+What changed under 0.14.0:
+
+- **SAFETY documentation** (#219 wave): every `unsafe` block in `strided-view`, `strided-perm`,
+  `strided-basic` (including `map_view.rs` and `ops_view.rs`), `strided-kernel`, `strided-fused` and
+  `strided-nn` now names the site that validates it (#435, #438, #440–#442, #444, #446, #448, #449).
+  Comments only; no code changed.
+- **Fixes**: `CopyPlan` costed by its footprint (#424), per-operand element size in the block model
+  (#431), tile placement for the transposed, spilled and view paths (#422, #429, #433), tiled
+  segments in `ConcatenatePlan`'s whole-plan parallel replay (#432), alignment of zero-length erased
+  buffers (#436), and the `get_unchecked` index-arity contract (#439).
+- **Docs**: the crate READMEs follow the published 0.14 / view 0.8 line (#417, #418, #420).
+
+No public item was added or removed. `[workspace.dependencies]` moves with the crates, so a
+dependent packages against the version it needs.
+
+## 0.14.0 (2026-11-08) — breaking
 
 Bumped to **0.14.0**: `strided-basic`, `strided-perm`, `strided-kernel`, `strided-fused`, `strided-nn`.
 `strided-view` goes to **0.8.0** and `strided-traits` to **0.7.2**; the table below says why each one moves.
@@ -65,9 +88,9 @@ the whole crate, `strided-kernel` re-exports `strided-basic`, and `strided-fused
 A patch on the 0.13.x line would be the wrong number: in 0.x the minor is the breaking position, and a downstream that
 keeps `strided-view = "0.7"` while taking the new `strided-perm` gets two view types and `E0308` at the boundary — the
 failure the version number has to announce, and one no workspace test can see, because the workspace builds on paths.
-`[workspace.dependencies]` names these versions, so a dependent packages against the dependency it needs. Nothing here is
-published yet, so `cargo package` of a dependent reports the missing version until the bottom-up publish (`traits`, `view`,
-`perm`, `basic`, `fused`, `nn`, `kernel`) has run.
+`[workspace.dependencies]` names these versions, so a dependent packages against the dependency it needs. All seven were published bottom-up on 2026-11-08, so there is no
+missing version for a dependent to meet; the order was (`traits`, `view`,
+`perm`, `basic`, `fused`, `nn`, `kernel`).
 
 ### The unpublished 0.13.1 batch
 
