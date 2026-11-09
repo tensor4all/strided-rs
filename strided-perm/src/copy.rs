@@ -140,9 +140,11 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
         let len = total_len(raw.dims);
         if exec.is_serial() {
             // SAFETY: `prepare` (copy.rs:85) proved `dims`, the strides and the two
-            // origins describe the same shape, and each view's constructor proved
-            // through `validate_bounds` (strided-view/src/view.rs:186) that its
-            // reachable offsets stay inside its own slice. A contiguous layout
+            // origins describe the same shape, and each view's construction proved
+            // that its reachable offsets stay inside its own slice:
+            // `validate_bounds` (strided-view/src/view.rs:187), or for a
+            // `StridedArray` view the dense layout argued at `StridedArray::view`
+            // (strided-view/src/view.rs:1456). A contiguous layout
             // reaches exactly `total_len(dims)` consecutive elements from that
             // origin, so both ranges are live for `len` elements; the caller holds
             // `&mut StridedViewMut` against a shared `&StridedView`, so they do not
@@ -152,7 +154,10 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
             let src_addr = raw.src as usize;
             let dst_addr = dst_ptr as usize;
             exec.for_ranges(len, std::num::NonZeroUsize::MIN, |range| {
-                // SAFETY: `range` is a disjoint subrange of `0..len`, so both
+                // SAFETY: the pointers are rebuilt from `as usize` casts of the
+                // live `raw.src`/`dst_ptr`, which expose their provenance, so the
+                // casts back recover it. `range` is a disjoint subrange of
+                // `0..len`, so both
                 // `.add(range.start)` pointers stay within the two live `len`-element
                 // contiguous ranges justified above; the subranges are disjoint, and
                 // raw stores are valid for the uninitialized `U` destination.
@@ -184,6 +189,17 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     if !strided_view::is_injective_layout(raw.dims, raw.dst_strides) {
         return Err(StridedError::NonInjectiveOutputLayout);
     }
+    // SAFETY: `execute_permute_blocked` (execute.rs:131) needs `src`/`dst` valid at
+    // every offset of the layout `plan` was built from, no overlap, no other
+    // access to the destination, and an injective destination when `exec` fans
+    // out, over a layout with no zero extent. `plan` is `build_permute_plan`
+    // over exactly `raw.dims` and the two stride runs, and `raw` is a
+    // `RawCopy`, which only `prepare` builds and only after returning `None`
+    // for a zero extent (copy.rs:100); validity and non-overlap are this function's `# Safety`
+    // (copy.rs:116); the callers hold `&mut StridedViewMut` for the whole call, so
+    // nothing else touches the destination; injectivity was checked just
+    // above. `dst_ptr` is `raw.dst` cast from `U` to `T`, the same layout for
+    // `U = T` and `U = MaybeUninit<T>`, and the engine only stores through it.
     execute_permute_blocked(raw.src, dst_ptr, &plan, exec);
     Ok(())
 }
@@ -231,9 +247,10 @@ pub fn copy_into<T: Copy + Send + Sync + 'static>(
 ) -> Result<()> {
     match prepare(dest, src)? {
         // SAFETY: `prepare` (copy.rs:85) rejected a rank or shape mismatch and a
-        // zero-sized copy, and each view's constructor proved its reachable offsets
-        // stay inside its slice through `validate_bounds`
-        // (strided-view/src/view.rs:186). `&mut StridedViewMut` excludes any other
+        // zero-sized copy, and each view's construction proved its reachable
+        // offsets stay inside its slice (`validate_bounds`,
+        // strided-view/src/view.rs:187, or the dense `StridedArray` layout).
+        // `&mut StridedViewMut` excludes any other
         // borrow of the destination, so the two raw extents cannot overlap.
         Some(raw) => unsafe { copy_raw(raw, exec) },
         None => Ok(()),
@@ -262,7 +279,7 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
     exec: Exec<'_>,
 ) -> Result<()> {
     match prepare(dest, src)? {
-        // SAFETY: as `copy_into` (copy.rs:227) — `prepare` matched the shapes and
+        // SAFETY: as `copy_into` (copy.rs:243) — `prepare` matched the shapes and
         // both views proved their bounds at construction. `MaybeUninit<T>` has `T`'s
         // size and alignment, and the engine only stores into the destination, so
         // the uninitialized extent is never read.

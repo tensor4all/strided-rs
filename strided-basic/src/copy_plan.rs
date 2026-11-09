@@ -220,6 +220,22 @@ impl CopyPlan {
         self.fused.inline()
     }
 
+    /// The cache tiles [`Self::execute`] replays this plan with for
+    /// destination element `D` and source element `S`, or `None` when it keeps
+    /// the column-major walk: the one decision a caller replaying the plan's
+    /// traversal itself must reuse.
+    #[inline]
+    pub(crate) fn tiles<D, S>(&self) -> Option<Tiles> {
+        self.fused.tiles::<D, S>()
+    }
+
+    /// Whether [`Self::tiles`] can return tiles for any element types; known
+    /// at compile time ([`PairTraversal::may_tile`]).
+    #[inline]
+    pub(crate) fn may_tile(&self) -> bool {
+        self.fused.may_tile()
+    }
+
     /// Copy into uninitialized storage, then lend the initialized destination to `f`.
     ///
     /// [`Self::execute_uninit`] initializes every reachable logical destination

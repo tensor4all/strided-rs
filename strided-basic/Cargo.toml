@@ -55,6 +55,11 @@ harness = false
 required-features = ["parallel"]
 
 [[bench]]
+name = "concat_parallel"
+harness = false
+required-features = ["parallel"]
+
+[[bench]]
 name = "overhead_smoke"
 harness = false
 

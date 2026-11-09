@@ -134,6 +134,28 @@ impl PairTraversal {
         }
     }
 
+    /// Whether [`Self::tiles`] can return tiles for any element types: `false`
+    /// when the traversal covers at most one element or has fewer than two
+    /// axes of extent above 1, the exits [`pair_tiles`] and
+    /// [`spilled_pair_tiles`] take before they look at an element size. Such
+    /// a traversal is one run, whose order no block vector can change.
+    pub(crate) fn may_tile(&self) -> bool {
+        let (total, moving) = match self {
+            Self::Inline(layout) => (
+                fused_total(layout),
+                layout.dims[..layout.rank]
+                    .iter()
+                    .filter(|&&dim| dim != 1)
+                    .count(),
+            ),
+            Self::Spilled(axes) => (
+                spilled_total(axes),
+                axes.iter().filter(|axis| axis.dim != 1).count(),
+            ),
+        };
+        total > 1 && moving >= 2
+    }
+
     /// The inline layout, or `None` when the traversal spilled.
     #[inline]
     pub(crate) fn inline(&self) -> Option<&FusedPairLayout> {
@@ -536,17 +558,82 @@ pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
     S: Copy,
     Apply: Fn(&mut D, S),
 {
+    let tiles = tile_count(tile_box, blocks);
+    // SAFETY: forwarded caller contract; `0..tiles` is the whole tile grid.
+    unsafe {
+        apply_tile_range(
+            dst_ptr, dst_base, src_ptr, src_base, tile_box, blocks, 0, tiles, apply,
+        );
+    }
+}
+
+/// Number of tiles of extents `blocks` that cover `tile_box`; at most its
+/// element count, so it cannot overflow.
+pub(crate) fn tile_count(
+    tile_box: &FusedPairLayout,
+    blocks: &[usize; RAW_FUSED_RANK_LIMIT],
+) -> usize {
+    tile_box.dims[..tile_box.rank]
+        .iter()
+        .zip(blocks)
+        .map(|(&dim, &block)| dim.div_ceil(block))
+        .product()
+}
+
+/// Replay the tiles `first..first + count` of `tile_box`, numbered in
+/// column-major order of the tile grid [`apply_tiled_box`] walks, each in
+/// column-major order by [`apply_fused_range`].
+///
+/// Disjoint tile ranges address disjoint logical indices, and the ranges
+/// `0..k`, `k..tile_count` together walk exactly what [`apply_tiled_box`]
+/// walks, in the same order.
+///
+/// # Safety
+///
+/// The [`apply_fused_range`] contract for the whole of `tile_box`, every
+/// `blocks[axis]` for `axis < tile_box.rank` at least 1, and
+/// `first + count` at most [`tile_count`] of `tile_box` and `blocks`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) unsafe fn apply_tile_range<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    tile_box: &FusedPairLayout,
+    blocks: &[usize; RAW_FUSED_RANK_LIMIT],
+    first: usize,
+    count: usize,
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    if count == 0 {
+        return;
+    }
     let rank = tile_box.rank;
     let mut tile = *tile_box;
-    for (dim, &block) in tile.dims[..rank].iter_mut().zip(blocks) {
-        *dim = block.min(*dim);
-    }
     // `origin[axis]` is the first box coordinate of the current tile along
     // `axis`; `dst_tile`/`src_tile` are the offsets of the tile origin.
     let mut origin = [0usize; RAW_FUSED_RANK_LIMIT];
     let mut dst_tile = dst_base;
     let mut src_tile = src_base;
+    // Decode `first` into its tile-grid coordinates, axis 0 fastest.
+    let mut rest = first;
+    for axis in 0..rank {
+        let along = tile_box.dims[axis].div_ceil(blocks[axis]);
+        origin[axis] = (rest % along) * blocks[axis];
+        rest /= along;
+        dst_tile += origin[axis] as isize * tile_box.dst_strides[axis];
+        src_tile += origin[axis] as isize * tile_box.src_strides[axis];
+        tile.dims[axis] = blocks[axis].min(tile_box.dims[axis] - origin[axis]);
+    }
+    let mut left = count;
     loop {
+        // Counted here, where the tile is walked, so that a test sees the
+        // walk itself and not the range a caller asked for.
         #[cfg(test)]
         crate::threading::record_tile_box();
         // SAFETY: the tile is a sub-box of `tile_box` at a reachable origin, so
@@ -563,15 +650,18 @@ pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
                 apply,
             );
         }
+        left -= 1;
+        if left == 0 {
+            return;
+        }
         // Column-major odometer over the tile grid. An axis advances only
         // when another tile follows along it, so `blocks[axis]` is at most
         // its last box coordinate, and it rewinds by its current origin:
-        // every intermediate offset is a reachable offset of the box.
+        // every intermediate offset is a reachable offset of the box. The
+        // caller's bound on `first + count` keeps the walk inside the grid.
         let mut axis = 0;
         loop {
-            if axis == rank {
-                return;
-            }
+            debug_assert!(axis < rank, "tile range past the end of the grid");
             let next = origin[axis] + blocks[axis];
             if next < tile_box.dims[axis] {
                 origin[axis] = next;
