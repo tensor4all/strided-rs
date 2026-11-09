@@ -79,10 +79,17 @@ impl Layout {
         RawStridedMut::new(data, &self.dims, &self.dst, self.dst_offset).unwrap()
     }
 
-    fn given_tiles<D, S>(&self) -> Option<PairTiles> {
-        PairTraversal::given(&self.dims, &self.dst, &self.src)
-            .inline()
-            .and_then(pair_tiles::<D, S>)
+    /// The tiles [`PairTraversal::given`] selects, whatever their shape.
+    fn tiles<D, S>(&self) -> Option<Tiles> {
+        PairTraversal::given(&self.dims, &self.dst, &self.src).tiles::<D, S>()
+    }
+
+    /// The tiles of the inline walk only.
+    fn inline_tiles<D, S>(&self) -> Option<PairTiles> {
+        self.tiles::<D, S>()
+            .as_ref()
+            .and_then(Tiles::inline)
+            .copied()
     }
 }
 
@@ -130,6 +137,21 @@ fn layouts() -> Vec<(&'static str, Layout)> {
         ),
         ("16^4 reversed", reversed(&[16; 4])),
         ("4^8 reversed", reversed(&[4; 8])),
+        // Fused rank above the inline limit: the spilled walk.
+        ("4^9 reversed", reversed(&[4; 9])),
+        // The spilled walk with a negative source axis and a nonzero base: a
+        // walker that drops the sign still matches the positive case above.
+        ("4^9 reversed source, negative last axis, cropped base", {
+            let dims = [4usize; 9];
+            let dst: Vec<isize> = (0..9).map(|axis| 1isize << (2 * axis)).collect();
+            let mut src: Vec<isize> = (0..9).map(|axis| 1isize << (2 * (8 - axis))).collect();
+            src[8] = -1;
+            Layout::new(&dims, &dst, &src, 8)
+        }),
+        (
+            "rank 12 reversed",
+            reversed(&[2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4, 4]),
+        ),
         // An extent-1 axis that `pair_tiles` drops.
         (
             "[1, 65, 65] transpose",
@@ -246,6 +268,9 @@ where
     check_uninit("replay_copy_raw_uninit", &|d, s| *d = s, &|d| {
         replay_copy_raw_uninit(d, &source, exec()).unwrap()
     });
+    check_uninit("replay_map_raw_uninit", &|d, s| *d = s, &|d| {
+        replay_map_raw_uninit(d, &source, |s| s, exec()).unwrap()
+    });
     check_uninit("CopyPlan::execute_uninit", &|d, s| *d = s, &|d| {
         copy.execute_uninit(d, &source, exec()).unwrap()
     });
@@ -292,11 +317,206 @@ fn check_f64_rows<'e>(layout: &Layout, exec: impl Fn() -> Exec<'e>, label: &str)
 }
 
 #[test]
+fn spilled_layouts_tile_as_their_compressed_rank_would() {
+    // [#425]: a fused rank above the inline limit walks untiled, unless the
+    // shared model's tiles are applied to the spilled axes too.
+    let nine = reversed(&[4; 9]);
+    let (dst_len, src_len) = nine.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let mut expected = vec![0.0f64; dst_len];
+    oracle(&nine, &mut expected, &src, |d, s| *d = s);
+    let mut actual = vec![0.0f64; dst_len];
+    crate::threading::take_tile_boxes();
+    replay_copy_raw(
+        &mut nine.dst_view(&mut actual),
+        &nine.src_view(&src),
+        Exec::serial(),
+    )
+    .unwrap();
+    assert_eq!(bits(&actual), bits(&expected));
+    let boxes = crate::threading::take_tile_boxes();
+    assert!(
+        boxes >= 16,
+        "the rank-9 copy must visit cache tiles, got {boxes} boxes"
+    );
+    assert!(matches!(nine.tiles::<f64, f64>(), Some(Tiles::Spilled(_))));
+
+    // One inert axis appended to the rank-8 layout: `given` keeps the axis and
+    // spills, while the compressed layout is the rank-8 one, so the shared
+    // model must reach the same blocks and the same slots.
+    let rank8 = reversed(&[4; 8]);
+    let mut padded = Layout::new(
+        &[4, 4, 4, 4, 4, 4, 4, 4, 1],
+        &[1, 4, 16, 64, 256, 1024, 4096, 16384, 3],
+        &[16384, 4096, 1024, 256, 64, 16, 4, 1, 5],
+        0,
+    );
+    padded.dst_offset = rank8.dst_offset;
+    padded.src_offset = rank8.src_offset;
+    let Some(Tiles::Inline(compressed)) = padded.tiles::<f64, f64>() else {
+        panic!("a padded rank-9 layout must tile as its compressed rank-8 one");
+    };
+    assert_eq!(compressed.layout.rank, 8);
+    assert_eq!(compressed.layout.dims[..8], rank8.dims[..]);
+    let rank8_tiles = rank8
+        .inline_tiles::<f64, f64>()
+        .expect("the rank-8 layout tiles");
+    assert_eq!(compressed.blocks, rank8_tiles.blocks);
+
+    let (dst_len, src_len) = padded.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let mut expected = vec![0.0f64; dst_len];
+    oracle(&padded, &mut expected, &src, |d, s| *d = s);
+    let mut actual = vec![0.0f64; dst_len];
+    crate::threading::take_tile_boxes();
+    replay_copy_raw(
+        &mut padded.dst_view(&mut actual),
+        &padded.src_view(&src),
+        Exec::serial(),
+    )
+    .unwrap();
+    assert_eq!(bits(&actual), bits(&expected));
+    let boxes = crate::threading::take_tile_boxes();
+    assert!(
+        boxes >= 16,
+        "the padded rank-9 copy must visit cache tiles, got {boxes} boxes"
+    );
+
+    // The spilled walk with a negative source axis and a nonzero base reaches
+    // the tiles too, and only a sign-preserving offset reproduces the oracle.
+    let cropped = layouts()
+        .into_iter()
+        .find(|(label, _)| label.starts_with("4^9 reversed source"))
+        .expect("the negative spilled layout");
+    assert!(matches!(
+        cropped.1.tiles::<f64, f64>(),
+        Some(Tiles::Spilled(_))
+    ));
+    let (dst_len, src_len) = cropped.1.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let mut expected = vec![0.0f64; dst_len];
+    oracle(&cropped.1, &mut expected, &src, |d, s| *d = s);
+    let mut actual = vec![0.0f64; dst_len];
+    crate::threading::take_tile_boxes();
+    replay_copy_raw(
+        &mut cropped.1.dst_view(&mut actual),
+        &cropped.1.src_view(&src),
+        Exec::serial(),
+    )
+    .unwrap();
+    assert_eq!(bits(&actual), bits(&expected), "{}", cropped.0);
+    let boxes = crate::threading::take_tile_boxes();
+    assert!(
+        boxes >= 16,
+        "the negative spilled copy must visit tiles, got {boxes}"
+    );
+
+    // A layout whose column-major walk is kept stays on it: one box count of
+    // zero is the same answer the inline route gives the rank-8 layout.
+    let dense = Layout::new(&[4096, 512], &[1, 4096], &[1, 4096], 0);
+    assert!(dense.tiles::<f64, f64>().is_none());
+
+    // The split leaves of the spilled route partition the box, as the inline
+    // ones do.
+    let team = team();
+    let nine = reversed(&[4; 9]);
+    let (dst_len, src_len) = nine.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let mut actual = vec![0.0f64; dst_len];
+    crate::threading::take_tiled_leaves();
+    replay_copy_raw(
+        &mut nine.dst_view(&mut actual),
+        &nine.src_view(&src),
+        team.exec(4),
+    )
+    .unwrap();
+    let leaves = crate::threading::take_tiled_leaves();
+    #[cfg(feature = "parallel")]
+    {
+        assert!(!leaves.is_empty(), "the spilled box must split at width 4");
+        assert!(leaf_visits(&nine, &leaves).iter().all(|&v| v == 1));
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = leaves;
+}
+
+/// [#425] review follow-up: every spilled plan entry, not only the raw replay,
+/// must reach the tiles. A mutation that suppresses tiles for
+/// `PairTraversal::Spilled` inside `CopyPlan` or `UpdatePlan` has to fail here.
+/// The model cuts after axis 0 here and reads a **nine**-entry tail in
+/// `slabs_share_no_line`; the fixed eight-entry buffer this replaced panicked
+/// on it, and no other fixture in the file produces a tail above eight (#425).
+#[test]
+fn a_tail_above_eight_entries_is_decided_without_panicking() {
+    let dims = [8usize, 256, 2, 2, 2, 2, 2, 2, 2, 2];
+    let dst = [
+        1isize, 8, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+    ];
+    let src = [1isize, 2048, 1024, 512, 256, 128, 64, 32, 16, 8];
+    let layout = Layout::new(&dims, &dst, &src, 0);
+    assert!(layout.tiles::<f64, f64>().is_none());
+}
+
+#[test]
+fn spilled_plan_entries_visit_tiles() {
+    let nine = reversed(&[4; 9]);
+    let (dst_len, src_len) = nine.lens();
+    let src: Vec<f64> = (0..src_len).map(f64::value).collect();
+    let source = nine.src_view(&src);
+    let copy = CopyPlan::compile(&nine.dims, &nine.dst, &nine.src).unwrap();
+    let update = UpdatePlan::compile(&nine.dims, &nine.dst, &nine.src).unwrap();
+
+    let run = |name: &str, f: &mut dyn FnMut(&mut RawStridedMut<'_, f64>)| {
+        let mut actual = vec![0.0f64; dst_len];
+        crate::threading::take_tile_boxes();
+        f(&mut nine.dst_view(&mut actual));
+        let boxes = crate::threading::take_tile_boxes();
+        assert!(
+            boxes >= 16,
+            "{name}: the spilled plan must visit cache tiles, got {boxes} boxes"
+        );
+    };
+    run("CopyPlan::execute", &mut |d| {
+        copy.execute(d, &source, Exec::serial()).unwrap()
+    });
+    run("CopyPlan::execute_scale", &mut |d| {
+        copy.execute_scale(d, &source, 2.0, Exec::serial()).unwrap()
+    });
+    run("CopyPlan::execute_conj", &mut |d| {
+        copy.execute_conj(d, &source, Exec::serial()).unwrap()
+    });
+    run("UpdatePlan::execute", &mut |d| {
+        update
+            .execute(d, &source, 2.0, 3.0, |x| x, Exec::serial())
+            .unwrap()
+    });
+
+    let run_uninit = |name: &str, f: &mut dyn FnMut(&mut RawStridedMut<'_, MaybeUninit<f64>>)| {
+        let mut actual = vec![MaybeUninit::new(0.0f64); dst_len];
+        crate::threading::take_tile_boxes();
+        f(&mut nine.dst_view(&mut actual));
+        let boxes = crate::threading::take_tile_boxes();
+        assert!(
+            boxes >= 16,
+            "{name}: the spilled plan must visit cache tiles, got {boxes} boxes"
+        );
+    };
+    run_uninit("CopyPlan::execute_uninit", &mut |d| {
+        copy.execute_uninit(d, &source, Exec::serial()).unwrap()
+    });
+    run_uninit("UpdatePlan::execute_uninit", &mut |d| {
+        update
+            .execute_uninit(d, &source, 2.0, |x| x, Exec::serial())
+            .unwrap()
+    });
+}
+
+#[test]
 fn tiled_replays_equal_the_column_major_oracle() {
     let team = team();
     for (label, layout) in layouts() {
         assert!(
-            layout.given_tiles::<f64, f64>().is_some(),
+            layout.tiles::<f64, f64>().is_some(),
             "{label} must take the tiled walk"
         );
         for parallel in [false, true] {
@@ -312,13 +532,56 @@ fn tiled_replays_equal_the_column_major_oracle() {
             check_f64_rows(&layout, exec, label);
         }
     }
+    let layout = |prefix: &str| {
+        layouts()
+            .into_iter()
+            .find(|(label, _)| label.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no layout named {prefix}"))
+            .1
+    };
     // One clipped tile: 67 = 43 + 24 and 45 = 42 + 3.
-    let tiles = layouts()[0].1.given_tiles::<f64, f64>().unwrap();
+    let tiles = layout("67x45").inline_tiles::<f64, f64>().unwrap();
     assert_eq!(tiles.blocks[..2], [43, 42]);
     // The extent-1 axis is dropped before the model.
-    let tiles = layouts()[4].1.given_tiles::<f64, f64>().unwrap();
+    let tiles = layout("[1, 65, 65]").inline_tiles::<f64, f64>().unwrap();
     assert_eq!(tiles.layout.rank, 2);
     assert_eq!(tiles.layout.dims[..2], [65, 65]);
+}
+
+/// A spilled layout whose block does not divide every extent: the last tile of
+/// each such axis must be clipped to the remaining extent. The exact-division
+/// spilled fixtures cannot see that arithmetic — a `min` against the whole box
+/// extent instead of the remaining one still matches the oracle on them.
+#[test]
+fn spilled_tiles_clip_the_last_tile_to_the_remaining_extent() {
+    let team = team();
+    let layout = reversed(&[5; 9]);
+    let tiles = layout
+        .tiles::<f64, f64>()
+        .expect("5^9 reversed must take the tiled walk");
+    let Tiles::Spilled(tiles) = tiles else {
+        panic!("5^9 reversed must reach the spilled walk, not the inline one");
+    };
+    assert!(
+        tiles
+            .blocks
+            .iter()
+            .zip(&tiles.dims)
+            .any(|(&block, &dim)| dim % block != 0),
+        "the fixture must leave a clipped last tile: dims {:?} blocks {:?}",
+        tiles.dims,
+        tiles.blocks
+    );
+    for parallel in [false, true] {
+        let exec = || {
+            if parallel {
+                team.exec(4)
+            } else {
+                Exec::serial()
+            }
+        };
+        check_entries::<f64>(&layout, exec, "5^9 reversed clipped");
+    }
 }
 
 #[test]
@@ -488,8 +751,7 @@ fn layouts_whose_tiles_keep_the_order_take_the_single_pass() {
 /// Whether `pair_tiles::<D, S>` selects tiles for the given axes.
 fn tiles<D, S>(dims: &[usize], dst: &[isize], src: &[isize]) -> bool {
     PairTraversal::given(dims, dst, src)
-        .inline()
-        .and_then(pair_tiles::<D, S>)
+        .tiles::<D, S>()
         .is_some()
 }
 
@@ -500,9 +762,9 @@ fn slabs_that_share_no_cache_line_keep_the_flat_walk() {
     let f3 = Layout::new(&[4096, 17, 33], &[1, 4096, 69_632], &[1, 135_168, 4096], 0);
     let model = crate::block::compute_block_sizes(&f3.dims, &[&f3.dst, &f3.src], 8);
     assert_eq!(model.as_slice(), [4096, 16, 16]);
-    assert!(f3.given_tiles::<f64, f64>().is_none());
+    assert!(f3.tiles::<f64, f64>().is_none());
     // A zero-sized source moves no line; the destination alone decides.
-    assert!(f3.given_tiles::<f64, ()>().is_none());
+    assert!(f3.tiles::<f64, ()>().is_none());
     // Sparse prefixes whose bounding intervals are separated and line-sized,
     // the second with a whole-layout span above the model's 64 * N region.
     assert!(!tiles::<f64, f64>(
@@ -526,8 +788,8 @@ fn slabs_that_share_no_cache_line_keep_the_flat_walk() {
     // Not declined: under the model's 8-byte size the slabs look line-sized,
     // but the u8 source's 8-byte slabs share lines with their neighbours.
     let mixed = Layout::new(&[8, 512, 512], &[1, 8, 4096], &[1, 4096, 8], 0);
-    assert!(mixed.given_tiles::<u64, u8>().is_some());
-    assert!(mixed.given_tiles::<f64, f64>().is_none());
+    assert!(mixed.tiles::<u64, u8>().is_some());
+    assert!(mixed.tiles::<f64, f64>().is_none());
 
     let team = team();
     let (dst_len, src_len) = f3.lens();
@@ -616,7 +878,7 @@ fn split_leaves_partition_the_box() {
     // split cuts axis 2 into origins 0, 8, 16, 24.
     let dims = [64usize, 17, 33];
     let layout = Layout::new(&dims, &[1, 64, 1088], &[561, 1, 17], 0);
-    let tiles = layout.given_tiles::<f64, f64>().unwrap();
+    let tiles = layout.inline_tiles::<f64, f64>().unwrap();
     assert_eq!(tiles.blocks[..3], [35, 17, 2]);
     let (dst_len, src_len) = layout.lens();
     let src: Vec<f64> = (0..src_len).map(f64::value).collect();
@@ -665,7 +927,7 @@ fn tiled_replay_keeps_the_callers_budget() {
     // width 2: a tiled replay must split into 4 leaves, as the plan does.
     use threadteam::{DispatchCosts, DispatchKind, HostClass, WidthCosts};
     let layout = Layout::new(&[128, 128], &[1, 128], &[128, 1], 0);
-    assert!(layout.given_tiles::<f64, f64>().is_some());
+    assert!(layout.tiles::<f64, f64>().is_some());
     let estimate = KernelClass::Copy.estimate(layout.total());
     let costs = WidthCosts::new([estimate / 100, estimate * 10, estimate * 10]);
     let pool = threadteam::Pool::builder()
@@ -743,7 +1005,7 @@ fn non_injective_destination_replays_serially_in_column_major_order() {
     let dst = [1isize, 64, 0];
     let src = [64isize, 1, 4096];
     let layout = Layout::new(&dims, &dst, &src, 0);
-    assert!(layout.given_tiles::<i64, i64>().is_some());
+    assert!(layout.tiles::<i64, i64>().is_some());
     let (dst_len, src_len) = layout.lens();
     let values: Vec<i64> = (0..src_len as i64).map(|k| k * 7 - 1000).collect();
     let team = team();
@@ -795,7 +1057,7 @@ fn inert_singleton_strides_stay_out_of_the_arithmetic() {
     // A stride of `isize::MAX` on an extent-1 axis is valid and unused.
     let m = isize::MAX;
     let layout = Layout::new(&[1, 65, 65], &[m, 1, 65], &[m, 65, 1], 0);
-    let tiles = layout.given_tiles::<f64, f64>().unwrap();
+    let tiles = layout.inline_tiles::<f64, f64>().unwrap();
     assert_eq!(tiles.blocks[..2], [56, 33]);
     let (dst_len, src_len) = layout.lens();
     let src: Vec<f64> = (0..src_len).map(f64::value).collect();

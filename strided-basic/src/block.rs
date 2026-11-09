@@ -356,38 +356,92 @@ fn region_in<T: RegionInt>(
     offset: usize,
     elem_size: usize,
 ) -> Option<T> {
+    let mut memory_region = T::ZERO;
+    for strides in strides_list {
+        let region = region_of::<T>(
+            dims.iter().copied().zip(strides[offset..].iter().copied()),
+            elem_size,
+        )?;
+        memory_region = memory_region.add(region)?;
+    }
+    Some(memory_region)
+}
+
+/// One term of [`region_in`]: the region of one operand over its
+/// `(extent, stride)` axes in iteration order.
+fn region_of<T: RegionInt>(
+    axes: impl Iterator<Item = (usize, isize)>,
+    elem_size: usize,
+) -> Option<T> {
     let cache_line = T::from_usize(CACHE_LINE_SIZE)?;
     let elem_size = T::from_usize(elem_size)?;
-    let mut memory_region = T::ZERO;
-
-    for strides in strides_list {
-        let mut num_contiguous_bytes = T::ZERO;
-        let mut num_cache_line_blocks = T::ONE;
-
-        for (&d, &s) in dims.iter().zip(&strides[offset..]) {
-            let s = T::from_usize(s.unsigned_abs())?.mul(elem_size)?;
-            if s < cache_line {
-                // Small stride: contributes to contiguous region. The product
-                // is below 2^70, so only the sum can saturate.
-                num_contiguous_bytes =
-                    num_contiguous_bytes.add(T::from_usize(d.saturating_sub(1))?.mul(s)?)?;
-            } else {
-                // Large stride: multiplies cache line blocks
-                num_cache_line_blocks = num_cache_line_blocks.mul(T::from_usize(d)?)?;
-            }
+    let mut num_contiguous_bytes = T::ZERO;
+    let mut num_cache_line_blocks = T::ONE;
+    for (d, s) in axes {
+        let s = T::from_usize(s.unsigned_abs())?.mul(elem_size)?;
+        if s < cache_line {
+            // Small stride: contributes to contiguous region. The product
+            // is below 2^70, so only the sum can saturate.
+            num_contiguous_bytes =
+                num_contiguous_bytes.add(T::from_usize(d.saturating_sub(1))?.mul(s)?)?;
+        } else {
+            // Large stride: multiplies cache line blocks
+            num_cache_line_blocks = num_cache_line_blocks.mul(T::from_usize(d)?)?;
         }
-
-        // Convert to cache lines
-        let contiguous_lines = num_contiguous_bytes.div(cache_line).add(T::ONE)?;
-
-        memory_region = memory_region.add(
-            cache_line
-                .mul(contiguous_lines)?
-                .mul(num_cache_line_blocks)?,
-        )?;
     }
+    // Convert to cache lines
+    let contiguous_lines = num_contiguous_bytes.div(cache_line).add(T::ONE)?;
+    cache_line.mul(contiguous_lines)?.mul(num_cache_line_blocks)
+}
 
-    Some(memory_region)
+/// [`memory_region`] over one operand given as `(extent, stride)` axes.
+fn axes_region<I: Iterator<Item = (usize, isize)> + Clone>(axes: I, elem_size: usize) -> u128 {
+    region_of::<u64>(axes.clone(), elem_size)
+        .map(u128::from)
+        .or_else(|| region_of::<u128>(axes, elem_size))
+        .unwrap_or(u128::MAX)
+}
+
+/// Whether an operand strides are nonzero and strictly increasing in magnitude.
+fn axes_increasing<I: Iterator<Item = isize>>(mut axes: I) -> bool {
+    let Some(first) = axes.next() else {
+        return true;
+    };
+    if first == 0 {
+        return false;
+    }
+    let mut prev = first.unsigned_abs();
+    axes.all(|s| {
+        let m = s.unsigned_abs();
+        let ok = m > prev;
+        prev = m;
+        ok
+    })
+}
+
+/// Whether [`reduced_block_sizes`] answers `None` from the axes alone, before
+/// it builds any metadata: a zero `elem_size`, a memory region within
+/// [`BLOCK_MEMORY_SIZE`], or every operand strides nonzero and strictly
+/// increasing in magnitude.
+///
+/// A caller that would have to materialize `dims` and stride slices for the
+/// model asks this first, over the axes it already holds, so that an exit
+/// costs no allocation. The answer is what the model itself decides.
+pub(crate) fn exits_before_metadata<I>(axes: I, elem_size: usize) -> bool
+where
+    I: Iterator<Item = (usize, isize, isize)> + Clone,
+{
+    if elem_size == 0 {
+        return true;
+    }
+    let total = axes_region(axes.clone().map(|(d, dst, _)| (d, dst)), elem_size).saturating_add(
+        axes_region(axes.clone().map(|(d, _, src)| (d, src)), elem_size),
+    );
+    if total <= BLOCK_MEMORY_SIZE as u128 {
+        return true;
+    }
+    axes_increasing(axes.clone().map(|(_, dst, _)| dst))
+        && axes_increasing(axes.map(|(_, _, src)| src))
 }
 
 /// [`memory_region`] over per-operand byte strides, for the unit tests.
