@@ -168,6 +168,31 @@ pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;
 /// Used for memory region calculations in block size computation.
 pub const CACHE_LINE_SIZE: usize = 64;
 
+/// Measurement hooks for benchmarks only; compiled out of every other build.
+#[cfg(feature = "bench-hooks")]
+pub mod bench_hooks {
+    use core::sync::atomic::AtomicBool;
+
+    /// Whether [`crate::block::declines_tiles`] may decline the tiles
+    /// ([#428]). Clearing it times the model's tiles against the flat walk in
+    /// one process; see `benches/view_decline_428.rs`.
+    ///
+    /// [#428]: https://github.com/tensor4all/strided-rs/issues/428
+    pub static DECLINE_TILES: AtomicBool = AtomicBool::new(true);
+
+    /// The view path's block vector for axes that are already in iteration
+    /// order, i.e. the decision the bench toggles above.
+    pub fn planned_blocks(
+        dims: &[usize],
+        strides_list: &[&[isize]],
+        elem_sizes: &[usize],
+    ) -> Vec<usize> {
+        crate::block::compute_block_sizes(dims, strides_list, elem_sizes)
+            .as_slice()
+            .to_vec()
+    }
+}
+
 mod gather_plan;
 mod outer_product;
 mod static_indexing_plan;

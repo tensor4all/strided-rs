@@ -91,7 +91,11 @@ Then no line is shared and tiling cannot save traffic. Otherwise
 address-adjacent runs can share one boundary line, and declining forgoes at
 most one reuse per adjacent pair (`S - 1` for `S` runs). That is a small fraction only
 when each run touches many lines; for sparse or line-sized runs it can be a
-large share of the lines they touch.
+large share of the lines they touch. The view path (`copy_into`, `map_into`)
+reads the same rule from the same shared model, so one layout gets one answer
+whichever entry reaches it (issue
+[#428](https://github.com/tensor4all/strided-rs/issues/428)); its port of
+Strided.jl's `_computeblocks` had kept the tiles.
 
 ### Reduction evaluation order and the deterministic route
 

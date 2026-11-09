@@ -90,7 +90,15 @@ pub(crate) fn compute_block_sizes(
     elem_sizes: &[usize],
 ) -> InlineVec<usize> {
     debug_assert_eq!(strides_list.len(), elem_sizes.len());
-    reduced_block_sizes(dims, strides_list, elem_sizes).unwrap_or_else(|| InlineVec::from(dims))
+    let Some(blocks) = reduced_block_sizes(dims, strides_list, elem_sizes) else {
+        return InlineVec::from(dims);
+    };
+    // The same exit the plan and replay walk takes (#422): the answer is the
+    // full dimensions, which is how this caller asks for the flat walk.
+    if declines_tiles(dims, strides_list, elem_sizes, &blocks) {
+        return InlineVec::from(dims);
+    }
+    blocks
 }
 
 /// The model's block vector, or `None` when one of its sufficient exits keeps
@@ -502,6 +510,110 @@ fn last_argmax_weighted(blocks: &[usize], costs: &[isize]) -> Option<usize> {
     }
 
     max_idx
+}
+
+/// Whether `blocks` reorder slabs that no visit order can make share a line,
+/// so the caller keeps the flat walk instead of tiling.
+///
+/// The axes before the first reduced one are walked whole inside every tile,
+/// so those tiles are exactly the slabs [`slabs_share_no_line`] judges, and
+/// every operand has to have lines of its own for tiling to buy anything.
+/// `false` when no axis is reduced (nothing to decline) and when the first
+/// axis is (with an empty prefix a slab is one element, which the helper's own
+/// width test answers `false` for anyway).
+pub(crate) fn declines_tiles(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_sizes: &[usize],
+    blocks: &[usize],
+) -> bool {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    #[cfg(feature = "bench-hooks")]
+    if !crate::bench_hooks::DECLINE_TILES.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let Some(first_cut) = (0..dims.len()).find(|&axis| blocks[axis] < dims[axis]) else {
+        return false;
+    };
+    first_cut > 0
+        && strides_list
+            .iter()
+            .zip(elem_sizes)
+            .all(|(strides, &elem_size)| slabs_share_no_line(dims, strides, first_cut, elem_size))
+}
+
+/// Whether one operand's *slabs*, its sub-boxes over the leading `prefix`
+/// axes at each coordinate of the other axes, provably share no cache line,
+/// so that no visit order of the other axes can reuse a line across slabs.
+///
+/// Both walks visit every slab contiguously in the same internal order, so a
+/// tiled walk can save traffic only on a line touched by two slabs. With the
+/// byte span `w` of a slab's bounding interval and the tail byte strides all
+/// multiples of the cache line, and the tail strides nested (each, in
+/// ascending order, at least `w` plus the spans of the smaller ones), the
+/// bounding intervals of distinct slabs are disjoint and congruent modulo the
+/// line. The helper sees no base address and assumes the lowest address of
+/// each bounding interval is line-aligned. An aligned coordinate-zero pointer
+/// is not enough when a prefix stride is negative. Under that assumption every
+/// slab has lines of its own. Otherwise address-adjacent slabs can share one
+/// boundary line, so declining forgoes at most one reuse per adjacent pair,
+/// `S - 1` for `S` slabs. That is a large share of the touched lines for
+/// sparse or line-sized slabs. A zero-sized operand moves no line. Arithmetic
+/// is checked, and an unrepresentable quantity answers `false`, which keeps
+/// the tiles.
+///
+/// Strided.jl's `_computeblocks` has no such exit: it tiles these layouts
+/// because the kept prefix's region exceeds its budget, although the tile
+/// only reorders slabs that share nothing. The view path is a port of that
+/// function, and [`declines_tiles`] applies the exit to its answer too
+/// ([#428]).
+///
+/// [#428]: https://github.com/tensor4all/strided-rs/issues/428
+fn slabs_share_no_line(dims: &[usize], strides: &[isize], prefix: usize, elem_size: usize) -> bool {
+    if elem_size == 0 {
+        return true;
+    }
+    let line = crate::CACHE_LINE_SIZE as u128;
+    let elem = elem_size as u128;
+    // `|s| * elem < 2^127`; only the products with extents and the sums can
+    // overflow.
+    let byte = |axis: usize| strides[axis].unsigned_abs() as u128 * elem;
+    let reach = |axis: usize| ((dims[axis] - 1) as u128).checked_mul(byte(axis));
+    let Some(width) = (0..prefix).try_fold(elem, |width, axis| width.checked_add(reach(axis)?))
+    else {
+        return false;
+    };
+    if width % line != 0 {
+        return false;
+    }
+    // Inline up to `RAW_FUSED_RANK_LIMIT`, heap above it: the spilled route
+    // reaches this with more axes (issue #425), and the inline route must stay
+    // allocation-free.
+    let count = dims.len() - prefix;
+    let mut inline = [(0u128, 0usize); crate::raw_ops::RAW_FUSED_RANK_LIMIT];
+    let mut spilled = Vec::new();
+    let tail: &mut [(u128, usize)] = if count <= crate::raw_ops::RAW_FUSED_RANK_LIMIT {
+        let tail = &mut inline[..count];
+        for (slot, axis) in tail.iter_mut().zip(prefix..dims.len()) {
+            *slot = (byte(axis), axis);
+        }
+        tail
+    } else {
+        spilled.extend((prefix..dims.len()).map(|axis| (byte(axis), axis)));
+        &mut spilled
+    };
+    tail.sort_unstable();
+    let mut span = width;
+    for &(stride, axis) in tail.iter() {
+        if stride % line != 0 || stride < span {
+            return false;
+        }
+        let Some(next) = reach(axis).and_then(|reach| span.checked_add(reach)) else {
+            return false;
+        };
+        span = next;
+    }
+    true
 }
 
 #[cfg(test)]

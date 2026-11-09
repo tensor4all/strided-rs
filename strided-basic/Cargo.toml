@@ -25,6 +25,8 @@ pulp = { workspace = true, optional = true }
 default = ["simd"]
 parallel = ["threadteam/parallel", "strided-perm/parallel"]
 simd = ["dep:pulp"]
+# Measurement hooks for `benches/view_decline_428.rs` (tensor4all/strided-rs#428).
+bench-hooks = []
 
 [dev-dependencies]
 criterion.workspace = true
@@ -55,3 +57,8 @@ required-features = ["parallel"]
 [[bench]]
 name = "overhead_smoke"
 harness = false
+
+[[bench]]
+name = "view_decline_428"
+harness = false
+required-features = ["bench-hooks"]

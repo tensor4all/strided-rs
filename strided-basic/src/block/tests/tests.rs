@@ -594,6 +594,77 @@ fn the_pointwise_plan_uses_each_operands_element_size() {
     }
 }
 
+/// [#428]: the view path answers the layout of #422 the way plan and replay
+/// walk it. `pointwise_plan` is what `copy_into` and `map_into` call, and its
+/// block vector is the whole routing decision for their walk.
+#[test]
+fn the_view_path_keeps_the_flat_walk_where_the_tiles_share_no_cache_line() {
+    // F3 (`raw_ops::tests::tiled_tests`): every tile keeps axis 0 whole, so a
+    // tile is a 32 KiB slab, and the tail axes only permute slabs whose
+    // strides are line multiples and nested. No visit order reuses a line.
+    let dims = [4096usize, 17, 33];
+    let dst = [1isize, 4096, 69_632];
+    let src = [1, 135_168, 4096];
+    let strides: [&[isize]; 2] = [&dst, &src];
+    let elem_sizes = [std::mem::size_of::<f64>(); 2];
+    let total = 4096 * 17 * 33;
+    // The model itself still offers tiles; the decline is the caller's.
+    assert_eq!(
+        model_blocks_sized(&dims, &strides, &elem_sizes),
+        [4096, 16, 16]
+    );
+    let (fused_dims, ordered, plan) =
+        crate::kernel::pointwise_plan(&dims, &strides, Some(0), &elem_sizes, total);
+    let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+    assert_eq!(fused_dims.as_slice(), dims);
+    assert_eq!(ordered.as_slice(), strides.as_slice());
+    assert_eq!(
+        plan.block.as_slice(),
+        fused_dims.as_slice(),
+        "the view path must keep the flat walk where no visit order reuses a line"
+    );
+
+    // A broadcast source whose slabs are one cache line wide and re-read, so
+    // its slab intervals are not disjoint: the view path keeps the tiles.
+    let dims = [64usize, 64, 64];
+    let dst = [1isize, 64, 4096];
+    let src = [0isize, 1, 1];
+    let strides: [&[isize]; 2] = [&dst, &src];
+    let (fused_dims, ordered, plan) =
+        crate::kernel::pointwise_plan(&dims, &strides, Some(0), &elem_sizes, 64 * 64 * 64);
+    let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+    assert_eq!(
+        model_blocks_sized(&fused_dims, &ordered, &elem_sizes),
+        [64, 31, 16]
+    );
+    assert_eq!(plan.block.as_slice(), [64, 31, 16]);
+
+    // The parity rows of `benches/view_decline_428.rs` tile and are not
+    // declined, so the decline cannot move them: the view path still returns
+    // the model's blocks script for script.
+    let parity = [
+        ([1024usize, 1024], [1024isize, 1], [1isize, 1024]),
+        ([512usize, 512], [1isize, 512], [0isize, 1]),
+    ];
+    for (dims, dst, src) in parity {
+        let strides: [&[isize]; 2] = [&dst, &src];
+        let (fused_dims, ordered, plan) = crate::kernel::pointwise_plan(
+            &dims,
+            &strides,
+            Some(0),
+            &elem_sizes,
+            dims.iter().product(),
+        );
+        let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+        assert_ne!(plan.block.as_slice(), fused_dims.as_slice(), "must tile");
+        assert_eq!(
+            plan.block.as_slice(),
+            model_blocks_sized(&fused_dims, &ordered, &elem_sizes),
+            "{dims:?}"
+        );
+    }
+}
+
 #[test]
 fn a_zero_sized_destination_leaves_the_reduction_to_the_source() {
     // The other orientation of the ZST contract: the destination has no
@@ -831,9 +902,16 @@ fn flat_scratch_matches_the_model_across_its_spill_boundaries() {
     .map(|perm| permuted_strides(&dims, perm))
     .collect();
     let strides = refs(&strides);
-    let blocks = compute_block_sizes(&dims, &strides, &[8, 8, 8]);
+    // The model's answer, which this test is about: every operand's slabs
+    // share no line here, so `compute_block_sizes` declines it (#428) and the
+    // scratch is read through `reduced_block_sizes`.
+    let blocks = reduced_block_sizes(&dims, &strides, &[8, 8, 8]).unwrap();
     assert_eq!(blocks[..2], dims[..2]);
     assert_ne!(blocks.as_slice(), dims.as_slice());
     assert_eq!(blocks.as_slice(), model_blocks(&dims, &strides, 8));
     assert_eq!(blocks.as_slice(), [8, 5, 5, 5, 2, 3]);
+    assert_eq!(
+        compute_block_sizes(&dims, &strides, &[8, 8, 8]).as_slice(),
+        dims
+    );
 }
