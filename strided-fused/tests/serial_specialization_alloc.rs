@@ -8,12 +8,12 @@
 //! kernel it dispatches to allocates.
 //!
 //! The counting allocator is process global, so this lives in its own test
-//! binary and the counted windows run on the calling thread only.
+//! binary. The serial windows count the calling thread's allocations; the
+//! `parallel` windows count the process-wide atomic, all threads included.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+mod common;
+
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "parallel")]
 use strided_basic::Pool;
@@ -23,24 +23,12 @@ use strided_basic::{
 };
 use strided_fused::{fused_elementwise_into, ErasedFusedPlan, FusedInst, FusedOp, FusedPlan};
 
-struct CountingAllocator;
-
-static GLOBAL_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-    static THREAD_FREES: Cell<usize> = const { Cell::new(0) };
-}
-
-fn record_allocation() {
-    GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-    // `try_with` fails only during thread teardown, when nothing is counted.
-    let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
-}
-
-fn record_deallocation() {
-    let _ = THREAD_FREES.try_with(|count| count.set(count.get().wrapping_add(1)));
-}
+#[cfg(feature = "parallel")]
+use common::count_global_allocations;
+use common::{
+    count_allocations, count_net_allocations, record_allocation, record_deallocation,
+    THREAD_ALLOCATIONS, THREAD_FREES,
+};
 
 /// The counters run inside `GlobalAlloc` methods, which must not unwind, so
 /// they wrap at `usize::MAX` instead of panicking under overflow checks.
@@ -60,74 +48,49 @@ fn counters_wrap_at_usize_max_instead_of_panicking() {
     assert_eq!(wrapped_frees, 0);
 }
 
-// SAFETY: each method forwards its arguments unchanged to `System`, which meets the `GlobalAlloc`
-// contract, and the counting side effects neither allocate nor unwind. `fetch_add` on the atomic
-// wraps on overflow. The thread-local `Cell`s are `const`-initialized and have no destructor, so
-// `try_with` registers nothing and allocates nothing, and it returns `Err` during teardown
-// instead of panicking. Their updates use `wrapping_add`, so they cannot panic either, even with
-// overflow checks enabled; a plain `+ 1` would panic at `usize::MAX`, and a panic unwinding out
-// of a `GlobalAlloc` method violates its contract.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record_allocation();
-        // SAFETY: forwards `alloc`'s caller contract (a non-zero-size `layout`) unchanged to
-        // `System`, which allocated every block this allocator hands out.
-        System.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        record_deallocation();
-        // SAFETY: forwards `dealloc`'s caller contract (`ptr` allocated by this allocator with
-        // `layout`) unchanged to `System`, which allocated every block this allocator hands out.
-        System.dealloc(ptr, layout)
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        record_allocation();
-        // SAFETY: forwards `realloc`'s caller contract (`ptr` from this allocator with `layout`,
-        // a valid non-zero `new_size`) unchanged to `System`, which allocated every block this
-        // allocator hands out.
-        System.realloc(ptr, layout, new_size)
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
-
-fn count_allocations(run: impl FnOnce()) -> usize {
-    let before = THREAD_ALLOCATIONS.with(Cell::get);
-    run();
-    THREAD_ALLOCATIONS.with(Cell::get) - before
-}
-
-/// Net live allocations (allocations minus frees) made by the calling thread
-/// while `run` executes. Used to catch a dropped-metadata leak.
-fn count_net_allocations(run: impl FnOnce()) -> isize {
-    let before_alloc = THREAD_ALLOCATIONS.with(Cell::get);
-    let before_free = THREAD_FREES.with(Cell::get);
-    run();
-    let after_alloc = THREAD_ALLOCATIONS.with(Cell::get);
-    let after_free = THREAD_FREES.with(Cell::get);
-    (after_alloc - before_alloc) as isize - (after_free - before_free) as isize
-}
-
-/// Steady-state allocations made by every thread while `run` executes.
+/// Every counted delta wraps, so a measurement window that crosses the wrap
+/// reports the one operation it recorded instead of underflowing. Each case
+/// saturates one counter, so it fails on its own if that delta is a plain
+/// subtraction again.
 ///
-/// The window runs three times and reports the minimum. A pool worker the
-/// warm-up never scheduled pays one-time first-touch costs (thread-local
-/// registration allocates on macOS) the first time it picks up a split, which
-/// is not a per-call allocation; a per-call allocation shows up in every round.
-/// (#321)
-#[cfg(feature = "parallel")]
-fn count_global_allocations(mut run: impl FnMut()) -> usize {
-    (0..3)
-        .map(|_| {
-            let before = GLOBAL_ALLOCATIONS.load(Ordering::SeqCst);
-            run();
-            GLOBAL_ALLOCATIONS.load(Ordering::SeqCst) - before
-        })
-        .min()
-        .unwrap_or(0)
+/// The counters are restored before anything is asserted, because a failing
+/// assertion allocates and would otherwise be counted.
+#[test]
+fn counted_deltas_wrap_instead_of_underflowing() {
+    let saved = THREAD_ALLOCATIONS.with(|count| count.replace(usize::MAX));
+    let allocations = count_allocations(record_allocation);
+    THREAD_ALLOCATIONS.with(|count| count.set(saved));
+    assert_eq!(allocations, 1);
+
+    let saved = THREAD_ALLOCATIONS.with(|count| count.replace(usize::MAX));
+    let net_allocations = count_net_allocations(record_allocation);
+    THREAD_ALLOCATIONS.with(|count| count.set(saved));
+    assert_eq!(net_allocations, 1);
+
+    let saved = THREAD_FREES.with(|count| count.replace(usize::MAX));
+    let net_frees = count_net_allocations(record_deallocation);
+    THREAD_FREES.with(|count| count.set(saved));
+    assert_eq!(net_frees, -1);
+}
+
+/// The signed combination wraps as well. Saturating both counters leaves an
+/// allocation delta of `isize::MAX + 1` (cast to `isize::MIN`) and a free delta
+/// of 1, so the true net is `isize::MAX` and is representable: `wrapping_sub`
+/// reports it, while a plain signed subtraction overflows.
+///
+/// The counters are restored before the assertion, because a failing assertion
+/// allocates and would otherwise be counted.
+#[test]
+fn net_delta_reports_isize_max_instead_of_overflowing() {
+    let saved_allocations = THREAD_ALLOCATIONS.with(|count| count.replace(0));
+    let saved_frees = THREAD_FREES.with(|count| count.replace(0));
+    let net = count_net_allocations(|| {
+        THREAD_ALLOCATIONS.with(|count| count.set(isize::MAX as usize + 1));
+        THREAD_FREES.with(|count| count.set(1));
+    });
+    THREAD_ALLOCATIONS.with(|count| count.set(saved_allocations));
+    THREAD_FREES.with(|count| count.set(saved_frees));
+    assert_eq!(net, isize::MAX);
 }
 
 fn single_op(op: FusedOp) -> FusedPlan {
