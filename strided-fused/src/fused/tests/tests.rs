@@ -186,7 +186,7 @@ fn replay_all_static_families<'p>(mint: impl Fn() -> Exec<'p>, mut collect: impl
         // SAFETY: `output` has `arrays[0].len()` slots under `arrays[0].dims()` with stride `[1]`
         // (rank 1), so the layout reaches every slot, and `fused_elementwise_into_uninit`
         // returned `Ok`; its implementation documents fully overwriting the destination
-        // (fused.rs:1782).
+        // (fused.rs:1792).
         collect(
             &output
                 .iter()

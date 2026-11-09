@@ -115,7 +115,7 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
         // to fill it) violates `from_raw_parts_mut`'s validity requirement.
         // SAFETY: the buffer holds `words * 16` bytes, at least `len * size_of::<T>()`
         // (chunk.rs:109), and its `u128` alignment covers `T`: a `Some` seed, the only way
-        // here, comes from `chunk_seed` (fused.rs:1391), which declines every scalar but `f32`
+        // here, comes from `chunk_seed` (fused.rs:1396), which declines every scalar but `f32`
         // and `f64` (chunk.rs:82). `MaybeUninit<T>` needs no initialization, and the `RefCell`
         // borrow makes this the only access.
         let uninit = unsafe {
@@ -304,7 +304,7 @@ unsafe fn replay_block<T: FusedScalar>(
             )
         };
         // SAFETY: `run_chunks` reads direct inputs over the same `done .. done + chunk` range,
-        // and `direct` marks only stride-1 inputs (contract and `direct_inputs`, fused.rs:1436),
+        // and `direct` marks only stride-1 inputs (contract and `direct_inputs`, fused.rs:1441),
         // so the range lies inside their `len` elements.
         unsafe {
             run_chunks(
@@ -408,7 +408,7 @@ unsafe fn replay_block_uninit<T: FusedScalar>(
             )
         };
         // SAFETY: `run_chunks` reads direct inputs over the same `done .. done + chunk` range,
-        // and `direct` marks only stride-1 inputs (contract and `direct_inputs`, fused.rs:1436),
+        // and `direct` marks only stride-1 inputs (contract and `direct_inputs`, fused.rs:1441),
         // so the range lies inside their `len` elements.
         unsafe {
             run_chunks(
@@ -567,7 +567,7 @@ unsafe fn run_chunks<T: FusedScalar>(
         let read = |index: usize| -> &[T] {
             if index < plan.input_count && direct[index] {
                 // SAFETY: `direct[index]` holds only for stride-1 inputs (contract,
-                // chunk.rs:137; `direct_inputs`, fused.rs:1436), so `offsets + done .. +
+                // chunk.rs:137; `direct_inputs`, fused.rs:1441), so `offsets + done .. +
                 // chunk` lies inside the input's `len` contiguous readable elements. Inputs are
                 // never written during the call.
                 return unsafe {

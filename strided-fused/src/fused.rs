@@ -1100,10 +1100,10 @@ where
                     // SAFETY: `map_into_validated` (strided-basic/src/execution.rs:161) needs
                     // three things. Every input shape equals `dest`'s: `validate_shapes` checked
                     // it (fused.rs:857) on the initialized path, and
-                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1801) on the
+                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1811) on the
                     // uninitialized one. `validated` belongs to this `dest`'s geometry: here
                     // `dest` is `dests[0]` of a single-destination call (fused.rs:1256,
-                    // fused.rs:1804), and the marker was made for `dests[0]` (fused.rs:851;
+                    // fused.rs:1814), and the marker was made for `dests[0]` (fused.rs:851;
                     // uninitialized entry: erased.rs:328). Bounds and aliasing hold for the
                     // replay: every view keeps its construction-time bounds, `dest` is borrowed
                     // `&mut`, and the inputs are shared views.
@@ -1319,8 +1319,10 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
         // SAFETY: `interpret_loop_body` has this function's contract (fused.rs:1291), passed on
-        // unchanged; `regs` holds `register_count` values, one per register `validate_plan`
-        // admits.
+        // unchanged, plus one clause: no operand element may lie inside `regs`. That holds
+        // because `regs` is `inline`, a local array created just above, so no operand pointer
+        // can point into it. `regs` holds `register_count` values, one per register
+        // `validate_plan` admits.
         unsafe {
             interpret_loop_body(
                 dst_ptrs,
@@ -1334,7 +1336,8 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: as for the inline register file above.
+        // SAFETY: as for the inline register file above; `heap` is a fresh local `Vec`, so no
+        // operand element lies inside it either.
         unsafe {
             interpret_loop_body(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
         };
@@ -1345,7 +1348,9 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
 /// stack or heap file is used identically.
 ///
 /// # Safety
-/// As [`interpret_inner_loop`].
+/// As [`interpret_inner_loop`], and no input or destination element may lie
+/// inside `regs`: the body holds `regs` as `&mut [T]` while it reads the
+/// inputs and writes the destinations through raw pointers.
 // Inert: `interpret_loop_body` takes 7 arguments and clippy's `too_many_arguments`
 // fires only above 7, so this allow suppresses nothing; it is left in place.
 #[allow(clippy::too_many_arguments)]
@@ -1393,8 +1398,8 @@ fn chunk_seed<T: FusedScalar>(inputs: &[StridedView<'_, T>]) -> Option<T> {
         return None;
     }
     // SAFETY: both interpreters call this only after returning early for an empty `dests[0]`
-    // (fused.rs:1461, fused.rs:1816) and after checking every input against its shape
-    // (fused.rs:857, fused.rs:1801), so `inputs[0]` is non-empty and `ptr()` is its element at
+    // (fused.rs:1466, fused.rs:1826) and after checking every input against its shape
+    // (fused.rs:857, fused.rs:1811), so `inputs[0]` is non-empty and `ptr()` is its element at
     // the view offset (`base_ptr`, strided-view/src/view.rs:446). This safe helper relies on
     // those two callers.
     Some(unsafe { *inputs[0].ptr() })
@@ -1531,11 +1536,11 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                     // buffer (chunk.rs:103), handed out only to this closure, so no operand
                     // overlaps it, and it holds `register_file_len(plan)` values because `seed`
                     // is `Some` (chunk.rs:108). `direct` came from `direct_inputs`, which starts
-                    // from `single_use_inputs` (fused.rs:1429), which never marks an input that
+                    // from `single_use_inputs` (fused.rs:1434), which never marks an input that
                     // `plan.outputs` names (chunk.rs:76), and then keeps only stride-1 inputs
-                    // (fused.rs:1436). The plan passed `validate_plan_for_scalar`, and only this
+                    // (fused.rs:1441). The plan passed `validate_plan_for_scalar`, and only this
                     // partition writes these destination elements (see `replay_partitions`,
-                    // fused.rs:1629).
+                    // fused.rs:1634).
                     unsafe {
                         chunk::replay_chunked(
                             operand_ptrs(&dst_ptrs),
@@ -1692,12 +1697,14 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
     // output names a defined value (fused.rs:816) and instructions read only earlier values
     // (fused.rs:805), so with `input_count == 0` there is no value to name and the plan is
     // rejected. So `input_ptrs[0]` exists, and its element at `offsets[n]` (`k = 0`) is readable
-    // under this function's contract (fused.rs:1674).
+    // under this function's contract (fused.rs:1679).
     let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
-        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1674),
-        // passed on unchanged; `regs` holds `register_count` values.
+        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1679),
+        // passed on unchanged, plus one clause: no operand element may lie inside `regs`. That
+        // holds because `regs` is `inline`, a local array created just above. `regs` holds
+        // `register_count` values.
         unsafe {
             interpret_loop_body_uninit(
                 dst_ptrs,
@@ -1711,7 +1718,8 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: as for the inline register file above.
+        // SAFETY: as for the inline register file above; `heap` is a fresh local `Vec`, so no
+        // operand element lies inside it either.
         unsafe {
             interpret_loop_body_uninit(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
         };
@@ -1721,7 +1729,9 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
 /// Uninitialized-destination sibling of [`interpret_loop_body`].
 ///
 /// # Safety
-/// As [`interpret_inner_loop_uninit`].
+/// As [`interpret_inner_loop_uninit`], and no input or destination element may
+/// lie inside `regs`: the body holds `regs` as `&mut [T]` while it reads the
+/// inputs and writes the destinations through raw pointers.
 // Inert: `interpret_loop_body_uninit` takes 7 arguments and clippy's
 // `too_many_arguments` fires only above 7, so this allow suppresses nothing.
 #[allow(clippy::too_many_arguments)]
@@ -1742,7 +1752,7 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
             let stride = inner_stride(strides, stride_index);
             // SAFETY: element `i < len` of input `input_index`, at its block offset and inner
             // stride, readable under the contract this body shares with
-            // `interpret_inner_loop_uninit` (fused.rs:1674).
+            // `interpret_inner_loop_uninit` (fused.rs:1679).
             regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
         for (instruction, inst) in plan.ops.iter().enumerate() {
@@ -1891,11 +1901,11 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     // buffer (chunk.rs:103), handed out only to this closure, so no operand
                     // overlaps it, and it holds `register_file_len(plan)` values because `seed`
                     // is `Some` (chunk.rs:108). `direct` came from `direct_inputs`, which starts
-                    // from `single_use_inputs` (fused.rs:1429), which never marks an input that
+                    // from `single_use_inputs` (fused.rs:1434), which never marks an input that
                     // `plan.outputs` names (chunk.rs:76), and then keeps only stride-1 inputs
-                    // (fused.rs:1436). The plan passed `validate_plan_for_scalar`, and only this
+                    // (fused.rs:1441). The plan passed `validate_plan_for_scalar`, and only this
                     // partition writes these destination elements (see `replay_partitions`,
-                    // fused.rs:1629).
+                    // fused.rs:1634).
                     unsafe {
                         chunk::replay_chunked_uninit(
                             operand_ptrs(&dst_ptrs),
@@ -1910,7 +1920,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     }
                     return Ok(());
                 }
-                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1674) holds:
+                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1679) holds:
                 // `offsets`, `len` and `strides` describe one generated block over shapes checked
                 // equal, so every element it reaches is inside each operand; only this partition
                 // writes those destination elements (see `replay_partitions`); and the plan
