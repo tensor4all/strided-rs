@@ -891,8 +891,8 @@ impl<'a> ErasedRawStridedUninitMut<'a> {
         // `T`-aligned with a whole multiple of `size_of::<T>()` bytes, for an
         // empty buffer too (raw.rs:137, raw.rs:174; #434): the base comes from
         // a `&mut [MaybeUninit<T>]` (`from_uninit_slice`, raw.rs:794) or from
-        // `from_raw_parts`, whose contract (raw.rs:826) makes `data..data +`
-        // byte_len` the allocation itself. As for `ErasedRawStridedMut`, no
+        // `from_raw_parts`, whose contract (raw.rs:826) makes
+        // `data..data + byte_len` the allocation itself. As for `ErasedRawStridedMut`, no
         // path in this crate builds it from an interior pointer.
         // `MaybeUninit<T>` accepts every bit pattern, so the partially
         // initialized extent is not read as `T` here.
