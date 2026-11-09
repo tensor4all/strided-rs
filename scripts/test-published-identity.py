@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -37,6 +38,16 @@ name = "demo"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "fixture"
+"""
+# `license` and `license-file` are mutually exclusive, so the license-file
+# layouts need a manifest without one.
+LICENSE_FILE_MANIFEST = """[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+exclude = ["LICENSE"]
 description = "fixture"
 """
 
@@ -260,6 +271,257 @@ class PublishedIdentityTest(unittest.TestCase):
         rc, out = self.fx.run("HEAD", lambda n, v: blob)
         self.assertEqual(rc, 1, out)
         self.assertIn("differs: README.md", out)
+
+    def _external_shared_file(self, name: str, manifest: str) -> pathlib.Path:
+        """`name` is declared outside the crate and the crate-local namesake is
+        excluded, so Cargo archives the external file and the local one is
+        only an alibi (GPT review on #416, critical)."""
+        (self.fx.root / name).write_text("ab")
+        self.fx.write(name, "ab")
+        self.fx.write("Cargo.toml", manifest)
+        self.fx.commit("external file, crate-local namesake excluded")
+        return self.fx.root / name
+
+    def _assert_size_lie_over_the_external_file_is_not_green(
+            self, name: str, manifest: str) -> None:
+        """GPT's reproduction: change only the file Cargo reads, then shorten the
+        tree archive's member onto the published bytes with a size/UID edit that
+        keeps the header checksum. The shortened member matches the excluded
+        local namesake and nothing else does."""
+        external = self._external_shared_file(name, manifest)
+        published = self.fx.package()
+        external.write_text("ab\0")
+        self.fx.commit("external file grew by a NUL, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 1, out)  # control: the added byte is a MISMATCH
+        self.assertIn(f"differs: {name}", out)
+        real = pi.package_tree
+
+        def corrupted(*args, **kwargs):
+            raw = bytearray(gzip.decompress(real(*args, **kwargs)))
+            if kwargs.get("allow_dirty"):  # the probe's own packaging
+                return gzip.compress(bytes(raw))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                o = tf.getmember(f"demo-0.1.0/{name}").offset
+            assert raw[o + 134] == ord("3") and raw[o + 114] == ord("0")
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the two cancel in the checksum
+            return gzip.compress(bytes(raw))
+
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("the member does not carry the bytes on disk", out)
+        self.assertNotIn("ok          demo", out)
+
+    def _assert_unchanged_external_file_is_ok(self, name: str, manifest: str) -> None:
+        """The other direction of the same bug: the excluded namesake differs
+        from the external file Cargo archived, and an unchanged package must
+        not be reported as unverifiable."""
+        (self.fx.root / name).write_text("external\n")
+        self.fx.write(name, "crate-local namesake, not shipped\n")
+        self.fx.write("Cargo.toml", manifest)
+        self.fx.commit("external file, crate-local namesake excluded")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_tampered_external_readme_behind_an_excluded_local_namesake_is_not_green(self) -> None:
+        self._assert_size_lie_over_the_external_file_is_not_green(
+            "README.md", CRATE_MANIFEST + 'readme = "../README.md"\nexclude = ["README.md"]\n')
+
+    def test_unchanged_external_readme_behind_an_excluded_local_namesake_is_ok(self) -> None:
+        self._assert_unchanged_external_file_is_ok(
+            "README.md", CRATE_MANIFEST + 'readme = "../README.md"\nexclude = ["README.md"]\n')
+
+    def test_tampered_external_license_file_behind_an_excluded_local_namesake_is_not_green(self) -> None:
+        self._assert_size_lie_over_the_external_file_is_not_green("LICENSE", LICENSE_FILE_MANIFEST)
+
+    def test_unchanged_external_license_file_behind_an_excluded_local_namesake_is_ok(self) -> None:
+        self._assert_unchanged_external_file_is_ok("LICENSE", LICENSE_FILE_MANIFEST)
+
+    def test_the_probe_keeps_the_entry_spelling_a_case_insensitive_fs_has(self) -> None:
+        # README.md and Readme.md are one directory entry on a case-insensitive
+        # filesystem. The probe must move aside and recreate the entry whose
+        # spelling exists: writing the archive member spelling changes Cargo's
+        # collision decision and can pick the wrong witness (#421 review).
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "README.md").write_text("x")
+            if not (directory / "readme.md").exists():
+                self.skipTest("case-sensitive filesystem")
+            self.assertEqual(pi.real_entry(directory / "Readme.md").name, "README.md")
+
+    def test_the_probe_keeps_a_unicode_spelling_the_filesystem_folded(self) -> None:
+        # APFS is also normalization-insensitive, so looking a canonically
+        # equivalent spelling up succeeds while its lowercased name matches no
+        # directory entry (`core.precomposeunicode=false` keeps the decomposed
+        # one on disk). The entry itself is what the probe has to write back
+        # (#421 review).
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            on_disk = unicodedata.normalize("NFD", "R\u00e9adme.md")
+            (directory / on_disk).write_text("x")
+            requested = directory / unicodedata.normalize("NFC", "R\u00e9adme.md")
+            if not requested.exists():
+                self.skipTest("filesystem does not fold Unicode spellings")
+            self.assertEqual(pi.real_entry(requested).name, on_disk)
+
+    def test_unchanged_package_with_a_case_mismatched_crate_local_namesake_is_ok(self) -> None:
+        # The probe moves the crate-local file aside and writes it back. On a
+        # case-insensitive filesystem `Readme.md` and `README.md` are one entry,
+        # so writing the archive member's spelling renames the file for good, and
+        # the probe's own packaging then sees a different layout from the one it
+        # was asked about: an unchanged package came out exit 2. real_entry()
+        # keeps the entry's spelling (#421 review).
+        (self.fx.root / "README.md").write_text("# external\n")
+        self.fx.write("Readme.md", "# crate-local\n")
+        if not (self.fx.root / "demo" / "README.md").exists():
+            self.skipTest("case-sensitive filesystem")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("external readme, case-mismatched crate-local namesake")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_external_readme_next_to_a_shipped_crate_local_namesake_is_ok(self) -> None:
+        # No `exclude`: Cargo ships the crate-local copy and warns about the
+        # declared one. Which of the two the member carries is Cargo's decision,
+        # so the checker asks Cargo instead of taking a file or refusing the
+        # layout, and an unchanged package stays green.
+        (self.fx.root / "README.md").write_text("# external\n")
+        self.fx.write("README.md", "# crate-local\n")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("both readmes, no exclude")
+        blob = self.fx.package()
+        rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok          demo 0.1.0", out)
+
+    def test_tampered_crate_local_readme_behind_an_external_declaration_is_not_green(self) -> None:
+        # The mirror of the excluded-namesake case (GPT review of the fix):
+        # without `exclude` Cargo ships the crate-local file, so the declared
+        # copy must not become the witness. Shortening the member onto the
+        # published bytes leaves it equal to the declared copy here.
+        (self.fx.root / "README.md").write_text("ab")
+        self.fx.write("README.md", "ab")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("both readmes, no exclude")
+        published = self.fx.package()
+        self.fx.write("README.md", "ab\0")
+        self.fx.commit("crate-local readme grew by a NUL, same version")
+        rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 1, out)  # control: the added NUL is a MISMATCH
+        self.assertIn("differs: README.md", out)
+        real = pi.package_tree
+
+        def corrupted(*args, **kwargs):
+            raw = bytearray(gzip.decompress(real(*args, **kwargs)))
+            if kwargs.get("allow_dirty"):  # the sentinel probe's own archive
+                return gzip.compress(bytes(raw))
+            with tarfile.open(fileobj=io.BytesIO(bytes(raw)), mode="r:") as tf:
+                o = tf.getmember("demo-0.1.0/README.md").offset
+            assert raw[o + 134] == ord("3") and raw[o + 114] == ord("0")
+            raw[o + 134] ^= 1  # size 3 -> 2
+            raw[o + 114] ^= 1  # UID 0 -> 1; the two cancel in the checksum
+            return gzip.compress(bytes(raw))
+
+        with mock.patch.object(pi, "package_tree", corrupted):
+            rc, out = self.fx.run("HEAD", lambda n, v: published)
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn("ok          demo", out)
+
+    def test_two_files_declared_outside_the_crate_as_one_name_are_not_checked(self) -> None:
+        # readme and license-file both name a file outside the crate, so nothing
+        # says which one the README.md member carries; the check refuses instead
+        # of taking the first.
+        crate = {"root": "/crate", "readme": "../README.md",
+                 "license_file": "../docs/README.md"}
+        with self.assertRaises(pi.CheckError):
+            pi.member_source("/repo", crate, "README.md", "/tmp")
+
+    def test_probe_payload_matching_neither_file_is_not_checked(self) -> None:
+        # GPT review on #421: a probe archive whose member is neither the marker
+        # nor the declared copy is a failed probe, not an answer ("the declared
+        # copy"), so it must not pick a witness.
+        (self.fx.root / "README.md").write_text("# external\n")
+        self.fx.write("README.md", "# crate-local\n")
+        self.fx.write("Cargo.toml", CRATE_MANIFEST + 'readme = "../README.md"\n')
+        self.fx.commit("both readmes, no exclude")
+        blob = self.fx.package()
+        real = pi.package_tree
+
+        def unexpected(*args, **kwargs):
+            probe = real(*args, **kwargs)
+            if not kwargs.get("allow_dirty"):
+                return probe
+            return repack(probe, {"demo-0.1.0/README.md": b"neither candidate\n"})
+
+        with mock.patch.object(pi, "package_tree", unexpected):
+            rc, out = self.fx.run("HEAD", lambda n, v: blob)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("neither the crate-local file nor", out)
+        self.assertNotIn("ok          demo", out)
+
+    def test_probe_refuses_a_crate_outside_the_temporary_checkout(self) -> None:
+        # GPT review on #421 (critical): a workspace member that is a symlink to a
+        # directory elsewhere put a live file under the probe's write path. The
+        # probe must refuse before writing and before packaging anything.
+        outer = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (outer / "README.md").write_text("# live file\n")
+        wt = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (wt / "demo").symlink_to(outer, target_is_directory=True)
+        crate = {"name": "demo", "version": "0.1.0", "root": str(wt / "demo"),
+                 "readme": "../README.md", "license_file": None}
+        with mock.patch.object(pi, "package_tree",
+                               side_effect=AssertionError("probe wrote into a live tree")):
+            with self.assertRaises(pi.CheckError) as raised:
+                pi.ships_local_namesake(str(wt), crate, "README.md", str(wt),
+                                        outer / "README.md")
+        self.assertIn("outside the temporary checkout", str(raised.exception))
+        self.assertEqual((outer / "README.md").read_text(), "# live file\n")
+
+    def test_probe_refuses_an_outside_directory_whose_file_symlinks_back_inside(self) -> None:
+        # GPT review on #421 (round 2, critical): the target check alone passed
+        # when an outside member directory held a README.md symlink pointing back
+        # into the checkout. Removing the link and writing a new file would then
+        # create it in the outside directory. The entry's directory has to be
+        # inside the checkout as well.
+        outer = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        wt = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (wt / "owned.md").write_text("# inside\n")
+        (outer / "demo").mkdir()
+        (outer / "demo" / "README.md").symlink_to(wt / "owned.md")
+        crate = {"name": "demo", "version": "0.1.0", "root": str(outer / "demo"),
+                 "readme": "../README.md", "license_file": None}
+        with mock.patch.object(pi, "package_tree",
+                               side_effect=AssertionError("probe wrote into a live tree")):
+            with self.assertRaises(pi.CheckError) as raised:
+                pi.ships_local_namesake(str(wt), crate, "README.md", str(wt),
+                                        outer / "README.md")
+        self.assertIn("outside the temporary checkout", str(raised.exception))
+        self.assertTrue((outer / "demo" / "README.md").is_symlink())
+
+    def test_probe_puts_the_file_back_when_the_marker_write_fails(self) -> None:
+        # GPT review on #421 (critical): a failed marker write used to leave the
+        # original behind under the backup name. It must be restored instead.
+        root = pathlib.Path(tempfile.mkdtemp(dir=self._tmp.name))
+        (root / "README.md").write_text("# crate-local\n")
+        (root.parent / "README.md").write_text("# external\n")
+        crate = {"name": "demo", "version": "0.1.0", "root": str(root),
+                 "readme": "../README.md", "license_file": None}
+
+        def no_space(self_, data):
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(pathlib.Path, "write_bytes", no_space):
+            with self.assertRaises(OSError):
+                pi.ships_local_namesake(str(root), crate, "README.md", str(root),
+                                        root.parent / "README.md")
+        self.assertEqual((root / "README.md").read_text(), "# crate-local\n")
+        self.assertEqual([p.name for p in root.iterdir()], ["README.md"])
 
     def test_unchanged_file_with_a_newline_in_its_name_is_ok(self) -> None:
         # GPT review on #411 (18:10Z, item 2): `notes\nmore` is one file.
@@ -868,6 +1130,48 @@ class MutationTest(unittest.TestCase):
             "    if on_disk != body:",
             "    if False:",
             ["PublishedIdentityTest.test_tree_member_size_lie_over_a_zero_byte_is_not_green"],
+        ),
+        # The member's bytes taken from a crate-local namesake instead of the
+        # readme / license-file the manifest declares outside the crate: an
+        # excluded local file then vouches for a shortened external member
+        # (#416 review, GPT critical).
+        "local_namesake_preferred": (
+            "    return (local if ships_local_namesake(repo, crate, rel, target_dir, outside[0])",
+            "    return (local if True",
+            ["PublishedIdentityTest.test_tampered_external_readme_behind_an_excluded_local_namesake_is_not_green",
+             "PublishedIdentityTest.test_unchanged_external_readme_behind_an_excluded_local_namesake_is_ok"],
+        ),
+        # Cargo not asked which of the two files it archived: the mirror case,
+        # where Cargo ships the crate-local file and the declared copy then
+        # vouches for a shortened member (GPT review of this fix).
+        "declared_file_preferred": (
+            "    return (local if ships_local_namesake(repo, crate, rel, target_dir, outside[0])",
+            "    return (local if False",
+            ["PublishedIdentityTest.test_tampered_crate_local_readme_behind_an_external_declaration_is_not_green",
+             "PublishedIdentityTest.test_external_readme_next_to_a_shipped_crate_local_namesake_is_ok"],
+        ),
+        # A probe archive whose member is neither the marker nor the declared
+        # copy is a failed probe, not an answer (#421 review).
+        "probe_result_not_checked": (
+            """    raise CheckError(f"the probe packaging of {crate['name']} carries a {rel} that is"
+                     f" neither the crate-local file nor {declared}")""",
+            "    return True",
+            ["PublishedIdentityTest.test_probe_payload_matching_neither_file_is_not_checked"],
+        ),
+        # The probe writing through a symlinked workspace member, outside the
+        # throwaway checkout (#421 review, critical).
+        "probe_path_escape_allowed": (
+            "        if not path.resolve().is_relative_to(checkout):",
+            "        if False:",
+            ["PublishedIdentityTest.test_probe_refuses_a_crate_outside_the_temporary_checkout",
+             "PublishedIdentityTest.test_probe_refuses_an_outside_directory_whose_file_symlinks_back_inside"],
+        ),
+        # The restore after a failed marker write skipped, which leaves the
+        # original behind under the backup name (#421 review, critical).
+        "probe_restore_skipped": (
+            "            except OSError:\n                pass  # nothing of ours to remove; the move below still restores",
+            "            except OSError:\n                raise",
+            ["PublishedIdentityTest.test_probe_puts_the_file_back_when_the_marker_write_fails"],
         ),
         # The end-of-archive check back to "something is there": a zeroed last
         # member header then leaves its own header and payload behind two

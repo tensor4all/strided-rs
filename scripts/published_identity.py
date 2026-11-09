@@ -81,10 +81,18 @@ Caveats, stated rather than hidden:
     caveat does not rest on the padding alone.
   * Nor does the tree side rest on the tar reader for a member's content: the
     bytes read out of the archive are compared with the bytes of the file Cargo
-    archived, on disk (a readme / license-file from outside the crate is read
-    where the manifest points, since Cargo archives it at the package root under
-    its own name). A member list and a set of end blocks say nothing about a
-    member's length: a header whose size field is edited can still pass its own
+    archived, on disk — where the manifest points for a `readme` /
+    `license-file` declared outside the crate, since Cargo archives that at the
+    package root under its own name. When the crate also has a file of that
+    name, Cargo ships one of the two according to the crate's include/exclude
+    rules, and choosing by what exists on disk got both directions wrong: the
+    crate-local file vouched for a shortened member whose real source was the
+    declared one, and an unchanged package came out unverifiable (#416 review,
+    GPT critical). So that case asks Cargo: the tree is packaged a second time
+    with a sentinel in place of the crate-local file, inside this script's own
+    temporary worktree, and the member either follows the sentinel or it does
+    not. A member list and a set of end blocks say nothing about a member's
+    length: a header whose size field is edited can still pass its own
     checksum — flip a bit in the size and one in the UID and the two cancel — so
     tarfile reads the member shorter and the padding swallows the rest (#416).
     A member whose bytes are not the file's bytes, or which names no file on
@@ -224,23 +232,130 @@ def published(name: str, ver: str, opener=None) -> bytes | None:
     return blob
 
 
-def member_bytes(crate: dict, rel: str, body: bytes) -> None:
+def real_entry(local: pathlib.Path) -> pathlib.Path:
+    """`local`, with the spelling its directory actually has.
+
+    On a case-insensitive filesystem `README.md` and `Readme.md` name the same
+    file, and writing a path spelled differently does not change the entry's
+    spelling. The probe below moves the crate-local file aside to ask Cargo
+    which namesake it archives; recreating it under the archive member's
+    spelling would change Cargo's collision decision and pick the wrong witness
+    (#421 review). A filesystem also folds canonically equivalent Unicode
+    spellings (APFS does), so the entry is the one the filesystem resolved, not
+    the one whose lowercased name matches.
+    """
+    names = os.listdir(local.parent)
+    if local.name in names:
+        return local
+    entry = os.lstat(local)
+    matches = [n for n in names if os.path.samestat(os.lstat(local.parent / n), entry)]
+    return local.parent / matches[0] if len(matches) == 1 else local
+
+
+def ships_local_namesake(repo: str, crate: dict, rel: str, target_dir: str,
+                         declared: pathlib.Path) -> bool:
+    """Whether Cargo archives the crate-local file `rel` rather than the copy the
+    manifest declares outside the crate, when the crate has both.
+
+    Cargo decides that from the crate's include/exclude rules, and a checker that
+    picked one of the two by looking at the files got it wrong in both directions
+    (#416 review, GPT critical): the crate-local file vouched for a shortened
+    member whose real source was the declared one, and an unchanged package was
+    unverifiable. So this asks Cargo: package the tree again with random bytes in
+    place of the crate-local file. A member holding those bytes is the
+    crate-local file; one holding the declared file's bytes is the declared copy;
+    anything else is a failed probe, not an answer. Random bytes, not a fixed
+    marker, so no file content can be mistaken for the marker. No packaging rule
+    is re-implemented here, and the worktree is this script's own temporary one.
+    """
+    local = real_entry(pathlib.Path(crate["root"]) / rel)
+    # The probe removes the entry and writes a new one, so the checkout has to own
+    # both the entry's target and the directory the new entry lands in: a
+    # workspace member that is a symlink elsewhere, or a file symlink whose target
+    # points back inside, would otherwise put a live file outside the throwaway
+    # worktree (#421 review). Refuse before writing and before packaging anything.
+    checkout = pathlib.Path(repo).resolve()
+    for path in (local.parent, local):
+        if not path.resolve().is_relative_to(checkout):
+            raise CheckError(f"the tree archive's {rel} is {path}, resolving to"
+                             f" {path.resolve()}, outside the temporary checkout {repo}:"
+                             " not writing there to ask Cargo")
+    marker = os.urandom(32)
+    # The backup goes to a temporary directory outside the package (Cargo ships a
+    # file left beside the crate-local one), and the restore below runs even when
+    # writing the marker fails, so the original is never left behind under a
+    # backup name (#421 review). shutil.move is a rename, or a copy across
+    # filesystems; moving rather than reading keeps a symlink a symlink.
+    backup = tempfile.mkdtemp(prefix="published-identity-probe-")
+    aside = pathlib.Path(backup) / local.name
+    try:
+        shutil.move(str(local), str(aside))
+        try:
+            local.write_bytes(marker)
+            probe, _ = crate_archive(package_tree(repo, crate, os.path.join(target_dir, "probe"),
+                                                  allow_dirty=True))
+        finally:
+            try:
+                local.unlink()
+            except OSError:
+                pass  # nothing of ours to remove; the move below still restores
+            shutil.move(str(aside), str(local))
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
+    if rel not in probe:
+        raise CheckError(f"the probe packaging of {crate['name']} has no {rel}, so it does"
+                         " not say which file Cargo archived")
+    if probe[rel] == hashlib.sha256(marker).hexdigest():
+        return True
+    if probe[rel] == hashlib.sha256(declared.read_bytes()).hexdigest():
+        return False
+    raise CheckError(f"the probe packaging of {crate['name']} carries a {rel} that is"
+                     f" neither the crate-local file nor {declared}")
+
+
+def member_source(repo: str, crate: dict, rel: str, target_dir: str) -> pathlib.Path:
+    """The file on disk Cargo read for the tree archive's member `rel`.
+
+    A readme / license-file declared OUTSIDE the crate is archived at the
+    package root under its own name, so that declaration, not a crate-local
+    file that merely shares the name, is what the member carries; the local file
+    is the source only when Cargo ships it (ships_local_namesake()).
+    """
+    root = pathlib.Path(crate["root"])
+    local = root / rel
+    outside = []
+    for key in ("readme", "license_file"):
+        declared = crate.get(key)
+        if not declared or pathlib.Path(declared).name != rel:
+            continue
+        # Textually outside the crate: `..` in the declared path, or an absolute
+        # one. Read textually, not by resolving: a declared path that is a
+        # symlink into the crate is still the file the member carries.
+        if pathlib.Path(declared).is_absolute() or ".." in pathlib.Path(declared).parts:
+            outside.append(root / declared)
+    if not outside:
+        return local
+    if len(set(outside)) > 1:
+        raise CheckError("the manifest declares more than one file outside the crate as"
+                         f" {rel}: {', '.join(sorted(str(p) for p in outside))}")
+    if not local.is_file():
+        return outside[0]
+    return (local if ships_local_namesake(repo, crate, rel, target_dir, outside[0])
+            else outside[0])
+
+
+def member_bytes(repo: str, crate: dict, target_dir: str, rel: str, body: bytes) -> None:
     """The tree archive's member `rel` must be the file Cargo archived, byte for
     byte. Neither the member list nor the end blocks see a member's length, and
     a size field edited with a compensating UID bit keeps the header checksum,
     so tarfile reads the member shorter and the padding swallows the rest: only
     an independent copy of the bytes, the file on disk, catches that (#416).
+    The file that counts is the one Cargo read (member_source()), not whatever
+    happens to have the right name.
     """
-    root = pathlib.Path(crate["root"])
     # Cargo.toml.orig is the crate's manifest verbatim.
-    source = root / ("Cargo.toml" if rel == "Cargo.toml.orig" else rel)
-    if not source.is_file():
-        # Cargo archives a readme / license-file from outside the crate at the
-        # package root, under its own file name.
-        for key in ("readme", "license_file"):
-            declared = crate.get(key)
-            if declared and pathlib.Path(declared).name == rel:
-                source = root / declared
+    source = (pathlib.Path(crate["root"]) / "Cargo.toml" if rel == "Cargo.toml.orig"
+              else member_source(repo, crate, rel, target_dir))
     try:
         on_disk = source.read_bytes()
     except OSError as e:
@@ -253,14 +368,15 @@ def member_bytes(crate: dict, rel: str, body: bytes) -> None:
 
 
 def crate_archive(blob: bytes, listed: bytes | None = None,
-                  crate: dict | None = None) -> tuple[dict[str, str], dict | None]:
+                  verify=None) -> tuple[dict[str, str], dict | None]:
     """(path-inside-crate -> sha256 for the files worth comparing, the archive's
     .cargo_vcs_info.json or None).
 
     `listed` is that same archive's file list from `cargo package --list`, in
-    bytes, and `crate` the crate the tree side was packaged from; passing both
-    means a structurally valid archive cannot lose a member or shorten one
-    unnoticed (see the caveats at the top of this file).
+    bytes, and `verify` is called with each compared member's (name, bytes), so
+    a structurally valid archive cannot lose a member or shorten one unnoticed
+    (the tree side passes member_bytes(); see the caveats at the top of this
+    file).
     """
     # Decompress the whole stream first: tarfile over a gzip stream stops at
     # the tar end marker and never checks the gzip trailer, so a truncated or
@@ -311,8 +427,8 @@ def crate_archive(blob: bytes, listed: bytes | None = None,
                 vcs = json.loads(body)
             elif rel not in SKIP_ALWAYS:
                 out[rel] = hashlib.sha256(body).hexdigest()
-                if crate is not None:
-                    member_bytes(crate, rel, body)
+                if verify is not None:
+                    verify(rel, body)
     # Two zero blocks are what a complete tar ends with, and tar-rs writes
     # nothing behind them. A stream cut off exactly at a member boundary leaves
     # an empty tail, and a stream cut off at a damage point leaves the rest of
@@ -378,7 +494,7 @@ def provenance(repo: str, ref: str, crate: dict, vcs: dict | None) -> list[str]:
             f" of {ref[:10]}"]
 
 
-def package_tree(repo: str, crate: dict, target_dir: str) -> bytes:
+def package_tree(repo: str, crate: dict, target_dir: str, allow_dirty: bool = False) -> bytes:
     """The .crate that `cargo package` builds from the checked-out tree.
 
     Comparing against Cargo's own archive, rather than re-deriving it from
@@ -394,9 +510,12 @@ def package_tree(repo: str, crate: dict, target_dir: str) -> bytes:
     that is reported as "could not check" (exit 2), not as green.
     """
     name, ver = crate["name"], crate["version"]
-    rc, _, err = run(["cargo", "package", "-p", name, "--no-verify", "-q",
-                      "--manifest-path", f"{repo}/Cargo.toml",
-                      "--target-dir", target_dir], cwd=repo, timeout=600)
+    cmd = ["cargo", "package", "-p", name, "--no-verify", "-q",
+           "--manifest-path", f"{repo}/Cargo.toml",
+           "--target-dir", target_dir]
+    if allow_dirty:  # the probe packaging writes into the tree on purpose
+        cmd.append("--allow-dirty")
+    rc, _, err = run(cmd, cwd=repo, timeout=600)
     if rc != 0:
         raise CheckError(f"cargo package failed for {name}: {err[:300]}")
     path = pathlib.Path(target_dir) / "package" / f"{name}-{ver}.crate"
@@ -434,8 +553,9 @@ def check_crate(repo: str, ref: str, crate: dict, target_dir: str) -> tuple[str,
     # SKIP_ALWAYS are left out. A file that shipped but is gone from the tree
     # (a deleted build.rs, say) shows as "only in published .crate".
     pub, vcs = crate_archive(blob)
-    tree, _ = crate_archive(package_tree(repo, crate, target_dir),
-                            package_list(repo, crate), crate)
+    tree, _ = crate_archive(
+        package_tree(repo, crate, target_dir), package_list(repo, crate),
+        lambda rel, body: member_bytes(repo, crate, target_dir, rel, body))
     diffs: list[str] = []
     for rel in sorted(set(pub) | set(tree)):
         if rel not in pub:
