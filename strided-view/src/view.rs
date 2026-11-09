@@ -805,32 +805,37 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
         // extent that `validate_bounds` (view.rs:187) proved stays inside
         // `data` for this view's construction (or that the `new_unchecked`
         // contract promised). A view from `StridedArray::view`
-        // (view.rs:1456) carries the same proof; see the comment there.
+        // (view.rs:1461) carries the same proof; see the comment there.
         Op::apply(unsafe { *self.ptr.offset(offset) })
     }
 
     /// Get an element without bounds checking.
     ///
     /// # Safety
-    /// Caller must ensure indices are within bounds.
+    ///
+    /// `indices.len()` must equal `self.ndim()`, and `indices[i] < self.dims()[i]`
+    /// for every axis `i`.
+    ///
+    /// A shorter `indices` does not mean "the missing axes are indexed with 0":
+    /// the loop below skips the axes it was not given, so on a view with a
+    /// zero-extent axis it dereferences the view's dangling base pointer.
+    /// Debug builds reject a wrong `indices.len()` with `debug_assert_eq!`.
     #[inline]
     pub unsafe fn get_unchecked(&self, indices: &[usize]) -> T {
+        debug_assert_eq!(indices.len(), self.ndim(), "wrong number of indices");
         let mut idx = 0isize;
         for (i, &index) in indices.iter().enumerate() {
             idx += index as isize * self.strides()[i];
         }
-        // SAFETY: this function's contract (view.rs:815) puts every index in
-        // bounds. Read as one index per axis with `index < dims[i]`, `idx` is
-        // an offset the view's construction proved reachable: by
-        // `validate_bounds` (view.rs:187), the dense constructors (see
-        // `StridedArray::view`, view.rs:1456), or the `new_unchecked` contract.
-        // `ptr` is the view's base, so `ptr + idx` stays inside `data`; a view
-        // with a zero extent has no in-bounds index, so its dangling `ptr` is
-        // not reached. An extra index panics on `strides()[i]` before this
-        // line. NOT COVERED: a shorter `indices` skips the missing axes, and on
-        // a zero-extent view `idx == 0` then dereferences the dangling base.
-        // The `# Safety` text leaves `indices.len() == ndim()` implicit;
-        // tightening it changes the API contract, so it is out of scope here.
+        // SAFETY: this function's `# Safety` contract (above) requires one
+        // index per axis, `indices.len() == self.ndim()`, with `index < dims[i]`
+        // for each. That makes `idx` an offset the view's construction proved
+        // reachable: `validate_bounds` (view.rs:187), the dense constructors
+        // (see `StridedArray::view`, view.rs:1461), or the `new_unchecked`
+        // contract. `ptr` is the view's base, so `ptr + idx` stays inside
+        // `data`. On a view with a zero-extent axis no index satisfies
+        // `index < dims[i]`, so the contract, not the debug-only arity check,
+        // is what keeps its dangling base unreached.
         Op::apply(*self.ptr.offset(idx))
     }
 }
@@ -1458,13 +1463,13 @@ impl<T> StridedArray<T> {
             empty_const_ptr()
         } else {
             // SAFETY: `offset` is either 0 from a constructor or was accepted by
-            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1393), so
+            // `validate_bounds` in `StridedArray::from_parts` (view.rs:1398), so
             // `data.as_ptr() + offset` stays inside `data`. The empty branch
             // above excludes a zero-sized layout, whose offset need not be
             // reachable. The view built below also needs the whole reachable
             // extent inside `data` (its `get` relies on it): `from_parts` proved
             // that with `validate_bounds`, and every dense constructor
-            // (`try_col_major`, view.rs:1242, and its row-major, `from_fn`,
+            // (`try_col_major`, view.rs:1247, and its row-major, `from_fn`,
             // `from_buffer` and uninit siblings) stores exactly
             // `checked_element_count(dims)` (view.rs:266) elements under
             // `checked_dense_strides` (view.rs:292), whose highest offset is that
@@ -1491,7 +1496,7 @@ impl<T> StridedArray<T> {
         } else {
             // SAFETY: as `view` above — `self.offset` is either 0 from a
             // constructor or was accepted by `validate_bounds` in
-            // `StridedArray::from_parts` (view.rs:1393), and `&mut self` keeps
+            // `StridedArray::from_parts` (view.rs:1398), and `&mut self` keeps
             // this reborrow exclusive. The empty branch above excludes a
             // zero-sized layout, whose offset need not be reachable. The whole
             // reachable extent stays inside `data` for the same reasons given in
@@ -1636,7 +1641,7 @@ impl<T: Copy> StridedArray<T> {
     /// ```
     pub unsafe fn col_major_uninit(dims: &[usize]) -> StridedArray<MaybeUninit<T>> {
         // SAFETY: `try_col_major_uninit` has the same contract as this function
-        // (view.rs:1613), which our caller accepted: read a slot only after
+        // (view.rs:1618), which our caller accepted: read a slot only after
         // writing it. This call reads nothing.
         Self::try_col_major_uninit(dims).expect("col_major_uninit: shape overflows isize")
     }
@@ -1682,7 +1687,7 @@ impl<T: Copy> StridedArray<T> {
         dims: &[usize],
     ) -> StridedArray<MaybeUninit<T>> {
         // SAFETY: `try_col_major_from_buffer_uninit` has the same contract as
-        // this function (view.rs:1613), which our caller accepted: read a slot
+        // this function (view.rs:1618), which our caller accepted: read a slot
         // only after writing it. This call reads nothing.
         Self::try_col_major_from_buffer_uninit(buf, dims)
             .expect("col_major_from_buffer_uninit: shape overflows isize")

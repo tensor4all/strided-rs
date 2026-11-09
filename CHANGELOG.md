@@ -128,6 +128,11 @@ Other breaking changes:
   `ErasedRawStridedUninitMut`) now return `StridedError::DataAlignmentMismatch`
   for a zero-length buffer whose base is misaligned (#434). They used to return
   `Ok`, leaving `data_as*` to form an unaligned `&[T]`, which is UB.
+- `strided_view::StridedView::get_unchecked` now states `indices.len() ==
+  ndim()` in its `# Safety` contract and checks it with `debug_assert_eq!` in
+  debug builds (#437). A shorter `indices` never meant "the missing axes are
+  indexed with 0": on a view with a zero-extent axis it dereferenced the
+  dangling base pointer. Release code generation is unchanged.
 
 Listed for completeness, not a downstream change: `strided-perm`'s own copy of
 `SMALL_TENSOR_THRESHOLD` (`src/kernel.rs`) is gone. That module was never public
