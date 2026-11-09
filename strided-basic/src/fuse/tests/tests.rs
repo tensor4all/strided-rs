@@ -389,6 +389,14 @@ fn test_compute_importance_rank_65_broadcast_output_keeps_live_axes_distinct() {
 fn test_compute_importance_matches_exact_reference() {
     // The original formula evaluated without overflow (u128). Wherever it fits,
     // the 64-bit weights must be identical, so the plan order is unchanged.
+    //
+    // The grid, for every rank `n = 1..=4` and operand count `m = 1..=4`:
+    //   * every independent stride permutation of every operand (the two
+    //     budget notes below say where `n = 4, m >= 3` drops to every pair),
+    //   * every zero-stride mask (all `2^n` subsets) on the output, on each
+    //     input in turn, and on every operand at once,
+    //   * every size-1 variant with at most two singleton axes, including the
+    //     non-adjacent `[2, 1, 2]` shape.
     fn reference(dims: &[usize], strides: &[&[isize]], orders: &[Vec<usize>]) -> Vec<u128> {
         let (n, m) = (dims.len(), strides.len());
         if n == 0 || m == 0 {
@@ -417,68 +425,157 @@ fn test_compute_importance_matches_exact_reference() {
         weights
     }
 
-    fn permute(items: &mut [isize], pos: usize, out: &mut Vec<Vec<isize>>) {
-        if pos == items.len() {
-            out.push(items.to_vec());
-            return;
+    fn permutations(items: &[isize]) -> Vec<Vec<isize>> {
+        fn rec(items: &mut [isize], pos: usize, out: &mut Vec<Vec<isize>>) {
+            if pos == items.len() {
+                out.push(items.to_vec());
+                return;
+            }
+            for i in pos..items.len() {
+                items.swap(pos, i);
+                rec(items, pos + 1, out);
+                items.swap(pos, i);
+            }
         }
-        for i in pos..items.len() {
-            items.swap(pos, i);
-            permute(items, pos + 1, out);
-            items.swap(pos, i);
-        }
+        let mut items = items.to_vec();
+        let mut out = Vec::new();
+        rec(&mut items, 0, &mut out);
+        out
     }
 
-    for n in 1..=4usize {
-        let mut powers: Vec<isize> = (0..n).map(|i| 1isize << i).collect();
-        let mut perms = Vec::new();
-        permute(&mut powers, 0, &mut perms);
-
-        let dim_grids = [vec![2usize; n], {
-            let mut d = vec![2usize; n];
-            d[0] = 1;
-            d
-        }];
-
-        for dims in &dim_grids {
-            for m in 1..=4usize {
-                // Every operand gets its own stride permutation; keeping the
-                // grid bounded at the top rank is what limits this to m <= 2.
-                if n == 4 && m > 2 {
-                    continue;
+    /// One operand stride tuple per combination: the operands at `crossed`
+    /// range over every permutation of the power-of-two strides independently,
+    /// the rest keep the column-major (identity) permutation.
+    fn stride_tuples(perms: &[Vec<isize>], m: usize, crossed: &[usize]) -> Vec<Vec<Vec<isize>>> {
+        let identity = perms[0].clone();
+        let mut tuples = Vec::new();
+        let mut pick = vec![0usize; crossed.len()];
+        loop {
+            let mut tuple = vec![identity.clone(); m];
+            for (slot, &operand) in crossed.iter().enumerate() {
+                tuple[operand] = perms[pick[slot]].clone();
+            }
+            tuples.push(tuple);
+            let mut carry = true;
+            for p in pick.iter_mut() {
+                if !carry {
+                    break;
                 }
-                for mut pick in 0..perms.len().pow(m as u32) {
-                    let mut strides: Vec<Vec<isize>> = Vec::with_capacity(m);
-                    for _ in 0..m {
-                        strides.push(perms[pick % perms.len()].clone());
-                        pick /= perms.len();
-                    }
-                    // Broadcast a subset of the output axes with a zero stride.
-                    for zero_mask in 0..(1u32 << n) {
+                *p += 1;
+                if *p == perms.len() {
+                    *p = 0;
+                } else {
+                    carry = false;
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+        tuples
+    }
+
+    fn check(dims: &[usize], strides: &[Vec<isize>]) {
+        let all_strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+        let orders: Vec<Vec<usize>> = strides.iter().map(|s| index_order(s).into_vec()).collect();
+
+        let got: Vec<u128> = compute_importance(dims, &all_strides, &orders)
+            .as_slice()
+            .iter()
+            .map(|&w| w as u128)
+            .collect();
+        let want = reference(dims, &all_strides, &orders);
+        assert_eq!(
+            got.as_slice(),
+            want.as_slice(),
+            "dims {:?} strides {:?}",
+            dims,
+            strides
+        );
+    }
+
+    let mut broadcast_cases = 0usize;
+
+    for n in 1..=4usize {
+        let powers: Vec<isize> = (0..n).map(|i| 1isize << i).collect();
+        let perms = permutations(&powers);
+
+        // Every size-1 variant: none, each single axis, and the non-adjacent
+        // pair that makes `[2, 1, 2]` reachable.
+        let mut dim_grids: Vec<Vec<usize>> = vec![vec![2usize; n]];
+        for i in 0..n {
+            let mut dims = vec![2usize; n];
+            dims[i] = 1;
+            dim_grids.push(dims);
+        }
+        if n >= 3 {
+            let mut dims = vec![2usize; n];
+            dims[0] = 1;
+            dims[n - 1] = 1;
+            dim_grids.push(dims);
+        }
+
+        for m in 1..=4usize {
+            // Stride permutations for the size-1 sweep: every operand
+            // independent while that stays within the test budget (n <= 3 any
+            // m, n = 4 up to m = 2). The exhaustive `24^3 + 24^4 = 345 600`
+            // grid at n = 4 costs ~4.6 s in a debug test build, so
+            // `n = 4, m >= 3` crosses every pair of operands instead
+            // (`24^2` per pair, the rest column-major).
+            let independent: Vec<Vec<usize>> = if perms.len().pow(m as u32) <= 2000 {
+                vec![(0..m).collect()]
+            } else {
+                (0..m)
+                    .flat_map(|i| ((i + 1)..m).map(move |j| vec![i, j]))
+                    .collect()
+            };
+            let mut tuples: Vec<Vec<Vec<isize>>> = Vec::new();
+            for crossed in &independent {
+                tuples.extend(stride_tuples(&perms, m, crossed));
+            }
+
+            // Every stride permutation against every size-1 variant.
+            for dims in &dim_grids {
+                for strides in &tuples {
+                    check(dims, strides);
+                }
+            }
+
+            // Every zero-stride mask (a broadcast axis) on every operand
+            // position: the output, each input in turn, and all operands at
+            // once. This sweep multiplies by `1 + (2^n - 1) * (m + 1)`, so it
+            // keeps full permutation independence only up to `(n!)^m <= 600`
+            // and permutes one operand at a time above that. The size-1
+            // variants rotate across the grid, so every broadcast case is also
+            // checked against several dims shapes.
+            let broadcast_tuples: Vec<Vec<Vec<isize>>> = if perms.len().pow(m as u32) <= 600 {
+                tuples.clone()
+            } else {
+                let mut t = Vec::new();
+                for operand in 0..m {
+                    t.extend(stride_tuples(&perms, m, &[operand]));
+                }
+                t
+            };
+            for strides in &broadcast_tuples {
+                for zero_mask in 0..(1u32 << n) {
+                    // Every mask on every position; a zero mask is the same
+                    // tuple for every position, so it is checked once.
+                    let receivers = if zero_mask == 0 { 1 } else { m + 1 };
+                    for role in 0..receivers {
                         let mut strides = strides.clone();
-                        for (i, s) in strides[0].iter_mut().enumerate() {
-                            if zero_mask & (1 << i) != 0 {
-                                *s = 0;
+                        for (k, operand) in strides.iter_mut().enumerate() {
+                            if role == m || role == k {
+                                for (i, s) in operand.iter_mut().enumerate() {
+                                    if zero_mask & (1 << i) != 0 {
+                                        *s = 0;
+                                    }
+                                }
                             }
                         }
-                        let all_strides: Vec<&[isize]> =
-                            strides.iter().map(|s| s.as_slice()).collect();
-                        let orders: Vec<Vec<usize>> =
-                            strides.iter().map(|s| index_order(s).into_vec()).collect();
-
-                        let got: Vec<u128> = compute_importance(dims, &all_strides, &orders)
-                            .as_slice()
-                            .iter()
-                            .map(|&w| w as u128)
-                            .collect();
-                        let want = reference(dims, &all_strides, &orders);
-                        assert_eq!(
-                            got.as_slice(),
-                            want.as_slice(),
-                            "dims {:?} strides {:?}",
-                            dims,
-                            strides
-                        );
+                        let dims = &dim_grids[broadcast_cases % dim_grids.len()];
+                        broadcast_cases += 1;
+                        check(dims, &strides);
                     }
                 }
             }
