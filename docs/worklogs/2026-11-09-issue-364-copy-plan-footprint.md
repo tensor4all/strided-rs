@@ -148,8 +148,8 @@ ledger installed), `a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_ra
 install), `a_reversed_run_past_l2_keeps_the_copy_row` (131072 elements at stride -1
 on both sides, 2 MiB together), `the_contiguous_exemption_is_the_walk_the_replay_takes`
 (replaces `a_reversed_dense_buffer_keeps_the_copy_row`, sec. 5b),
-`a_transposing_plan_past_l2_asks_for_the_width_of_its_measured_time` (budget 96,
-sec. 3), plus
+`a_transposing_plan_rate_past_l2_gives_the_width_of_its_measured_time` (budget 96,
+sec. 5b), plus
 `cost::tests::a_footprint_past_l2_is_priced_above_the_row_of_its_class` (the
 AVX-512 branch, `HostClass::X86_64Avx512` given explicitly, so it runs everywhere)
 and `the_splitter_asks_its_gate_at_the_rate_it_is_given` (drives
@@ -276,7 +276,14 @@ token dispatching from outside the pool, the plan's replay asks for:
 | 512 | 3.0 | 23 | 24, 24 (3.09, 3.24) | 6 |
 | 1024 | 3.0 | 47 | 46, 47 (2.91, 3.07) | 11 |
 
-The 512 and 1024 rows are pinned by the test. The 256 row misses (1 against 6-7):
+The 512 and 1024 rows are pinned by the test, **for the width rule
+(`for_len_at_rate`) at the plan's rate only**. These layouts take the tiled replay,
+which does not narrow the budget: replayed through `replay_on(X86_64Avx512, ..)`
+with a 96-thread pool at budget 96, its splitter records 96 leaves for both rows
+(one install, `max_live` 21 and 17 on this host). So #364's criterion is **not
+met for the placement the transposing replay actually makes**; narrowing the tiled
+replay to the plan's width is a scheduling change of #422 that has not been made or
+measured (sec. 6). The 256 row misses (1 against 6-7):
 it fits L2 and keeps the row, which is #364 item 1, not in this change. The 64 and
 128 rows agree only because no width pays there at either rate.
 
@@ -295,6 +302,10 @@ it fits L2 and keeps the row, which is #364 item 1, not in this change. The 64 a
   fastest (fusion sorts by signed destination stride), on `main` as here. It is now
   priced as that strided walk; making it one run is a change of the shared fusion
   sort (sec. 2) and has not been made or measured.
+- The tiled replay keeps the caller's budget (96 leaves at budget 96 for the 512
+  and 1024 transposes), so #364's budget-96 width criterion holds for the width
+  rule at the plan's rate but not for the tiled placement. Whether the tiled
+  replay should be narrowed to `for_len_at_rate`'s width is open.
 - The parallel `CopyPlan` scheduling this change moves (the width of the untiled
   replay, the tiled replay's fork gate and splitter) has **not been measured**
   against `main`: the appendix harness times every `CopyPlan` row with
