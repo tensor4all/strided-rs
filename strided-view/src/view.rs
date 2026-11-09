@@ -833,9 +833,9 @@ impl<'a, T: Copy, Op: ElementOp<T>> StridedView<'a, T, Op> {
         // reachable: `validate_bounds` (view.rs:187), the dense constructors
         // (see `StridedArray::view`, view.rs:1461), or the `new_unchecked`
         // contract. `ptr` is the view's base, so `ptr + idx` stays inside
-        // `data`. A view with a zero-extent axis has no in-bounds index tuple,
-        // so the arity check above keeps its dangling `ptr` unreached; a longer
-        // `indices` panics on that check (debug) or on `strides()[i]` (release).
+        // `data`. On a view with a zero-extent axis no index satisfies
+        // `index < dims[i]`, so the contract, not the debug-only arity check,
+        // is what keeps its dangling base unreached.
         Op::apply(*self.ptr.offset(idx))
     }
 }
