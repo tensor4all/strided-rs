@@ -297,71 +297,64 @@ impl CopyPlan {
         })
     }
 
-    /// Whether the fused traversal is one unit-stride run, the layout the `Copy`
-    /// row is calibrated on. A streamed contiguous copy keeps that rate at every
-    /// footprint, and a reversed one (`-1` on both sides) streams the same way.
+    /// Whether the replay walks the plan as one unit-stride run on each side, the
+    /// layout the `Copy` row is calibrated on. A streamed contiguous copy keeps
+    /// that rate at every footprint, and a reversed one (`-1` on a side) streams
+    /// the same way.
+    ///
+    /// The question is about the walk the replay takes, not about a walk the
+    /// layout would allow: both replays walk the fused axes in their stored
+    /// order with axis 0 fastest (`apply_fused_range`, `apply_spilled_range`),
+    /// and the tiled replay only exists for two or more moving axes. So the
+    /// strides, read in that order, must be the running products of the extents
+    /// with one sign per operand. Fusion already merges every such pair, so in
+    /// practice this is a fused rank of one at unit stride; a dense *reversed*
+    /// buffer of rank two or more is not one run here, because fusion sorts the
+    /// axes by signed destination stride and walks `[-1, -512]` over
+    /// `[512, 512]` with `-512` fastest (strided-rs#364 review). It is priced
+    /// as the strided walk it is.
     fn is_contiguous_run(&self) -> bool {
-        // Fusion sorts the axes by signed destination stride, so a dense
-        // reversed buffer keeps more than one axis: [-1, -512] over
-        // [512, 512] stays rank two although it streams as one run, and a
-        // dense run above the inline rank spills with every axis kept. In
-        // ascending magnitude the strides must be the running products of the
-        // extents, with one sign per operand. Steps strictly increase (every
-        // axis has extent at least two), so each axis matches at most one step.
-        fn one_run(
-            rank: usize,
-            dim: impl Fn(usize) -> usize,
-            dst: impl Fn(usize) -> isize,
-            src: impl Fn(usize) -> isize,
-        ) -> bool {
+        fn walks_one_run(axes: impl Iterator<Item = (usize, isize, isize)>) -> bool {
             let mut step = 1usize;
-            let mut dst_sign = 0i8;
-            let mut src_sign = 0i8;
-            for _ in 0..rank {
-                let Some(axis) = (0..rank).find(|&axis| {
-                    dim(axis) != 1
-                        && dst(axis).unsigned_abs() == step
-                        && src(axis).unsigned_abs() == step
-                }) else {
-                    return false;
-                };
-                let axis_dst_sign = if dst(axis) < 0 { -1 } else { 1 };
-                let axis_src_sign = if src(axis) < 0 { -1 } else { 1 };
-                if (dst_sign != 0 && dst_sign != axis_dst_sign)
-                    || (src_sign != 0 && src_sign != axis_src_sign)
-                {
+            let mut signs = None;
+            for (dim, dst, src) in axes {
+                if dim == 1 {
+                    continue;
+                }
+                if dst.unsigned_abs() != step || src.unsigned_abs() != step {
                     return false;
                 }
-                dst_sign = axis_dst_sign;
-                src_sign = axis_src_sign;
-                step = step.saturating_mul(dim(axis));
+                let axis_signs = (dst < 0, src < 0);
+                if *signs.get_or_insert(axis_signs) != axis_signs {
+                    return false;
+                }
+                step = step.saturating_mul(dim);
             }
             true
         }
         match &self.fused {
-            PairTraversal::Inline(layout) => one_run(
-                layout.rank,
-                |axis| layout.dims[axis],
-                |axis| layout.dst_strides[axis],
-                |axis| layout.src_strides[axis],
-            ),
-            PairTraversal::Spilled(axes) => one_run(
-                axes.len(),
-                |axis| axes[axis].dim,
-                |axis| axes[axis].dst,
-                |axis| axes[axis].src,
-            ),
+            PairTraversal::Inline(layout) => walks_one_run((0..layout.rank).map(|axis| {
+                (
+                    layout.dims[axis],
+                    layout.dst_strides[axis],
+                    layout.src_strides[axis],
+                )
+            })),
+            PairTraversal::Spilled(axes) => {
+                walks_one_run(axes.iter().map(|axis| (axis.dim, axis.dst, axis.src)))
+            }
         }
     }
 
-    /// Serial rate this plan prices itself at on this host: the `Copy` row while
-    /// the plan is one contiguous run or its working set fits the class's L2
-    /// cache, the class's beyond-L2 copy rate otherwise (strided-rs#364).
+    /// Serial rate this plan prices itself at on host class `host`: the `Copy`
+    /// row while the plan is one contiguous run or its working set fits the
+    /// class's L2 cache, the class's beyond-L2 copy rate otherwise
+    /// (strided-rs#364). [`Self::replay`] asks it for [`HostClass::detect`]; the
+    /// class is a parameter so that the tests can pin it.
     ///
     /// The element size is the one fact `compile` cannot know, so the footprint
     /// in bytes is formed here from the compiled span; nothing is probed.
-    fn ns_per_element<D, S>(&self) -> f64 {
-        let host = HostClass::detect();
+    fn ns_per_element_on<D, S>(&self, host: HostClass) -> f64 {
         if self.is_contiguous_run() {
             return KernelClass::Copy.ns_per_element_of(host);
         }
@@ -385,7 +378,8 @@ impl CopyPlan {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)
     }
 
-    /// Check the per-call facts, then replay the compiled traversal.
+    /// Check the per-call facts, then replay the compiled traversal, priced for
+    /// this host's class.
     fn replay<D, S, Apply>(
         &self,
         dest: &mut RawStridedMut<'_, D>,
@@ -398,9 +392,29 @@ impl CopyPlan {
         S: Copy + Send + Sync,
         Apply: Fn(&mut D, S) + Sync,
     {
+        self.replay_on(HostClass::detect(), dest, src, apply, exec)
+    }
+
+    /// [`Self::replay`] priced for host class `host`: every scheduling decision
+    /// of the replay asks at [`Self::ns_per_element_on`] of that class. Split out
+    /// so that a test can pin the class and observe the rate reach the replay on
+    /// every host (strided-rs#364).
+    fn replay_on<D, S, Apply>(
+        &self,
+        host: HostClass,
+        dest: &mut RawStridedMut<'_, D>,
+        src: &RawStridedRef<'_, S>,
+        apply: Apply,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        D: Copy + Send + Sync,
+        S: Copy + Send + Sync,
+        Apply: Fn(&mut D, S) + Sync,
+    {
         self.check_call(dest, src)?;
         let tiles = self.fused.tiles::<D, S>();
-        let ns_per_element = self.ns_per_element::<D, S>();
+        let ns_per_element = self.ns_per_element_on::<D, S>(host);
         // SAFETY: `check_call` proved both views carry exactly the compiled
         // layout, and `fused` is the fusion of that layout (only `compile`
         // and `Default`, the rank-zero layout, build it). `compile` checked
