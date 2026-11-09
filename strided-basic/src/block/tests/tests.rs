@@ -109,7 +109,7 @@ fn test_compute_block_sizes_full_pipeline() {
     let strides = [1isize, 100];
     let strides_list: Vec<&[isize]> = vec![&strides];
 
-    let blocks = compute_block_sizes(&dims, &strides_list, 8);
+    let blocks = compute_block_sizes(&dims, &strides_list, &[8]);
 
     // Should return valid block sizes
     assert_eq!(blocks.len(), 2);
@@ -410,8 +410,8 @@ fn test_compute_blocks_negative_strides() {
     // Negative strides are handled via their magnitude: same blocks as the
     // positive layout.
     let dims = [100usize, 100];
-    let positive = compute_block_sizes(&dims, &[&[1, 100], &[100, 1]], 8);
-    let negative = compute_block_sizes(&dims, &[&[-1, -100], &[-100, 1]], 8);
+    let positive = compute_block_sizes(&dims, &[&[1, 100], &[100, 1]], &[8, 8]);
+    let negative = compute_block_sizes(&dims, &[&[-1, -100], &[-100, 1]], &[8, 8]);
     assert_eq!(negative, positive);
 }
 
@@ -423,7 +423,7 @@ fn test_compute_block_sizes_4d_column_major() {
     let strides = [1isize, 32, 1024, 32768]; // Column-major
     let strides_list: Vec<&[isize]> = vec![&strides];
 
-    let blocks = compute_block_sizes(&dims, &strides_list, 8);
+    let blocks = compute_block_sizes(&dims, &strides_list, &[8]);
 
     assert_eq!(blocks.len(), 4);
     // Verify blocks are valid
@@ -441,7 +441,7 @@ fn test_compute_block_sizes_4d_permuted_strides() {
     let strides = [1isize, 32, 1024, 32768];
     let strides_list: Vec<&[isize]> = vec![&strides];
 
-    let blocks = compute_block_sizes(&dims, &strides_list, 8);
+    let blocks = compute_block_sizes(&dims, &strides_list, &[8]);
 
     assert_eq!(blocks.as_slice(), [32, 32, 32, 32]);
 }
@@ -452,7 +452,8 @@ fn test_compute_block_sizes_4d_permuted_strides() {
 mod oracle;
 
 use crate::kernel::{build_plan, build_plan_fused};
-use oracle::{legacy_blocks, model_blocks, LegacyCosts};
+use num_complex::Complex64 as C64;
+use oracle::{legacy_blocks, model_blocks, model_blocks_sized, LegacyCosts};
 
 fn refs(strides: &[Vec<isize>]) -> Vec<&[isize]> {
     strides.iter().map(|s| s.as_slice()).collect()
@@ -464,7 +465,7 @@ fn compute_block_sizes_equals_the_exact_model_on_the_sweep() {
     for (dims, strides, elem_size) in oracle::sweep() {
         let strides = refs(&strides);
         let model = model_blocks(&dims, &strides, elem_size);
-        let blocks = compute_block_sizes(&dims, &strides, elem_size);
+        let blocks = compute_block_sizes(&dims, &strides, &vec![elem_size; strides.len()]);
         assert_eq!(
             blocks.as_slice(),
             model,
@@ -486,10 +487,136 @@ fn compute_block_sizes_equals_the_exact_model_on_the_sweep() {
         "{fits} fitting, {overflows} overflowing"
     );
     // Rank 0 returns before any conversion of the element size.
-    assert!(compute_block_sizes(&[], &[&[]], usize::MAX).is_empty());
+    assert!(compute_block_sizes(&[], &[&[]], &[usize::MAX]).is_empty());
     assert_eq!(
         legacy_blocks(&[], &[&[]], usize::MAX, LegacyCosts::Saturating),
         Some(vec![])
+    );
+}
+
+/// Per-operand element sizes for the sweep: a deterministic spread over real
+/// and degenerate sizes, so most cases mix sizes and some put a zero on one
+/// operand.
+fn sweep_elem_sizes(operands: usize, case: usize, seed: usize) -> Vec<usize> {
+    const SIZES: [usize; 6] = [0, 1, 2, 4, 8, 16];
+    (0..operands)
+        .map(|k| SIZES[(case + 2 * k + seed) % SIZES.len()])
+        .collect()
+}
+
+#[test]
+fn compute_block_sizes_equals_the_exact_model_per_operand_on_the_sweep() {
+    // The same sweep, with each operand planned at its own element size.
+    let mut mixed = 0;
+    for (case, (dims, strides, seed)) in oracle::sweep().into_iter().enumerate() {
+        let strides = refs(&strides);
+        let elem_sizes = sweep_elem_sizes(strides.len(), case, seed);
+        let model = model_blocks_sized(&dims, &strides, &elem_sizes);
+        let blocks = compute_block_sizes(&dims, &strides, &elem_sizes);
+        assert_eq!(
+            blocks.as_slice(),
+            model,
+            "{dims:?} {strides:?} e={elem_sizes:?}"
+        );
+        if elem_sizes.iter().any(|&e| e != elem_sizes[0]) {
+            mixed += 1;
+        }
+    }
+    assert!(mixed > 0, "{mixed} mixed-size cases");
+}
+
+#[test]
+fn a_mixed_size_pair_blocks_at_each_operands_own_footprint() {
+    // f64 <- u8 and c64 <- f64 over a transposed source, so no axis fuses and
+    // both operands stay under their real byte strides. A single shared size
+    // (the larger one, as before #426) overstates the small operand and picks
+    // a different tile.
+    let dims = [128usize, 128];
+    let dst = [1isize, 128];
+    let src = [128, 1];
+    let strides: [&[isize]; 2] = [&dst, &src];
+    // (dst size, src size, the model's blocks, the pre-#426 blocks)
+    let cases: [(usize, usize, [usize; 2], [usize; 2]); 2] =
+        [(8, 1, [57, 56], [64, 32]), (16, 8, [40, 32], [32, 32])];
+    for (dst_size, src_size, blocks, old_blocks) in cases {
+        let elem_sizes = [dst_size, src_size];
+        let model = model_blocks_sized(&dims, &strides, &elem_sizes);
+        assert_eq!(
+            compute_block_sizes(&dims, &strides, &elem_sizes).as_slice(),
+            model
+        );
+        let uniform = dst_size.max(src_size);
+        let old = model_blocks_sized(&dims, &strides, &[uniform, uniform]);
+        assert_eq!(
+            legacy_blocks(&dims, &strides, uniform, LegacyCosts::Saturating),
+            Some(old.clone())
+        );
+        assert_eq!(model, blocks, "dst={dst_size} src={src_size}");
+        assert_eq!(
+            old, old_blocks,
+            "dst={dst_size} src={src_size}: the shared size {uniform} answer"
+        );
+        assert_ne!(
+            model, old,
+            "dst={dst_size} src={src_size}: a shared size {uniform} must change the tile"
+        );
+    }
+}
+
+#[test]
+fn the_pointwise_plan_uses_each_operands_element_size() {
+    // Every typed pointwise entry passes its operands' sizes here, and this is
+    // where they reach the model. The plan is checked against the oracle on
+    // the axes the planner actually returns (ordered, fused, compressed).
+    let dims = [128usize, 128];
+    let dst = [1isize, 128];
+    let src = [128, 1];
+    let strides: [&[isize]; 2] = [&dst, &src];
+    let total = 128 * 128;
+    let cases: [[usize; 2]; 2] = [
+        [std::mem::size_of::<f64>(), std::mem::size_of::<u8>()],
+        [std::mem::size_of::<C64>(), std::mem::size_of::<f64>()],
+    ];
+    for elem_sizes in cases {
+        let (fused_dims, ordered, plan) =
+            crate::kernel::pointwise_plan(&dims, &strides, Some(0), &elem_sizes, total);
+        let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+        assert_eq!(
+            plan.block.as_slice(),
+            model_blocks_sized(&fused_dims, &ordered, &elem_sizes),
+            "{elem_sizes:?}"
+        );
+        // The pre-#426 wiring: one element size for every operand.
+        let uniform = elem_sizes.iter().copied().max().unwrap();
+        let (_, _, shared) =
+            crate::kernel::pointwise_plan(&dims, &strides, Some(0), &[uniform; 2], total);
+        assert_ne!(plan.block, shared.block, "{elem_sizes:?}");
+    }
+}
+
+#[test]
+fn a_zero_sized_destination_leaves_the_reduction_to_the_source() {
+    // The other orientation of the ZST contract: the destination has no
+    // storage (a `map_into` into a `Zst`), the source is f64. The destination
+    // contributes one cache line and order 1 everywhere; the model is still
+    // the oracle's.
+    let dims = [2usize, 8192];
+    let dst = [1isize, 2];
+    let src = [2, 1 << 14];
+    let strides: [&[isize]; 2] = [&dst, &src];
+    let elem_sizes = [0usize, 8];
+    let model = model_blocks_sized(&dims, &strides, &elem_sizes);
+    assert_eq!(
+        compute_block_sizes(&dims, &strides, &elem_sizes).as_slice(),
+        model
+    );
+    assert_eq!(model, [2, 511]);
+    // A uniform 8 plans the zero-sized destination by its element strides,
+    // which are strictly increasing, so the exit keeps the full dimensions.
+    assert_eq!(
+        model_blocks_sized(&dims, &strides, &[8, 8]),
+        [2, 8192],
+        "the pre-#426 answer for the same input"
     );
 }
 
@@ -500,7 +627,7 @@ fn a_zip_reduce_region_beyond_usize_is_exact() {
     let dims = [1024usize; 6];
     let a = [8isize, 16, 8, 8, 8, 8];
     let b = [16isize, 8, 8, 8, 8, 8];
-    let (dims, strides, plan) = build_plan_fused(&dims, &[&a, &b], None, 8);
+    let (dims, strides, plan) = build_plan_fused(&dims, &[&a, &b], None, &[8, 8]);
     assert_eq!(dims.as_slice(), [1024; 6]);
     assert_eq!(strides[0].as_slice(), [8, 8, 8, 8, 8, 16]);
     assert_eq!(strides[1].as_slice(), [8, 8, 8, 8, 16, 8]);
@@ -522,22 +649,24 @@ impl crate::ElementOpApply for Zst {}
 static ZSTS: [Zst; 1 << 62] = [Zst; 1 << 62];
 
 #[test]
-fn a_zero_sized_source_byte_stride_beyond_isize_is_exact() {
-    // R1-B: f64 destination from a zero-sized source. The planner converts
-    // both with the larger element size, so the source byte stride
-    // 2^61 * 8 = 2^64 wrapped to 0 before the exact contract.
+fn a_zero_sized_source_stops_the_increasing_strides_exit() {
+    // R1-B, restated for per-operand element sizes (#426): the f64 destination
+    // is planned at 8 bytes and the zero-sized source at 0, so its byte
+    // strides are exactly 0 rather than 2^61 * 8 (which a uniform size made
+    // overflow u64). The source's constant stride order 1 is then the global
+    // minimum on every axis, so the destination's increasing order stops
+    // matching it: the increasing-strides exit must not fire and the model
+    // reduces axis 1.
     let dims = [2usize, 8192];
     let dst_strides = [1isize, 2];
     let src_strides = [1isize << 61, 1];
-    let (_, _, plan) = build_plan_fused(&dims, &[&dst_strides, &src_strides], Some(0), 8);
-    assert_eq!(plan.block.as_slice(), [2, 1024]);
+    let strides = [&dst_strides[..], &src_strides[..]];
+    let (_, _, plan) = build_plan_fused(&dims, &strides, Some(0), &[8, 0]);
+    assert_eq!(model_blocks_sized(&dims, &strides, &[8, 0]), [2, 2044]);
+    assert_eq!(plan.block.as_slice(), [2, 2044]);
+    // The planner before #426 sized both operands at 8 and overflowed here.
     assert_eq!(
-        legacy_blocks(
-            &dims,
-            &[&dst_strides, &src_strides],
-            8,
-            LegacyCosts::Saturating
-        ),
+        legacy_blocks(&dims, &strides, 8, LegacyCosts::Saturating),
         None
     );
 
@@ -556,7 +685,11 @@ fn a_zero_element_size_keeps_every_axis_for_any_operand_count() {
     let mut strides = vec![vec![1isize, 2]; 512];
     strides.push(vec![2, 1]);
     let strides = refs(&strides);
-    assert_eq!(compute_block_sizes(&dims, &strides, 0).as_slice(), [2, 2]);
+    let zeros = vec![0usize; strides.len()];
+    assert_eq!(
+        compute_block_sizes(&dims, &strides, &zeros).as_slice(),
+        [2, 2]
+    );
     assert_eq!(model_blocks(&dims, &strides, 0), [2, 2]);
     assert_eq!(
         legacy_blocks(&dims, &strides, 0, LegacyCosts::Saturating),
@@ -584,7 +717,7 @@ fn a_halving_score_beyond_isize_selects_the_exact_maximum() {
     assert_eq!(compute_costs(&[&a, &b]).as_slice(), [1 << 62, 2]);
     // Regions 73728 -> 49152 (halved) -> 24576 (decremented).
     assert_eq!(
-        compute_block_sizes(&dims, &[&a, &b], 1).as_slice(),
+        compute_block_sizes(&dims, &[&a, &b], &[1, 1]).as_slice(),
         [1, 8192]
     );
     assert_eq!(model_blocks(&dims, &[&a, &b], 1), [1, 8192]);
@@ -602,7 +735,7 @@ fn tied_strides_run_the_full_core() {
     let dst = [1isize, 64, 4096];
     for src in [[0isize, 1, 1], [1, 1, 1]] {
         assert_eq!(
-            compute_block_sizes(&dims, &[&dst, &src], 8).as_slice(),
+            compute_block_sizes(&dims, &[&dst, &src], &[8, 8]).as_slice(),
             [64, 31, 16]
         );
         assert_eq!(model_blocks(&dims, &[&dst, &src], 8), [64, 31, 16]);
@@ -619,7 +752,10 @@ fn strictly_increasing_strides_keep_every_axis_in_the_model() {
     ];
     for (dims, dst, src) in cases {
         assert_eq!(model_blocks(dims, &[&dst, &src], 8), dims);
-        assert_eq!(compute_block_sizes(dims, &[&dst, &src], 8).as_slice(), dims);
+        assert_eq!(
+            compute_block_sizes(dims, &[&dst, &src], &[8, 8]).as_slice(),
+            dims
+        );
     }
 }
 
@@ -627,12 +763,12 @@ fn strictly_increasing_strides_keep_every_axis_in_the_model() {
 fn build_plan_forwards_ordered_dims_and_strides() {
     // R3-5: [3, 5] row-major iterates in order [1, 0], so the block core
     // sees dims [5, 3] and strides [1, 5].
-    let plan = build_plan(&[3, 5], &[&[5, 1]], Some(0), 8);
+    let plan = build_plan(&[3, 5], &[&[5, 1]], Some(0), &[8]);
     assert_eq!(plan.order.as_slice(), [1, 0]);
     assert_eq!(plan.block.as_slice(), [5, 3]);
     // [3, 1000]: forwarded strides [1, 1000] fit (region 24000); unreordered
     // strides [1000, 1] would not (64000) and give blocks [512, 3].
-    let plan = build_plan(&[3, 1000], &[&[1000, 1]], Some(0), 8);
+    let plan = build_plan(&[3, 1000], &[&[1000, 1]], Some(0), &[8]);
     assert_eq!(plan.order.as_slice(), [1, 0]);
     assert_eq!(plan.block.as_slice(), [1000, 3]);
 }
@@ -668,7 +804,7 @@ fn flat_scratch_matches_the_model_across_its_spill_boundaries() {
             .collect();
         let strides = refs(&strides);
         assert!(!strides.iter().all(|s| strictly_increasing(s)));
-        let blocks = compute_block_sizes(&dims, &strides, 8);
+        let blocks = compute_block_sizes(&dims, &strides, &vec![8usize; operands]);
         assert_ne!(
             blocks.as_slice(),
             dims.as_slice(),
@@ -695,7 +831,7 @@ fn flat_scratch_matches_the_model_across_its_spill_boundaries() {
     .map(|perm| permuted_strides(&dims, perm))
     .collect();
     let strides = refs(&strides);
-    let blocks = compute_block_sizes(&dims, &strides, 8);
+    let blocks = compute_block_sizes(&dims, &strides, &[8, 8, 8]);
     assert_eq!(blocks[..2], dims[..2]);
     assert_ne!(blocks.as_slice(), dims.as_slice());
     assert_eq!(blocks.as_slice(), model_blocks(&dims, &strides, 8));

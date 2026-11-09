@@ -24,7 +24,7 @@ zip_map2_into<D, A, B>(dest: &mut StridedViewMut<D>, a: &StridedView<A>, b: &Str
 | Layer | Change | Complexity |
 |-------|--------|------------|
 | `kernel.rs` | None (already type-agnostic: offsets + strides only) | None |
-| `block.rs` | `elem_size: usize` → `elem_sizes: &[usize]` (per-array byte strides) | Small |
+| `block.rs` | `elem_size: usize` → `elem_sizes: &[usize]` (per-array byte strides) | Done ([#426](https://github.com/tensor4all/strided-rs/issues/426)) |
 | `map_view.rs` | Separate type params on inner loops and public APIs | Medium |
 | `ops_view.rs` | Trait bounds express promotion (e.g. `D: Add<S, Output=D>`) | Medium |
 | `threading.rs` | `SendPtr<T>` already generic; just use per-type pointers | Small |

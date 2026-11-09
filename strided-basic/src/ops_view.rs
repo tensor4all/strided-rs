@@ -1,8 +1,8 @@
 //! High-level operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    build_plan_fused, build_plan_fused_small, ensure_same_shape, for_each_inner_block_preordered,
-    same_contiguous_layout, sequential_contiguous_layout, total_len, SMALL_TENSOR_THRESHOLD,
+    ensure_same_shape, for_each_inner_block_preordered, pointwise_plan, same_contiguous_layout,
+    sequential_contiguous_layout, total_len,
 };
 use crate::map_view::{copy_map_into, map_into, zip_map2_into};
 use crate::reduce_view::reduce;
@@ -389,14 +389,14 @@ pub fn add_acc<
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
-    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
-
     let total = total_len(dst_dims)?;
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[std::mem::size_of::<D>(), std::mem::size_of::<S>()],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -507,14 +507,14 @@ pub fn mul_acc<
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
-    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
-
     let total = total_len(dst_dims)?;
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[std::mem::size_of::<D>(), std::mem::size_of::<S>()],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -628,14 +628,14 @@ where
     }
 
     let strides_list: [&[isize]; 2] = [dst_strides, src_strides];
-    let elem_size = std::mem::size_of::<D>().max(std::mem::size_of::<S>());
-
     let total = total_len(dst_dims)?;
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[std::mem::size_of::<D>(), std::mem::size_of::<S>()],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -756,16 +756,18 @@ where
     }
 
     let strides_list: [&[isize]; 3] = [dst_strides, a_strides, b_strides];
-    let elem_size = std::mem::size_of::<D>()
-        .max(std::mem::size_of::<A>())
-        .max(std::mem::size_of::<B>());
-
     let total = total_len(dst_dims)?;
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(dst_dims, &strides_list)
-    } else {
-        build_plan_fused(dst_dims, &strides_list, Some(0), elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        dst_dims,
+        &strides_list,
+        Some(0),
+        &[
+            std::mem::size_of::<D>(),
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<B>(),
+        ],
+        total,
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Map, total, &exec) {
@@ -977,16 +979,15 @@ where
     }
 
     let strides_list: [&[isize]; 2] = [a_strides, b_strides];
-    let elem_size = std::mem::size_of::<A>()
-        .max(std::mem::size_of::<B>())
-        .max(std::mem::size_of::<R>());
-
+    // The accumulator `R` is not a memory operand, so it has no element size.
     let total = total_len(a_dims)?;
-    let (fused_dims, ordered_strides, plan) = if total <= SMALL_TENSOR_THRESHOLD {
-        build_plan_fused_small(a_dims, &strides_list)
-    } else {
-        build_plan_fused(a_dims, &strides_list, None, elem_size)
-    };
+    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+        a_dims,
+        &strides_list,
+        Some(0),
+        &[std::mem::size_of::<A>(), std::mem::size_of::<B>()],
+        total,
+    );
 
     let mut acc = R::zero();
     let initial_offsets: crate::inline::OperandVec<isize> =

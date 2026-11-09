@@ -232,7 +232,7 @@ where
     let strides_list: [&[isize]; 1] = [src_strides];
 
     let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(src_dims, &strides_list, None, std::mem::size_of::<T>());
+        build_plan_fused(src_dims, &strides_list, None, &[std::mem::size_of::<T>()]);
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Reduce, total, &exec) {
@@ -558,9 +558,12 @@ where
     }
 
     let strides_list: [&[isize]; 2] = [a_strides, b_strides];
-    let elem_size = std::mem::size_of::<A>().max(std::mem::size_of::<B>());
-    let (fused_dims, ordered_strides, plan) =
-        build_plan_fused(dims, &strides_list, None, elem_size);
+    let (fused_dims, ordered_strides, plan) = build_plan_fused(
+        dims,
+        &strides_list,
+        None,
+        &[std::mem::size_of::<A>(), std::mem::size_of::<B>()],
+    );
 
     let total = total_len(&fused_dims)?;
     if is_parallel(KernelClass::Reduce, total, &exec) {

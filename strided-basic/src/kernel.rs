@@ -33,7 +33,7 @@ pub(crate) fn build_plan(
     dims: &[usize],
     strides_list: &[&[isize]],
     dest_index: Option<usize>,
-    elem_size: usize,
+    elem_sizes: &[usize],
 ) -> KernelPlan {
     let order = order::compute_order(dims, strides_list, dest_index);
     let ordered_dims: InlineVec<usize> = order.iter().map(|&d| dims[d]).collect();
@@ -43,8 +43,26 @@ pub(crate) fn build_plan(
         .collect();
     let ordered_strides_refs: OperandVec<&[isize]> =
         ordered_strides.iter().map(|s| s.as_slice()).collect();
-    let block = block::compute_block_sizes(&ordered_dims, &ordered_strides_refs, elem_size);
+    let block = block::compute_block_sizes(&ordered_dims, &ordered_strides_refs, elem_sizes);
     KernelPlan { order, block }
+}
+
+/// The plan a typed pointwise operation runs: [`build_plan_fused_small`] for
+/// tensors at or below [`SMALL_TENSOR_THRESHOLD`], [`build_plan_fused`]
+/// otherwise, with `elem_sizes[k]` the element size of `strides_list[k]`.
+pub(crate) fn pointwise_plan(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    dest_index: Option<usize>,
+    elem_sizes: &[usize],
+    total: usize,
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dims, strides_list)
+    } else {
+        build_plan_fused(dims, strides_list, dest_index, elem_sizes)
+    }
 }
 
 /// Build an execution plan with dimension fusion.
@@ -58,11 +76,14 @@ pub(crate) fn build_plan(
 ///
 /// Returns `(fused_dims, ordered_strides, KernelPlan)` where dimensions
 /// and strides are already in iteration order (plan.order is identity).
+///
+/// `elem_sizes[k]` is the element size in bytes of `strides_list[k]`; the
+/// block model forms `strides_list[k][i] * elem_sizes[k]` per operand.
 pub(crate) fn build_plan_fused(
     dims: &[usize],
     strides_list: &[&[isize]],
     dest_index: Option<usize>,
-    elem_size: usize,
+    elem_sizes: &[usize],
 ) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // 1. Compute optimal iteration order on original dims
     let order = order::compute_order(dims, strides_list, dest_index);
@@ -86,7 +107,7 @@ pub(crate) fn build_plan_fused(
 
     // 5. Compute blocks on the already ordered axes
     let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
-    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_size);
+    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_sizes);
 
     (
         compressed_dims,

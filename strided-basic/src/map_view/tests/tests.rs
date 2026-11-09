@@ -299,3 +299,31 @@ fn broadcast_zip_splits_and_covers_each_destination_once() {
         }
     }
 }
+
+#[test]
+fn a_mixed_size_map_writes_every_element_of_the_transposed_layout() {
+    // The f64 <- u8 plan tiles this layout as [57, 56], where a single shared
+    // element size tiled it [64, 32] (#426). This pins that the per-operand
+    // wiring still walks the whole non-fusing, transposed-source layout and
+    // pairs the right source element with each destination element.
+    let dims = [128usize, 128];
+    let dst_strides = [1isize, 128];
+    let src_strides = [128, 1];
+    let src: Vec<u8> = (0..128 * 128).map(|i| (i % 253) as u8).collect();
+    let mut dst = vec![0.0f64; 128 * 128];
+
+    let source = crate::StridedView::<u8>::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = crate::StridedViewMut::<f64>::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+    map_into(&mut dest, &source, |x: u8| f64::from(x), Exec::serial()).unwrap();
+
+    for col in 0..128 {
+        for row in 0..128 {
+            // dst is column-major, the source is row-major.
+            assert_eq!(
+                dst[row + 128 * col],
+                f64::from(src[col + 128 * row]),
+                "({row}, {col})"
+            );
+        }
+    }
+}

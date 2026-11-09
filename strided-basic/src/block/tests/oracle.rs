@@ -1,14 +1,14 @@
 //! Test-only exact model of the shared block planner, used by the block tests
-//! of both `strided-basic` and `strided-perm`.
+//! of `strided-basic`.
 //!
-//! [`model_blocks`] transliterates Strided.jl 2.6.1 `_computeblocks` and
-//! `totalmemoryregion` (`src/mapreduce.jl:505-558`) over mathematical
-//! integers, held in checked `u128` (any overflow aborts the test), with the
-//! Rust conventions the planners keep: byte stride magnitudes `|s| * e`,
-//! costs `1` for a zero minimum stride and `min(2 * min|s|, isize::MAX)`
-//! otherwise, and no halving candidate once every block is 1. Stride orders
-//! rank the exact byte magnitudes. It has no early exit, no reordering, and
-//! shares no code with either planner.
+//! [`model_blocks_sized`] transliterates Strided.jl 2.6.6 `_computeblocks` and
+//! `totalmemoryregion` (`src/mapreduce.jl:586-650`), with one element size per
+//! operand, over mathematical integers, held in checked `u128` (any overflow
+//! aborts the test), with the Rust conventions the planners keep: byte stride
+//! magnitudes `|s| * e`, costs `1` for a zero minimum stride and
+//! `min(2 * min|s|, isize::MAX)` otherwise, and no halving candidate once
+//! every block is 1. Stride orders rank the exact byte magnitudes. It has no
+//! early exit, no reordering, and shares no code with either planner.
 //!
 //! [`legacy_blocks`] replays the planner arithmetic before the exact contract,
 //! with every conversion and operation checked; it is `None` exactly when one
@@ -140,11 +140,23 @@ fn computeblocks(
 }
 
 /// The model's blocks for axes already in iteration order, each extent at
-/// least 1.
+/// least 1, with one element size for every operand.
 pub fn model_blocks(dims: &[usize], strides: &[&[isize]], elem_size: usize) -> Vec<usize> {
+    model_blocks_sized(dims, strides, &vec![elem_size; strides.len()])
+}
+
+/// As [`model_blocks`], with each operand's own element size, as Strided.jl
+/// forms `bytestrides = map((s, stride) -> s .* stride, sizeof.(eltype.(arrays)), strides)`.
+pub fn model_blocks_sized(
+    dims: &[usize],
+    strides: &[&[isize]],
+    elem_sizes: &[usize],
+) -> Vec<usize> {
+    assert_eq!(strides.len(), elem_sizes.len());
     let magnitudes: Vec<Vec<u128>> = strides
         .iter()
-        .map(|s| {
+        .zip(elem_sizes)
+        .map(|(s, &elem_size)| {
             s.iter()
                 .map(|&x| exact((x.unsigned_abs() as u128).checked_mul(elem_size as u128)))
                 .collect()

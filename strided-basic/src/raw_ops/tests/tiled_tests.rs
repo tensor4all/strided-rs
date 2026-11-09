@@ -760,7 +760,7 @@ fn slabs_that_share_no_cache_line_keep_the_flat_walk() {
     // F3: both operands stream whole 32 KiB runs along axis 0 and the tail
     // axes only permute those runs; the model still offers [4096, 16, 16].
     let f3 = Layout::new(&[4096, 17, 33], &[1, 4096, 69_632], &[1, 135_168, 4096], 0);
-    let model = crate::block::compute_block_sizes(&f3.dims, &[&f3.dst, &f3.src], 8);
+    let model = crate::block::compute_block_sizes(&f3.dims, &[&f3.dst, &f3.src], &[8, 8]);
     assert_eq!(model.as_slice(), [4096, 16, 16]);
     assert!(f3.tiles::<f64, f64>().is_none());
     // A zero-sized source moves no line; the destination alone decides.
