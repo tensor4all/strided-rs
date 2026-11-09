@@ -6,6 +6,9 @@ fn test_execute_identity_copy() {
     let src = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
     let mut dst = vec![0.0f64; 6];
     let plan = build_permute_plan(&[2, 3], &[1, 2], &[1, 2], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 1 + 2 * 2 = 5 on both
+    // sides, below both lengths (6). The token is serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -21,6 +24,9 @@ fn terminal_cursor_advance_may_leave_the_allocation() {
     let src = [1.0f64, 2.0, 3.0, 4.0, 5.0];
     let mut dst = vec![0.0f64; 4];
     let plan = build_permute_plan(&[2, 2], &[1, 3], &[1, 2], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest source offset is 1 + 3 = 4 < 5 and
+    // the largest destination offset 1 + 2 = 3 < 4. The token is serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -36,6 +42,9 @@ fn test_execute_transpose_2d() {
     let src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
     let mut dst = vec![0.0f64; 6];
     let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 3 + 2 = 5 (source) and 1
+    // + 4 = 5 (destination), below both lengths (6). The token is serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -53,6 +62,9 @@ fn test_execute_3d_permute() {
 
     // Permuted: dims [4,2,3], strides [6,1,2], dst col-major [1,4,8]
     let plan = build_permute_plan(&[4, 2, 3], &[6, 1, 2], &[1, 4, 8], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 18 + 1 + 4 = 23 (source)
+    // and 3 + 4 + 16 = 23 (destination), below both lengths (24). The token is serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -80,6 +92,10 @@ fn test_execute_4d_permute() {
 
     // Permuted [3,1,0,2]: dims [5,3,2,4], strides [24,2,1,6], dst [1,5,15,30]
     let plan = build_permute_plan(&[5, 3, 2, 4], &[24, 2, 1, 6], &[1, 5, 15, 30], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 96 + 4 + 1 + 18 = 119
+    // (source) and 4 + 10 + 15 + 90 = 119 (destination), below both lengths (120). The token is
+    // serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -110,6 +126,10 @@ fn test_execute_5d_permute() {
     // Permuted [4,0,1,2,3]: dims [3,2,2,2,2], strides [16,1,2,4,8], dst [1,3,6,12,24]
     let plan =
         build_permute_plan(&[3, 2, 2, 2, 2], &[16, 1, 2, 4, 8], &[1, 3, 6, 12, 24], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 32 + 1 + 2 + 4 + 8 = 47
+    // (source) and 2 + 3 + 6 + 12 + 24 = 47 (destination), below both lengths (48). The token is
+    // serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -137,6 +157,9 @@ fn test_execute_rank0_scalar() {
     let src = [42.0f64];
     let mut dst = vec![0.0f64];
     let plan = build_permute_plan(&[], &[], &[], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; a rank-0 plan reaches only offset 0, which both
+    // one-element buffers hold. The token is serial.
     unsafe {
         execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
     }
@@ -188,6 +211,10 @@ fn test_execute_par_transpose_2d() {
     let src = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
     let mut dst = vec![0.0f64; 6];
     let plan = build_permute_plan(&[2, 3], &[3, 1], &[1, 2], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 3 + 2 = 5 (source) and 1
+    // + 4 = 5 (destination), below both lengths (6). The destination layout is column-major,
+    // hence injective, so the parallel token is allowed.
     unsafe {
         execute_permute_blocked(
             src.as_ptr(),
@@ -209,6 +236,10 @@ fn test_execute_par_large() {
 
     // [256, 256, 256] col-major, transpose [2, 0, 1]
     let plan = build_permute_plan(&[n, n, n], &[65536, 1, 256], &[1, 256, 65536], 8).unwrap();
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is 255 * (65536 + 1 + 256) =
+    // n^3 - 1 on both sides, below both lengths (n^3). The destination layout is column-major,
+    // hence injective, so the parallel token is allowed.
     unsafe {
         execute_permute_blocked(
             src.as_ptr(),
@@ -258,6 +289,11 @@ fn test_execute_budget_one_token_matches_serial_on_the_calling_thread() {
     let mut dst_serial = vec![0.0f64; total];
     let plan = build_permute_plan(&[n, n], &[n as isize, 1], &[1, n as isize], 8).unwrap();
 
+    // SAFETY: (execute.rs:116) `src` and `dst` are separate live buffers, and the plan is
+    // `build_permute_plan` over the layout below; the largest offset is (n - 1) * (n + 1) = n^2 -
+    // 1 on both sides, below each buffer's length (n^2); the two calls write separate
+    // destinations. The destination layout is column-major, hence injective, so the parallel
+    // token is allowed.
     unsafe {
         execute_permute_blocked(
             src.as_ptr(),

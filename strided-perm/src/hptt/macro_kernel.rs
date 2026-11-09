@@ -18,7 +18,10 @@ use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
 /// where i iterates along dim_A (0..block_a) and j along dim_B (0..block_b).
 ///
 /// # Safety
-/// src/dst must be valid for the given block sizes and strides.
+///
+/// `src` must be valid for reads at `i + j * lda` and `dst` for writes at
+/// `j + i * ldb` for every `i < block_a`, `j < block_b`, and the two extents
+/// must not overlap.
 #[inline]
 pub unsafe fn macro_kernel_f64(
     src: *const f64,
@@ -28,6 +31,14 @@ pub unsafe fn macro_kernel_f64(
     ldb: isize,
     block_b: usize,
 ) {
+    // SAFETY: (covers the micro-kernel calls and the remainder loops) every
+    // `offset` is `i + j * lda` on `src` or `j + i * ldb` on `dst` with
+    // `i < block_a` and `j < block_b`: the full tiles start at multiples of
+    // `MICRO` below `full_* * MICRO <= block_*`, and the remainder loops stop
+    // at `rem_*`. So each access is a tile element under this function's
+    // `# Safety` (macro_kernel.rs:22), and each micro-kernel call gets a full
+    // `MICRO` x `MICRO` sub-tile (stride-1 along `i`, rows of `lda`/`ldb`), as
+    // `transpose_micro` (micro_kernel/mod.rs:25) requires.
     const MICRO: usize = <ScalarKernel as MicroKernel<f64>>::MICRO; // 4
 
     let full_a = block_a / MICRO;
@@ -82,6 +93,10 @@ pub unsafe fn macro_kernel_f64(
 }
 
 /// Process a tile of `block_a × block_b` elements using f32 micro-kernels.
+///
+/// # Safety
+///
+/// As [`macro_kernel_f64`], with `f32` elements.
 #[inline]
 pub unsafe fn macro_kernel_f32(
     src: *const f32,
@@ -91,6 +106,14 @@ pub unsafe fn macro_kernel_f32(
     ldb: isize,
     block_b: usize,
 ) {
+    // SAFETY: (covers the micro-kernel calls and the remainder loops) every
+    // `offset` is `i + j * lda` on `src` or `j + i * ldb` on `dst` with
+    // `i < block_a` and `j < block_b`: the full tiles start at multiples of
+    // `MICRO` below `full_* * MICRO <= block_*`, and the remainder loops stop
+    // at `rem_*`. So each access is a tile element under this function's
+    // `# Safety` (macro_kernel.rs:99), and each micro-kernel call gets a full
+    // `MICRO` x `MICRO` sub-tile (stride-1 along `i`, rows of `lda`/`ldb`), as
+    // `transpose_micro` (micro_kernel/mod.rs:25) requires.
     const MICRO: usize = <ScalarKernel as MicroKernel<f32>>::MICRO; // 8
 
     let full_a = block_a / MICRO;
@@ -143,6 +166,12 @@ pub unsafe fn macro_kernel_f32(
 /// ConstStride1 inner copy: simple memcpy or strided element-wise copy.
 ///
 /// Used when dim_A == dim_B (both arrays have stride 1 along the same dim).
+///
+/// # Safety
+///
+/// `src` must be valid for reads at `k * src_stride` and `dst` for writes at
+/// `k * dst_stride` for every `k < count`, and the two extents must not
+/// overlap.
 #[inline(always)]
 pub unsafe fn const_stride1_copy<T: Copy>(
     src: *const T,
@@ -151,6 +180,12 @@ pub unsafe fn const_stride1_copy<T: Copy>(
     src_stride: isize,
     dst_stride: isize,
 ) {
+    // SAFETY: (covers all four branches) under this function's `# Safety`
+    // (macro_kernel.rs:172) both runs of `count` elements are valid and disjoint,
+    // which is what `copy_nonoverlapping` needs when both strides are 1. The
+    // loops dereference only the cursors for `k < count`; the advance after
+    // the last copy may leave the allocation, so it uses `wrapping_offset`
+    // and is never dereferenced.
     if src_stride == 1 && dst_stride == 1 {
         std::ptr::copy_nonoverlapping(src, dst, count);
     } else if dst_stride == 1 {
@@ -187,6 +222,10 @@ pub unsafe fn const_stride1_copy<T: Copy>(
 ///
 /// Performs the same transpose as macro_kernel but without micro-kernel
 /// optimization. Used for types other than f64/f32.
+///
+/// # Safety
+///
+/// As [`macro_kernel_f64`], with `T` elements.
 #[inline]
 pub unsafe fn macro_kernel_fallback<T: Copy>(
     src: *const T,
@@ -196,6 +235,8 @@ pub unsafe fn macro_kernel_fallback<T: Copy>(
     ldb: isize,
     block_b: usize,
 ) {
+    // SAFETY: `i < block_a` and `j < block_b`, so both accesses are tile
+    // elements under this function's `# Safety` (macro_kernel.rs:228).
     for j in 0..block_b as isize {
         for i in 0..block_a as isize {
             *dst.offset(j + i * ldb) = *src.offset(i + j * lda);

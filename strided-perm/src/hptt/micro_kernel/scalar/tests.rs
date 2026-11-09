@@ -7,6 +7,8 @@ fn test_scalar_f64_4x4() {
     let src: Vec<f64> = (0..16).map(|i| i as f64).collect();
     let mut dst = vec![0.0f64; 16];
 
+    // SAFETY: (micro_kernel/mod.rs:25) separate 16-element buffers; the largest offset is 3 * 4 +
+    // 3 = 15 on both sides.
     unsafe {
         ScalarKernel::transpose_micro(src.as_ptr(), 4, dst.as_mut_ptr(), 4);
     }
@@ -32,6 +34,8 @@ fn test_scalar_f64_non_square_strides() {
     }
     let mut dst = vec![0.0f64; 24];
 
+    // SAFETY: (micro_kernel/mod.rs:25) separate buffers; the largest offset is 3 * 5 + 3 = 18 <
+    // 20 (source) and 3 + 3 * 6 = 21 < 24 (destination).
     unsafe {
         ScalarKernel::transpose_micro(src.as_ptr(), 5, dst.as_mut_ptr(), 6);
     }
@@ -48,6 +52,8 @@ fn test_scalar_f32_8x8() {
     let src: Vec<f32> = (0..64).map(|i| i as f32).collect();
     let mut dst = vec![0.0f32; 64];
 
+    // SAFETY: (micro_kernel/mod.rs:25) separate 64-element buffers; the largest offset is 7 * 8 +
+    // 7 = 63 on both sides.
     unsafe {
         ScalarKernel::transpose_micro(src.as_ptr(), 8, dst.as_mut_ptr(), 8);
     }

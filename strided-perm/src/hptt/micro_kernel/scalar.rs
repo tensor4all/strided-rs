@@ -12,6 +12,9 @@ impl MicroKernel<f64> for ScalarKernel {
 
     #[inline(always)]
     unsafe fn transpose_micro(src: *const f64, lda: isize, dst: *mut f64, ldb: isize) {
+        // SAFETY: `i, j < MICRO` (4), so `src + i * lda + j` and `dst + i + j * ldb`
+        // are elements of the `MICRO` x `MICRO` tiles the trait contract
+        // (micro_kernel/mod.rs:25) makes valid.
         for j in 0..4_isize {
             for i in 0..4_isize {
                 *dst.offset(i + j * ldb) = *src.offset(i * lda + j);
@@ -26,6 +29,9 @@ impl MicroKernel<f32> for ScalarKernel {
 
     #[inline(always)]
     unsafe fn transpose_micro(src: *const f32, lda: isize, dst: *mut f32, ldb: isize) {
+        // SAFETY: `i, j < MICRO` (8), so `src + i * lda + j` and `dst + i + j * ldb`
+        // are elements of the `MICRO` x `MICRO` tiles the trait contract
+        // (micro_kernel/mod.rs:25) makes valid.
         for j in 0..8_isize {
             for i in 0..8_isize {
                 *dst.offset(i + j * ldb) = *src.offset(i * lda + j);
