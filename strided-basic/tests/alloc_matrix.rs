@@ -505,6 +505,7 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
     check_plans(&pool);
     record_rank9_spill(&pool);
     check_replay_rank9_spill_is_bounded();
+    check_overflowing_stride_keeps_the_exit_allocation_free();
 }
 
 /// Tensor-sized cases that must reach the parallel branches. The default
@@ -961,8 +962,9 @@ fn record_rank9_spill(pool: &Pool) {
 ///
 /// Since #425 a spilled layout asks the shared cache-block model, which takes
 /// slices: the compressed dims, destination and source strides (3 buffers),
-/// beside the axis list and the range cursor. A layout the model tiles adds
-/// its blocks and the tile walk's extents and origins.
+/// beside the axis list and the range cursor — but only when the model's
+/// exits, answered from the axes alone, do not decide first. A layout the
+/// model tiles adds its blocks and the tile walk's extents and origins.
 fn check_replay_rank9_spill_is_bounded() {
     use strided_basic::{replay_copy_raw, RawStridedMut, RawStridedRef};
     let dims = vec![2usize; 9];
@@ -979,8 +981,47 @@ fn check_replay_rank9_spill_is_bounded() {
     };
     let first = call();
     let second = call();
-    // Axis list + 3 model slices + range cursor; this layout's model keeps the
-    // full dims, so it adds no tile buffers.
-    assert!(first <= 5, "rank-9 replay allocated {first} times");
+    // The axis list and the range cursor, nothing more: this layout's region
+    // fits the block budget, so the model's exits answer from the axes and the
+    // three rank-sized slices are never materialized ([#425]).
+    assert!(first <= 2, "rank-9 replay allocated {first} times");
     assert_eq!(first, second, "rank-9 replay allocations grew");
+}
+
+/// The exits are answered from the axes, so they must also cover the case where
+/// the *byte* magnitude of a stride overflows the checked `u64` region while the
+/// region itself fits the budget: a zero-sized operand can carry a stride no
+/// allocation could hold. The wide fallback keeps this layout on the exit path;
+/// reading the overflow as "does not fit" would materialize the three model
+/// slices for a decision that ends in "no tiles".
+fn check_overflowing_stride_keeps_the_exit_allocation_free() {
+    use strided_basic::{replay_map_raw, RawStridedMut, RawStridedRef};
+    let dims = vec![2usize; 9];
+    let len = total(&dims);
+    let dest_strides: Vec<isize> = (0..9).map(|axis| 1isize << axis).collect();
+    let mut src_strides = vec![0isize; 9];
+    src_strides[0] = 1isize << 61;
+    let mut out = vec![0.0f64; len];
+    let unit: [(); 1] = [()];
+    // SAFETY: zero-sized elements make every offset of the dangling pointer a
+    // valid access, so an element reach no allocation could hold is still in
+    // bounds; the checked constructor refuses the layout before it can see that.
+    let source = unsafe { RawStridedRef::new_unchecked(&unit, &dims, &src_strides, 0) };
+    let mut dest = RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
+    let apply = |_: &mut f64, _: ()| {};
+    replay_map_raw(&mut dest, &source, apply, Exec::serial()).unwrap();
+    let mut call = || {
+        count_thread_allocations(|| {
+            replay_map_raw(&mut dest, &source, apply, Exec::serial()).unwrap()
+        })
+    };
+    let first = call();
+    let second = call();
+    // The axis list and the range cursor: the region is 4096 + 128 bytes, so
+    // the model exits before its slices exist.
+    assert!(
+        first <= 2,
+        "a cache-fit spilled replay allocated {first} times"
+    );
+    assert_eq!(first, second, "cache-fit spilled replay allocations grew");
 }
