@@ -190,7 +190,7 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     // Above the inline limit the fused traversal spills, but every allocation
     // stays bounded by the rank, never by the element count: the raw call
     // builds one spilled layout plus one cursor, and a prepared plan allocates
-    // only the cursor per execution.
+    // only rank-sized buffers per execution.
     let dims = [2usize; 9];
     let dst_strides: Vec<isize> = (0..9).map(|axis| 1isize << axis).collect();
     let src_strides: Vec<isize> = (0..9).rev().map(|axis| 1isize << axis).collect();
@@ -218,9 +218,12 @@ fn execute_is_allocation_free_up_to_rank_limit() {
                 .unwrap();
         }
     });
+    // Since #425 a spilled execution also asks the shared cache-block model,
+    // which takes the compressed dims and both stride slices: three rank-sized
+    // buffers beside the cursor, none of them scaling with the element count.
     assert_eq!(
-        allocations, 32,
-        "a spilled rank-9 plan must allocate one cursor per execution"
+        allocations, 128,
+        "a spilled rank-9 plan must allocate only rank-sized buffers per execution"
     );
 
     let dims = [4usize, 4];

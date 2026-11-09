@@ -955,9 +955,14 @@ fn record_rank9_spill(pool: &Pool) {
     eprintln!("rank-9 permuted map_into spill: serial={serial}, parallel={parallel}");
 }
 
-/// Above the inline rank the plan-free replay spills its axis list and range
-/// cursors by contract; the count is bounded by the rank, so it must not grow
-/// from one warm call to the next.
+/// Above the inline rank the plan-free replay spills its axis list, the tile
+/// decision's rank-sized slices and range cursors by contract; the count is
+/// bounded by the rank, so it must not grow from one warm call to the next.
+///
+/// Since #425 a spilled layout asks the shared cache-block model, which takes
+/// slices: the compressed dims, destination and source strides (3 buffers),
+/// beside the axis list and the range cursor. A layout the model tiles adds
+/// its blocks and the tile walk's extents and origins.
 fn check_replay_rank9_spill_is_bounded() {
     use strided_basic::{replay_copy_raw, RawStridedMut, RawStridedRef};
     let dims = vec![2usize; 9];
@@ -974,6 +979,8 @@ fn check_replay_rank9_spill_is_bounded() {
     };
     let first = call();
     let second = call();
-    assert!(first <= 2, "rank-9 replay allocated {first} times");
+    // Axis list + 3 model slices + range cursor; this layout's model keeps the
+    // full dims, so it adds no tile buffers.
+    assert!(first <= 5, "rank-9 replay allocated {first} times");
     assert_eq!(first, second, "rank-9 replay allocations grew");
 }

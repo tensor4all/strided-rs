@@ -222,6 +222,27 @@ pub(crate) fn take_tiled_leaves() -> Vec<TiledLeaf> {
     TILED_LEAVES.with(|all| all.take())
 }
 
+// Cache-tile boxes the tiled box walks visited on this thread. The leaf
+// records above only exist when the splitter runs; this counts the walk itself,
+// so a test can see the tiled route on a serial token too.
+#[cfg(test)]
+thread_local! {
+    static TILE_BOXES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Records one visited cache-tile box.
+#[cfg(test)]
+pub(crate) fn record_tile_box() {
+    TILE_BOXES.with(|n| n.set(n.get() + 1));
+}
+
+/// The cache-tile boxes visited on this thread since the last call, and resets
+/// the count.
+#[cfg(test)]
+pub(crate) fn take_tile_boxes() -> usize {
+    TILE_BOXES.with(|n| n.replace(0))
+}
+
 /// Copy `len` contiguous elements, chunked across the budget of `exec` when
 /// one section pays for a copy of that size (`KernelClass::Copy`) and as one
 /// direct `copy_nonoverlapping` otherwise.

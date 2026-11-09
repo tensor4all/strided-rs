@@ -78,7 +78,11 @@ same copy-class rule, on a destination proven injective; the plan-free entries
 replay any other destination serially in column-major order. A layout whose
 shared cache-block model changes the visit order is walked tile by tile
 instead, and splits with the view path's tree splitter (gated per node, on the
-caller's token), each leaf walking its sub-box with the same tiles. Layouts
+caller's token), each leaf walking its sub-box with the same tiles. The rule
+does not depend on the fused rank: an axis list that spilled above the inline
+limit is tiled exactly when the same layout, compressed by dropping its
+extent-1 axes, would be tiled inline (issue
+[#425](https://github.com/tensor4all/strided-rs/issues/425)). Layouts
 whose regrouped runs provably occupy separate address ranges whose spans and
 offsets are whole cache lines, such as a permutation of whole contiguous runs,
 keep the flat walk, and the flat split stays balanced. The rule sees no base
