@@ -291,10 +291,12 @@ it fits L2 and keeps the row, which is #364 item 1, not in this change. The 64 a
 
 - One rate per class, not per layout. The calibration is the *tiled* transposing
   path (sec. 3). The replay that is not tiled is not calibrated row by row: the one
-  untiled beyond-L2 layout measured here (rank-1, stride 256) costs 9.6-12.7 ns per
-  element under a co-tenant, i.e. the 3.0 rate under-prices that extreme by 3-4x,
-  and a run long enough to fill a cache line was not measured. The earlier "up to 3x
-  high" bound had no measurement behind it and is withdrawn.
+  untiled beyond-L2 layout measured here (rank-1, stride 256) cost 9.6-12.7 ns per
+  element under a co-tenant, and a run long enough to fill a cache line was not
+  measured. A contended sample cannot establish the uncontended value, so this is
+  recorded as an observation and no direction or ratio is claimed for the gap; what
+  it does show is that this layout is not priced by the tiled calibration. The
+  earlier "up to 3x high" bound had no measurement behind it and is withdrawn.
 - A transposing plan inside L2 keeps the row and is 2.7-7.8x low (sec. 3). #364 item
   1 (a per-segment term) is what interpolates between the two regimes; it is not in
   this change.
@@ -330,11 +332,15 @@ taskset -c 0-7,16-23 ./target/release/examples/repro424
 `Exec::serial()` for every `CopyPlan` row; `Exec::new(pool, 16)` over
 `Pool::builder().threads(16)` (host default dispatch costs) for every `copy_into`
 row; `REPS = 41`, four warmup repetitions discarded, median of the 41 samples; each
-case asserts one copied element so a wrong traversal fails the run instead of being
-timed. The three trees were separate worktrees: `~/work/pr424-main` at b2358fb
-(`origin/main`), `~/work/pr424-head` at 1417eb5 (the withdrawn head) and
-`~/work/strided-424` (this change, rebuilt after each push).
-
+case checks only its two endpoint elements over a constant 1.5 fill. That does
+not detect a wrong traversal — a copy that skipped the interior, or one that ignored
+the transpose, would still pass those two asserts — so these timings are not evidence
+that the traversal is correct. Correctness is carried by the unit tests
+(`copy_plan::tests`), which compare whole buffers against an oracle. A rerun should
+fill the source with distinct values and validate the full logical mapping outside
+the timed region (2026-11-09 review). The three trees were separate worktrees:
+`~/work/pr424-main` at b2358fb (`origin/main`), `~/work/pr424-head` at 1417eb5 (the
+withdrawn head) and `~/work/strided-424` (this change, rebuilt after each push).
 Runs (median ns/element; load average from `uptime` after the run; the measured set
 is cpus 0-7,16-23, the observer 8-15,24-31):
 
@@ -406,7 +412,7 @@ fn plan_case(n: usize, transpose: bool) -> f64 {
         drop(dst_mut);
         if rep >= 4 {
             samples.push(elapsed.as_secs_f64() * 1e9 / (n * n) as f64);
-        }
+    // Two endpoints over a constant fill only: this is not a correctness check.
     }
     // One checked element, so a wrong traversal fails the run instead of timing it.
     assert_eq!(dst[0], 1.5);

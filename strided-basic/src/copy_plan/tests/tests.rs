@@ -723,10 +723,7 @@ fn a_strided_plan_past_l2_forks_untiled_at_its_own_rate() {
     );
     let plan = CopyPlan::compile(&dims, &strides, &strides).unwrap();
     assert!(
-        plan.fused
-            .inline()
-            .and_then(pair_tiles::<f64, f64>)
-            .is_none(),
+        plan.fused.tiles::<f64, f64>().is_none(),
         "the layout must take the replay that is not tiled"
     );
     // The row of every class leaves this pool serial, so only the plan's own rate
@@ -796,10 +793,7 @@ fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
     let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
     // The layout must reach the tiled replay, or this test proves nothing.
     assert!(
-        plan.fused
-            .inline()
-            .and_then(pair_tiles::<f64, f64>)
-            .is_some(),
+        plan.fused.tiles::<f64, f64>().is_some(),
         "the layout must have tiles for `replay_tiled` to see the rate"
     );
     let mut observed = Vec::new();
@@ -845,11 +839,13 @@ fn a_strided_plan_past_l2_splits_its_tiled_replay_at_its_own_rate() {
 /// plan's estimate is within one step (one participant) of the width
 /// `Exec::width_for(measured_serial, 1)` picks for the measured serial time.
 ///
-/// This is the width of the replay that is **not** tiled. These transposing
-/// layouts take the tiled replay of strided-rs#422, which does not narrow the
-/// budget: its splitter forks down to the budget (96 leaves at budget 96 for both
-/// rows, measured with `take_tiled_leaves`), so this test does not establish the
-/// criterion for the tiled placement; that is an open item of #364. The rows are the `n` = 512 and 1024 rows of #364's table
+/// This is the width of the replay that is **not** tiled. Both rows take the
+/// tiled replay of strided-rs#422, which does not narrow the budget; the replay
+/// is executed below and records 96 leaves at a 96-slot token for both rows, so
+/// the tiled *placement* asks for the budget, not for the width its rate wants
+/// (24 and 46-47 participants in #364's table). That gap is strided-rs#430; this
+/// test establishes the pricing the placement gates on, not the tiled placement.
+/// The rows are the `n` = 512 and 1024 rows of #364's table
 /// (Xeon Platinum 9242, `x86_64-avx512`, serial and warm, `f64`), quoted as
 /// recorded constants because that host is not available here; the pool carries
 /// that class's dispatch costs, and the root token dispatches from outside the
@@ -898,6 +894,39 @@ fn a_transposing_plan_rate_past_l2_gives_the_width_of_its_measured_time() {
             at_row + 1 < planned,
             "{n} x {n}: the row asks for {at_row}, the plan {planned}"
         );
+        // The tiled replay does not narrow the budget: its splitter forks
+        // down to the token (96 leaves at budget 96). Executed here, so the
+        // gap to the width the measured serial time wants is a measurement.
+        let src = vec![1.5f64; total];
+        let mut dst = vec![0.0f64; total];
+        let src_dims = [n, n];
+        let src_strides = [1isize, side];
+        let dst_strides = [side, 1isize];
+        let src_ref = RawStridedRef::new(&src, &src_dims, &src_strides, 0).unwrap();
+        let replay_exec = Exec::new(&pool, 96).unwrap();
+        let mut dst_mut = RawStridedMut::new(&mut dst, &src_dims, &dst_strides, 0).unwrap();
+        plan.replay_on(
+            class,
+            &mut dst_mut,
+            &src_ref,
+            |d: &mut f64, s| *d = s,
+            replay_exec,
+        )
+        .unwrap();
+        let leaves = crate::threading::take_tiled_leaves();
+        assert!(
+            leaves.len() > 1,
+            "{n} x {n}: the tiled replay did not fork ({0} leaves)",
+            leaves.len()
+        );
+        assert_eq!(
+            leaves.len(),
+            96,
+            "{n} x {n}: the splitter must walk down to the 96-slot budget, not the measured width"
+        );
+        assert_eq!(dst[0], 1.5);
+        assert_eq!(dst[n * n - 1], 1.5);
+        assert_eq!(dst[(n / 2) * n + (n / 2)], 1.5);
     }
 }
 

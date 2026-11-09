@@ -122,6 +122,18 @@ impl PairTraversal {
         Self::Inline(FusedPairLayout::empty())
     }
 
+    /// The cache tiles of this traversal, or `None` when the column-major walk
+    /// is kept.
+    ///
+    /// The one decision entry point for both storage shapes, so a plan and a
+    /// replay entry ask the same question whatever the fused rank.
+    pub(crate) fn tiles<D, S>(&self) -> Option<Tiles> {
+        match self {
+            Self::Inline(layout) => pair_tiles::<D, S>(layout).map(Tiles::Inline),
+            Self::Spilled(axes) => spilled_pair_tiles::<D, S>(axes),
+        }
+    }
+
     /// The inline layout, or `None` when the traversal spilled.
     #[inline]
     pub(crate) fn inline(&self) -> Option<&FusedPairLayout> {
@@ -290,6 +302,44 @@ fn spilled_total(axes: &[FusedAxis]) -> usize {
     axes.iter().map(|axis| axis.dim).product()
 }
 
+/// The cache tiles chosen for a traversal whose tiled walk visits the slots in
+/// a different order from the column-major walk.
+///
+/// Built by [`PairTraversal::tiles`]: [`Tiles::Inline`] for a compressed rank
+/// at most [`RAW_FUSED_RANK_LIMIT`], [`Tiles::Spilled`] above it.
+#[derive(Clone, Debug)]
+pub(crate) enum Tiles {
+    Inline(PairTiles),
+    Spilled(SpilledTiles),
+}
+
+impl Tiles {
+    /// The tiles of the inline walk, or `None` for a spilled traversal (whose
+    /// compressed layout, when it fits inline, is replayed through that same
+    /// walk).
+    pub(crate) fn inline(&self) -> Option<&PairTiles> {
+        match self {
+            Self::Inline(tiles) => Some(tiles),
+            Self::Spilled(_) => None,
+        }
+    }
+}
+
+/// The cache tiles of a spilled axis list whose compressed rank exceeds
+/// [`RAW_FUSED_RANK_LIMIT`].
+///
+/// `dims`/`dst`/`src` are the compressed axes (extent-1 axes dropped, order
+/// kept) and address exactly the slots of the axis list they were built from,
+/// in the same column-major order. They are rank-sized slices rather than one
+/// array, because the tile walk and the dimension splitter both take slices.
+#[derive(Clone, Debug)]
+pub(crate) struct SpilledTiles {
+    pub(crate) dims: Vec<usize>,
+    pub(crate) dst: Vec<isize>,
+    pub(crate) src: Vec<isize>,
+    pub(crate) blocks: Vec<usize>,
+}
+
 /// The cache tiles of a fused pair layout whose tiled walk visits the slots in
 /// a different order from the column-major walk.
 ///
@@ -337,9 +387,30 @@ pub(crate) fn pair_tiles<D, S>(layout: &FusedPairLayout) -> Option<PairTiles> {
         &compressed
     };
     let rank = layout.rank;
-    let dims = &layout.dims[..rank];
-    let dst = &layout.dst_strides[..rank];
-    let src = &layout.src_strides[..rank];
+    let model = tile_blocks::<D, S>(
+        &layout.dims[..rank],
+        &layout.dst_strides[..rank],
+        &layout.src_strides[..rank],
+    )?;
+    let mut blocks = [1; RAW_FUSED_RANK_LIMIT];
+    blocks[..rank].copy_from_slice(&model);
+    Some(PairTiles {
+        layout: *layout,
+        blocks,
+    })
+}
+
+/// The block vector of the shared cache-block model for already-compressed
+/// axes (`dims`/`dst`/`src` of one length, every extent at least 2), or `None`
+/// when the column-major walk is kept.
+///
+/// The single source of the tiling decision for both storage shapes: the
+/// inline [`FusedPairLayout`] and the spilled [`SpilledTiles`].
+fn tile_blocks<D, S>(
+    dims: &[usize],
+    dst: &[isize],
+    src: &[isize],
+) -> Option<crate::inline::InlineVec<usize>> {
     // `None`: one of the model's exits keeps the full dimensions, which
     // cannot change the visit order.
     let model = crate::block::reduced_block_sizes(
@@ -347,7 +418,7 @@ pub(crate) fn pair_tiles<D, S>(layout: &FusedPairLayout) -> Option<PairTiles> {
         &[dst, src],
         core::mem::size_of::<D>().max(core::mem::size_of::<S>()),
     )?;
-    let first_cut = (0..rank).find(|&axis| model[axis] < dims[axis])?;
+    let first_cut = (0..dims.len()).find(|&axis| model[axis] < dims[axis])?;
     if model[first_cut + 1..].iter().all(|&block| block == 1) {
         return None;
     }
@@ -359,12 +430,66 @@ pub(crate) fn pair_tiles<D, S>(layout: &FusedPairLayout) -> Option<PairTiles> {
     {
         return None;
     }
-    let mut blocks = [1; RAW_FUSED_RANK_LIMIT];
-    blocks[..rank].copy_from_slice(&model);
-    Some(PairTiles {
-        layout: *layout,
-        blocks,
-    })
+    Some(model)
+}
+
+/// Cache tiles for replaying a spilled axis list, or `None` when the
+/// column-major walk is kept.
+///
+/// The invariant: an axis list is tiled exactly when the same layout given
+/// inline would be. The extent-1 axes therefore go first, in their given
+/// order — they address offset 0 whatever their stride, so dropping them keeps
+/// the slot order and the decision of the layout they padded. A compressed
+/// rank at most [`RAW_FUSED_RANK_LIMIT`] is decided and replayed through
+/// [`PairTiles`] itself ([#425]).
+///
+/// [#425]: https://github.com/tensor4all/strided-rs/issues/425
+pub(crate) fn spilled_pair_tiles<D, S>(axes: &[FusedAxis]) -> Option<Tiles> {
+    if spilled_total(axes) <= 1 {
+        return None;
+    }
+    let mut compressed = FusedPairLayout::empty();
+    let mut rank = 0;
+    for axis in axes.iter().filter(|axis| axis.dim != 1) {
+        if rank < RAW_FUSED_RANK_LIMIT {
+            compressed.dims[rank] = axis.dim;
+            compressed.dst_strides[rank] = axis.dst;
+            compressed.src_strides[rank] = axis.src;
+        }
+        rank += 1;
+    }
+    if rank <= RAW_FUSED_RANK_LIMIT {
+        // Fewer than two moving axes are one run, which `pair_tiles` declines.
+        compressed.rank = rank;
+        return pair_tiles::<D, S>(&compressed).map(Tiles::Inline);
+    }
+    // The exits the model decides before its metadata are answered from the axes,
+    // before any slice is materialized: a call it declines allocates nothing
+    // ([#425]).
+    let elem_size = core::mem::size_of::<D>().max(core::mem::size_of::<S>());
+    if crate::block::exits_before_metadata(
+        axes.iter()
+            .filter(|axis| axis.dim != 1)
+            .map(|axis| (axis.dim, axis.dst, axis.src)),
+        elem_size,
+    ) {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(rank);
+    let mut dst = Vec::with_capacity(rank);
+    let mut src = Vec::with_capacity(rank);
+    for axis in axes.iter().filter(|axis| axis.dim != 1) {
+        dims.push(axis.dim);
+        dst.push(axis.dst);
+        src.push(axis.src);
+    }
+    let blocks = tile_blocks::<D, S>(&dims, &dst, &src)?;
+    Some(Tiles::Spilled(SpilledTiles {
+        dims,
+        dst,
+        src,
+        blocks: blocks.into_vec(),
+    }))
 }
 
 /// `layout` without its extent-1 axes, in the given order.
@@ -424,12 +549,22 @@ fn slabs_share_no_line(dims: &[usize], strides: &[isize], prefix: usize, elem_si
     if width % line != 0 {
         return false;
     }
-    let mut tail = [(0u128, 0usize); RAW_FUSED_RANK_LIMIT];
+    // Inline up to `RAW_FUSED_RANK_LIMIT`, heap above it: the spilled route
+    // reaches this with more axes (issue #425), and the inline route must stay
+    // allocation-free.
     let count = dims.len() - prefix;
-    for (slot, axis) in tail.iter_mut().zip(prefix..dims.len()) {
-        *slot = (byte(axis), axis);
-    }
-    let tail = &mut tail[..count];
+    let mut inline = [(0u128, 0usize); RAW_FUSED_RANK_LIMIT];
+    let mut spilled = Vec::new();
+    let tail: &mut [(u128, usize)] = if count <= RAW_FUSED_RANK_LIMIT {
+        let tail = &mut inline[..count];
+        for (slot, axis) in tail.iter_mut().zip(prefix..dims.len()) {
+            *slot = (byte(axis), axis);
+        }
+        tail
+    } else {
+        spilled.extend((prefix..dims.len()).map(|axis| (byte(axis), axis)));
+        &mut spilled
+    };
     tail.sort_unstable();
     let mut span = width;
     for &(stride, axis) in tail.iter() {
@@ -480,6 +615,8 @@ pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
     let mut dst_tile = dst_base;
     let mut src_tile = src_base;
     loop {
+        #[cfg(test)]
+        crate::threading::record_tile_box();
         // SAFETY: the tile is a sub-box of `tile_box` at a reachable origin, so
         // the caller's contract covers every logical index of the tile.
         unsafe {
@@ -515,6 +652,86 @@ pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
             src_tile -= origin[axis] as isize * tile_box.src_strides[axis];
             origin[axis] = 0;
             tile.dims[axis] = blocks[axis].min(tile_box.dims[axis]);
+            axis += 1;
+        }
+    }
+}
+
+/// Replay every logical index of `box_dims`, a sub-box of `tiles`, tile by
+/// tile: the tiles of extents `tiles.blocks`, anchored at the box origin and
+/// clipped to it, are visited in column-major order of the tile grid, and each
+/// tile is walked in column-major order by [`apply_spilled_range`].
+///
+/// The spilled counterpart of [`apply_tiled_box`]: same tile odometer, same
+/// per-element walk as the untiled replay, only the axis storage differs. Kept
+/// out of line so that the untiled spilled replay keeps its code shape.
+///
+/// # Safety
+///
+/// The [`apply_spilled_range`] contract for the whole of `box_dims`, which
+/// must be `tiles.dims` or a sub-box of it anchored at `dst_base`/`src_base`,
+/// and every `tiles.blocks[axis]` at least 1.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) unsafe fn apply_spilled_tiled_box<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    tiles: &SpilledTiles,
+    box_dims: &[usize],
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    let rank = box_dims.len();
+    // One rank-sized axis list for the current tile and one cursor for the
+    // whole walk, however many tiles it visits.
+    let mut tile: Vec<FusedAxis> = (0..rank)
+        .map(|axis| FusedAxis {
+            dim: 1,
+            dst: tiles.dst[axis],
+            src: tiles.src[axis],
+        })
+        .collect();
+    let mut index = vec![0usize; rank];
+    let mut origin = vec![0usize; rank];
+    let mut dst_tile = dst_base;
+    let mut src_tile = src_base;
+    loop {
+        #[cfg(test)]
+        crate::threading::record_tile_box();
+        let mut count = 1usize;
+        for axis in 0..rank {
+            let dim = tiles.blocks[axis].min(box_dims[axis] - origin[axis]);
+            tile[axis].dim = dim;
+            count *= dim;
+        }
+        // SAFETY: the tile is a sub-box of `box_dims` at a reachable origin, so
+        // the caller's contract covers every logical index of the tile.
+        unsafe {
+            apply_spilled_range_with(
+                dst_ptr, dst_tile, src_ptr, src_tile, &tile, 0, count, &mut index, apply,
+            );
+        }
+        // The column-major odometer of [`apply_tiled_box`], over slices.
+        let mut axis = 0;
+        loop {
+            if axis == rank {
+                return;
+            }
+            let next = origin[axis] + tiles.blocks[axis];
+            if next < box_dims[axis] {
+                origin[axis] = next;
+                dst_tile += tiles.blocks[axis] as isize * tiles.dst[axis];
+                src_tile += tiles.blocks[axis] as isize * tiles.src[axis];
+                break;
+            }
+            dst_tile -= origin[axis] as isize * tiles.dst[axis];
+            src_tile -= origin[axis] as isize * tiles.src[axis];
+            origin[axis] = 0;
             axis += 1;
         }
     }
@@ -726,12 +943,47 @@ pub(crate) unsafe fn apply_spilled_range<D, S, Apply>(
     if len == 0 {
         return;
     }
+    let mut index = vec![0usize; axes.len()];
+    // SAFETY: forwarded caller contract; `index` is the rank-sized cursor.
+    unsafe {
+        apply_spilled_range_with(
+            dst_ptr, dst_base, src_ptr, src_base, axes, start, len, &mut index, apply,
+        )
+    }
+}
+
+/// [`apply_spilled_range`] with the caller's rank-sized coordinate buffer, so
+/// that the tile walk keeps one cursor for all its tiles.
+///
+/// # Safety
+///
+/// The [`apply_spilled_range`] contract, and `index.len()` at least
+/// `axes.len()`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn apply_spilled_range_with<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    axes: &[FusedAxis],
+    start: usize,
+    len: usize,
+    index: &mut [usize],
+    apply: &Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: Fn(&mut D, S),
+{
+    if len == 0 {
+        return;
+    }
     let rank = axes.len();
+    debug_assert!(index.len() >= rank);
     let inner_len = axes[0].dim;
     let inner_dst = axes[0].dst;
     let inner_src = axes[0].src;
 
-    let mut index = vec![0usize; rank];
     let mut rest = start;
     let mut dst_outer = dst_base;
     let mut src_outer = src_base;
@@ -1030,7 +1282,7 @@ where
     let traversal = PairTraversal::given(dest.dims(), dest.strides(), src.strides());
     let injective =
         || crate::layout_check::is_injective_layout_without_alloc(dest.dims(), dest.strides());
-    let mut tiles = traversal.inline().and_then(pair_tiles::<D, S>);
+    let mut tiles = traversal.tiles::<D, S>();
     let mut proven = None;
     if tiles.is_some() {
         let holds = injective();
@@ -1058,7 +1310,7 @@ where
     // SAFETY: `traversal` is built from exactly the views' dims and strides
     // (`ensure_same_dims` proved the dims agree), so the views' bounds proofs
     // cover every replayed offset; `total_len` checked the nonzero product;
-    // `tiles` is `pair_tiles` of the inline traversal, and tiles or a
+    // `tiles` is `PairTraversal::tiles` of `traversal`, and tiles or a
     // non-serial `exec` are left only for a destination proven injective;
     // the exclusive and shared borrows cannot overlap.
     unsafe {
@@ -1084,9 +1336,9 @@ where
 /// instead, each tile column-major over the given axes. Bounds were validated when the views were built
 /// ([`RawStridedRef::new`], [`RawStridedMut::new`]). On a successful call the
 /// replay itself (validation, traversal and dispatch) allocates nothing for a
-/// rank at most [`RAW_FUSED_RANK_LIMIT`]; above it, the axis list and the cursor
-/// of each replayed range are stored in rank-sized buffers. An error may
-/// allocate its payload.
+/// rank at most [`RAW_FUSED_RANK_LIMIT`]; above it, the axis list, the tile
+/// decision's slices and the cursors are stored in rank-sized buffers. An error
+/// may allocate its payload.
 ///
 /// The width comes from the repository rule on `exec`. A parallel or tiled
 /// replay runs only on a destination proven injective without allocating; any

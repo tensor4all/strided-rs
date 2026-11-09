@@ -109,9 +109,11 @@ const COPY_L2_BYTES: usize = 1 << 20;
 /// unit-stride run keeps the row at every footprint. Every class without a
 /// beyond-L2 measurement keeps the row at every size.
 ///
-/// A traversal whose runs are shorter than a cache line can be worse than 3.0: a
-/// rank-1 run at stride 256 (one element per 2 KiB) measured 9.8 ns per element
-/// under a co-tenant process, so this rate under-prices that extreme, not over.
+/// A traversal whose runs are shorter than a cache line may be worse than 3.0: a
+/// rank-1 run at stride 256 (one element per 2 KiB) measured 9.6-12.7 ns per element
+/// under a co-tenant process. A contended sample cannot establish the uncontended
+/// value, so this is recorded as an observation and this rate is not claimed to
+/// under- or over-price that extreme.
 pub(crate) fn copy_ns_per_element_for_footprint(host: HostClass, bytes: usize) -> f64 {
     if matches!(host, HostClass::X86_64Avx512) && bytes > COPY_L2_BYTES {
         return 3.0;
