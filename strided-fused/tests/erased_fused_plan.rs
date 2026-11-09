@@ -540,7 +540,9 @@ fn erased_fused_plan_executes_multiple_uninit_outputs_for_f32() {
             .unwrap();
     }
     let init = |slots: &[MaybeUninit<f32>; 3]| -> Vec<f32> {
-        // SAFETY: `execute_outputs_uninit` writes every reachable element.
+        // SAFETY: each destination has 3 slots under `dims` `[3]` with stride `[1]`, so the
+        // layout reaches every slot, and `execute_outputs_uninit` returned `Ok`, which
+        // initializes every logical destination element (strided-fused/src/erased.rs:221).
         slots
             .iter()
             .map(|slot| unsafe { slot.assume_init() })
@@ -669,11 +671,13 @@ fn erased_fused_plan_executes_rank_zero_uninit_multiple_outputs() {
         plan.execute_outputs_uninit(&mut dests, &pointers, Exec::serial())
             .unwrap();
     }
-    // SAFETY: `execute_outputs_uninit` writes every reachable element.
+    // SAFETY: the layout is rank 0, a single element at offset 0, so each one-slot destination is
+    // fully reachable, and `execute_outputs_uninit` returned `Ok`, which initializes every
+    // logical destination element (strided-fused/src/erased.rs:221).
     assert_eq!(unsafe { pass_through[0].assume_init() }, 2.0);
-    // SAFETY: as above.
+    // SAFETY: as for `pass_through` above.
     assert_eq!(unsafe { negated[0].assume_init() }, -2.0);
-    // SAFETY: as above.
+    // SAFETY: as for `pass_through` above.
     assert_eq!(unsafe { twice[0].assume_init() }, 2.0);
 }
 
@@ -766,12 +770,21 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
     let mut storage = [1.0f64, 2.0, 3.0, 4.0];
     let byte_len = core::mem::size_of_val(&storage);
     let base = std::ptr::NonNull::new(storage.as_mut_ptr().cast::<u8>()).unwrap();
-    // SAFETY: both descriptors alias the same allocation on purpose; the overlap
-    // check must reject before any reference is formed or any write happens.
+    // SAFETY: `ErasedRawStridedPtr::from_raw_parts` (strided-view/src/raw.rs:204) needs an
+    // `f64`-aligned allocation of `byte_len` initialized bytes that stays alive: `base` heads the
+    // live `[f64; 4]` `storage`. The descriptor may overlap a destination
+    // (strided-view/src/raw.rs:211), which is what this test sets up; the entry rejects that
+    // overlap before converting or reading the input (`validate_uninit_no_overlap`,
+    // strided-fused/src/erased.rs:319).
     let input = unsafe {
         ErasedRawStridedPtr::from_raw_parts(KernelDType::F64, base, byte_len, &dims, &unit, 0)
     }
     .unwrap();
+    // SAFETY: `ErasedRawStridedUninitMut::from_raw_parts` (strided-view/src/raw.rs:826) needs an
+    // aligned, writable allocation used exclusively by the descriptor: `storage` is live and
+    // nothing writes it otherwise. The only other handle is the read-only `input` pointer, which
+    // is compared by address and never dereferenced, because the call fails on the overlap before
+    // any conversion or write.
     let overlapping = unsafe {
         ErasedRawStridedUninitMut::from_raw_parts(KernelDType::F64, base, byte_len, &dims, &unit, 0)
     }
@@ -793,6 +806,9 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
     for (index, slot) in first_storage.iter().enumerate() {
         // SAFETY: the sentinel slots were initialized before the call.
         assert_eq!(
+            // SAFETY: every slot of `first_storage` was created as `MaybeUninit::new(7.5)`, the
+            // call failed before writing, and the uninitialized-destination path stores only
+            // initialized values anyway.
             unsafe { slot.assume_init() },
             7.5,
             "first destination element {index} was written before validation failed"

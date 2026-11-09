@@ -42,19 +42,29 @@ fn record_deallocation() {
     let _ = THREAD_FREES.try_with(|count| count.set(count.get() + 1));
 }
 
+// SAFETY: each method forwards its arguments unchanged to `System`, which meets the `GlobalAlloc`
+// contract. The counting side effects (an atomic add, and `try_with` on a `const`-initialized
+// thread-local `Cell`) neither allocate nor unwind.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_allocation();
+        // SAFETY: forwards `alloc`'s caller contract (a non-zero-size `layout`) unchanged to
+        // `System`, which allocated every block this allocator hands out.
         System.alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         record_deallocation();
+        // SAFETY: forwards `dealloc`'s caller contract (`ptr` allocated by this allocator with
+        // `layout`) unchanged to `System`, which allocated every block this allocator hands out.
         System.dealloc(ptr, layout)
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record_allocation();
+        // SAFETY: forwards `realloc`'s caller contract (`ptr` from this allocator with `layout`,
+        // a valid non-zero `new_size`) unchanged to `System`, which allocated every block this
+        // allocator hands out.
         System.realloc(ptr, layout, new_size)
     }
 }
