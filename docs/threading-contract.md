@@ -127,8 +127,9 @@ A caller that wants its own thread budget builds a `Pool`, mints
   above are pinned by their types.
 - `strided-basic/tests/copy_into_col_major_policy.rs` — `copy_into_col_major`
   must use the token it is handed: a large permutation copy under a four-slot
-  token shows more than one live task under that token's ledger root, which the
-  hard-coded `Exec::serial()` of #212 failed.
+  token installs work into that token's pool, and the destination holds the
+  transposed source at an off-diagonal element. The hard-coded `Exec::serial()`
+  of #212 installed nothing and failed the first check.
 - `strided-basic/tests/serial_exec_global_pool.rs` — serial work never starts
   the process-global pool.
 - `strided-basic/tests/execution_pool_*.rs`, `strided-fused`,

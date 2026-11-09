@@ -39,4 +39,7 @@ fn copy_into_col_major_uses_the_callers_token() {
     // The parallel route must still produce the copy (the byte-for-byte check on
     // the serial route is `ops_view::tests::tiled_tests`).
     assert_eq!(destination.get(&[N - 1, N - 1]), (N * N - 1) as f64);
+    // Off-diagonal, so a source that was not transposed fails here: symmetry made
+    // the corner element above pass either way.
+    assert_eq!(destination.get(&[1, 0]), N as f64);
 }
