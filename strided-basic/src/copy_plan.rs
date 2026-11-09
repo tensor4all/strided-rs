@@ -15,7 +15,7 @@
 
 use core::{
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{size_of, MaybeUninit},
     ops::{Add, Mul},
 };
 
@@ -28,6 +28,7 @@ use crate::raw_ops::{
     SpilledTiles, Tiles,
 };
 use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
+use strided_perm::HostClass;
 
 // Same pattern as map_view.rs / outer_product.rs: inline storage in both
 // feature configurations. Only `compile` touches these; `execute*` never
@@ -205,6 +206,11 @@ pub struct CopyPlan {
     dst_strides: AxisVec<isize>,
     src_strides: AxisVec<isize>,
     fused: PairTraversal,
+    /// Elements each side spans ([`span_elements`]), so that the working set in
+    /// bytes is `dst_span * size_of::<D>() + src_span * size_of::<S>()` at replay,
+    /// where the element types are known.
+    dst_span: usize,
+    src_span: usize,
 }
 
 impl CopyPlan {
@@ -286,7 +292,77 @@ impl CopyPlan {
             dst_strides: dst_strides.into(),
             src_strides: src_strides.into(),
             fused: fuse_pair_traversal(dims, dst_strides, src_strides),
+            dst_span: span_elements(dims, dst_strides),
+            src_span: span_elements(dims, src_strides),
         })
+    }
+
+    /// Whether the replay walks the plan as one unit-stride run on each side, the
+    /// layout the `Copy` row is calibrated on. A streamed contiguous copy keeps
+    /// that rate at every footprint, and a reversed one (`-1` on a side) streams
+    /// the same way.
+    ///
+    /// The question is about the walk the replay takes, not about a walk the
+    /// layout would allow: both replays walk the fused axes in their stored
+    /// order with axis 0 fastest (`apply_fused_range`, `apply_spilled_range`),
+    /// and the tiled replay only exists for two or more moving axes. So the
+    /// strides, read in that order, must be the running products of the extents
+    /// with one sign per operand. Fusion already merges every such pair, so in
+    /// practice this is a fused rank of one at unit stride; a dense *reversed*
+    /// buffer of rank two or more is not one run here, because fusion sorts the
+    /// axes by signed destination stride and walks `[-1, -512]` over
+    /// `[512, 512]` with `-512` fastest (strided-rs#364 review). It is priced
+    /// as the strided walk it is.
+    fn is_contiguous_run(&self) -> bool {
+        fn walks_one_run(axes: impl Iterator<Item = (usize, isize, isize)>) -> bool {
+            let mut step = 1usize;
+            let mut signs = None;
+            for (dim, dst, src) in axes {
+                if dim == 1 {
+                    continue;
+                }
+                if dst.unsigned_abs() != step || src.unsigned_abs() != step {
+                    return false;
+                }
+                let axis_signs = (dst < 0, src < 0);
+                if *signs.get_or_insert(axis_signs) != axis_signs {
+                    return false;
+                }
+                step = step.saturating_mul(dim);
+            }
+            true
+        }
+        match &self.fused {
+            PairTraversal::Inline(layout) => walks_one_run((0..layout.rank).map(|axis| {
+                (
+                    layout.dims[axis],
+                    layout.dst_strides[axis],
+                    layout.src_strides[axis],
+                )
+            })),
+            PairTraversal::Spilled(axes) => {
+                walks_one_run(axes.iter().map(|axis| (axis.dim, axis.dst, axis.src)))
+            }
+        }
+    }
+
+    /// Serial rate this plan prices itself at on host class `host`: the `Copy`
+    /// row while the plan is one contiguous run or its working set fits the
+    /// class's L2 cache, the class's beyond-L2 copy rate otherwise
+    /// (strided-rs#364). [`Self::replay`] asks it for [`HostClass::detect`]; the
+    /// class is a parameter so that the tests can pin it.
+    ///
+    /// The element size is the one fact `compile` cannot know, so the footprint
+    /// in bytes is formed here from the compiled span; nothing is probed.
+    fn ns_per_element_on<D, S>(&self, host: HostClass) -> f64 {
+        if self.is_contiguous_run() {
+            return KernelClass::Copy.ns_per_element_of(host);
+        }
+        let bytes = self
+            .dst_span
+            .saturating_mul(size_of::<D>())
+            .saturating_add(self.src_span.saturating_mul(size_of::<S>()));
+        crate::cost::copy_ns_per_element_for_footprint(host, bytes)
     }
 
     /// Check the per-call facts: the supplied views must carry exactly the
@@ -302,7 +378,8 @@ impl CopyPlan {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)
     }
 
-    /// Check the per-call facts, then replay the compiled traversal.
+    /// Check the per-call facts, then replay the compiled traversal, priced for
+    /// this host's class.
     fn replay<D, S, Apply>(
         &self,
         dest: &mut RawStridedMut<'_, D>,
@@ -315,14 +392,45 @@ impl CopyPlan {
         S: Copy + Send + Sync,
         Apply: Fn(&mut D, S) + Sync,
     {
+        self.replay_on(HostClass::detect(), dest, src, apply, exec)
+    }
+
+    /// [`Self::replay`] priced for host class `host`: every scheduling decision
+    /// of the replay asks at [`Self::ns_per_element_on`] of that class. Split out
+    /// so that a test can pin the class and observe the rate reach the replay on
+    /// every host (strided-rs#364).
+    fn replay_on<D, S, Apply>(
+        &self,
+        host: HostClass,
+        dest: &mut RawStridedMut<'_, D>,
+        src: &RawStridedRef<'_, S>,
+        apply: Apply,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        D: Copy + Send + Sync,
+        S: Copy + Send + Sync,
+        Apply: Fn(&mut D, S) + Sync,
+    {
         self.check_call(dest, src)?;
         let tiles = self.fused.tiles::<D, S>();
+        let ns_per_element = self.ns_per_element_on::<D, S>(host);
         // SAFETY: `check_call` proved both views carry exactly the compiled
         // layout, and `fused` is the fusion of that layout (only `compile`
         // and `Default`, the rank-zero layout, build it). `compile` checked
         // the element count and proved the destination injective, so the
         // tiles of `fused` may be replayed.
-        unsafe { replay_fused(dest, src, &self.fused, tiles.as_ref(), apply, exec) };
+        unsafe {
+            replay_fused(
+                dest,
+                src,
+                &self.fused,
+                tiles.as_ref(),
+                apply,
+                ns_per_element,
+                exec,
+            )
+        };
         Ok(())
     }
 
@@ -416,6 +524,18 @@ impl CopyPlan {
     {
         self.replay(dest, src, |dst: &mut T, value: T| *dst = value.conj(), exec)
     }
+}
+
+/// Elements one side of a compiled layout spans: `1 + sum((dim - 1) * |stride|)`,
+/// the reach of the side from its base offset. Summed over the two sides it is
+/// the plan's working set in elements, saturating rather than wrapping because a
+/// stride is only bounded by `isize`.
+fn span_elements(dims: &[usize], strides: &[isize]) -> usize {
+    dims.iter()
+        .zip(strides)
+        .fold(1usize, |span, (&dim, &stride)| {
+            span.saturating_add(dim.saturating_sub(1).saturating_mul(stride.unsigned_abs()))
+        })
 }
 
 /// Verify that a pair of raw views carries exactly a compiled layout.
@@ -531,7 +651,17 @@ impl UpdatePlan {
         // SAFETY: as in `CopyPlan::replay`: the views carry the compiled
         // layout, `fused` is its fusion (built only by `compile`), and
         // `compile` checked the count and destination injectivity.
-        unsafe { replay_fused(dest, src, &self.fused, tiles.as_ref(), apply, exec) };
+        unsafe {
+            replay_fused(
+                dest,
+                src,
+                &self.fused,
+                tiles.as_ref(),
+                apply,
+                KernelClass::Copy.ns_per_element(),
+                exec,
+            )
+        };
         Ok(())
     }
 
@@ -681,12 +811,19 @@ impl UpdatePlan {
 /// - When `tiles` is `Some` or `exec` is not serial, the destination strides
 ///   must be injective over the traversal.
 /// - The destination and source must not overlap.
+///
+/// `ns_per_element` is the serial rate the untiled replay prices itself at; a plan
+/// whose footprint is past its class's L2 passes its own
+/// ([`CopyPlan::ns_per_element_on`]), every other caller passes the rate of
+/// `KernelClass::Copy` ([`crate::cost::KernelClass::ns_per_element`]). The tiled
+/// replay keeps its own gating.
 pub(crate) unsafe fn replay_fused<D, S, Apply>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
     traversal: &PairTraversal,
     tiles: Option<&Tiles>,
     apply: Apply,
+    ns_per_element: f64,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
@@ -712,6 +849,7 @@ pub(crate) unsafe fn replay_fused<D, S, Apply>(
                 layout,
                 tiles.and_then(Tiles::inline),
                 apply,
+                ns_per_element,
                 exec,
             ),
             PairTraversal::Spilled(axes) => match tiles {
@@ -723,12 +861,29 @@ pub(crate) unsafe fn replay_fused<D, S, Apply>(
                     &tiles.layout,
                     Some(tiles),
                     apply,
+                    ns_per_element,
                     exec,
                 ),
-                Some(Tiles::Spilled(tiles)) => {
-                    replay_spilled_tiled(dst_ptr, dst_base, src_ptr, src_base, tiles, apply, exec)
-                }
-                None => replay_spilled_raw(dst_ptr, dst_base, src_ptr, src_base, axes, apply, exec),
+                Some(Tiles::Spilled(tiles)) => replay_spilled_tiled(
+                    dst_ptr,
+                    dst_base,
+                    src_ptr,
+                    src_base,
+                    tiles,
+                    apply,
+                    exec,
+                    ns_per_element,
+                ),
+                None => replay_spilled_raw(
+                    dst_ptr,
+                    dst_base,
+                    src_ptr,
+                    src_base,
+                    axes,
+                    apply,
+                    ns_per_element,
+                    exec,
+                ),
             },
         }
     }
@@ -764,6 +919,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
     layout: &FusedPairLayout,
     tiles: Option<&PairTiles>,
     apply: Apply,
+    ns_per_element: f64,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
@@ -777,10 +933,21 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
     if let Some(tiles) = tiles {
         // SAFETY: forwarded caller contract; `tiles` addresses exactly the
         // slots of `layout` and the destination is injective over them.
-        unsafe { replay_tiled(dst_ptr, dst_base, src_ptr, src_base, tiles, &apply, exec) };
+        unsafe {
+            replay_tiled(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                tiles,
+                &apply,
+                ns_per_element,
+                exec,
+            )
+        };
         return;
     }
-    let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+    let exec = crate::cost::for_len_at_rate(exec, total, ns_per_element);
     if !exec.is_serial() {
         let dst_ptr = crate::threading::SendPtr(dst_ptr);
         let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
@@ -826,6 +993,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
 /// The [`replay_fused_raw`] contract for `tiles.layout`, with an injective
 /// destination.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn replay_tiled<D, S, Apply>(
     dst_ptr: *mut D,
     dst_base: isize,
@@ -833,6 +1001,7 @@ unsafe fn replay_tiled<D, S, Apply>(
     src_base: isize,
     tiles: &PairTiles,
     apply: &Apply,
+    ns_per_element: f64,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
@@ -842,7 +1011,9 @@ unsafe fn replay_tiled<D, S, Apply>(
     let layout = &tiles.layout;
     let rank = layout.rank;
     let total = fused_total(layout);
-    if !crate::cost::is_parallel(KernelClass::Copy, total, &exec) {
+    // The plan's rate, not the row: a footprint past the class's L2 pays here too
+    // (strided-rs#364).
+    if !crate::cost::is_parallel_at_rate(total, ns_per_element, &exec) {
         // SAFETY: forwarded caller contract over the whole box.
         unsafe {
             apply_tiled_box(
@@ -863,13 +1034,13 @@ unsafe fn replay_tiled<D, S, Apply>(
     let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
     #[cfg(test)]
     let leaves = std::sync::Mutex::new(Vec::new());
-    let result = crate::threading::mapreduce_threaded(
+    let result = crate::threading::mapreduce_threaded_at_rate(
         &layout.dims[..rank],
         &tiles.blocks[..rank],
         &strides,
         &[dst_base, src_base],
         &costs,
-        KernelClass::Copy,
+        ns_per_element,
         exec,
         &|box_dims, _, _, offsets| {
             #[cfg(test)]
@@ -925,6 +1096,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
     tiles: &SpilledTiles,
     apply: Apply,
     exec: Exec<'_>,
+    ns_per_element: f64,
 ) where
     D: Copy + Send + Sync,
     S: Copy + Send + Sync,
@@ -932,7 +1104,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
 {
     let rank = tiles.dims.len();
     let total = tiles.dims.iter().product::<usize>();
-    if !crate::cost::is_parallel(KernelClass::Copy, total, &exec) {
+    if !crate::cost::is_parallel_at_rate(total, ns_per_element, &exec) {
         // SAFETY: forwarded caller contract over the whole box.
         unsafe {
             apply_spilled_tiled_box(
@@ -953,13 +1125,13 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
     let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
     #[cfg(test)]
     let leaves = std::sync::Mutex::new(Vec::new());
-    let result = crate::threading::mapreduce_threaded(
+    let result = crate::threading::mapreduce_threaded_at_rate(
         &tiles.dims[..rank],
         &tiles.blocks[..rank],
         &strides,
         &[dst_base, src_base],
         &costs,
-        KernelClass::Copy,
+        ns_per_element,
         exec,
         &|box_dims, _, _, offsets| {
             #[cfg(test)]
@@ -999,6 +1171,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
 /// # Safety
 ///
 /// The [`replay_fused_raw`] contract, for `axes`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
     dst_ptr: *mut D,
     dst_base: isize,
@@ -1006,6 +1179,7 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
     src_base: isize,
     axes: &[FusedAxis],
     apply: Apply,
+    ns_per_element: f64,
     exec: Exec<'_>,
 ) where
     D: Copy + Send + Sync,
@@ -1016,7 +1190,7 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
     if total == 0 {
         return;
     }
-    let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+    let exec = crate::cost::for_len_at_rate(exec, total, ns_per_element);
     if !exec.is_serial() {
         let dst_ptr = crate::threading::SendPtr(dst_ptr);
         let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);

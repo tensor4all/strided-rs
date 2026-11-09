@@ -48,6 +48,20 @@
 //! elements). A kernel with a cost not in the table is classified by the nearest
 //! row, never given a constant of its own.
 //!
+//! A [`CopyPlan`](crate::CopyPlan) prices itself above the `Copy` row when its
+//! working set does not fit the L2 cache of the class *and* its traversal is not
+//! one contiguous run (`copy_ns_per_element_for_footprint`, which carries the
+//! measurement of that regime; strided-rs#364). The footprint and the
+//! traversal are both known in `CopyPlan::compile`, so the plan carries them and
+//! nothing is probed at run time, and the rate reaches every scheduling decision
+//! the replay makes: the width of the replay that is not tiled
+//! (`for_len_at_rate`) and both the fork gate and every node of the recursive
+//! splitter of the tiled replay of strided-rs#422 (`is_parallel_at_rate`). A
+//! contiguous run keeps the row at every size:
+//! a streamed unit-stride copy measures the row's rate past L2 as well, which is
+//! why the row itself is not raised. Every other kernel still prices itself at
+//! the row.
+//!
 //! # Sections
 //!
 //! `sections` is the number of dispatches the entry performs, counted truthfully:
@@ -66,6 +80,47 @@ use core::time::Duration;
 use strided_perm::{copy_ns_per_element_of, HostClass};
 use threadteam::Exec;
 
+/// Working set, in bytes, past which a copy pays L3/DRAM traffic instead of the
+/// L2-resident rate: the L2 size of both hosts behind the `x86_64-avx512` `Copy`
+/// row (1 MiB per core on the Zen 5 host of the worklog of `strided-rs#364` and
+/// on the Xeon Platinum 9242 of `strided-rs#363`).
+const COPY_L2_BYTES: usize = 1 << 20;
+
+/// Serial throughput of a copy in nanoseconds per element on this host for a copy
+/// whose source and destination span `bytes` bytes together: the `Copy` row while
+/// that working set fits the class's L2 cache, the class's beyond-L2 copy rate
+/// after (strided-rs#364).
+///
+/// Past [`COPY_L2_BYTES`] a traversal that touches a new cache line per element
+/// pays the line rather than the element: it reads a line to take one `f64` out
+/// of it and writes a line to put it down, so the cost is the L3/DRAM traffic of
+/// the plan. This is a calibration of the *tiled* transposing path; the replay that
+/// is not tiled is not calibrated row by row. A transposing `n x n` `f64` copy
+/// measures 2.33-2.45 ns per element at
+/// `n` = 512 and 1024 on the Zen 5 host of
+/// `docs/worklogs/2026-11-09-issue-364-copy-plan-footprint.md`, and 2.91-3.24 on
+/// the Xeon Platinum 9242 (`n` = 512 and 1024, quoted from the table of #364), so
+/// the beyond-L2 rate is 3.0: 3.0 / 2.33 = 1.29, 3.0 / 3.24 = 0.93, i.e. within
+/// 1.3x of every one of those medians, and 9.7 / 3.0 = 3.2 below the 7.2-9.7 the
+/// same host measured before strided-rs#422 tiled its transposed path.
+///
+/// A *contiguous* copy is not priced here: it streams 0.176-0.177 ns per element
+/// at 2 and 16 MiB on that host, which is the row within 4%, so a plan that is one
+/// unit-stride run keeps the row at every footprint. Every class without a
+/// beyond-L2 measurement keeps the row at every size.
+///
+/// A traversal whose runs are shorter than a cache line may be worse than 3.0: a
+/// rank-1 run at stride 256 (one element per 2 KiB) measured 9.6-12.7 ns per element
+/// under a co-tenant process. A contended sample cannot establish the uncontended
+/// value, so this is recorded as an observation and this rate is not claimed to
+/// under- or over-price that extreme.
+pub(crate) fn copy_ns_per_element_for_footprint(host: HostClass, bytes: usize) -> f64 {
+    if matches!(host, HostClass::X86_64Avx512) && bytes > COPY_L2_BYTES {
+        return 3.0;
+    }
+    copy_ns_per_element_of(host)
+}
+
 /// Serial cost class of a kernel; see the module documentation of `strided-basic/src/cost.rs` for the
 /// table.
 ///
@@ -82,6 +137,11 @@ use threadteam::Exec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelClass {
     /// Copies, fills, permutations and index gathers.
+    ///
+    /// A `CopyPlan` whose working set is past the class's L2 cache and whose
+    /// traversal is not one contiguous run prices itself above this row
+    /// (`strided-basic/src/cost.rs`'s `copy_ns_per_element_for_footprint`,
+    /// strided-rs#364).
     Copy,
     /// Element-wise arithmetic and fused arithmetic chains.
     Map,
@@ -188,7 +248,22 @@ pub fn tree_width(exec: &Exec<'_>, class: KernelClass, elements: usize) -> NonZe
 
 /// Narrows `exec` to the width a flat entry over `len` elements of `class` justifies.
 pub(crate) fn for_len<'a>(exec: Exec<'a>, class: KernelClass, len: usize) -> Exec<'a> {
-    let width = parallel_width(&exec, class, len);
+    for_len_at_rate(exec, len, class.ns_per_element())
+}
+
+/// Narrows `exec` to the width a flat entry over `len` elements costing
+/// `ns_per_element` each justifies.
+///
+/// [`for_len`] is this function at the rate of a class. A `CopyPlan` passes a rate
+/// of its own: one whose footprint is past the class's L2 and whose traversal is
+/// not a single contiguous run prices itself above the row
+/// (`copy_ns_per_element_for_footprint`, strided-rs#364).
+pub(crate) fn for_len_at_rate<'a>(exec: Exec<'a>, len: usize, ns_per_element: f64) -> Exec<'a> {
+    if exec.is_serial() {
+        return exec;
+    }
+    let estimate = Duration::from_secs_f64(len as f64 * ns_per_element * 1e-9);
+    let width = exec.width_for(estimate, 1);
     exec.limit(width)
 }
 
@@ -201,9 +276,70 @@ pub(crate) fn for_len_tree<'a>(exec: Exec<'a>, class: KernelClass, len: usize) -
 /// Whether one fork of `exec` over `len` elements of `class` pays: the gate of a
 /// node of the dimension splitter and of the entries that call it.
 pub(crate) fn is_parallel(class: KernelClass, len: usize, exec: &Exec<'_>) -> bool {
+    is_parallel_at_rate(len, class.ns_per_element(), exec)
+}
+
+/// Whether one fork of `exec` over `len` elements costing `ns_per_element` each
+/// pays: the gate of a node of the dimension splitter, at the rate its caller
+/// prices the work at.
+///
+/// [`is_parallel`] is this function at the rate of a class. A `CopyPlan` past its
+/// class's L2 passes its own rate, so the tiled splitter of strided-rs#422 opens
+/// the same fork the plan's width rule asks for
+/// (`copy_ns_per_element_for_footprint`, strided-rs#364).
+pub(crate) fn is_parallel_at_rate(len: usize, ns_per_element: f64, exec: &Exec<'_>) -> bool {
     if exec.is_serial() {
         return false;
     }
     let two = NonZeroUsize::new(2).unwrap_or(ONE);
-    exec.pays(class.estimate(len), 1, two.min(exec.budget()))
+    let estimate = Duration::from_secs_f64(len as f64 * ns_per_element * 1e-9);
+    exec.pays(estimate, 1, two.min(exec.budget()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The beyond-L2 branch is a property of the class under test, not of the
+    /// machine that runs the test, so it is asserted with the class given
+    /// explicitly (strided-rs#364).
+    #[test]
+    fn a_footprint_past_l2_is_priced_above_the_row_of_its_class() {
+        // Four MiB: the 512 x 512 f64 case of strided-rs#363, source plus
+        // destination.
+        assert_eq!(
+            copy_ns_per_element_for_footprint(HostClass::X86_64Avx512, 4 << 20),
+            3.0
+        );
+        // Up to and including the class's L2 size the row stands.
+        assert_eq!(
+            copy_ns_per_element_for_footprint(HostClass::X86_64Avx512, COPY_L2_BYTES),
+            0.171
+        );
+        assert_eq!(
+            copy_ns_per_element_for_footprint(HostClass::X86_64Avx512, 0),
+            0.171
+        );
+        // One byte past it is priced at the beyond-L2 rate.
+        assert_eq!(
+            copy_ns_per_element_for_footprint(HostClass::X86_64Avx512, COPY_L2_BYTES + 1),
+            3.0
+        );
+        // Every class without a beyond-L2 measurement keeps one rate at every
+        // size.
+        for class in [
+            HostClass::Aarch64Apple,
+            HostClass::X86_64Avx2,
+            HostClass::X86_64Scalar,
+            HostClass::Aarch64,
+            HostClass::Generic,
+        ] {
+            assert_eq!(
+                copy_ns_per_element_for_footprint(class, usize::MAX >> 8),
+                copy_ns_per_element_of(class),
+                "{} has no beyond-L2 measurement",
+                class.name()
+            );
+        }
+    }
 }
