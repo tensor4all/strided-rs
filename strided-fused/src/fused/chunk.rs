@@ -138,9 +138,14 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
 /// address `offsets[i]` plus `len` contiguous writable (outputs) or readable
 /// (inputs) elements; a stride-0 input need only address one readable element
 /// at `offsets[i]`. No other thread may access those destination elements
-/// during the call. The plan must be validated for these operand counts,
-/// `strides` must satisfy [`block_replay_eligible`], `direct` may mark only
-/// stride-1 inputs, and `regs` must hold [`register_file_len`] elements.
+/// during the call. Neither the input nor the destination storage may overlap
+/// `regs`: the replay holds `&mut` chunks of `regs` while it reads direct input
+/// slices and writes destination slices. The plan must be validated for these
+/// operand counts, `strides` must satisfy [`block_replay_eligible`], and `regs`
+/// must hold [`register_file_len`] elements. `direct` may mark only stride-1
+/// inputs that no entry of `plan.outputs` names: the replay neither loads nor
+/// computes a direct input's register, so a destination naming it would store
+/// the register's stale contents instead of the input.
 // Chunk replay: pointer tables, plan, offsets, the block length, strides, direct
 // flags and registers.
 #[allow(clippy::too_many_arguments)]
@@ -169,7 +174,7 @@ pub(super) unsafe fn replay_chunked<T: FusedScalar>(
     });
     // SAFETY: the caller upholds this function's contract, which the block body shares.
     #[cfg(not(feature = "simd"))]
-    // SAFETY: `replay_block` has this function's contract (chunk.rs:147), passed on unchanged.
+    // SAFETY: `replay_block` has this function's contract (chunk.rs:152), passed on unchanged.
     unsafe {
         replay_block(
             dst_ptrs, input_ptrs, plan, offsets, len, strides, direct, regs,
@@ -205,7 +210,7 @@ impl<T: FusedScalar> pulp::WithSimd for ReplayBlock<'_, T> {
     #[inline(always)]
     fn with_simd<S: pulp::Simd>(self, _simd: S) {
         // SAFETY: `ReplayBlock` is private to this module and built only in `replay_chunked`
-        // (chunk.rs:147) from arguments that meet that function's contract, which
+        // (chunk.rs:152) from arguments that meet that function's contract, which
         // `replay_block` shares.
         unsafe {
             replay_block(
@@ -242,7 +247,7 @@ impl<T: FusedScalar> pulp::WithSimd for ReplayBlockUninit<'_, T> {
     #[inline(always)]
     fn with_simd<S: pulp::Simd>(self, _simd: S) {
         // SAFETY: `ReplayBlockUninit` is private to this module and built only in
-        // `replay_chunked_uninit` (chunk.rs:332) from arguments that meet that function's
+        // `replay_chunked_uninit` (chunk.rs:337) from arguments that meet that function's
         // contract, which `replay_block_uninit` shares.
         unsafe {
             replay_block_uninit(
@@ -354,7 +359,7 @@ pub(super) unsafe fn replay_chunked_uninit<T: FusedScalar>(
     });
     // SAFETY: the caller upholds this function's contract, which the block body shares.
     #[cfg(not(feature = "simd"))]
-    // SAFETY: `replay_block_uninit` has this function's contract (chunk.rs:332), passed on
+    // SAFETY: `replay_block_uninit` has this function's contract (chunk.rs:337), passed on
     // unchanged.
     unsafe {
         replay_block_uninit(
@@ -444,7 +449,7 @@ unsafe fn fill_broadcast_inputs<T: FusedScalar>(
         if strides[first_operand + index] != 0 {
             continue;
         }
-        // SAFETY: this function's contract (chunk.rs:434): the operand addresses a readable
+        // SAFETY: this function's contract (chunk.rs:439): the operand addresses a readable
         // element at its block offset.
         let value = unsafe { *ptr.offset(offsets[first_operand + index]) };
         regs[index * FUSED_CHUNK_ELEMS..][..FUSED_CHUNK_ELEMS].fill(value);
@@ -717,7 +722,7 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
     }
 
     if TypeId::of::<T>() == TypeId::of::<f32>() {
-        // SAFETY: `cast_chunk`'s contract (chunk.rs:751) is `T == U`, which the `TypeId`
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:756) is `T == U`, which the `TypeId`
         // comparison just above proves for `f32`.
         let (src, dst) = unsafe { cast_chunk::<T, f32>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
@@ -731,7 +736,7 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
         });
     }
     if TypeId::of::<T>() == TypeId::of::<f64>() {
-        // SAFETY: `cast_chunk`'s contract (chunk.rs:751) is `T == U`, which the `TypeId`
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:756) is `T == U`, which the `TypeId`
         // comparison just above proves for `f64`.
         let (src, dst) = unsafe { cast_chunk::<T, f64>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
@@ -757,7 +762,7 @@ unsafe fn cast_chunk<'a, T: 'static, U: 'static>(
     debug_assert_eq!(TypeId::of::<T>(), TypeId::of::<U>());
     debug_assert_eq!(size_of::<T>(), size_of::<U>());
     debug_assert_eq!(align_of::<T>(), align_of::<U>());
-    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:751), so the
+    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:756), so the
     // pointer, length and lifetime describe the same elements.
     let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<U>(), src.len()) };
     // SAFETY: as for `src`; `dst` keeps its exclusive borrow.
