@@ -785,8 +785,10 @@ fn slabs_that_share_no_cache_line_keep_the_flat_walk() {
         &[1, 65_536, 4096],
         &[1, 4096, 4096]
     ));
-    // Not declined: under the model's 8-byte size the slabs look line-sized,
-    // but the u8 source's 8-byte slabs share lines with their neighbours.
+    // Not declined: the u8 source's slabs are 8 elements of 1 byte, below a
+    // line, so the pair still pays for tiling. The former single-size model
+    // gave both operands the 8-byte size of the u64 destination and this
+    // fixture then looked line-sized on both sides (#426).
     let mixed = Layout::new(&[8, 512, 512], &[1, 8, 4096], &[1, 4096, 8], 0);
     assert!(mixed.tiles::<u64, u8>().is_some());
     assert!(mixed.tiles::<f64, f64>().is_none());

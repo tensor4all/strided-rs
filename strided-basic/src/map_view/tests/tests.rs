@@ -327,3 +327,37 @@ fn a_mixed_size_map_writes_every_element_of_the_transposed_layout() {
         }
     }
 }
+
+
+/// tensor4all/strided-rs#431 review: the value assertions above cannot tell the
+/// per-operand tiling from the uniform one, so pin the traversal itself. With
+/// the caller sizing each operand by its own element size the same fixture is
+/// walked in the [57, 56] tiling and index 57 of the visit order holds `1`;
+/// rewriting only the caller's size literal to `[8, 8]` restores the [64, 32]
+/// tiling, where the same index holds `212` (both read from this fixture).
+#[test]
+fn a_mixed_size_map_walks_the_per_operand_tiling() {
+    let dims = [128usize, 128];
+    let dst_strides = [1isize, 128];
+    let src_strides = [128, 1];
+    let src: Vec<u8> = (0..128 * 128).map(|i| (i % 253) as u8).collect();
+    let mut dst = vec![0.0f64; 128 * 128];
+    let visit = std::sync::Mutex::new(Vec::<u64>::new());
+
+    let source = crate::StridedView::<u8>::new(&src, &dims, &src_strides, 0).unwrap();
+    let mut dest = crate::StridedViewMut::<f64>::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+    map_into(
+        &mut dest,
+        &source,
+        |x: u8| {
+            visit.lock().unwrap().push(u64::from(x));
+            f64::from(x)
+        },
+        Exec::serial(),
+    )
+    .unwrap();
+
+    let visit = visit.into_inner().unwrap();
+    assert_eq!(visit.len(), 128 * 128, "every element is visited once");
+    assert_eq!(visit[57], 1, "the [57, 56] tiling, not the [64, 32] one");
+}
