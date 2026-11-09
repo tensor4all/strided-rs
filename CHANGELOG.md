@@ -14,18 +14,20 @@ identified one body of content, so this patch moves it.
 
 What changed under 0.14.0:
 
-- **SAFETY documentation** (#219 wave): every `unsafe` block in `strided-view`, `strided-perm`,
+- **SAFETY documentation** (#219 wave): the `unsafe` blocks in `strided-view`, `strided-perm`,
   `strided-basic` (including `map_view.rs` and `ops_view.rs`), `strided-kernel`, `strided-fused` and
-  `strided-nn` now names the site that validates it (#435, #438, #440–#442, #444, #446, #448, #449).
-  Comments only; no code changed.
+  `strided-nn` name the site that validates them (#435, #438, #440–#442, #444, #446, #448, #449).
+  That is what those PRs say they changed; the identity check compares bytes, not intent. The one
+  non-comment change in the set is the two unit tests #449 added.
 - **Fixes**: `CopyPlan` costed by its footprint (#424), per-operand element size in the block model
   (#431), tile placement for the transposed, spilled and view paths (#422, #429, #433), tiled
   segments in `ConcatenatePlan`'s whole-plan parallel replay (#432), alignment of zero-length erased
   buffers (#436), and the `get_unchecked` index-arity contract (#439).
 - **Docs**: the crate READMEs follow the published 0.14 / view 0.8 line (#417, #418, #420).
 
-No public item was added or removed. `[workspace.dependencies]` moves with the crates, so a
-dependent packages against the version it needs.
+`[workspace.dependencies]` moves with the crates, so a dependent packages against the version it
+needs. This list is drawn from the commit subjects between the 0.14.0 publish and `34ec19c`; it is
+not a re-audit of each diff.
 
 ## 0.14.0 (2026-11-08) — breaking
 
