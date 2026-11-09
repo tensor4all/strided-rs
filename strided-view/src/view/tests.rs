@@ -279,7 +279,7 @@ fn test_try_constructors_reject_overflowing_shapes() {
             vec![1.0; 3],
             dims,
         ));
-        // SAFETY: the uninit constructors' only contract (view.rs:1613) is
+        // SAFETY: the uninit constructors' only contract (view.rs:1618) is
         // to read a slot after writing it; these calls fail and read nothing.
         assert_overflow(unsafe { StridedArray::<f64>::try_col_major_uninit(dims) });
         // SAFETY: as above.
@@ -295,7 +295,7 @@ fn uninit_col_major_writes_bool_slots_before_reading_them() {
     // neither 0 nor 1 is not a `bool`, so an uninitialized slot in a `Vec<bool>`
     // was already invalid before the caller wrote anything (#413).
     let dims = [2usize, 3];
-    // SAFETY: (view.rs:1613) every slot is written below before it is read.
+    // SAFETY: (view.rs:1618) every slot is written below before it is read.
     let mut a = unsafe { StridedArray::<bool>::try_col_major_uninit(&dims).unwrap() };
     for j in 0..dims[1] {
         for i in 0..dims[0] {
@@ -316,7 +316,7 @@ fn uninit_from_buffer_holds_reference_elements() {
     // `&u32` is the other element `set_len` storage broke, and this drives the
     // buffer constructor: the empty buffer grows to the shape.
     let values = [11u32, 22, 33];
-    // SAFETY: (view.rs:1613) every slot is written below before it is read.
+    // SAFETY: (view.rs:1618) every slot is written below before it is read.
     let mut a = unsafe {
         StridedArray::<&u32>::try_col_major_from_buffer_uninit(Vec::new(), &[3]).unwrap()
     };
@@ -335,7 +335,7 @@ fn uninit_from_buffer_resizes_without_touching_retained_slots() {
     // Spare capacity: the slot the caller already wrote survives the call.
     let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(6);
     buf.push(MaybeUninit::new(7));
-    // SAFETY: (view.rs:1613) only slot 0, written above, is read.
+    // SAFETY: (view.rs:1618) only slot 0, written above, is read.
     let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[2, 3]).unwrap() };
     assert_eq!((a.len(), a.data().len()), (6, 6));
     // SAFETY: slot 0 was written before the call; the others are never read.
@@ -343,18 +343,18 @@ fn uninit_from_buffer_resizes_without_touching_retained_slots() {
 
     // A longer buffer is truncated to the shape.
     let buf = vec![MaybeUninit::new(1u8); 10];
-    // SAFETY: (view.rs:1613) no slot is read.
+    // SAFETY: (view.rs:1618) no slot is read.
     let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[2, 3]).unwrap() };
     assert_eq!(a.data().len(), 6);
 
     // A zero extent makes the array empty whatever the other extents.
     let buf = vec![MaybeUninit::new(1u8); 3];
-    // SAFETY: (view.rs:1613) no slot is read.
+    // SAFETY: (view.rs:1618) no slot is read.
     let a = unsafe { StridedArray::try_col_major_from_buffer_uninit(buf, &[0, 4]).unwrap() };
     assert!(a.is_empty() && a.data().is_empty());
 
     // A zero-sized element still tracks its element count.
-    // SAFETY: (view.rs:1613) no slot is read.
+    // SAFETY: (view.rs:1618) no slot is read.
     let a =
         unsafe { StridedArray::<()>::try_col_major_from_buffer_uninit(Vec::new(), &[3]).unwrap() };
     assert_eq!(a.data().len(), 3);
@@ -607,4 +607,34 @@ fn test_view_set_rejects_an_out_of_bounds_index() {
     let mut data = vec![0.0f64; 4];
     let mut view = StridedViewMut::<f64>::new(&mut data, &[2, 2], &[2, 1], 0).unwrap();
     view.set(&[2, 0], 1.0);
+}
+
+// `get_unchecked` requires one index per axis. A shorter `indices` used to be
+// accepted silently: the loop skipped the missing axes, which read index 0 of
+// them instead of rejecting the call (#437).
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "wrong number of indices")]
+fn test_view_get_unchecked_rejects_a_short_index() {
+    let data = vec![1.0f64, 2.0, 3.0, 4.0];
+    let view = StridedView::<f64>::new(&data, &[2, 2], &[2, 1], 0).unwrap();
+    // SAFETY: the call violates the arity contract on purpose (#437). In debug
+    // builds `get_unchecked` panics on its `debug_assert_eq!` before it forms
+    // an offset, so the violating dereference never runs; the test is gated on
+    // `debug_assertions` and cannot exist where that check is compiled out.
+    let _ = unsafe { view.get_unchecked(&[1]) };
+}
+
+// The counterexample from #437: with a zero-extent axis the view's base pointer
+// is dangling, so dropping that axis used to dereference it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "wrong number of indices")]
+fn test_view_get_unchecked_rejects_a_short_index_on_a_zero_extent_axis() {
+    let data: [u8; 0] = [];
+    let view = StridedView::<u8>::new(&data, &[0], &[1], 0).unwrap();
+    // SAFETY: as above; the omitted axis has extent 0, so without the arity
+    // check the call would dereference the view's dangling base pointer.
+    let _ = unsafe { view.get_unchecked(&[]) };
 }
