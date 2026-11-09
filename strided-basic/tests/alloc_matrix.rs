@@ -1002,11 +1002,12 @@ fn check_overflowing_stride_keeps_the_exit_allocation_free() {
     let mut src_strides = vec![0isize; 9];
     src_strides[0] = 1isize << 61;
     let mut out = vec![0.0f64; len];
-    let unit: [(); 1] = [()];
-    // SAFETY: zero-sized elements make every offset of the dangling pointer a
-    // valid access, so an element reach no allocation could hold is still in
-    // bounds; the checked constructor refuses the layout before it can see that.
-    let source = unsafe { RawStridedRef::new_unchecked(&unit, &dims, &src_strides, 0) };
+    // A logically long zero-sized slice: the checked constructor requires every
+    // reachable *element* index to be inside the slice, and `1 << 61` is not
+    // inside one element. Zero-sized elements cost no storage, so this is a
+    // `Vec` of `()` rather than an allocation of that many bytes.
+    let unit: Vec<()> = vec![(); (1usize << 61) + 1];
+    let source = RawStridedRef::new(&unit, &dims, &src_strides, 0).unwrap();
     let mut dest = RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
     let apply = |_: &mut f64, _: ()| {};
     replay_map_raw(&mut dest, &source, apply, Exec::serial()).unwrap();
