@@ -17,8 +17,9 @@ What changed under 0.14.0:
 - **SAFETY documentation** (#219 wave): the `unsafe` blocks in `strided-view`, `strided-perm`,
   `strided-basic` (including `map_view.rs` and `ops_view.rs`), `strided-kernel`, `strided-fused` and
   `strided-nn` name the site that validates them (#435, #438, #440–#442, #444, #446, #448, #449).
-  That is what those PRs say they changed; the identity check compares bytes, not intent. The one
-  non-comment change in the set is the two unit tests #449 added.
+  That is what those PRs say they changed; the identity check compares bytes, not intent. Apart from
+  two new unit tests in #449 and a rustfmt reflow in #440, those diffs change comments only (checked
+  by removing comment lines from `git show` of each merge commit).
 - **Fixes**: `CopyPlan` costed by its footprint (#424), per-operand element size in the block model
   (#431), tile placement for the transposed, spilled and view paths (#422, #429, #433), tiled
   segments in `ConcatenatePlan`'s whole-plan parallel replay (#432), alignment of zero-length erased
