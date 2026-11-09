@@ -35,16 +35,20 @@ thread_local! {
 fn record_allocation() {
     GLOBAL_ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
     // `try_with` fails only during thread teardown, when nothing is counted.
-    let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+    let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
 }
 
 fn record_deallocation() {
-    let _ = THREAD_FREES.try_with(|count| count.set(count.get() + 1));
+    let _ = THREAD_FREES.try_with(|count| count.set(count.get().wrapping_add(1)));
 }
 
 // SAFETY: each method forwards its arguments unchanged to `System`, which meets the `GlobalAlloc`
-// contract. The counting side effects (an atomic add, and `try_with` on a `const`-initialized
-// thread-local `Cell`) neither allocate nor unwind.
+// contract, and the counting side effects neither allocate nor unwind. `fetch_add` on the atomic
+// wraps on overflow. The thread-local `Cell`s are `const`-initialized and have no destructor, so
+// `try_with` registers nothing and allocates nothing, and it returns `Err` during teardown
+// instead of panicking. Their updates use `wrapping_add`, so they cannot panic either, even with
+// overflow checks enabled; a plain `+ 1` would panic at `usize::MAX`, and a panic unwinding out
+// of a `GlobalAlloc` method violates its contract.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_allocation();
