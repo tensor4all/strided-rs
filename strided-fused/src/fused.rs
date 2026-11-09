@@ -1100,10 +1100,10 @@ where
                     // SAFETY: `map_into_validated` (strided-basic/src/execution.rs:161) needs
                     // three things. Every input shape equals `dest`'s: `validate_shapes` checked
                     // it (fused.rs:857) on the initialized path, and
-                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1794) on the
+                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1801) on the
                     // uninitialized one. `validated` belongs to this `dest`'s geometry: here
                     // `dest` is `dests[0]` of a single-destination call (fused.rs:1256,
-                    // fused.rs:1797), and the marker was made for `dests[0]` (fused.rs:851;
+                    // fused.rs:1804), and the marker was made for `dests[0]` (fused.rs:851;
                     // uninitialized entry: erased.rs:328). Bounds and aliasing hold for the
                     // replay: every view keeps its construction-time bounds, `dest` is borrowed
                     // `&mut`, and the inputs are shared views.
@@ -1393,8 +1393,8 @@ fn chunk_seed<T: FusedScalar>(inputs: &[StridedView<'_, T>]) -> Option<T> {
         return None;
     }
     // SAFETY: both interpreters call this only after returning early for an empty `dests[0]`
-    // (fused.rs:1461, fused.rs:1809) and after checking every input against its shape
-    // (fused.rs:857, fused.rs:1794), so `inputs[0]` is non-empty and `ptr()` is its element at
+    // (fused.rs:1461, fused.rs:1816) and after checking every input against its shape
+    // (fused.rs:857, fused.rs:1801), so `inputs[0]` is non-empty and `ptr()` is its element at
     // the view offset (`base_ptr`, strided-view/src/view.rs:446). This safe helper relies on
     // those two callers.
     Some(unsafe { *inputs[0].ptr() })
@@ -1485,20 +1485,26 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
     let total = dests[0].len();
     let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
         // SAFETY: `build_plan_fused_small` (strided-basic/src/execution.rs:87) needs matching
-        // rank-indexed lengths and representable shape, stride and offset arithmetic. `dims` is
-        // `dests[0]`'s, and every entry of `strides_list` has that rank, because each operand's
-        // shape was checked equal to it before this call. Every stride comes from a view whose
-        // construction bounded all reachable offsets (`validate_bounds`,
-        // strided-view/src/view.rs:187), so the arithmetic is representable.
+        // rank-indexed lengths and representable shape, stride and offset arithmetic. The lengths
+        // match: `dims` is `dests[0]`'s, and every entry of `strides_list` has that rank, because
+        // each operand's shape was checked equal to it before this call. Construction-time
+        // `validate_bounds` (strided-view/src/view.rs:187) establishes only that each operand's
+        // reachable offsets lie inside its slice; it does not establish the planner's arithmetic,
+        // which this proof leaves open. This small-tensor path skips the dimension ordering
+        // (strided-basic/src/kernel.rs:134), where the shift overflow tracked in #450 lives.
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
         // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
         // rank-indexed lengths, a valid destination index and representable shape, stride and
-        // offset arithmetic. `dims` is `dests[0]`'s, and every entry of `strides_list` has that
-        // rank, because each operand's shape was checked equal to it before this call. Every
-        // stride comes from a view whose construction bounded all reachable offsets
-        // (`validate_bounds`, strided-view/src/view.rs:187), so the arithmetic is representable.
-        // Index `0` is `dests[0]`.
+        // offset arithmetic. The lengths match: `dims` is `dests[0]`'s, and every entry of
+        // `strides_list` has that rank, because each operand's shape was checked equal to it
+        // before this call. Index `0` is `dests[0]`. Construction-time `validate_bounds`
+        // (strided-view/src/view.rs:187) establishes only that each operand's reachable offsets
+        // lie inside its slice, not the planner's arithmetic: the dimension-order importance
+        // shifts `1u64` by up to `g * rank` bits (strided-basic/src/fuse.rs:174-175, :185-186)
+        // before size-1 axes are cleared (:191-195), which overflows for some bounded layouts
+        // with three or more operands. That is tracked in #450; this precondition is not proven
+        // here.
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), elem_size) }
     };
 
@@ -1529,7 +1535,7 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                     // `plan.outputs` names (chunk.rs:76), and then keeps only stride-1 inputs
                     // (fused.rs:1436). The plan passed `validate_plan_for_scalar`, and only this
                     // partition writes these destination elements (see `replay_partitions`,
-                    // fused.rs:1623).
+                    // fused.rs:1629).
                     unsafe {
                         chunk::replay_chunked(
                             operand_ptrs(&dst_ptrs),
@@ -1634,9 +1640,10 @@ where
 {
     let total: usize = dims.iter().product();
     if parallel_width(&exec, class, total).get() > 1 {
-        // SAFETY: `compute_costs` (strided-basic/src/execution.rs:467) only needs the
-        // rank-indexed `ordered_strides` of one `build_plan_fused*` result, which is what both
-        // callers pass.
+        // SAFETY: `compute_costs` (strided-basic/src/execution.rs:467) needs well-formed
+        // rank-indexed `ordered_strides`, here one `build_plan_fused*` result, and representable
+        // cost arithmetic. The views' bounds checks establish only slice validity, so this proof
+        // does not establish the cost arithmetic.
         let costs = unsafe { compute_costs(ordered_strides) };
         // SAFETY: `mapreduce_threaded` (strided-basic/src/execution.rs:496). `dims`, `blocks`,
         // `ordered_strides` and `initial_offsets` come from one `build_plan_fused*` result, and
@@ -1685,11 +1692,11 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
     // output names a defined value (fused.rs:816) and instructions read only earlier values
     // (fused.rs:805), so with `input_count == 0` there is no value to name and the plan is
     // rejected. So `input_ptrs[0]` exists, and its element at `offsets[n]` (`k = 0`) is readable
-    // under this function's contract (fused.rs:1667).
+    // under this function's contract (fused.rs:1674).
     let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
-        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1667),
+        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1674),
         // passed on unchanged; `regs` holds `register_count` values.
         unsafe {
             interpret_loop_body_uninit(
@@ -1735,7 +1742,7 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
             let stride = inner_stride(strides, stride_index);
             // SAFETY: element `i < len` of input `input_index`, at its block offset and inner
             // stride, readable under the contract this body shares with
-            // `interpret_inner_loop_uninit` (fused.rs:1667).
+            // `interpret_inner_loop_uninit` (fused.rs:1674).
             regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
         for (instruction, inst) in plan.ops.iter().enumerate() {
@@ -1838,20 +1845,26 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
     let total = dests[0].len();
     let (fused_dims, ordered_strides, kernel_plan) = if total <= SMALL_TENSOR_THRESHOLD {
         // SAFETY: `build_plan_fused_small` (strided-basic/src/execution.rs:87) needs matching
-        // rank-indexed lengths and representable shape, stride and offset arithmetic. `dims` is
-        // `dests[0]`'s, and every entry of `strides_list` has that rank, because each operand's
-        // shape was checked equal to it before this call. Every stride comes from a view whose
-        // construction bounded all reachable offsets (`validate_bounds`,
-        // strided-view/src/view.rs:187), so the arithmetic is representable.
+        // rank-indexed lengths and representable shape, stride and offset arithmetic. The lengths
+        // match: `dims` is `dests[0]`'s, and every entry of `strides_list` has that rank, because
+        // each operand's shape was checked equal to it before this call. Construction-time
+        // `validate_bounds` (strided-view/src/view.rs:187) establishes only that each operand's
+        // reachable offsets lie inside its slice; it does not establish the planner's arithmetic,
+        // which this proof leaves open. This small-tensor path skips the dimension ordering
+        // (strided-basic/src/kernel.rs:134), where the shift overflow tracked in #450 lives.
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
         // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
         // rank-indexed lengths, a valid destination index and representable shape, stride and
-        // offset arithmetic. `dims` is `dests[0]`'s, and every entry of `strides_list` has that
-        // rank, because each operand's shape was checked equal to it before this call. Every
-        // stride comes from a view whose construction bounded all reachable offsets
-        // (`validate_bounds`, strided-view/src/view.rs:187), so the arithmetic is representable.
-        // Index `0` is `dests[0]`.
+        // offset arithmetic. The lengths match: `dims` is `dests[0]`'s, and every entry of
+        // `strides_list` has that rank, because each operand's shape was checked equal to it
+        // before this call. Index `0` is `dests[0]`. Construction-time `validate_bounds`
+        // (strided-view/src/view.rs:187) establishes only that each operand's reachable offsets
+        // lie inside its slice, not the planner's arithmetic: the dimension-order importance
+        // shifts `1u64` by up to `g * rank` bits (strided-basic/src/fuse.rs:174-175, :185-186)
+        // before size-1 axes are cleared (:191-195), which overflows for some bounded layouts
+        // with three or more operands. That is tracked in #450; this precondition is not proven
+        // here.
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), core::mem::size_of::<T>()) }
     };
 
@@ -1882,7 +1895,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     // `plan.outputs` names (chunk.rs:76), and then keeps only stride-1 inputs
                     // (fused.rs:1436). The plan passed `validate_plan_for_scalar`, and only this
                     // partition writes these destination elements (see `replay_partitions`,
-                    // fused.rs:1623).
+                    // fused.rs:1629).
                     unsafe {
                         chunk::replay_chunked_uninit(
                             operand_ptrs(&dst_ptrs),
@@ -1897,7 +1910,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     }
                     return Ok(());
                 }
-                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1667) holds:
+                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1674) holds:
                 // `offsets`, `len` and `strides` describe one generated block over shapes checked
                 // equal, so every element it reaches is inside each operand; only this partition
                 // writes those destination elements (see `replay_partitions`); and the plan
