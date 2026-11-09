@@ -141,16 +141,13 @@ fn layouts() -> Vec<(&'static str, Layout)> {
         ("4^9 reversed", reversed(&[4; 9])),
         // The spilled walk with a negative source axis and a nonzero base: a
         // walker that drops the sign still matches the positive case above.
-        (
-            "4^9 reversed source, negative last axis, cropped base",
-            {
-                let dims = [4usize; 9];
-                let dst: Vec<isize> = (0..9).map(|axis| 1isize << (2 * axis)).collect();
-                let mut src: Vec<isize> = (0..9).map(|axis| 1isize << (2 * (8 - axis))).collect();
-                src[8] = -1;
-                Layout::new(&dims, &dst, &src, 8)
-            },
-        ),
+        ("4^9 reversed source, negative last axis, cropped base", {
+            let dims = [4usize; 9];
+            let dst: Vec<isize> = (0..9).map(|axis| 1isize << (2 * axis)).collect();
+            let mut src: Vec<isize> = (0..9).map(|axis| 1isize << (2 * (8 - axis))).collect();
+            src[8] = -1;
+            Layout::new(&dims, &dst, &src, 8)
+        }),
         (
             "rank 12 reversed",
             reversed(&[2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4, 4]),
@@ -391,7 +388,10 @@ fn spilled_layouts_tile_as_their_compressed_rank_would() {
         .into_iter()
         .find(|(label, _)| label.starts_with("4^9 reversed source"))
         .expect("the negative spilled layout");
-    assert!(matches!(cropped.1.tiles::<f64, f64>(), Some(Tiles::Spilled(_))));
+    assert!(matches!(
+        cropped.1.tiles::<f64, f64>(),
+        Some(Tiles::Spilled(_))
+    ));
     let (dst_len, src_len) = cropped.1.lens();
     let src: Vec<f64> = (0..src_len).map(f64::value).collect();
     let mut expected = vec![0.0f64; dst_len];
@@ -406,7 +406,10 @@ fn spilled_layouts_tile_as_their_compressed_rank_would() {
     .unwrap();
     assert_eq!(bits(&actual), bits(&expected), "{}", cropped.0);
     let boxes = crate::threading::take_tile_boxes();
-    assert!(boxes >= 16, "the negative spilled copy must visit tiles, got {boxes}");
+    assert!(
+        boxes >= 16,
+        "the negative spilled copy must visit tiles, got {boxes}"
+    );
 
     // A layout whose column-major walk is kept stays on it: one box count of
     // zero is the same answer the inline route gives the rank-8 layout.
