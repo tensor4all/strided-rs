@@ -864,9 +864,16 @@ pub(crate) unsafe fn replay_fused<D, S, Apply>(
                     ns_per_element,
                     exec,
                 ),
-                Some(Tiles::Spilled(tiles)) => {
-                    replay_spilled_tiled(dst_ptr, dst_base, src_ptr, src_base, tiles, apply, exec)
-                }
+                Some(Tiles::Spilled(tiles)) => replay_spilled_tiled(
+                    dst_ptr,
+                    dst_base,
+                    src_ptr,
+                    src_base,
+                    tiles,
+                    apply,
+                    exec,
+                    ns_per_element,
+                ),
                 None => replay_spilled_raw(
                     dst_ptr,
                     dst_base,
@@ -1089,6 +1096,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
     tiles: &SpilledTiles,
     apply: Apply,
     exec: Exec<'_>,
+    ns_per_element: f64,
 ) where
     D: Copy + Send + Sync,
     S: Copy + Send + Sync,
@@ -1096,7 +1104,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
 {
     let rank = tiles.dims.len();
     let total = tiles.dims.iter().product::<usize>();
-    if !crate::cost::is_parallel(KernelClass::Copy, total, &exec) {
+    if !crate::cost::is_parallel_at_rate(total, ns_per_element, &exec) {
         // SAFETY: forwarded caller contract over the whole box.
         unsafe {
             apply_spilled_tiled_box(
@@ -1117,13 +1125,13 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
     let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
     #[cfg(test)]
     let leaves = std::sync::Mutex::new(Vec::new());
-    let result = crate::threading::mapreduce_threaded(
+    let result = crate::threading::mapreduce_threaded_at_rate(
         &tiles.dims[..rank],
         &tiles.blocks[..rank],
         &strides,
         &[dst_base, src_base],
         &costs,
-        KernelClass::Copy,
+        ns_per_element,
         exec,
         &|box_dims, _, _, offsets| {
             #[cfg(test)]

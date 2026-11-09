@@ -1143,3 +1143,61 @@ fn the_contiguous_exemption_is_the_walk_the_replay_takes() {
         PairTraversal::Spilled(_)
     ));
 }
+
+/// The spilled tiled replay — a fused rank above the inline limit whose tiles
+/// the model applies to the compressed axes — prices its fork gate and its
+/// splitter at the plan rate too. #364's review found the rate was dropped on
+/// this branch: it gated at the `Copy` row, so a plan priced at 3.0 ns per
+/// element stayed serial where the same plan on the inline path forked.
+#[cfg(feature = "parallel")]
+#[test]
+fn a_spilled_tiled_plan_past_l2_prices_its_splitter_at_its_own_rate() {
+    use threadteam::{ledger, DispatchCosts, DispatchKind, HostClass, Pool, WidthCosts};
+    let flat = WidthCosts::flat(core::time::Duration::from_micros(100));
+    let costs = DispatchCosts::for_class(HostClass::Generic)
+        .with(DispatchKind::Team, flat)
+        .with(DispatchKind::InPool, flat)
+        .with(DispatchKind::Outside, flat);
+    let pool = Pool::builder()
+        .threads(4)
+        .dispatch_costs(costs)
+        .build()
+        .unwrap();
+    let dims = [4usize; 9];
+    let dst_strides = [1isize, 4, 16, 64, 256, 1024, 4096, 16384, 65536];
+    let src_strides = [65536isize, 16384, 4096, 1024, 256, 64, 16, 4, 1];
+    let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
+    assert!(
+        matches!(plan.fused.tiles::<f64, f64>(), Some(Tiles::Spilled(_))),
+        "the case must take the spilled tiled replay"
+    );
+    let class = HostClass::X86_64Avx512;
+    let rate = plan.ns_per_element_on::<f64, f64>(class);
+    let row = KernelClass::Copy.ns_per_element_of(class);
+    // 262144 elements: 44.8 us at the row, 786 us at the plan rate, against a
+    // 100 us fork.
+    assert!(rate > row * 10.0);
+    let len = 262_144;
+    let mut installs = Vec::new();
+    for class in [HostClass::X86_64Avx512, HostClass::Generic] {
+        let src = vec![1.5f64; len];
+        let mut dst = vec![0.0f64; len];
+        let src_ref = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
+        let mut dst_mut = RawStridedMut::new(&mut dst, &dims, &dst_strides, 0).unwrap();
+        let exec = Exec::new(&pool, 4).unwrap();
+        let root = exec.ledger_root().unwrap();
+        plan.replay_on(class, &mut dst_mut, &src_ref, |d: &mut f64, s| *d = s, exec)
+            .unwrap();
+        assert_eq!(dst[0], 1.5);
+        assert_eq!(dst[len - 1], 1.5);
+        installs.push(ledger::installs(root));
+    }
+    assert!(
+        installs[0] > 0,
+        "the spilled splitter did not fork: the plan priced 262144 elements at {rate} ns"
+    );
+    assert_eq!(
+        installs[1], 0,
+        "priced for a class without a beyond-L2 rate the spilled replay must stay serial"
+    );
+}

@@ -316,8 +316,10 @@ it fits L2 and keeps the row, which is #364 item 1, not in this change. The 64 a
   row); only `x86_64-avx512` changes, and no such host was measured with a parallel
   `CopyPlan` for this change.
 - The beyond-L2 rate is calibrated on two hosts (2.32-2.76 here, 2.91-3.24 on the
-  reporting Xeon, quoted) and is 3.2-4.2x low against the 9.6-12.7 above and the
-  7.2-9.7 this host measured before #422 tiled the transposed path (quoted).
+  reporting Xeon, quoted). The one untiled beyond-L2 layout measured here (rank-1,
+  stride 256) is 9.6-12.7 ns per element, sampled while a co-tenant shared the
+  measured CPUs; a contended sample cannot establish the uncontended value, so no
+  underpricing ratio is claimed.
 
 ## Appendix: harness, commands and runs
 
@@ -412,9 +414,9 @@ fn plan_case(n: usize, transpose: bool) -> f64 {
         drop(dst_mut);
         if rep >= 4 {
             samples.push(elapsed.as_secs_f64() * 1e9 / (n * n) as f64);
-    // Two endpoints over a constant fill only: this is not a correctness check.
+        }
     }
-    // One checked element, so a wrong traversal fails the run instead of timing it.
+    // Two endpoints over a constant fill only: this is not a correctness check.
     assert_eq!(dst[0], 1.5);
     assert_eq!(dst[n * n - 1], 1.5);
     median(samples)
