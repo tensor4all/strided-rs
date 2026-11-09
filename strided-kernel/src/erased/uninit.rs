@@ -624,7 +624,7 @@ fn uninit_view_mut<'a, T: KernelStorageElement>(
     let strides = dest.strides();
     let offset = dest.offset();
     let data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:952) needs every index
+    // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:957) needs every index
     // combination in bounds: the same `validate_bounds` argument as in `uninit_raw_mut`
     // (erased/uninit.rs:601) covers these dims, strides and offset over `data`; the `&mut` slice
     // type carries the exclusivity.
@@ -992,7 +992,7 @@ where
             data.len(),
         )
     };
-    // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:952) needs every index
+    // SAFETY: `StridedViewMut::new_unchecked` (strided-view/src/view.rs:957) needs every index
     // combination in bounds: `dest` validated these dims, strides and offset against its slot
     // count when it was built (`validate_bounds`, strided-view/src/view.rs:187), and the
     // reinterpreted slice above keeps that count.
