@@ -132,5 +132,9 @@ A caller that wants its own thread budget builds a `Pool`, mints
   of #212 installed nothing and failed the first check.
 - `strided-basic/tests/serial_exec_global_pool.rs` — serial work never starts
   the process-global pool.
+- `strided-perm/tests/policy_guard.rs` — the permutation engine takes its width
+  from the token: a section cost the copy cannot repay installs nothing, a free
+  section installs work, and a serial token never starts the process-global pool
+  (tensor4all/strided-rs#209).
 - `strided-basic/tests/execution_pool_*.rs`, `strided-fused`,
   `strided-perm` — a pooled token stays within its budget.
