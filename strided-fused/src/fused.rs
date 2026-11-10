@@ -44,7 +44,7 @@ impl<'a, T> InitializedViewsMut<'a, T> {
         debug_assert!(self.len < strided_basic::OPERAND_CAP);
         // SAFETY: `storage` holds `OPERAND_CAP` writable slots by `new`'s contract
         // (fused.rs:36), and `len < OPERAND_CAP`: both callers push at most `dests.len() <=
-        // OPERAND_CAP` views (erased.rs:448, erased.rs:549). The `debug_assert!` above checks
+        // OPERAND_CAP` views (erased.rs:448, erased.rs:551). The `debug_assert!` above checks
         // that only in debug builds; this safe method relies on its two callers.
         unsafe { self.storage.add(self.len).write(MaybeUninit::new(view)) };
         self.len += 1;
@@ -64,8 +64,8 @@ impl<'a, T> InitializedViewsMut<'a, T> {
 impl<T> Drop for InitializedViewsMut<'_, T> {
     fn drop(&mut self) {
         for index in 0..self.len {
-            // SAFETY: `push` initialized every slot below `len`, and each one is dropped exactly
-            // once, here.
+            // SAFETY: `push` (fused.rs:43) initialized every slot below `len`; `MaybeUninit` has
+            // the view's layout, and `&mut self` in `drop` drops each slot exactly once.
             unsafe { (*self.storage.add(index)).assume_init_drop() };
         }
     }
@@ -1336,8 +1336,8 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: as for the inline register file above; `heap` is a fresh local `Vec`, so no
-        // operand element lies inside it either.
+        // SAFETY: as for the inline register file above (fused.rs:1321): `heap` is a fresh `Vec`,
+        // so no operand element lies inside it either.
         unsafe {
             interpret_loop_body(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
         };
@@ -1380,8 +1380,8 @@ unsafe fn interpret_loop_body<T: FusedScalar>(
         }
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
-            // SAFETY: element `i < len` of output `output_index`, writable under the same
-            // contract, and no other thread touches it.
+            // SAFETY: element `i < len` of output `output_index`, writable under this body's
+            // contract with `interpret_inner_loop` (fused.rs:1291); no other thread touches it.
             unsafe {
                 *dst_ptr.offset(offsets[output_index] + i * stride) =
                     regs[plan.outputs[output_index]];
@@ -1718,8 +1718,8 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: as for the inline register file above; `heap` is a fresh local `Vec`, so no
-        // operand element lies inside it either.
+        // SAFETY: as for the inline register file above (fused.rs:1704): `heap` is a fresh `Vec`,
+        // so no operand element lies inside it either.
         unsafe {
             interpret_loop_body_uninit(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
         };
@@ -1761,8 +1761,8 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
         }
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
-            // SAFETY: element `i < len` of output `output_index`, writable under the same
-            // contract; it is written, never read.
+            // SAFETY: element `i < len` of output `output_index`, writable under this body's
+            // contract with `interpret_inner_loop_uninit` (fused.rs:1679); it is never read.
             unsafe {
                 *dst_ptr.offset(offsets[output_index] + i * stride) =
                     MaybeUninit::new(regs[plan.outputs[output_index]]);

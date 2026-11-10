@@ -124,8 +124,8 @@ pub(super) fn with_register_file<T: FusedScalar, R>(
         for slot in uninit.iter_mut() {
             slot.write(seed);
         }
-        // SAFETY: every one of the `len` slots was written by the loop just above, so the `T`
-        // view is initialized; it reborrows `uninit`.
+        // SAFETY: every one of the `len` slots was written by the loop above (chunk.rs:124), so
+        // the `T` view is initialized; it reborrows `uninit`, which holds `len` slots.
         let regs = unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<T>(), len) };
         f(regs)
     })
@@ -553,6 +553,14 @@ unsafe fn store_output_chunks_uninit<T: FusedScalar>(
 /// Instruction `k` reads registers below `input_count + k` and writes exactly
 /// `input_count + k`, which validation guarantees, so splitting the file at the
 /// output register keeps the borrows disjoint without raw pointers.
+///
+/// # Safety
+/// As [`replay_chunked`]'s contract (`chunk.rs:137`), for one chunk: each output
+/// addresses `offsets[i] + done` plus `chunk` writable elements, each direct input
+/// the same range of readable ones, `done + chunk <= len`, and no other thread
+/// accesses them. `regs` must hold [`register_file_len`] elements and
+/// `chunk <= FUSED_CHUNK_ELEMS`. Both callers (`chunk.rs:312`, `:418`) hold all of
+/// that, from the replay's contract and from `chunk = (len - done).min(..)`.
 #[inline(always)]
 // Chunk executor: plan, the chunk length, pointer tables, offsets, first operand,
 // direct flags, the run offset and the register file.
@@ -729,7 +737,7 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
     }
 
     if TypeId::of::<T>() == TypeId::of::<f32>() {
-        // SAFETY: `cast_chunk`'s contract (chunk.rs:763) is `T == U`, which the `TypeId`
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:771) is `T == U`, which the `TypeId`
         // comparison just above proves for `f32`.
         let (src, dst) = unsafe { cast_chunk::<T, f32>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
@@ -743,7 +751,7 @@ fn try_analytic_unary_chunk<T: FusedScalar>(op: FusedOp, src: &[T], dst: &mut [T
         });
     }
     if TypeId::of::<T>() == TypeId::of::<f64>() {
-        // SAFETY: `cast_chunk`'s contract (chunk.rs:763) is `T == U`, which the `TypeId`
+        // SAFETY: `cast_chunk`'s contract (chunk.rs:771) is `T == U`, which the `TypeId`
         // comparison just above proves for `f64`.
         let (src, dst) = unsafe { cast_chunk::<T, f64>(src, dst) };
         return apply(op, src, dst, |op, src, dst| match op {
@@ -769,10 +777,11 @@ unsafe fn cast_chunk<'a, T: 'static, U: 'static>(
     debug_assert_eq!(TypeId::of::<T>(), TypeId::of::<U>());
     debug_assert_eq!(size_of::<T>(), size_of::<U>());
     debug_assert_eq!(align_of::<T>(), align_of::<U>());
-    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:763), so the
+    // SAFETY: `T` and `U` are the same type by this function's contract (chunk.rs:771), so the
     // pointer, length and lifetime describe the same elements.
     let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<U>(), src.len()) };
-    // SAFETY: as for `src`; `dst` keeps its exclusive borrow.
+    // SAFETY: as for `src` (chunk.rs:780): the same `T == U` contract applies, and
+    // `dst` keeps its exclusive borrow.
     let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<U>(), dst.len()) };
     (src, dst)
 }

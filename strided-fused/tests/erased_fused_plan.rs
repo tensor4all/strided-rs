@@ -675,9 +675,11 @@ fn erased_fused_plan_executes_rank_zero_uninit_multiple_outputs() {
     // fully reachable, and `execute_outputs_uninit` returned `Ok`, which initializes every
     // logical destination element (strided-fused/src/erased.rs:221).
     assert_eq!(unsafe { pass_through[0].assume_init() }, 2.0);
-    // SAFETY: as for `pass_through` above.
+    // SAFETY: as for `pass_through` above (erased_fused_plan.rs:674): the same rank-0 layout and
+    // the same `Ok` from `execute_outputs_uninit` (strided-fused/src/erased.rs:221).
     assert_eq!(unsafe { negated[0].assume_init() }, -2.0);
-    // SAFETY: as for `pass_through` above.
+    // SAFETY: as for `negated` above (erased_fused_plan.rs:678): the same rank-0 layout and the
+    // same `Ok` from `execute_outputs_uninit` (strided-fused/src/erased.rs:221).
     assert_eq!(unsafe { twice[0].assume_init() }, 2.0);
 }
 
@@ -806,9 +808,10 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
     for (index, slot) in first_storage.iter().enumerate() {
         // SAFETY: the sentinel slots were initialized before the call.
         assert_eq!(
-            // SAFETY: every slot of `first_storage` was created as `MaybeUninit::new(7.5)`, the
-            // call failed before writing, and the uninitialized-destination path stores only
-            // initialized values anyway.
+            // SAFETY: every slot of `first_storage` was created as `MaybeUninit::new(7.5)`
+            // (erased_fused_plan.rs:796), and the call failed at the overlap check
+            // (strided-fused/src/erased.rs:319) before any store; the uninitialized-destination
+            // path stores only initialized values anyway.
             unsafe { slot.assume_init() },
             7.5,
             "first destination element {index} was written before validation failed"
