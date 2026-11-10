@@ -522,9 +522,9 @@ fn test_compute_importance_matches_exact_reference() {
             // Stride permutations for the size-1 sweep: every operand
             // independent while that stays within the test budget (n <= 3 any
             // m, n = 4 up to m = 2). The exhaustive `24^3 + 24^4 = 345 600`
-            // grid at n = 4 costs ~4.6 s in a debug test build, so
-            // `n = 4, m >= 3` crosses every pair of operands instead
-            // (`24^2` per pair, the rest column-major).
+            // grid at n = 4 is what that budget excludes -- no timing is
+            // claimed for it here -- so `n = 4, m >= 3` crosses every pair of
+            // operands instead (`24^2` per pair, the rest column-major).
             let independent: Vec<Vec<usize>> = if perms.len().pow(m as u32) <= 2000 {
                 vec![(0..m).collect()]
             } else {
