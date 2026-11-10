@@ -1494,10 +1494,10 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         // match: `dims` is `dests[0]`'s, and every entry of `strides_list` has that rank, because
         // each operand's shape was checked equal to it before this call. Construction-time
         // `validate_bounds` (strided-view/src/view.rs:187) establishes only that each operand's
-        // reachable offsets lie inside its slice; it does not establish the planner's arithmetic,
-        // which this proof leaves open. This path skips the dimension ordering
-        // (strided-basic/src/kernel.rs:134), so the importance weight never forms; the arithmetic
-        // left is `fuse_dims`'s, and it is checked (strided-basic/src/fuse.rs:63-65, :76-79).
+        // reachable offsets lie inside its slice; it does not establish the planner's arithmetic.
+        // This path skips the dimension ordering (strided-basic/src/kernel.rs:134), so the
+        // importance weight never forms; the arithmetic left is `fuse_dims`'s, and it is checked
+        // (strided-basic/src/fuse.rs:63-65, :76-79).
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
         // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
@@ -1859,10 +1859,10 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         // match: `dims` is `dests[0]`'s, and every entry of `strides_list` has that rank, because
         // each operand's shape was checked equal to it before this call. Construction-time
         // `validate_bounds` (strided-view/src/view.rs:187) establishes only that each operand's
-        // reachable offsets lie inside its slice; it does not establish the planner's arithmetic,
-        // which this proof leaves open. This path skips the dimension ordering
-        // (strided-basic/src/kernel.rs:134), so the importance weight never forms; the arithmetic
-        // left is `fuse_dims`'s, and it is checked (strided-basic/src/fuse.rs:63-65, :76-79).
+        // reachable offsets lie inside its slice; it does not establish the planner's arithmetic.
+        // This path skips the dimension ordering (strided-basic/src/kernel.rs:134), so the
+        // importance weight never forms; the arithmetic left is `fuse_dims`'s, and it is checked
+        // (strided-basic/src/fuse.rs:63-65, :76-79).
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
         // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
