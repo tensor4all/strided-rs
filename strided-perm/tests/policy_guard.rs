@@ -84,7 +84,14 @@ fn the_permutation_runs_on_the_token_it_is_handed() {
     assert_transposed(&destination, &source, "the pooled copy");
 
     // The serial route writes the transposed source and never starts the
-    // process-global pool (the rayon guard of #209).
+    // process-global pool (the rayon guard of #209). Poison the destination
+    // first: otherwise the pooled copy's output already satisfies the value
+    // check and deleting this copy would go unnoticed (review of 4168cea).
+    for i in 0..N {
+        for j in 0..N {
+            destination.set(&[i, j], f64::NAN);
+        }
+    }
     copy_into(&mut destination.view_mut(), &transposed, Exec::serial()).unwrap();
     assert_transposed(&destination, &source, "the serial copy");
     assert!(
