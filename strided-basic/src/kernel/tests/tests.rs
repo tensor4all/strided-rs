@@ -419,3 +419,224 @@ fn test_macro_kernel_7d_visits_all_elements() {
 fn test_macro_kernel_8d_visits_all_elements() {
     verify_kernel_visits_all_elements(8);
 }
+
+// ============================================================================
+// L1 set fit of the planned tiles (#287)
+// ============================================================================
+
+/// Lines a tile may keep live in one 8-way L1 set.
+const LIVE_LINES: u128 = 6;
+
+/// The per-set load of the lines a tile keeps live, computed independently of
+/// the planner from the L1d geometry the tiles target: 32 KiB, 8 ways, so a
+/// 4 KiB way and 64-byte lines.
+///
+/// For operand `k`, `c_k` is its first axis whose byte stride is below a line;
+/// the lines along the axes before it are revisited on the next step of
+/// `c_k`. Along an axis of byte stride `s` they repeat a set after
+/// `4096 / gcd(s, 4096)` steps, so `b` steps put `ceil(b / P)` lines in a set.
+/// A tile may keep [`LIVE_LINES`] of them: the 8 ways less a quarter of
+/// headroom for pseudo-LRU replacement and the stride prefetcher.
+fn l1_set_load(blocks: &[usize], strides_list: &[&[isize]], elem_sizes: &[usize]) -> u128 {
+    const LINE: u128 = 64;
+    const WAY: u128 = 32 * 1024 / 8;
+    fn gcd(a: u128, b: u128) -> u128 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    strides_list
+        .iter()
+        .zip(elem_sizes)
+        .filter(|&(_, &e)| e > 0)
+        .filter_map(|(strides, &e)| {
+            let byte = |i: usize| strides[i].unsigned_abs() as u128 * e as u128;
+            // `c_k = 0`: the operand streams its lines and keeps none live.
+            let c = (0..strides.len())
+                .find(|&i| byte(i) < LINE)
+                .filter(|&c| c > 0)?;
+            Some((0..c).fold(1u128, |load, i| {
+                let period = WAY / gcd(byte(i), WAY);
+                load * (blocks[i] as u128).div_ceil(period)
+            }))
+        })
+        .sum()
+}
+
+/// Column-major strides of `dims`.
+fn col_major(dims: &[usize]) -> Vec<isize> {
+    let mut acc = 1isize;
+    dims.iter()
+        .map(|&d| {
+            let s = acc;
+            acc *= d as isize;
+            s
+        })
+        .collect()
+}
+
+/// Strides of `dims` stored with axis `storage[0]` fastest, then `storage[1]`, ...
+fn stored(dims: &[usize], storage: &[usize]) -> Vec<isize> {
+    let mut strides = vec![0isize; dims.len()];
+    let mut acc = 1isize;
+    for &axis in storage {
+        strides[axis] = acc;
+        acc *= dims[axis] as isize;
+    }
+    strides
+}
+
+/// `D = A op B` layouts whose transposed or permuted operands walk
+/// power-of-two strides along the destination's run: the tiles of #287.
+fn transposed_operand_layouts() -> Vec<(&'static str, Vec<usize>, Vec<Vec<isize>>)> {
+    let mut cases = Vec::new();
+    for (m, n) in [(2048, 2048), (1024, 4096), (4096, 1024)] {
+        let d = col_major(&[m, n]);
+        let t = stored(&[m, n], &[1, 0]);
+        cases.push((
+            "B transposed",
+            vec![m, n],
+            vec![d.clone(), d.clone(), t.clone()],
+        ));
+        cases.push((
+            "A and B transposed",
+            vec![m, n],
+            vec![d.clone(), t.clone(), t.clone()],
+        ));
+        cases.push((
+            "B transposed, A row broadcast",
+            vec![m, n],
+            vec![d, vec![0, 1], t],
+        ));
+    }
+    let dims = [128usize, 128, 256];
+    let d = col_major(&dims);
+    for storage in [[2, 0, 1], [1, 2, 0], [2, 1, 0]] {
+        cases.push((
+            "B permuted",
+            dims.to_vec(),
+            vec![d.clone(), d.clone(), stored(&dims, &storage)],
+        ));
+    }
+    cases
+}
+
+#[test]
+fn transposed_operand_tiles_fit_the_l1_sets() {
+    for elem in [8usize, 4] {
+        for (name, dims, strides) in transposed_operand_layouts() {
+            let refs: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+            let sizes = vec![elem; refs.len()];
+            let (fused, ordered, plan) = build_plan_fused(&dims, &refs, Some(0), &sizes);
+            let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+            let load = l1_set_load(&plan.block, &ordered, &sizes);
+            assert!(
+                load <= LIVE_LINES,
+                "{name} {dims:?} elem {elem}: tiles {:?} over {:?} keep {load} lines live in one 8-way L1 set",
+                plan.block.as_slice(),
+                fused.as_slice(),
+            );
+        }
+    }
+}
+
+#[test]
+fn transposed_copy_pair_tiles_fit_the_l1_sets() {
+    use crate::raw_ops::{pair_tiles, FusedPairLayout, RAW_FUSED_RANK_LIMIT};
+    for (m, n) in [(2048usize, 2048usize), (1024, 4096), (4096, 1024)] {
+        let mut layout = FusedPairLayout {
+            rank: 2,
+            dims: [1; RAW_FUSED_RANK_LIMIT],
+            dst_strides: [0; RAW_FUSED_RANK_LIMIT],
+            src_strides: [0; RAW_FUSED_RANK_LIMIT],
+        };
+        layout.dims[..2].copy_from_slice(&[m, n]);
+        layout.dst_strides[..2].copy_from_slice(&[1, m as isize]);
+        layout.src_strides[..2].copy_from_slice(&[n as isize, 1]);
+        let tiles = pair_tiles::<f64, f64>(&layout).expect("a transposed copy is tiled");
+        let blocks = &tiles.blocks[..2];
+        let load = l1_set_load(blocks, &[&[1, m as isize], &[n as isize, 1]], &[8, 8]);
+        assert!(
+            load <= LIVE_LINES,
+            "copy [{m}, {n}] transposed: tiles {blocks:?} keep {load} lines live in one 8-way L1 set"
+        );
+    }
+}
+
+/// Layouts without a large-stride run under a reused operand, a destination
+/// with zero-stride (reduced) axes, and the transposed set: the planner's tiles
+/// never exceed the model's, equal them where no line is kept live, and keep
+/// every destination zero-stride axis at the model's block.
+#[test]
+fn planned_tiles_never_exceed_the_model_and_keep_the_reduced_axes() {
+    let mut cases = transposed_operand_layouts();
+    for (m, n) in [(2048usize, 2048usize), (2047, 2047), (1000, 4100)] {
+        let d = col_major(&[m, n]);
+        let t = stored(&[m, n], &[1, 0]);
+        // No operand keeps a line live: the model's tiles exactly.
+        cases.push((
+            "column-major",
+            vec![m, n],
+            vec![d.clone(), d.clone(), d.clone()],
+        ));
+        cases.push((
+            "row broadcast",
+            vec![m, n],
+            vec![d.clone(), d.clone(), vec![0, 1]],
+        ));
+        cases.push((
+            "column broadcast",
+            vec![m, n],
+            vec![d.clone(), d.clone(), vec![1, 0]],
+        ));
+        // A reduction into a vector: the destination's zero-stride axis.
+        cases.push(("sum over columns", vec![m, n], vec![vec![1, 0], t.clone()]));
+        cases.push(("sum over rows", vec![m, n], vec![vec![0, 1], d.clone()]));
+        cases.push((
+            "sum over rows of a transpose",
+            vec![m, n],
+            vec![vec![0, 1], t],
+        ));
+    }
+    for elem in [8usize, 4] {
+        for (name, dims, strides) in &cases {
+            let refs: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+            let sizes = vec![elem; refs.len()];
+            let (fused, ordered, plan) = build_plan_fused(dims, &refs, Some(0), &sizes);
+            let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+            let model = crate::block::compute_block_sizes(&fused, &ordered, &sizes);
+            for axis in 0..fused.len() {
+                assert!(
+                    (1..=model[axis]).contains(&plan.block[axis]),
+                    "{name} {dims:?} elem {elem}: tiles {:?} outside 1..=model {:?}",
+                    plan.block.as_slice(),
+                    model.as_slice(),
+                );
+                if ordered[0][axis] == 0 {
+                    assert_eq!(
+                        plan.block[axis], model[axis],
+                        "{name} {dims:?} elem {elem}: reduced axis {axis} moved from the model"
+                    );
+                }
+            }
+            if l1_set_load(&model, &ordered, &sizes) <= LIVE_LINES {
+                assert_eq!(
+                    plan.block.as_slice(),
+                    model.as_slice(),
+                    "{name} {dims:?} elem {elem}: tiles within the sets must stay the model's"
+                );
+            }
+            // A fold has no destination; its tiles order the accumulator and
+            // stay the model's.
+            let (fold_dims, fold_strides, fold_plan) = build_plan_fused(dims, &refs, None, &sizes);
+            let fold_strides: Vec<&[isize]> = fold_strides.iter().map(|s| s.as_slice()).collect();
+            assert_eq!(
+                fold_plan.block.as_slice(),
+                crate::block::compute_block_sizes(&fold_dims, &fold_strides, &sizes).as_slice(),
+                "{name} {dims:?} elem {elem}: a fold's tiles moved from the model"
+            );
+        }
+    }
+}
