@@ -490,7 +490,10 @@ fn stored(dims: &[usize], storage: &[usize]) -> Vec<isize> {
 
 /// `D = A op B` layouts whose transposed or permuted operands walk
 /// power-of-two strides along the destination's run: the tiles of #287.
-fn transposed_operand_layouts() -> Vec<(&'static str, Vec<usize>, Vec<Vec<isize>>)> {
+/// A named layout: dims and one stride vector per operand, destination first.
+type NamedLayout = (&'static str, Vec<usize>, Vec<Vec<isize>>);
+
+fn transposed_operand_layouts() -> Vec<NamedLayout> {
     let mut cases = Vec::new();
     for (m, n) in [(2048, 2048), (1024, 4096), (4096, 1024)] {
         let d = col_major(&[m, n]);
