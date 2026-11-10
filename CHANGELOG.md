@@ -122,6 +122,18 @@ failure the version number has to announce, and one no workspace test can see, b
 missing version for a dependent to meet; the order was (`traits`, `view`,
 `perm`, `basic`, `fused`, `nn`, `kernel`).
 
+### The fused planner no longer overflows its ordering weights (#450)
+
+`compute_importance` packs each array's axis level `n - order` `g = ceil(log2(m + 2))` bits
+apart, which needs 98 bits at rank 32 with four planner operands (the highest term is
+`2^97`: a 93-bit level shift times the `2^4` output weight). `1u64 << shift` panicked in
+debug ("attempt to shift left with overflow") and wrapped in release, where the plan order for a
+high-rank pointwise call came out scrambled. The packing is now tried first under checked
+arithmetic and kept whenever it fits, so weights and plan order are unchanged wherever the old
+code worked; on an actual overflow the per-level width narrows to the widest one that fits,
+which keeps every level distinct below rank ~62. Past that, the levels above the cap share the
+top weight.
+
 ### The unpublished 0.13.1 batch
 
 `strided-view` 0.7.3, `strided-basic`/`strided-perm`/`strided-kernel` 0.13.1 and `strided-traits` 0.7.2 were staged and
