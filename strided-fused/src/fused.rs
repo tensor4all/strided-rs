@@ -1507,9 +1507,10 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         // before this call. Index `0` is `dests[0]`. Construction-time `validate_bounds`
         // (strided-view/src/view.rs:187) establishes only that each operand's reachable offsets
         // lie inside its slice; the planner's arithmetic is checked. The importance weight shifts
-        // `1u64` by up to `g * rank` bits (#450), but `compute_importance` checks every shift,
-        // product and sum (strided-basic/src/fuse.rs:179-182), skips size-1 axes (:186-190) and
-        // narrows the width or ties every axis when the packing does not fit (:207-231).
+        // `1u64` by up to `g * rank` bits (#450), but `compute_importance` checks every shift
+        // (strided-basic/src/fuse.rs:179-182), every weighted product (:196) and every sum
+        // (:200), skips size-1 axes (:186-190) and narrows the width or ties every axis when
+        // the packing does not fit (:207-231).
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), elem_size) }
     };
 
@@ -1872,9 +1873,10 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         // before this call. Index `0` is `dests[0]`. Construction-time `validate_bounds`
         // (strided-view/src/view.rs:187) establishes only that each operand's reachable offsets
         // lie inside its slice; the planner's arithmetic is checked. The importance weight shifts
-        // `1u64` by up to `g * rank` bits (#450), but `compute_importance` checks every shift,
-        // product and sum (strided-basic/src/fuse.rs:179-182), skips size-1 axes (:186-190) and
-        // narrows the width or ties every axis when the packing does not fit (:207-231).
+        // `1u64` by up to `g * rank` bits (#450), but `compute_importance` checks every shift
+        // (strided-basic/src/fuse.rs:179-182), every weighted product (:196) and every sum
+        // (:200), skips size-1 axes (:186-190) and narrows the width or ties every axis when
+        // the packing does not fit (:207-231).
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), core::mem::size_of::<T>()) }
     };
 
