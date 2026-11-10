@@ -97,7 +97,7 @@ fn typed_ops_on_near_max_layouts_do_not_overflow() {
         let mut dst =
             StridedViewMut::new(&mut dst_data, &c.dims, &c.dst_strides, c.dst_offset).unwrap();
         copy_into(&mut dst, &src(), Exec::serial()).unwrap();
-        copy_into_col_major(&mut dst, &src()).unwrap();
+        copy_into_col_major(&mut dst, &src(), Exec::serial()).unwrap();
         map_into(&mut dst, &src(), |x| x, Exec::serial()).unwrap();
         zip_map2_into(&mut dst, &src(), &src(), |x, y| x + y, Exec::serial()).unwrap();
         add_acc(&mut dst, &src(), Exec::serial()).unwrap();

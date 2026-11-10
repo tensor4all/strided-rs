@@ -4,6 +4,30 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
+## 0.15.0 (unreleased) — minor
+
+`0.14.0` is published and the tree already carries the parked `0.14.1` patch (#452), so nothing unpublished can absorb
+an API addition: a new parameter on `copy_into_col_major` is a minor. The workspace version still reads `0.14.1` and
+moves when this section is released, together with or after that patch.
+
+### `strided-basic`: `copy_into_col_major` takes its `Exec` token
+
+`strided_basic::copy_into_col_major(dst, src)` hard-coded `Exec::serial()` and handed that to the permutation engine, so a
+4096x4096 transpose asked for on a four-slot pool ran on one core and the signature said nothing about it (#212). It now
+takes the token last, like `copy_into` and every other entry that can fan out ([`docs/threading-contract.md`]), and
+forwards the caller's token unchanged.
+
+```rust
+// before
+copy_into_col_major(&mut dst, &src)?;
+// after
+copy_into_col_major(&mut dst, &src, exec)?;   // Exec::serial() restores the old route
+```
+
+Same result, same layout rules; only the route changes. `strided-perm::copy_into_col_major` already took an `Exec`.
+
+[`docs/threading-contract.md`]: https://github.com/tensor4all/strided-rs/blob/main/docs/threading-contract.md
+
 ## 0.14.1 (unreleased) — patch
 
 `0.14.0` shipped on crates.io on 2026-11-08. Since then `main` has changed shipped files in all six
@@ -29,6 +53,9 @@ What changed under 0.14.0:
 `[workspace.dependencies]` moves with the crates, so a dependent packages against the version it
 needs. This list is drawn from the commit subjects between the 0.14.0 publish and `34ec19c`; it is
 not a re-audit of each diff.
+
+This patch is the version move for the published-content identity check (#409, #452) and nothing else. It does not carry
+the `copy_into_col_major` signature change: that is a new minor and lands in `0.15.0` above.
 
 ## 0.14.0 (2026-11-08) — breaking
 

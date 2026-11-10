@@ -50,7 +50,7 @@ fn broadcast_updates_with_overflowing_count_return_error() {
     assert!(copy_into(&mut dst, &src(dims, strides), Exec::serial()).is_err());
     assert!(copy_conj_into(&mut dst, &src(dims, strides), Exec::serial()).is_err());
     assert!(copy_scale_into(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
-    assert!(copy_into_col_major(&mut dst, &src(dims, strides)).is_err());
+    assert!(copy_into_col_major(&mut dst, &src(dims, strides), Exec::serial()).is_err());
     assert!(copy_transpose_scale_into(&mut dst, &src(dims, strides), 2.0, Exec::serial()).is_err());
     assert!(map_into(&mut dst, &src(dims, strides), |x| x, Exec::serial()).is_err());
     assert!(zip_map2_into(
@@ -89,7 +89,7 @@ fn empty_layouts_with_overflowing_extents_are_noops() {
         copy_into(&mut dst, &s(), Exec::serial()).unwrap();
         copy_conj_into(&mut dst, &s(), Exec::serial()).unwrap();
         copy_scale_into(&mut dst, &s(), 2.0, Exec::serial()).unwrap();
-        copy_into_col_major(&mut dst, &s()).unwrap();
+        copy_into_col_major(&mut dst, &s(), Exec::serial()).unwrap();
         map_into(&mut dst, &s(), |x| x, Exec::serial()).unwrap();
         zip_map2_into(&mut dst, &s(), &s(), |x, y| x + y, Exec::serial()).unwrap();
         zip_map3_into(
