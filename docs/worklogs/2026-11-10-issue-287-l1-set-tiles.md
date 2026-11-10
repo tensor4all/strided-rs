@@ -48,7 +48,7 @@ checked bitwise against the model's before timing.
 - Changed cells: median ratio 1.44 (range 0.47-3.33). `copy_into` and `replay_copy_raw` gain
   in every changed cell (1.13-3.33x), `f32` `mul_into` 1.07-1.74x except B perm (2,0,1); `f64`
   `mul_into` 0.47-1.51x. The #287 cell (2048², B transposed): 1.22x f64 / 1.68x f32 at 1T, 1.11x / 1.55x at 4T.
-- **Regressions (10):** `mul_into` with B permuted on [128,128,256] (fused to [16384, 256]): (2,0,1) f64
+- **Regressions (10):** `mul_into` with B permuted on [128,128,256]: (2,0,1) f64 (fused to [16384, 256], B row stride 2 KiB)
   and f32, (1,2,0) f64, (2,1,0) f64, each at 1T and 4T (0.47-0.80); 1024×4096 f64 at 4T, B transposed
   (0.72) and A,B transposed (0.84).
 
