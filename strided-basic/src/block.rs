@@ -138,27 +138,40 @@ pub(crate) fn destination_block_sizes(
 /// sweep of those axes. An operand with `c_k = 0` streams its lines and has
 /// nothing live; one with no such axis never revisits a line.
 ///
-/// **How many share a set.** Along an axis with byte stride `s >= line`,
-/// consecutive lines land in sets that repeat after `P = w / gcd(s, w)` steps,
-/// so `b` steps put `ceil(b / P)` lines in one set. The operand's per-set load
-/// is the product of those factors over its axes before `c_k`, and the loads
-/// of all operands add up. A power-of-two leading dimension is the bad case:
-/// a 2048-element `f64` row stride is 16 KiB, `P = 1`, and the model's
-/// `[40, 32]` tile puts 40 lines in one 8-way set ([#287]). A non-power-of-two
-/// stride spreads its lines over many sets and is left alone.
+/// **How many share a set.** Along an axis whose byte stride is a multiple
+/// of the way size `w`, every step lands in the same set, so `b` steps put `b`
+/// lines in one set. The operand's per-set load is the product of the extents
+/// of such axes before `c_k`, and the loads of all operands add up. A
+/// power-of-two leading dimension is the case: a 2048-element `f64` row stride
+/// is 16 KiB, and the model's `[40, 32]` tile puts 40 lines in one 8-way set
+/// ([#287]).
+///
+/// Only full aliasing counts. An axis whose stride is not a multiple of `w`
+/// spreads its lines over `w / gcd(s, w) >= 2` sets, and on the #287 probe a
+/// stride with two sets (2 KiB, `f64` 16384×256) showed no penalty at the
+/// model's tile while the shorter runs of a fit cost the walk 1.4x; such axes
+/// are left alone (see the worklog).
 ///
 /// **The budget.** The load may not exceed
 /// [`L1_LIVE_LINES_PER_SET`](crate::L1_LIVE_LINES_PER_SET), the ways less a
 /// quarter of headroom for the pseudo-LRU replacement and the stride
 /// prefetcher (see the constant).
 ///
-/// **The fit.** While the load exceeds the budget, the outermost shrinkable axis
-/// (the inner run stays long for the operands that stream it) is cut to the
-/// largest extent that meets the budget, or, if that axis alone cannot, to the
-/// extent `min P` at which it contributes a factor of 1, and the next axis is
-/// tried. Blocks only shrink, so the model's footprint bound still holds
-/// (upper bound), and no block drops below `min(b_i, min_k P_k,i)` (lower
-/// bound): an axis whose lines do not alias is never cut.
+/// **The fit.** While the load exceeds the budget, the outermost shrinkable
+/// axis (the inner run stays long for the operands that stream it) is cut to
+/// the largest extent that meets the budget, or, if that axis alone cannot, to
+/// 1, and the next axis is tried. Blocks only shrink, so the model's footprint
+/// bound still holds (upper bound), and only an axis on which some live
+/// operand fully aliases is cut at all (no other axis moves).
+///
+/// **Which walks.** Only two-operand walks (one destination, one source:
+/// `copy_into`, unary maps, the raw pair replay) are fitted; a walk with more
+/// operands keeps the model's tiles. The #287 gate measured the fit on both:
+/// every two-operand cell whose tiles changed ran faster (1.13x to 3.3x),
+/// while three-operand `mul_into` regressed in 16 cells, up to 2.1x slower
+/// (permuted B and rectangular transposes in `f64`), because the walk's
+/// per-run cost on the shortened runs outweighs the set fit there. The
+/// measurement is in the worklog.
 ///
 /// **Numerical results.** Tiles change only the visit order. A caller either
 /// writes each destination slot once from a pointwise expression (the map,
@@ -185,7 +198,8 @@ pub(crate) fn fit_l1_sets(
     let budget = crate::bench_hooks::L1_SET_BUDGET.load(core::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "bench-hooks"))]
     let budget = crate::L1_LIVE_LINES_PER_SET;
-    if budget == 0 {
+    // Two-operand walks only: see "Which walks" above.
+    if budget == 0 || strides_list.len() != 2 {
         return;
     }
     let sets = L1Sets::new(strides_list, elem_sizes);
@@ -256,11 +270,11 @@ impl<'a> L1Sets<'a> {
         (c > 0).then_some(c)
     }
 
-    /// Steps along an axis of byte stride `s` before its lines repeat a set.
-    fn period(&self, k: usize, axis: usize) -> usize {
+    /// Whether every step of operand `k` along `axis` lands in the same set:
+    /// its byte stride is a nonzero multiple of the way size.
+    fn aliases(&self, k: usize, axis: usize) -> bool {
         let s = self.strides_list[k][axis].unsigned_abs() as u128 * self.elem_sizes[k] as u128;
-        // `WAY / gcd` divides `WAY`, which fits `usize`.
-        (Self::WAY / gcd(s, Self::WAY)) as usize
+        s != 0 && s.is_multiple_of(Self::WAY)
     }
 
     /// The summed per-set load of every operand's live lines, with `axis`
@@ -273,30 +287,24 @@ impl<'a> L1Sets<'a> {
         (0..self.strides_list.len())
             .filter_map(|k| {
                 let c = self.reuse_axis(k)?;
-                Some((0..c).fold(1u128, |load, axis| {
-                    load.saturating_mul(extent(axis).div_ceil(self.period(k, axis)) as u128)
-                }))
+                Some(
+                    (0..c)
+                        .filter(|&axis| self.aliases(k, axis))
+                        .fold(1u128, |load, axis| {
+                            load.saturating_mul(extent(axis) as u128)
+                        }),
+                )
             })
             .fold(0u128, u128::saturating_add)
     }
 
-    /// The extent at which `axis` contributes a factor of 1 to every operand
-    /// that keeps it live (`min_k P_k`), or `None` when it already does at
-    /// `block` and cutting it cannot lower the load.
+    /// `Some(1)` when cutting `axis` can lower the load (some operand keeps
+    /// it live and fully aliases on it, and `block > 1`), else `None`.
     fn floor(&self, axis: usize, block: usize) -> Option<usize> {
-        let floor = (0..self.strides_list.len())
-            .filter(|&k| self.reuse_axis(k).is_some_and(|c| axis < c))
-            .map(|k| self.period(k, axis))
-            .min()?;
-        (floor < block).then_some(floor)
+        let counted = (0..self.strides_list.len())
+            .any(|k| self.reuse_axis(k).is_some_and(|c| axis < c) && self.aliases(k, axis));
+        (counted && block > 1).then_some(1)
     }
-}
-
-fn gcd(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
 }
 
 /// The model's block vector, or `None` when one of its sufficient exits keeps

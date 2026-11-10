@@ -433,20 +433,13 @@ const LIVE_LINES: u128 = 6;
 ///
 /// For operand `k`, `c_k` is its first axis whose byte stride is below a line;
 /// the lines along the axes before it are revisited on the next step of
-/// `c_k`. Along an axis of byte stride `s` they repeat a set after
-/// `4096 / gcd(s, 4096)` steps, so `b` steps put `ceil(b / P)` lines in a set.
+/// `c_k`. An axis whose byte stride is a multiple of the 4 KiB way puts all
+/// `b` of its lines in one set; other axes spread theirs and are not counted.
 /// A tile may keep [`LIVE_LINES`] of them: the 8 ways less a quarter of
 /// headroom for pseudo-LRU replacement and the stride prefetcher.
 fn l1_set_load(blocks: &[usize], strides_list: &[&[isize]], elem_sizes: &[usize]) -> u128 {
     const LINE: u128 = 64;
     const WAY: u128 = 32 * 1024 / 8;
-    fn gcd(a: u128, b: u128) -> u128 {
-        if b == 0 {
-            a
-        } else {
-            gcd(b, a % b)
-        }
-    }
     strides_list
         .iter()
         .zip(elem_sizes)
@@ -457,10 +450,11 @@ fn l1_set_load(blocks: &[usize], strides_list: &[&[isize]], elem_sizes: &[usize]
             let c = (0..strides.len())
                 .find(|&i| byte(i) < LINE)
                 .filter(|&c| c > 0)?;
-            Some((0..c).fold(1u128, |load, i| {
-                let period = WAY / gcd(byte(i), WAY);
-                load * (blocks[i] as u128).div_ceil(period)
-            }))
+            Some(
+                (0..c)
+                    .filter(|&i| byte(i) % WAY == 0)
+                    .fold(1u128, |load, i| load * blocks[i] as u128),
+            )
         })
         .sum()
 }
@@ -526,10 +520,30 @@ fn transposed_operand_layouts() -> Vec<NamedLayout> {
     cases
 }
 
+/// Copy-shaped (one destination, one source) layouts whose source is
+/// transposed or permuted along the destination's run.
+fn transposed_pair_layouts() -> Vec<NamedLayout> {
+    let mut cases = Vec::new();
+    for (m, n) in [(2048, 2048), (1024, 4096), (4096, 1024)] {
+        let d = col_major(&[m, n]);
+        let t = stored(&[m, n], &[1, 0]);
+        cases.push(("source transposed", vec![m, n], vec![d, t]));
+    }
+    let dims = [128usize, 128, 256];
+    for storage in [[1, 2, 0], [2, 1, 0]] {
+        cases.push((
+            "source permuted",
+            dims.to_vec(),
+            vec![col_major(&dims), stored(&dims, &storage)],
+        ));
+    }
+    cases
+}
+
 #[test]
-fn transposed_operand_tiles_fit_the_l1_sets() {
+fn transposed_pair_tiles_fit_the_l1_sets() {
     for elem in [8usize, 4] {
-        for (name, dims, strides) in transposed_operand_layouts() {
+        for (name, dims, strides) in transposed_pair_layouts() {
             let refs: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
             let sizes = vec![elem; refs.len()];
             let (fused, ordered, plan) = build_plan_fused(&dims, &refs, Some(0), &sizes);
@@ -540,6 +554,26 @@ fn transposed_operand_tiles_fit_the_l1_sets() {
                 "{name} {dims:?} elem {elem}: tiles {:?} over {:?} keep {load} lines live in one 8-way L1 set",
                 plan.block.as_slice(),
                 fused.as_slice(),
+            );
+        }
+    }
+}
+
+/// Walks with more than two operands keep the model's tiles: the #287 gate
+/// measured the fit regressing three-operand `mul_into`.
+#[test]
+fn wider_walks_keep_the_model_tiles() {
+    for elem in [8usize, 4] {
+        for (name, dims, strides) in transposed_operand_layouts() {
+            let refs: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+            let sizes = vec![elem; refs.len()];
+            let (fused, ordered, plan) = build_plan_fused(&dims, &refs, Some(0), &sizes);
+            let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+            let model = crate::block::compute_block_sizes(&fused, &ordered, &sizes);
+            assert_eq!(
+                plan.block.as_slice(),
+                model.as_slice(),
+                "{name} {dims:?} elem {elem}"
             );
         }
     }
@@ -575,6 +609,7 @@ fn transposed_copy_pair_tiles_fit_the_l1_sets() {
 #[test]
 fn planned_tiles_never_exceed_the_model_and_keep_the_reduced_axes() {
     let mut cases = transposed_operand_layouts();
+    cases.extend(transposed_pair_layouts());
     for (m, n) in [(2048usize, 2048usize), (2047, 2047), (1000, 4100)] {
         let d = col_major(&[m, n]);
         let t = stored(&[m, n], &[1, 0]);
