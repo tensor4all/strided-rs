@@ -386,6 +386,34 @@ fn test_compute_importance_rank_65_broadcast_output_keeps_live_axes_distinct() {
 }
 
 #[test]
+fn test_compute_importance_rank_65_two_inputs_reject_cap_63() {
+    // Review of #450: the previous test has one input, so every term fits at
+    // cap 63. A weight is the *sum* over operands, and two inputs on the same
+    // live axis each bring 2^63, which overflows: the fallback must reject cap
+    // 63 and settle on 62, where 2^62 + 2^62 is 2^63. Saturating the sum
+    // instead would accept 63 and return u64::MAX.
+    let n = 65;
+    let mut dims = vec![1usize; n];
+    dims[0] = 2;
+    let out_strides = vec![0isize; n];
+    let in_strides: Vec<isize> = (0..n).map(|i| i as isize + 1).collect();
+    let all_strides: [&[isize]; 3] = [&out_strides, &in_strides, &in_strides];
+    let index_orders: Vec<Vec<usize>> = [&out_strides[..], &in_strides[..], &in_strides[..]]
+        .iter()
+        .map(|s| index_order(s).into_vec())
+        .collect();
+
+    let importance = compute_importance(&dims, &all_strides, &index_orders);
+
+    assert_eq!(
+        importance[0],
+        1u64 << 63,
+        "two inputs at cap 62: 2^62 + 2^62"
+    );
+    assert!(importance[1..].iter().all(|&w| w == 0));
+}
+
+#[test]
 fn test_compute_importance_matches_exact_reference() {
     // The original formula evaluated without overflow (u128). Wherever it fits,
     // the 64-bit weights must be identical, so the plan order is unchanged.
