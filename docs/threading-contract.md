@@ -39,10 +39,11 @@ Julia's Strided.jl makes the same choice for threaded matmul
      `strided-basic/src/execution.rs:40`) takes `exec` second: it is not an
      operation entry but the helper the tree-shaped entries call.
    - **Serial-only entries.** An entry that cannot fan out takes no token at all
-     and always runs on the calling thread, for example
-     `strided_basic::copy_into_col_major` (`strided-basic/src/ops_view.rs:316-321`,
-     which hands `Exec::serial()` to the permutation engine) and `dot`
-     (`strided-basic/src/ops_view.rs:857`).
+     and always runs on the calling thread, for example `dot`
+     (`strided-basic/src/ops_view.rs:935`). `strided_basic::copy_into_col_major`
+     used to sit here: it took no token and handed `Exec::serial()` to the
+     permutation engine, so a caller could not see that a large transpose ran on
+     one core. It now takes its token like `copy_into` (issue #212).
 
    `REPOSITORY_RULES.md` ("CPU Threading Contract") makes the fan-out half a
    review rule, and the crate docs state it
@@ -80,8 +81,8 @@ A caller that wants its own thread budget builds a `Pool`, mints
 ## State of the code
 
 - The typed entries of `strided-basic` and `strided-perm` that can fan out are
-  pinned by type in `strided-basic/tests/threading_contract.rs`: 47 entries, of
-  which 46 take the token last and one (`parallel_map_reduce`) takes it second.
+  pinned by type in `strided-basic/tests/threading_contract.rs`: 48 entries, of
+  which 47 take the token last and one (`parallel_map_reduce`) takes it second.
   An entry that drops its token stops compiling. The pinned list is:
   - element-wise: `map_into`, `map_into_uninit_with_kernel`, `zip_map2_into`,
     `zip_map3_into`, `zip_map4_into`, `mul_into`, `mul_into_uninit`,
@@ -90,7 +91,8 @@ A caller that wants its own thread budget builds a `Pool`, mints
     `batched_outer_product_into_uninit`;
   - in-place update: `map_update_into`, `zip_update2_into`, `zip_update3_into`;
   - reduction: `reduce`, `zip_reduce`, `reduce_axis`, `reduce_axis_into`, `sum`;
-  - copy and scale: `copy_into`, `copy_into_uninit`, `copy_scale_into`, `copy_conj_into`,
+  - copy and scale: `copy_into`, `copy_into_col_major`, `copy_into_uninit`,
+    `copy_scale_into`, `copy_conj_into`,
     `copy_transpose_scale_into`, and `strided-perm`'s `copy_into`,
     `copy_into_uninit`, `copy_into_col_major`;
   - arithmetic and layout: `add_acc`, `mul_acc`, `axpy_acc`, `fma_acc`, `axpby_accum`,
@@ -102,7 +104,7 @@ A caller that wants its own thread budget builds a `Pool`, mints
   - the range-helper exception: `parallel_map_reduce`, token second.
 
   Entries that cannot fan out are not pinned because they carry no token:
-  `strided_basic::copy_into_col_major` and `dot` are the current examples.
+  `dot` is the current example.
 - The remaining plan replays (`GatherPlan`, `ScatterPlan`, `SlicePlan`,
   `ReversePlan`, `ConcatenatePlan`, `PadPlan`, `DynamicSlicePlan`,
   `DynamicUpdateSlicePlan`) and the erased entries of `strided-kernel`,
@@ -121,8 +123,13 @@ A caller that wants its own thread budget builds a `Pool`, mints
 - `strided-basic/tests/threading_contract.rs` — a serial token never justifies a
   second worker for any kernel class; the two observed entries (`map_into`,
   `zip_map2_into`) run on the calling thread under `Exec::serial()` and off it
-  under a pooled token (when the `parallel` feature is on); and the 47 entries
+  under a pooled token (when the `parallel` feature is on); and the 48 entries
   above are pinned by their types.
+- `strided-basic/tests/copy_into_col_major_policy.rs` — `copy_into_col_major`
+  must use the token it is handed: a large permutation copy under a four-slot
+  token installs work into that token's pool, and the destination holds the
+  transposed source at an off-diagonal element. The hard-coded `Exec::serial()`
+  of #212 installed nothing and failed the first check.
 - `strided-basic/tests/serial_exec_global_pool.rs` — serial work never starts
   the process-global pool.
 - `strided-basic/tests/execution_pool_*.rs`, `strided-fused`,

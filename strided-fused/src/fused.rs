@@ -1495,8 +1495,9 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         // each operand's shape was checked equal to it before this call. Construction-time
         // `validate_bounds` (strided-view/src/view.rs:187) establishes only that each operand's
         // reachable offsets lie inside its slice; it does not establish the planner's arithmetic,
-        // which this proof leaves open. This small-tensor path skips the dimension ordering
-        // (strided-basic/src/kernel.rs:134), where the shift overflow tracked in #450 lives.
+        // which this proof leaves open. This path skips the dimension ordering
+        // (strided-basic/src/kernel.rs:134), so the importance weight never forms; the arithmetic
+        // left is `fuse_dims`'s, and it is checked (strided-basic/src/fuse.rs:63-65, :76-79).
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
         // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
@@ -1505,11 +1506,10 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
         // `strides_list` has that rank, because each operand's shape was checked equal to it
         // before this call. Index `0` is `dests[0]`. Construction-time `validate_bounds`
         // (strided-view/src/view.rs:187) establishes only that each operand's reachable offsets
-        // lie inside its slice, not the planner's arithmetic: the dimension-order importance
-        // shifts `1u64` by up to `g * rank` bits (strided-basic/src/fuse.rs:174-175, :185-186)
-        // before size-1 axes are cleared (:191-195), which overflows for some bounded layouts
-        // with three or more operands. That is tracked in #450; this precondition is not proven
-        // here.
+        // lie inside its slice; the planner's arithmetic is checked. The importance weight shifts
+        // `1u64` by up to `g * rank` bits (#450), but `compute_importance` checks every shift
+        // (strided-basic/src/fuse.rs:179-182), the weighted product (:196) and the sum (:200),
+        // skips size-1 axes (:186-190) and narrows the width if the packing does not fit (:207-231).
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), elem_size) }
     };
 
@@ -1860,8 +1860,9 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         // each operand's shape was checked equal to it before this call. Construction-time
         // `validate_bounds` (strided-view/src/view.rs:187) establishes only that each operand's
         // reachable offsets lie inside its slice; it does not establish the planner's arithmetic,
-        // which this proof leaves open. This small-tensor path skips the dimension ordering
-        // (strided-basic/src/kernel.rs:134), where the shift overflow tracked in #450 lives.
+        // which this proof leaves open. This path skips the dimension ordering
+        // (strided-basic/src/kernel.rs:134), so the importance weight never forms; the arithmetic
+        // left is `fuse_dims`'s, and it is checked (strided-basic/src/fuse.rs:63-65, :76-79).
         unsafe { build_plan_fused_small(&dims, &strides_list) }
     } else {
         // SAFETY: `build_plan_fused` (strided-basic/src/execution.rs:53) needs matching
@@ -1870,11 +1871,10 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
         // `strides_list` has that rank, because each operand's shape was checked equal to it
         // before this call. Index `0` is `dests[0]`. Construction-time `validate_bounds`
         // (strided-view/src/view.rs:187) establishes only that each operand's reachable offsets
-        // lie inside its slice, not the planner's arithmetic: the dimension-order importance
-        // shifts `1u64` by up to `g * rank` bits (strided-basic/src/fuse.rs:174-175, :185-186)
-        // before size-1 axes are cleared (:191-195), which overflows for some bounded layouts
-        // with three or more operands. That is tracked in #450; this precondition is not proven
-        // here.
+        // lie inside its slice; the planner's arithmetic is checked. The importance weight shifts
+        // `1u64` by up to `g * rank` bits (#450), but `compute_importance` checks every shift
+        // (strided-basic/src/fuse.rs:179-182), the weighted product (:196) and the sum (:200),
+        // skips size-1 axes (:186-190) and narrows the width if the packing does not fit (:207-231).
         unsafe { build_plan_fused(&dims, &strides_list, Some(0), core::mem::size_of::<T>()) }
     };
 

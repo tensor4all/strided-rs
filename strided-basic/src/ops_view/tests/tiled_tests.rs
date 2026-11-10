@@ -188,7 +188,7 @@ fn copy_into_col_major_copies_from_non_col_major_source() {
         StridedArray::<usize>::from_fn_row_major(&[3, 4], |index| index[0] * 10 + index[1]);
     let mut destination = StridedArray::<usize>::col_major(&[3, 4]);
 
-    copy_into_col_major(&mut destination.view_mut(), &source.view()).unwrap();
+    copy_into_col_major(&mut destination.view_mut(), &source.view(), Exec::serial()).unwrap();
 
     for row in 0..3 {
         for column in 0..4 {
