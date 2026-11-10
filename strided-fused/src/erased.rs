@@ -458,8 +458,9 @@ where
             let strides = dest.strides();
             let offset = dest.offset();
             let data = dest.data_as_mut::<T>()?;
-            // SAFETY: as for the single-destination view above: this descriptor's
-            // construction-time `validate_bounds` covers these dims, strides and offset.
+            // SAFETY: as for the single-destination view above (erased.rs:439): the descriptor's
+            // construction-time `validate_bounds` (strided-view/src/view.rs:187) covers these
+            // dims, strides and offset, and `data_as_mut` (strided-view/src/raw.rs:710) the count.
             views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
         }
         return execute_fused_inputs(views.as_mut_slice(), inputs, plan, exec);
@@ -471,8 +472,9 @@ where
         let strides = dest.strides();
         let offset = dest.offset();
         let data = dest.data_as_mut::<T>()?;
-        // SAFETY: as for the single-destination view above: this descriptor's construction-time
-        // `validate_bounds` covers these dims, strides and offset.
+        // SAFETY: as for the single-destination view above (erased.rs:439): the descriptor's
+        // construction-time `validate_bounds` (strided-view/src/view.rs:187) covers these dims,
+        // strides and offset, and `data_as_mut` (strided-view/src/raw.rs:710) returned the count.
         dest_views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
     }
     execute_fused_inputs(&mut dest_views, inputs, plan, exec)
@@ -552,15 +554,17 @@ where
         // SAFETY: `InitializedViewsMut::new` (fused.rs:38) needs `OPERAND_CAP` writable slots
         // that outlive the guard: `storage` is an `OPERAND_CAP` array declared before `views`, so
         // it is dropped after it, and this branch holds only when `dests.len() <= OPERAND_CAP`
-        // (erased.rs:549), which bounds the pushes.
+        // (erased.rs:551), which bounds the pushes.
         let mut views = unsafe { crate::fused::InitializedViewsMut::new(storage.as_mut_ptr()) };
         for dest in dests.iter_mut() {
             let dims = dest.dims();
             let strides = dest.strides();
             let offset = dest.offset();
             let data = dest.data_as_uninit_mut::<T>()?;
-            // SAFETY: as for the single-destination view above: this descriptor's
-            // construction-time `validate_bounds` covers these dims, strides and offset.
+            // SAFETY: as for the single-destination view above (erased.rs:541): the descriptor's
+            // construction-time `validate_bounds` (strided-view/src/view.rs:187) covers these
+            // dims, strides and offset, and `data_as_uninit_mut` (strided-view/src/raw.rs:882)
+            // returned the count.
             views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
         }
         return execute_fused_uninit_inputs(plan, views.as_mut_slice(), inputs, validated, exec);
@@ -572,8 +576,10 @@ where
         let strides = dest.strides();
         let offset = dest.offset();
         let data = dest.data_as_uninit_mut::<T>()?;
-        // SAFETY: as for the single-destination view above: this descriptor's construction-time
-        // `validate_bounds` covers these dims, strides and offset.
+        // SAFETY: as for the single-destination view above (erased.rs:541): the descriptor's
+        // construction-time `validate_bounds` (strided-view/src/view.rs:187) covers these dims,
+        // strides and offset, and `data_as_uninit_mut` (strided-view/src/raw.rs:882) returned
+        // the count.
         dest_views.push(unsafe { StridedViewMut::new_unchecked(data, dims, strides, offset) });
     }
     execute_fused_uninit_inputs(plan, &mut dest_views, inputs, validated, exec)
@@ -614,7 +620,8 @@ where
                 // against every destination with `validate_uninit_no_overlap` (erased.rs:319)
                 // before dispatching. The destinations stay borrowed `&mut` for the call.
                 unsafe { a.try_as_ref_after_no_overlap()? },
-                // SAFETY: as for `a`: the same overlap check covered `b`.
+                // SAFETY: as for `a`: the same `validate_uninit_no_overlap` check covered `b`
+                // (erased.rs:319).
                 unsafe { b.try_as_ref_after_no_overlap()? },
             ];
             let views = [erased_view::<T>(&refs[0])?, erased_view::<T>(&refs[1])?];
@@ -630,9 +637,11 @@ where
                 // against every destination with `validate_uninit_no_overlap` (erased.rs:319)
                 // before dispatching. The destinations stay borrowed `&mut` for the call.
                 unsafe { a.try_as_ref_after_no_overlap()? },
-                // SAFETY: as for `a`: the same overlap check covered `b`.
+                // SAFETY: as for `a`: the same `validate_uninit_no_overlap` check covered `b`
+                // (erased.rs:319).
                 unsafe { b.try_as_ref_after_no_overlap()? },
-                // SAFETY: as for `a`: the same overlap check covered `c`.
+                // SAFETY: as for `a`: the same `validate_uninit_no_overlap` check covered `c`
+                // (erased.rs:319).
                 unsafe { c.try_as_ref_after_no_overlap()? },
             ];
             let views = [
@@ -652,11 +661,14 @@ where
                 // against every destination with `validate_uninit_no_overlap` (erased.rs:319)
                 // before dispatching. The destinations stay borrowed `&mut` for the call.
                 unsafe { a.try_as_ref_after_no_overlap()? },
-                // SAFETY: as for `a`: the same overlap check covered `b`.
+                // SAFETY: as for `a`: the same `validate_uninit_no_overlap` check covered `b`
+                // (erased.rs:319).
                 unsafe { b.try_as_ref_after_no_overlap()? },
-                // SAFETY: as for `a`: the same overlap check covered `c`.
+                // SAFETY: as for `a`: the same `validate_uninit_no_overlap` check covered `c`
+                // (erased.rs:319).
                 unsafe { c.try_as_ref_after_no_overlap()? },
-                // SAFETY: as for `a`: the same overlap check covered `d`.
+                // SAFETY: as for `a`: the same `validate_uninit_no_overlap` check covered `d`
+                // (erased.rs:319).
                 unsafe { d.try_as_ref_after_no_overlap()? },
             ];
             let views = [

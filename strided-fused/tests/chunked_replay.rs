@@ -973,7 +973,9 @@ fn chunked_replay_parallel_pool_matches_reference() {
         // every slot, and `execute_outputs_uninit` returned `Ok`, which initializes every logical
         // destination element (strided-fused/src/erased.rs:221).
         let pass = unsafe { pass_through[index].assume_init() };
-        // SAFETY: as for `pass_through` above.
+        // SAFETY: as for `pass_through` above (chunked_replay.rs:972): `product` also has `len`
+        // slots under `[len]`/`[1]`, and `execute_outputs_uninit` returned `Ok`, which
+        // initializes every logical destination element (strided-fused/src/erased.rs:221).
         let value = unsafe { product[index].assume_init() };
         assert_eq!(pass, a[0], "pass-through element {index}");
         assert_eq!(value, a[0] * b[index], "product element {index}");
