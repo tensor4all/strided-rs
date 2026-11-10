@@ -101,6 +101,212 @@ pub(crate) fn compute_block_sizes(
     blocks
 }
 
+/// [`compute_block_sizes`] for a kernel that writes operand `dest`, with the
+/// tiles fitted to the L1 sets by [`fit_l1_sets`] (#287).
+///
+/// The fit runs only on a block vector the model reduced and did not decline:
+/// every exit that keeps the full dimensions keeps them here too.
+pub(crate) fn destination_block_sizes(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_sizes: &[usize],
+    dest: usize,
+) -> InlineVec<usize> {
+    let Some(mut blocks) = reduced_block_sizes(dims, strides_list, elem_sizes) else {
+        return InlineVec::from(dims);
+    };
+    if declines_tiles(dims, strides_list, elem_sizes, &blocks) {
+        return InlineVec::from(dims);
+    }
+    fit_l1_sets(dims, strides_list, elem_sizes, dest, &mut blocks);
+    blocks
+}
+
+/// Shrink `blocks` until the lines a tile keeps live for reuse fit the L1
+/// sets they fall in (#287).
+///
+/// Strided.jl's model budgets a tile by its total footprint only. A cache is
+/// set-associative, though: one set holds at most [`L1_WAYS`](crate::L1_WAYS)
+/// lines, and lines whose addresses differ by a multiple of the way size
+/// `w = BLOCK_MEMORY_SIZE / L1_WAYS` share a set.
+///
+/// **Which lines are live.** In the tile walk axis 0 is the inner run, then
+/// axes 1, 2, ... nest outward. For operand `k`, let `c_k` be its first axis
+/// whose byte stride is below a line (its reuse axis). The lines touched along
+/// the axes before `c_k` are revisited on the next step of axis `c_k` (the
+/// next element of each line), so they must all stay resident across one
+/// sweep of those axes. An operand with `c_k = 0` streams its lines and has
+/// nothing live; one with no such axis never revisits a line.
+///
+/// **How many share a set.** Along an axis whose byte stride is a multiple
+/// of the way size `w`, every step lands in the same set, so `b` steps put `b`
+/// lines in one set. The operand's per-set load is the product of the extents
+/// of such axes before `c_k`, and the loads of all operands add up. A
+/// power-of-two leading dimension is the case: a 2048-element `f64` row stride
+/// is 16 KiB, and the model's `[40, 32]` tile puts 40 lines in one 8-way set
+/// ([#287]).
+///
+/// Only full aliasing counts. An axis whose stride is not a multiple of `w`
+/// spreads its lines over `w / gcd(s, w) >= 2` sets, and on the #287 probe a
+/// stride with two sets (2 KiB, `f64` 16384×256) showed no penalty at the
+/// model's tile while the shorter runs of a fit cost the walk 1.4x; such axes
+/// are left alone (see the worklog).
+///
+/// **The budget.** The load may not exceed
+/// [`L1_LIVE_LINES_PER_SET`](crate::L1_LIVE_LINES_PER_SET), the ways less a
+/// quarter of headroom for the pseudo-LRU replacement and the stride
+/// prefetcher (see the constant).
+///
+/// **The fit.** While the load exceeds the budget, the outermost shrinkable
+/// axis (the inner run stays long for the operands that stream it) is cut to
+/// the largest extent that meets the budget, or, if that axis alone cannot, to
+/// 1, and the next axis is tried. Blocks only shrink, so the model's footprint
+/// bound still holds (upper bound), and only an axis on which some live
+/// operand fully aliases is cut at all (no other axis moves).
+///
+/// **Which walks.** Only two-operand walks (one destination, one source:
+/// `copy_into`, unary maps, the raw pair replay) are fitted; a walk with more
+/// operands keeps the model's tiles. The #287 gate measured the fit on both:
+/// every two-operand cell whose tiles changed ran faster (1.13x to 3.3x),
+/// while three-operand `mul_into` regressed in 16 cells, up to 2.1x slower
+/// (permuted B and rectangular transposes in `f64`), because the walk's
+/// per-run cost on the shortened runs outweighs the set fit there. The
+/// measurement is in the worklog.
+///
+/// **Numerical results.** Tiles change only the visit order. A caller either
+/// writes each destination slot once from a pointwise expression (the map,
+/// zip, fused and update entries validate an injective destination), or
+/// accumulates into it (`add_acc` and the other `*_acc` entries accept a
+/// destination with zero-stride axes). The order in which one output element
+/// accumulates its contributions depends only on the blocks of the
+/// destination's zero-stride axes, and those are never cut, so every output
+/// is bit-identical to the model's tiles. A fold into one accumulator (`dot`,
+/// the reductions) does not call this, because there every block orders the
+/// fold.
+///
+/// [#287]: https://github.com/tensor4all/strided-rs/issues/287
+pub(crate) fn fit_l1_sets(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_sizes: &[usize],
+    dest: usize,
+    blocks: &mut [usize],
+) {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    debug_assert_eq!(dims.len(), blocks.len());
+    #[cfg(feature = "bench-hooks")]
+    let budget = crate::bench_hooks::L1_SET_BUDGET.load(core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "bench-hooks"))]
+    let budget = crate::L1_LIVE_LINES_PER_SET;
+    // Two-operand walks only: see "Which walks" above.
+    if budget == 0 || strides_list.len() != 2 {
+        return;
+    }
+    let sets = L1Sets::new(strides_list, elem_sizes);
+    if sets.load(blocks, None) <= budget as u128 {
+        return;
+    }
+    let frozen = |axis: usize| strides_list.get(dest).is_some_and(|s| s[axis] == 0);
+    // Outermost first; each axis is visited once, and is left either meeting
+    // the budget or contributing a factor of 1.
+    for axis in (0..dims.len()).rev() {
+        if frozen(axis) {
+            continue;
+        }
+        let Some(floor) = sets.floor(axis, blocks[axis]) else {
+            continue;
+        };
+        let current = blocks[axis];
+        if sets.load(blocks, Some((axis, floor))) > budget as u128 {
+            blocks[axis] = floor;
+            continue;
+        }
+        // The load is nondecreasing in the extent: the largest extent in
+        // `[floor, current)` within the budget.
+        let (mut lo, mut hi) = (floor, current - 1);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if sets.load(blocks, Some((axis, mid))) <= budget as u128 {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        blocks[axis] = lo;
+        return;
+    }
+}
+
+/// The per-set line load of [`fit_l1_sets`]: each operand's reuse axis and the
+/// byte strides before it.
+struct L1Sets<'a> {
+    strides_list: &'a [&'a [isize]],
+    elem_sizes: &'a [usize],
+}
+
+impl<'a> L1Sets<'a> {
+    const LINE: u128 = CACHE_LINE_SIZE as u128;
+    const WAY: u128 = (BLOCK_MEMORY_SIZE / crate::L1_WAYS) as u128;
+
+    fn new(strides_list: &'a [&'a [isize]], elem_sizes: &'a [usize]) -> Self {
+        Self {
+            strides_list,
+            elem_sizes,
+        }
+    }
+
+    /// Operand `k`'s reuse axis `c_k` (its first axis with a byte stride below
+    /// a line), or `None` when it keeps no line live: it has no such axis, it
+    /// is zero-sized, or `c_k = 0`.
+    fn reuse_axis(&self, k: usize) -> Option<usize> {
+        let elem = self.elem_sizes[k] as u128;
+        if elem == 0 {
+            return None;
+        }
+        let strides = self.strides_list[k];
+        let c = strides
+            .iter()
+            .position(|&s| s.unsigned_abs() as u128 * elem < Self::LINE)?;
+        (c > 0).then_some(c)
+    }
+
+    /// Whether every step of operand `k` along `axis` lands in the same set:
+    /// its byte stride is a nonzero multiple of the way size.
+    fn aliases(&self, k: usize, axis: usize) -> bool {
+        let s = self.strides_list[k][axis].unsigned_abs() as u128 * self.elem_sizes[k] as u128;
+        s != 0 && s.is_multiple_of(Self::WAY)
+    }
+
+    /// The summed per-set load of every operand's live lines, with `axis`
+    /// optionally replaced by another extent. Saturates.
+    fn load(&self, blocks: &[usize], with: Option<(usize, usize)>) -> u128 {
+        let extent = |axis: usize| match with {
+            Some((a, b)) if a == axis => b,
+            _ => blocks[axis],
+        };
+        (0..self.strides_list.len())
+            .filter_map(|k| {
+                let c = self.reuse_axis(k)?;
+                Some(
+                    (0..c)
+                        .filter(|&axis| self.aliases(k, axis))
+                        .fold(1u128, |load, axis| {
+                            load.saturating_mul(extent(axis) as u128)
+                        }),
+                )
+            })
+            .fold(0u128, u128::saturating_add)
+    }
+
+    /// `Some(1)` when cutting `axis` can lower the load (some operand keeps
+    /// it live and fully aliases on it, and `block > 1`), else `None`.
+    fn floor(&self, axis: usize, block: usize) -> Option<usize> {
+        let counted = (0..self.strides_list.len())
+            .any(|k| self.reuse_axis(k).is_some_and(|c| axis < c) && self.aliases(k, axis));
+        (counted && block > 1).then_some(1)
+    }
+}
+
 /// The model's block vector, or `None` when one of its sufficient exits keeps
 /// the full dimensions before any metadata is built: rank zero, a memory
 /// region within the budget, or operands whose byte strides are all nonzero

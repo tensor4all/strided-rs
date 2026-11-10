@@ -563,6 +563,17 @@ fn a_mixed_size_pair_blocks_at_each_operands_own_footprint() {
     }
 }
 
+/// The pointwise planner's oracle (#287): the model's blocks, then the L1 set
+/// fit for the destination at operand 0, unless the model kept the full
+/// dimensions (an exit or a decline, which the fit never overrides).
+fn planned_blocks_sized(dims: &[usize], strides: &[&[isize]], elem_sizes: &[usize]) -> Vec<usize> {
+    let mut blocks = model_blocks_sized(dims, strides, elem_sizes);
+    if blocks != dims {
+        super::fit_l1_sets(dims, strides, elem_sizes, 0, &mut blocks);
+    }
+    blocks
+}
+
 #[test]
 fn the_pointwise_plan_uses_each_operands_element_size() {
     // Every typed pointwise entry passes its operands' sizes here, and this is
@@ -583,7 +594,7 @@ fn the_pointwise_plan_uses_each_operands_element_size() {
         let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
         assert_eq!(
             plan.block.as_slice(),
-            model_blocks_sized(&fused_dims, &ordered, &elem_sizes),
+            planned_blocks_sized(&fused_dims, &ordered, &elem_sizes),
             "{elem_sizes:?}"
         );
         // The pre-#426 wiring: one element size for every operand.
@@ -641,7 +652,7 @@ fn the_view_path_keeps_the_flat_walk_where_the_tiles_share_no_cache_line() {
 
     // The parity rows of `benches/view_decline_428.rs` tile and are not
     // declined, so the decline cannot move them: the view path still returns
-    // the model's blocks script for script.
+    // the model's blocks, fitted to the L1 sets, script for script.
     let parity = [
         ([1024usize, 1024], [1024isize, 1], [1isize, 1024]),
         ([512usize, 512], [1isize, 512], [0isize, 1]),
@@ -657,9 +668,10 @@ fn the_view_path_keeps_the_flat_walk_where_the_tiles_share_no_cache_line() {
         );
         let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
         assert_ne!(plan.block.as_slice(), fused_dims.as_slice(), "must tile");
+        // The decline cannot move them; the L1 set fit (#287) may.
         assert_eq!(
             plan.block.as_slice(),
-            model_blocks_sized(&fused_dims, &ordered, &elem_sizes),
+            planned_blocks_sized(&fused_dims, &ordered, &elem_sizes),
             "{dims:?}"
         );
     }

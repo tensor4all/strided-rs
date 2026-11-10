@@ -1,0 +1,103 @@
+# 2026-11-10 — #287: fitting destination tiles to the L1 sets
+
+Machine: primerose, AMD EPYC (Zen 3), 64 cores in 8 L3 domains of 8; L1d 32 KiB 8-way (4 KiB way),
+4 KiB pages (THP `madvise`). A shared host: measurements on the idle domain 32-39 only, agent pinned
+off it. Hardware counters were not available (`perf_event_paranoid = 4`), so the mechanism below is
+supported by timing controls, not by miss counts.
+
+## Decision
+
+`block::fit_l1_sets` shrinks the tiles of a destination-writing walk until each L1 set holds at most
+`L1_WAYS - L1_WAYS / 4` = 6 lines that a tile keeps live for reuse. It runs on the view planner
+(`build_plan_fused` with a destination) and on the raw pair replay (`tile_blocks`). Folds keep the
+model's tiles. **The predeclared no-regression gate failed** (10 of 180 cells), see below; the change
+is proposed with that result, not as a pass.
+
+## Mechanism
+
+On a power-of-two leading dimension every line of a transposed operand's run along the destination's
+contiguous axis lands in one L1 set (`P = 4096 / gcd(stride, 4096) = 1`). The model's `[40, 32]` for
+2048² `mul_into` with B row-major keeps 40 B lines live in an 8-way set. A hand scalar loop over the
+same tiles (`benches/tile_probe_287.rs`, medians of 5 rounds) separates this from the walk:
+
+| tile | 2048² walk | 2048² hand | 2047² walk | 2047² hand |
+|---|---|---|---|---|
+| [40,32] (model) | 20.2 ms | 17.9 ms | 15.3 ms | 9.4 ms |
+| [8,64] (#287 probe) | 17.1 | 10.2 | 17.6 | 9.4 |
+| [6,32] | 13.8 | 9.5 | 17.9 | 9.8 |
+
+The aliasing penalty is real (hand loop 17.9 vs 9.4 ms on the non-power-of-two control) and the
+issue's ~10 ms reproduces with the hand loop. The production walk is 4-7 ms slower than the hand loop
+at every tile, which is a separate cost (per-run callback) that no tile removes.
+
+The budget's quarter of headroom is calibrated, not derived: on the 2048² B-transposed cell a budget of
+8 lines ran 0.78-0.93x the model, 6 lines 1.2x (f64) / 1.5x (f32), 4 lines 1.1x / 1.15x. Pseudo-LRU
+replacement and the stride prefetcher pulling the next row's line into the same set are the plausible
+reasons; they are not measured. The 2048² cells of the gate below are therefore not independent
+evidence for the constant; the other shapes and 4T are.
+
+## Gate (one paired run, protocol declared before it)
+
+`benches/block_l1_sets_287.rs` at commit a65d56b, in-process toggle (`L1_SET_BUDGET` 0 vs 6), 45
+layouts × {f64, f32} × {1T on core 33, 4T on 33-36}; 5 rounds of current / candidate / current-again,
+median of 9 calls each, ratio inside a round. Noise threshold τ = max(5 %, p95 of |A/A − 1|) = 6.7 %;
+a cell regresses if its median ratio < 1 − τ and all 5 rounds are slower. Every arm's output was
+checked bitwise against the model's before timing.
+
+- Tiles changed in 92 cells, none of them a non-power-of-two control. Unchanged cells: ratio 0.91-1.13.
+- Changed cells: median ratio 1.44 (range 0.47-3.33). `copy_into` and `replay_copy_raw` gain
+  in every changed cell (1.13-3.33x), `f32` `mul_into` 1.07-1.74x except B perm (2,0,1); `f64`
+  `mul_into` 0.47-1.51x. The #287 cell (2048², B transposed): 1.22x f64 / 1.68x f32 at 1T, 1.11x / 1.55x at 4T.
+- **Regressions (10):** `mul_into` with B permuted on [128,128,256]: (2,0,1) f64 (fused to [16384, 256], B row stride 2 KiB)
+  and f32, (1,2,0) f64, (2,1,0) f64, each at 1T and 4T (0.47-0.80); 1024×4096 f64 at 4T, B transposed
+  (0.72) and A,B transposed (0.84).
+
+Reasons, from the hand-loop probe on the two fused shapes behind the 3-D cells (medians of 5 rounds):
+
+| fused shape (layout) | tile | walk | hand |
+|---|---|---|---|
+| 128×32768 (perm (1,2,0), B row stride 256 KiB, `P = 1`) | model [40,32] | 16.4 ms | 13.8 ms |
+| | fit [6,32] | 18.2 ms | 9.6 ms |
+| 16384×256 (perm (2,0,1), B row stride 2 KiB, `P = 2`) | model [40,32] | 13.0 ms | 9.7 ms |
+| | fit [12,32] | 18.8 ms | 10.1 ms |
+
+- Full aliasing (`P = 1`, perm (1,2,0)): the set fit is right. The hand loop gains 1.44x, but the
+  production walk loses, because it pays its per-run callback on 6-element runs.
+- Partial aliasing (`P = 2`, perm (2,0,1)): the set-count model is wrong. The hand loop shows no
+  penalty at [40,32], so the fit buys nothing and the walk pays for shorter runs.
+- perm (2,1,0) (unfused 3-D) and 1024×4096 f64 at 4T: not probed; unexplained.
+
+The rule was not narrowed to exclude these cells after the run.
+
+Host: loadavg 4.7 at start, 7.1 at end; no foreign process on 32-39 at either point. Spread of the
+current arm's median across rounds: median 10 %, max 20 %.
+
+## Folds
+
+`dot` plans with `Some(0)` (operand 0 is its input `a`) and folds into one accumulator in tile
+order, so it would have been fitted and its rounding changed. It now plans through
+`kernel::fold_plan`: main's order and fusion, the model's tiles. The reductions plan with
+`dest_index: None` and never reach the fit. `dot` is not among the timed cells.
+
+## Not done
+
+- The walk's per-run overhead (the larger half of the #287 gap) is untouched.
+- `AGENTS.md:133-134` (Key Constants) does not list `L1_WAYS` / `L1_LIVE_LINES_PER_SET`; left for the
+  maintainer, as `AGENTS.md` is not edited by agents here.
+
+## Restriction and rerun (8ed2499)
+
+The owner's recomputation of the first run (candidate median over the median of both current arms,
+per cell) counted 16 cells above 3%, all three-operand `mul_into`; every changed two-operand cell was
+faster. The fit now runs only on two-operand walks (`strides_list.len() == 2`: `copy_into`, unary maps,
+the raw pair replay) and counts only fully aliasing axes (byte stride a multiple of the 4 KiB way).
+`mul_into` and every wider walk keep the model's tiles, so the #287 cell itself (2048² `mul_into`,
+B transposed) is no longer changed by this PR.
+
+Rerun of the same 180 cells, same harness and pinning (loadavg 14.8 at start, 6.8 at the end; two
+`claude` processes at 1-3% CPU on 32-39, under the 20% validity threshold):
+
+- 32 cells change tiles, all `copy_into` / `replay_copy_raw`; candidate/current 0.273-0.887 (median
+  0.518), none above 3%. Best: `replay_copy_raw` transposed [1024,4096] f32 1T, 13.81 -> 3.77 ms.
+- 25 cells read above 3%, all with identical tiles in both arms (identical code); the A/A arm itself
+  deviates by more than 3% in 51 cells of this run. Those are noise, not regressions.

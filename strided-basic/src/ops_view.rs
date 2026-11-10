@@ -985,10 +985,11 @@ where
     let strides_list: [&[isize]; 2] = [a_strides, b_strides];
     // The accumulator `R` is not a memory operand, so it has no element size.
     let total = total_len(a_dims)?;
-    let (fused_dims, ordered_strides, plan) = pointwise_plan(
+    // A fold: its tiles order `acc`, so it keeps the model's (#287).
+    let (fused_dims, ordered_strides, plan) = crate::kernel::fold_plan(
         a_dims,
         &strides_list,
-        Some(0),
+        0,
         &[std::mem::size_of::<A>(), std::mem::size_of::<B>()],
         total,
     );

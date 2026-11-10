@@ -85,6 +85,37 @@ pub(crate) fn build_plan_fused(
     dest_index: Option<usize>,
     elem_sizes: &[usize],
 ) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
+    plan_fused(dims, strides_list, dest_index, elem_sizes, dest_index)
+}
+
+/// [`pointwise_plan`] for a fold into one accumulator that orders its axes
+/// as if operand `order_by` were a destination (`dot`): the same order, fusion
+/// and model tiles, but never the L1 set fit, because a fold's tiles order its
+/// accumulation and must stay the model's (#287).
+pub(crate) fn fold_plan(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    order_by: usize,
+    elem_sizes: &[usize],
+    total: usize,
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    if total <= SMALL_TENSOR_THRESHOLD {
+        build_plan_fused_small(dims, strides_list)
+    } else {
+        plan_fused(dims, strides_list, Some(order_by), elem_sizes, None)
+    }
+}
+
+/// [`build_plan_fused`] with the ordering operand and the destination the
+/// tiles are fitted for given apart; `fit_dest: None` keeps the model's tiles.
+fn plan_fused(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    dest_index: Option<usize>,
+    elem_sizes: &[usize],
+    fit_dest: Option<usize>,
+) -> (InlineVec<usize>, OperandVec<InlineVec<isize>>, KernelPlan) {
     // 1. Compute optimal iteration order on original dims
     let order = order::compute_order(dims, strides_list, dest_index);
 
@@ -105,9 +136,28 @@ pub(crate) fn build_plan_fused(
     let compressed_strides_refs: OperandVec<&[isize]> =
         compressed_strides.iter().map(|s| s.as_slice()).collect();
 
-    // 5. Compute blocks on the already ordered axes
+    // 5. Compute blocks on the already ordered axes. With a destination the
+    // tiles are also fitted to the L1 sets (#287); a fold keeps the model's
+    // tiles, which order its single accumulator.
     let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
-    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_sizes);
+    let block = match fit_dest {
+        Some(dest) => block::destination_block_sizes(
+            &compressed_dims,
+            &compressed_strides_refs,
+            elem_sizes,
+            dest,
+        ),
+        None => block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_sizes),
+    };
+    #[cfg(feature = "bench-hooks")]
+    let block = {
+        let forced = crate::bench_hooks::FORCED_TILES.lock().unwrap();
+        if fit_dest.is_some() && forced.len() == block.len() {
+            InlineVec::from(forced.as_slice())
+        } else {
+            block
+        }
+    };
 
     (
         compressed_dims,
