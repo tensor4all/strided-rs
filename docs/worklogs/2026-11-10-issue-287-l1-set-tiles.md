@@ -52,14 +52,32 @@ checked bitwise against the model's before timing.
   and f32, (1,2,0) f64, (2,1,0) f64, each at 1T and 4T (0.47-0.80); 1024×4096 f64 at 4T, B transposed
   (0.72) and A,B transposed (0.84).
 
-Reason, as far as the data goes: these are three-operand `f64` walks where the fit shortens the inner
-run (to 6, 12 or 3 elements) on layouts whose aliasing is partial (B row stride 2 KiB, `P = 2`) or whose
-per-thread share is small. The walk pays its per-run callback for every run, and in these cells that
-cost exceeds what the set fit saves; the hand-loop probe shows the same walk overhead. The rule was not
-narrowed to exclude them after the run.
+Reasons, from the hand-loop probe on the two fused shapes behind the 3-D cells (medians of 5 rounds):
+
+| fused shape (layout) | tile | walk | hand |
+|---|---|---|---|
+| 128×32768 (perm (1,2,0), B row stride 256 KiB, `P = 1`) | model [40,32] | 16.4 ms | 13.8 ms |
+| | fit [6,32] | 18.2 ms | 9.6 ms |
+| 16384×256 (perm (2,0,1), B row stride 2 KiB, `P = 2`) | model [40,32] | 13.0 ms | 9.7 ms |
+| | fit [12,32] | 18.8 ms | 10.1 ms |
+
+- Full aliasing (`P = 1`, perm (1,2,0)): the set fit is right. The hand loop gains 1.44x, but the
+  production walk loses, because it pays its per-run callback on 6-element runs.
+- Partial aliasing (`P = 2`, perm (2,0,1)): the set-count model is wrong. The hand loop shows no
+  penalty at [40,32], so the fit buys nothing and the walk pays for shorter runs.
+- perm (2,1,0) (unfused 3-D) and 1024×4096 f64 at 4T: not probed; unexplained.
+
+The rule was not narrowed to exclude these cells after the run.
 
 Host: loadavg 4.7 at start, 7.1 at end; no foreign process on 32-39 at either point. Spread of the
 current arm's median across rounds: median 10 %, max 20 %.
+
+## Folds
+
+`dot` plans with `Some(0)` (operand 0 is its input `a`) and folds into one accumulator in tile
+order, so it would have been fitted and its rounding changed. It now plans through
+`kernel::fold_plan`: main's order and fusion, the model's tiles. The reductions plan with
+`dest_index: None` and never reach the fit. `dot` is not among the timed cells.
 
 ## Not done
 

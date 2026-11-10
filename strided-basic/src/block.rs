@@ -160,13 +160,15 @@ pub(crate) fn destination_block_sizes(
 /// (upper bound), and no block drops below `min(b_i, min_k P_k,i)` (lower
 /// bound): an axis whose lines do not alias is never cut.
 ///
-/// **Numerical results.** Tiles change only the visit order. Every caller
-/// in this workspace writes an injective destination once per slot from a
-/// pointwise expression, so its output is bit-identical under any tiles. An
-/// axis on which the destination has stride `0` is kept anyway: the order in
-/// which one output element would accumulate its contributions depends only
-/// on the blocks of those axes. A kernel without a destination (a fold into
-/// one accumulator) does not call this, because there every block orders the
+/// **Numerical results.** Tiles change only the visit order. A caller either
+/// writes each destination slot once from a pointwise expression (the map,
+/// zip, fused and update entries validate an injective destination), or
+/// accumulates into it (`add_acc` and the other `*_acc` entries accept a
+/// destination with zero-stride axes). The order in which one output element
+/// accumulates its contributions depends only on the blocks of the
+/// destination's zero-stride axes, and those are never cut, so every output
+/// is bit-identical to the model's tiles. A fold into one accumulator (`dot`,
+/// the reductions) does not call this, because there every block orders the
 /// fold.
 ///
 /// [#287]: https://github.com/tensor4all/strided-rs/issues/287

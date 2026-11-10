@@ -181,13 +181,12 @@ pub(crate) const L1_WAYS: usize = 8;
 /// Lines a tile may keep live in one L1 set: [`L1_WAYS`] less a quarter of
 /// them (6 of 8).
 ///
-/// The quarter is headroom, not geometry. The replacement policy of these
+/// The quarter is headroom, not geometry: the replacement policy of these
 /// caches is a pseudo-LRU that does not always evict the oldest line, and the
 /// L1 stride prefetcher of a strided operand pulls its next lines into the
 /// same set, so a set filled to exactly its ways still evicts lines before
-/// they are reused. On the #287 diagnostic (Zen 3, 2048^2 `mul_into` with B
-/// transposed, one thread) a budget of 8 lines ran 0.78-0.93x the model's
-/// tiles, 6 lines 1.2x (`f64`) and 1.5x (`f32`), and 4 lines 1.1x and 1.15x.
+/// they are reused. The value was calibrated on the #287 diagnostic; the
+/// measurement is in `docs/worklogs/2026-11-10-issue-287-l1-set-tiles.md`.
 pub(crate) const L1_LIVE_LINES_PER_SET: usize = L1_WAYS - L1_WAYS / 4;
 
 /// Measurement hooks for benchmarks only; compiled out of every other build.

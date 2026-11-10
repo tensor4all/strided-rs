@@ -643,3 +643,25 @@ fn planned_tiles_never_exceed_the_model_and_keep_the_reduced_axes() {
         }
     }
 }
+
+/// `dot` folds into one accumulator in tile order, so its plan keeps the
+/// model's tiles even where a destination-writing plan of the same layout is
+/// fitted to the L1 sets (#287): its result bits stay those of the model.
+#[test]
+fn a_fold_keeps_the_model_tiles_where_a_destination_is_fitted() {
+    for (m, n) in [(2048usize, 2048usize), (1024, 4096)] {
+        let a = col_major(&[m, n]);
+        let b = stored(&[m, n], &[1, 0]);
+        let refs: [&[isize]; 2] = [&a, &b];
+        let total = m * n;
+        let (fused, ordered, fold) = fold_plan(&[m, n], &refs, 0, &[8, 8], total);
+        let ordered: Vec<&[isize]> = ordered.iter().map(|s| s.as_slice()).collect();
+        let model = crate::block::compute_block_sizes(&fused, &ordered, &[8, 8]);
+        assert_eq!(fold.block.as_slice(), model.as_slice(), "[{m}, {n}]");
+        let (_, _, fitted) = pointwise_plan(&[m, n], &refs, Some(0), &[8, 8], total);
+        assert_ne!(
+            fitted.block, fold.block,
+            "[{m}, {n}]: the layout must be one the fit moves"
+        );
+    }
+}
