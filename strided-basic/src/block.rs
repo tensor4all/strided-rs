@@ -101,6 +101,202 @@ pub(crate) fn compute_block_sizes(
     blocks
 }
 
+/// [`compute_block_sizes`] for a kernel that writes operand `dest`, with the
+/// tiles fitted to the L1 sets by [`fit_l1_sets`] (#287).
+///
+/// The fit runs only on a block vector the model reduced and did not decline:
+/// every exit that keeps the full dimensions keeps them here too.
+pub(crate) fn destination_block_sizes(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_sizes: &[usize],
+    dest: usize,
+) -> InlineVec<usize> {
+    let Some(mut blocks) = reduced_block_sizes(dims, strides_list, elem_sizes) else {
+        return InlineVec::from(dims);
+    };
+    if declines_tiles(dims, strides_list, elem_sizes, &blocks) {
+        return InlineVec::from(dims);
+    }
+    fit_l1_sets(dims, strides_list, elem_sizes, dest, &mut blocks);
+    blocks
+}
+
+/// Shrink `blocks` until the lines a tile keeps live for reuse fit the L1
+/// sets they fall in (#287).
+///
+/// Strided.jl's model budgets a tile by its total footprint only. A cache is
+/// set-associative, though: one set holds at most [`L1_WAYS`](crate::L1_WAYS)
+/// lines, and lines whose addresses differ by a multiple of the way size
+/// `w = BLOCK_MEMORY_SIZE / L1_WAYS` share a set.
+///
+/// **Which lines are live.** In the tile walk axis 0 is the inner run, then
+/// axes 1, 2, ... nest outward. For operand `k`, let `c_k` be its first axis
+/// whose byte stride is below a line (its reuse axis). The lines touched along
+/// the axes before `c_k` are revisited on the next step of axis `c_k` (the
+/// next element of each line), so they must all stay resident across one
+/// sweep of those axes. An operand with `c_k = 0` streams its lines and has
+/// nothing live; one with no such axis never revisits a line.
+///
+/// **How many share a set.** Along an axis with byte stride `s >= line`,
+/// consecutive lines land in sets that repeat after `P = w / gcd(s, w)` steps,
+/// so `b` steps put `ceil(b / P)` lines in one set. The operand's per-set load
+/// is the product of those factors over its axes before `c_k`, and the loads
+/// of all operands add up. A power-of-two leading dimension is the bad case:
+/// a 2048-element `f64` row stride is 16 KiB, `P = 1`, and the model's
+/// `[40, 32]` tile puts 40 lines in one 8-way set ([#287]). A non-power-of-two
+/// stride spreads its lines over many sets and is left alone.
+///
+/// **The budget.** The load may not exceed
+/// [`L1_LIVE_LINES_PER_SET`](crate::L1_LIVE_LINES_PER_SET), the ways less a
+/// quarter of headroom for the pseudo-LRU replacement and the stride
+/// prefetcher (see the constant).
+///
+/// **The fit.** While the load exceeds the budget, the outermost shrinkable axis
+/// (the inner run stays long for the operands that stream it) is cut to the
+/// largest extent that meets the budget, or, if that axis alone cannot, to the
+/// extent `min P` at which it contributes a factor of 1, and the next axis is
+/// tried. Blocks only shrink, so the model's footprint bound still holds
+/// (upper bound), and no block drops below `min(b_i, min_k P_k,i)` (lower
+/// bound): an axis whose lines do not alias is never cut.
+///
+/// **Numerical results.** Tiles change only the visit order. Every caller
+/// in this workspace writes an injective destination once per slot from a
+/// pointwise expression, so its output is bit-identical under any tiles. An
+/// axis on which the destination has stride `0` is kept anyway: the order in
+/// which one output element would accumulate its contributions depends only
+/// on the blocks of those axes. A kernel without a destination (a fold into
+/// one accumulator) does not call this, because there every block orders the
+/// fold.
+///
+/// [#287]: https://github.com/tensor4all/strided-rs/issues/287
+pub(crate) fn fit_l1_sets(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_sizes: &[usize],
+    dest: usize,
+    blocks: &mut [usize],
+) {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    debug_assert_eq!(dims.len(), blocks.len());
+    #[cfg(feature = "bench-hooks")]
+    let budget = crate::bench_hooks::L1_SET_BUDGET.load(core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "bench-hooks"))]
+    let budget = crate::L1_LIVE_LINES_PER_SET;
+    if budget == 0 {
+        return;
+    }
+    let sets = L1Sets::new(strides_list, elem_sizes);
+    if sets.load(blocks, None) <= budget as u128 {
+        return;
+    }
+    let frozen = |axis: usize| strides_list.get(dest).is_some_and(|s| s[axis] == 0);
+    // Outermost first; each axis is visited once, and is left either meeting
+    // the budget or contributing a factor of 1.
+    for axis in (0..dims.len()).rev() {
+        if frozen(axis) {
+            continue;
+        }
+        let Some(floor) = sets.floor(axis, blocks[axis]) else {
+            continue;
+        };
+        let current = blocks[axis];
+        if sets.load(blocks, Some((axis, floor))) > budget as u128 {
+            blocks[axis] = floor;
+            continue;
+        }
+        // The load is nondecreasing in the extent: the largest extent in
+        // `[floor, current)` within the budget.
+        let (mut lo, mut hi) = (floor, current - 1);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if sets.load(blocks, Some((axis, mid))) <= budget as u128 {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        blocks[axis] = lo;
+        return;
+    }
+}
+
+/// The per-set line load of [`fit_l1_sets`]: each operand's reuse axis and the
+/// byte strides before it.
+struct L1Sets<'a> {
+    strides_list: &'a [&'a [isize]],
+    elem_sizes: &'a [usize],
+}
+
+impl<'a> L1Sets<'a> {
+    const LINE: u128 = CACHE_LINE_SIZE as u128;
+    const WAY: u128 = (BLOCK_MEMORY_SIZE / crate::L1_WAYS) as u128;
+
+    fn new(strides_list: &'a [&'a [isize]], elem_sizes: &'a [usize]) -> Self {
+        Self {
+            strides_list,
+            elem_sizes,
+        }
+    }
+
+    /// Operand `k`'s reuse axis `c_k` (its first axis with a byte stride below
+    /// a line), or `None` when it keeps no line live: it has no such axis, it
+    /// is zero-sized, or `c_k = 0`.
+    fn reuse_axis(&self, k: usize) -> Option<usize> {
+        let elem = self.elem_sizes[k] as u128;
+        if elem == 0 {
+            return None;
+        }
+        let strides = self.strides_list[k];
+        let c = strides
+            .iter()
+            .position(|&s| s.unsigned_abs() as u128 * elem < Self::LINE)?;
+        (c > 0).then_some(c)
+    }
+
+    /// Steps along an axis of byte stride `s` before its lines repeat a set.
+    fn period(&self, k: usize, axis: usize) -> usize {
+        let s = self.strides_list[k][axis].unsigned_abs() as u128 * self.elem_sizes[k] as u128;
+        // `WAY / gcd` divides `WAY`, which fits `usize`.
+        (Self::WAY / gcd(s, Self::WAY)) as usize
+    }
+
+    /// The summed per-set load of every operand's live lines, with `axis`
+    /// optionally replaced by another extent. Saturates.
+    fn load(&self, blocks: &[usize], with: Option<(usize, usize)>) -> u128 {
+        let extent = |axis: usize| match with {
+            Some((a, b)) if a == axis => b,
+            _ => blocks[axis],
+        };
+        (0..self.strides_list.len())
+            .filter_map(|k| {
+                let c = self.reuse_axis(k)?;
+                Some((0..c).fold(1u128, |load, axis| {
+                    load.saturating_mul(extent(axis).div_ceil(self.period(k, axis)) as u128)
+                }))
+            })
+            .fold(0u128, u128::saturating_add)
+    }
+
+    /// The extent at which `axis` contributes a factor of 1 to every operand
+    /// that keeps it live (`min_k P_k`), or `None` when it already does at
+    /// `block` and cutting it cannot lower the load.
+    fn floor(&self, axis: usize, block: usize) -> Option<usize> {
+        let floor = (0..self.strides_list.len())
+            .filter(|&k| self.reuse_axis(k).is_some_and(|c| axis < c))
+            .map(|k| self.period(k, axis))
+            .min()?;
+        (floor < block).then_some(floor)
+    }
+}
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 /// The model's block vector, or `None` when one of its sufficient exits keeps
 /// the full dimensions before any metadata is built: rank zero, a memory
 /// region within the budget, or operands whose byte strides are all nonzero

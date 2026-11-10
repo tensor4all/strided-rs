@@ -67,3 +67,13 @@ harness = false
 name = "view_decline_428"
 harness = false
 required-features = ["bench-hooks"]
+
+[[bench]]
+name = "block_l1_sets_287"
+harness = false
+required-features = ["bench-hooks", "parallel"]
+
+[[bench]]
+name = "tile_probe_287"
+harness = false
+required-features = ["bench-hooks", "parallel"]

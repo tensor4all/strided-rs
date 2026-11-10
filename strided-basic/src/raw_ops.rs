@@ -435,7 +435,7 @@ fn tile_blocks<D, S>(
 ) -> Option<crate::inline::InlineVec<usize>> {
     // `None`: one of the model's exits keeps the full dimensions, which
     // cannot change the visit order.
-    let model = crate::block::reduced_block_sizes(
+    let mut model = crate::block::reduced_block_sizes(
         dims,
         &[dst, src],
         &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
@@ -454,6 +454,14 @@ fn tile_blocks<D, S>(
     ) {
         return None;
     }
+    // Operand 0 is the destination, as on the view path (#287).
+    crate::block::fit_l1_sets(
+        dims,
+        &[dst, src],
+        &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
+        0,
+        &mut model,
+    );
     Some(model)
 }
 

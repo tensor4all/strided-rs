@@ -168,6 +168,28 @@ pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;
 /// Used for memory region calculations in block size computation.
 pub const CACHE_LINE_SIZE: usize = 64;
 
+/// Associativity of the L1 data cache the tiles target.
+///
+/// With [`BLOCK_MEMORY_SIZE`] it fixes the way size, `BLOCK_MEMORY_SIZE /
+/// L1_WAYS` = 4 KiB: addresses that differ by a multiple of it fall in the same
+/// set, and a set holds at most `L1_WAYS` lines. 32 KiB 8-way (Zen 1-4,
+/// Skylake) and 48 KiB 12-way (Ice Lake and later, Zen 5) L1d caches share the
+/// 4 KiB way, and 8 is the smaller associativity, so the bound stays safe on
+/// both. See `block::fit_l1_sets` (#287).
+pub(crate) const L1_WAYS: usize = 8;
+
+/// Lines a tile may keep live in one L1 set: [`L1_WAYS`] less a quarter of
+/// them (6 of 8).
+///
+/// The quarter is headroom, not geometry. The replacement policy of these
+/// caches is a pseudo-LRU that does not always evict the oldest line, and the
+/// L1 stride prefetcher of a strided operand pulls its next lines into the
+/// same set, so a set filled to exactly its ways still evicts lines before
+/// they are reused. On the #287 diagnostic (Zen 3, 2048^2 `mul_into` with B
+/// transposed, one thread) a budget of 8 lines ran 0.78-0.93x the model's
+/// tiles, 6 lines 1.2x (`f64`) and 1.5x (`f32`), and 4 lines 1.1x and 1.15x.
+pub(crate) const L1_LIVE_LINES_PER_SET: usize = L1_WAYS - L1_WAYS / 4;
+
 /// Measurement hooks for benchmarks only; compiled out of every other build.
 #[cfg(feature = "bench-hooks")]
 pub mod bench_hooks {
@@ -179,6 +201,44 @@ pub mod bench_hooks {
     ///
     /// [#428]: https://github.com/tensor4all/strided-rs/issues/428
     pub static DECLINE_TILES: AtomicBool = AtomicBool::new(true);
+
+    /// The per-set line budget `block::fit_l1_sets` enforces ([#287]); `0`
+    /// turns the step off. Storing `0` and the default alternately
+    /// times the model's tiles against the fitted ones in one process; see
+    /// `benches/block_l1_sets_287.rs`.
+    ///
+    /// [#287]: https://github.com/tensor4all/strided-rs/issues/287
+    pub static L1_SET_BUDGET: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(crate::L1_LIVE_LINES_PER_SET);
+
+    /// Tiles the pointwise planner uses instead of its own when non-empty and
+    /// of the fused rank: a diagnostic to time an arbitrary tile through the
+    /// production walk ([#287]).
+    ///
+    /// [#287]: https://github.com/tensor4all/strided-rs/issues/287
+    pub static FORCED_TILES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    /// The tiles the raw pair replay picks for `dims` as given (no fusion or
+    /// reordering), or `None` for its column-major walk.
+    pub fn pair_blocks<T>(dims: &[usize], dst: &[isize], src: &[isize]) -> Option<Vec<usize>> {
+        match crate::raw_ops::PairTraversal::given(dims, dst, src).tiles::<T, T>()? {
+            crate::raw_ops::Tiles::Inline(tiles) => Some(tiles.blocks[..dims.len()].to_vec()),
+            crate::raw_ops::Tiles::Spilled(tiles) => Some(tiles.blocks),
+        }
+    }
+
+    /// The fused dims and block vector the pointwise planner hands a kernel
+    /// whose destination is operand `dest`, for the bench's report.
+    pub fn pointwise_blocks(
+        dims: &[usize],
+        strides_list: &[&[isize]],
+        elem_sizes: &[usize],
+        dest: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let (dims, _, plan) =
+            crate::kernel::build_plan_fused(dims, strides_list, Some(dest), elem_sizes);
+        (dims.as_slice().to_vec(), plan.block.as_slice().to_vec())
+    }
 
     /// The view path's block vector for axes that are already in iteration
     /// order, i.e. the decision the bench toggles above.

@@ -105,9 +105,28 @@ pub(crate) fn build_plan_fused(
     let compressed_strides_refs: OperandVec<&[isize]> =
         compressed_strides.iter().map(|s| s.as_slice()).collect();
 
-    // 5. Compute blocks on the already ordered axes
+    // 5. Compute blocks on the already ordered axes. With a destination the
+    // tiles are also fitted to the L1 sets (#287); a fold without one keeps
+    // the model's tiles, which order its single accumulator.
     let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
-    let block = block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_sizes);
+    let block = match dest_index {
+        Some(dest) => block::destination_block_sizes(
+            &compressed_dims,
+            &compressed_strides_refs,
+            elem_sizes,
+            dest,
+        ),
+        None => block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_sizes),
+    };
+    #[cfg(feature = "bench-hooks")]
+    let block = {
+        let forced = crate::bench_hooks::FORCED_TILES.lock().unwrap();
+        if dest_index.is_some() && forced.len() == block.len() {
+            InlineVec::from(forced.as_slice())
+        } else {
+            block
+        }
+    };
 
     (
         compressed_dims,
