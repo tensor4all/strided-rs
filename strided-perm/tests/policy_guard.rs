@@ -38,6 +38,16 @@ fn assert_transposed(destination: &StridedArray<f64>, source: &StridedArray<f64>
     }
 }
 
+/// Fill the destination with NaN so the next copy must write every entry to
+/// pass the assertion below: without that, an earlier copy output already
+/// satisfies the check and a copy that wrote nothing goes unnoticed.
+fn poison(destination: &mut StridedArray<f64>) {
+    for i in 0..N {
+        for j in 0..N {
+            destination.set(&[i, j], f64::NAN);
+        }
+    }
+}
 fn pool_with(cost: Duration) -> Pool {
     let costs = WidthCosts::flat(cost);
     Pool::builder()
@@ -70,6 +80,9 @@ fn the_permutation_runs_on_the_token_it_is_handed() {
 
     // The same copy under a free section fans out: the token's dispatch cost
     // decides, not the element count.
+    // Poison first: the cold copy wrote the right values already, so without
+    // this the pooled copy could write nothing and still pass (review of 4168cea).
+    poison(&mut destination);
     let hot = pool_with(Duration::ZERO);
     let exec = Exec::new(&hot, 4).unwrap();
     let root = exec.ledger_root().unwrap();
@@ -87,11 +100,7 @@ fn the_permutation_runs_on_the_token_it_is_handed() {
     // process-global pool (the rayon guard of #209). Poison the destination
     // first: otherwise the pooled copy's output already satisfies the value
     // check and deleting this copy would go unnoticed (review of 4168cea).
-    for i in 0..N {
-        for j in 0..N {
-            destination.set(&[i, j], f64::NAN);
-        }
-    }
+    poison(&mut destination);
     copy_into(&mut destination.view_mut(), &transposed, Exec::serial()).unwrap();
     assert_transposed(&destination, &source, "the serial copy");
     assert!(
