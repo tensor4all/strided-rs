@@ -217,10 +217,12 @@ pub fn compute_importance<I: AsRef<[usize]>>(
         .or_else(|| {
             // One bit per level still overflows from rank ~62 on: share the top
             // weight, with the widest level cap that fits. The bound is `u64`,
-            // not a fixed 61: the cap that fits depends on the shape (a cap of
-            // 61 is forced only when the output stream is live, because its
-            // weight is `4 * 2^cap`; with an all-zero output stride `63` fits),
-            // so let the checked arithmetic choose per shape.
+            // not a fixed 61: the cap that fits depends on the shape, and on
+            // every operand at once. A live output stream alone rules out 63
+            // (its weight is `4 * 2^cap`), and an all-zero output stride does
+            // not buy 63 either: two inputs at the same level can each bring
+            // `2^cap`, and rank 65 with a 2-sized axis does exactly that. The
+            // checked sum, not a per-operand rule, decides.
             (1..=63u64)
                 .rev()
                 .find_map(|level_cap| weights(1, level_cap))
