@@ -23,6 +23,21 @@ use threadteam::{ledger, DispatchCosts, Exec, Pool, WidthCosts};
 /// #209, so a size-based fan-out would open here.
 const N: usize = 257;
 
+/// The destination must hold the transpose of `source`. Called after each copy
+/// so that every route is observed on its own output, not on whatever the next
+/// copy leaves behind.
+fn assert_transposed(destination: &StridedArray<f64>, source: &StridedArray<f64>, route: &str) {
+    for i in 0..N {
+        for j in 0..N {
+            assert_eq!(
+                destination.get(&[i, j]),
+                source.get(&[j, i]),
+                "{route}: mismatch at [{i}, {j}]"
+            );
+        }
+    }
+}
+
 fn pool_with(cost: Duration) -> Pool {
     let costs = WidthCosts::flat(cost);
     Pool::builder()
@@ -51,6 +66,7 @@ fn the_permutation_runs_on_the_token_it_is_handed() {
         0,
         "a copy too small to repay a fan-out installed work"
     );
+    assert_transposed(&destination, &source, "the narrow-to-one-slot copy");
 
     // The same copy under a free section fans out: the token's dispatch cost
     // decides, not the element count.
@@ -62,19 +78,15 @@ fn the_permutation_runs_on_the_token_it_is_handed() {
         ledger::installs(root) > 0,
         "a free section never fanned out: the token was ignored"
     );
+    // Check the pooled copy *before* the serial copy replaces its output: with
+    // only the final comparison (review of cf164de), a pooled copy that wrote
+    // the wrong values still passed because the serial copy overwrote it.
+    assert_transposed(&destination, &source, "the pooled copy");
 
     // The serial route writes the transposed source and never starts the
     // process-global pool (the rayon guard of #209).
     copy_into(&mut destination.view_mut(), &transposed, Exec::serial()).unwrap();
-    for i in 0..N {
-        for j in 0..N {
-            assert_eq!(
-                destination.get(&[i, j]),
-                source.get(&[j, i]),
-                "mismatch at [{i}, {j}]"
-            );
-        }
-    }
+    assert_transposed(&destination, &source, "the serial copy");
     assert!(
         ledger::global_pool_unstarted(),
         "the permutation reached the process-global pool"
