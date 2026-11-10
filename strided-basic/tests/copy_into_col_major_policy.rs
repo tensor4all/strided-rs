@@ -11,8 +11,9 @@ mod common;
 
 use strided_basic::{copy_into_col_major, StridedArray};
 
-/// A 1024x1024 `f64` transpose: about 94 us of serial copy work, which repays
-/// the 100 ns sections of the shared test pool four times over.
+/// A 1024x1024 `f64` transpose: 8 MiB of source and 8 MiB of destination, far
+/// more work than the short sections the shared test pool hands out, so any
+/// fan-out at all moves the install counter.
 const N: usize = 1024;
 
 #[test]
