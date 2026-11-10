@@ -84,3 +84,20 @@ order, so it would have been fitted and its rounding changed. It now plans throu
 - The walk's per-run overhead (the larger half of the #287 gap) is untouched.
 - `AGENTS.md:133-134` (Key Constants) does not list `L1_WAYS` / `L1_LIVE_LINES_PER_SET`; left for the
   maintainer, as `AGENTS.md` is not edited by agents here.
+
+## Restriction and rerun (8ed2499)
+
+The owner's recomputation of the first run (candidate median over the median of both current arms,
+per cell) counted 16 cells above 3%, all three-operand `mul_into`; every changed two-operand cell was
+faster. The fit now runs only on two-operand walks (`strides_list.len() == 2`: `copy_into`, unary maps,
+the raw pair replay) and counts only fully aliasing axes (byte stride a multiple of the 4 KiB way).
+`mul_into` and every wider walk keep the model's tiles, so the #287 cell itself (2048² `mul_into`,
+B transposed) is no longer changed by this PR.
+
+Rerun of the same 180 cells, same harness and pinning (loadavg 14.8 at start, 6.8 at the end; two
+`claude` processes at 1-3% CPU on 32-39, under the 20% validity threshold):
+
+- 32 cells change tiles, all `copy_into` / `replay_copy_raw`; candidate/current 0.273-0.887 (median
+  0.518), none above 3%. Best: `replay_copy_raw` transposed [1024,4096] f32 1T, 13.81 -> 3.77 ms.
+- 25 cells read above 3%, all with identical tiles in both arms (identical code); the A/A arm itself
+  deviates by more than 3% in 51 cells of this run. Those are noise, not regressions.
