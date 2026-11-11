@@ -250,3 +250,79 @@ fn update_plan_execute_uninit_parallel_initializes_every_slot() {
     assert_eq!(serial, expected);
     assert_eq!(parallel, expected);
 }
+
+/// At budget 96 on the `x86_64-avx512` class, the width the plan's estimate asks
+/// for on the five rows of strided-rs#363's table, as literals: `n` = 64, 128 the
+/// region is one participant, 256 asks for 6, 512 for 23 and 1024 for 47, against
+/// 1, 1, 1, 6, 11 for the flat `Copy` row the plan used to be priced at. The class
+/// and its dispatch costs are named, so these are the same numbers on every
+/// runner (strided-rs#364).
+///
+/// #363 records 24 and 46-47 participants as the width the *measured* serial time
+/// of the 512 and 1024 rows wants; the plan's 3.0 ns per element asks for 23 and
+/// 47, i.e. within one participant (the assertion holds `width_for(measured, 1)`
+/// against the plan rate in
+/// `a_transposing_plan_rate_past_l2_gives_the_width_of_its_measured_time`). The
+/// equal-layout column keeps the row at every `n`: 0.23-0.50 ns per element
+/// measured for a streamed copy is not a rate this change raises, which is why the
+/// contiguous widths are `main`'s.
+#[cfg(feature = "parallel")]
+#[test]
+fn the_plan_rate_asks_for_these_widths_at_budget_96() {
+    use threadteam::{DispatchCosts, HostClass, Pool};
+    let class = HostClass::X86_64Avx512;
+    let pool = Pool::builder()
+        .threads(96)
+        .dispatch_costs(DispatchCosts::for_class(class))
+        .build()
+        .unwrap();
+    let rate_of = |plan: &CopyPlan| plan.ns_per_element_on::<f64, f64>(class);
+    for (n, transpose_width, equal_width) in [
+        (64usize, 1usize, 1usize),
+        (128, 1, 1),
+        (256, 6, 1),
+        (512, 23, 6),
+        (1024, 47, 11),
+    ] {
+        let side = n as isize;
+        let total = n * n;
+        let mut exec = Exec::new(&pool, 96).unwrap();
+        assert_eq!(exec.budget().get(), 96);
+        let at_flat = crate::cost::for_len_at_rate(
+            exec.reborrow(),
+            total,
+            KernelClass::Copy.ns_per_element_of(class),
+        )
+        .budget()
+        .get();
+        let transpose = CopyPlan::compile(&[n, n], &[side, 1], &[1, side]).unwrap();
+        let equal = CopyPlan::compile(&[n, n], &[1, side], &[1, side]).unwrap();
+        let transposing = crate::cost::for_len_at_rate(exec.reborrow(), total, rate_of(&transpose))
+            .budget()
+            .get();
+        let streamed = crate::cost::for_len_at_rate(exec.reborrow(), total, rate_of(&equal))
+            .budget()
+            .get();
+        assert_eq!(
+            transposing,
+            transpose_width,
+            "{n} x {n} transposing: {:.3} ns per element asks for {transposing}",
+            rate_of(&transpose)
+        );
+        assert_eq!(
+            streamed,
+            equal_width,
+            "{n} x {n} equal layout: {:.3} ns per element asks for {streamed}",
+            rate_of(&equal)
+        );
+        // The equal-layout column did not move: it is the flat row's width.
+        assert_eq!(
+            equal_width, at_flat,
+            "{n} x {n} contiguous widths are unchanged"
+        );
+        assert!(
+            transpose_width >= at_flat,
+            "{n} x {n}: the plan must ask for at least the flat row's width"
+        );
+    }
+}
