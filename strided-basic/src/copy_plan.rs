@@ -303,82 +303,27 @@ impl CopyPlan {
         if !crate::layout_check::is_injective_layout(dims, dst_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
+        let fused = fuse_pair_traversal(dims, dst_strides, src_strides);
         Ok(Self {
             dims: dims.into(),
             dst_strides: dst_strides.into(),
             src_strides: src_strides.into(),
-            fused: fuse_pair_traversal(dims, dst_strides, src_strides),
+            fused,
             dst_span: span_elements(dims, dst_strides),
             src_span: span_elements(dims, src_strides),
         })
     }
 
-    /// Whether the replay walks the plan as one unit-stride run on each side, the
-    /// layout the `Copy` row is calibrated on. A streamed contiguous copy keeps
-    /// that rate at every footprint, and a reversed one (`-1` on a side) streams
-    /// the same way.
-    ///
-    /// The question is about the walk the replay takes, not about a walk the
-    /// layout would allow: both replays walk the fused axes in their stored
-    /// order with axis 0 fastest (`apply_fused_range`, `apply_spilled_range`),
-    /// and the tiled replay only exists for two or more moving axes. So the
-    /// strides, read in that order, must be the running products of the extents
-    /// with one sign per operand. Fusion already merges every such pair, so in
-    /// practice this is a fused rank of one at unit stride; a dense *reversed*
-    /// buffer of rank two or more is not one run here, because fusion sorts the
-    /// axes by signed destination stride and walks `[-1, -512]` over
-    /// `[512, 512]` with `-512` fastest (strided-rs#364 review). It is priced
-    /// as the strided walk it is.
-    fn is_contiguous_run(&self) -> bool {
-        fn walks_one_run(axes: impl Iterator<Item = (usize, isize, isize)>) -> bool {
-            let mut step = 1usize;
-            let mut signs = None;
-            for (dim, dst, src) in axes {
-                if dim == 1 {
-                    continue;
-                }
-                if dst.unsigned_abs() != step || src.unsigned_abs() != step {
-                    return false;
-                }
-                let axis_signs = (dst < 0, src < 0);
-                if *signs.get_or_insert(axis_signs) != axis_signs {
-                    return false;
-                }
-                step = step.saturating_mul(dim);
-            }
-            true
-        }
-        match &self.fused {
-            PairTraversal::Inline(layout) => walks_one_run((0..layout.rank).map(|axis| {
-                (
-                    layout.dims[axis],
-                    layout.dst_strides[axis],
-                    layout.src_strides[axis],
-                )
-            })),
-            PairTraversal::Spilled(axes) => {
-                walks_one_run(axes.iter().map(|axis| (axis.dim, axis.dst, axis.src)))
-            }
-        }
-    }
-
     /// Serial rate this plan prices itself at on host class `host`: the `Copy`
-    /// row while the plan is one contiguous run or its working set fits the
-    /// class's L2 cache, the class's beyond-L2 copy rate otherwise
+    /// row while the plan is one contiguous run, the row plus one cache line per
+    /// run of its walk otherwise, the class's beyond-L2 line past its L2 cache
     /// (strided-rs#364). [`Self::replay`] asks it for [`HostClass::detect`]; the
     /// class is a parameter so that the tests can pin it.
     ///
     /// The element size is the one fact `compile` cannot know, so the footprint
     /// in bytes is formed here from the compiled span; nothing is probed.
     fn ns_per_element_on<D, S>(&self, host: HostClass) -> f64 {
-        if self.is_contiguous_run() {
-            return KernelClass::Copy.ns_per_element_of(host);
-        }
-        let bytes = self
-            .dst_span
-            .saturating_mul(size_of::<D>())
-            .saturating_add(self.src_span.saturating_mul(size_of::<S>()));
-        crate::cost::copy_ns_per_element_for_footprint(host, bytes)
+        plan_ns_per_element::<D, S>(host, &self.fused, self.dst_span, self.src_span)
     }
 
     /// Check the per-call facts: the supplied views must carry exactly the
@@ -542,6 +487,103 @@ impl CopyPlan {
     }
 }
 
+/// Whether the replay walks `fused` as one unit-stride run on each side, the
+/// layout the `Copy` row is calibrated on, and the length of the unit-stride run
+/// its walk starts with.
+///
+/// A *run* is a stretch of the walk that advances by one element on both sides;
+/// a streamed contiguous copy is one run and keeps the row at every footprint, a
+/// reversed one (`-1` on a side) streams the same way, and a transposing walk
+/// takes one run of one element per visit. The run length is the
+/// `elements / segments` ratio of strided-rs#364's
+/// `segments * per_segment + elements * per_element_inside_segment`, read off the
+/// frozen fused layout, so it is a compile-time plan property and nothing is
+/// probed.
+///
+/// The question is about the walk the replay takes, not about a walk the layout
+/// would allow: both replays walk the fused axes in their stored order with axis 0
+/// fastest (`apply_fused_range`, `apply_spilled_range`), and the tiled replay only
+/// exists for two or more moving axes. So the strides, read in that order, must be
+/// the running products of the extents with one sign per operand. Fusion already
+/// merges every such pair, so in practice a one-run walk is a fused rank of one at
+/// unit stride; a dense *reversed* buffer of rank two or more is not one run here,
+/// because fusion sorts the axes by signed destination stride and walks
+/// `[-1, -512]` over `[512, 512]` with `-512` fastest (strided-rs#364 review).
+/// That walk's runs are one element long, and it is priced as the strided walk it
+/// is.
+fn walk_runs(fused: &PairTraversal) -> (usize, bool) {
+    /// `(leading run length, that run is the whole walk)`.
+    fn runs(axes: impl Iterator<Item = (usize, isize, isize)>) -> (usize, bool) {
+        let mut len = 1usize;
+        let mut signs = None;
+        for (dim, dst, src) in axes {
+            if dim == 1 {
+                continue;
+            }
+            // A direction flip ends the run too: the walk reverses there, so the
+            // next element is a new cache line even at a unit stride.
+            let axis_signs = (dst < 0, src < 0);
+            if dst.unsigned_abs() != len
+                || src.unsigned_abs() != len
+                || *signs.get_or_insert(axis_signs) != axis_signs
+            {
+                return (len, false);
+            }
+            len = len.saturating_mul(dim);
+        }
+        (len, true)
+    }
+    match fused {
+        PairTraversal::Inline(layout) => runs(inline_axes(layout)),
+        PairTraversal::Spilled(axes) => runs(spilled_axes(axes)),
+    }
+}
+
+// shortcut: the run length is the fused axes' untiled walk. The tiled replay of
+// strided-rs#422 cuts a box, so its runs can be shorter than the leading axis run
+// (an inner extent of 8 tiled to 6 and 2 halves the run length and so doubles the
+// per-run line charge). Upgrade when a tiled plan's in-L2 pricing is measured
+// against the model: derive the charge from `PairTraversal::tiles` then.
+
+/// The axes of a fused walk in replay order (axis 0 fastest) as
+/// `(extent, destination stride, source stride)`.
+fn inline_axes(layout: &FusedPairLayout) -> impl Iterator<Item = (usize, isize, isize)> + '_ {
+    (0..layout.rank).map(move |axis| {
+        (
+            layout.dims[axis],
+            layout.dst_strides[axis],
+            layout.src_strides[axis],
+        )
+    })
+}
+
+/// [`inline_axes`] for the spilled traversal.
+fn spilled_axes(axes: &[FusedAxis]) -> impl Iterator<Item = (usize, isize, isize)> + '_ {
+    axes.iter().map(|axis| (axis.dim, axis.dst, axis.src))
+}
+
+/// Serial rate a copy-shaped plan prices itself at on `host`, from the three
+/// facts `compile` froze in its fused layout and spans: whether the whole walk is
+/// one contiguous run, the length of its runs, and the working set in bytes.
+///
+/// [`CopyPlan`] and [`UpdatePlan`] both replay [`replay_fused`], so both ask their
+/// rate here (strided-rs#364).
+fn plan_ns_per_element<D, S>(
+    host: HostClass,
+    fused: &PairTraversal,
+    dst_span: usize,
+    src_span: usize,
+) -> f64 {
+    let (run_len, one_run) = walk_runs(fused);
+    if one_run {
+        return KernelClass::Copy.ns_per_element_of(host);
+    }
+    let bytes = dst_span
+        .saturating_mul(size_of::<D>())
+        .saturating_add(src_span.saturating_mul(size_of::<S>()));
+    crate::cost::copy_ns_per_element_for_plan(host, bytes, run_len)
+}
+
 /// Elements one side of a compiled layout spans: `1 + sum((dim - 1) * |stride|)`,
 /// the reach of the side from its base offset. Summed over the two sides it is
 /// the plan's working set in elements, saturating rather than wrapping because a
@@ -617,6 +659,10 @@ pub struct UpdatePlan {
     dst_strides: AxisVec<isize>,
     src_strides: AxisVec<isize>,
     fused: PairTraversal,
+    /// Working-set spans, as on [`CopyPlan`]: the footprint in bytes is formed at
+    /// replay, where the element types are known.
+    dst_span: usize,
+    src_span: usize,
 }
 
 impl UpdatePlan {
@@ -641,15 +687,27 @@ impl UpdatePlan {
         if !crate::layout_check::is_injective_layout(dims, dst_strides) {
             return Err(StridedError::NonInjectiveOutputLayout);
         }
+        let fused = fuse_pair_traversal(dims, dst_strides, src_strides);
         Ok(Self {
             dims: dims.into(),
             dst_strides: dst_strides.into(),
             src_strides: src_strides.into(),
-            fused: fuse_pair_traversal(dims, dst_strides, src_strides),
+            fused,
+            dst_span: span_elements(dims, dst_strides),
+            src_span: span_elements(dims, src_strides),
         })
     }
 
-    /// Check the per-call facts, then replay the compiled traversal.
+    /// Serial rate this plan prices itself at on host class `host`: the same
+    /// [`plan_ns_per_element`] as [`CopyPlan`], because both replay
+    /// [`replay_fused`] and a caller that paid the line per run on one would pay
+    /// it on the other (strided-rs#364).
+    fn ns_per_element_on<D, S>(&self, host: HostClass) -> f64 {
+        plan_ns_per_element::<D, S>(host, &self.fused, self.dst_span, self.src_span)
+    }
+
+    /// Check the per-call facts, then replay the compiled traversal, priced for
+    /// this host's class.
     fn replay<D, S, Apply>(
         &self,
         dest: &mut RawStridedMut<'_, D>,
@@ -662,8 +720,28 @@ impl UpdatePlan {
         S: Copy + Send + Sync,
         Apply: Fn(&mut D, S) + Sync,
     {
+        self.replay_on(HostClass::detect(), dest, src, apply, exec)
+    }
+
+    /// [`Self::replay`] priced for host class `host`: split out for the same
+    /// reason as [`CopyPlan::replay_on`], so that a test can pin the class and see
+    /// the plan's rate reach the replay on every host (strided-rs#364).
+    fn replay_on<D, S, Apply>(
+        &self,
+        host: HostClass,
+        dest: &mut RawStridedMut<'_, D>,
+        src: &RawStridedRef<'_, S>,
+        apply: Apply,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        D: Copy + Send + Sync,
+        S: Copy + Send + Sync,
+        Apply: Fn(&mut D, S) + Sync,
+    {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
         let tiles = self.fused.tiles::<D, S>();
+        let ns_per_element = self.ns_per_element_on::<D, S>(host);
         // SAFETY: as in `CopyPlan::replay`: the views carry the compiled
         // layout, `fused` is its fusion (built only by `compile`), and
         // `compile` checked the count and destination injectivity.
@@ -674,7 +752,7 @@ impl UpdatePlan {
                 &self.fused,
                 tiles.as_ref(),
                 apply,
-                KernelClass::Copy.ns_per_element(),
+                ns_per_element,
                 exec,
             )
         };
@@ -828,11 +906,11 @@ impl UpdatePlan {
 ///   must be injective over the traversal.
 /// - The destination and source must not overlap.
 ///
-/// `ns_per_element` is the serial rate the untiled replay prices itself at; a plan
-/// whose footprint is past its class's L2 passes its own
-/// ([`CopyPlan::ns_per_element_on`]), every other caller passes the rate of
-/// `KernelClass::Copy` ([`crate::cost::KernelClass::ns_per_element`]). The tiled
-/// replay keeps its own gating.
+/// `ns_per_element` is the serial rate the replay prices itself at; both plan
+/// types pass their own ([`CopyPlan::ns_per_element_on`],
+/// `UpdatePlan::ns_per_element_on`), because the pricing follows the traversal and
+/// not the entry. The plan-free `replay_*_raw` entries pass the rate of
+/// `KernelClass::Copy` ([`crate::cost::KernelClass::ns_per_element`]).
 pub(crate) unsafe fn replay_fused<D, S, Apply>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
