@@ -82,6 +82,13 @@ where
     assert_eq!(assume_init_vec(dest), expected);
 }
 
+/// Build a zero-extent destination from `[MaybeUninit<T>; 0]`.
+///
+/// The buffer is correctly aligned for `T` (`[MaybeUninit<T>; 0]` has
+/// `align_of::<T>()`), so this covers the zero-extent path rather than
+/// acceptance of misaligned empty storage. The latter is rejected under the
+/// #434 contract and is guarded by
+/// `strided-view/tests/erased_empty_alignment.rs`.
 fn assert_empty_uninit_slice<T>(dtype: KernelDType)
 where
     T: Copy + strided_kernel::KernelStorageElement,
@@ -133,7 +140,7 @@ fn erased_slice_uninit_executes_every_kernel_dtype() {
 }
 
 #[test]
-fn erased_slice_uninit_accepts_unaligned_empty_storage_for_every_kernel_dtype() {
+fn erased_slice_uninit_accepts_aligned_empty_storage_for_every_kernel_dtype() {
     assert_empty_uninit_slice::<f32>(KernelDType::F32);
     assert_empty_uninit_slice::<f64>(KernelDType::F64);
     assert_empty_uninit_slice::<i32>(KernelDType::I32);
