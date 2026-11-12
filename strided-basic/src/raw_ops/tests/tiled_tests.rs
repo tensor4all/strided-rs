@@ -564,13 +564,13 @@ fn spilled_tiles_clip_the_last_tile_to_the_remaining_extent() {
     };
     assert!(
         tiles
-            .blocks
+            .blocks()
             .iter()
-            .zip(&tiles.dims)
+            .zip(tiles.dims())
             .any(|(&block, &dim)| dim % block != 0),
         "the fixture must leave a clipped last tile: dims {:?} blocks {:?}",
-        tiles.dims,
-        tiles.blocks
+        tiles.dims(),
+        tiles.blocks()
     );
     for parallel in [false, true] {
         let exec = || {
@@ -1340,4 +1340,29 @@ fn may_tile_admits_every_traversal_that_tiles() {
     assert!(cases
         .iter()
         .any(|(_, t)| t.may_tile() && t.tiles::<f64, f64>().is_some()));
+}
+
+/// The wide fixtures of the allocation test (`alloc_matrix.rs`,
+/// `check_replay_any_rank_is_allocation_free`) reach the branches it means to
+/// cover: (c) the spilled tiled walk of `4^9` with a reversed source, and (d)
+/// a 21-axis layout the model's early exits do not answer, so it builds its
+/// 42-entry stride-order table, above the 40-entry inline scratch, and still
+/// tiles.
+#[test]
+fn wide_allocation_fixtures_reach_the_spilled_model() {
+    let wide = reversed(&[4; 9]);
+    assert!(matches!(wide.tiles::<f64, f64>(), Some(Tiles::Spilled(_))));
+
+    let dims = vec![2usize; 21];
+    let dst: Vec<isize> = (0..21).map(|k| 1isize << k).collect();
+    let src: Vec<isize> = (0..21).rev().map(|k| 1isize << k).collect();
+    let axes = dims
+        .iter()
+        .zip(&dst)
+        .zip(&src)
+        .map(|((&dim, &dst), &src)| (dim, dst, src));
+    assert!(!crate::block::exits_before_metadata(axes, 8, 8));
+    assert!(2 * dims.len() > crate::inline::OPERAND_CAP * strided_view::INLINE_RANK);
+    let deep = Layout::new(&dims, &dst, &src, 0);
+    assert!(matches!(deep.tiles::<f64, f64>(), Some(Tiles::Spilled(_))));
 }

@@ -218,12 +218,13 @@ pub mod bench_hooks {
     pub static FORCED_TILES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
     /// The tiles the raw pair replay picks for `dims` as given (no fusion or
-    /// reordering), or `None` for its column-major walk.
+    /// reordering; extent-1 axes are dropped, as the model drops them), or
+    /// `None` for its column-major walk. The extents must have a checked,
+    /// nonzero product.
     pub fn pair_blocks<T>(dims: &[usize], dst: &[isize], src: &[isize]) -> Option<Vec<usize>> {
-        match crate::raw_ops::PairTraversal::given(dims, dst, src).tiles::<T, T>()? {
-            crate::raw_ops::Tiles::Inline(tiles) => Some(tiles.blocks[..dims.len()].to_vec()),
-            crate::raw_ops::Tiles::Spilled(tiles) => Some(tiles.blocks),
-        }
+        crate::raw_ops::with_given_route::<T, T, _>(dims, dst, src, |route| {
+            route.blocks().map(<[usize]>::to_vec)
+        })
     }
 
     /// The fused dims and block vector the pointwise planner hands a kernel

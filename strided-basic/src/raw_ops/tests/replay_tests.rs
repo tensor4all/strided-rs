@@ -730,3 +730,69 @@ fn non_injective_destination_keeps_the_given_axis_order() {
         assert_eq!(mapped, [0, 2, 4, 3, 5]);
     }
 }
+
+/// The moving-axis bound is what the wide route's stack arrays are sized by:
+/// `usize::BITS - 1` extent-2 axes are the most a checked count admits, and
+/// they fill exactly that many slots.
+#[test]
+fn the_wide_route_holds_the_largest_checked_moving_rank() {
+    let moving = usize::BITS as usize - 1;
+    let dims = vec![2usize; moving];
+    let strides = vec![0isize; moving];
+    crate::kernel::total_len(&dims).expect("2^(BITS - 1) elements fit usize");
+    let PairTraversal::Spilled(axes) = PairTraversal::given(&dims, &strides, &strides) else {
+        panic!("{moving} moving axes must spill");
+    };
+    assert_eq!(axes.len(), moving);
+    assert!(axes.len() < MAX_MOVING_AXES);
+}
+
+/// One more moving axis than the bound overflows the count: the entries reject
+/// it before any route is built. The constructors accept the broadcast, whose
+/// only reachable offset is 0.
+#[test]
+fn a_count_beyond_the_moving_axis_bound_is_rejected_before_the_route() {
+    let dims = vec![2usize; usize::BITS as usize];
+    let strides = vec![0isize; dims.len()];
+    let src = [1.0f64];
+    let mut dst = [0.0f64];
+    let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &dims, &strides, 0).unwrap();
+    assert!(matches!(
+        replay_copy_raw(&mut dest, &source, Exec::serial()),
+        Err(StridedError::OffsetOverflow)
+    ));
+    assert!(matches!(
+        replay_map_raw(&mut dest, &source, |d: &mut f64, s| *d += s, Exec::serial()),
+        Err(StridedError::OffsetOverflow)
+    ));
+    assert_eq!(dst, [0.0]);
+}
+
+/// The wide untiled replay of the allocation test (`alloc_matrix.rs`,
+/// `check_pooled_wide_replay`) dispatches more than one range on a team token,
+/// so every worker range runs its own cursor.
+#[test]
+fn wide_untiled_replay_fans_out_on_a_team_token() {
+    let team = team();
+    let dims = vec![2usize; 17];
+    let strides: Vec<isize> = (0..17).map(|k| 1isize << k).collect();
+    let n: usize = dims.iter().product();
+    let PairTraversal::Spilled(_) = PairTraversal::given(&dims, &strides, &strides) else {
+        panic!("seventeen moving axes must spill");
+    };
+    assert!(PairTraversal::given(&dims, &strides, &strides)
+        .tiles::<f64, f64>()
+        .is_none());
+    let src: Vec<f64> = (0..n).map(|v| v as f64).collect();
+    let mut out = vec![0.0f64; n];
+    let (exec, root) = fan_out_token(&team, n);
+    replay_copy_raw(
+        &mut RawStridedMut::new(&mut out, &dims, &strides, 0).unwrap(),
+        &RawStridedRef::new(&src, &dims, &strides, 0).unwrap(),
+        exec,
+    )
+    .unwrap();
+    assert_fanned_out(Some(root));
+    assert_eq!(out, src);
+}

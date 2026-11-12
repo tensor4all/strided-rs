@@ -3,11 +3,12 @@
 //! The map/zip kernels build a traversal plan per call; for small replay
 //! copies that fixed cost dominates. These entry points take
 //! [`RawStridedRef`]/[`RawStridedMut`], fuse the stride pair into a loop nest
-//! (inline storage for fused ranks at most [`RAW_FUSED_RANK_LIMIT`], one
-//! rank-bounded spill above that), and run plain loops - no view plan, no
-//! cache, and no per-element allocation on any call path. Higher *original*
-//! ranks are normalized and fused before that choice is made, so they no
-//! longer leave the fused replay.
+//! (inline storage for fused ranks at most [`RAW_FUSED_RANK_LIMIT`], a stack
+//! layout bounded by the moving-axis count above that), and run plain loops -
+//! no view plan, no cache, and no per-element allocation on any call path; the
+//! `replay_*_raw` entries allocate nothing at any rank on a serial token.
+//! Higher *original* ranks are normalized and fused before that choice is
+//! made, so they no longer leave the fused replay.
 
 use crate::cost::KernelClass;
 use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result};
@@ -17,15 +18,26 @@ use core::ops::{Add, Mul};
 
 /// Rank up to which a fused loop nest is stored inline.
 ///
-/// The stateless [`copy_scale_raw`] family and [`crate::CopyPlan`] fuse any rank:
-/// layouts whose *fused* rank is at most this limit replay from that inline
-/// storage, and higher fused ranks spill to storage bounded by their rank.
+/// It selects the traversal: a layout of at most this many axes replays through
+/// the inline loop nest, a longer one through the out-of-line wide loop. It
+/// does not decide allocation for the `replay_*_raw` entries, which allocate
+/// nothing at any rank on a serial token (see [`replay_copy_raw`]).
 ///
-/// Replay is allocation-free for an original rank at most this limit. A higher
-/// *original* rank needs one transient scratch buffer even when the fused layout
-/// still fits inline, because fusion happens before the representation is
-/// chosen; the replay itself is still allocation-free in that case.
+/// The stateless [`copy_scale_raw`] family and the compilation of
+/// [`crate::CopyPlan`] fuse any rank. An *original* rank above this limit needs
+/// one transient fusion scratch buffer there even when the fused layout still
+/// fits inline, because fusion happens before the representation is chosen.
 pub const RAW_FUSED_RANK_LIMIT: usize = 8;
+
+/// Capacity of the stack storage of the wide replay route.
+///
+/// A replay reaches its loops only with a checked, nonzero element count, and
+/// every axis of extent above 1 at least doubles that count, so
+/// `2^m <= total <= usize::MAX` bounds the `m` moving axes by
+/// `usize::BITS - 1`. Extent-1 axes are dropped before the bound is used: their
+/// coordinate is 0 throughout the walk, so dropping them changes neither the
+/// slots nor their column-major order.
+pub(crate) const MAX_MOVING_AXES: usize = usize::BITS as usize;
 
 /// One fused axis, used while sorting and merging axes and when a layout has to
 /// spill beyond [`RAW_FUSED_RANK_LIMIT`].
@@ -122,22 +134,37 @@ impl PairTraversal {
         Self::Inline(FusedPairLayout::empty())
     }
 
-    /// The cache tiles of this traversal, or `None` when the column-major walk
-    /// is kept.
+    /// Run `f` on the replay route of this traversal: its axes with the cache
+    /// tiles of destination element `D` and source element `S`, or no tiles
+    /// when the column-major walk is kept.
     ///
     /// The one decision entry point for both storage shapes, so a plan and a
-    /// replay entry ask the same question whatever the fused rank.
-    pub(crate) fn tiles<D, S>(&self) -> Option<Tiles> {
+    /// replay entry ask the same question whatever the fused rank. A spilled
+    /// traversal decides in [`with_spilled_route`], whose stack frame holds the
+    /// wide tiles while `f` runs.
+    pub(crate) fn with_route<D, S, R>(&self, f: impl FnOnce(Route<'_>) -> R) -> R {
         match self {
-            Self::Inline(layout) => pair_tiles::<D, S>(layout).map(Tiles::Inline),
-            Self::Spilled(axes) => spilled_pair_tiles::<D, S>(axes),
+            Self::Inline(layout) => {
+                let tiles = pair_tiles::<D, S>(layout);
+                f(Route::Inline {
+                    layout,
+                    tiles: tiles.as_ref(),
+                })
+            }
+            Self::Spilled(axes) => with_spilled_route::<D, S, R>(axes, f),
         }
     }
 
-    /// Whether [`Self::tiles`] can return tiles for any element types: `false`
+    /// The cache tiles of this traversal, copied out of its route.
+    #[cfg(test)]
+    pub(crate) fn tiles<D, S>(&self) -> Option<Tiles> {
+        self.with_route::<D, S, _>(|route| route.snapshot())
+    }
+
+    /// Whether [`Self::with_route`] can tile for any element types: `false`
     /// when the traversal covers at most one element or has fewer than two
     /// axes of extent above 1, the exits [`pair_tiles`] and
-    /// [`spilled_pair_tiles`] take before they look at an element size. Such
+    /// [`with_spilled_route`] take before they look at an element size. Such
     /// a traversal is one run, whose order no block vector can change.
     pub(crate) fn may_tile(&self) -> bool {
         let (total, moving) = match self {
@@ -266,31 +293,177 @@ pub(crate) fn fuse_pair_traversal(
 }
 
 impl PairTraversal {
-    /// The given axes as a traversal, in their given order: nothing is
-    /// sorted, merged or dropped. Rank zero becomes the one-element
-    /// `EMPTY_AXIS` layout that [`fuse_axes`] also produces.
-    ///
-    /// The three slices must have equal length, and the extents a checked,
-    /// nonzero product (the replay totals multiply them unchecked).
+    /// The traversal [`with_given_route`] replays for the given axes, as an
+    /// owned value for the tests.
+    #[cfg(test)]
     pub(crate) fn given(dims: &[usize], dst_strides: &[isize], src_strides: &[isize]) -> Self {
-        debug_assert!(dims.len() == dst_strides.len() && dims.len() == src_strides.len());
-        let rank = dims.len();
-        if rank > RAW_FUSED_RANK_LIMIT {
-            return Self::Spilled(
-                dims.iter()
-                    .zip(dst_strides)
-                    .zip(src_strides)
-                    .map(|((&dim, &dst), &src)| FusedAxis { dim, dst, src })
-                    .collect(),
-            );
-        }
-        let mut layout = FusedPairLayout::empty();
-        layout.rank = rank.max(1);
-        layout.dims[..rank].copy_from_slice(dims);
-        layout.dst_strides[..rank].copy_from_slice(dst_strides);
-        layout.src_strides[..rank].copy_from_slice(src_strides);
-        Self::Inline(layout)
+        with_given_route::<(), (), _>(dims, dst_strides, src_strides, |route| match route {
+            Route::Inline { layout, .. } => Self::Inline(*layout),
+            Route::Spilled { axes, .. } => Self::Spilled(axes.to_vec()),
+        })
     }
+}
+
+/// A replay route borrowed from the frame that decided it: the axes to walk
+/// and, when the walk is tiled, their cache tiles.
+///
+/// The wide storage lives in the out-of-line frames of [`with_spilled_route`]
+/// and [`with_given_route`], so the inline route's frame never holds it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Route<'a> {
+    Inline {
+        layout: &'a FusedPairLayout,
+        tiles: Option<&'a PairTiles>,
+    },
+    Spilled {
+        axes: &'a [FusedAxis],
+        tiles: Option<&'a SpilledTiles>,
+    },
+}
+
+impl<'a> Route<'a> {
+    /// Whether the route walks cache tiles.
+    pub(crate) fn is_tiled(&self) -> bool {
+        match self {
+            Self::Inline { tiles, .. } => tiles.is_some(),
+            Self::Spilled { tiles, .. } => tiles.is_some(),
+        }
+    }
+
+    /// The same axes walked column-major.
+    pub(crate) fn untiled(self) -> Self {
+        match self {
+            Self::Inline { layout, .. } => Self::Inline {
+                layout,
+                tiles: None,
+            },
+            Self::Spilled { axes, .. } => Self::Spilled { axes, tiles: None },
+        }
+    }
+
+    /// The block vector of the tiles over their compressed axes, or `None` for
+    /// the column-major walk.
+    #[cfg(feature = "bench-hooks")]
+    pub(crate) fn blocks(&self) -> Option<&'a [usize]> {
+        match *self {
+            Self::Inline { tiles, .. } => tiles.map(|tiles| &tiles.blocks[..tiles.layout.rank]),
+            Self::Spilled { tiles, .. } => tiles.map(SpilledTiles::blocks),
+        }
+    }
+
+    /// The tiles of the route, copied out.
+    #[cfg(test)]
+    pub(crate) fn snapshot(self) -> Option<Tiles> {
+        match self {
+            Self::Inline { tiles, .. } => tiles.copied().map(Tiles::Inline),
+            Self::Spilled { tiles, .. } => tiles.copied().map(Tiles::Spilled),
+        }
+    }
+}
+
+/// Run `f` on the replay route of the given axes, in their given order:
+/// nothing is sorted or merged. Rank zero becomes the one-element
+/// `EMPTY_AXIS` layout that [`fuse_axes`] also produces.
+///
+/// The three slices must have equal length, and the extents a checked,
+/// nonzero product (the replay totals multiply them unchecked). A rank above
+/// [`RAW_FUSED_RANK_LIMIT`] is compacted to its moving axes first, out of line
+/// ([`with_wide_given_route`]).
+pub(crate) fn with_given_route<D, S, R>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    f: impl FnOnce(Route<'_>) -> R,
+) -> R {
+    debug_assert!(dims.len() == dst_strides.len() && dims.len() == src_strides.len());
+    let rank = dims.len();
+    if rank > RAW_FUSED_RANK_LIMIT {
+        return with_wide_given_route::<D, S, R>(dims, dst_strides, src_strides, f);
+    }
+    let mut layout = FusedPairLayout::empty();
+    layout.rank = rank.max(1);
+    layout.dims[..rank].copy_from_slice(dims);
+    layout.dst_strides[..rank].copy_from_slice(dst_strides);
+    layout.src_strides[..rank].copy_from_slice(src_strides);
+    let tiles = pair_tiles::<D, S>(&layout);
+    f(Route::Inline {
+        layout: &layout,
+        tiles: tiles.as_ref(),
+    })
+}
+
+/// [`with_given_route`] above [`RAW_FUSED_RANK_LIMIT`] given axes: the moving
+/// axes, in their given order, in a stack array. At most
+/// [`RAW_FUSED_RANK_LIMIT`] of them replay through the inline layout, more
+/// through [`with_spilled_route`].
+///
+/// The tile decision is the one the given axes would get: the model already
+/// drops extent-1 axes before it decides.
+#[inline(never)]
+fn with_wide_given_route<D, S, R>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+    f: impl FnOnce(Route<'_>) -> R,
+) -> R {
+    let mut axes = [EMPTY_AXIS; MAX_MOVING_AXES];
+    let mut moving = 0;
+    for ((&dim, &dst), &src) in dims.iter().zip(dst_strides).zip(src_strides) {
+        if dim == 1 {
+            continue;
+        }
+        // INVARIANT: the caller's checked nonzero count gives
+        // `2^moving <= total <= usize::MAX`, so `moving < MAX_MOVING_AXES`.
+        axes[moving] = FusedAxis { dim, dst, src };
+        moving += 1;
+    }
+    if moving <= RAW_FUSED_RANK_LIMIT {
+        let layout = FusedPairLayout::from_axes(if moving == 0 {
+            &[EMPTY_AXIS]
+        } else {
+            &axes[..moving]
+        });
+        let tiles = pair_tiles::<D, S>(&layout);
+        return f(Route::Inline {
+            layout: &layout,
+            tiles: tiles.as_ref(),
+        });
+    }
+    with_spilled_route::<D, S, R>(&axes[..moving], f)
+}
+
+/// Run `f` on the replay route of a spilled axis list: more than
+/// [`RAW_FUSED_RANK_LIMIT`] axes, every extent at least 2, and a checked
+/// product (fused or compacted axes).
+///
+/// The exits the model decides before its metadata are answered from the axes
+/// first ([#425]), so a layout they answer never sets up the tiles' storage.
+///
+/// [#425]: https://github.com/tensor4all/strided-rs/issues/425
+#[inline(never)]
+fn with_spilled_route<D, S, R>(axes: &[FusedAxis], f: impl FnOnce(Route<'_>) -> R) -> R {
+    debug_assert!(axes.len() > RAW_FUSED_RANK_LIMIT && axes.iter().all(|axis| axis.dim >= 2));
+    if crate::block::exits_before_metadata(
+        axes.iter().map(|axis| (axis.dim, axis.dst, axis.src)),
+        core::mem::size_of::<D>(),
+        core::mem::size_of::<S>(),
+    ) {
+        return f(Route::Spilled { axes, tiles: None });
+    }
+    with_modelled_spilled_route::<D, S, R>(axes, f)
+}
+
+/// [`with_spilled_route`] past the model's early exits: the tiles live in this
+/// frame while `f` runs, so neither the inline route nor an early exit carries
+/// their storage.
+#[inline(never)]
+fn with_modelled_spilled_route<D, S, R>(axes: &[FusedAxis], f: impl FnOnce(Route<'_>) -> R) -> R {
+    let mut tiles = SpilledTiles::EMPTY;
+    let tiled = spilled_tiles::<D, S>(axes, &mut tiles);
+    f(Route::Spilled {
+        axes,
+        tiles: tiled.then_some(&tiles),
+    })
 }
 
 /// Fuse a raw stride pair into the inline representation.
@@ -324,21 +497,18 @@ fn spilled_total(axes: &[FusedAxis]) -> usize {
     axes.iter().map(|axis| axis.dim).product()
 }
 
-/// The cache tiles chosen for a traversal whose tiled walk visits the slots in
-/// a different order from the column-major walk.
-///
-/// Built by [`PairTraversal::tiles`]: [`Tiles::Inline`] for a compressed rank
-/// at most [`RAW_FUSED_RANK_LIMIT`], [`Tiles::Spilled`] above it.
+/// The tiles of a route, copied out for the tests.
+#[cfg(test)]
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // a test snapshot; production borrows `Route`
 pub(crate) enum Tiles {
     Inline(PairTiles),
     Spilled(SpilledTiles),
 }
 
+#[cfg(test)]
 impl Tiles {
-    /// The tiles of the inline walk, or `None` for a spilled traversal (whose
-    /// compressed layout, when it fits inline, is replayed through that same
-    /// walk).
+    /// The tiles of the inline walk, or `None` for a spilled one.
     pub(crate) fn inline(&self) -> Option<&PairTiles> {
         match self {
             Self::Inline(tiles) => Some(tiles),
@@ -347,19 +517,46 @@ impl Tiles {
     }
 }
 
-/// The cache tiles of a spilled axis list whose compressed rank exceeds
+/// The cache tiles of a spilled axis list whose rank exceeds
 /// [`RAW_FUSED_RANK_LIMIT`].
 ///
-/// `dims`/`dst`/`src` are the compressed axes (extent-1 axes dropped, order
-/// kept) and address exactly the slots of the axis list they were built from,
-/// in the same column-major order. They are rank-sized slices rather than one
-/// array, because the tile walk and the dimension splitter both take slices.
-#[derive(Clone, Debug)]
+/// `dims`/`dst`/`src` are the axes of the list, every extent at least 2, and
+/// address exactly its slots in the same column-major order. They are stored
+/// in arrays of [`MAX_MOVING_AXES`] and read as `rank`-long slices, because the
+/// tile walk and the dimension splitter both take slices.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SpilledTiles {
-    pub(crate) dims: Vec<usize>,
-    pub(crate) dst: Vec<isize>,
-    pub(crate) src: Vec<isize>,
-    pub(crate) blocks: Vec<usize>,
+    rank: usize,
+    dims: [usize; MAX_MOVING_AXES],
+    dst: [isize; MAX_MOVING_AXES],
+    src: [isize; MAX_MOVING_AXES],
+    blocks: [usize; MAX_MOVING_AXES],
+}
+
+impl SpilledTiles {
+    const EMPTY: Self = Self {
+        rank: 0,
+        dims: [1; MAX_MOVING_AXES],
+        dst: [0; MAX_MOVING_AXES],
+        src: [0; MAX_MOVING_AXES],
+        blocks: [1; MAX_MOVING_AXES],
+    };
+
+    pub(crate) fn dims(&self) -> &[usize] {
+        &self.dims[..self.rank]
+    }
+
+    pub(crate) fn dst(&self) -> &[isize] {
+        &self.dst[..self.rank]
+    }
+
+    pub(crate) fn src(&self) -> &[isize] {
+        &self.src[..self.rank]
+    }
+
+    pub(crate) fn blocks(&self) -> &[usize] {
+        &self.blocks[..self.rank]
+    }
 }
 
 /// The cache tiles of a fused pair layout whose tiled walk visits the slots in
@@ -409,119 +606,94 @@ pub(crate) fn pair_tiles<D, S>(layout: &FusedPairLayout) -> Option<PairTiles> {
         &compressed
     };
     let rank = layout.rank;
-    let model = tile_blocks::<D, S>(
+    let mut blocks = [1; RAW_FUSED_RANK_LIMIT];
+    tile_blocks::<D, S, { 2 * RAW_FUSED_RANK_LIMIT }, RAW_FUSED_RANK_LIMIT>(
         &layout.dims[..rank],
         &layout.dst_strides[..rank],
         &layout.src_strides[..rank],
-    )?;
-    let mut blocks = [1; RAW_FUSED_RANK_LIMIT];
-    blocks[..rank].copy_from_slice(&model);
-    Some(PairTiles {
+        &mut blocks[..rank],
+    )
+    .then_some(PairTiles {
         layout: *layout,
         blocks,
     })
 }
 
 /// The block vector of the shared cache-block model for already-compressed
-/// axes (`dims`/`dst`/`src` of one length, every extent at least 2), or `None`
-/// when the column-major walk is kept.
+/// axes (`dims`/`dst`/`src` of one length, every extent at least 2), written
+/// to `blocks`; `false` when the column-major walk is kept.
+///
+/// The model's scratch holds `ORDERS` stride-order slots (two per axis) and
+/// `AXES` cost slots, at least what `dims` needs. It is set up only past the
+/// model's exits, so a layout they answer does not pay for it.
 ///
 /// The single source of the tiling decision for both storage shapes: the
 /// inline [`FusedPairLayout`] and the spilled [`SpilledTiles`].
-fn tile_blocks<D, S>(
+fn tile_blocks<D, S, const ORDERS: usize, const AXES: usize>(
     dims: &[usize],
     dst: &[isize],
     src: &[isize],
-) -> Option<crate::inline::InlineVec<usize>> {
-    // `None`: one of the model's exits keeps the full dimensions, which
+    blocks: &mut [usize],
+) -> bool {
+    let strides = [dst, src];
+    let elem_sizes = [core::mem::size_of::<D>(), core::mem::size_of::<S>()];
+    // `false`: one of the model's exits keeps the full dimensions, which
     // cannot change the visit order.
-    let mut model = crate::block::reduced_block_sizes(
+    if crate::block::model_exits(dims, &strides, &elem_sizes) {
+        return false;
+    }
+    let rank = dims.len();
+    // INVARIANT: both callers pass capacities of at least their rank.
+    let mut orders = [0usize; ORDERS];
+    let mut costs = [0isize; AXES];
+    crate::block::reduced_block_sizes_into(
         dims,
-        &[dst, src],
-        &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
-    )?;
-    let first_cut = (0..dims.len()).find(|&axis| model[axis] < dims[axis])?;
-    if model[first_cut + 1..].iter().all(|&block| block == 1) {
-        return None;
+        &strides,
+        &elem_sizes,
+        blocks,
+        &mut orders[..2 * rank],
+        &mut costs[..rank],
+    );
+    let Some(first_cut) = (0..dims.len()).find(|&axis| blocks[axis] < dims[axis]) else {
+        return false;
+    };
+    if blocks[first_cut + 1..].iter().all(|&block| block == 1) {
+        return false;
     }
     // The axes before `first_cut` are walked whole inside every tile, so each
     // operand is judged with its own element size, as the model now does.
-    if crate::block::declines_tiles(
-        dims,
-        &[dst, src],
-        &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
-        &model,
-    ) {
-        return None;
+    if crate::block::declines_tiles(dims, &strides, &elem_sizes, blocks) {
+        return false;
     }
     // Operand 0 is the destination, as on the view path (#287).
-    crate::block::fit_l1_sets(
-        dims,
-        &[dst, src],
-        &[core::mem::size_of::<D>(), core::mem::size_of::<S>()],
-        0,
-        &mut model,
-    );
-    Some(model)
+    crate::block::fit_l1_sets(dims, &strides, &elem_sizes, 0, blocks);
+    true
 }
 
-/// Cache tiles for replaying a spilled axis list, or `None` when the
-/// column-major walk is kept.
+/// Cache tiles for replaying a spilled axis list (more than
+/// [`RAW_FUSED_RANK_LIMIT`] axes, every extent at least 2, a checked product)
+/// that [`crate::block::exits_before_metadata`] does not answer, written to
+/// `tiles`; `false` when the column-major walk is kept.
 ///
 /// The invariant: an axis list is tiled exactly when the same layout given
-/// inline would be. The extent-1 axes therefore go first, in their given
-/// order — they address offset 0 whatever their stride, so dropping them keeps
-/// the slot order and the decision of the layout they padded. A compressed
-/// rank at most [`RAW_FUSED_RANK_LIMIT`] is decided and replayed through
-/// [`PairTiles`] itself ([#425]).
-///
-/// [#425]: https://github.com/tensor4all/strided-rs/issues/425
-pub(crate) fn spilled_pair_tiles<D, S>(axes: &[FusedAxis]) -> Option<Tiles> {
-    if spilled_total(axes) <= 1 {
-        return None;
+/// inline would be.
+fn spilled_tiles<D, S>(axes: &[FusedAxis], tiles: &mut SpilledTiles) -> bool {
+    let rank = axes.len();
+    // INVARIANT: every axis has an extent of at least 2 and the product is a
+    // checked nonzero count, so `2^rank <= usize::MAX` and
+    // `rank < MAX_MOVING_AXES`.
+    tiles.rank = rank;
+    for (axis, entry) in axes.iter().enumerate() {
+        tiles.dims[axis] = entry.dim;
+        tiles.dst[axis] = entry.dst;
+        tiles.src[axis] = entry.src;
     }
-    let mut compressed = FusedPairLayout::empty();
-    let mut rank = 0;
-    for axis in axes.iter().filter(|axis| axis.dim != 1) {
-        if rank < RAW_FUSED_RANK_LIMIT {
-            compressed.dims[rank] = axis.dim;
-            compressed.dst_strides[rank] = axis.dst;
-            compressed.src_strides[rank] = axis.src;
-        }
-        rank += 1;
-    }
-    if rank <= RAW_FUSED_RANK_LIMIT {
-        // Fewer than two moving axes are one run, which `pair_tiles` declines.
-        compressed.rank = rank;
-        return pair_tiles::<D, S>(&compressed).map(Tiles::Inline);
-    }
-    // The exits the model decides before its metadata are answered from the axes,
-    // before any slice is materialized: a call it declines allocates nothing
-    // ([#425]).
-    if crate::block::exits_before_metadata(
-        axes.iter()
-            .filter(|axis| axis.dim != 1)
-            .map(|axis| (axis.dim, axis.dst, axis.src)),
-        core::mem::size_of::<D>(),
-        core::mem::size_of::<S>(),
-    ) {
-        return None;
-    }
-    let mut dims = Vec::with_capacity(rank);
-    let mut dst = Vec::with_capacity(rank);
-    let mut src = Vec::with_capacity(rank);
-    for axis in axes.iter().filter(|axis| axis.dim != 1) {
-        dims.push(axis.dim);
-        dst.push(axis.dst);
-        src.push(axis.src);
-    }
-    let blocks = tile_blocks::<D, S>(&dims, &dst, &src)?;
-    Some(Tiles::Spilled(SpilledTiles {
-        dims,
-        dst,
-        src,
-        blocks: blocks.into_vec(),
-    }))
+    tile_blocks::<D, S, { 2 * MAX_MOVING_AXES }, MAX_MOVING_AXES>(
+        &tiles.dims[..rank],
+        &tiles.dst[..rank],
+        &tiles.src[..rank],
+        &mut tiles.blocks[..rank],
+    )
 }
 
 /// `layout` without its extent-1 axes, in the given order.
@@ -694,7 +866,8 @@ pub(crate) unsafe fn apply_tile_range<D, S, Apply>(
 ///
 /// The spilled counterpart of [`apply_tiled_box`]: same tile odometer, same
 /// per-element walk as the untiled replay, only the axis storage differs. Kept
-/// out of line so that the untiled spilled replay keeps its code shape.
+/// out of line so that the untiled spilled replay keeps its code shape. The
+/// tile, its cursor and its origin are stack arrays of [`MAX_MOVING_AXES`].
 ///
 /// # Safety
 ///
@@ -717,17 +890,20 @@ pub(crate) unsafe fn apply_spilled_tiled_box<D, S, Apply>(
     Apply: Fn(&mut D, S),
 {
     let rank = box_dims.len();
-    // One rank-sized axis list for the current tile and one cursor for the
-    // whole walk, however many tiles it visits.
-    let mut tile: Vec<FusedAxis> = (0..rank)
-        .map(|axis| FusedAxis {
-            dim: 1,
-            dst: tiles.dst[axis],
-            src: tiles.src[axis],
-        })
-        .collect();
-    let mut index = vec![0usize; rank];
-    let mut origin = vec![0usize; rank];
+    // One axis list for the current tile and one cursor for the whole walk,
+    // however many tiles it visits.
+    // INVARIANT: `box_dims` is `tiles.dims` or a sub-box of it, so
+    // `rank == tiles.rank < MAX_MOVING_AXES`.
+    let mut tile_axes = [EMPTY_AXIS; MAX_MOVING_AXES];
+    let tile = &mut tile_axes[..rank];
+    for (axis, slot) in tile.iter_mut().enumerate() {
+        slot.dst = tiles.dst[axis];
+        slot.src = tiles.src[axis];
+    }
+    let mut cursor = [0usize; MAX_MOVING_AXES];
+    let index = &mut cursor[..rank];
+    let mut origins = [0usize; MAX_MOVING_AXES];
+    let origin = &mut origins[..rank];
     let mut dst_tile = dst_base;
     let mut src_tile = src_base;
     loop {
@@ -743,7 +919,7 @@ pub(crate) unsafe fn apply_spilled_tiled_box<D, S, Apply>(
         // the caller's contract covers every logical index of the tile.
         unsafe {
             apply_spilled_range_with(
-                dst_ptr, dst_tile, src_ptr, src_tile, &tile, 0, count, &mut index, apply,
+                dst_ptr, dst_tile, src_ptr, src_tile, tile, 0, count, index, apply,
             );
         }
         // The column-major odometer of [`apply_tiled_box`], over slices.
@@ -944,12 +1120,14 @@ pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
 /// column-major order of the axes (axis 0 fastest).
 ///
 /// The carry loop is the one [`apply_fused_range`] uses, over interleaved axes
-/// with its carry state in one rank-bounded `Vec`: no allocation scales with
-/// the tensor size and no per-element coordinate decode happens.
+/// with its carry state in a stack array of [`MAX_MOVING_AXES`]: nothing is
+/// allocated and no per-element coordinate decode happens.
 ///
 /// # Safety
 ///
-/// The [`apply_fused_range`] contract holds for `axes`.
+/// The [`apply_fused_range`] contract holds for `axes`, which hold at most
+/// [`MAX_MOVING_AXES`] entries (every caller passes fused or compacted axes of
+/// a checked count; a longer list panics before any access).
 ///
 /// Kept out of line: inlining this second carry loop into the inline replay
 /// measurably slows that one down.
@@ -973,11 +1151,14 @@ pub(crate) unsafe fn apply_spilled_range<D, S, Apply>(
     if len == 0 {
         return;
     }
-    let mut index = vec![0usize; axes.len()];
+    let mut cursor = [0usize; MAX_MOVING_AXES];
+    // INVARIANT: fused and compacted axes have extents of at least 2 and a
+    // checked product, so `axes.len() < MAX_MOVING_AXES`.
+    let index = &mut cursor[..axes.len()];
     // SAFETY: forwarded caller contract; `index` is the rank-sized cursor.
     unsafe {
         apply_spilled_range_with(
-            dst_ptr, dst_base, src_ptr, src_base, axes, start, len, &mut index, apply,
+            dst_ptr, dst_base, src_ptr, src_base, axes, start, len, index, apply,
         )
     }
 }
@@ -1309,51 +1490,55 @@ where
     if total == 0 {
         return Ok(());
     }
-    let traversal = PairTraversal::given(dest.dims(), dest.strides(), src.strides());
-    let injective =
-        || crate::layout_check::is_injective_layout_without_alloc(dest.dims(), dest.strides());
-    let mut tiles = traversal.tiles::<D, S>();
-    let mut proven = None;
-    if tiles.is_some() {
-        let holds = injective();
-        proven = Some(holds);
-        if !holds {
-            tiles = None;
+    let (dims, dst_strides) = (dest.dims(), dest.strides());
+    let injective = || crate::layout_check::is_injective_layout_without_alloc(dims, dst_strides);
+    with_given_route::<D, S, _>(dims, dst_strides, src.strides(), |route| {
+        let mut route = route;
+        let mut proven = None;
+        if route.is_tiled() {
+            let holds = injective();
+            proven = Some(holds);
+            if !holds {
+                route = route.untiled();
+            }
         }
-    }
-    let exec = if tiles.is_some() {
-        // The tiled tree gates every node on the caller's token itself; the
-        // flat width rule would cap it at the width of one flat dispatch.
-        exec
-    } else {
-        let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
-        if !exec.is_serial() && !proven.unwrap_or_else(injective) {
-            // A destination not proven injective replays as one sequential
-            // column-major walk, which is also its defined semantics; the
-            // budget-one token cannot be widened again by the replay's own
-            // width rule.
-            exec.limit(NonZeroUsize::MIN)
-        } else {
+        let exec = if route.is_tiled() {
+            // The tiled tree gates every node on the caller's token itself; the
+            // flat width rule would cap it at the width of one flat dispatch.
             exec
-        }
-    };
-    // SAFETY: `traversal` is built from exactly the views' dims and strides
-    // (`ensure_same_dims` proved the dims agree), so the views' bounds proofs
-    // cover every replayed offset; `total_len` checked the nonzero product;
-    // `tiles` is `PairTraversal::tiles` of `traversal`, and tiles or a
-    // non-serial `exec` are left only for a destination proven injective;
-    // the exclusive and shared borrows cannot overlap.
-    unsafe {
-        crate::copy_plan::replay_fused(
-            dest,
-            src,
-            &traversal,
-            tiles.as_ref(),
-            apply,
-            KernelClass::Copy.ns_per_element(),
-            exec,
-        )
-    };
+        } else {
+            let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+            if !exec.is_serial() && !proven.unwrap_or_else(injective) {
+                // A destination not proven injective replays as one sequential
+                // column-major walk, which is also its defined semantics; the
+                // budget-one token cannot be widened again by the replay's own
+                // width rule.
+                exec.limit(NonZeroUsize::MIN)
+            } else {
+                exec
+            }
+        };
+        // SAFETY: the route is built from exactly the views' dims and strides
+        // (`ensure_same_dims` proved the dims agree); compaction drops only
+        // extent-1 axes, whose coordinate is always 0, so the reachable
+        // offsets equal the views' validated set, and the original metadata
+        // still drives bounds, shape and injectivity. The views' bounds proofs
+        // therefore cover every replayed offset; `total_len` checked the
+        // nonzero product; the route's tiles are the decision for its own
+        // axes, and tiles or a non-serial `exec` are left only for a
+        // destination proven injective; the exclusive and shared borrows
+        // cannot overlap.
+        unsafe {
+            crate::copy_plan::replay_fused(
+                dest,
+                src,
+                route,
+                apply,
+                KernelClass::Copy.ns_per_element(),
+                exec,
+            )
+        };
+    });
     Ok(())
 }
 
@@ -1364,11 +1549,14 @@ where
 /// column-major walk; when the shared cache-block model finds tiles that change
 /// the visit order and can reuse a cache line, the walk goes tile by tile
 /// instead, each tile column-major over the given axes. Bounds were validated when the views were built
-/// ([`RawStridedRef::new`], [`RawStridedMut::new`]). On a successful call the
-/// replay itself (validation, traversal and dispatch) allocates nothing for a
-/// rank at most [`RAW_FUSED_RANK_LIMIT`]; above it, the axis list, the tile
-/// decision's slices and the cursors are stored in rank-sized buffers. An error
-/// may allocate its payload.
+/// ([`RawStridedRef::new`], [`RawStridedMut::new`]).
+///
+/// On a successful call the replay itself (validation, traversal and
+/// dispatch) allocates nothing at any rank on a serial token, or on a pooled
+/// token whose replay is not tiled. A pooled tiled replay with more than
+/// [`RAW_FUSED_RANK_LIMIT`] moving axes may allocate the splitter's metadata.
+/// The wide route uses a rank-bounded amount of stack. An error may allocate
+/// its payload.
 ///
 /// The width comes from the repository rule on `exec`. A parallel or tiled
 /// replay runs only on a destination proven injective without allocating; any

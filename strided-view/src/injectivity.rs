@@ -278,16 +278,67 @@ fn block_differences_avoid_zero(
     // zero vector. Each axis is (delta, extent - 1, |stride|) and `r` is the
     // running `sum(delta * stride)`; negating every enumerated stride is a
     // bijection on the box, so `|stride|` is used throughout.
-    let mut axes: tinyvec::TinyVec<[(i128, i128, i128); crate::INLINE_RANK]> = (0..dims.len())
-        .filter(|&axis| enumerated(axis))
-        .map(|axis| {
-            (
+    let enumerated_count = count - 2;
+    let fill = |axes: &mut [DifferenceAxis]| {
+        for (slot, axis) in axes
+            .iter_mut()
+            .zip((0..dims.len()).filter(|&axis| enumerated(axis)))
+        {
+            *slot = (
                 0,
                 (dims[axis] - 1) as i128,
                 strides[axis].unsigned_abs() as i128,
-            )
-        })
-        .collect();
+            );
+        }
+    };
+    let collides = |r: i128| r % g == 0 && solvable(-r / g);
+    let found = if enumerated_count <= crate::INLINE_RANK {
+        let mut axes = [(0i128, 0i128, 0i128); crate::INLINE_RANK];
+        let axes = &mut axes[..enumerated_count];
+        fill(axes);
+        difference_walk_collides(axes, boxed, &collides)
+    } else {
+        wide_difference_walk_collides(enumerated_count, &fill, boxed, &collides)?
+    };
+    Some(!found)
+}
+
+/// One enumerated axis of the difference walk: `(delta, extent - 1, |stride|)`.
+type DifferenceAxis = (i128, i128, i128);
+
+/// Most axes the difference walk can enumerate. Every enumerated axis has an
+/// extent above 1, so it multiplies the box by at least 3, and the budget
+/// guard runs before the walk: `3^14 / 2 <= 2^22 < 3^15 / 2` admits at most 14.
+const WIDE_DIFFERENCE_AXES: usize = 16;
+
+/// [`difference_walk_collides`] for more than [`crate::INLINE_RANK`]
+/// enumerated axes, kept out of line so the common walk's frame keeps its size.
+/// `None` only for a count the budget guard excludes.
+#[inline(never)]
+fn wide_difference_walk_collides(
+    count: usize,
+    fill: &impl Fn(&mut [DifferenceAxis]),
+    boxed: u128,
+    collides: &impl Fn(i128) -> bool,
+) -> Option<bool> {
+    // INVARIANT: the budget guard bounds `count` by 14 (see
+    // `WIDE_DIFFERENCE_AXES`); a larger count answers undecided.
+    if count > WIDE_DIFFERENCE_AXES {
+        return None;
+    }
+    let mut axes = [(0i128, 0i128, 0i128); WIDE_DIFFERENCE_AXES];
+    let axes = &mut axes[..count];
+    fill(axes);
+    Some(difference_walk_collides(axes, boxed, collides))
+}
+
+/// Whether the upper half of the difference box, walked in mixed radix from
+/// just past the zero vector, holds a difference `r` for which `collides`.
+fn difference_walk_collides(
+    axes: &mut [DifferenceAxis],
+    boxed: u128,
+    collides: &impl Fn(i128) -> bool,
+) -> bool {
     let mut r = 0i128;
     for _ in 0..boxed / 2 {
         for (delta, bound, stride) in axes.iter_mut() {
@@ -299,11 +350,11 @@ fn block_differences_avoid_zero(
             r -= *stride * (*delta + *bound);
             *delta = -*bound;
         }
-        if r % g == 0 && solvable(-r / g) {
-            return Some(false);
+        if collides(r) {
+            return true;
         }
     }
-    Some(true)
+    false
 }
 
 /// `gcd(a, b)` and the inverse of `a / g` modulo `b / g` (`0` when

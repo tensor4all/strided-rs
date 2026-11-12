@@ -13,10 +13,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
 
-use strided_view::auxiliary::index_order;
+use strided_view::auxiliary::{index_order, index_order_into};
 use strided_view::{
-    col_major_strides, row_major_strides, StrideVec, StridedArray, StridedView, StridedViewMut,
-    INLINE_RANK,
+    col_major_strides, is_injective_layout, is_injective_layout_without_alloc, row_major_strides,
+    StrideVec, StridedArray, StridedView, StridedViewMut, INLINE_RANK,
 };
 
 struct CountingAllocator;
@@ -311,4 +311,26 @@ fn above_inline_rank_spills_gracefully() {
         black_box(index_order(&strides));
     });
     assert_eq!(allocations, 1, "rank 9 index_order should spill once");
+    // The caller-storage form writes into the caller's slice at any rank.
+    let mut order = [0usize; 9];
+    let allocations = count_allocations(|| {
+        index_order_into(&strides, &mut order).unwrap();
+    });
+    assert_eq!(allocations, 0, "rank 9 index_order_into allocated");
+    assert_eq!(order[..], index_order(&strides)[..]);
+}
+
+/// An eleven-axis interleaved block whose difference search enumerates nine
+/// axes, more than the inline rank, is still decided without allocating, and
+/// with the answer of the exact check.
+#[test]
+fn wide_difference_search_allocates_nothing() {
+    let dims = [2usize; 11];
+    let strides = [4isize, 5, 6, 12, 24, 48, 96, 192, 384, 768, 1536];
+    let mut injective = false;
+    let allocations = count_allocations(|| {
+        injective = is_injective_layout_without_alloc(&dims, &strides);
+    });
+    assert_eq!(allocations, 0, "nine-axis difference search allocated");
+    assert_eq!(injective, is_injective_layout(&dims, &strides));
 }

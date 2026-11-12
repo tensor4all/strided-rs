@@ -1,5 +1,5 @@
 //! Asserts the zero-allocation contract of prepared erased/raw replay for ranks
-//! at most `RAW_FUSED_RANK_LIMIT`.
+//! at most `RAW_FUSED_RANK_LIMIT`, and of serial prepared execution above it.
 //!
 //! This lives in its own integration-test binary because it installs a
 //! counting global allocator; keeping it isolated avoids counting noise from
@@ -192,10 +192,9 @@ fn execute_is_allocation_free_up_to_rank_limit() {
     });
     assert_eq!(allocations, 0, "execute/execute_scale must not allocate");
 
-    // Above the inline limit the fused traversal spills, but every allocation
-    // stays bounded by the rank, never by the element count: the raw call
-    // builds one spilled layout plus one cursor, and a prepared plan allocates
-    // only rank-sized buffers per execution.
+    // Above the inline limit the fused traversal spills. The stateless raw call
+    // still fuses into one transient rank-sized scratch; its replay, like a
+    // prepared plan's serial execution, holds the spilled cursor on the stack.
     let dims = [2usize; 9];
     let dst_strides: Vec<isize> = (0..9).map(|axis| 1isize << axis).collect();
     let src_strides: Vec<isize> = (0..9).rev().map(|axis| 1isize << axis).collect();
@@ -209,9 +208,9 @@ fn execute_is_allocation_free_up_to_rank_limit() {
             copy_scale_raw(&mut dest, &source, 1.0).unwrap();
         }
     });
-    assert_eq!(
-        allocations, 32,
-        "a spilled rank-9 raw call must allocate one layout and one cursor per call"
+    assert!(
+        allocations <= 16,
+        "a spilled rank-9 raw call may allocate only its fusion scratch, got {allocations}"
     );
 
     let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
@@ -223,14 +222,9 @@ fn execute_is_allocation_free_up_to_rank_limit() {
                 .unwrap();
         }
     });
-    // Since #425 a spilled execution also asks the shared cache-block model.
-    // The model exits this layout (its region fits the block budget) before any
-    // slice is materialized, so the three rank-sized buffers are not allocated,
-    // and the cursor stays the only allocation ([#425], review follow-up).
-    assert_eq!(
-        allocations, 32,
-        "a spilled rank-9 plan must allocate only the cursor when the model exits"
-    );
+    // A spilled execution asks the shared cache-block model from stack storage
+    // and replays with a stack cursor (#469).
+    assert_eq!(allocations, 0, "a spilled rank-9 plan execution allocated");
 
     let dims = [4usize, 4];
     let strides = [1isize, 4];

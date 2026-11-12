@@ -5,8 +5,10 @@
 //! on both sides of `SMALL_TENSOR_THRESHOLD`, with contiguous, permuted and
 //! stride-0 operands, serial and inside an explicit two-worker pool. Output
 //! data of array-returning APIs and allocations made inside user callbacks are
-//! out of scope (P1) and are not asserted. The rank-9 spill is executed but not
-//! gated: above the inline rank bound the planner may spill by contract.
+//! out of scope (P1) and are not asserted. The rank-9 view-path spill is
+//! executed but not gated: above the inline rank bound the planner may spill by
+//! contract. The `replay_*_raw` entries are gated at every rank: they allocate
+//! nothing on a serial token, or on a pooled token whose replay is not tiled.
 //!
 //! The counter is process global, so the whole matrix runs in one test; the
 //! setup and warm-up calls stay outside every counted window.
@@ -504,7 +506,7 @@ fn typed_entries_are_allocation_free_up_to_rank_limit() {
     check_full_reduction(&pool);
     check_plans(&pool);
     record_rank9_spill(&pool);
-    check_replay_rank9_spill_is_bounded();
+    check_replay_any_rank_is_allocation_free();
     check_overflowing_stride_keeps_the_exit_allocation_free();
 }
 
@@ -543,6 +545,36 @@ fn check_parallel_threshold() {
         run_map_entries(dims, &pool);
         run_replay_entries(dims, &pool);
     }
+    check_pooled_wide_replay(&pool);
+}
+
+/// An untiled wide replay that fans out: `[2; 17]`, column-major on both sides
+/// (strictly increasing strides, so the model exits and the route is untiled),
+/// on a pooled token. The window counts every thread, so a worker's range
+/// cursor would show; the unit test
+/// `wide_untiled_replay_fans_out_on_a_team_token` proves the dispatch.
+fn check_pooled_wide_replay(pool: &Pool) {
+    use strided_basic::execution::{parallel_width, KernelClass};
+    use strided_basic::{replay_copy_raw, RawStridedMut, RawStridedRef};
+    let dims = vec![2usize; 17];
+    let strides = col_major_strides(&dims).into_vec();
+    let len = total(&dims);
+    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
+    let mut out = vec![0.0f64; len];
+    let source = RawStridedRef::new(&src, &dims, &strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut out, &dims, &strides, 0).unwrap();
+    let allocations = on_worker(pool, |pool| {
+        let width = parallel_width(&Exec::new(pool, 2).unwrap(), KernelClass::Copy, len).get();
+        #[cfg(feature = "parallel")]
+        assert!(width >= 2, "the wide replay runs at width {width}");
+        #[cfg(not(feature = "parallel"))]
+        let _ = width;
+        let mut tokens = pooled_tokens(pool, 4);
+        replay_copy_raw(&mut dest, &source, tokens.pop().unwrap()).unwrap();
+        count_allocations(|| replay_copy_raw(&mut dest, &source, tokens.pop().unwrap()).unwrap())
+    });
+    assert_eq!(allocations, 0, "pooled wide replay allocated {allocations}");
+    assert_eq!(out, src);
 }
 
 /// The recursive full-reduction fold (`reduce`, whose parallel path combines
@@ -956,36 +988,98 @@ fn record_rank9_spill(pool: &Pool) {
     eprintln!("rank-9 permuted map_into spill: serial={serial}, parallel={parallel}");
 }
 
-/// Above the inline rank the plan-free replay spills its axis list, the tile
-/// decision's rank-sized slices and range cursors by contract; the count is
-/// bounded by the rank, so it must not grow from one warm call to the next.
-///
-/// Since #425 a spilled layout asks the shared cache-block model, which takes
-/// slices: the compressed dims, destination and source strides (3 buffers),
-/// beside the axis list and the range cursor — but only when the model's
-/// exits, answered from the axes alone, do not decide first. A layout the
-/// model tiles adds its blocks and the tile walk's extents and origins.
-fn check_replay_rank9_spill_is_bounded() {
-    use strided_basic::{replay_copy_raw, RawStridedMut, RawStridedRef};
+/// The four `replay_*_raw` entries on a serial token at ranks above the inline
+/// one: the issue's nine-axis reversed-to-column-major copy, the same nine
+/// moving axes among 191 extent-1 axes, a wide layout the model tiles, and a
+/// 21-axis layout whose stride-order table exceeds the 40-entry inline scratch.
+fn check_replay_any_rank_is_allocation_free() {
+    // (a) The issue fixture: nine extent-2 axes, source reversed.
     let dims = vec![2usize; 9];
-    let len = total(&dims);
-    let src: Vec<f64> = (0..len).map(|v| v as f64).collect();
-    let mut out = vec![0.0f64; len];
-    let dest_strides = strides_for(&dims, LayoutKind::Contiguous);
-    let src_strides = strides_for(&dims, LayoutKind::Permuted);
-    let source = RawStridedRef::new(&src, &dims, &src_strides, 0).unwrap();
-    let mut dest = RawStridedMut::new(&mut out, &dims, &dest_strides, 0).unwrap();
-    replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap();
-    let mut call = || {
-        count_thread_allocations(|| replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap())
+    let dst: Vec<isize> = (0..9).map(|k| 1isize << k).collect();
+    let src: Vec<isize> = (0..9).rev().map(|k| 1isize << k).collect();
+    assert_serial_replays_allocate_nothing("rank 9", &dims, &dst, &src);
+
+    // (b) Rank 200: the nine moving axes of (a), each followed by extent-1
+    // axes with arbitrary strides.
+    let mut padded = (Vec::new(), Vec::new(), Vec::new());
+    for axis in 0..200usize {
+        if axis % 22 == 0 && axis / 22 < 9 {
+            let k = axis / 22;
+            padded.0.push(2usize);
+            padded.1.push(dst[k]);
+            padded.2.push(src[k]);
+        } else {
+            padded.0.push(1);
+            padded.1.push(axis as isize);
+            padded.2.push(-(axis as isize));
+        }
+    }
+    assert_eq!(padded.0.iter().filter(|&&d| d == 2).count(), 9);
+    assert_serial_replays_allocate_nothing("rank 200", &padded.0, &padded.1, &padded.2);
+
+    // (c) A wide layout the model tiles: `4^9` with the source stride order
+    // reversed (2 MiB per buffer).
+    let dims = vec![4usize; 9];
+    let dst: Vec<isize> = (0..9).map(|k| 1isize << (2 * k)).collect();
+    let src: Vec<isize> = (0..9).rev().map(|k| 1isize << (2 * k)).collect();
+    assert_serial_replays_allocate_nothing("wide tiled", &dims, &dst, &src);
+
+    // (d) 21 axes, reversed source: the model builds its 42-entry stride-order
+    // table (2^21 elements, 16 MiB per buffer).
+    let dims = vec![2usize; 21];
+    let dst: Vec<isize> = (0..21).map(|k| 1isize << k).collect();
+    let src: Vec<isize> = (0..21).rev().map(|k| 1isize << k).collect();
+    assert_serial_replays_allocate_nothing("rank 21", &dims, &dst, &src);
+}
+
+/// Warm, then count one serial call of each of the four replay entries on the
+/// calling thread.
+fn assert_serial_replays_allocate_nothing(
+    name: &str,
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+) {
+    use strided_basic::{
+        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit,
+        RawStridedMut, RawStridedRef,
     };
-    let first = call();
-    let second = call();
-    // The axis list and the range cursor, nothing more: this layout's region
-    // fits the block budget, so the model's exits answer from the axes and the
-    // three rank-sized slices are never materialized ([#425]).
-    assert!(first <= 2, "rank-9 replay allocated {first} times");
-    assert_eq!(first, second, "rank-9 replay allocations grew");
+    let src: Vec<f64> = (0..required_len(dims, src_strides))
+        .map(|v| v as f64)
+        .collect();
+    let dst_len = required_len(dims, dst_strides);
+    let mut out = vec![0.0f64; dst_len];
+    let mut uninit = vec![MaybeUninit::<f64>::uninit(); dst_len];
+    let source = RawStridedRef::new(&src, dims, src_strides, 0).unwrap();
+    fn counted(name: &str, entry: &str, mut run: impl FnMut()) {
+        run();
+        let count = count_thread_allocations(&mut run);
+        assert_eq!(count, 0, "{name}: serial {entry} allocated {count}");
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut out, dims, dst_strides, 0).unwrap();
+        counted(name, "replay_copy_raw", || {
+            replay_copy_raw(&mut dest, &source, Exec::serial()).unwrap()
+        });
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut out, dims, dst_strides, 0).unwrap();
+        counted(name, "replay_map_raw", || {
+            replay_map_raw(&mut dest, &source, |d: &mut f64, s| *d += s, Exec::serial()).unwrap()
+        });
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut uninit, dims, dst_strides, 0).unwrap();
+        counted(name, "replay_copy_raw_uninit", || {
+            replay_copy_raw_uninit(&mut dest, &source, Exec::serial()).unwrap()
+        });
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut uninit, dims, dst_strides, 0).unwrap();
+        counted(name, "replay_map_raw_uninit", || {
+            replay_map_raw_uninit(&mut dest, &source, |s| 2.0 * s, Exec::serial()).unwrap()
+        });
+    }
 }
 
 /// The exits are answered from the axes, so they must also cover the case where
@@ -1018,11 +1112,14 @@ fn check_overflowing_stride_keeps_the_exit_allocation_free() {
     };
     let first = call();
     let second = call();
-    // The axis list and the range cursor: the region is 4096 + 128 bytes, so
-    // the model exits before its slices exist.
-    assert!(
-        first <= 2,
+    // The region is 4096 + 128 bytes, so the model exits before its slices
+    // exist, and the wide route holds its axes and cursor on the stack.
+    assert_eq!(
+        first, 0,
         "a cache-fit spilled replay allocated {first} times"
     );
-    assert_eq!(first, second, "cache-fit spilled replay allocations grew");
+    assert_eq!(
+        second, 0,
+        "a cache-fit spilled replay allocated {second} times"
+    );
 }

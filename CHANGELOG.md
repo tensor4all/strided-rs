@@ -28,6 +28,23 @@ Same result, same layout rules; only the route changes. `strided-perm::copy_into
 
 [`docs/threading-contract.md`]: https://github.com/tensor4all/strided-rs/blob/main/docs/threading-contract.md
 
+### `strided-basic`: `replay_*_raw` allocate nothing at any rank on a serial token
+
+`replay_copy_raw`, `replay_copy_raw_uninit`, `replay_map_raw` and `replay_map_raw_uninit` allocated rank-sized buffers
+above `RAW_FUSED_RANK_LIMIT` (8) axes: the axis list and range cursor, and, when the cache-block model ran, its slices,
+stride-order table, costs, blocks and the tile walk's extents and origins (#469). They now hold that state in stack
+arrays bounded by the moving-axis count, which a checked element count bounds by `usize::BITS - 1`, and allocate
+nothing on a successful serial call at any rank, or on a pooled call whose replay is not tiled. A pooled tiled replay
+with more than 8 moving axes may still allocate the dimension splitter's metadata. `RAW_FUSED_RANK_LIMIT` now only
+selects the inline or the wide traversal. Serial `CopyPlan`/`UpdatePlan` execution of a spilled layout stops
+allocating too; `copy_scale_raw`, `axpy_raw` and plan compilation keep their fusion scratch.
+
+### `strided-view` 0.8.1: `auxiliary::index_order_into`
+
+`index_order_into(strides, out)` writes the stride order into caller storage and returns `StrideLengthMismatch` when
+the lengths differ; `index_order` is its allocating form and is unchanged. The injectivity check's difference search no
+longer allocates when it enumerates more than eight axes.
+
 ## 0.14.1 (unreleased) — patch
 
 `0.14.0` shipped on crates.io on 2026-11-08. Since then `main` has changed shipped files in all six
