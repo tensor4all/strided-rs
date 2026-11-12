@@ -481,6 +481,9 @@ fn from_meta<'a, T, Op>(
 impl<'a, T, Op> StridedView<'a, T, Op> {
     /// Create an immutable strided view, copying the caller's metadata inline.
     ///
+    /// `dims`, `strides`, and `offset` are in units of `T` (elements, not
+    /// bytes).
+    ///
     /// The layout is copied into the view's inline storage, so it does not
     /// need to outlive the view and no heap allocation happens at rank
     /// `<= INLINE_RANK`. The view's lifetime is tied to `data` only.
@@ -512,6 +515,9 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
     }
 
     /// Create a view without bounds checking, copying the caller's metadata.
+    ///
+    /// `dims`, `strides`, and `offset` are in units of `T` (elements, not
+    /// bytes).
     ///
     /// # Safety
     /// The caller must ensure all index combinations stay within bounds.
@@ -549,7 +555,7 @@ impl<'a, T, Op> StridedView<'a, T, Op> {
         self.meta.strides()
     }
 
-    /// Returns the byte offset into the backing data.
+    /// Returns the offset into the backing data, in units of `T` (elements, not bytes).
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
@@ -917,6 +923,9 @@ impl<'a, T> StridedViewMut<'a, T> {
 
     /// Create a mutable view, copying the caller's metadata inline.
     ///
+    /// `dims`, `strides`, and `offset` are in units of `T` (elements, not
+    /// bytes).
+    ///
     /// The layout is copied, so it does not need to outlive the view and no
     /// heap allocation happens at rank `<= INLINE_RANK`.
     ///
@@ -952,6 +961,9 @@ impl<'a, T> StridedViewMut<'a, T> {
     }
 
     /// Create without bounds checking, copying the caller's metadata.
+    ///
+    /// `dims`, `strides`, and `offset` are in units of `T` (elements, not
+    /// bytes).
     ///
     /// # Safety
     /// Caller must ensure all index combinations stay within bounds.
@@ -989,7 +1001,7 @@ impl<'a, T> StridedViewMut<'a, T> {
         self.meta.strides()
     }
 
-    /// Returns the byte offset into the backing data.
+    /// Returns the offset into the backing data, in units of `T` (elements, not bytes).
     #[inline]
     pub fn offset(&self) -> isize {
         self.offset
@@ -1385,6 +1397,9 @@ impl<T: Clone + Default> StridedArray<T> {
 
 impl<T> StridedArray<T> {
     /// Create from raw parts.
+    ///
+    /// `dims`, `strides`, and `offset` are in units of `T` (elements, not
+    /// bytes).
     ///
     /// # Errors
     ///
