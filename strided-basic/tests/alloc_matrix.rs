@@ -196,8 +196,8 @@ fn assert_entry<'p>(
 /// a pooled token, for every source layout (the callbacks allocate nothing).
 fn run_replay_entries(dims: &[usize], pool: &Pool) {
     use strided_basic::{
-        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit,
-        RawStridedMut, RawStridedRef,
+        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_fused,
+        replay_map_raw_uninit, replay_map_raw_uninit_fused, RawStridedMut, RawStridedRef,
     };
     let layouts = [
         strides_for(dims, LayoutKind::Contiguous),
@@ -247,6 +247,22 @@ fn run_replay_entries(dims: &[usize], pool: &Pool) {
             let mut dest = RawStridedMut::new(&mut uninit, dims, &dst_strides, 0).unwrap();
             replay_map_raw_uninit(&mut dest, &source, |s| 2.0 * s, exec).unwrap();
         });
+        assert_entry("replay_map_raw_fused", pool, dims, &kinds, |kind, exec| {
+            let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+            let mut dest = RawStridedMut::new(&mut out, dims, &dst_strides, 0).unwrap();
+            replay_map_raw_fused(&mut dest, &source, |d: &mut f64, s| *d += s, exec).unwrap();
+        });
+        assert_entry(
+            "replay_map_raw_uninit_fused",
+            pool,
+            dims,
+            &kinds,
+            |kind, exec| {
+                let source = RawStridedRef::new(&src, dims, &layouts[kind_index(kind)], 0).unwrap();
+                let mut dest = RawStridedMut::new(&mut uninit, dims, &dst_strides, 0).unwrap();
+                replay_map_raw_uninit_fused(&mut dest, &source, |s| 2.0 * s, exec).unwrap();
+            },
+        );
     }
 }
 
@@ -1041,8 +1057,8 @@ fn assert_serial_replays_allocate_nothing(
     src_strides: &[isize],
 ) {
     use strided_basic::{
-        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit,
-        RawStridedMut, RawStridedRef,
+        replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_fused,
+        replay_map_raw_uninit, replay_map_raw_uninit_fused, RawStridedMut, RawStridedRef,
     };
     let src: Vec<f64> = (0..required_len(dims, src_strides))
         .map(|v| v as f64)
@@ -1078,6 +1094,19 @@ fn assert_serial_replays_allocate_nothing(
         let mut dest = RawStridedMut::new(&mut uninit, dims, dst_strides, 0).unwrap();
         counted(name, "replay_map_raw_uninit", || {
             replay_map_raw_uninit(&mut dest, &source, |s| 2.0 * s, Exec::serial()).unwrap()
+        });
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut out, dims, dst_strides, 0).unwrap();
+        counted(name, "replay_map_raw_fused", || {
+            replay_map_raw_fused(&mut dest, &source, |d: &mut f64, s| *d += s, Exec::serial())
+                .unwrap()
+        });
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut uninit, dims, dst_strides, 0).unwrap();
+        counted(name, "replay_map_raw_uninit_fused", || {
+            replay_map_raw_uninit_fused(&mut dest, &source, |s| 2.0 * s, Exec::serial()).unwrap()
         });
     }
 }

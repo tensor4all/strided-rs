@@ -53,6 +53,17 @@ fn assert_fanned_out(root: Option<u64>) {
     let _ = chunks;
 }
 
+fn col_major_strides(dims: &[usize]) -> Vec<isize> {
+    let mut stride = 1isize;
+    dims.iter()
+        .map(|&dim| {
+            let out = stride;
+            stride *= dim as isize;
+            out
+        })
+        .collect()
+}
+
 /// Smallest backing length covering every reachable offset from `offset`.
 fn span(dims: &[usize], strides: &[isize], offset: isize) -> usize {
     if dims.contains(&0) {
@@ -417,6 +428,131 @@ fn rank_nine_spilled_layout_matches_the_compiled_plans() {
         "the plan must spill too"
     );
     check_rows_serial_and_team::<f64>(&fixture);
+}
+
+/// The fused entry on the same fixtures: the destination is injective, so the
+/// fused visit order cannot change the result, and every element must match the
+/// given-axis replay bit for bit.
+fn assert_bits_eq(label: &str, got: &[[u64; 2]], want: &[[u64; 2]]) {
+    assert_eq!(got.len(), want.len(), "{label}: length");
+    if let Some((index, (g, w))) = got.iter().zip(want).enumerate().find(|(_, (g, w))| g != w) {
+        panic!("{label}: first mismatch at {index}: {g:?} != {w:?}");
+    }
+}
+
+fn check_fused_rows<T: Value>(fixture: &Fixture) {
+    let src: Vec<T> = (0..fixture.src_len).map(T::value).collect();
+    let source = fixture.src(&src);
+    let mut expected = vec![T::sentinel(); fixture.dst_len];
+    replay_copy_raw(&mut fixture.dst(&mut expected), &source, Exec::serial()).unwrap();
+
+    let mut got = vec![T::sentinel(); fixture.dst_len];
+    replay_map_raw_fused(
+        &mut fixture.dst(&mut got),
+        &source,
+        |d: &mut T, s| *d = s,
+        Exec::serial(),
+    )
+    .unwrap();
+    assert_bits_eq("copy", &bits(&got), &bits(&expected));
+
+    let mut uninit = vec![MaybeUninit::new(T::sentinel()); fixture.dst_len];
+    replay_map_raw_uninit_fused(
+        &mut fixture.dst(&mut uninit),
+        &source,
+        |s: T| s,
+        Exec::serial(),
+    )
+    .unwrap();
+    assert_bits_eq("uninit", &bits_uninit(&uninit), &bits(&expected));
+
+    // Accumulating callbacks keep their arithmetic under the fused route. Only
+    // the reachable destination slots are written; holes keep the filler.
+    let mut acc = vec![T::one(); fixture.dst_len];
+    replay_map_raw_fused(
+        &mut fixture.dst(&mut acc),
+        &fixture.src(&vec![T::one(); fixture.src_len]),
+        |d: &mut T, s| *d = *d + s,
+        Exec::serial(),
+    )
+    .unwrap();
+    let want = (T::one() + T::one()).bits();
+    for &slot in &offsets(&fixture.dims, &fixture.dst_strides, fixture.dst_offset) {
+        assert_eq!(
+            acc[slot].bits(),
+            want,
+            "accumulate at destination slot {slot}"
+        );
+    }
+}
+
+#[test]
+fn fused_replay_matches_the_given_axis_replay() {
+    let fixtures = [cropped_band(), negative_source()];
+    for fixture in &fixtures {
+        check_fused_rows::<f64>(fixture);
+        check_fused_rows::<Complex64>(fixture);
+    }
+    let dims = [3usize; 9];
+    let dst: Vec<isize> = (0..9).map(|axis| 3isize.pow(axis)).collect();
+    let src: Vec<isize> = dst.iter().rev().copied().collect();
+    let fixture = Fixture::new(&dims, &dst, &src, 0);
+    assert!(matches!(
+        PairTraversal::given(&dims, &dst, &src),
+        PairTraversal::Spilled(_)
+    ));
+    check_fused_rows::<f64>(&fixture);
+}
+
+/// Block sides 2 and 8 at ranks 2-4: the shape the downstream gate measures.
+/// The source is the reversed destination, so fusion has something to merge and
+/// the fused route must still write every slot.
+#[test]
+fn fused_replay_matches_on_small_blocks() {
+    for side in [2usize, 8] {
+        for rank in 2..=4usize {
+            let dims = vec![side; rank];
+            let dst = col_major_strides(&dims);
+            let src: Vec<isize> = dst.iter().rev().copied().collect();
+            let fixture = Fixture::new(&dims, &dst, &src, 0);
+            check_fused_rows::<f64>(&fixture);
+        }
+    }
+}
+
+/// A rank above the inline limit with extent-1 axes: the compaction and the
+/// fusion scratch both stay on the stack and the result is unchanged.
+#[test]
+fn fused_replay_handles_a_rank_above_the_inline_limit() {
+    let moving = [2usize, 3, 4];
+    let (mut dims, mut dst, mut src) = (Vec::new(), Vec::new(), Vec::new());
+    for axis in 0..40usize {
+        if axis % 13 == 0 && axis / 13 < moving.len() {
+            let k = axis / 13;
+            dims.push(moving[k]);
+            dst.push([1isize, 2, 6][k]);
+            src.push([12isize, 4, 1][k]);
+        } else {
+            dims.push(1);
+            dst.push(axis as isize);
+            src.push(-(axis as isize));
+        }
+    }
+    let fixture = Fixture::new(&dims, &dst, &src, 0);
+    check_fused_rows::<f64>(&fixture);
+}
+
+#[test]
+fn fused_replay_rejects_a_shape_mismatch_before_writing() {
+    let src = [1.0f64, 2.0, 3.0, 4.0];
+    let mut out = [7.0f64; 4];
+    let source = RawStridedRef::new(&src, &[2, 2], &[1, 2], 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut out, &[4], &[1], 0).unwrap();
+    assert!(matches!(
+        replay_map_raw_fused(&mut dest, &source, |d: &mut f64, s| *d = s, Exec::serial()),
+        Err(StridedError::ShapeMismatch(_, _))
+    ));
+    assert_eq!(out, [7.0; 4]);
 }
 
 #[test]

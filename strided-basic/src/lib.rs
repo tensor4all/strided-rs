@@ -77,6 +77,9 @@
 //! - [`replay_copy_raw`], [`replay_map_raw`] and their `_uninit` forms: replay
 //!   already-fused dims and strides as given, compiling nothing, serially or
 //!   across the token's budget
+//! - [`replay_map_raw_fused`] and [`replay_map_raw_uninit_fused`]: the same
+//!   replay, but fuse the pair inside the call for callers that hold unfused
+//!   axes
 //! - [`copy_scale_raw`], [`axpy_raw`] and their `conj` forms: serial copies
 //!   that fuse the layout on every call
 //!
@@ -149,7 +152,8 @@ pub use ops_view::{
 };
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, replay_copy_raw,
-    replay_copy_raw_uninit, replay_map_raw, replay_map_raw_uninit, RAW_FUSED_RANK_LIMIT,
+    replay_copy_raw_uninit, replay_map_raw, replay_map_raw_fused, replay_map_raw_uninit,
+    replay_map_raw_uninit_fused, RAW_FUSED_RANK_LIMIT,
 };
 pub use reduce_view::{reduce, reduce_axis, reduce_axis_into, zip_reduce};
 pub use simd::MaybeSimdOps;
