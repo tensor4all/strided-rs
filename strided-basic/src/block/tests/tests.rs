@@ -1,4 +1,6 @@
 use super::*;
+use crate::fuse::compute_costs;
+use strided_view::auxiliary::index_order;
 
 #[test]
 fn test_total_memory_region_contiguous() {
@@ -926,4 +928,26 @@ fn flat_scratch_matches_the_model_across_its_spill_boundaries() {
         compute_block_sizes(&dims, &strides, &[8, 8, 8]).as_slice(),
         dims
     );
+}
+
+/// The slab decision is shared with callers that pass uncompressed axes, such
+/// as `bench_hooks::planned_blocks`: the F3 layout with 100 stride-0 extent-1
+/// axes appended has a 102-entry tail, past the bounded branch, and keeps the
+/// helper's answer. The stride-0 singletons sort first and `0 < span`, so the
+/// slabs are not separated and the tiles are kept.
+#[test]
+fn a_padded_tail_beyond_the_bounded_branch_keeps_the_slab_answer() {
+    let mut dims = vec![4096usize, 17, 33];
+    let mut dst = vec![1isize, 4096, 69_632];
+    let mut src = vec![1isize, 135_168, 4096];
+    let unpadded = reduced_block_sizes(&dims, &[&dst, &src], &[8, 8]).unwrap();
+    dims.extend([1usize; 100]);
+    dst.extend([0isize; 100]);
+    src.extend([0isize; 100]);
+    let blocks = reduced_block_sizes(&dims, &[&dst, &src], &[8, 8]).unwrap();
+    let mut expected = unpadded.to_vec();
+    expected.extend([1usize; 100]);
+    assert_eq!(blocks.as_slice(), expected);
+    assert!(dims.len() - 1 > crate::raw_ops::MAX_MOVING_AXES);
+    assert!(!declines_tiles(&dims, &[&dst, &src], &[8, 8], &blocks));
 }

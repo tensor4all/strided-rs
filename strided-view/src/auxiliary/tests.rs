@@ -31,3 +31,21 @@ fn test_index_order_all_same() {
     let order = index_order(&[3, 3, 3]);
     assert_eq!(order.as_slice(), &[1, 1, 1]);
 }
+
+#[test]
+fn index_order_into_matches_index_order() {
+    let strides = [-4isize, 0, 2, 2, 1, -9, 0, 3, 7, 11];
+    let mut out = [0usize; 10];
+    index_order_into(&strides, &mut out).unwrap();
+    assert_eq!(out[..], index_order(&strides)[..]);
+}
+
+#[test]
+fn index_order_into_rejects_a_length_mismatch_without_writing() {
+    let mut out = [7usize; 2];
+    assert!(matches!(
+        index_order_into(&[4, 1, 2], &mut out),
+        Err(crate::StridedError::StrideLengthMismatch)
+    ));
+    assert_eq!(out, [7, 7]);
+}

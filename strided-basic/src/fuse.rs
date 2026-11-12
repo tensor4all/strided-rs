@@ -248,31 +248,32 @@ pub(crate) fn compute_costs<S: AsRef<[isize]>>(all_strides: &[S]) -> InlineVec<i
         return InlineVec::new();
     };
     let n = first.as_ref().len();
+    // Filled in place at the inline rank: collecting element by element
+    // through the inline vector measured as most of this function's cost.
+    if n <= strided_view::INLINE_RANK {
+        let mut costs = [0isize; strided_view::INLINE_RANK];
+        compute_costs_into(all_strides, &mut costs[..n]);
+        return InlineVec::from_array_len(costs, n);
+    }
+    let mut costs = vec![0isize; n];
+    compute_costs_into(all_strides, &mut costs);
+    InlineVec::Heap(costs)
+}
+
+/// [`compute_costs`] written into `costs`, one slot per axis of the first
+/// operand, for a caller that holds its own storage at any rank.
+pub(crate) fn compute_costs_into<S: AsRef<[isize]>>(all_strides: &[S], costs: &mut [isize]) {
     // Zero -> 1, nonzero -> 2*abs. Costs only rank axes, so a stride beyond
     // isize::MAX / 2 (reachable with zero-sized elements) saturates instead
     // of overflowing, and `isize::MIN`'s magnitude counts as `isize::MAX`.
-    let cost = |axis: usize| {
+    for (axis, slot) in costs.iter_mut().enumerate() {
         let min = all_strides
             .iter()
             .map(|strides| strides.as_ref()[axis].checked_abs().unwrap_or(isize::MAX))
             .min()
             .unwrap_or(isize::MAX);
-        if min == 0 {
-            1
-        } else {
-            min.saturating_mul(2)
-        }
-    };
-    // Filled in place at the inline rank: collecting element by element
-    // through the inline vector measured as most of this function's cost.
-    if n <= strided_view::INLINE_RANK {
-        let mut costs = [0isize; strided_view::INLINE_RANK];
-        for (axis, slot) in costs[..n].iter_mut().enumerate() {
-            *slot = cost(axis);
-        }
-        return InlineVec::from_array_len(costs, n);
+        *slot = if min == 0 { 1 } else { min.saturating_mul(2) };
     }
-    (0..n).map(cost).collect()
 }
 
 #[cfg(test)]

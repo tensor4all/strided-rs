@@ -1187,7 +1187,10 @@ fn a_spilled_tiled_plan_past_l2_prices_its_splitter_at_its_own_rate() {
     let src_strides = [65536isize, 16384, 4096, 1024, 256, 64, 16, 4, 1];
     let plan = CopyPlan::compile(&dims, &dst_strides, &src_strides).unwrap();
     assert!(
-        matches!(plan.fused.tiles::<f64, f64>(), Some(Tiles::Spilled(_))),
+        matches!(
+            plan.fused.tiles::<f64, f64>(),
+            Some(crate::raw_ops::Tiles::Spilled(_))
+        ),
         "the case must take the spilled tiled replay"
     );
     let class = HostClass::X86_64Avx512;

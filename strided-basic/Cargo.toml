@@ -77,3 +77,8 @@ required-features = ["bench-hooks", "parallel"]
 name = "tile_probe_287"
 harness = false
 required-features = ["bench-hooks", "parallel"]
+
+[[bench]]
+name = "replay_raw"
+harness = false
+required-features = ["parallel"]

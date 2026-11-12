@@ -1592,10 +1592,7 @@ impl ConcatenatePlan {
             crate::inline::OperandVec::with_capacity(inputs.len());
         for plan in &self.copy_plans {
             // An inline traversal only ever tiles inline.
-            segment_tiles.push(
-                plan.tiles::<D, T>()
-                    .and_then(|tiles| tiles.inline().copied()),
-            );
+            segment_tiles.push(plan.inline_tiles::<D, T>());
         }
         let dest_ptr = crate::threading::SendPtr(dest.data_mut().as_mut_ptr());
         let starts = &self.segment_starts;

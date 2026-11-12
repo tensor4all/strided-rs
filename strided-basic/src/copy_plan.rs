@@ -24,18 +24,16 @@ use num_traits::{One, Zero};
 use crate::cost::KernelClass;
 use crate::raw_ops::{
     apply_fused_range, apply_spilled_range, apply_spilled_tiled_box, apply_tiled_box,
-    fuse_pair_traversal, fused_total, FusedAxis, FusedPairLayout, PairTiles, PairTraversal,
-    SpilledTiles, Tiles,
+    fuse_pair_traversal, fused_total, pair_tiles, FusedAxis, FusedPairLayout, PairTiles,
+    PairTraversal, Route, SpilledTiles,
 };
 use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 use strided_perm::HostClass;
 
 // Same pattern as map_view.rs / outer_product.rs: inline storage in both
 // feature configurations. Only `compile` touches these; `execute*` never
-// allocates for them. (A spilled fused layout needs rank-sized buffers per
-// execution: the cursor of each replayed range, the cache-block model's
-// compressed dims and two stride slices, and, when the model tiles, its block
-// vector beside the tile walk's extents and origins.)
+// allocates for them. (A spilled fused layout replays from stack arrays bounded
+// by its moving-axis count: see `raw_ops::MAX_MOVING_AXES`.)
 type AxisVec<T> = crate::inline::InlineVec<T>;
 
 pub(crate) trait OverwriteWriter<T> {
@@ -220,13 +218,13 @@ impl CopyPlan {
         self.fused.inline()
     }
 
-    /// The cache tiles [`Self::execute`] replays this plan with for
-    /// destination element `D` and source element `S`, or `None` when it keeps
-    /// the column-major walk: the one decision a caller replaying the plan's
-    /// traversal itself must reuse.
+    /// The cache tiles [`Self::execute`] replays this plan's inline layout with
+    /// for destination element `D` and source element `S`, or `None` when it
+    /// keeps the column-major walk or the layout spilled: the one decision a
+    /// caller replaying the plan's inline traversal itself must reuse.
     #[inline]
-    pub(crate) fn tiles<D, S>(&self) -> Option<Tiles> {
-        self.fused.tiles::<D, S>()
+    pub(crate) fn inline_tiles<D, S>(&self) -> Option<PairTiles> {
+        self.fused.inline().and_then(pair_tiles::<D, S>)
     }
 
     /// Whether [`Self::tiles`] can return tiles for any element types; known
@@ -374,24 +372,15 @@ impl CopyPlan {
         Apply: Fn(&mut D, S) + Sync,
     {
         self.check_call(dest, src)?;
-        let tiles = self.fused.tiles::<D, S>();
         let ns_per_element = self.ns_per_element_on::<D, S>(host);
-        // SAFETY: `check_call` proved both views carry exactly the compiled
-        // layout, and `fused` is the fusion of that layout (only `compile`
-        // and `Default`, the rank-zero layout, build it). `compile` checked
-        // the element count and proved the destination injective, so the
-        // tiles of `fused` may be replayed.
-        unsafe {
-            replay_fused(
-                dest,
-                src,
-                &self.fused,
-                tiles.as_ref(),
-                apply,
-                ns_per_element,
-                exec,
-            )
-        };
+        self.fused.with_route::<D, S, _>(|route| {
+            // SAFETY: `check_call` proved both views carry exactly the compiled
+            // layout, and `fused` is the fusion of that layout (only `compile`
+            // and `Default`, the rank-zero layout, build it). `compile` checked
+            // the element count and proved the destination injective, so the
+            // tiles of `fused` may be replayed.
+            unsafe { replay_fused(dest, src, route, apply, ns_per_element, exec) }
+        });
         Ok(())
     }
 
@@ -543,7 +532,7 @@ fn walk_runs(fused: &PairTraversal) -> (usize, bool) {
 // strided-rs#422 cuts a box, so its runs can be shorter than the leading axis run
 // (an inner extent of 8 tiled to 6 and 2 halves the run length and so doubles the
 // per-run line charge). Upgrade when a tiled plan's in-L2 pricing is measured
-// against the model: derive the charge from `PairTraversal::tiles` then.
+// against the model: derive the charge from `PairTraversal::with_route` then.
 
 /// The axes of a fused walk in replay order (axis 0 fastest) as
 /// `(extent, destination stride, source stride)`.
@@ -740,22 +729,13 @@ impl UpdatePlan {
         Apply: Fn(&mut D, S) + Sync,
     {
         check_layout_pair(&self.dims, &self.dst_strides, &self.src_strides, dest, src)?;
-        let tiles = self.fused.tiles::<D, S>();
         let ns_per_element = self.ns_per_element_on::<D, S>(host);
-        // SAFETY: as in `CopyPlan::replay`: the views carry the compiled
-        // layout, `fused` is its fusion (built only by `compile`), and
-        // `compile` checked the count and destination injectivity.
-        unsafe {
-            replay_fused(
-                dest,
-                src,
-                &self.fused,
-                tiles.as_ref(),
-                apply,
-                ns_per_element,
-                exec,
-            )
-        };
+        self.fused.with_route::<D, S, _>(|route| {
+            // SAFETY: as in `CopyPlan::replay`: the views carry the compiled
+            // layout, `fused` is its fusion (built only by `compile`), and
+            // `compile` checked the count and destination injectivity.
+            unsafe { replay_fused(dest, src, route, apply, ns_per_element, exec) }
+        });
         Ok(())
     }
 
@@ -881,12 +861,12 @@ impl UpdatePlan {
     }
 }
 
-/// Replay `traversal` over a pair of raw views, splitting it across the budget
+/// Replay `route` over a pair of raw views, splitting it across the budget
 /// of `exec` when the repository threshold allows it.
 ///
-/// With `tiles`, the replay walks the cache tiles of [`PairTraversal::tiles`]
-/// and splits the box with the dimension splitter (see [`replay_fused_raw`]
-/// and [`replay_spilled_tiled`]). Without, the logical index space `0..total`
+/// A tiled route walks its cache tiles and splits the box with the dimension
+/// splitter (see [`replay_fused_raw`] and [`replay_spilled_tiled`]). An
+/// untiled one splits the logical index space `0..total`
 /// (column-major over the traversal axes) is split into contiguous worker
 /// ranges, which divides the outer axes and, when there are fewer outer
 /// positions than workers, also chunks long inner runs (for example a rank-1
@@ -894,16 +874,18 @@ impl UpdatePlan {
 ///
 /// # Safety
 ///
-/// - `traversal` must replay exactly the logical index space of the two
-///   views: either their dims and strides fused by `fuse_pair_traversal`, or
-///   built from them by `PairTraversal::given`. The views' own bounds proofs
+/// - `route` must replay exactly the logical index space of the two views:
+///   either their dims and strides fused by `fuse_pair_traversal`
+///   ([`PairTraversal::with_route`]), or given by them
+///   ([`crate::raw_ops::with_given_route`]). The views' own bounds proofs
 ///   ([`RawStridedRef::new`], [`RawStridedMut::new`], or the caller of their
 ///   `new_unchecked`) then make every replayed offset in-bounds.
-/// - The product of the traversal extents must not overflow `usize` (a
-///   checked count, zero included).
-/// - `tiles`, when `Some`, must be [`PairTraversal::tiles`] of `traversal`.
-/// - When `tiles` is `Some` or `exec` is not serial, the destination strides
-///   must be injective over the traversal.
+/// - The product of the route's extents must not overflow `usize` (a checked
+///   count, zero included).
+/// - The route's tiles, when present, must be the decision of the route
+///   builder for its own axes.
+/// - When the route is tiled or `exec` is not serial, the destination strides
+///   must be injective over the route.
 /// - The destination and source must not overlap.
 ///
 /// `ns_per_element` is the serial rate the replay prices itself at; both plan
@@ -914,8 +896,7 @@ impl UpdatePlan {
 pub(crate) unsafe fn replay_fused<D, S, Apply>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
-    traversal: &PairTraversal,
-    tiles: Option<&Tiles>,
+    route: Route<'_>,
     apply: Apply,
     ns_per_element: f64,
     exec: Exec<'_>,
@@ -928,57 +909,46 @@ pub(crate) unsafe fn replay_fused<D, S, Apply>(
     let src_base = src.offset();
     let dst_base = dest.offset();
     let dst_ptr = dest.data_mut().as_mut_ptr();
-    // SAFETY: forwarded caller contract: every logical index of `traversal`
-    // maps to in-bounds slots of both views, injectivity holds whenever the
-    // replay is tiled or the token can fan out, and the borrows do not
-    // overlap. A `Tiles::Inline` compressed from a spilled axis list addresses
-    // exactly the slots of that list, in the same column-major order.
+    // SAFETY: forwarded caller contract: every logical index of `route` maps
+    // to in-bounds slots of both views, injectivity holds whenever the replay
+    // is tiled or the token can fan out, and the borrows do not overlap. Inline
+    // tiles address exactly the slots of their layout, in the same column-major
+    // order.
     unsafe {
-        match traversal {
-            PairTraversal::Inline(layout) => replay_fused_raw(
+        match route {
+            Route::Inline { layout, tiles } => replay_fused_raw(
                 dst_ptr,
                 dst_base,
                 src_ptr,
                 src_base,
                 layout,
-                tiles.and_then(Tiles::inline),
+                tiles,
                 apply,
                 ns_per_element,
                 exec,
             ),
-            PairTraversal::Spilled(axes) => match tiles {
-                Some(Tiles::Inline(tiles)) => replay_fused_raw(
-                    dst_ptr,
-                    dst_base,
-                    src_ptr,
-                    src_base,
-                    &tiles.layout,
-                    Some(tiles),
-                    apply,
-                    ns_per_element,
-                    exec,
-                ),
-                Some(Tiles::Spilled(tiles)) => replay_spilled_tiled(
-                    dst_ptr,
-                    dst_base,
-                    src_ptr,
-                    src_base,
-                    tiles,
-                    apply,
-                    exec,
-                    ns_per_element,
-                ),
-                None => replay_spilled_raw(
-                    dst_ptr,
-                    dst_base,
-                    src_ptr,
-                    src_base,
-                    axes,
-                    apply,
-                    ns_per_element,
-                    exec,
-                ),
-            },
+            Route::Spilled {
+                tiles: Some(tiles), ..
+            } => replay_spilled_tiled(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                tiles,
+                apply,
+                exec,
+                ns_per_element,
+            ),
+            Route::Spilled { axes, tiles: None } => replay_spilled_raw(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                axes,
+                apply,
+                ns_per_element,
+                exec,
+            ),
         }
     }
 }
@@ -1196,8 +1166,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
     S: Copy + Send + Sync,
     Apply: Fn(&mut D, S) + Sync,
 {
-    let rank = tiles.dims.len();
-    let total = tiles.dims.iter().product::<usize>();
+    let total = tiles.dims().iter().product::<usize>();
     if !crate::cost::is_parallel_at_rate(total, ns_per_element, &exec) {
         // SAFETY: forwarded caller contract over the whole box.
         unsafe {
@@ -1207,21 +1176,21 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
                 src_ptr,
                 src_base,
                 tiles,
-                &tiles.dims,
+                tiles.dims(),
                 &apply,
             )
         };
         return;
     }
-    let strides = [&tiles.dst[..rank], &tiles.src[..rank]];
+    let strides = [tiles.dst(), tiles.src()];
     let costs = crate::fuse::compute_costs(&strides);
     let dst_ptr = crate::threading::SendPtr(dst_ptr);
     let src_ptr = crate::threading::SendPtr(src_ptr as *mut S);
     #[cfg(test)]
     let leaves = std::sync::Mutex::new(Vec::new());
     let result = crate::threading::mapreduce_threaded_at_rate(
-        &tiles.dims[..rank],
-        &tiles.blocks[..rank],
+        tiles.dims(),
+        tiles.blocks(),
         &strides,
         &[dst_base, src_base],
         &costs,

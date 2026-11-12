@@ -38,10 +38,10 @@
 //!   saturates: both budget comparisons keep their unbounded outcome and
 //!   nothing panics.
 
-use crate::fuse::compute_costs;
+use crate::fuse::compute_costs_into;
 use crate::inline::{InlineVec, OPERAND_CAP};
 use crate::{BLOCK_MEMORY_SIZE, CACHE_LINE_SIZE};
-use strided_view::auxiliary::index_order;
+use strided_view::auxiliary::index_order_into;
 
 /// Operand-major scratch of the core's stride orders: inline up to
 /// [`OPERAND_CAP`] operands of `INLINE_RANK` axes, spilling above.
@@ -320,43 +320,84 @@ pub(crate) fn reduced_block_sizes(
     elem_sizes: &[usize],
 ) -> Option<InlineVec<usize>> {
     debug_assert_eq!(strides_list.len(), elem_sizes.len());
-    if dims.is_empty() {
+    if model_exits(dims, strides_list, elem_sizes) {
         return None;
     }
-    if memory_region(dims, strides_list, 0, elem_sizes) <= BLOCK_MEMORY_SIZE as u128
+    // A table length beyond `usize` cannot be stored; full dimensions are a
+    // valid block vector, though not the model's result in general.
+    let len = strides_list.len().checked_mul(dims.len())?;
+    let mut orders: Scratch<usize> = Scratch::with_capacity(len);
+    orders.resize(len, 0);
+    let mut costs: InlineVec<isize> = InlineVec::with_capacity(dims.len());
+    costs.resize(dims.len(), 0);
+    let mut blocks = InlineVec::from(dims);
+    reduced_block_sizes_into(
+        dims,
+        strides_list,
+        elem_sizes,
+        &mut blocks,
+        &mut orders,
+        &mut costs,
+    );
+    Some(blocks)
+}
+
+/// The model's sufficient exits that keep the full dimensions before any
+/// metadata is built: where [`reduced_block_sizes`] returns `None`. A caller
+/// asks this before it sets up the scratch of [`reduced_block_sizes_into`].
+pub(crate) fn model_exits(dims: &[usize], strides_list: &[&[isize]], elem_sizes: &[usize]) -> bool {
+    dims.is_empty()
+        || memory_region(dims, strides_list, 0, elem_sizes) <= BLOCK_MEMORY_SIZE as u128
         || strides_list
             .iter()
             .zip(elem_sizes)
             .all(|(strides, &elem_size)| elem_size > 0 && strictly_increasing(strides))
-    {
-        return None;
-    }
+}
 
+/// [`reduced_block_sizes`] into caller storage, for a layout [`model_exits`]
+/// does not answer: `blocks` and `costs` hold one slot per axis and `orders`
+/// one per operand and axis, and `blocks` holds the model's blocks on return.
+/// A caller that holds bounded storage for its rank runs the model without
+/// allocating.
+pub(crate) fn reduced_block_sizes_into(
+    dims: &[usize],
+    strides_list: &[&[isize]],
+    elem_sizes: &[usize],
+    blocks: &mut [usize],
+    orders: &mut [usize],
+    costs: &mut [isize],
+) {
+    debug_assert_eq!(strides_list.len(), elem_sizes.len());
+    debug_assert_eq!(blocks.len(), dims.len());
+    debug_assert_eq!(costs.len(), dims.len());
+    debug_assert_eq!(orders.len(), strides_list.len() * dims.len());
+    debug_assert!(!model_exits(dims, strides_list, elem_sizes));
+    blocks.copy_from_slice(dims);
     let pitch = dims.len();
-    // A table length beyond `usize` cannot be stored; full dimensions are a
-    // valid block vector, though not the model's result in general.
-    let len = strides_list.len().checked_mul(pitch)?;
-    let mut orders: Scratch<usize> = Scratch::with_capacity(len);
-    for (strides, &elem_size) in strides_list.iter().zip(elem_sizes) {
+    for ((strides, &elem_size), row) in strides_list
+        .iter()
+        .zip(elem_sizes)
+        .zip(orders.chunks_exact_mut(pitch.max(1)))
+    {
         if elem_size == 0 {
             // Every byte stride is 0, so every axis has stride order 1.
-            orders.extend(std::iter::repeat_n(1usize, pitch));
+            row.fill(1);
         } else {
             // With `elem_size > 0` the byte strides are an exact positive
             // multiple of the element strides, so both have the same order.
-            orders.extend_from_slice(&index_order(strides));
+            // INVARIANT: `row` has one slot per axis, so the lengths agree.
+            let filled = index_order_into(strides, row);
+            debug_assert!(filled.is_ok());
         }
     }
-    let costs = compute_costs(strides_list);
+    compute_costs_into(strides_list, costs);
     let rows = Rows {
         pitch,
         strides: strides_list,
         elem_sizes,
-        orders: &orders,
+        orders,
     };
-    let mut blocks = InlineVec::from(dims);
-    compute_blocks_at(&mut blocks, 0, &costs, &rows, BLOCK_MEMORY_SIZE);
-    Some(blocks)
+    compute_blocks_at(blocks, 0, costs, &rows, BLOCK_MEMORY_SIZE);
 }
 
 /// Whether every stride is nonzero and strictly larger in magnitude than the
@@ -792,22 +833,55 @@ fn slabs_share_no_line(dims: &[usize], strides: &[isize], prefix: usize, elem_si
     if width % line != 0 {
         return false;
     }
-    // Inline up to `RAW_FUSED_RANK_LIMIT`, heap above it: the spilled route
-    // reaches this with more axes (issue #425), and the inline route must stay
-    // allocation-free.
+    // Storage by tail length: inline up to `RAW_FUSED_RANK_LIMIT`, a bounded
+    // out-of-line array up to `MAX_MOVING_AXES` (the most a replay passes,
+    // since it passes moving axes only), heap above it for callers that pass
+    // uncompressed axes.
     let count = dims.len() - prefix;
-    let mut inline = [(0u128, 0usize); crate::raw_ops::RAW_FUSED_RANK_LIMIT];
-    let mut spilled = Vec::new();
-    let tail: &mut [(u128, usize)] = if count <= crate::raw_ops::RAW_FUSED_RANK_LIMIT {
-        let tail = &mut inline[..count];
+    let fill = |tail: &mut [(u128, usize)]| {
         for (slot, axis) in tail.iter_mut().zip(prefix..dims.len()) {
             *slot = (byte(axis), axis);
         }
-        tail
-    } else {
-        spilled.extend((prefix..dims.len()).map(|axis| (byte(axis), axis)));
-        &mut spilled
     };
+    let separated = |tail: &mut [(u128, usize)]| tail_separated(tail, width, line, &reach);
+    if count <= crate::raw_ops::RAW_FUSED_RANK_LIMIT {
+        let mut inline = [(0u128, 0usize); crate::raw_ops::RAW_FUSED_RANK_LIMIT];
+        let tail = &mut inline[..count];
+        fill(tail);
+        separated(tail)
+    } else if count <= crate::raw_ops::MAX_MOVING_AXES {
+        wide_tail_separated(count, &fill, &separated)
+    } else {
+        let mut tail = vec![(0u128, 0usize); count];
+        fill(&mut tail);
+        separated(&mut tail)
+    }
+}
+
+/// The bounded branch of [`slabs_share_no_line`], out of line so that the
+/// inline tail's frame keeps its size.
+#[inline(never)]
+fn wide_tail_separated(
+    count: usize,
+    fill: &impl Fn(&mut [(u128, usize)]),
+    separated: &impl Fn(&mut [(u128, usize)]) -> bool,
+) -> bool {
+    let mut wide = [(0u128, 0usize); crate::raw_ops::MAX_MOVING_AXES];
+    // INVARIANT: the caller dispatches here only for
+    // `count <= MAX_MOVING_AXES`.
+    let tail = &mut wide[..count];
+    fill(tail);
+    separated(tail)
+}
+
+/// The decision of [`slabs_share_no_line`] over its tail of
+/// `(byte stride, axis)` entries, sorted here.
+fn tail_separated(
+    tail: &mut [(u128, usize)],
+    width: u128,
+    line: u128,
+    reach: &impl Fn(usize) -> Option<u128>,
+) -> bool {
     tail.sort_unstable();
     let mut span = width;
     for &(stride, axis) in tail.iter() {
