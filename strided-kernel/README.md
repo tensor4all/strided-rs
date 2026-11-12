@@ -142,7 +142,7 @@ The library automatically optimizes iteration order for cache efficiency:
 ```toml
 [dependencies]
 # 0.14 is the current published release and carries the `*_acc` / `*_into` names.
-strided-kernel = { version = "0.14", features = ["parallel"] }
+strided-kernel = { version = "0.15", features = ["parallel"] }
 ```
 
 Every operation that can fan out takes a `threadteam::Exec` placement token as
