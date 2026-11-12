@@ -1730,6 +1730,180 @@ where
     )
 }
 
+/// `f(&mut dest[i], src[i])` after fusing the two layouts inside the call.
+///
+/// [`replay_map_raw`] replays the axes exactly as given, so a caller that holds
+/// an unfused layout has to fuse it first and pays that pass per call. This
+/// entry performs the same fusion [`copy_scale_raw`] does before choosing the
+/// route, then replays with the caller's token; the small-block fusion cost is
+/// therefore inside the crate, once, instead of at every call site.
+///
+/// The traversal, width, callback and allocation contracts are those of
+/// [`replay_map_raw`]: the visit order is unspecified, and a successful call
+/// allocates nothing at any rank on a serial token, or on a pooled token whose
+/// replay is not tiled above [`RAW_FUSED_RANK_LIMIT`] moving axes. The fusion
+/// itself holds its scratch on the stack, so it does not allocate either.
+///
+/// # Errors
+///
+/// As [`replay_map_raw`].
+///
+/// # Examples
+///
+/// ```rust
+/// use strided_basic::{replay_map_raw_fused, Exec, RawStridedMut, RawStridedRef};
+///
+/// let src = [1.0f64, 2.0, 3.0, 4.0];
+/// let mut acc = [10.0f64, 20.0, 30.0, 40.0];
+/// let source = RawStridedRef::new(&src, &[2, 2], &[2, 1], 0).unwrap();
+/// // The destination is transposed relative to the source; the fused entry
+/// // fuses the two layouts before it walks them.
+/// let mut dst = RawStridedMut::new(&mut acc, &[2, 2], &[1, 2], 0).unwrap();
+/// replay_map_raw_fused(&mut dst, &source, |d, s| *d += s, Exec::serial()).unwrap();
+/// assert_eq!(acc, [11.0, 23.0, 32.0, 44.0]);
+/// ```
+pub fn replay_map_raw_fused<D, S, F>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    f: F,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    F: Fn(&mut D, S) + Send + Sync,
+{
+    replay_fused_given(dest, src, f, exec)
+}
+
+/// [`replay_map_raw_fused`] into a potentially uninitialized destination.
+///
+/// `f` cannot read the destination. On success every reachable destination
+/// element is initialized and no other slot is written. The fused traversal,
+/// callback and allocation contract is that of [`replay_map_raw_fused`].
+///
+/// # Errors
+///
+/// As [`replay_map_raw`].
+///
+/// # Examples
+///
+/// ```rust
+/// use core::mem::MaybeUninit;
+/// use strided_basic::{replay_map_raw_uninit_fused, Exec, RawStridedMut, RawStridedRef};
+///
+/// let src = [1i32, 2, 3];
+/// let mut storage = [MaybeUninit::<f64>::uninit(); 3];
+/// let mut dst = RawStridedMut::new(&mut storage, &[3], &[1], 0).unwrap();
+/// let source = RawStridedRef::new(&src, &[3], &[1], 0).unwrap();
+/// replay_map_raw_uninit_fused(&mut dst, &source, |s| f64::from(s) * 0.5, Exec::serial())
+///     .unwrap();
+/// drop(dst);
+/// // SAFETY: every reachable destination slot was initialized above.
+/// let values: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+/// assert_eq!(values, [0.5, 1.0, 1.5]);
+/// ```
+pub fn replay_map_raw_uninit_fused<D, S, F>(
+    dest: &mut RawStridedMut<'_, MaybeUninit<D>>,
+    src: &RawStridedRef<'_, S>,
+    f: F,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    F: Fn(S) -> D + Send + Sync,
+{
+    replay_fused_given(
+        dest,
+        src,
+        move |dst: &mut MaybeUninit<D>, value: S| {
+            dst.write(f(value));
+        },
+        exec,
+    )
+}
+
+/// Fuse the compacted moving axes of the pair on the stack, then replay them.
+///
+/// [`fuse_pair_traversal`] keeps a `Vec` for an original rank above
+/// [`RAW_FUSED_RANK_LIMIT`]; this path compacts extent-1 axes first and holds
+/// both the compacted and the fused axes in fixed arrays, so the fusion adds no
+/// allocation at any rank. The element count is checked before the arrays are
+/// indexed, which also bounds the moving-axis count by
+/// [`MAX_MOVING_AXES`].
+fn replay_fused_given<D, S, Apply>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    apply: Apply,
+    exec: Exec<'_>,
+) -> Result<()>
+where
+    D: Copy + Send + Sync,
+    S: Copy + Send + Sync,
+    Apply: Fn(&mut D, S) + Send + Sync,
+{
+    ensure_same_dims(dest.dims(), src.dims())?;
+    if crate::kernel::total_len(dest.dims())? == 0 {
+        return Ok(());
+    }
+
+    let mut dims = [1usize; MAX_MOVING_AXES];
+    let mut dst_strides = [0isize; MAX_MOVING_AXES];
+    let mut src_strides = [0isize; MAX_MOVING_AXES];
+    let mut moving = 0;
+    for ((&dim, &dst), &src_stride) in dest.dims().iter().zip(dest.strides()).zip(src.strides()) {
+        if dim == 1 {
+            continue;
+        }
+        // INVARIANT: the checked nonzero count gives `2^moving <= total`, so
+        // `moving < MAX_MOVING_AXES`.
+        dims[moving] = dim;
+        dst_strides[moving] = dst;
+        src_strides[moving] = src_stride;
+        moving += 1;
+    }
+
+    let mut fused = [EMPTY_AXIS; MAX_MOVING_AXES];
+    let rank = fuse_axes(
+        &mut fused[..moving.max(1)],
+        &dims[..moving],
+        &dst_strides[..moving],
+        &src_strides[..moving],
+    );
+    let mut fused_dims = [1usize; MAX_MOVING_AXES];
+    let mut fused_dst = [0isize; MAX_MOVING_AXES];
+    let mut fused_src = [0isize; MAX_MOVING_AXES];
+    for (slot, axis) in fused[..rank].iter().enumerate() {
+        fused_dims[slot] = axis.dim;
+        fused_dst[slot] = axis.dst;
+        fused_src[slot] = axis.src;
+    }
+
+    let dst_offset = dest.offset();
+    let src_offset = src.offset();
+    // SAFETY: fusion only reorders and merges the compacted moving axes, so the
+    // set of reachable offsets is unchanged and the views' constructors already
+    // proved that set inside their data.
+    let mut dest = unsafe {
+        RawStridedMut::new_unchecked(
+            dest.data_mut(),
+            &fused_dims[..rank],
+            &fused_dst[..rank],
+            dst_offset,
+        )
+    };
+    let src = unsafe {
+        RawStridedRef::new_unchecked(
+            src.data(),
+            &fused_dims[..rank],
+            &fused_src[..rank],
+            src_offset,
+        )
+    };
+    replay_given(&mut dest, &src, apply, exec)
+}
+
 #[cfg(test)]
 #[path = "raw_ops/tests/tests.rs"]
 mod tests;

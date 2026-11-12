@@ -19,6 +19,9 @@
 //! - `R4`: wide replays, serial: `[2; 9]` reversed into column-major, `[2; 12]`
 //!   reversed, rank 200 with the nine moving axes of `[2; 9]`, and `4^9`
 //!   reversed (tiled).
+//! - `R5`: the small-block rows of #471, block sides 2 and 8 at ranks 2-4,
+//!   serial: the same `|d, s| *d += s` callback through `replay_map_raw` (the
+//!   axes as given) and `replay_map_raw_fused` (fused inside the call).
 //!
 //! ```text
 //! cargo bench --profile release -p strided-basic --features parallel --bench replay_raw
@@ -27,7 +30,9 @@
 use std::hint::black_box;
 
 use strided_basic::execution::{parallel_width, KernelClass};
-use strided_basic::{replay_copy_raw, Exec, Pool, RawStridedMut, RawStridedRef};
+use strided_basic::{
+    replay_copy_raw, replay_map_raw, replay_map_raw_fused, Exec, Pool, RawStridedMut, RawStridedRef,
+};
 
 #[allow(dead_code)] // the shared support module also serves the overhead benches
 #[path = "support/mod.rs"]
@@ -80,6 +85,13 @@ fn span(dims: &[usize], strides: &[isize], offset: isize) -> usize {
     (hi + 1) as usize
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Copy,
+    Map,
+    MapFused,
+}
+
 struct Row {
     id: String,
     dims: Vec<usize>,
@@ -87,6 +99,7 @@ struct Row {
     src: Vec<isize>,
     src_offset: isize,
     pooled: bool,
+    op: Op,
 }
 
 impl Row {
@@ -98,7 +111,13 @@ impl Row {
             src,
             src_offset: 0,
             pooled: false,
+            op: Op::Copy,
         }
+    }
+
+    fn mapping(mut self, op: Op) -> Self {
+        self.op = op;
+        self
     }
 
     fn pooled(mut self) -> Self {
@@ -222,6 +241,27 @@ fn rows() -> Vec<Row> {
         col_major(&wide),
         reversed(&wide),
     ));
+    // #471 small blocks: sides 2 and 8, ranks 2-4, mapped with `+=`.
+    for side in [2usize, 8] {
+        for rank in 2..=4usize {
+            let dims = vec![side; rank];
+            let dst = col_major(&dims);
+            let src = reversed(&dims);
+            rows.push(
+                Row::new(
+                    format!("R5 map-given side{side} r{rank}"),
+                    &dims,
+                    dst.clone(),
+                    src.clone(),
+                )
+                .mapping(Op::Map),
+            );
+            rows.push(
+                Row::new(format!("R5 map-fused side{side} r{rank}"), &dims, dst, src)
+                    .mapping(Op::MapFused),
+            );
+        }
+    }
     rows
 }
 
@@ -254,8 +294,28 @@ fn main() {
             assert!(width >= 2, "{}: pooled row runs at width {width}", row.id);
         }
         let iterations = (ELEMENTS_PER_SAMPLE / total).max(1);
-        let mut call = || {
-            replay_copy_raw(black_box(&mut dest), black_box(&source), exec()).unwrap();
+        let mut call = || match row.op {
+            Op::Copy => {
+                replay_copy_raw(black_box(&mut dest), black_box(&source), exec()).unwrap();
+            }
+            Op::Map => {
+                replay_map_raw(
+                    black_box(&mut dest),
+                    black_box(&source),
+                    |d: &mut f64, s| *d += s,
+                    exec(),
+                )
+                .unwrap();
+            }
+            Op::MapFused => {
+                replay_map_raw_fused(
+                    black_box(&mut dest),
+                    black_box(&source),
+                    |d: &mut f64, s| *d += s,
+                    exec(),
+                )
+                .unwrap();
+            }
         };
         for _ in 0..iterations.min(64) {
             call();

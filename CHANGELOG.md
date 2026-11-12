@@ -39,6 +39,17 @@ with more than 8 moving axes may still allocate the dimension splitter's metadat
 selects the inline or the wide traversal. Serial `CopyPlan`/`UpdatePlan` execution of a spilled layout stops
 allocating too; `copy_scale_raw`, `axpy_raw` and plan compilation keep their fusion scratch.
 
+### `strided-basic`: `replay_map_raw_fused` and `replay_map_raw_uninit_fused`
+
+The two additive entries fuse the pair inside the call (`copy_scale_raw`'s
+rule, sorted by destination stride and merged where contiguous) and then replay
+through the same allocation-free route as `replay_map_raw`, so a caller holding
+unfused axes no longer pays its own fusion pass per call (#471). The fusion
+scratch is two fixed stack arrays; a successful call allocates nothing at any
+rank on a serial token, or on a pooled token whose replay is not tiled above
+`RAW_FUSED_RANK_LIMIT` moving axes. The given-axis entries are unchanged and
+remain the cheaper choice when the axes are already fused.
+
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
 `index_order_into(strides, out)` writes the stride order into caller storage and returns `StrideLengthMismatch` when
