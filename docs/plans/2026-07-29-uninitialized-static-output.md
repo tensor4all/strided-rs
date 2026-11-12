@@ -34,8 +34,10 @@ storage is formed.
 ## Verification
 
 Focused differential tests cover all `KernelDType` values, `bool`, complex
-values, alignment-1 empty storage, non-contiguous pad output, multi-input
-concatenate, rank above the inline traversal limit, and overlap rejection
+values, zero-length storage that is correctly aligned for the dtype (the
+misaligned empty case is rejected and guarded in `strided-view`),
+non-contiguous pad output, multi-input concatenate, rank above the inline
+traversal limit, and overlap rejection
 before mutation. Concatenate validates every segment offset before writing, so
 a later overflow cannot leave a partially initialized destination. The
 allocation-counting test covers all four erased full-overwrite entry points.
