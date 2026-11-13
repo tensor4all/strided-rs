@@ -167,7 +167,7 @@ fn fused_range_replay_matches_reference_for_every_split() {
                             &layout,
                             start,
                             end - start,
-                            &|d: &mut i64, v| *d = v,
+                            &mut |d: &mut i64, v| *d = v,
                         );
                     }
                 }
@@ -542,7 +542,7 @@ fn spilled_range_replay_matches_reference_for_every_split() {
                         axes,
                         start,
                         end - start,
-                        &|d: &mut i64, v| *d = v,
+                        &mut |d: &mut i64, v| *d = v,
                     );
                 }
             }

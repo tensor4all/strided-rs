@@ -80,6 +80,8 @@
 //! - [`replay_map_raw_fused`] and [`replay_map_raw_uninit_fused`]: the same
 //!   replay, but fuse the pair inside the call for callers that hold unfused
 //!   axes
+//! - [`replay_map_raw_serial`]: the serial replay of [`replay_map_raw`] for an
+//!   `FnMut` and for elements that are not `Send + Sync`
 //! - [`copy_scale_raw`], [`axpy_raw`] and their `conj` forms: serial copies
 //!   that fuse the layout on every call
 //!
@@ -152,8 +154,8 @@ pub use ops_view::{
 };
 pub use raw_ops::{
     axpy_conj_raw, axpy_raw, copy_scale_conj_raw, copy_scale_raw, replay_copy_raw,
-    replay_copy_raw_uninit, replay_map_raw, replay_map_raw_fused, replay_map_raw_uninit,
-    replay_map_raw_uninit_fused, RAW_FUSED_RANK_LIMIT,
+    replay_copy_raw_uninit, replay_map_raw, replay_map_raw_fused, replay_map_raw_serial,
+    replay_map_raw_uninit, replay_map_raw_uninit_fused, RAW_FUSED_RANK_LIMIT,
 };
 pub use reduce_view::{reduce, reduce_axis, reduce_axis_into, zip_reduce};
 pub use simd::MaybeSimdOps;

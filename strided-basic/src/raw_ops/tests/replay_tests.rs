@@ -932,3 +932,263 @@ fn wide_untiled_replay_fans_out_on_a_team_token() {
     assert_fanned_out(Some(root));
     assert_eq!(out, src);
 }
+
+/// Destination slots in the order the tiled walk is specified to visit them,
+/// from the specification alone: the tile grid column-major, tiles of extents
+/// `blocks` anchored at the origin and clipped to the box, each tile
+/// column-major.
+fn tile_order(dims: &[usize], dst_strides: &[isize], blocks: &[usize], base: isize) -> Vec<usize> {
+    let rank = dims.len();
+    let grid: Vec<usize> = dims
+        .iter()
+        .zip(blocks)
+        .map(|(&d, &b)| d.div_ceil(b))
+        .collect();
+    let mut order = Vec::new();
+    for tile in 0..grid.iter().product::<usize>() {
+        let mut rest = tile;
+        let origin: Vec<usize> = (0..rank)
+            .map(|axis| {
+                let coord = rest % grid[axis];
+                rest /= grid[axis];
+                coord * blocks[axis]
+            })
+            .collect();
+        let extent: Vec<usize> = (0..rank)
+            .map(|axis| blocks[axis].min(dims[axis] - origin[axis]))
+            .collect();
+        for element in 0..extent.iter().product::<usize>() {
+            let mut rest = element;
+            let mut slot = base;
+            for axis in 0..rank {
+                slot += (origin[axis] + rest % extent[axis]) as isize * dst_strides[axis];
+                rest /= extent[axis];
+            }
+            order.push(slot as usize);
+        }
+    }
+    order
+}
+
+/// `replay_map_raw_serial` walks what `replay_map_raw` walks on a serial
+/// token: the same `(destination slot, source value)` sequence and the same
+/// final buffer, on every route. The sequence is also checked against an
+/// order built from the specification alone: column-major over the given axes
+/// for an untiled route, [`tile_order`] for a tiled one.
+#[test]
+fn serial_entry_visits_what_the_serial_token_visits() {
+    use std::sync::Mutex;
+
+    struct Case {
+        label: &'static str,
+        dims: Vec<usize>,
+        dst: Vec<isize>,
+        src: Vec<isize>,
+        src_offset: isize,
+        /// Whether the route must come out tiled (and be kept: an injective
+        /// destination).
+        tiled: bool,
+    }
+    let reversed = |dims: &[usize]| {
+        let mut strides = col_major_strides(&dims.iter().rev().copied().collect::<Vec<_>>());
+        strides.reverse();
+        strides
+    };
+    let mut cases = vec![
+        Case {
+            label: "rank 0",
+            dims: vec![],
+            dst: vec![],
+            src: vec![],
+            src_offset: 0,
+            tiled: false,
+        },
+        Case {
+            label: "rank 1 reversed",
+            dims: vec![5],
+            dst: vec![1],
+            src: vec![-1],
+            src_offset: 4,
+            tiled: false,
+        },
+        Case {
+            label: "inline untiled",
+            dims: vec![3, 4, 2],
+            dst: col_major_strides(&[3, 4, 2]),
+            src: vec![8, 2, 1],
+            src_offset: 0,
+            tiled: false,
+        },
+        Case {
+            label: "inline tiled",
+            dims: vec![16, 16, 16],
+            dst: col_major_strides(&[16, 16, 16]),
+            src: reversed(&[16, 16, 16]),
+            src_offset: 0,
+            tiled: true,
+        },
+        Case {
+            label: "non-injective accumulate",
+            dims: vec![64, 3],
+            dst: vec![0, 1],
+            src: vec![1, 64],
+            src_offset: 0,
+            tiled: false,
+        },
+        Case {
+            label: "zero extent",
+            dims: vec![3, 0, 2],
+            dst: vec![1, 3, 3],
+            src: vec![1, 3, 3],
+            src_offset: 0,
+            tiled: false,
+        },
+        Case {
+            label: "rank 9 issue layout (spilled untiled)",
+            dims: vec![2; 9],
+            dst: col_major_strides(&[2; 9]),
+            src: reversed(&[2; 9]),
+            src_offset: 0,
+            tiled: false,
+        },
+        Case {
+            label: "4^9 reversed (spilled tiled)",
+            dims: vec![4; 9],
+            dst: col_major_strides(&[4; 9]),
+            src: reversed(&[4; 9]),
+            src_offset: 0,
+            tiled: true,
+        },
+    ];
+    // Rank 12 with eight moving axes: the wide route compacts to inline.
+    let mut wide = Case {
+        label: "rank 12, eight moving (inline after compaction)",
+        dims: vec![],
+        dst: vec![],
+        src: vec![],
+        src_offset: 0,
+        tiled: false,
+    };
+    let moving = [3usize, 2, 2, 3, 2, 2, 2, 3];
+    let moving_src = reversed(&moving);
+    let moving_dst = col_major_strides(&moving);
+    for axis in 0..12 {
+        if axis % 3 == 2 {
+            wide.dims.push(1);
+            wide.dst.push(1000);
+            wide.src.push(-1000);
+        } else {
+            let k = axis - axis / 3;
+            wide.dims.push(moving[k]);
+            wide.dst.push(moving_dst[k]);
+            wide.src.push(moving_src[k]);
+        }
+    }
+    cases.push(wide);
+
+    for case in &cases {
+        let label = case.label;
+        let route_tiles = if case.dims.contains(&0) {
+            None
+        } else {
+            PairTraversal::given(&case.dims, &case.dst, &case.src).tiles::<f64, f64>()
+        };
+        assert_eq!(route_tiles.is_some(), case.tiled, "{label}: route");
+        let src_len = span(&case.dims, &case.src, case.src_offset);
+        let src: Vec<f64> = (0..src_len).map(|v| v as f64 * 0.5 - 3.0).collect();
+        let dst_len = span(&case.dims, &case.dst, 0).max(1);
+        let initial: Vec<f64> = (0..dst_len).map(|v| v as f64 * 100.0).collect();
+        let source = RawStridedRef::new(&src, &case.dims, &case.src, case.src_offset).unwrap();
+
+        let mut by_token = initial.clone();
+        let base = by_token.as_ptr() as usize;
+        let token_visits = Mutex::new(Vec::new());
+        replay_map_raw(
+            &mut RawStridedMut::new(&mut by_token, &case.dims, &case.dst, 0).unwrap(),
+            &source,
+            |d: &mut f64, s: f64| {
+                let slot = (d as *mut f64 as usize - base) / size_of::<f64>();
+                token_visits.lock().unwrap().push((slot, s.to_bits()));
+                *d += s;
+            },
+            Exec::serial(),
+        )
+        .unwrap();
+        let token_visits = token_visits.into_inner().unwrap();
+
+        let mut by_entry = initial.clone();
+        let base = by_entry.as_ptr() as usize;
+        let mut entry_visits = Vec::new();
+        replay_map_raw_serial(
+            &mut RawStridedMut::new(&mut by_entry, &case.dims, &case.dst, 0).unwrap(),
+            &source,
+            |d: &mut f64, s: f64| {
+                let slot = (d as *mut f64 as usize - base) / size_of::<f64>();
+                entry_visits.push((slot, s.to_bits()));
+                *d += s;
+            },
+        )
+        .unwrap();
+
+        assert!(entry_visits == token_visits, "{label}: visit sequence");
+        assert_eq!(bits(&by_entry), bits(&by_token), "{label}: result");
+        let slots: Vec<usize> = entry_visits.iter().map(|&(slot, _)| slot).collect();
+        let specified = match &route_tiles {
+            None => offsets(&case.dims, &case.dst, 0),
+            Some(Tiles::Inline(tiles)) => {
+                let rank = tiles.layout.rank;
+                tile_order(
+                    &tiles.layout.dims[..rank],
+                    &tiles.layout.dst_strides[..rank],
+                    &tiles.blocks[..rank],
+                    0,
+                )
+            }
+            Some(Tiles::Spilled(tiles)) => tile_order(tiles.dims(), tiles.dst(), tiles.blocks(), 0),
+        };
+        assert!(slots == specified, "{label}: specified visit order");
+    }
+}
+
+/// The serial entry fails as the serial token does, before `f` first runs and
+/// before any write.
+#[test]
+fn serial_entry_errors_match_the_serial_token() {
+    let src = [1.0f64; 8];
+    let mut dst = [-1.0f64; 8];
+    let source = RawStridedRef::new(&src, &[2, 4], &[1, 2], 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut dst, &[4, 2], &[1, 4], 0).unwrap();
+    let mut calls = 0;
+    assert!(matches!(
+        replay_map_raw(&mut dest, &source, |d: &mut f64, s| *d = s, Exec::serial()),
+        Err(StridedError::ShapeMismatch(..))
+    ));
+    assert!(matches!(
+        replay_map_raw_serial(&mut dest, &source, |d: &mut f64, s| {
+            calls += 1;
+            *d = s
+        }),
+        Err(StridedError::ShapeMismatch(..))
+    ));
+    assert_eq!(dst, [-1.0; 8]);
+
+    let dims = vec![2usize; usize::BITS as usize];
+    let strides = vec![0isize; dims.len()];
+    let one = [1.0f64];
+    let mut out = [0.0f64];
+    let source = RawStridedRef::new(&one, &dims, &strides, 0).unwrap();
+    let mut dest = RawStridedMut::new(&mut out, &dims, &strides, 0).unwrap();
+    assert!(matches!(
+        replay_map_raw(&mut dest, &source, |d: &mut f64, s| *d += s, Exec::serial()),
+        Err(StridedError::OffsetOverflow)
+    ));
+    assert!(matches!(
+        replay_map_raw_serial(&mut dest, &source, |d: &mut f64, s| {
+            calls += 1;
+            *d += s
+        }),
+        Err(StridedError::OffsetOverflow)
+    ));
+    assert_eq!(out, [0.0]);
+    assert_eq!(calls, 0);
+}

@@ -50,6 +50,16 @@ rank on a serial token, or on a pooled token whose replay is not tiled above
 `RAW_FUSED_RANK_LIMIT` moving axes. The given-axis entries are unchanged and
 remain the cheaper choice when the axes are already fused.
 
+### `strided-basic`: `replay_map_raw_serial`
+
+The additive entry `replay_map_raw_serial(dest, src, f)` is `replay_map_raw` on the calling thread, with only
+`D: Copy`, `S: Copy` and `F: FnMut(&mut D, S)`: no `Send`, no `Sync`, no `Exec` (#469). A generic `T: Copy` copy is
+`replay_map_raw_serial(dst, src, |d, s| *d = s)`. It shares the route and the leaves of `replay_map_raw` under
+`Exec::serial()`, whose serial token now walks that same function, so the traversal, the errors and the visit order are
+the same: column-major over the given axes, or tile by tile for a destination proven injective that the cache-block
+model tiles. A successful call allocates nothing at any rank. There is no `_uninit` form: with `D = MaybeUninit<T>` the
+destination is initialized when `f` writes every slot. The parallel entries keep their bounds.
+
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
 `index_order_into(strides, out)` writes the stride order into caller storage and returns `StrideLengthMismatch` when

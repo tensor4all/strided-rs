@@ -732,11 +732,11 @@ pub(crate) unsafe fn apply_tiled_box<D, S, Apply>(
     src_base: isize,
     tile_box: &FusedPairLayout,
     blocks: &[usize; RAW_FUSED_RANK_LIMIT],
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     let tiles = tile_count(tile_box, blocks);
     // SAFETY: forwarded caller contract; `0..tiles` is the whole tile grid.
@@ -784,11 +784,11 @@ pub(crate) unsafe fn apply_tile_range<D, S, Apply>(
     blocks: &[usize; RAW_FUSED_RANK_LIMIT],
     first: usize,
     count: usize,
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     if count == 0 {
         return;
@@ -883,11 +883,11 @@ pub(crate) unsafe fn apply_spilled_tiled_box<D, S, Apply>(
     src_base: isize,
     tiles: &SpilledTiles,
     box_dims: &[usize],
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     let rank = box_dims.len();
     // One axis list for the current tile and one cursor for the whole walk,
@@ -954,11 +954,11 @@ pub(crate) fn apply_fused_pair<D, S, Apply>(
     dst: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
     layout: &FusedPairLayout,
-    apply: Apply,
+    mut apply: Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     let total = fused_total(layout);
     if total == 0 {
@@ -976,7 +976,7 @@ pub(crate) fn apply_fused_pair<D, S, Apply>(
     // and exclusive borrows cannot overlap, and this is the only writer.
     unsafe {
         apply_fused_range(
-            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply,
+            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &mut apply,
         );
     }
 }
@@ -993,11 +993,11 @@ pub(crate) fn apply_spilled_pair<D, S, Apply>(
     dst: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
     axes: &[FusedAxis],
-    apply: Apply,
+    mut apply: Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     let total = spilled_total(axes);
     if total == 0 {
@@ -1010,7 +1010,90 @@ pub(crate) fn apply_spilled_pair<D, S, Apply>(
     // SAFETY: same contract as `apply_fused_pair`, for the axis list fused from
     // the same dims/strides.
     unsafe {
-        apply_spilled_range(dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &apply);
+        apply_spilled_range(
+            dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &mut apply,
+        );
+    }
+}
+
+/// Serial replay of a route on the calling thread: the four whole-box walks of
+/// the parallel replay's serial branches, one sequential pass through `apply`.
+///
+/// [`crate::copy_plan::replay_fused`] sends a serial token here, and so does
+/// [`replay_map_raw_serial`] with its `FnMut`, so both walk the same leaves in
+/// the same order. No arm needs `Send` or `Sync`: nothing crosses a thread.
+///
+/// # Safety
+///
+/// The [`crate::copy_plan::replay_fused`] contract for `route` at these bases,
+/// with a serial token: every logical index maps to in-bounds slots of both
+/// allocations, the product of the extents does not overflow, the tiles (when
+/// present) are the route builder's own and the destination is injective over
+/// a tiled route, and the destination does not overlap the source.
+pub(crate) unsafe fn replay_route_serial<D, S, Apply>(
+    dst_ptr: *mut D,
+    dst_base: isize,
+    src_ptr: *const S,
+    src_base: isize,
+    route: Route<'_>,
+    apply: &mut Apply,
+) where
+    D: Copy,
+    S: Copy,
+    Apply: FnMut(&mut D, S),
+{
+    // SAFETY: forwarded caller contract. Inline tiles address exactly the
+    // slots of their layout; spilled tiles hold their own axes. One
+    // sequential walk updates a repeated slot once per logical index, in
+    // order, so an untiled route needs no injectivity.
+    unsafe {
+        match route {
+            Route::Inline {
+                layout,
+                tiles: None,
+            } => apply_fused_range(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                layout,
+                0,
+                fused_total(layout),
+                apply,
+            ),
+            Route::Inline {
+                tiles: Some(tiles), ..
+            } => apply_tiled_box(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                &tiles.layout,
+                &tiles.blocks,
+                apply,
+            ),
+            Route::Spilled { axes, tiles: None } => apply_spilled_range(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                axes,
+                0,
+                spilled_total(axes),
+                apply,
+            ),
+            Route::Spilled {
+                tiles: Some(tiles), ..
+            } => apply_spilled_tiled_box(
+                dst_ptr,
+                dst_base,
+                src_ptr,
+                src_base,
+                tiles,
+                tiles.dims(),
+                apply,
+            ),
+        }
     }
 }
 
@@ -1042,11 +1125,11 @@ pub(crate) unsafe fn apply_fused_range<D, S, Apply>(
     layout: &FusedPairLayout,
     start: usize,
     len: usize,
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     if len == 0 {
         return;
@@ -1142,11 +1225,11 @@ pub(crate) unsafe fn apply_spilled_range<D, S, Apply>(
     axes: &[FusedAxis],
     start: usize,
     len: usize,
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     if len == 0 {
         return;
@@ -1180,11 +1263,11 @@ unsafe fn apply_spilled_range_with<D, S, Apply>(
     start: usize,
     len: usize,
     index: &mut [usize],
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     if len == 0 {
         return;
@@ -1263,11 +1346,11 @@ unsafe fn apply_run<D, S, Apply>(
     src_offset: isize,
     src_stride: isize,
     len: usize,
-    apply: &Apply,
+    apply: &mut Apply,
 ) where
     D: Copy,
     S: Copy,
-    Apply: Fn(&mut D, S),
+    Apply: FnMut(&mut D, S),
 {
     if dst_stride == 1 {
         // SAFETY: a unit destination stride makes the run `len` consecutive
@@ -1466,14 +1549,51 @@ where
     Ok(())
 }
 
-/// Checked replay of the given axes of two views: the shared body of the
-/// `replay_*_raw` entries.
+/// The checked route of the given axes of two views: the shared front of
+/// every `replay_*_raw` entry, parallel and serial.
 ///
 /// The element count is checked before anything is built. The unfused
 /// traversal keeps every given extent, and the replay totals (`fused_total`,
 /// `replay_spilled_raw`) take an unchecked product, so the zero-first count
 /// of `kernel::total_len` has to keep an empty layout whose nonzero prefix
-/// overflows, such as `[usize::MAX, 2, 0]`, away from them.
+/// overflows, such as `[usize::MAX, 2, 0]`, away from them. An empty layout
+/// returns before `f` runs.
+///
+/// `f` receives the route, the element count and, when the route came out
+/// tiled, whether the destination was proven injective; the tiles are dropped
+/// unless it was.
+///
+/// The slices are the views' own metadata, borrowed apart from the views so
+/// that `f` can take the destination mutably.
+fn with_checked_route<D, S>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_dims: &[usize],
+    src_strides: &[isize],
+    f: impl FnOnce(Route<'_>, usize, Option<bool>),
+) -> Result<()> {
+    ensure_same_dims(dims, src_dims)?;
+    let total = crate::kernel::total_len(dims)?;
+    if total == 0 {
+        return Ok(());
+    }
+    with_given_route::<D, S, _>(dims, dst_strides, src_strides, |route| {
+        let mut route = route;
+        let mut proven = None;
+        if route.is_tiled() {
+            let holds = crate::layout_check::is_injective_layout_without_alloc(dims, dst_strides);
+            proven = Some(holds);
+            if !holds {
+                route = route.untiled();
+            }
+        }
+        f(route, total, proven)
+    });
+    Ok(())
+}
+
+/// Checked replay of the given axes of two views: the shared body of the
+/// parallel `replay_*_raw` entries.
 fn replay_given<D, S, Apply>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
@@ -1485,61 +1605,52 @@ where
     S: Copy + Send + Sync,
     Apply: Fn(&mut D, S) + Sync,
 {
-    ensure_same_dims(dest.dims(), src.dims())?;
-    let total = crate::kernel::total_len(dest.dims())?;
-    if total == 0 {
-        return Ok(());
-    }
     let (dims, dst_strides) = (dest.dims(), dest.strides());
     let injective = || crate::layout_check::is_injective_layout_without_alloc(dims, dst_strides);
-    with_given_route::<D, S, _>(dims, dst_strides, src.strides(), |route| {
-        let mut route = route;
-        let mut proven = None;
-        if route.is_tiled() {
-            let holds = injective();
-            proven = Some(holds);
-            if !holds {
-                route = route.untiled();
-            }
-        }
-        let exec = if route.is_tiled() {
-            // The tiled tree gates every node on the caller's token itself; the
-            // flat width rule would cap it at the width of one flat dispatch.
-            exec
-        } else {
-            let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
-            if !exec.is_serial() && !proven.unwrap_or_else(injective) {
-                // A destination not proven injective replays as one sequential
-                // column-major walk, which is also its defined semantics; the
-                // budget-one token cannot be widened again by the replay's own
-                // width rule.
-                exec.limit(NonZeroUsize::MIN)
-            } else {
+    with_checked_route::<D, S>(
+        dims,
+        dst_strides,
+        src.dims(),
+        src.strides(),
+        |route, total, proven| {
+            let exec = if route.is_tiled() {
+                // The tiled tree gates every node on the caller's token itself; the
+                // flat width rule would cap it at the width of one flat dispatch.
                 exec
-            }
-        };
-        // SAFETY: the route is built from exactly the views' dims and strides
-        // (`ensure_same_dims` proved the dims agree); compaction drops only
-        // extent-1 axes, whose coordinate is always 0, so the reachable
-        // offsets equal the views' validated set, and the original metadata
-        // still drives bounds, shape and injectivity. The views' bounds proofs
-        // therefore cover every replayed offset; `total_len` checked the
-        // nonzero product; the route's tiles are the decision for its own
-        // axes, and tiles or a non-serial `exec` are left only for a
-        // destination proven injective; the exclusive and shared borrows
-        // cannot overlap.
-        unsafe {
-            crate::copy_plan::replay_fused(
-                dest,
-                src,
-                route,
-                apply,
-                KernelClass::Copy.ns_per_element(),
-                exec,
-            )
-        };
-    });
-    Ok(())
+            } else {
+                let exec = crate::cost::for_len(exec, KernelClass::Copy, total);
+                if !exec.is_serial() && !proven.unwrap_or_else(injective) {
+                    // A destination not proven injective replays as one sequential
+                    // column-major walk, which is also its defined semantics; the
+                    // budget-one token cannot be widened again by the replay's own
+                    // width rule.
+                    exec.limit(NonZeroUsize::MIN)
+                } else {
+                    exec
+                }
+            };
+            // SAFETY: the route is built from exactly the views' dims and strides
+            // (`ensure_same_dims` proved the dims agree); compaction drops only
+            // extent-1 axes, whose coordinate is always 0, so the reachable
+            // offsets equal the views' validated set, and the original metadata
+            // still drives bounds, shape and injectivity. The views' bounds proofs
+            // therefore cover every replayed offset; `total_len` checked the
+            // nonzero product; the route's tiles are the decision for its own
+            // axes, and tiles or a non-serial `exec` are left only for a
+            // destination proven injective; the exclusive and shared borrows
+            // cannot overlap.
+            unsafe {
+                crate::copy_plan::replay_fused(
+                    dest,
+                    src,
+                    route,
+                    apply,
+                    KernelClass::Copy.ns_per_element(),
+                    exec,
+                )
+            };
+        },
+    )
 }
 
 /// `dest = src`, replaying the axes of the two views exactly as given.
@@ -1652,6 +1763,8 @@ where
 /// effect depends on the supplied slot values alone. On a destination that is
 /// not proven injective, the elements are visited serially in column-major
 /// order of the given axes.
+/// For an `FnMut`, or for element types that are not `Send + Sync`, use
+/// [`replay_map_raw_serial`].
 ///
 /// # Errors
 ///
@@ -1681,6 +1794,117 @@ where
     F: Fn(&mut D, S) + Send + Sync,
 {
     replay_given(dest, src, f, exec)
+}
+
+/// [`replay_map_raw`] on the calling thread, for callbacks and elements that
+/// are not `Send + Sync`: `f(&mut dest[i], src[i])` for every element, with
+/// `f` an `FnMut`.
+///
+/// The traversal, the errors and the visit order are those of
+/// [`replay_map_raw`] under [`Exec::serial()`]: both walk the same route
+/// through the same leaves. `f` is called exactly once per logical element,
+/// sequentially on the calling thread, column-major over the given axes with
+/// axis 0 fastest. The one exception is a destination proven injective whose
+/// layout the shared cache-block model tiles: the walk then goes tile by tile,
+/// the tile grid and each tile column-major. A destination that is not proven
+/// injective is always walked column-major, so an accumulating `f` sees a
+/// repeated slot once per logical index, in that order.
+///
+/// A successful call allocates nothing at any rank; allocations made by `f`
+/// are its own. The wide route uses a rank-bounded amount of the caller's
+/// stack. An error may allocate its payload.
+///
+/// With `D = MaybeUninit<T>` the destination is initialized only if `f`
+/// writes its slot on every call: a successful return guarantees that `f` ran
+/// exactly once for every reachable destination element, not that it wrote.
+///
+/// # Errors
+///
+/// As [`replay_copy_raw`], before `f` first runs.
+///
+/// # Examples
+///
+/// A generic copy whose element type need not be `Send` or `Sync`, counting
+/// its calls through a captured `Rc`:
+///
+/// ```rust
+/// use std::cell::Cell;
+/// use std::rc::Rc;
+/// use strided_basic::{replay_map_raw_serial, RawStridedMut, RawStridedRef, Result};
+///
+/// fn copy_generic<T: Copy>(dst: &mut RawStridedMut<'_, T>, src: &RawStridedRef<'_, T>) -> Result<()> {
+///     replay_map_raw_serial(dst, src, |d, s| *d = s)
+/// }
+///
+/// let stored = [0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0]; // column-major 2 x 3
+/// let src = RawStridedRef::new(&stored, &[2, 3], &[1, 2], 0).unwrap();
+/// let mut out = [0.0f64; 6];
+/// let mut dst = RawStridedMut::new(&mut out, &[2, 3], &[3, 1], 0).unwrap();
+/// copy_generic(&mut dst, &src).unwrap();
+///
+/// let calls = Rc::new(Cell::new(0));
+/// let counter = Rc::clone(&calls);
+/// replay_map_raw_serial(&mut dst, &src, |d, s| {
+///     counter.set(counter.get() + 1);
+///     *d += s;
+/// })
+/// .unwrap();
+/// drop(dst);
+/// assert_eq!(calls.get(), 6);
+/// assert_eq!(out, [0.0, 4.0, 8.0, 2.0, 6.0, 10.0]);
+/// ```
+///
+/// An uninitialized destination, filled by a closure that writes every slot:
+///
+/// ```rust
+/// use core::mem::MaybeUninit;
+/// use strided_basic::{replay_map_raw_serial, RawStridedMut, RawStridedRef};
+///
+/// let src = [1.0f64, 2.0, 3.0];
+/// let mut storage = [MaybeUninit::<f64>::uninit(); 3];
+/// let mut dst = RawStridedMut::new(&mut storage, &[3], &[1], 0).unwrap();
+/// let source = RawStridedRef::new(&src, &[3], &[-1], 2).unwrap();
+/// replay_map_raw_serial(&mut dst, &source, |d: &mut MaybeUninit<f64>, s| {
+///     d.write(s);
+/// })
+/// .unwrap();
+/// drop(dst);
+/// // SAFETY: the closure writes its slot on every call, and the successful
+/// // replay called it once for every reachable destination slot, which are
+/// // all three slots of `storage`.
+/// let values: Vec<f64> = storage.iter().map(|v| unsafe { v.assume_init() }).collect();
+/// assert_eq!(values, [3.0, 2.0, 1.0]);
+/// ```
+pub fn replay_map_raw_serial<D, S, F>(
+    dest: &mut RawStridedMut<'_, D>,
+    src: &RawStridedRef<'_, S>,
+    mut f: F,
+) -> Result<()>
+where
+    D: Copy,
+    S: Copy,
+    F: FnMut(&mut D, S),
+{
+    let (dims, dst_strides) = (dest.dims(), dest.strides());
+    with_checked_route::<D, S>(
+        dims,
+        dst_strides,
+        src.dims(),
+        src.strides(),
+        |route, _, _| {
+            let src_ptr = src.data().as_ptr();
+            let src_base = src.offset();
+            let dst_base = dest.offset();
+            let dst_ptr = dest.data_mut().as_mut_ptr();
+            // SAFETY: the route is the one `replay_given` builds from exactly the
+            // views' dims and strides, so the views' bounds proofs cover every
+            // replayed offset and `total_len` checked the nonzero product (see
+            // there). `with_checked_route` kept tiles only for a destination
+            // proven injective, and an untiled walk is one sequential pass; the
+            // exclusive and shared borrows cannot overlap.
+            unsafe { replay_route_serial(dst_ptr, dst_base, src_ptr, src_base, route, &mut f) };
+        },
+    )
 }
 
 /// `dest[i] = f(src[i])` into a potentially uninitialized destination.
