@@ -1004,8 +1004,8 @@ fn record_rank9_spill(pool: &Pool) {
     eprintln!("rank-9 permuted map_into spill: serial={serial}, parallel={parallel}");
 }
 
-/// The four `replay_*_raw` entries on a serial token at ranks above the inline
-/// one: the issue's nine-axis reversed-to-column-major copy, the same nine
+/// The `replay_*_raw` entries on a serial token, and `replay_map_raw_serial`,
+/// at ranks above the inline one: the issue's nine-axis reversed-to-column-major copy, the same nine
 /// moving axes among 191 extent-1 axes, a wide layout the model tiles, and a
 /// 21-axis layout whose stride-order table exceeds the 40-entry inline scratch.
 fn check_replay_any_rank_is_allocation_free() {
@@ -1048,8 +1048,8 @@ fn check_replay_any_rank_is_allocation_free() {
     assert_serial_replays_allocate_nothing("rank 21", &dims, &dst, &src);
 }
 
-/// Warm, then count one serial call of each of the four replay entries on the
-/// calling thread.
+/// Warm, then count one serial call of each replay entry, and of the serial
+/// `replay_map_raw_serial` with an `FnMut`, on the calling thread.
 fn assert_serial_replays_allocate_nothing(
     name: &str,
     dims: &[usize],
@@ -1058,7 +1058,8 @@ fn assert_serial_replays_allocate_nothing(
 ) {
     use strided_basic::{
         replay_copy_raw, replay_copy_raw_uninit, replay_map_raw, replay_map_raw_fused,
-        replay_map_raw_uninit, replay_map_raw_uninit_fused, RawStridedMut, RawStridedRef,
+        replay_map_raw_serial, replay_map_raw_uninit, replay_map_raw_uninit_fused, RawStridedMut,
+        RawStridedRef,
     };
     let src: Vec<f64> = (0..required_len(dims, src_strides))
         .map(|v| v as f64)
@@ -1108,6 +1109,18 @@ fn assert_serial_replays_allocate_nothing(
         counted(name, "replay_map_raw_uninit_fused", || {
             replay_map_raw_uninit_fused(&mut dest, &source, |s| 2.0 * s, Exec::serial()).unwrap()
         });
+    }
+    {
+        let mut dest = RawStridedMut::new(&mut out, dims, dst_strides, 0).unwrap();
+        let mut calls = 0usize;
+        counted(name, "replay_map_raw_serial", || {
+            replay_map_raw_serial(&mut dest, &source, |d: &mut f64, s| {
+                calls += 1;
+                *d += s
+            })
+            .unwrap()
+        });
+        assert_eq!(calls, 2 * total(dims), "{name}: one call per element");
     }
 }
 

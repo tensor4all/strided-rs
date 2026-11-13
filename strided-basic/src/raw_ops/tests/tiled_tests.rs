@@ -1137,7 +1137,7 @@ fn tile_odometer_stays_within_the_reachable_offsets() {
                 base,
                 &layout,
                 &tile_blocks,
-                &|_: &mut (), _: ()| visited.set(visited.get() + 1),
+                &mut |_: &mut (), _: ()| visited.set(visited.get() + 1),
             );
         }
         assert_eq!(visited.get(), dims.iter().product::<usize>(), "{dims:?}");
@@ -1226,7 +1226,7 @@ fn tile_ranges_partition_the_tiled_box_walk() {
                 layout.src_offset,
                 &tiles.layout,
                 &tiles.blocks,
-                &|d: &mut f64, s: f64| {
+                &mut |d: &mut f64, s: f64| {
                     let slot = (d as *mut f64 as usize - whole_base) / size_of::<f64>();
                     reference.borrow_mut().push(slot);
                     *d = s;
@@ -1266,7 +1266,7 @@ fn tile_ranges_partition_the_tiled_box_walk() {
                         &tiles.blocks,
                         first,
                         len,
-                        &|d: &mut f64, s: f64| {
+                        &mut |d: &mut f64, s: f64| {
                             let slot = (d as *mut f64 as usize - base) / size_of::<f64>();
                             visits.borrow_mut().push(slot);
                             *d = s;

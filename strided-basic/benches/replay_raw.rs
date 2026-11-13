@@ -22,6 +22,14 @@
 //! - `R5`: the small-block rows of #471, block sides 2 and 8 at ranks 2-4,
 //!   serial: the same `|d, s| *d += s` callback through `replay_map_raw` (the
 //!   axes as given) and `replay_map_raw_fused` (fused inside the call).
+//! - `R6`: the serial API pair over every serial `R1`, `R2` and `R4` shape: one
+//!   `+=` function item, [`accumulate`], through `replay_map_raw_serial` (A) and
+//!   `replay_map_raw` on `Exec::serial()` (B), sampled interleaved in this one
+//!   binary (`support::measure_case`, report only). Its ratio is A/B. A shared
+//!   function item, not two closures, gives both entries one callback type, so
+//!   they share the instantiation of the serial walk and its leaves: two
+//!   closure types would compare two separately optimized copies of the same
+//!   leaf, whose code layout differs.
 //!
 //! ```text
 //! cargo bench --profile release -p strided-basic --features parallel --bench replay_raw
@@ -31,7 +39,8 @@ use std::hint::black_box;
 
 use strided_basic::execution::{parallel_width, KernelClass};
 use strided_basic::{
-    replay_copy_raw, replay_map_raw, replay_map_raw_fused, Exec, Pool, RawStridedMut, RawStridedRef,
+    replay_copy_raw, replay_map_raw, replay_map_raw_fused, replay_map_raw_serial, Exec, Pool,
+    RawStridedMut, RawStridedRef,
 };
 
 #[allow(dead_code)] // the shared support module also serves the overhead benches
@@ -330,4 +339,52 @@ fn main() {
         };
         println!("{}\t{:.2}\t{}", row.id, median(samples), allocations);
     }
+    serial_pairs();
+}
+
+/// The `R6` callback, shared by both entries.
+fn accumulate(d: &mut f64, s: f64) {
+    *d += s;
+}
+
+/// `R6`: `replay_map_raw_serial` against `replay_map_raw` on a serial token,
+/// with the same callback, over the serial `R1`, `R2` and `R4` shapes.
+fn serial_pairs() {
+    let mut cases = Vec::new();
+    for row in rows() {
+        if row.pooled || row.op != Op::Copy || row.id.starts_with("R3") {
+            continue;
+        }
+        let total: usize = row.dims.iter().product();
+        let src_len = span(&row.dims, &row.src, row.src_offset);
+        let dst_len = span(&row.dims, &row.dst, 0);
+        let src: Vec<f64> = (0..src_len).map(|v| v as f64).collect();
+        let (mut out_a, mut out_b) = (vec![0.0f64; dst_len], vec![0.0f64; dst_len]);
+        let source = RawStridedRef::new(&src, &row.dims, &row.src, row.src_offset).unwrap();
+        let mut dest_a = RawStridedMut::new(&mut out_a, &row.dims, &row.dst, 0).unwrap();
+        let mut dest_b = RawStridedMut::new(&mut out_b, &row.dims, &row.dst, 0).unwrap();
+        let iterations = (ELEMENTS_PER_SAMPLE / total).max(1);
+        // The ids name the row they pair; a bench binary may leak them.
+        let id: &'static str = Box::leak(format!("R6 {}", &row.id[3..]).into_boxed_str());
+        cases.push(support::measure_case(
+            id,
+            "replay_map_raw_serial / replay_map_raw(Exec::serial())",
+            iterations,
+            support::Gate::Report,
+            || {
+                replay_map_raw_serial(black_box(&mut dest_a), black_box(&source), accumulate)
+                    .unwrap();
+            },
+            || {
+                replay_map_raw(
+                    black_box(&mut dest_b),
+                    black_box(&source),
+                    accumulate,
+                    Exec::serial(),
+                )
+                .unwrap();
+            },
+        ));
+    }
+    support::print_table(&cases, "### R6: serial entry vs serial token");
 }

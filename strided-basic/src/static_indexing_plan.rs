@@ -1654,7 +1654,7 @@ impl ConcatenatePlan {
                         &tiles.blocks,
                         first,
                         end - first,
-                        &apply,
+                        &mut &apply,
                     );
                 } else {
                     crate::raw_ops::apply_fused_range(
@@ -1665,7 +1665,7 @@ impl ConcatenatePlan {
                         layout,
                         local_start,
                         local_end - local_start,
-                        &apply,
+                        &mut &apply,
                     );
                 }
             }
@@ -1769,7 +1769,7 @@ impl ConcatenatePlan {
                         layout,
                         local_start,
                         local_end - local_start,
-                        &apply,
+                        &mut &apply,
                     );
                 }
                 position += 1;

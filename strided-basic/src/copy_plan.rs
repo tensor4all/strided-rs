@@ -24,8 +24,8 @@ use num_traits::{One, Zero};
 use crate::cost::KernelClass;
 use crate::raw_ops::{
     apply_fused_range, apply_spilled_range, apply_spilled_tiled_box, apply_tiled_box,
-    fuse_pair_traversal, fused_total, pair_tiles, FusedAxis, FusedPairLayout, PairTiles,
-    PairTraversal, Route, SpilledTiles,
+    fuse_pair_traversal, fused_total, pair_tiles, replay_route_serial, FusedAxis, FusedPairLayout,
+    PairTiles, PairTraversal, Route, SpilledTiles,
 };
 use crate::{ElementOpApply, Exec, RawStridedMut, RawStridedRef, Result, StridedError};
 use strided_perm::HostClass;
@@ -870,7 +870,9 @@ impl UpdatePlan {
 /// (column-major over the traversal axes) is split into contiguous worker
 /// ranges, which divides the outer axes and, when there are fewer outer
 /// positions than workers, also chunks long inner runs (for example a rank-1
-/// contiguous copy).
+/// contiguous copy). A serial token walks the route through
+/// [`replay_route_serial`], the walk [`crate::replay_map_raw_serial`]
+/// shares.
 ///
 /// # Safety
 ///
@@ -897,7 +899,7 @@ pub(crate) unsafe fn replay_fused<D, S, Apply>(
     dest: &mut RawStridedMut<'_, D>,
     src: &RawStridedRef<'_, S>,
     route: Route<'_>,
-    apply: Apply,
+    mut apply: Apply,
     ns_per_element: f64,
     exec: Exec<'_>,
 ) where
@@ -909,6 +911,13 @@ pub(crate) unsafe fn replay_fused<D, S, Apply>(
     let src_base = src.offset();
     let dst_base = dest.offset();
     let dst_ptr = dest.data_mut().as_mut_ptr();
+    if exec.is_serial() {
+        // SAFETY: forwarded caller contract, on a serial token.
+        unsafe {
+            replay_route_serial(dst_ptr, dst_base, src_ptr, src_base, route, &mut apply);
+        }
+        return;
+    }
     // SAFETY: forwarded caller contract: every logical index of `route` maps
     // to in-bounds slots of both views, injectivity holds whenever the replay
     // is tiled or the token can fan out, and the borrows do not overlap. Inline
@@ -982,7 +991,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
     src_base: isize,
     layout: &FusedPairLayout,
     tiles: Option<&PairTiles>,
-    apply: Apply,
+    mut apply: Apply,
     ns_per_element: f64,
     exec: Exec<'_>,
 ) where
@@ -1029,7 +1038,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
                     layout,
                     range.start,
                     range.len(),
-                    &apply,
+                    &mut &apply,
                 );
             }
         });
@@ -1039,7 +1048,7 @@ pub(crate) unsafe fn replay_fused_raw<D, S, Apply>(
     // sequential walk needs no injectivity.
     unsafe {
         apply_fused_range(
-            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &apply,
+            dst_ptr, dst_base, src_ptr, src_base, layout, 0, total, &mut apply,
         );
     }
 }
@@ -1087,7 +1096,7 @@ unsafe fn replay_tiled<D, S, Apply>(
                 src_base,
                 layout,
                 &tiles.blocks,
-                apply,
+                &mut &*apply,
             )
         };
         return;
@@ -1125,7 +1134,7 @@ unsafe fn replay_tiled<D, S, Apply>(
                     offsets[1],
                     &leaf,
                     &tiles.blocks,
-                    apply,
+                    &mut &*apply,
                 )
             };
             Ok(())
@@ -1158,7 +1167,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
     src_ptr: *const S,
     src_base: isize,
     tiles: &SpilledTiles,
-    apply: Apply,
+    mut apply: Apply,
     exec: Exec<'_>,
     ns_per_element: f64,
 ) where
@@ -1177,7 +1186,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
                 src_base,
                 tiles,
                 tiles.dims(),
-                &apply,
+                &mut apply,
             )
         };
         return;
@@ -1213,7 +1222,7 @@ unsafe fn replay_spilled_tiled<D, S, Apply>(
                     offsets[1],
                     tiles,
                     box_dims,
-                    &apply,
+                    &mut &apply,
                 )
             };
             Ok(())
@@ -1241,7 +1250,7 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
     src_ptr: *const S,
     src_base: isize,
     axes: &[FusedAxis],
-    apply: Apply,
+    mut apply: Apply,
     ns_per_element: f64,
     exec: Exec<'_>,
 ) where
@@ -1269,7 +1278,7 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
                     axes,
                     range.start,
                     range.len(),
-                    &apply,
+                    &mut &apply,
                 );
             }
         });
@@ -1278,7 +1287,9 @@ pub(crate) unsafe fn replay_spilled_raw<D, S, Apply>(
     // SAFETY: forwarded caller contract over the full range `0..total`; one
     // sequential walk needs no injectivity.
     unsafe {
-        apply_spilled_range(dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &apply);
+        apply_spilled_range(
+            dst_ptr, dst_base, src_ptr, src_base, axes, 0, total, &mut apply,
+        );
     }
 }
 
