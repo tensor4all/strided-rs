@@ -1,8 +1,8 @@
 //! Copy/permutation operations on strided views.
 
 use crate::fuse::FusionPlanError;
-use crate::hptt::{build_permute_plan, execute_permute_blocked};
-use strided_view::{Result, StridedError, StridedView, StridedViewMut};
+use crate::hptt::{build_permute_plan, execute_permute_blocked, ConjStore, PlainStore, Store};
+use strided_view::{ElementOpApply, Result, StridedError, StridedView, StridedViewMut};
 use threadteam::Exec;
 
 /// Map a permutation planning failure onto the shared view error vocabulary.
@@ -117,7 +117,7 @@ fn prepare<'a, T, U>(
 /// `raw.src` valid for reads of initialized `T` at every source offset; the
 /// two ranges must not overlap. Every store goes through raw pointers, so the
 /// destination may be uninitialized storage.
-unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
+unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U, S: Store<T>>(
     raw: RawCopy<'_, T, U>,
     exec: Exec<'_>,
 ) -> Result<()> {
@@ -135,8 +135,10 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
         None => exec.limit(std::num::NonZeroUsize::MIN),
     };
     // Fast path: both contiguous. A contiguous layout is injective by
-    // construction, so it skips the validation below.
-    if is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
+    // construction, so it skips the validation below. A conjugating store must
+    // not `memcpy`: it falls through to the planner, which reduces a contiguous
+    // layout to `ConstStride1` with unit strides and the store's element loop.
+    if S::PLAIN && is_both_contiguous(raw.dims, raw.dst_strides, raw.src_strides) {
         let len = total_len(raw.dims);
         if exec.is_serial() {
             // SAFETY: `prepare` (copy.rs:85) proved `dims`, the strides and the two
@@ -200,7 +202,7 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
     // nothing else touches the destination; injectivity was checked just
     // above. `dst_ptr` is `raw.dst` cast from `U` to `T`, the same layout for
     // `U = T` and `U = MaybeUninit<T>`, and the engine only stores through it.
-    execute_permute_blocked(raw.src, dst_ptr, &plan, exec);
+    execute_permute_blocked::<T, S>(raw.src, dst_ptr, &plan, exec);
     Ok(())
 }
 
@@ -215,8 +217,9 @@ unsafe fn copy_raw<T: Copy + Send + Sync + 'static, U>(
 /// A contiguous copy uses one `memcpy` per range of the narrowed token, or a
 /// single `memcpy` on the calling thread when that token is serial.
 ///
-/// This is a simple copy without ElementOp support. For copies with
-/// element operations (conj, transpose, etc.), use `strided_kernel::copy_into`.
+/// This is a plain copy: no element operation is applied. For a conjugation on
+/// the same engine use [`copy_conj_into`]; for other element operations
+/// (transpose, scale, ...) use the `strided_kernel` element-map entries.
 ///
 /// # Errors
 ///
@@ -252,7 +255,7 @@ pub fn copy_into<T: Copy + Send + Sync + 'static>(
         // strided-view/src/view.rs:187, or the dense `StridedArray` layout).
         // `&mut StridedViewMut` excludes any other
         // borrow of the destination, so the two raw extents cannot overlap.
-        Some(raw) => unsafe { copy_raw(raw, exec) },
+        Some(raw) => unsafe { copy_raw::<T, T, PlainStore>(raw, exec) },
         None => Ok(()),
     }
 }
@@ -283,7 +286,85 @@ pub fn copy_into_uninit<T: Copy + Send + Sync + 'static>(
         // both views proved their bounds at construction. `MaybeUninit<T>` has `T`'s
         // size and alignment, and the engine only stores into the destination, so
         // the uninitialized extent is never read.
-        Some(raw) => unsafe { copy_raw(raw, exec) },
+        Some(raw) => unsafe { copy_raw::<T, core::mem::MaybeUninit<T>, PlainStore>(raw, exec) },
+        None => Ok(()),
+    }
+}
+
+/// Copy elements with complex conjugation: `dest[i] = conj(src[i])`.
+///
+/// The same HPTT-inspired blocked permutation as [`copy_into`], with the
+/// conjugate applied as each element is stored — HPTT's `conjA`, so conjugation
+/// costs no extra pass over memory. The store is monomorphized, so the engine
+/// keeps its native `f64`/`f32` micro-kernels for a plain copy and its generic
+/// element path for this one. The plan, the width selection
+/// ([`copy_ns_per_element`](crate::copy_ns_per_element) times the elements) and
+/// the error set are those of [`copy_into`].
+///
+/// `T: ElementOpApply` ([`strided_view::ElementOpApply`]) is the bound
+/// `strided_basic::copy_conj_into` uses, so the two entries line up. The
+/// operation is meaningful for the complex element types (`Complex<f32>`,
+/// `Complex<f64>`). An element type whose `conj` is the identity (every real
+/// type) is accepted and copied unchanged through the generic element store,
+/// which is slower than the native kernels: use [`copy_into`] for those.
+///
+/// # Errors
+///
+/// Same rejection set as [`copy_into`]: [`StridedError::RankMismatch`],
+/// [`StridedError::ShapeMismatch`], [`StridedError::OffsetOverflow`] and
+/// [`StridedError::NonInjectiveOutputLayout`]. Nothing is written unless
+/// validation succeeds.
+///
+/// # Examples
+///
+/// ```
+/// use num_complex::Complex64;
+/// use threadteam::Exec;
+/// use strided_perm::copy_conj_into;
+/// use strided_view::StridedArray;
+///
+/// let src = StridedArray::<Complex64>::from_fn_col_major(&[2, 3], |idx| {
+///     Complex64::new(idx[0] as f64, idx[1] as f64)
+/// });
+/// let mut dst = StridedArray::<Complex64>::col_major(&[3, 2]);
+/// let src_t = src.view().permute(&[1, 0]).unwrap();
+/// copy_conj_into(&mut dst.view_mut(), &src_t, Exec::serial()).unwrap();
+/// assert_eq!(dst.get(&[2, 1]), Complex64::new(1.0, -2.0));
+/// ```
+pub fn copy_conj_into<T: ElementOpApply + Send + Sync + 'static>(
+    dest: &mut StridedViewMut<T>,
+    src: &StridedView<T>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: as `copy_into` (copy.rs:246): `prepare` (copy.rs:85) matched the
+        // shapes and both views proved their bounds at construction. `ConjStore`
+        // only reads an initialized source element and writes a `T` derived from
+        // it.
+        Some(raw) => unsafe { copy_raw::<T, T, ConjStore>(raw, exec) },
+        None => Ok(()),
+    }
+}
+
+/// Conjugating copy into an uninitialized destination: `dest[i] = conj(src[i])`.
+///
+/// The allocation-free sibling of [`copy_conj_into`], selected on `T` for the
+/// same reason as [`copy_into_uninit`]: the engine's dispatch keys off the
+/// source element type, and the destination is only ever written.
+///
+/// # Errors
+///
+/// Same rejection set as [`copy_conj_into`]. Nothing is written unless
+/// validation succeeds.
+pub fn copy_conj_into_uninit<T: ElementOpApply + Send + Sync + 'static>(
+    dest: &mut StridedViewMut<core::mem::MaybeUninit<T>>,
+    src: &StridedView<T>,
+    exec: Exec<'_>,
+) -> Result<()> {
+    match prepare(dest, src)? {
+        // SAFETY: as `copy_conj_into` (copy.rs:334): `MaybeUninit<T>` has `T`'s
+        // size and alignment and the engine only stores into it.
+        Some(raw) => unsafe { copy_raw::<T, core::mem::MaybeUninit<T>, ConjStore>(raw, exec) },
         None => Ok(()),
     }
 }

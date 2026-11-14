@@ -1,4 +1,5 @@
 use super::*;
+use crate::hptt::PlainStore;
 
 #[test]
 fn test_macro_kernel_f64_full_block() {
@@ -83,7 +84,7 @@ fn test_const_stride1_copy_contiguous() {
     let mut dst = vec![0.0f64; 5];
     // SAFETY: (macro_kernel.rs:172) separate five-element buffers; offsets 0..5 on both sides.
     unsafe {
-        const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 5, 1, 1);
+        const_stride1_copy::<_, PlainStore>(src.as_ptr(), dst.as_mut_ptr(), 5, 1, 1);
     }
     assert_eq!(dst, src);
 }
@@ -95,7 +96,7 @@ fn test_const_stride1_copy_strided() {
     // SAFETY: (macro_kernel.rs:172) separate buffers; source offsets 0, 2, 4 < 5, destination
     // offsets 0, 1, 2 < 5.
     unsafe {
-        const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 3, 2, 1);
+        const_stride1_copy::<_, PlainStore>(src.as_ptr(), dst.as_mut_ptr(), 3, 2, 1);
     }
     assert_eq!(dst[0], 1.0);
     assert_eq!(dst[1], 2.0);
@@ -113,7 +114,7 @@ fn const_stride1_leaf_advances_wrap_at_the_allocation_end() {
     // SAFETY: (macro_kernel.rs:172) separate buffers; source offsets 0, 3 < 4, destination
     // offsets 0, 1 < 2. The terminal advance wraps and is not read.
     unsafe {
-        const_stride1_copy(src.as_ptr(), dst.as_mut_ptr(), 2, 3, 1);
+        const_stride1_copy::<_, PlainStore>(src.as_ptr(), dst.as_mut_ptr(), 2, 3, 1);
     }
     assert_eq!(dst, vec![1.0, 4.0]);
 }

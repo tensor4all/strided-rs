@@ -7,6 +7,7 @@ use crate::hptt::macro_kernel::{
     const_stride1_copy, macro_kernel_f32, macro_kernel_f64, macro_kernel_fallback,
 };
 use crate::hptt::plan::{ExecMode, GroupedTilePlan, LoopLevel, PermutePlan};
+use crate::hptt::Store;
 
 use core::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +50,11 @@ fn native_float_kind<T: 'static>() -> Option<usize> {
 ///
 /// # Safety
 /// Same requirements as [`execute_permute_blocked`].
-unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &PermutePlan) {
+unsafe fn execute_serial<T: Copy + 'static, S: Store<T>>(
+    src: *const T,
+    dst: *mut T,
+    plan: &PermutePlan,
+) {
     // SAFETY: (covers every unsafe call in this match) the caller upholds the contract of
     // `execute_permute_blocked` (execute.rs:117) for `plan`, including a layout with no
     // zero extent (execute.rs:120). The plan then reaches exactly the element offsets of
@@ -64,16 +69,24 @@ unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &P
     // view.
     match plan.mode {
         ExecMode::Scalar => {
-            *dst = *src;
+            // SAFETY: the caller proved both pointers live for one element.
+            unsafe { S::store(dst, src) };
         }
         ExecMode::ConstStride1 { inner_dim } => {
             let count = plan.fused_dims[inner_dim];
             let src_stride = plan.src_strides[inner_dim];
             let dst_stride = plan.dst_strides[inner_dim];
             if plan.levels.is_empty() {
-                const_stride1_copy(src, dst, count, src_stride, dst_stride);
+                const_stride1_copy::<T, S>(src, dst, count, src_stride, dst_stride);
             } else {
-                const_stride1_recursive(src, dst, &plan.levels, count, src_stride, dst_stride);
+                const_stride1_recursive::<T, S>(
+                    src,
+                    dst,
+                    &plan.levels,
+                    count,
+                    src_stride,
+                    dst_stride,
+                );
             }
         }
         ExecMode::GroupedTranspose => {
@@ -82,9 +95,9 @@ unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &P
                 .as_ref()
                 .expect("grouped transpose mode requires grouped tile plan");
             if plan.levels.is_empty() {
-                grouped_tile_copy(src, dst, grouped);
+                grouped_tile_copy::<T, S>(src, dst, grouped);
             } else {
-                grouped_recursive(src, dst, &plan.levels, grouped);
+                grouped_recursive::<T, S>(src, dst, &plan.levels, grouped);
             }
         }
         ExecMode::Transpose { dim_a, dim_b } => {
@@ -96,9 +109,18 @@ unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &P
 
             if plan.levels.is_empty() {
                 // No outer loops — just the 2D blocked transpose
-                dispatch_blocked_2d(src, dst, size_a, size_b, lda, ldb, block);
+                dispatch_blocked_2d::<T, S>(src, dst, size_a, size_b, lda, ldb, block);
             } else {
-                transpose_recursive(src, dst, &plan.levels, size_a, size_b, lda, ldb, block);
+                transpose_recursive::<T, S>(
+                    src,
+                    dst,
+                    &plan.levels,
+                    size_a,
+                    size_b,
+                    lda,
+                    ldb,
+                    block,
+                );
             }
         }
     }
@@ -128,7 +150,7 @@ unsafe fn execute_serial<T: Copy + 'static>(src: *const T, dst: *mut T, plan: &P
 ///   logical index space, and that alone does not keep two workers off one byte
 ///   when `dst_strides` is not injective. The crate's public entry proves this
 ///   with `is_injective_layout` at `copy.rs:189` before calling here.
-pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
+pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     plan: &PermutePlan,
@@ -138,7 +160,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
     // fallbacks further down) passes this function's own contract to a
     // function whose `# Safety` is the same (execute.rs:51).
     if exec.is_serial() {
-        execute_serial(src, dst, plan);
+        execute_serial::<T, S>(src, dst, plan);
         return;
     }
 
@@ -151,7 +173,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                 // region `dispatch_blocked_2d_par` (execute.rs:676) requires. `exec`
                 // fans out only over an injective destination, per this
                 // function's `# Safety`.
-                dispatch_blocked_2d_par(
+                dispatch_blocked_2d_par::<T, S>(
                     src,
                     dst,
                     plan.fused_dims[dim_a],
@@ -191,10 +213,12 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // because the caller supplied an injective destination, proved
                     // with `is_injective_layout` at `copy.rs:189`, not because the
                     // split itself separates them.
-                    unsafe { const_stride1_copy(s, d, range.len(), src_stride, dst_stride) };
+                    unsafe {
+                        const_stride1_copy::<T, S>(s, d, range.len(), src_stride, dst_stride)
+                    };
                 });
             }
-            _ => execute_serial(src, dst, plan),
+            _ => execute_serial::<T, S>(src, dst, plan),
         }
         return;
     }
@@ -202,7 +226,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
     let root = &plan.levels[0];
     let outer_dim = root.end;
     if outer_dim <= 1 {
-        execute_serial(src, dst, plan);
+        execute_serial::<T, S>(src, dst, plan);
         return;
     }
 
@@ -240,9 +264,11 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // `execute_permute_blocked`'s `# Safety` (execute.rs:117).
                     unsafe {
                         if inner.is_empty() {
-                            dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
+                            dispatch_blocked_2d::<T, S>(s, d, size_a, size_b, lda, ldb, block);
                         } else {
-                            transpose_recursive(s, d, inner, size_a, size_b, lda, ldb, block);
+                            transpose_recursive::<T, S>(
+                                s, d, inner, size_a, size_b, lda, ldb, block,
+                            );
                         }
                     }
                 }
@@ -262,9 +288,11 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // (`execute_permute_blocked`'s `# Safety`, execute.rs:117).
                     unsafe {
                         if inner.is_empty() {
-                            const_stride1_copy(s, d, count, src_stride, dst_stride);
+                            const_stride1_copy::<T, S>(s, d, count, src_stride, dst_stride);
                         } else {
-                            const_stride1_recursive(s, d, inner, count, src_stride, dst_stride);
+                            const_stride1_recursive::<T, S>(
+                                s, d, inner, count, src_stride, dst_stride,
+                            );
                         }
                     }
                 }
@@ -288,15 +316,15 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
                     // execute.rs:117).
                     unsafe {
                         if inner.is_empty() {
-                            grouped_tile_copy(s, d, grouped);
+                            grouped_tile_copy::<T, S>(s, d, grouped);
                         } else {
-                            grouped_recursive(s, d, inner, grouped);
+                            grouped_recursive::<T, S>(s, d, inner, grouped);
                         }
                     }
                 }
             });
         }
-        ExecMode::Scalar => execute_serial(src, dst, plan),
+        ExecMode::Scalar => execute_serial::<T, S>(src, dst, plan),
     }
 }
 
@@ -311,7 +339,7 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static>(
 /// tile) must be valid for reads from `src` and writes to `dst`; the two
 /// extents must not overlap, and no other thread may write those destination
 /// elements during the call.
-unsafe fn grouped_recursive<T: Copy>(
+unsafe fn grouped_recursive<T: Copy, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     levels: &[LoopLevel],
@@ -327,9 +355,9 @@ unsafe fn grouped_recursive<T: Copy>(
         // the remaining levels and the tile reach a subset of the elements this
         // call's `# Safety` (execute.rs:309) covers.
         if rest.is_empty() {
-            grouped_tile_copy(s, d, grouped);
+            grouped_tile_copy::<T, S>(s, d, grouped);
         } else {
-            grouped_recursive(s, d, rest, grouped);
+            grouped_recursive::<T, S>(s, d, rest, grouped);
         }
         // INVARIANT: the advance after the last iteration may leave the
         // allocation — the cursor is never dereferenced there, so it must use
@@ -348,7 +376,11 @@ unsafe fn grouped_recursive<T: Copy>(
 /// from `dst`; the two extents must not overlap, and no other thread may
 /// write those destination elements during the call.
 #[inline]
-unsafe fn grouped_tile_copy<T: Copy>(src: *const T, dst: *mut T, grouped: &GroupedTilePlan) {
+unsafe fn grouped_tile_copy<T: Copy, S: Store<T>>(
+    src: *const T,
+    dst: *mut T,
+    grouped: &GroupedTilePlan,
+) {
     let group_a = &grouped.group_a;
     let group_b = &grouped.group_b;
     // Borrow the offset tables once; indexing the `ArrayVec` per access would
@@ -367,7 +399,8 @@ unsafe fn grouped_tile_copy<T: Copy>(src: *const T, dst: *mut T, grouped: &Group
     // same tile.
     let copy_b = |src_a: *const T, dst_a: *mut T| {
         for b in 0..group_b.len {
-            *dst_a.offset(b_dst[b]) = *src_a.offset(b_src[b]);
+            // SAFETY: the offset tables were built from the validated layout.
+            unsafe { S::store(dst_a.offset(b_dst[b]), src_a.offset(b_src[b])) };
         }
     };
     if group_a.outer.is_empty() && group_b.outer.is_empty() {
@@ -434,7 +467,7 @@ unsafe fn walk_outer<T>(
 /// and no other thread may write those destination elements during the call.
 /// `block` must be non-zero, as [`dispatch_blocked_2d`] requires.
 #[allow(clippy::too_many_arguments)] // INVARIANT: raw cursors plus the tile geometry the leaf needs.
-unsafe fn transpose_recursive<T: Copy + 'static>(
+unsafe fn transpose_recursive<T: Copy + 'static, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     levels: &[LoopLevel],
@@ -455,9 +488,9 @@ unsafe fn transpose_recursive<T: Copy + 'static>(
         // call's `# Safety` (execute.rs:431) covers. `block` is the plan's
         // `block_for_elem_size` (plan.rs:266), 16 or 32, so it is non-zero.
         if rest.is_empty() {
-            dispatch_blocked_2d(s, d, size_a, size_b, lda, ldb, block);
+            dispatch_blocked_2d::<T, S>(s, d, size_a, size_b, lda, ldb, block);
         } else {
-            transpose_recursive(s, d, rest, size_a, size_b, lda, ldb, block);
+            transpose_recursive::<T, S>(s, d, rest, size_a, size_b, lda, ldb, block);
         }
         // INVARIANT: the last-iteration advance may leave the allocation; the
         // cursor is not dereferenced after it, so `wrapping_offset` is required
@@ -470,8 +503,9 @@ unsafe fn transpose_recursive<T: Copy + 'static>(
 /// 2D blocked transpose over dim_A × dim_B.
 ///
 /// The native-float micro-kernel is used only for the exact 4/8-byte types the
-/// guard in [`native_float_kind`] allows; every other `T` goes through the
-/// generic element-wise path.
+/// guard in [`native_float_kind`] allows and only for a plain store; every other
+/// `T`, and every conjugating store, goes through the generic element-wise path
+/// that writes through `S`.
 ///
 /// # Safety
 ///
@@ -480,7 +514,7 @@ unsafe fn transpose_recursive<T: Copy + 'static>(
 /// not overlap, and no other thread may write those destination elements
 /// during the call. `block` must be non-zero.
 #[inline]
-unsafe fn dispatch_blocked_2d<T: Copy + 'static>(
+unsafe fn dispatch_blocked_2d<T: Copy + 'static, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     size_a: usize,
@@ -495,7 +529,8 @@ unsafe fn dispatch_blocked_2d<T: Copy + 'static>(
     // so the reinterpreted accesses are aligned and every bit pattern is a
     // valid value.
     match native_float_kind::<T>() {
-        Some(8) => blocked_transpose_2d_f64(
+        // The native kernels copy bits, so a conjugating store never takes them.
+        Some(8) if S::PLAIN => blocked_transpose_2d_f64(
             src as *const f64,
             dst as *mut f64,
             size_a,
@@ -504,7 +539,7 @@ unsafe fn dispatch_blocked_2d<T: Copy + 'static>(
             ldb,
             block,
         ),
-        Some(4) => blocked_transpose_2d_f32(
+        Some(4) if S::PLAIN => blocked_transpose_2d_f32(
             src as *const f32,
             dst as *mut f32,
             size_a,
@@ -513,7 +548,7 @@ unsafe fn dispatch_blocked_2d<T: Copy + 'static>(
             ldb,
             block,
         ),
-        _ => blocked_transpose_2d_fallback(src, dst, size_a, size_b, lda, ldb, block),
+        _ => blocked_transpose_2d_fallback::<T, S>(src, dst, size_a, size_b, lda, ldb, block),
     }
 }
 
@@ -595,7 +630,7 @@ unsafe fn blocked_transpose_2d_f32(
 /// # Safety
 ///
 /// As [`dispatch_blocked_2d`], with `T` elements.
-unsafe fn blocked_transpose_2d_fallback<T: Copy>(
+unsafe fn blocked_transpose_2d_fallback<T: Copy, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     size_a: usize,
@@ -614,7 +649,7 @@ unsafe fn blocked_transpose_2d_fallback<T: Copy>(
             // tile to the grid, so both `offset`s land on an element of this
             // call's region (execute.rs:478) and the `ba` x `bb` sub-tile is
             // inside it, as `macro_kernel_fallback` (macro_kernel.rs:233) requires.
-            macro_kernel_fallback(
+            macro_kernel_fallback::<T, S>(
                 src.offset(ia as isize + ib as isize * lda),
                 lda,
                 ba,
@@ -682,7 +717,7 @@ fn for_each_tile_par(
 // any decision, so the lint is suppressed here rather than the call shape
 // changed.
 #[allow(clippy::too_many_arguments)]
-unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
+unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     size_a: usize,
@@ -705,33 +740,38 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
         // reach distinct destination offsets, and so that no two workers write one
         // offset, rests on the caller's injective destination (established at
         // `is_injective_layout`, `copy.rs:189`), not on the tile partition.
-        Some(8) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
-            macro_kernel_f64(
-                (src_addr as *const f64).offset(ia as isize + ib as isize * lda),
-                lda,
-                ba,
-                (dst_addr as *mut f64).offset(ib as isize + ia as isize * ldb),
-                ldb,
-                bb,
-            );
-        }),
+        // The native kernels copy bits, so a conjugating store never takes them.
+        Some(8) if S::PLAIN => {
+            for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
+                macro_kernel_f64(
+                    (src_addr as *const f64).offset(ia as isize + ib as isize * lda),
+                    lda,
+                    ba,
+                    (dst_addr as *mut f64).offset(ib as isize + ia as isize * ldb),
+                    ldb,
+                    bb,
+                );
+            })
+        }
         // SAFETY: as the `f64` arm above. `native_float_kind` (execute.rs:29)
         // admits `f32` here only for types whose alignment is at least 4, so the
         // cast is aligned at every tile offset.
-        Some(4) => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
-            macro_kernel_f32(
-                (src_addr as *const f32).offset(ia as isize + ib as isize * lda),
-                lda,
-                ba,
-                (dst_addr as *mut f32).offset(ib as isize + ia as isize * ldb),
-                ldb,
-                bb,
-            );
-        }),
+        Some(4) if S::PLAIN => {
+            for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
+                macro_kernel_f32(
+                    (src_addr as *const f32).offset(ia as isize + ib as isize * lda),
+                    lda,
+                    ba,
+                    (dst_addr as *mut f32).offset(ib as isize + ia as isize * ldb),
+                    ldb,
+                    bb,
+                );
+            })
+        }
         // SAFETY: as the `f64` arm above, on `T` itself, which needs no alignment
         // or representation assumption.
         _ => for_each_tile_par(exec, size_a, size_b, block, |ia, ba, ib, bb| unsafe {
-            macro_kernel_fallback(
+            macro_kernel_fallback::<T, S>(
                 (src_addr as *const T).offset(ia as isize + ib as isize * lda),
                 lda,
                 ba,
@@ -761,7 +801,7 @@ unsafe fn dispatch_blocked_2d_par<T: Copy + Send + Sync + 'static>(
 /// `count` must be at least 1, so each leaf origin is itself an element and
 /// hence non-null and aligned, which `const_stride1_copy` needs even for an
 /// empty run.
-unsafe fn const_stride1_recursive<T: Copy>(
+unsafe fn const_stride1_recursive<T: Copy, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     levels: &[LoopLevel],
@@ -780,9 +820,9 @@ unsafe fn const_stride1_recursive<T: Copy>(
         // this call's `# Safety` (execute.rs:757) covers; with `count >= 1` the
         // leaf origins are elements, so they are non-null and aligned.
         if rest.is_empty() {
-            const_stride1_copy(s, d, count, src_stride, dst_stride);
+            const_stride1_copy::<T, S>(s, d, count, src_stride, dst_stride);
         } else {
-            const_stride1_recursive(s, d, rest, count, src_stride, dst_stride);
+            const_stride1_recursive::<T, S>(s, d, rest, count, src_stride, dst_stride);
         }
         // INVARIANT: the last-iteration advance may leave the allocation; the
         // cursor is not dereferenced after it, so `wrapping_offset` is required

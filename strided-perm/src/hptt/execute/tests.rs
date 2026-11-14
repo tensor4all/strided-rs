@@ -1,5 +1,6 @@
 use super::*;
 use crate::hptt::plan::build_permute_plan;
+use crate::hptt::PlainStore;
 
 #[test]
 fn test_execute_identity_copy() {
@@ -10,7 +11,12 @@ fn test_execute_identity_copy() {
     // `build_permute_plan` over the layout below; the largest offset is 1 + 2 * 2 = 5 on both
     // sides, below both lengths (6). The token is serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
     assert_eq!(dst, src);
 }
@@ -28,7 +34,12 @@ fn terminal_cursor_advance_may_leave_the_allocation() {
     // `build_permute_plan` over the layout below; the largest source offset is 1 + 3 = 4 < 5 and
     // the largest destination offset 1 + 2 = 3 < 4. The token is serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
     // dst(i, j) = src(i + 3j) in col-major dst: [1, 2, 4, 5].
     assert_eq!(dst, vec![1.0, 2.0, 4.0, 5.0]);
@@ -46,7 +57,12 @@ fn test_execute_transpose_2d() {
     // `build_permute_plan` over the layout below; the largest offset is 3 + 2 = 5 (source) and 1
     // + 4 = 5 (destination), below both lengths (6). The token is serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
     // Expected: dst = [1, 4, 2, 5, 3, 6]
     assert_eq!(dst, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
@@ -66,7 +82,12 @@ fn test_execute_3d_permute() {
     // `build_permute_plan` over the layout below; the largest offset is 18 + 1 + 4 = 23 (source)
     // and 3 + 4 + 16 = 23 (destination), below both lengths (24). The token is serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
 
     for k in 0..4 {
@@ -97,7 +118,12 @@ fn test_execute_4d_permute() {
     // (source) and 4 + 10 + 15 + 90 = 119 (destination), below both lengths (120). The token is
     // serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
 
     for i0 in 0..5 {
@@ -131,7 +157,12 @@ fn test_execute_5d_permute() {
     // (source) and 2 + 3 + 6 + 12 + 24 = 47 (destination), below both lengths (48). The token is
     // serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
 
     for i0 in 0..3 {
@@ -161,7 +192,12 @@ fn test_execute_rank0_scalar() {
     // `build_permute_plan` over the layout below; a rank-0 plan reaches only offset 0, which both
     // one-element buffers hold. The token is serial.
     unsafe {
-        execute_permute_blocked(src.as_ptr(), dst.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
     assert_eq!(dst[0], 42.0);
 }
@@ -216,7 +252,7 @@ fn test_execute_par_transpose_2d() {
     // + 4 = 5 (destination), below both lengths (6). The destination layout is column-major,
     // hence injective, so the parallel token is allowed.
     unsafe {
-        execute_permute_blocked(
+        execute_permute_blocked::<_, PlainStore>(
             src.as_ptr(),
             dst.as_mut_ptr(),
             &plan,
@@ -241,7 +277,7 @@ fn test_execute_par_large() {
     // n^3 - 1 on both sides, below both lengths (n^3). The destination layout is column-major,
     // hence injective, so the parallel token is allowed.
     unsafe {
-        execute_permute_blocked(
+        execute_permute_blocked::<_, PlainStore>(
             src.as_ptr(),
             dst.as_mut_ptr(),
             &plan,
@@ -295,13 +331,18 @@ fn test_execute_budget_one_token_matches_serial_on_the_calling_thread() {
     // destinations. The destination layout is column-major, hence injective, so the parallel
     // token is allowed.
     unsafe {
-        execute_permute_blocked(
+        execute_permute_blocked::<_, PlainStore>(
             src.as_ptr(),
             dst_one.as_mut_ptr(),
             &plan,
             Exec::new(&pool, 1).unwrap(),
         );
-        execute_permute_blocked(src.as_ptr(), dst_serial.as_mut_ptr(), &plan, Exec::serial());
+        execute_permute_blocked::<_, PlainStore>(
+            src.as_ptr(),
+            dst_serial.as_mut_ptr(),
+            &plan,
+            Exec::serial(),
+        );
     }
 
     assert_eq!(dst_one, dst_serial);

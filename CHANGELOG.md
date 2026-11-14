@@ -10,6 +10,25 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 an API addition: a new parameter on `copy_into_col_major` is a minor. The workspace version still reads `0.14.1` and
 moves when this section is released, together with or after that patch.
 
+### `strided-perm`: `copy_conj_into` and `copy_conj_into_uninit`
+
+The permutation engine gained a conjugating copy for the complex element types (#467):
+`copy_conj_into(dest, src, exec)` and `copy_conj_into_uninit(dest, src, exec)` apply `conj`
+as each element is stored, the way HPTT's `conjA` template parameter does, so one plan
+serves both stores and the conjugate costs no extra pass over memory. Validation, the
+error set, the width decision and the plan are those of `copy_into` / `copy_into_uninit`;
+a conjugating copy of a contiguous layout therefore takes the element store instead of
+`memcpy`. `T: ElementOpApply` (re-exported by `strided-view`) is the bound, so a real
+element type is accepted and copied unchanged through the generic element store: use
+`copy_into` for those.
+
+`strided_basic::copy_conj_into` keeps its element-map route: the measured profile puts the
+two routes in no fixed order (`255x255`, `64^3` and `[100,2,100]` favour the engine,
+`256^2`, `1024^2`, `2048^2`, `128^3` and `32^4` favour the element map), so choosing the
+default is left to #467. The table, the
+harness and the comparison are in
+[`docs/worklogs/2026-11-14-issue-467-conj-permute.md`](docs/worklogs/2026-11-14-issue-467-conj-permute.md).
+
 ### `strided-basic`: `copy_into_col_major` takes its `Exec` token
 
 `strided_basic::copy_into_col_major(dst, src)` hard-coded `Exec::serial()` and handed that to the permutation engine, so a

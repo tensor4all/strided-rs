@@ -215,3 +215,92 @@ fn test_build_loop_levels_chain() {
     assert_eq!(levels[0].ldb, 5);
     assert!(build_loop_levels(&dims, &src_s, &dst_s, &[]).is_empty());
 }
+
+/// Every `ExecMode` a conjugating copy can take is reached by a named shape of
+/// `tests/conj_copy.rs`, so neither store arm can rot untested
+/// (tensor4all/strided-rs#467). Element size 16 is `Complex<f64>`.
+#[test]
+fn conj_copy_shapes_cover_every_exec_mode() {
+    // A permuted view of a dense column-major tensor: (source dims, permutation),
+    // with the view's own dims and strides derived from it.
+    fn permuted(
+        dims: &[usize],
+        perm: &[usize],
+        elem_size: usize,
+    ) -> (PermutePlan, Vec<usize>, Vec<isize>, Vec<isize>) {
+        let mut base = Vec::with_capacity(dims.len());
+        let mut stride = 1isize;
+        for &d in dims {
+            base.push(stride);
+            stride *= d as isize;
+        }
+        let view_dims: Vec<usize> = perm.iter().map(|&p| dims[p]).collect();
+        let src_strides: Vec<isize> = perm.iter().map(|&p| base[p]).collect();
+        let mut dst_strides = Vec::with_capacity(view_dims.len());
+        let mut stride = 1isize;
+        for &d in &view_dims {
+            dst_strides.push(stride);
+            stride *= d as isize;
+        }
+        let plan = build_permute_plan(&view_dims, &src_strides, &dst_strides, elem_size).unwrap();
+        (plan, view_dims, src_strides, dst_strides)
+    }
+
+    for (dims, perm) in [
+        (vec![4usize, 3], vec![1usize, 0]),
+        (vec![3, 4, 5], vec![2, 0, 1]),
+        (vec![2, 3, 2, 5], vec![3, 1, 0, 2]),
+        (vec![5, 1, 7], vec![2, 0, 1]),
+    ] {
+        let (plan, ..) = permuted(&dims, &perm, 16);
+        assert!(
+            matches!(plan.mode, ExecMode::Transpose { .. }),
+            "{dims:?} perm {perm:?}: {:?}",
+            plan.mode
+        );
+    }
+
+    // Contiguous same-layout copy: the conj store must keep this off `memcpy`
+    // but still on the strided-copy mode.
+    let (plan, ..) = permuted(&[8, 8], &[0, 1], 16);
+    assert!(
+        matches!(plan.mode, ExecMode::ConstStride1 { .. }),
+        "{:?}",
+        plan.mode
+    );
+    // Rank 0.
+    let plan = build_permute_plan(&[], &[], &[], 16).unwrap();
+    assert!(matches!(plan.mode, ExecMode::Scalar), "{:?}", plan.mode);
+    // Gapped inner source stride, and a reversed one.
+    for (src_strides, dst_strides) in [
+        (vec![2isize, 12], vec![1isize, 6]),
+        (vec![-1isize, 3], vec![1isize, 3]),
+    ] {
+        let plan = build_permute_plan(&[6, 4], &src_strides, &dst_strides, 16).unwrap();
+        assert!(
+            matches!(plan.mode, ExecMode::ConstStride1 { .. }),
+            "{src_strides:?}: {:?}",
+            plan.mode
+        );
+    }
+    // The parallel 2D transpose of `tests/conj_copy.rs`.
+    let plan = build_permute_plan(&[1024, 1031], &[256, 1], &[1, 1024], 16).unwrap();
+    assert!(
+        matches!(plan.mode, ExecMode::Transpose { .. }),
+        "{:?}",
+        plan.mode
+    );
+    // The rank-8 scattered layout `tests/conj_copy.rs` copies conjugated.
+    let plan = build_permute_plan(
+        &[2, 2, 2, 2, 2, 2, 2, 2],
+        &[16, 1024, 8388608, 4096, 1048576, 1, 8, 131072],
+        &[1, 2, 4, 8, 16, 32, 64, 128],
+        16,
+    )
+    .unwrap();
+    assert!(
+        matches!(plan.mode, ExecMode::GroupedTranspose),
+        "{:?}",
+        plan.mode
+    );
+}

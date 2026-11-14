@@ -27,7 +27,9 @@ mod host;
 mod hptt;
 
 // Re-export primary API
-pub use copy::{copy_into, copy_into_col_major, copy_into_uninit};
+pub use copy::{
+    copy_conj_into, copy_conj_into_uninit, copy_into, copy_into_col_major, copy_into_uninit,
+};
 pub use fuse::{plan_bilateral_fusion, BilateralFusionPlan, FusionPlanError};
 pub use host::{copy_ns_per_element, copy_ns_per_element_of, HostClass};
 
