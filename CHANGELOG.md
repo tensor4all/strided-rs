@@ -29,6 +29,30 @@ default is left to #467. The table, the
 harness and the comparison are in
 [`docs/worklogs/2026-11-14-issue-467-conj-permute.md`](docs/worklogs/2026-11-14-issue-467-conj-permute.md).
 
+### `strided-perm`: the permutation fallback stops thrashing an L1 set (#466)
+
+`copy_into` was 4.5x slower per element when the destination's strided-axis byte
+stride was a multiple of the 4 KiB L1 way: every row of a macro tile then lands
+in one set, and the fallback kernel walked the tile with `j` outermost, which
+asks that set to hold `block_a` lines at once and refetches each for write
+allocation.
+
+The scalar fallback now decides per tile from the two strides it is handed. A
+destination-only alias walks `i` outermost, writing each row's contiguous run in
+one visit; when the source row aliases as well — a square transpose — the loop
+order stays and the `a` extent is cut to six rows instead, the budget
+`strided-basic`'s `block::fit_l1_sets` spends (#287), since moving the thrash to
+the reads is not a win when the source collides too. Otherwise nothing changes.
+Same plan, same blocking, same `f64`/`f32` micro-kernels, no API change.
+
+Every row of #466's 2D and 3D tables now runs at or below its `2^d ± 1`
+neighbours (`[1024, 32]` 5.62 -> 1.09 ns/element, `[96,96,96]` 5.54 -> 3.14,
+`[32,32,32]` 5.67 -> 1.12); `f64` never enters this kernel and does not move.
+The square transposes gain 1.8-2.0x serially, and four pooled cells stay 1.04-1.36x
+above `main` because `main` is already free of the penalty at four threads. Host,
+protocol, both tables and the four rejected variants are in
+[`docs/worklogs/2026-11-14-issue-466-l1-set-order.md`](docs/worklogs/2026-11-14-issue-466-l1-set-order.md).
+
 ### `strided-basic`: `copy_into_col_major` takes its `Exec` token
 
 `strided_basic::copy_into_col_major(dst, src)` hard-coded `Exec::serial()` and handed that to the permutation engine, so a
