@@ -6,6 +6,7 @@
 //! loops for edge remainders.
 
 use crate::hptt::micro_kernel::{MicroKernel, ScalarKernel};
+use crate::hptt::Store;
 
 /// Process a tile of `block_a × block_b` elements using f64 micro-kernels.
 ///
@@ -163,7 +164,9 @@ pub unsafe fn macro_kernel_f32(
     }
 }
 
-/// ConstStride1 inner copy: simple memcpy or strided element-wise copy.
+/// ConstStride1 inner copy: memcpy for a plain unit-stride pair, otherwise an
+/// element-wise copy through `S`. A conjugating store must never take the
+/// `memcpy` branch.
 ///
 /// Used when dim_A == dim_B (both arrays have stride 1 along the same dim).
 ///
@@ -175,7 +178,7 @@ pub unsafe fn macro_kernel_f32(
 /// `count == 0`, because the contiguous branch hands them to
 /// `copy_nonoverlapping`.
 #[inline(always)]
-pub unsafe fn const_stride1_copy<T: Copy>(
+pub unsafe fn const_stride1_copy<T: Copy, S: Store<T>>(
     src: *const T,
     dst: *mut T,
     count: usize,
@@ -189,16 +192,15 @@ pub unsafe fn const_stride1_copy<T: Copy>(
     // loops dereference only the cursors for `k < count`; the advance after
     // the last copy may leave the allocation, so it uses `wrapping_offset`
     // and is never dereferenced.
-    if src_stride == 1 && dst_stride == 1 {
+    if S::PLAIN && src_stride == 1 && dst_stride == 1 {
         std::ptr::copy_nonoverlapping(src, dst, count);
     } else if dst_stride == 1 {
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
-            *d = *s;
-            // The cursor advance after the last copy may leave the
-            // allocation and is never dereferenced, so it must not use
-            // `offset`/`add` (which require the result to stay in bounds).
+            // SAFETY: as above; the cursor advance after the last copy may
+            // leave the allocation, so it uses `wrapping_offset`.
+            unsafe { S::store(d, s) };
             s = s.wrapping_offset(src_stride);
             d = d.wrapping_offset(1);
         }
@@ -206,7 +208,8 @@ pub unsafe fn const_stride1_copy<T: Copy>(
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
-            *d = *s;
+            // SAFETY: as above.
+            unsafe { S::store(d, s) };
             s = s.wrapping_offset(1);
             d = d.wrapping_offset(dst_stride);
         }
@@ -214,7 +217,8 @@ pub unsafe fn const_stride1_copy<T: Copy>(
         let mut s = src;
         let mut d = dst;
         for _ in 0..count {
-            *d = *s;
+            // SAFETY: as above.
+            unsafe { S::store(d, s) };
             s = s.wrapping_offset(src_stride);
             d = d.wrapping_offset(dst_stride);
         }
@@ -224,13 +228,14 @@ pub unsafe fn const_stride1_copy<T: Copy>(
 /// Fallback element-by-element 2D copy for unsupported element sizes.
 ///
 /// Performs the same transpose as macro_kernel but without micro-kernel
-/// optimization. Used for types other than f64/f32.
+/// optimization. Used for types other than f64/f32, and for every element type
+/// whose store conjugates.
 ///
 /// # Safety
 ///
 /// As [`macro_kernel_f64`], with `T` elements.
 #[inline]
-pub unsafe fn macro_kernel_fallback<T: Copy>(
+pub unsafe fn macro_kernel_fallback<T: Copy, S: Store<T>>(
     src: *const T,
     lda: isize,
     block_a: usize,
@@ -242,7 +247,7 @@ pub unsafe fn macro_kernel_fallback<T: Copy>(
     // elements under this function's `# Safety` (macro_kernel.rs:231).
     for j in 0..block_b as isize {
         for i in 0..block_a as isize {
-            *dst.offset(j + i * ldb) = *src.offset(i + j * lda);
+            unsafe { S::store(dst.offset(j + i * ldb), src.offset(i + j * lda)) };
         }
     }
 }

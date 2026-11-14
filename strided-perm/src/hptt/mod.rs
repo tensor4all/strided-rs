@@ -16,6 +16,8 @@ mod execute;
 mod macro_kernel;
 pub(crate) mod micro_kernel;
 mod plan;
+mod store;
 
 pub(crate) use execute::execute_permute_blocked;
 pub(crate) use plan::build_permute_plan;
+pub(crate) use store::{ConjStore, PlainStore, Store};

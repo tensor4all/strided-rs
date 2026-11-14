@@ -20,7 +20,15 @@ threadteam.workspace = true
 parallel = ["threadteam/parallel"]
 
 [dev-dependencies]
+num-complex.workspace = true
 threadteam = { workspace = true, features = ["ledger"] }
+
+[[bench]]
+name = "conj_copy"
+harness = false
+# The threaded column needs a real pool; a serial token would measure the same
+# run twice.
+required-features = ["parallel"]
 
 [lib]
 bench = false
