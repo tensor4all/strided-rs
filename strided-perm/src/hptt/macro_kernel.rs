@@ -225,11 +225,61 @@ pub unsafe fn const_stride1_copy<T: Copy, S: Store<T>>(
     }
 }
 
+/// A destination row that is a multiple of this many bytes from its
+/// neighbour puts every row's cache line of one tile in the same L1 set.
+///
+/// The way size of the 32 KiB 8-way L1 data cache the blocking targets, the
+/// same `BLOCK_MEMORY_SIZE / L1_WAYS` that `strided-basic`'s
+/// `block::fit_l1_sets` uses ([#287]); 48 KiB 12-way L1d caches (Ice Lake and
+/// later, Zen 5) share the 4 KiB way. `strided-perm` sits below
+/// `strided-basic` and cannot take the constant from there, so the number is
+/// restated here.
+///
+/// [#287]: https://github.com/tensor4all/strided-rs/issues/287
+const L1_WAYS: usize = 8;
+const L1_WAY_BYTES: usize = crate::BLOCK_MEMORY_SIZE / L1_WAYS;
+
+/// Whether `stride` steps between rows that land in one L1 set
+/// (tensor4all/strided-rs#466).
+///
+/// A stride of 0 repeats one address rather than walking a set, and a
+/// non-multiple of [`L1_WAY_BYTES`] spreads consecutive rows over other sets;
+/// neither is treated as aliasing here.
+fn aliases_l1_sets(stride: isize, elem_size: usize) -> bool {
+    let bytes = (stride.unsigned_abs() as u128) * elem_size as u128;
+    bytes != 0 && bytes.is_multiple_of(L1_WAY_BYTES as u128)
+}
+
+/// Lines a tile may keep live in one L1 set: `L1_WAYS` less a quarter of it,
+/// the budget `strided-basic`'s `block::fit_l1_sets` spends (#287). Restated
+/// here for the same reason as [`L1_WAY_BYTES`].
+const L1_LIVE_LINES_PER_SET: usize = L1_WAYS - L1_WAYS / 4;
+
 /// Fallback element-by-element 2D copy for unsupported element sizes.
 ///
 /// Performs the same transpose as macro_kernel but without micro-kernel
 /// optimization. Used for types other than f64/f32, and for every element type
 /// whose store conjugates.
+///
+/// **Store order.** `j` is the destination's stride-1 axis and `i` the axis it
+/// steps by `ldb`. When `ldb` aliases the L1 sets ([`aliases_l1_sets`]) every
+/// row's line of the tile lands in one set, and walking `i` fastest stores one
+/// element per row per visit: the tile needs `block_a` lines of that set live
+/// at once, over the eight ways it has, and each is fetched again for write
+/// allocation (#466 measured 4.5x against the neighbouring stride). Walking `i`
+/// outermost writes a row's whole contiguous run in one visit and retires its
+/// lines as it goes, so only one line of the set is live. The source side pays
+/// with an unstreamed read, which measured cheaper than the re-fetched
+/// partial-line stores.
+///
+/// That trade only holds while the source still streams, i.e. while `lda` does
+/// not alias. When both strides do — a square transpose, where destination and
+/// source rows collide the same way — moving the thrash to the reads is not a
+/// win, so the loop order stays and the `i` extent is cut to
+/// [`L1_LIVE_LINES_PER_SET`] instead: the source run keeps streaming and one
+/// set holds at most that many destination lines, which it has ways for. A
+/// non-aliasing `ldb` keeps the source-ordered loop: it streams the source, and
+/// the destination's rows then spread over enough sets.
 ///
 /// # Safety
 ///
@@ -245,9 +295,34 @@ pub unsafe fn macro_kernel_fallback<T: Copy, S: Store<T>>(
 ) {
     // SAFETY: `i < block_a` and `j < block_b`, so both accesses are tile
     // elements under this function's `# Safety` (macro_kernel.rs:231).
-    for j in 0..block_b as isize {
+    let elem_size = std::mem::size_of::<T>();
+    if aliases_l1_sets(lda, elem_size) && aliases_l1_sets(ldb, elem_size) {
+        let mut i0 = 0usize;
+        while i0 < block_a {
+            let i1 = (i0 + L1_LIVE_LINES_PER_SET).min(block_a);
+            for j in 0..block_b as isize {
+                for i in i0..i1 {
+                    unsafe {
+                        S::store(
+                            dst.offset(j + i as isize * ldb),
+                            src.offset(i as isize + j * lda),
+                        )
+                    };
+                }
+            }
+            i0 = i1;
+        }
+    } else if aliases_l1_sets(ldb, elem_size) {
         for i in 0..block_a as isize {
-            unsafe { S::store(dst.offset(j + i * ldb), src.offset(i + j * lda)) };
+            for j in 0..block_b as isize {
+                unsafe { S::store(dst.offset(j + i * ldb), src.offset(i + j * lda)) };
+            }
+        }
+    } else {
+        for j in 0..block_b as isize {
+            for i in 0..block_a as isize {
+                unsafe { S::store(dst.offset(j + i * ldb), src.offset(i + j * lda)) };
+            }
         }
     }
 }
