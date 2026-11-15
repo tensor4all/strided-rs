@@ -22,12 +22,21 @@ a conjugating copy of a contiguous layout therefore takes the element store inst
 element type is accepted and copied unchanged through the generic element store: use
 `copy_into` for those.
 
-`strided_basic::copy_conj_into` keeps its element-map route: the measured profile puts the
-two routes in no fixed order (`255x255`, `64^3` and `[100,2,100]` favour the engine,
-`256^2`, `1024^2`, `2048^2`, `128^3` and `32^4` favour the element map), so choosing the
-default is left to #467. The table, the
-harness and the comparison are in
-[`docs/worklogs/2026-11-14-issue-467-conj-permute.md`](docs/worklogs/2026-11-14-issue-467-conj-permute.md).
+`strided_basic::copy_conj_into` now routes a non-contiguous complex copy to that entry when the engine is measured to
+beat the element map, and keeps the element map otherwise (#467): a `Complex32`/`Complex64` copy whose source and
+destination layouts differ and whose packed footprint (`total_len(dims) * size_of::<T>()`, not the address span of the
+strided view) is below 24 MiB. The bound is measured, not guessed: `[64,64,64]`, the 32^3-96^3 3D rows, `[100,2,100]`,
+112^3 and the 128^2-1024^2 2D rows are up to 2.7x faster on the engine, while contiguous copies stay on the map
+1.2-2.7x faster there, and the 26-32 MiB 3D rows (120^3-128^3) keep the map where it is 1.09-1.15x faster.
+The predicate is [`conj_perm_engine_route`](strided-basic/src/ops_view.rs), one measured constant plus two
+layout/type properties. The two measured tables — one on the base the routing was developed against, one on the base
+that carries the engine's L1-aliasing fix (#480) — label their rows, and `CONJ_ROUTE_GATE=1` passes on the current
+base. `copy_conj_into` gains a `'static` bound (as `copy_into_uninit` and `copy_transpose_scale_into` already have):
+this is breaking for a caller whose element type is not `'static`, and it is what lets the type be tested and handed
+to the engine. No other signature changes, and real element types keep the map.
+The two tables, the protocol and the residual classes are in
+[`docs/worklogs/2026-11-15-issue-467-conj-route.md`](docs/worklogs/2026-11-15-issue-467-conj-route.md), and
+`strided-basic/benches/conj_route_467.rs` reproduces them (`CONJ_ROUTE_GATE=1` gates on them).
 
 ### `strided-perm`: the permutation fallback stops thrashing an L1 set (#466)
 

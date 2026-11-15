@@ -13,6 +13,7 @@ use crate::kernel::for_each_inner_block_preordered;
 use crate::Result;
 use core::num::NonZeroUsize;
 use std::ops::Range;
+use strided_view::ElementOpApply;
 use threadteam::Exec;
 
 /// Stack-allocated Vec for dims/offsets in recursive threading.
@@ -193,6 +194,21 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_dispatched_chunks() -> usize {
     DISPATCHED_CHUNKS.with(|n| n.replace(0))
+}
+
+// The route `strided_basic::copy_conj_into` took is a decision, not an output
+// bit: two routes can write the same values. Counted per calling thread for
+// the in-crate route tests.
+#[cfg(test)]
+thread_local! {
+    static CONJ_PERMUTED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The conjugating permuting copies [`copy_conj_permuted`] has run on this
+/// thread since the last call, and resets the count.
+#[cfg(test)]
+pub(crate) fn take_conj_permuted() -> usize {
+    CONJ_PERMUTED.with(|n| n.replace(0))
 }
 
 /// One leaf box of a split tiled replay: the destination and source offsets
@@ -378,6 +394,25 @@ pub(crate) fn copy_permuted_uninit<T: Copy + Send + Sync + 'static>(
     exec: Exec<'_>,
 ) -> crate::Result<()> {
     strided_perm::copy_into_uninit(dest, src, exec)
+}
+
+/// [`copy_permuted`] with the conjugation applied on store.
+///
+/// The permutation engine conjugates each element as it stores it (HPTT's
+/// `conjA`), so the copy takes no extra pass over memory. `strided_basic::
+/// copy_conj_into` reaches this route only where the engine is measured to beat
+/// the element map (the route predicate in `ops_view`). A complex element type
+/// never selects the engine's native `f32`/`f64` micro-kernels, so the store is
+/// its generic element store: the conjugation is the only difference from
+/// [`copy_permuted`].
+pub(crate) fn copy_conj_permuted<T: ElementOpApply + Send + Sync + 'static>(
+    dest: &mut crate::StridedViewMut<T>,
+    src: &crate::StridedView<T>,
+    exec: Exec<'_>,
+) -> crate::Result<()> {
+    #[cfg(test)]
+    CONJ_PERMUTED.with(|n| n.set(n.get() + 1));
+    strided_perm::copy_conj_into(dest, src, exec)
 }
 
 /// Dimension to halve: `_lastargmax((dims .- 1) .* costs)`, or `None` when

@@ -82,3 +82,7 @@ required-features = ["bench-hooks", "parallel"]
 name = "replay_raw"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "conj_route_467"
+harness = false
