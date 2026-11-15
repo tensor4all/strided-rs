@@ -353,3 +353,67 @@ fn only_a_multiple_of_the_l1_way_aliases() {
         );
     }
 }
+
+/// `ldb` steps a multiple of the L1 way, so `macro_kernel_f64` takes its
+/// scalar-fallback branch (#466). The tile must still be a plain transpose.
+#[test]
+fn test_macro_kernel_f64_aliasing_ldb() {
+    let (block_a, block_b, lda, ldb) = (8usize, 9usize, 11isize, 512isize);
+    // 512 * 8 bytes is one 4 KiB L1 way; 11 * 8 is not.
+    assert!(aliases_l1_sets(ldb, std::mem::size_of::<f64>()));
+    assert!(!aliases_l1_sets(lda, std::mem::size_of::<f64>()));
+
+    let src_len = ((block_a - 1) as isize + (block_b - 1) as isize * lda + 1) as usize;
+    let dst_len = ((block_b - 1) as isize + (block_a - 1) as isize * ldb + 1) as usize;
+    let src: Vec<f64> = (0..src_len).map(|i| i as f64).collect();
+    let mut dst = vec![0.0f64; dst_len];
+
+    // SAFETY: separate buffers sized to the largest offset plus one.
+    unsafe {
+        macro_kernel_f64(src.as_ptr(), lda, block_a, dst.as_mut_ptr(), ldb, block_b);
+    }
+
+    for j in 0..block_b as isize {
+        for i in 0..block_a as isize {
+            assert_eq!(
+                dst[(j + i * ldb) as usize],
+                src[(i + j * lda) as usize],
+                "mismatch at i={i}, j={j}"
+            );
+        }
+    }
+}
+
+/// Both strides alias: the fallback takes its `i`-extent-shrinking branch.
+#[test]
+fn test_macro_kernel_f64_aliasing_both() {
+    let (block_a, block_b, stride) = (9usize, 7usize, 512isize);
+    assert!(aliases_l1_sets(stride, std::mem::size_of::<f64>()));
+
+    let src_len = ((block_a - 1) as isize + (block_b - 1) as isize * stride + 1) as usize;
+    let dst_len = ((block_b - 1) as isize + (block_a - 1) as isize * stride + 1) as usize;
+    let src: Vec<f64> = (0..src_len).map(|i| i as f64).collect();
+    let mut dst = vec![0.0f64; dst_len];
+
+    // SAFETY: separate buffers sized to the largest offset plus one.
+    unsafe {
+        macro_kernel_f64(
+            src.as_ptr(),
+            stride,
+            block_a,
+            dst.as_mut_ptr(),
+            stride,
+            block_b,
+        );
+    }
+
+    for j in 0..block_b as isize {
+        for i in 0..block_a as isize {
+            assert_eq!(
+                dst[(j + i * stride) as usize],
+                src[(i + j * stride) as usize],
+                "mismatch at i={i}, j={j}"
+            );
+        }
+    }
+}
