@@ -1143,6 +1143,17 @@ where
 
 /// Overwriting copy with complex conjugation: `dest[i] = conj(src[i])`.
 ///
+/// A non-contiguous copy of a complex element type is handed to the permutation
+/// engine's conjugating store ([`strided_perm::copy_conj_into`], HPTT's
+/// `conjA`) when that engine is measured to beat the element map for the shape;
+/// every other copy keeps the element map. The engine conjugates each element
+/// as it stores it, so the operation costs no extra pass over memory. Which
+/// route is taken is measured, not guessed: `benches/conj_route_467.rs`
+/// reproduces the table and `docs/worklogs/2026-11-15-issue-467-conj-route.md`
+/// records it, with the bound and the rows that fix it. A real element type's
+/// `conj` is the identity, so it always keeps the element map; use
+/// [`copy_into`] for those.
+///
 /// # Errors
 ///
 /// The rejection set of [`copy_into`]: [`StridedError::RankMismatch`] or
@@ -1152,13 +1163,76 @@ where
 /// [`StridedError::NonInjectiveOutputLayout`] when the destination layout
 /// cannot be proven representable and injective. Nothing is written unless
 /// validation succeeds.
-pub fn copy_conj_into<T: Copy + ElementOpApply + Send + Sync>(
+///
+/// The engine route reports one of those differently: it plans the permutation
+/// before it checks the destination for injectivity, so an unrepresentable
+/// destination keeps reporting [`StridedError::OffsetOverflow`] (issue #263)
+/// where [`copy_into`] reports [`StridedError::NonInjectiveOutputLayout`] under
+/// its "cannot be proven representable and injective" case. Nothing is written
+/// on either route.
+pub fn copy_conj_into<T: ElementOpApply + Send + Sync + 'static>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
     exec: Exec<'_>,
 ) -> Result<()> {
+    if conj_perm_engine_route::<T>(dest.dims(), dest.strides(), src.strides()) {
+        return crate::threading::copy_conj_permuted(dest, src, exec);
+    }
     let src_conj = src.conj();
     copy_into(dest, &src_conj, exec)
+}
+
+/// Bytes of one operand below which [`copy_conj_into`] leaves a non-contiguous
+/// complex copy on the permutation engine ([#467]).
+///
+/// Measured crossing, `Complex<f64>`, `Exec::serial()`, ns per element, quoted as
+/// element map over engine (`> 1` means the engine wins), across four passes:
+/// 112^3 = 21.4 MiB is 1.51-1.67, 116^3 = 23.8 MiB is 0.93-0.96, 120^3 = 26.4
+/// MiB is 0.90-0.93, 124^3 = 29.1 MiB is 0.86-0.89 and 128^3 = 32.0 MiB is
+/// 0.84-0.97. The engine's tiles stop beating the map's blocked traversal once
+/// one operand no longer fits in a 32 MiB last-level-cache domain, so the bound
+/// sits inside that bracket at 24 MiB — above the last outright engine win
+/// (112^3) and below every row the map wins or ties (120^3 and up), with 116^3
+/// the one tie it leaves on the engine side. `Complex<f32>` is bounded the same
+/// way in bytes but was not measured.
+///
+/// [#467]: https://github.com/tensor4all/strided-rs/issues/467
+const CONJ_PERM_ENGINE_MAX_BYTES: usize = 24 * 1024 * 1024;
+
+/// Whether [`copy_conj_into`] hands this copy to the permutation engine: a
+/// complex element type, a non-contiguous layout, and a packed footprint below
+/// [`CONJ_PERM_ENGINE_MAX_BYTES`]. The footprint bound is measured and the other
+/// two clauses are what the engine's conjugating store cannot do better than the
+/// map; the table behind all three is `benches/conj_route_467.rs`, recorded in
+/// `docs/worklogs/2026-11-15-issue-467-conj-route.md`.
+fn conj_perm_engine_route<T: 'static>(
+    dims: &[usize],
+    dst_strides: &[isize],
+    src_strides: &[isize],
+) -> bool {
+    if !element_conj_is_applied::<T>() {
+        return false;
+    }
+    // A contiguous copy takes the map's SIMD store loop (or its splitting
+    // contiguous path); the engine's conjugating store has no memcpy.
+    if same_contiguous_layout(dims, &[dst_strides, src_strides]).is_some() {
+        return false;
+    }
+    // An overflowing element count is the map path's `OffsetOverflow` to report.
+    total_len(dims).is_ok_and(|len| {
+        len.checked_mul(std::mem::size_of::<T>())
+            .is_some_and(|bytes| bytes < CONJ_PERM_ENGINE_MAX_BYTES)
+    })
+}
+
+/// Whether `T`'s `conj` is not the identity, i.e. whether the engine's
+/// conjugating store does anything.
+#[inline]
+fn element_conj_is_applied<T: 'static>() -> bool {
+    use std::any::TypeId;
+
+    let id = TypeId::of::<T>();
+    id == TypeId::of::<num_complex::Complex32>() || id == TypeId::of::<num_complex::Complex64>()
 }
 
 #[inline]
@@ -1911,3 +1985,7 @@ where
 #[cfg(test)]
 #[path = "ops_view/tests/tiled_tests.rs"]
 mod tiled_tests;
+
+#[cfg(test)]
+#[path = "ops_view/tests/conj_route_tests.rs"]
+mod conj_route_tests;
