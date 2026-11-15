@@ -6,9 +6,11 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 
 ## 0.15.0 (unreleased) — minor
 
-`0.14.0` is published and the tree already carries the parked `0.14.1` patch (#452), so nothing unpublished can absorb
-an API addition: a new parameter on `copy_into_col_major` is a minor. The workspace version still reads `0.14.1` and
-moves when this section is released, together with or after that patch.
+`0.14.0` (and `strided-view` 0.8.0) is the published line. The tree already carries this section's unreleased `0.15.0`
+manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel`, and `strided-view`
+0.8.1; the inherited workspace version is `0.7.2`. The parked `0.14.1` patch (#452) was superseded by the #468 bump and
+never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
+manifests move when it is released.
 
 ### `strided-perm`: `copy_conj_into` and `copy_conj_into_uninit`
 
@@ -120,13 +122,14 @@ destination is initialized when `f` writes every slot. The parallel entries keep
 the lengths differ; `index_order` is its allocating form and is unchanged. The injectivity check's difference search no
 longer allocates when it enumerates more than eight axes.
 
-## 0.14.1 (unreleased) — patch
+## 0.14.1 (superseded by 0.15.0) — patch
 
 `0.14.0` shipped on crates.io on 2026-11-08. Since then `main` has changed shipped files in all six
 crates, so the weekly `Packaged crate tests` job's `published content identity` step (#409) reports
 `6 mismatch(es)` at `34ec19c` (run 42670871078); the same check run locally
 (`python3 scripts/published_identity.py .`) reports the same six. The version number no longer
-identified one body of content, so this patch moves it.
+identified one body of content, so this patch was to move it. It was superseded before publication: #468 moved the
+five retained crates straight to `0.15.0`, and the changes listed below are part of that release.
 
 What changed under 0.14.0:
 
@@ -146,8 +149,8 @@ What changed under 0.14.0:
 needs. This list is drawn from the commit subjects between the 0.14.0 publish and `34ec19c`; it is
 not a re-audit of each diff.
 
-This patch is the version move for the published-content identity check (#409, #452) and nothing else. It does not carry
-the `copy_into_col_major` signature change: that is a new minor and lands in `0.15.0` above.
+This patch was never published: #468 folded its version move for the published-content identity check (#409, #452) into
+`0.15.0` above. It does not carry the `copy_into_col_major` signature change: that is a new minor in `0.15.0`.
 
 ## 0.14.0 (2026-11-08) — breaking
 
