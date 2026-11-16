@@ -211,10 +211,13 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
             ));
         }
         "cg-vjp" => {
-            let mut grad_x = vec![T::from_f64(0.0); cg.num_nodes * (128 + 3 * cg.feature_dim())];
+            // `grad_x` holds the narrow `[N, 1, 128]` and the wide `[N, 3, 128]`
+            // view back to back: N*(128 + 3*f) elements, which is 4*N*f because
+            // this descriptor has f = 128.
+            let grad_x_elems = cg.num_nodes * (128 + 3 * cg.feature_dim());
+            let mut grad_x = vec![T::from_f64(0.0); grad_x_elems];
             let mut grad_w = vec![T::from_f64(0.0); cg.num_edges * 10 * cg.feature_dim()];
             let mut grad_y = vec![T::from_f64(0.0); cg.num_edges * 16];
-            let half = cg.num_nodes * cg.feature_dim();
             let mut run_llmlip = || {
                 let (_path, out) = cg.llmlip_vjp(&buffers).expect("llmlip vjp");
                 black_box(out);
@@ -259,7 +262,7 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
                 measured[1].median_ns / measured[0].median_ns,
                 measured[2].median_ns / measured[0].median_ns,
                 measured[3].median_ns / measured[0].median_ns,
-                (2 * half * std::mem::size_of::<T>()) as f64 / (1024.0 * 1024.0),
+                (grad_x_elems * std::mem::size_of::<T>()) as f64 / (1024.0 * 1024.0),
                 (cg.num_edges as f64
                     * 16.0
                     * cg.feature_dim() as f64

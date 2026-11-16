@@ -1,9 +1,12 @@
-# load at campaign start 2026-11-17T07:54:07+09:00
- 07:54:07 up 12 days, 18:24,  4 users,  load average: 1.95, 0.90, 0.64
-cpu0 performance 2763260kHz
-cpu1 performance 2958611kHz
-cpu2 performance 2000000kHz
-cpu3 performance 2943339kHz
-cpu8 performance 2000000kHz
-cpu16 performance 2000000kHz
-cpu24 performance 2000000kHz
+# load at campaign start 2026-11-17T08:34:32+09:00
+ 08:34:32 up 12 days, 19:05,  4 users,  load average: 2.20, 4.98, 4.41
+# foreign processes pinned to core 0 during an earlier attempt:
+%CPU     PID COMMAND
+62.1 4175948 fbench
+51.7  125621 tlbench-before
+16.7 3079669 kache-engine
+cpu4 performance 2870501kHz
+cpu5 performance 2000000kHz
+cpu6 performance 2000000kHz
+cpu7 performance 2983534kHz
+cpu8 performance 2924627kHz

@@ -55,8 +55,9 @@ overwriting it.
 
 ## Measurement rules this harness enforces
 
-* **One L3 domain per cell.** Measured CPUs come from `taskset` (`0` for 1T,
-  `0,1,2,3` for 4T, all inside `index3/cache0`); the campaign shell and the
+* **One L3 domain per cell.** Measured CPUs come from `taskset` (`4` for 1T,
+  `4,5,6,7` for 4T, all inside `index3/cache0`; core `0` is avoided because
+  foreign processes were pinned there — see the worklog §3); the campaign shell and the
   observer are pinned to the other domain (`8-15,24-31`). Derive the sets from
   `/sys/devices/system/cpu/*/cache/index3/shared_cpu_list` on a new host.
 * **Thread count, not affinity, on both sides.** llmlip dispatches through
@@ -68,7 +69,9 @@ overwriting it.
   point of the comparison) and reports its size per cell.
 * **Round-robin, not one side after the other.** `measure::interleaved` times side
   0, side 1, ... once per sample, so no side sits in a different slice of the
-  machine's drift; each side's repeat count (`inner`) is warmed until one timed
+  machine's drift, and `campaign.sh` re-measures an anchor cell at both ends and
+  rejects the run if they disagree by more than 15 %; each side's repeat count
+  (`inner`) is warmed until one timed
   round spans `--target-ms`.
 * **Exact allocation accounting.** Records carry `alloc_bytes_total` /
   `alloc_calls_total` next to the per-call figures, and the per-call figure is
@@ -79,6 +82,6 @@ overwriting it.
 * **The `Exec` mint is quantified, not removed.** `Exec` is neither `Copy` nor
   `Clone`, so the strided side mints one per call *inside* the timed closure: those
   nanoseconds are part of every strided figure above. `exec_new` reports that
-  share (1.7-2.3 ns) so a reader can see how much of a cell is token
+  share (2.0-2.4 ns) so a reader can see how much of a cell is token
   construction — it is not subtracted.
 * **Fresh process per cell** so `VmHWM` is a peak, not a residue.

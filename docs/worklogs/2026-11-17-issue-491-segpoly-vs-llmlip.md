@@ -56,9 +56,17 @@ two views `x0e [N,1,128]` and `x1o [N,3,128]`), `bar_w` (`u = 128`), `bar_y`
 
 ## 3. Method
 
-Pinned `taskset`, one L3 domain for the measured cell (`0` for 1T, `0,1,2,3` for
+Pinned `taskset`, one L3 domain for the measured cell (`4` for 1T, `4,5,6,7` for
 4T, all inside `index3/cache0 = 0-7,16-23`) and the observer (campaign shell,
 recorder) on the other domain (`8-15,24-31`). Governor `performance`, boost on.
+Core `0` is deliberately not one of them: a first attempt pinned `0` / `0,1,2,3`
+while two foreign processes (`fbench verify --threads 1`, `tlbench-before`) were
+pinned to core `0`, and every figure of that attempt came out ~2x slow (f64 1T
+forward 156.3 ms llmlip / 138.3 ms segpoly instead of 78 / 69) with the ratios
+intact (0.88). That attempt was discarded, not published; `campaign.sh` now also
+re-measures one anchor cell before and after the 16 cells and refuses the run if
+the two ends disagree by more than 15 % (this run: strided 68.7 -> 71.3 ms, 3.7 %;
+llmlip 77.9 -> 78.1 ms, 0.1 %).
 llmlip's rayon **global** pool is pinned to the same thread count
 (`harness/src/main.rs:fix_llmlip_threads`) — without that, "1T" is 32 threads on
 one core, which inflated the first pass by ~1.5x and made llmlip look
@@ -81,7 +89,7 @@ bytes per call cannot truncate to zero. The counter is process-wide and lives in
 The strided side must mint an `Exec` per call (`Exec` is neither `Copy` nor
 `Clone`, and `execute_into` consumes it). That mint happens **inside** the timed
 closure, so its cost is part of every strided wall time in §4-§5; `exec_new`
-reports that share — **1.7-2.3 ns and 0 bytes per mint** — rather than removing
+reports that share — **2.0-2.4 ns and 0 bytes per mint** — rather than removing
 it.
 
 ## 4. Forward: `conv_tp` (`y = Σ cg · w · x · y`)
@@ -90,25 +98,25 @@ Median wall time; ratio = strided / llmlip.
 
 | dtype | T | atoms | llmlip | strided | ratio |
 | --- | --- | --- | --- | --- | --- |
-| f64 | 1 | 128 | 78.2 ms | 68.5 ms | **0.88** |
-| f64 | 1 | 1024 | 636.2 ms | 557.5 ms | **0.88** |
+| f64 | 1 | 128 | 78.0 ms | 68.7 ms | **0.88** |
+| f64 | 1 | 1024 | 638.9 ms | 555.0 ms | **0.87** |
 | f64 | 4 | 128 | 10.2 ms | 17.4 ms | 1.70 |
-| f64 | 4 | 1024 | 86.3 ms | 142.2 ms | 1.65 |
-| f32 | 1 | 128 | 35.3 ms | 65.6 ms | 1.86 |
-| f32 | 1 | 1024 | 279.1 ms | 526.6 ms | 1.89 |
-| f32 | 4 | 128 | 8.8 ms | 16.3 ms | 1.84 |
-| f32 | 4 | 1024 | 71.8 ms | 132.5 ms | 1.85 |
+| f64 | 4 | 1024 | 86.0 ms | 141.5 ms | 1.65 |
+| f32 | 1 | 128 | 34.9 ms | 65.6 ms | 1.88 |
+| f32 | 1 | 1024 | 282.8 ms | 531.8 ms | 1.88 |
+| f32 | 4 | 128 | 9.1 ms | 16.6 ms | 1.83 |
+| f32 | 4 | 1024 | 72.3 ms | 134.2 ms | 1.86 |
 
 Single-thread f64 is the one cell where the executor wins: **12 % faster than
 llmlip's fast kernel, identical at 128 and 1024 atoms** (so it is a kernel
 property, not a cache artifact). Three reasons it does not extend:
 
 * **f32 lanes.** llmlip's f32 kernel is 2.2x faster than its own f64 kernel
-  (35.3 vs 78.2 ms); segpoly gains 1.04x (65.6 vs 68.5 ms). The `u = 128` f32 lane
+  (34.9 vs 78.0 ms); segpoly gains 1.05x (65.6 vs 68.7 ms). The `u = 128` f32 lane
   is 512 B per row — the executor's lane lowering does not get the SIMD width out
   of it that llmlip's hand-written f32 paths do.
-* **4T.** llmlip scales 7.4x on 4 cores (636.2 -> 86.3 ms), segpoly 3.9x
-  (557.5 -> 142.2 ms). The executor splits *units* (nodes) with
+* **4T.** llmlip scales 7.4x on 4 cores (638.9 -> 86.0 ms), segpoly 3.9x
+  (555.0 -> 141.5 ms). The executor splits *units* (nodes) with
   `BLOCK_ROWS = 256`; at 128 nodes there are fewer units than useful chunks, and
   per-node work is uneven (degree 30-70), so 4 workers idle. llmlip's rayon
   fan-out is per edge-range.
@@ -124,19 +132,19 @@ also given because they say *why*.
 
 | dtype | T | atoms | llmlip | `bar_x` | `bar_w` | `bar_y` | sum | ratio |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| f64 | 1 | 128 | 195.0 ms | 68.7 (0.35) | 61.8 (0.32) | 423.9 (2.17) | 554.4 | 2.84 |
-| f64 | 1 | 1024 | 1560.2 ms | 554.0 (0.36) | 505.0 (0.32) | 3413.2 (2.19) | 4472.3 | 2.87 |
-| f64 | 4 | 128 | 33.8 ms | 26.7 (0.79) | 15.5 (0.46) | 119.1 (3.52) | 161.3 | 4.77 |
-| f64 | 4 | 1024 | 257.1 ms | 222.5 (0.87) | 127.5 (0.50) | 878.4 (3.42) | 1228.4 | 4.78 |
-| f32 | 1 | 128 | 45.6 ms | 62.9 (1.38) | 60.4 (1.32) | 416.3 (9.12) | 539.6 | 11.82 |
-| f32 | 1 | 1024 | 430.5 ms | 515.3 (1.20) | 492.5 (1.14) | 3350.7 (7.78) | 4358.4 | 10.12 |
-| f32 | 4 | 128 | 11.9 ms | 25.6 (2.15) | 15.3 (1.28) | 105.4 (8.87) | 146.3 | 12.31 |
-| f32 | 4 | 1024 | 161.6 ms | 205.7 (1.27) | 123.4 (0.76) | 925.3 (5.72) | 1254.3 | 7.76 |
+| f64 | 1 | 128 | 193.5 ms | 67.2 (0.35) | 61.5 (0.32) | 426.4 (2.20) | 555.2 | 2.87 |
+| f64 | 1 | 1024 | 1568.2 ms | 578.0 (0.37) | 520.2 (0.33) | 3496.6 (2.23) | 4594.9 | 2.93 |
+| f64 | 4 | 128 | 32.1 ms | 26.6 (0.83) | 15.5 (0.48) | 107.8 (3.36) | 150.0 | 4.67 |
+| f64 | 4 | 1024 | 285.6 ms | 227.2 (0.80) | 128.5 (0.45) | 926.7 (3.24) | 1282.3 | 4.49 |
+| f32 | 1 | 128 | 45.9 ms | 62.1 (1.35) | 60.6 (1.32) | 417.6 (9.10) | 540.3 | 11.78 |
+| f32 | 1 | 1024 | 430.6 ms | 517.9 (1.20) | 497.2 (1.15) | 3729.4 (8.66) | 4744.5 | 11.02 |
+| f32 | 4 | 128 | 11.9 ms | 28.6 (2.40) | 15.4 (1.30) | 106.2 (8.92) | 150.2 | 12.62 |
+| f32 | 4 | 1024 | 171.7 ms | 213.7 (1.24) | 124.9 (0.73) | 849.4 (4.95) | 1188.0 | 6.92 |
 
 Two vectorised plans beat the whole fused llmlip call: `bar_x` 0.35x and
 `bar_w` 0.32x in f64 1T (f32 loses its edge, as in the forward). The
-`bar_edge_attrs` reduction is the opposite extreme — 2.2x in f64 1T, 6-9x in f32
-— and alone accounts for **72-77 %** of the segment's time. It is the only
+`bar_edge_attrs` reduction is the opposite extreme — 2.2x in f64 1T, 5-9x in f32
+— and alone accounts for **70-79 %** of the segment's time. It is the only
 gradient whose lane is a reduction over `(feature, m)` rather than a feature
 vector, so it lowers to the `u = 1` scalar plan with 11 008 paths over
 `N x 5 120` rows: the CG work per byte of output is 128x that of the vectorised
@@ -152,24 +160,27 @@ allocates neither.
 | bytes per forward call | **0** | 2.6-40.6 MiB |
 | bytes per VJP call | **0** | 29.4-474.2 MiB |
 | allocation calls per call | **0** | 15-1 230 |
-| `Exec` mint per call (in the figure above) | 1.7-2.3 ns, 0 bytes | n/a (rayon dispatch) |
+| `Exec` mint per call (in the figure above) | 2.0-2.4 ns, 0 bytes | n/a (rayon dispatch) |
 
 `execute_into` holds the zero-allocation contract of PR #490 for all four plans:
 over every timed call of every cell the strided side recorded
 `alloc_bytes_total = 0` and `alloc_calls_total = 0`, at 1T and at 4T, in f32 and
 f64. Two 4T VJP cells (128 atoms) are the exception: one 1 520-byte allocation in
 one of the 30 timed `bar_w` calls (51 B/call amortized over that cell). What that
-is, precisely: the **first pooled execution of that plan** pays a one-off,
-every later one is free — `tests/alloc.rs` warms the plan and then asserts the
+is, precisely: it is **lazy per-worker initialization** on the pool's first use of
+that plan — each worker thread allocates its own scratch on its first task and
+never again, so the 30 timed calls of that cell contain exactly one such event and
+every later execution is free. `tests/alloc.rs` warms the plan and then asserts the
 next pooled call allocates exactly 0 bytes. Because the counter is process-wide it
-cannot say *which* component paid it, only that it is not a per-call cost. That
+cannot attribute the bytes to a specific structure, only show that they are
+per-worker first-touch and not per call. That
 gate also proves it is not vacuous: it first requires the counter to see a 1 MiB
 allocation. llmlip allocates per call, and its count depends on the thread count
 (46 at 1T, 238-1 230 at 4T) because rayon chunks allocate.
 
 `VmHWM` is per *process* and both sides run in one process per cell, so it is
 reported per cell rather than per side: 85 MiB (f64) / 93 MiB (f32) at 128 atoms
-and 646 / 718 MiB at 1024 for the forward; 192 / 99 MiB at 128 atoms and
+and 646 / 718 MiB at 1024 for the forward; 192-193 / 99-100 MiB at 128 atoms and
 1 510-1 513 / 764-765 MiB at 1024 for the VJP. That peak is set by the
 caller-owned buffers both sides share — `tp_weights` plus the outputs — not by the
 kernel. What differs is the `[E, 5 120]` intermediate, present only on the llmlip
@@ -196,7 +207,7 @@ relative error explodes where a sum cancels.
 | f32 VJP `bar_w` | 7.2e-7 | 2.7e-7 | 9.8e-4 | 2.6e-7 |
 | f32 VJP `bar_y` | 2.9e-4 | 3.4e-6 | 1.2e-1 | 1.3e-6 |
 
-f64 agrees to 4.6e-16-3.6e-15 of scale, i.e. at the accumulator's precision; the
+f64 agrees to 2.8e-16-3.6e-15 of scale, i.e. at the accumulator's precision; the
 f32 figures are a handful of f32 ulps of an 11 008-term reduction, which is why
 `bar_y` is the loosest cell. `bar_w` came out bit-identical in the 1T cells.
 
@@ -207,7 +218,7 @@ catches, corrupting one element at a time in the narrow middle, the narrow tail
 and the wide tail); 1T and 4T produce **bit-identical** output for the forward and
 all three VJPs, in f32 and f64. `tests/alloc.rs` (1 test, its own binary because
 the counters are process-wide) asserts `execute_into` allocates exactly 0 bytes
-and 0 calls serially and after the first pooled execution, and starts by requiring
+and 0 calls serially and on every pooled execution after the per-worker first touch, and starts by requiring
 the counting allocator to see a 1 MiB allocation — otherwise the assertion would
 be vacuous.
 
@@ -224,7 +235,7 @@ be vacuous.
 3. **Thread scaling, not single-thread throughput, is the 4T gap**: the executor
    splits nodes, and MACE layer-1 nodes are few and uneven. Edge-range splitting
    (what rayon does for llmlip) would need a different `IndexMode`/unit choice.
-4. **f32 gains nothing from the lane width.** On the strided side f32 is 1.04x its
+4. **f32 gains nothing from the lane width.** On the strided side f32 is 1.05x its
    f64 wall time, while llmlip's f32 is 2.2x its f64. Worth a separate look; it is
    not a correctness issue (both sides agree to f32 precision).
 
@@ -266,7 +277,7 @@ cargo build --release -p llmlip --features parallel,bench-api
 cd benchmarks/strided-491-mace-ab && cargo test --release && cargo build --release
 
 # 3. one cell (prints the JSON record, appends it with --raw-dir)
-taskset -c 0,1,2,3 target/release/mace-ab --cell cg-vjp --dtype f64 \
+taskset -c 4,5,6,7 target/release/mace-ab --cell cg-vjp --dtype f64 \
   --threads 4 --atoms 1024 --samples 15 --target-ms 20 --raw-dir raw
 
 # 4. all 16 cells, observer pinned off the measured L3 domain

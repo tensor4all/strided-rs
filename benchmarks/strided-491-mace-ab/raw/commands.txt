@@ -4,11 +4,14 @@ cd ~/work/strided-491-ab/llmlip.rs && cargo build --release -p llmlip --features
 # in and on the llmlip checkout (see README)
 cd benchmarks/strided-491-mace-ab && cargo test --release && cargo build --release
 # one cell; every field of the JSON record is defined in src/main.rs
-taskset -c 0,1,2,3 target/release/mace-ab --cell cg-vjp --dtype f64 --threads 4 \
+# (measured cpus: 4 for 1T, 4,5,6,7 for 4T — all inside index3/cache0; cpu 0 had
+# foreign processes on it, see raw/host.txt)
+taskset -c 4,5,6,7 target/release/mace-ab --cell cg-vjp --dtype f64 --threads 4 \
   --atoms 1024 --samples 15 --target-ms 20 --raw-dir raw
 # all 16 cells, observer pinned off the measured L3 domain. The transcript is
 # committed as raw/campaign.txt: .gitignore:14 drops *.log, so a campaign.log
 # would never have been added by `git add -A`.
 taskset -c 8-15,24-31 ./campaign.sh
-grep -c '^{' raw/campaign.txt     # 16
+grep -c '^{' raw/campaign.txt     # 18 = 16 cells + 2 anchors
 grep -c FAILED raw/campaign.txt   # 0
+awk '/^=== anchor/{a=1} a' raw/campaign.txt | tail -3   # anchor drift guard verdict

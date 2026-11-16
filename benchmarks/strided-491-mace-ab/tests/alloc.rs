@@ -44,9 +44,10 @@ fn the_executor_allocates_nothing_per_call() {
     );
 
     // Pooled `bar_w`. Two 4T cells record one 1 520-byte allocation in one of
-    // their 30 timed calls; this shows that the first pooled execution of a plan
-    // may pay it and every later one is free. The counter is process-wide, so it
-    // cannot say which component paid it — only that it is not per call.
+    // their 30 timed calls; this shows that the pool's first use of a plan pays a
+    // lazy per-worker initialization and every later execution is free. The
+    // counter is process-wide, so it cannot attribute the bytes to a specific
+    // structure — only show that they are per-worker first-touch, not per call.
     let mut grad_w = vec![0.0f64; cg.num_edges * 10 * cg.feature_dim()];
     let mut again = vec![0.0f64; grad_w.len()];
     let exec = mace_ab::exec_for(4, Some(&pool));
@@ -59,6 +60,6 @@ fn the_executor_allocates_nothing_per_call() {
     assert_eq!(
         (pooled.bytes, pooled.calls),
         (0, 0),
-        "the first pooled execution of a plan may allocate, later ones may not, got {pooled:?}"
+        "per-worker initialization may allocate once, later executions may not, got {pooled:?}"
     );
 }

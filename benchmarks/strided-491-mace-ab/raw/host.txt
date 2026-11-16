@@ -1,11 +1,13 @@
-host:           AMD Ryzen AI MAX+ 395 (Strix Halo), 32 logical CPUs
-l3 domains:     index3 cache0 = 0-7,16-23 ; cache1 = 8-15,24-31
-measured cpus:  0 (1T) and 0,1,2,3 (4T) -- all inside index3 cache0
-observer cpus:  8-15,24-31 (the other L3 domain): campaign shell, this record
-governor:       performance (all cpus), boost on
-kernel:         7.0.0-42-generic
-gpu:            none (no nvidia-smi, no /usr/local/cuda-*) -> no GPU path touched
-rustc:          rustc 1.100.0 (0ef1bc386 2026-11-09)
-cargo:          cargo 1.100.0 (3acc79c0c 2026-11-05)
-llmlip:         6bfb041 (the baseline pinned by tensor4all/tenferro-rs#2412)
-strided-rs:     443e9b3 (origin/main, PR #490 merged)
+host: AMD Ryzen AI MAX+ 395 (Strix Halo), 32 logical CPUs
+kernel: 7.0.0-42-generic
+rustc / cargo: 1.100.0
+governor: performance, boost on; no NVIDIA GPU present (`nvidia-smi` absent,
+/usr/local/cuda-* absent), so no GPU path is exercised
+L3 domains (index3): cache0 = 0-7,16-23 ; cache1 = 8-15,24-31
+measured cell: 1T -> cpu 4 ; 4T -> cpus 4,5,6,7 (all in cache0)
+observer (campaign shell, recorder, agent): cpus 8-15,24-31 (cache1)
+note: cpu 0 is avoided on purpose. Foreign processes ("fbench verify --threads 1",
+"tlbench-before") were pinned to cpu 0 during an earlier attempt and made every
+cell ~2x slow with the ratios unchanged; that attempt was discarded (worklog §3).
+campaign.sh re-measures one anchor cell before and after the 16 cells and refuses
+the run when the two ends disagree by more than 15 %.
