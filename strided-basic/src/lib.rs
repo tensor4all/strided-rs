@@ -261,6 +261,7 @@ pub mod bench_hooks {
 
 mod gather_plan;
 mod outer_product;
+mod run_sum;
 mod static_indexing_plan;
 pub use gather_plan::{
     DynamicSlicePlan, DynamicUpdateSlicePlan, GatherIndex, GatherPlan, GatherSpec, ScatterPlan,
@@ -270,4 +271,5 @@ pub use outer_product::{
     batched_outer_product_into, batched_outer_product_into_uninit, plan_lazy_outer_product,
     LazyOuterProductLayout,
 };
+pub use run_sum::{RunIndex, RunSumPlan};
 pub use static_indexing_plan::{ConcatenatePlan, PadPlan, ReversePlan, SlicePlan};
