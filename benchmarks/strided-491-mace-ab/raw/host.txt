@@ -1,0 +1,12 @@
+host:           AMD Ryzen AI MAX+ 395 (Strix Halo), 32 logical CPUs
+l3 domains:     index3 cache0 = 0-7,16-23 ; cache1 = 8-15,24-31
+measured cpus:  0 (1T) and 0,1,2,3 (4T) -- all inside index3 cache0
+observer cpus:  8-15,24-31 (the other L3 domain): campaign shell, this record
+governor:       performance (all cpus)
+boost:          on (cpb)
+kernel:         7.0.0-42-generic
+gpu:            none (no nvidia-smi, no /usr/local/cuda-*) -> no GPU path touched
+rustc:          rustc 1.100.0 (0ef1bc386 2026-11-09)
+cargo:          cargo 1.100.0 (3acc79c0c 2026-11-05)
+llmlip:         6bfb041 (the baseline pinned by tensor4all/tenferro-rs#2412)
+strided-rs:     443e9b3 (origin/main, PR #490 merged)
