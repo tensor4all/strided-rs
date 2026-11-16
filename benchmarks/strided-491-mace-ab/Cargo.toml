@@ -1,0 +1,25 @@
+[package]
+name = "mace-ab"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: the parent workspace lists its members explicitly, so this crate is
+# not one of them (strided-rs#491).
+[workspace]
+
+[dependencies]
+strided-basic = { path = "../../strided-basic", default-features = false }
+strided-segpoly = { path = "../../strided-segpoly", default-features = false }
+llmlip = { path = "../../../llmlip.rs/crates/llmlip", default-features = false, features = [
+    "parallel",
+    "bench-api",
+] }
+# Only to pin llmlip's global pool to the same thread count as the strided exec.
+rayon = "1" 
+
+# llmlip's own release profile (llmlip.rs/Cargo.toml:40-42), so neither side is
+# measured under flags the other does not get.
+[profile.release]
+lto = "thin"
+codegen-units = 1

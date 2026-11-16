@@ -1,0 +1,8 @@
+# build (llmlip with the local-only bench-api feature; nothing is pushed)
+cd ~/work/strided-491-ab/llmlip.rs && cargo build --release -p llmlip --features parallel,bench-api
+# harness (own [workspace], path deps on strided-rs @ 443e9b3 and llmlip @ 6bfb041)
+cd ~/work/strided-491-ab/harness && cargo build --release && cargo test --release
+# one cell per line; --raw-dir appends the same JSON to raw/<cell>-<dtype>-<N>T-<atoms>.jsonl
+taskset -c 0,1,2,3 harness/target/release/mace-ab --cell cg-vjp --dtype f64 --threads 4 --atoms 1024 --samples 15 --raw-dir raw
+# the campaign driver (16 cells, observer pinned off the measured L3 domain)
+taskset -c 8-15,24-31 ./campaign.sh

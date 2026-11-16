@@ -1,0 +1,10 @@
+# load at start
+ 06:20:11 up 12 days, 16:50,  3 users,  load average: 2.04, 1.26, 1.18
+# frequency governor
+cpu0 performance 2999687kHz
+cpu1 performance 2802143kHz
+cpu2 performance 2000000kHz
+cpu3 performance 2000000kHz
+cpu8 performance 2759017kHz
+cpu16 performance 2000000kHz
+cpu24 performance 2000000kHz
