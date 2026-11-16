@@ -141,9 +141,9 @@ small-128/two-pass/pooled        7016       0.58         0.0      0.69
 `chain-8k` is 8192 edges × 16 segments × 32 lanes into 2048 runs: the fused
 pooled row is 1.9x the two-pass pooled row and never materialises the 32 MiB
 intermediate. `small-128` is 128 edges × 4 segments × 8 lanes: there the fused row
-is 1.4x *slower*, because per-path setup and the call's fixed costs dominate 4096
-multiply-adds. The crossover is real and is the honest statement of where this
-executor pays off; the small case was not tuned further. Both rows apply the same
+was 1.4x *slower* at this first measurement, because per-path setup and the call's
+fixed costs dominated 4096 multiply-adds; the follow-up below makes it 1.37x
+faster. Both rows apply the same
 per-segment coefficient and build one view per call, and the bench asserts before
 timing that they agree to 1e-12 (they are not bitwise equal: the fused row combines
 fixed block partials).
@@ -167,6 +167,39 @@ Two changes came out of it and both are in:
 The kernel is not blocked and not SIMD-dispatched: the lane loop autovectorises,
 and a `pulp` dispatch is a separate change with its own measurement (the same
 non-goal as Part 1's payload walk).
+
+### Follow-up: the small case (contiguous-lane kernel)
+
+Profiled on evo2 by ablation (`perf` is not available: `perf_event_paranoid` is 4),
+`small-128`, serial, 10.0 µs per call at `029a15c`: validation ~0.2 µs, task
+overhead ~0.3 µs, per-row and per-path setup (row bases, operand pointers, the arity
+match) ~3.5 µs, and the multiply-adds themselves ~6 µs, about 1.5 ns each. The lane
+loop indexed every operand by `lane * step` with a runtime step and bounds-checked
+the accumulator per lane, so it did not vectorise.
+
+The change: compile records per operation whether every input reads its `u` lanes
+contiguously (`OpPlan::unit_lanes`), and the replay resolves each input's row base
+once per row and operation and runs `op_row_contiguous`, which walks each path's
+operands as slices with the arity as a constant (one to three). Everything else (a
+lane stride other than 1, a broadcast operand, more operands) keeps the general
+path. The arithmetic is the same expression in the same order per lane
+(`acc + ((c · x0) · x1) · x2`), so the bits do not move: an FNV hash over every
+output bit is identical before and after for both bench shapes, serial and on a
+4-slot pool, and the fixture, determinism and allocation tests pass unchanged.
+
+Same bench, evo2, `taskset -c 0-7`, three runs each, `029a15c` → this change:
+
+| row | before | after |
+|---|---|---|
+| `small-128/fused/serial` | 9.93–10.01 µs | 5.03–5.09 µs |
+| `small-128`, two-pass ÷ fused (serial) | 0.70 | 1.37–1.39 |
+| `chain-8k/fused/pooled` | 1.46–1.68 ms | 1.19–1.32 ms |
+| `chain-8k/fused/serial` | 5.68–6.46 ms | 4.39–4.85 ms |
+
+`chain-8k` serial is still slower than the two-pass serial row (~3.7 ms); the fused
+row wins pooled. A `pulp` runtime dispatch of the task loop was tried on top and
+dropped: `small-128` was ~5% slower with it and `chain-8k` showed no consistent gain,
+so the non-goal above stands.
 
 ## 6. Deliberate non-changes
 

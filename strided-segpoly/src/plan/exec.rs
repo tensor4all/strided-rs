@@ -391,6 +391,42 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             for &op_index in self.out_ops[dense].iter() {
                 let op = &self.ops[op_index];
                 let arity = op.inputs.len() + 1;
+                // Contiguous lanes at arity one to three: the row bases are
+                // resolved once here and the paths walk slices, which is the
+                // same arithmetic in the same order as `accumulate` below.
+                if op.unit_lanes && (1..=3).contains(&op.inputs.len()) {
+                    let paths = op.base..op.base + op.num_paths();
+                    let offsets = op.offsets_base..op.offsets_base + op.num_paths() * arity;
+                    macro_rules! contiguous {
+                        ($n:literal) => {{
+                            let bases: [*const T; $n] = core::array::from_fn(|t| {
+                                let input = op.inputs[t] as usize;
+                                // SAFETY: `rows` holds this row's base for that
+                                // buffer, as in the general path below.
+                                unsafe { call.in_base[input].as_const().offset(rows[input]) }
+                            });
+                            // SAFETY: as for `accumulate`; every input has lane
+                            // step 1, so each path reads `u` contiguous lanes.
+                            unsafe {
+                                op_row_contiguous::<T, $n>(
+                                    acc,
+                                    u,
+                                    &op.seg_starts,
+                                    &op.seg_ends,
+                                    &self.path_coeffs[paths],
+                                    &self.path_offsets[offsets],
+                                    &bases,
+                                )
+                            }
+                        }};
+                    }
+                    match op.inputs.len() {
+                        1 => contiguous!(1),
+                        2 => contiguous!(2),
+                        _ => contiguous!(3),
+                    }
+                    continue;
+                }
                 let mut steps = [0isize; MAX_INPUTS];
                 for (slot, &input) in steps.iter_mut().zip(op.inputs.iter()) {
                     *slot = self.in_lane[input as usize];
@@ -509,9 +545,12 @@ unsafe fn accumulate<T: SegPolyElem>(
     /// the add phase reads only it, which is what lets the compiler vectorise
     /// both. Past this width the lane loop accumulates directly.
     ///
-    /// `shortcut: the lane loop is not SIMD-dispatched (no pulp kernel), so a
-    /// wide `u` past this tile runs the scalar loop; upgrade when the lane axis
-    /// becomes the measured bottleneck` (strided-rs#479).
+    /// `shortcut: the lane loop is not SIMD-dispatched (no pulp kernel), and this
+    /// general path (a lane step other than 1, a broadcast operand, or more than
+    /// three operands) indexes lanes by a runtime step, so it vectorises poorly;
+    /// lane-contiguous operations of arity one to three take
+    /// `op_row_contiguous` instead. Specialise the broadcast case when it is the
+    /// measured bottleneck` (strided-rs#479).
     const LANE_TILE: usize = 64;
 
     // Sliced to the operation's arity, so the inner loop is a zip over two slices
@@ -577,6 +616,68 @@ unsafe fn accumulate<T: SegPolyElem>(
         }
         let slot = lane_base + lane;
         acc[slot] = acc[slot] + product;
+    }
+}
+
+/// One operation's paths for one batch point, every input lane-contiguous.
+///
+/// The same sum as calling [`accumulate`] once per path in plan order: for each
+/// output segment, for each of its paths, `acc[lane] = acc[lane] + ((c · x_0) ·
+/// x_1) · x_2`, the product associated left to right from the coefficient. Only
+/// the bookkeeping moves: the row bases come in resolved, the arity is a
+/// constant, and each path's operands are slices of `u` lanes, so the lane loop
+/// has no index arithmetic or bounds checks and the compiler can vectorise it.
+///
+/// # Safety
+///
+/// `acc` holds `seg_starts.len() * u` elements; for every path `p` of
+/// `coeffs` and every operand `t < N`, `bases[t].offset(offsets[p * (N + 1) +
+/// t])` reaches `u` contiguous, initialised elements.
+#[inline(always)]
+unsafe fn op_row_contiguous<T: SegPolyElem, const N: usize>(
+    acc: &mut [T],
+    u: usize,
+    seg_starts: &[u32],
+    seg_ends: &[u32],
+    coeffs: &[T],
+    offsets: &[isize],
+    bases: &[*const T; N],
+) {
+    let arity = N + 1;
+    for (segment, (&start, &end)) in seg_starts.iter().zip(seg_ends.iter()).enumerate() {
+        if start == end {
+            continue;
+        }
+        let lane_base = segment * u;
+        let slots = &mut acc[lane_base..lane_base + u];
+        for local in start as usize..end as usize {
+            let coefficient = coeffs[local];
+            let path_offsets = &offsets[local * arity..local * arity + N];
+            // SAFETY: the caller's contract; each operand is `u` contiguous lanes.
+            let operand = |t: usize| unsafe {
+                core::slice::from_raw_parts(bases[t].offset(path_offsets[t]), u)
+            };
+            match N {
+                1 => {
+                    let x0 = operand(0);
+                    for (slot, &a) in slots.iter_mut().zip(x0) {
+                        *slot = *slot + coefficient * a;
+                    }
+                }
+                2 => {
+                    let (x0, x1) = (operand(0), operand(1));
+                    for ((slot, &a), &b) in slots.iter_mut().zip(x0).zip(x1) {
+                        *slot = *slot + coefficient * a * b;
+                    }
+                }
+                _ => {
+                    let (x0, x1, x2) = (operand(0), operand(1), operand(2));
+                    for (((slot, &a), &b), &c) in slots.iter_mut().zip(x0).zip(x1).zip(x2) {
+                        *slot = *slot + coefficient * a * b * c;
+                    }
+                }
+            }
+        }
     }
 }
 

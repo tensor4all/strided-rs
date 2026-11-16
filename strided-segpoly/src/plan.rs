@@ -112,6 +112,17 @@ struct OpPlan {
     seg_starts: Vec<u32>,
     /// Per output segment: one past the last local path index.
     seg_ends: Vec<u32>,
+    /// Whether every input reads its `u` lanes contiguously (lane step 1), so
+    /// the replay can walk them as slices. Set once `in_lane` is known.
+    unit_lanes: bool,
+}
+
+impl OpPlan {
+    /// Paths of this operation: `seg_ends` is the running path cursor, so its
+    /// last entry counts every path.
+    fn num_paths(&self) -> usize {
+        self.seg_ends.last().map_or(0, |&end| end as usize)
+    }
 }
 
 /// A destination block and the batch points that contribute to it.
@@ -498,6 +509,7 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                 offsets_base,
                 seg_starts,
                 seg_ends,
+                unit_lanes: false,
             });
         }
         for (op_index, op) in ops.iter().enumerate() {
@@ -649,7 +661,10 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                     strides[buffer][2]
                 }
             })
-            .collect();
+            .collect::<Vec<isize>>();
+        for op in &mut ops {
+            op.unit_lanes = op.inputs.iter().all(|&input| in_lane[input as usize] == 1);
+        }
 
         Ok(Self {
             u,
