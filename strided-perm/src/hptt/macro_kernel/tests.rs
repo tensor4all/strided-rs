@@ -161,15 +161,16 @@ fn recorded(span: isize, block_b: usize) -> Vec<(isize, isize)> {
 #[test]
 fn each_branch_walks_the_tile_it_was_picked_for() {
     const BLOCK_B: usize = 6;
+    // `u8` elements, so one L1 way of them is an aliasing row (#466).
+    let way = L1_WAY_BYTES as isize;
     for block_a in [1usize, 5, 6, 7, 12, 13] {
         for (lda, ldb, walk) in [
-            // `u8` elements: a stride of 4096 of them is a 4096-byte row, the
-            // aliasing one. Both sides alias, so the shrink branch.
-            (4096isize, 4096isize, Walk::Shrink),
+            // Both sides alias, so the shrink branch.
+            (way, way, Walk::Shrink),
             // Destination only: the full-run branch.
-            (19, 4096, Walk::Rows),
+            (19, way, Walk::Rows),
             // Source only, and neither: the original order.
-            (4096, 17, Walk::Cols),
+            (way, 17, Walk::Cols),
             (19, 19, Walk::Cols),
         ] {
             let src_len = (block_a as isize - 1) + (BLOCK_B as isize - 1) * lda + 1;
@@ -327,39 +328,57 @@ fn fallback_transposes_every_aliasing_and_non_aliasing_tile() {
     }
 }
 
-/// The order predicate: a row that is a multiple of the 4 KiB way aliases; a
-/// stride of 0 and anything else does not. A row of 256 `u64` elements (16
-/// bytes each) is 4096 bytes, which is the aliasing case of #466.
+/// One L1 way in elements of `elem_size` bytes: a row that far from its
+/// neighbour re-enters one set. 8 and 4 divide both target way sizes, so the
+/// f64 and f32 routes get an exact stride on either host.
+fn way_elements(elem_size: usize) -> isize {
+    (L1_WAY_BYTES / elem_size) as isize
+}
+
+/// The order predicate: a row that is a multiple of the L1 way aliases; a
+/// stride of 0 and anything else does not. The way is 4 KiB on x86 and 8 KiB
+/// on Apple silicon, so the strides are derived from it rather than written
+/// out (#466).
 #[test]
 fn only_a_multiple_of_the_l1_way_aliases() {
-    for (ldb, elem_size, expected) in [
-        (512isize, 8usize, true), // 4096 bytes
-        (1024, 8, true),          // 8192
-        (9216, 8, true),          // [96,96,96], 73728 bytes
-        (513, 8, false),          // 4104
-        (511, 8, false),
-        (1, 8, false),
-        (0, 8, false),
-        (256, 16, true), // 1024 * 16 in [32,1024]
-        (257, 16, false),
-        (-512, 8, true), // a negative stride aliases the same sets
-        (4096, 1, true),
-        (4095, 1, false),
-    ] {
-        assert_eq!(
-            aliases_l1_sets(ldb, elem_size),
-            expected,
-            "ldb={ldb} elem={elem_size}"
+    for elem_size in [std::mem::size_of::<f64>(), std::mem::size_of::<f32>()] {
+        let stride = way_elements(elem_size);
+        assert!(
+            aliases_l1_sets(stride, elem_size),
+            "one way, elem={elem_size}"
+        );
+        assert!(
+            aliases_l1_sets(-stride, elem_size),
+            "a negative stride aliases the same sets"
+        );
+        assert!(
+            aliases_l1_sets(stride * 9, elem_size),
+            "nine ways, elem={elem_size}"
+        );
+        assert!(
+            !aliases_l1_sets(stride + 1, elem_size),
+            "one element past a way, elem={elem_size}"
+        );
+        assert!(
+            !aliases_l1_sets(stride - 1, elem_size),
+            "one element short of a way, elem={elem_size}"
         );
     }
+    // A stride of 0 repeats one address rather than walking a set.
+    assert!(!aliases_l1_sets(0, 8));
+    assert!(!aliases_l1_sets(1, 8));
+    // The predicate is on bytes, so it does not depend on the element size.
+    assert!(aliases_l1_sets(L1_WAY_BYTES as isize, 1));
+    assert!(!aliases_l1_sets(L1_WAY_BYTES as isize - 1, 1));
 }
 
 /// `ldb` steps a multiple of the L1 way, so `macro_kernel_f64` takes its
 /// scalar-fallback branch (#466). The tile must still be a plain transpose.
 #[test]
 fn test_macro_kernel_f64_aliasing_ldb() {
-    let (block_a, block_b, lda, ldb) = (8usize, 9usize, 11isize, 512isize);
-    // 512 * 8 bytes is one 4 KiB L1 way; 11 * 8 is not.
+    let (block_a, block_b, lda) = (8usize, 9usize, 11isize);
+    let ldb = way_elements(std::mem::size_of::<f64>());
+    // `ldb * 8` is one L1 way; `lda * 8` is not.
     assert!(aliases_l1_sets(ldb, std::mem::size_of::<f64>()));
     assert!(!aliases_l1_sets(lda, std::mem::size_of::<f64>()));
 
@@ -387,7 +406,8 @@ fn test_macro_kernel_f64_aliasing_ldb() {
 /// Both strides alias: the fallback takes its `i`-extent-shrinking branch.
 #[test]
 fn test_macro_kernel_f64_aliasing_both() {
-    let (block_a, block_b, stride) = (9usize, 7usize, 512isize);
+    let (block_a, block_b) = (9usize, 7usize);
+    let stride = way_elements(std::mem::size_of::<f64>());
     assert!(aliases_l1_sets(stride, std::mem::size_of::<f64>()));
 
     let src_len = ((block_a - 1) as isize + (block_b - 1) as isize * stride + 1) as usize;
@@ -423,8 +443,9 @@ fn test_macro_kernel_f64_aliasing_both() {
 /// transpose.
 #[test]
 fn test_macro_kernel_f32_aliasing_ldb() {
-    let (block_a, block_b, lda, ldb) = (8usize, 9usize, 11isize, 1024isize);
-    // 1024 * 4 bytes is one 4 KiB L1 way; 11 * 4 is not.
+    let (block_a, block_b, lda) = (8usize, 9usize, 11isize);
+    let ldb = way_elements(std::mem::size_of::<f32>());
+    // `ldb * 4` is one L1 way; `lda * 4` is not.
     assert!(aliases_l1_sets(ldb, std::mem::size_of::<f32>()));
     assert!(!aliases_l1_sets(lda, std::mem::size_of::<f32>()));
 
@@ -452,7 +473,8 @@ fn test_macro_kernel_f32_aliasing_ldb() {
 /// Both strides alias: the f32 fallback takes its `i`-extent-shrinking branch.
 #[test]
 fn test_macro_kernel_f32_aliasing_both() {
-    let (block_a, block_b, stride) = (9usize, 7usize, 1024isize);
+    let (block_a, block_b) = (9usize, 7usize);
+    let stride = way_elements(std::mem::size_of::<f32>());
     assert!(aliases_l1_sets(stride, std::mem::size_of::<f32>()));
 
     let src_len = ((block_a - 1) as isize + (block_b - 1) as isize * stride + 1) as usize;
