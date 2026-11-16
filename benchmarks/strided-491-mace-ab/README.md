@@ -19,7 +19,8 @@ it and it cannot affect a released artifact.
 | `src/lib.rs` | shared buffers, sequence-valued inputs, comparison helpers |
 | `src/measure.rs` | counting allocator, `VmHWM`, warmup + median-of-15 |
 | `src/main.rs` | one cell per process: `--cell cg-fwd\|cg-vjp --dtype f32\|f64 --threads N --atoms 128\|1024` |
-| `tests/fidelity.rs` | the gates: published counters, both sides agree on **every node** in f32 and f64, 1T/4T bitwise for the forward and all three VJPs, a perturbation test that the comparisons are not node-0 only, zero allocation |
+| `tests/fidelity.rs` | the gates: published counters, both sides agree on **every node** in f32 and f64, 1T/4T bitwise for the forward and all three VJPs, a perturbation test that the comparisons are not node-0 only |
+| `tests/alloc.rs` | the zero-allocation gates, in their own test binary (the counters are process-wide, so they cannot be read next to the gates above), each starting by proving the counting allocator sees a 1 MiB allocation |
 | `campaign.sh` | all 16 cells, observer pinned off the measured L3 domain |
 | `raw/` | the recorded cells, host/load/command logs, and the llmlip patch |
 
@@ -72,6 +73,12 @@ overwriting it.
 * **Exact allocation accounting.** Records carry `alloc_bytes_total` /
   `alloc_calls_total` next to the per-call figures, and the per-call figure is
   `total / timed_calls` as an `f64` — a handful of bytes per call cannot truncate
-  to 0. The per-call `Exec` mint (`Exec` is neither `Copy` nor `Clone`) is timed
-  on its own as `exec_new` instead of hiding inside the kernel figure.
+  to 0. The counting allocator is installed in `src/lib.rs`, so the gate tests
+  count too; the counters are process-wide, which is why the allocation gates have
+  their own binary.
+* **The `Exec` mint is quantified, not removed.** `Exec` is neither `Copy` nor
+  `Clone`, so the strided side mints one per call *inside* the timed closure: those
+  nanoseconds are part of every strided figure above. `exec_new` reports that
+  share (1.7-2.3 ns) so a reader can see how much of a cell is token
+  construction — it is not subtracted.
 * **Fresh process per cell** so `VmHWM` is a peak, not a residue.

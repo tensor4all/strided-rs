@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 OUT=raw
 mkdir -p "$OUT"
 BIN=target/release/mace-ab
-log="$OUT/campaign.log"
+log="$OUT/campaign.txt"
 : > "$log"
 for atoms in 128 1024; do
   for dtype in f64 f32; do

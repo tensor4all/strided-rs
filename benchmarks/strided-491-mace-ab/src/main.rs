@@ -13,9 +13,6 @@ use mace_ab::measure::{self, Measured};
 use mace_ab::topo;
 use strided_basic::Pool;
 
-#[global_allocator]
-static ALLOCATOR: mace_ab::measure::Counting = mace_ab::measure::Counting;
-
 struct Args {
     cell: String,
     dtype: String,
@@ -164,8 +161,10 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
     record.push_str(&check);
 
     // The strided side mints an `Exec` per call (`Exec` is neither `Copy` nor
-    // `Clone`, and `execute_into` consumes it), so its cost and its allocations
-    // are measured separately instead of being folded into the kernel figure.
+    // `Clone`, and `execute_into` consumes it). The mint sits inside the timed
+    // closure, so it is already part of the strided wall time; this figure
+    // reports its share (and its allocations) so a reader can see how much of the
+    // number is token construction — it is quantified, not subtracted.
     let mut mint_exec = || {
         let exec = mace_ab::exec_for(args.threads, pool.as_ref());
         black_box(&exec);

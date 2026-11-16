@@ -1,7 +1,9 @@
 //! The fidelity gates: the descriptor reproduces the published layer-1 counters,
 //! both sides compute the same numbers on **every node**, the bits are
-//! thread-invariant in both dtypes, the comparisons actually look at the whole
-//! buffer, and the strided plans allocate nothing per call.
+//! thread-invariant in both dtypes, and the comparisons actually look at the
+//! whole buffer. The allocation gates live in `tests/alloc.rs`, which runs in its
+//! own process: the counters are process-wide, so they cannot be read while the
+//! other gates are allocating beside them.
 
 use mace_ab::cg::{self, Buffers, Cg, Scalar};
 use mace_ab::topo::Topology;
@@ -183,28 +185,42 @@ fn comparisons_cover_every_node() {
         "compare_forward ignored node {last} (base {base:e}, moved {moved:e})"
     );
 
-    // The VJP buffers are compared densely, so a perturbation at the end of each
-    // buffer has to show up.
+    // `bar_x` is compared dense, so a corruption anywhere has to show up. One at
+    // a time and each restored: a combined corruption would not say which element
+    // the comparison missed — the narrow view is `[node][feature]` over the first
+    // `N*f` elements, so `N*f` itself is already wide[0], not a narrow slot.
     let (_, (bar_x, bar_y, bar_w)) = cg.llmlip_vjp(&buffers).expect("llmlip vjp");
     let mut grad_x = vec![0.0f64; cg.num_nodes * (128 + 3 * f)];
     let exec = mace_ab::exec_for(1, None);
     cg.strided_vjp_x(&buffers, &mut grad_x, exec)
         .expect("vjp-x");
-    let (narrow, wide) = grad_x.split_at(cg.num_nodes * f);
-    let (base_x, _) = mace_ab::compare_grad_x(&cg, &bar_x, narrow, wide);
-    let wide_len = wide.len();
-    grad_x[cg.num_nodes * f] += 1.0; // narrow: node 0
-    grad_x[cg.num_nodes * f + wide_len - 1] += 1.0; // wide: last element
-    let (narrow, wide) = grad_x.split_at(cg.num_nodes * f);
-    let (moved_x, _) = mace_ab::compare_grad_x(&cg, &bar_x, narrow, wide);
+    let (base_x, _) = {
+        let (narrow, wide) = grad_x.split_at(cg.num_nodes * f);
+        mace_ab::compare_grad_x(&cg, &bar_x, narrow, wide)
+    };
     assert!(
         base_x < 1e-3,
         "unperturbed bar_x must agree, got {base_x:e}"
     );
-    assert!(
-        moved_x > 0.5,
-        "compare_grad_x ignored a perturbation at the end of the buffer"
-    );
+    let narrow_mid = (cg.num_nodes / 2) * f + f / 2;
+    let narrow_tail = cg.num_nodes * f - 1;
+    let wide_tail = grad_x.len() - 1;
+    for (label, index) in [
+        ("narrow middle", narrow_mid),
+        ("narrow tail", narrow_tail),
+        ("wide tail", wide_tail),
+    ] {
+        grad_x[index] += 1.0;
+        let moved = {
+            let (narrow, wide) = grad_x.split_at(cg.num_nodes * f);
+            mace_ab::compare_grad_x(&cg, &bar_x, narrow, wide).0
+        };
+        grad_x[index] -= 1.0;
+        assert!(
+            moved > 0.5,
+            "compare_grad_x ignored a corruption of bar_x at {index} ({label}), got {moved:e}"
+        );
+    }
 
     let mut grad_w = vec![0.0f64; cg.num_edges * 10 * f];
     let exec = mace_ab::exec_for(1, None);
@@ -321,54 +337,6 @@ fn bits_are_thread_invariant_f64() {
 #[test]
 fn bits_are_thread_invariant_f32() {
     check_thread_invariance::<f32>();
-}
-
-#[test]
-fn execute_allocates_nothing() {
-    let topology = small();
-    let cg = cg::build::<f64>(&topology).expect("plans");
-    let buffers = mace_ab::buffers(&cg, 9);
-    let mut out = vec![0.0f64; cg.num_nodes * cg.out_m_total() * cg.feature_dim()];
-    // Warm, then measure the kernel alone; the `Exec` is minted outside on
-    // purpose, its cost is reported as its own figure.
-    let exec = mace_ab::exec_for(1, None);
-    cg.strided_forward(&buffers, &mut out, exec).expect("warm");
-    mace_ab::measure::reset_alloc();
-    let exec = mace_ab::exec_for(1, None);
-    cg.strided_forward(&buffers, &mut out, exec).expect("timed");
-    let allocated = mace_ab::measure::alloc_snapshot();
-    assert_eq!(
-        (allocated.bytes, allocated.calls),
-        (0, 0),
-        "the executor must not allocate, got {allocated:?}"
-    );
-}
-
-/// The 4T cells each record one 1 520-byte allocation in one of 30 timed calls.
-/// This pins down what it is: the first pooled dispatch pays it, every later one
-/// is free. A per-call cost would show up here.
-#[test]
-fn pooled_execute_allocates_nothing_after_the_first_dispatch() {
-    let topology = small();
-    let cg = cg::build::<f64>(&topology).expect("plans");
-    let buffers = mace_ab::buffers(&cg, 17);
-    let pool = cg::pool(4).expect("pool");
-    let mut grad_w = vec![0.0f64; cg.num_edges * 10 * cg.feature_dim()];
-    let exec = mace_ab::exec_for(4, Some(&pool));
-    cg.strided_vjp_w(&buffers, &mut grad_w, exec).expect("warm");
-    let first = {
-        mace_ab::measure::reset_alloc();
-        let mut again = vec![0.0f64; grad_w.len()];
-        let exec = mace_ab::exec_for(4, Some(&pool));
-        cg.strided_vjp_w(&buffers, &mut again, exec)
-            .expect("second");
-        mace_ab::measure::alloc_snapshot()
-    };
-    assert_eq!(
-        (first.bytes, first.calls),
-        (0, 0),
-        "the pool's first dispatch may allocate, later ones may not, got {first:?}"
-    );
 }
 
 #[test]

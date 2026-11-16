@@ -1,9 +1,9 @@
-# load at campaign start 2026-11-17T07:10:08+09:00
- 07:10:08 up 12 days, 17:40,  4 users,  load average: 1.79, 1.10, 0.71
-cpu0 performance 2000000kHz
-cpu1 performance 2000000kHz
+# load at campaign start 2026-11-17T07:54:07+09:00
+ 07:54:07 up 12 days, 18:24,  4 users,  load average: 1.95, 0.90, 0.64
+cpu0 performance 2763260kHz
+cpu1 performance 2958611kHz
 cpu2 performance 2000000kHz
-cpu3 performance 2998749kHz
-cpu8 performance 2485725kHz
-cpu16 performance 2919794kHz
+cpu3 performance 2943339kHz
+cpu8 performance 2000000kHz
+cpu16 performance 2000000kHz
 cpu24 performance 2000000kHz

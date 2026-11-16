@@ -5,6 +5,12 @@ pub mod cg;
 pub mod measure;
 pub mod topo;
 
+/// Installed here, not in the binary: `tests/` links this library, and a counter
+/// that is never installed reads 0 for every allocation — which would make every
+/// allocation gate pass vacuously.
+#[global_allocator]
+static ALLOCATOR: measure::Counting = measure::Counting;
+
 use cg::{Buffers, Cg, Scalar};
 use strided_basic::{Exec, Pool};
 
