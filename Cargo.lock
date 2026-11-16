@@ -778,6 +778,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "strided-segpoly"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "strided-basic",
+ "thiserror",
+ "threadteam",
+]
+
+[[package]]
 name = "strided-traits"
 version = "0.7.2"
 dependencies = [

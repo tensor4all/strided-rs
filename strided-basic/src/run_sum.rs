@@ -45,10 +45,13 @@
 //!
 //! # Not in this plan
 //!
-//! The dtype-erased replay of the same plan (`strided-kernel`) lands with
-//! [#479]'s executor increment; this module is the typed side only. The payload
-//! walk is not blocked or SIMD-dispatched, and a single long run is one worker's
-//! work.
+//! This module is the typed side only: the dtype-erased replay does not exist, and
+//! no consumer of [#479] needs one. `strided-segpoly` reads the same `RunIndex`
+//! for its scattered outputs and runs its own payload walk, so a third copy of
+//! this plan that erases `T` would add a code path nothing calls.
+//!
+//! The payload walk is not blocked or SIMD-dispatched, and a single long run is
+//! one worker's work.
 //!
 //! [#479]: https://github.com/tensor4all/strided-rs/issues/479
 

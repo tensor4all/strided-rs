@@ -1,0 +1,33 @@
+[package]
+name = "strided-segpoly"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/strided-segpoly"
+description = "Executor for lowered segmented polynomials: fused sparse gather/segment/accumulate over strided CPU buffers."
+keywords = ["tensor", "strided", "kernels", "sparse"]
+categories = ["science", "mathematics", "algorithms"]
+# The first increment of tensor4all/strided-rs#479. Publication is a maintainer
+# release decision (`docs/design/cpu-kernel-boundaries.md`, "Verification and
+# publication"); `cargo package` is still checked by hand.
+publish = false
+
+[dependencies]
+# The executor fans out through strided-basic's budgeted primitive and reuses
+# its sorted-run topology; a serial `Exec` still runs it inline.
+strided-basic = { workspace = true, features = ["parallel"] }
+num-traits.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+threadteam = { workspace = true, features = ["ledger"] }
+
+[lib]
+bench = false
+
+[[bench]]
+name = "executor"
+harness = false
