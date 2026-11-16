@@ -145,8 +145,46 @@ downstream exhaustive `match`. `strided-view` is still unpublished in the tree (
 `unpublished strided-view 0.8.1`), so no published content changes; whether that body is published as it stands or as a
 `strided-view` minor, and whether `StridedError` gains the attribute, are release decisions for the maintainer.
 
-This is the typed half of #479. The dtype-erased replay (`strided-kernel`) and the segmented-polynomial executor are not
-in it.
+This is the typed half of #479, and the executor that consumes the index for its scattered outputs is the
+`strided-segpoly` section below. The dtype-erased replay (`strided-kernel`) is not in it.
+
+### `strided-segpoly`: the segmented-polynomial executor (#479 part 2)
+
+A new unpublished crate (`publish = false`, so no published content changes) executes a lowered segmented-polynomial
+descriptor. `SegPolyPlan::compile` takes the operations, paths and per-buffer `IndexMode`s together with the inputs' and
+outputs' layouts, and `execute_into` / `execute_acc` compute
+`out[..] (=|+=) Σ_path coeff_path · Π_operand operand[..]` over one batch axis, with that axis read out of a gather list,
+a `RunIndex` scatter or a single shared row instead of being the row itself. The lowering this consumes is the one a
+cuEquivariance-shaped front end produces (one undefined primal per output, `num_segments × u` payload); producing it is
+out of scope, reading it is the whole crate.
+
+Contract points that shape the code. At most one batch axis, else `MultiBatchAxis`. `f32`/`f64` only, with coefficients
+rounded at compile time to the element type (`SegPolyElem` is sealed). A negative or out-of-range gather/scatter index,
+and a batch extent that disagrees between buffers, are typed errors rather than panics. A scattered destination reads
+through the existing `RunIndex`, so the row mapping is the stable one `sort_paths` derives. An empty run writes zero
+under `execute_into` and adds nothing under `execute_acc`. Scratch is the caller's, sized by
+`scratch_len(token budget)`, and a call whose scratch is too small fails with `ScratchTooSmall` instead of truncating a
+sum. Inputs may alias each other; an output may not alias any other buffer, including another output. `compile` rejects
+what the layouts alone can show — an output whose own elements repeat is `NonInjectiveOutputLayout` — while two buffers
+over the same storage stay the caller's obligation, as `run_sum.rs` states it for its plan.
+
+The summation order is part of the result, not an implementation detail. Rows are visited inside their unit in run
+order, paths in descriptor order, rows grouped in fixed `BLOCK_ROWS = 256` blocks whose partials are combined left to
+right after the fork joins. The result is therefore bitwise invariant under the `Exec` budget, the worker count and the
+layout the caller reaches the same array through — not under a change of `BLOCK_ROWS`, which is a constant for that
+reason. The sign of zero in a later block's partial is the one documented exception. One
+`tree_width(..., KernelClass::Map, macs)` fork per call, children partitioned by cumulative row count, no nested forks,
+no atomics and no locks; a counting-allocator test asserts that `execute_into` and `execute_acc` allocate nothing on a
+serial token.
+
+Tests are generated, never hand-written: `tests/fixtures/generate.py` drives a pinned cuEquivariance commit
+(`9ed8c7613a79861415071027249cc458e423be30`) to lower each descriptor and to compute the expected output with its own
+naive executor, and checks in the `.npy` seeds plus a generated `cases.rs`. The cases cover symmetric contractions of
+degree 1, 2 and 3, spherical harmonics (uniform lane extent 1), a jvp and the backward pass of a degree-2 case, and a
+gather+scatter message-passing case with a run of several rows. On top of those, finite differences against the
+analytic derivative, the transpose as a discrete adjoint, one-token and n-token bitwise equality, and the rejection
+table. `benches/executor.rs` measures the fused path against the two-pass alternative (materialise every product, then
+`RunSumPlan`).
 
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
