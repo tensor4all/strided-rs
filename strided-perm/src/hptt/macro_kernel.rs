@@ -258,13 +258,17 @@ pub unsafe fn const_stride1_copy<T: Copy, S: Store<T>>(
 /// targets. The x86 ones, 32 KiB 8-way and the 48 KiB 12-way of Ice Lake and
 /// later / Zen 5, both give 4 KiB, the same `BLOCK_MEMORY_SIZE / L1_WAYS`
 /// that `strided-basic`'s `block::fit_l1_sets` uses ([#287]). Apple silicon
-/// gives 16 KiB (128 KiB 8-way on the P-cores, #466 follow-up); taking 4 KiB
-/// there sends a 4 KiB-multiple row that never aliases to the scalar order,
-/// which measured 1.2-1.8x slower on an M2.
+/// splits the ways: the P-core L1d is 128 KiB 8-way (16 KiB), the E-core
+/// 64 KiB 8-way (8 KiB). The #466 M2 re-run measured a 1.5-5x penalty on the
+/// P-core at an **8 KiB** destination row (`[32,1024]` f64, `[64,2048]` f64)
+/// and recovered half or more of it with the 4 KiB route, while the 4 KiB
+/// rows themselves are not aliases there and lose to the fallback. So the
+/// calibrated constant is 8 KiB, the smaller P/E way: it routes the 8, 16 and
+/// 64 KiB rows and leaves 4 KiB out.
 ///
 /// Only the measured target is specialised: other aarch64 cores (Neoverse,
-/// Cortex-A) also have a 16 KiB way, but nothing here was measured on them,
-/// so they keep the x86 number until a bench says otherwise.
+/// Cortex-A) have 16 KiB P-core ways too, but nothing here was measured on
+/// them, so they keep the x86 number until a bench says otherwise.
 ///
 /// `strided-perm` sits below `strided-basic` and cannot take the constant from
 /// there, so the number is restated here.
@@ -273,7 +277,7 @@ pub unsafe fn const_stride1_copy<T: Copy, S: Store<T>>(
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const L1_WAY_BYTES: usize = crate::BLOCK_MEMORY_SIZE / 8;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const L1_WAY_BYTES: usize = 16 * 1024;
+const L1_WAY_BYTES: usize = 8 * 1024;
 
 /// Ways the blocking targets: the 8-way x86 L1d, and the 8-way Apple P-core
 /// L1d. Only the live-line budget below depends on it.

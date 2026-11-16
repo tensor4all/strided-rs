@@ -336,7 +336,7 @@ fn way_elements(elem_size: usize) -> isize {
 }
 
 /// The order predicate: a row that is a multiple of the L1 way aliases; a
-/// stride of 0 and anything else does not. The way is 4 KiB on x86 and 16 KiB
+/// stride of 0 and anything else does not. The way is 4 KiB on x86 and 8 KiB
 /// on Apple silicon, so the strides are derived from it rather than written
 /// out (#466).
 #[test]
