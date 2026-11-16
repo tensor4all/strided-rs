@@ -637,9 +637,19 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             .max()
             .unwrap_or(0);
         // The lane step is the compiled lane stride, not a hardcoded 1: a caller
-        // may hand a view whose lanes are separated, and a zero stride is how a
-        // narrow buffer broadcasts over the lane axis.
-        let in_lane = (0..num_inputs).map(|buffer| strides[buffer][2]).collect();
+        // may hand a view whose lanes are separated. A unit-lane buffer (lane
+        // extent 1) broadcasts over the `u` lanes, so its step is 0 whatever its
+        // stride: the stride of a length-1 axis is arbitrary in a valid view, and
+        // stepping by it would read `(u - 1) * stride` elements past the buffer.
+        let in_lane = (0..num_inputs)
+            .map(|buffer| {
+                if dims[buffer][2] == 1 {
+                    0
+                } else {
+                    strides[buffer][2]
+                }
+            })
+            .collect();
 
         Ok(Self {
             u,

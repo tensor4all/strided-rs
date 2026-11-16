@@ -6,14 +6,15 @@
 //! destination that must be added once and not once per block, an empty output
 //! beside a full one, an output written by two operations out of descriptor order,
 //! an operation with more operands than the replay tables hold, a reversed batch
-//! stride, and a segment axis whose table cannot be allocated.
+//! stride, a segment axis whose table cannot be allocated, and a unit-lane input
+//! whose (arbitrary) lane stride must not be stepped.
 
 #[allow(dead_code)] // each test binary uses a different part of the harness
 #[path = "support/mod.rs"]
 mod support;
 
 use strided_basic::{Exec, RawStridedMut, RawStridedRef};
-use strided_segpoly::{IndexMode, SegPolyError, SegPolyPlan};
+use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyError, SegPolyPlan, Spec};
 use support::{assert_close, Buffer, Case, Mode, Op, PathSpec};
 
 /// Deterministic payload with mixed magnitudes, so regrouping a sum moves the
@@ -436,4 +437,71 @@ fn an_f32_plan_rounds_the_coefficient_at_compile_time() {
     )
     .expect("the f32 plan executes");
     assert_eq!(output, [16_777_216.0f32 * 2.0]);
+}
+
+#[test]
+fn a_unit_lane_input_broadcasts_whatever_its_lane_stride() {
+    // A lane extent of one broadcasts over the plan's `u` lanes. The stride of a
+    // length-1 axis is arbitrary in a valid view, so the replay must not step by
+    // it: stepping by 8 here would read elements 8, 16 and 24 of the backing
+    // slice, outside the `[1, 1, 1]` view. The backing slice is long enough that
+    // those reads stay inside the allocation and return the sentinel instead of
+    // the broadcast value, so the old replay fails deterministically.
+    let sentinel = 1.0e3f64;
+    let mut input = vec![sentinel; 25];
+    input[0] = 8.0;
+    let input_dims = [1usize, 1, 1];
+    let input_strides = [1isize, 1, 8];
+    let out_dims = [1usize, 1, 4];
+    let out_strides = [4isize, 4, 1];
+
+    let ids = [0u32, 0];
+    let paths = [Path {
+        segments: &ids,
+        coefficient: 1.0,
+    }];
+    let operations = [Operation {
+        buffers: &[0, 1],
+        path_start: 0,
+        num_paths: 1,
+    }];
+    let batched = [IndexMode::Batched];
+    let indexes: [&[IndexMode<'_>]; 2] = [&batched, &batched];
+    let spec = Spec {
+        num_batch_axes: 1,
+        operations: &operations,
+        paths: &paths,
+        indexes: &indexes,
+    };
+    let plan = SegPolyPlan::<f64>::compile(
+        &spec,
+        &[Layout {
+            dims: &input_dims,
+            strides: &input_strides,
+        }],
+        &[Layout {
+            dims: &out_dims,
+            strides: &out_strides,
+        }],
+    )
+    .expect("a unit-lane input with a nonzero lane stride is a valid layout");
+    assert_eq!(plan.u(), 4);
+
+    let input_view =
+        RawStridedRef::new(&input, &input_dims, &input_strides, 0).expect("input view");
+    let mut out = vec![-1.0f64; 4];
+    let mut scratch = vec![0.0f64; plan.scratch_len(1)];
+    {
+        let mut out_view =
+            RawStridedMut::new(&mut out, &out_dims, &out_strides, 0).expect("output view");
+        plan.execute_into(
+            std::slice::from_mut(&mut out_view),
+            &[input_view],
+            &indexes,
+            &mut scratch,
+            Exec::serial(),
+        )
+        .expect("executes");
+    }
+    assert_eq!(out, vec![8.0; 4]);
 }
