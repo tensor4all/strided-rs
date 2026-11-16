@@ -107,7 +107,8 @@ pub unsafe fn macro_kernel_f64(
     }
 }
 
-/// Process a tile of `block_a × block_b` elements using f32 micro-kernels.
+/// Process a tile of `block_a × block_b` elements using f32 micro-kernels,
+/// or the scalar order when the destination aliases the L1 sets.
 ///
 /// # Safety
 ///
@@ -121,12 +122,23 @@ pub unsafe fn macro_kernel_f32(
     ldb: isize,
     block_b: usize,
 ) {
+    // Same defect and route as `macro_kernel_f64`: when the destination row
+    // steps a multiple of the L1 way, the `j`-outer micro-kernel walk keeps
+    // the tile's rows live in one set and refetches each for write
+    // allocation. #466's follow-up measured the same penalty on f32, whose
+    // kernel kept this walk after the f64 fix; the scalar fallback's
+    // `i`-outer order writes each row's run in one visit.
+    if aliases_l1_sets(ldb, std::mem::size_of::<f32>()) {
+        // SAFETY: this function's contract is the fallback's.
+        return macro_kernel_fallback::<f32, PlainStore>(src, lda, block_a, dst, ldb, block_b);
+    }
+
     // SAFETY: (covers the micro-kernel calls and the remainder loops) every
     // `offset` is `i + j * lda` on `src` or `j + i * ldb` on `dst` with
     // `i < block_a` and `j < block_b`: the full tiles start at multiples of
     // `MICRO` below `full_* * MICRO <= block_*`, and the remainder loops stop
     // at `rem_*`. So each access is a tile element under this function's
-    // `# Safety` (macro_kernel.rs:99), and each micro-kernel call gets a full
+    // `# Safety` (macro_kernel.rs:124), and each micro-kernel call gets a full
     // `MICRO` x `MICRO` sub-tile (stride-1 along `i`, rows of `lda`/`ldb`), as
     // `transpose_micro` (micro_kernel/mod.rs:25) requires.
     const MICRO: usize = <ScalarKernel as MicroKernel<f32>>::MICRO; // 8
@@ -273,8 +285,8 @@ const L1_LIVE_LINES_PER_SET: usize = L1_WAYS - L1_WAYS / 4;
 ///
 /// Performs the same transpose as macro_kernel but without micro-kernel
 /// optimization. Used for types other than f64/f32, for every element type
-/// whose store conjugates, and for f64 tiles whose `ldb` aliases the L1 sets
-/// ([`aliases_l1_sets`]), where its store order beats the micro-kernel.
+/// whose store conjugates, and for f64/f32 tiles whose `ldb` aliases the L1
+/// sets ([`aliases_l1_sets`]), where its store order beats the micro-kernel.
 ///
 /// **Store order.** `j` is the destination's stride-1 axis and `i` the axis it
 /// steps by `ldb`. When `ldb` aliases the L1 sets ([`aliases_l1_sets`]) every
