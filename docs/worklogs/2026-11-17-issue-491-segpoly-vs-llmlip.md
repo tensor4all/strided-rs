@@ -95,8 +95,8 @@ property, not a cache artifact). Three reasons it does not extend:
   useful chunks, and per-node work is uneven (degree 30-70), so 4 workers idle.
   llmlip's rayon fan-out is per edge-range.
 * **No intermediate edge array.** segpoly never materializes the
-  `[E, 5 120]` conv_tp output — that is 230 MiB at 128 atoms / 1 840 MiB at 1024
-  in f64 (920 MiB / 20 MiB f32) that llmlip does allocate.
+  `[E, 5 120]` conv_tp output — 230 MiB f64 / 115 MiB f32 at 128 atoms and
+  1 840 MiB / 920 MiB at 1024, which llmlip does allocate.
 
 ## 5. VJP: `bar_x`, `bar_w`, `bar_y`
 
@@ -117,32 +117,36 @@ also given because they say *why*.
 
 Two vectorised plans beat the whole fused llmlip call: `bar_x` 0.34x and
 `bar_w` 0.31x in f64 1T (f32 loses its edge, as in the forward). The
-`bar_edge_attrs` reduction is the opposite extreme — 2.2x in f64 1T, 8-9x in f32
-— and alone accounts for **77-78 %** of the segment's time. It is the only
+`bar_edge_attrs` reduction is the opposite extreme — 2.2x in f64 1T, 6-9x in f32
+— and alone accounts for **72-78 %** of the segment's time. It is the only
 gradient whose lane is a reduction over `(feature, m)` rather than a feature
 vector, so it lowers to the `u = 1` scalar plan with 11 008 paths over
 `N x 5 120` rows: the CG work per byte of output is 128x that of the vectorised
-plans.
+plans. The feature-expanded form of the same reduction would need an
+`[E, 16, 128]` tensor to hold its partial sums (92 MiB f64 / 46 MiB f32 at 128
+atoms, 736 / 368 MiB at 1024); the `u = 1` plan re-derives the terms per path and
+allocates neither.
 
 ## 6. Allocation and memory
 
 | | strided | llmlip |
 | --- | --- | --- |
-| bytes / allocation calls per forward call | **0 / 0** | 2.6-40.2 MiB / 15-1 069 |
+| bytes / allocation calls per forward call | **0 / 0** | 2.6-40.6 MiB / 15-1 069 |
 | bytes / calls per VJP call | **0 / 0** | 29.4-474.2 MiB / 17-1 230 |
-| `VmHWM`, 1024 atoms f64 fwd | 646 MiB | 647 MiB |
-| `VmHWM`, 1024 atoms f64 vjp | 1 514 MiB | 1 510 MiB |
 
 `execute_into` holds the zero-allocation contract of PR #490 for all four plans,
 serially and on a pool (`tests/fidelity.rs::execute_allocates_nothing`). llmlip
-allocates per call, and its count depends on the thread count (238 -> 1 230 at
-4T) because rayon chunks allocate.
+allocates per call, and its count depends on the thread count (46 at 1T,
+238-1 230 at 4T) because rayon chunks allocate.
 
-`VmHWM` is per *process*, so equal peaks above do not mean equal traffic: the
-peak is set by the caller-owned buffers both sides share. The difference is the
-`[E, 5 120]` intermediate, present only on the llmlip side (230/920 MiB at 128
-atoms, 1 840 MiB f64 / 920 MiB f32 at 1024). segpoly's peak is
-`tp_weights + grad_w` because the harness has to hold the outputs it asked for.
+`VmHWM` is per *process* and both sides run in one process per cell, so it is
+reported per cell rather than per side: 646 MiB for the forward and 1 514 MiB for
+the VJP at 1 024 atoms in f64 (85 / 192 MiB at 128 atoms). That peak is set by the
+caller-owned buffers both sides share — `tp_weights` plus the outputs — not by the
+kernel. What differs is the `[E, 5 120]` intermediate, present only on the llmlip
+side: 230 MiB f64 / 115 MiB f32 at 128 atoms and 1 840 / 920 MiB at 1024.
+segpoly's peak is `tp_weights + grad_w` because the harness has to hold the
+outputs it asked for.
 
 ## 7. Numerics
 
@@ -152,7 +156,8 @@ kernels, not of models:
 | cell | max abs difference | note |
 | --- | --- | --- |
 | f64 fwd, 128 / 1024 atoms | 4.4e-16 / 1.8e-12 | elementwise relative up to 2e-5 where terms cancel |
-| f64 VJP `bar_x` / `bar_w` / `bar_y` | 1.4e-13 / 0 / 1.4e-13 | `bar_w` reached 0 in 1T cells |
+| f64 VJP, 128 atoms | 1.4e-13 / 0 / 1.4e-13 | `bar_w` came out identical in the 1T cells |
+| f64 VJP, 1024 atoms | 2.3e-10 / 3.4e-10 / 3.4e-10 | |
 | f32 fwd, 128 / 1024 atoms | 2.4e-7 / 7.3e-4 | f32 rounding of a 1 024-atom sum |
 | f32 VJP | elementwise relative 5.7e-7..1.1e-5 | |
 
