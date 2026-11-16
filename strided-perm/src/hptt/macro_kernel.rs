@@ -254,16 +254,30 @@ pub unsafe fn const_stride1_copy<T: Copy, S: Store<T>>(
 /// A destination row that is a multiple of this many bytes from its
 /// neighbour puts every row's cache line of one tile in the same L1 set.
 ///
-/// The way size of the 32 KiB 8-way L1 data cache the blocking targets, the
-/// same `BLOCK_MEMORY_SIZE / L1_WAYS` that `strided-basic`'s
-/// `block::fit_l1_sets` uses ([#287]); 48 KiB 12-way L1d caches (Ice Lake and
-/// later, Zen 5) share the 4 KiB way. `strided-perm` sits below
-/// `strided-basic` and cannot take the constant from there, so the number is
-/// restated here.
+/// The way size (`cache bytes / ways`) of the L1 data caches the blocking
+/// targets. The x86 ones, 32 KiB 8-way and the 48 KiB 12-way of Ice Lake and
+/// later / Zen 5, both give 4 KiB, the same `BLOCK_MEMORY_SIZE / L1_WAYS`
+/// that `strided-basic`'s `block::fit_l1_sets` uses ([#287]). Apple silicon
+/// gives 16 KiB (128 KiB 8-way on the P-cores, #466 follow-up); taking 4 KiB
+/// there sends a 4 KiB-multiple row that never aliases to the scalar order,
+/// which measured 1.2-1.8x slower on an M2.
+///
+/// Only the measured target is specialised: other aarch64 cores (Neoverse,
+/// Cortex-A) also have a 16 KiB way, but nothing here was measured on them,
+/// so they keep the x86 number until a bench says otherwise.
+///
+/// `strided-perm` sits below `strided-basic` and cannot take the constant from
+/// there, so the number is restated here.
 ///
 /// [#287]: https://github.com/tensor4all/strided-rs/issues/287
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+const L1_WAY_BYTES: usize = crate::BLOCK_MEMORY_SIZE / 8;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const L1_WAY_BYTES: usize = 16 * 1024;
+
+/// Ways the blocking targets: the 8-way x86 L1d, and the 8-way Apple P-core
+/// L1d. Only the live-line budget below depends on it.
 const L1_WAYS: usize = 8;
-const L1_WAY_BYTES: usize = crate::BLOCK_MEMORY_SIZE / L1_WAYS;
 
 /// Whether `stride` steps between rows that land in one L1 set
 /// (tensor4all/strided-rs#466).
