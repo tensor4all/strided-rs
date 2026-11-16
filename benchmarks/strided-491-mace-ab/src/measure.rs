@@ -1,4 +1,12 @@
 //! Wall time, allocation and peak-RSS measurement shared by both sides.
+//!
+//! Two rules this module exists for:
+//!
+//! * A per-call number is never an integer division of a total. Totals and the
+//!   exact timed-call count are kept, and the per-call figure is the ratio of
+//!   the two as an `f64`, so a handful of bytes per call cannot truncate to 0.
+//! * The sides of a cell are timed in a round-robin, one timed round per side per
+//!   sample, so neither side sits in a different slice of the machine's drift.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,14 +53,14 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-/// Allocation counters at one instant.
+/// Exact allocation totals over every timed call of one side.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Alloc {
-    /// Bytes allocated since the last reset.
+    /// Bytes allocated, summed over the timed calls.
     pub bytes: u64,
-    /// Allocation calls since the last reset.
+    /// Allocation calls, summed over the timed calls.
     pub calls: u64,
-    /// Peak live bytes since the last reset.
+    /// Peak live bytes inside one timed call.
     pub peak_live: u64,
 }
 
@@ -86,53 +94,103 @@ pub fn peak_rss_bytes() -> u64 {
 }
 
 /// One measured side: wall time per call and the allocations inside it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Measured {
     pub median_ns: f64,
     pub min_ns: f64,
     pub max_ns: f64,
+    /// Exact totals over `calls` timed calls.
     pub alloc: Alloc,
+    /// Timed calls this side ran: `samples * inner`.
+    pub calls: u64,
     pub samples: usize,
+    /// Calls timed together per sample.
+    pub inner: usize,
 }
 
-/// Time `run` until one sample spans `target`, then take `samples` medians.
-pub fn measure<F: FnMut()>(target: Duration, samples: usize, mut run: F) -> Measured {
-    // Warm up: at least one call, then until one call is long enough to time.
-    let mut inner = 1usize;
-    loop {
-        let start = Instant::now();
-        for _ in 0..inner {
-            run();
-        }
-        if start.elapsed() >= target || inner >= 1 << 20 {
-            break;
-        }
-        inner *= 2;
+impl Measured {
+    /// Bytes per call, unrounded.
+    #[must_use]
+    pub fn bytes_per_call(&self) -> f64 {
+        self.alloc.bytes as f64 / self.calls.max(1) as f64
     }
-    let mut per_sample = Vec::with_capacity(samples);
-    reset_alloc();
+
+    /// Allocation calls per call, unrounded.
+    #[must_use]
+    pub fn alloc_calls_per_call(&self) -> f64 {
+        self.alloc.calls as f64 / self.calls.max(1) as f64
+    }
+}
+
+/// Time every side in a round-robin and return one [`Measured`] per side.
+///
+/// Each side is warmed until one timed round spans `target`; the sample loop
+/// then times side 0, side 1, ... once per sample, so all sides see the same
+/// sequence of machine states.
+#[must_use]
+pub fn interleaved(
+    target: Duration,
+    samples: usize,
+    sides: &mut [&mut dyn FnMut()],
+) -> Vec<Measured> {
+    let count = sides.len();
+    let mut inner = vec![1usize; count];
+    for (index, side) in sides.iter_mut().enumerate() {
+        loop {
+            let start = Instant::now();
+            for _ in 0..inner[index] {
+                side();
+            }
+            if start.elapsed() >= target || inner[index] >= 1 << 20 {
+                break;
+            }
+            inner[index] *= 2;
+        }
+    }
+
+    let mut per_sample = vec![Vec::with_capacity(samples); count];
+    let mut totals = vec![Alloc::default(); count];
     for _ in 0..samples {
-        let start = Instant::now();
-        for _ in 0..inner {
-            run();
+        for (index, side) in sides.iter_mut().enumerate() {
+            reset_alloc();
+            let start = Instant::now();
+            for _ in 0..inner[index] {
+                side();
+            }
+            let elapsed = start.elapsed();
+            let alloc = alloc_snapshot();
+            per_sample[index].push(elapsed.as_secs_f64() * 1e9 / inner[index] as f64);
+            totals[index].bytes += alloc.bytes;
+            totals[index].calls += alloc.calls;
+            totals[index].peak_live = totals[index].peak_live.max(alloc.peak_live);
         }
-        let elapsed = start.elapsed();
-        per_sample.push(elapsed.as_secs_f64() * 1e9 / inner as f64);
     }
-    let alloc = alloc_snapshot();
-    let mut sorted = per_sample.clone();
-    sorted.sort_by(|left, right| left.total_cmp(right));
-    Measured {
-        median_ns: median(&mut per_sample.clone()),
-        min_ns: sorted.first().copied().unwrap_or(0.0),
-        max_ns: sorted.last().copied().unwrap_or(0.0),
-        alloc: Alloc {
-            bytes: alloc.bytes / (samples * inner) as u64,
-            calls: alloc.calls / (samples * inner) as u64,
-            peak_live: alloc.peak_live,
-        },
-        samples,
-    }
+
+    per_sample
+        .into_iter()
+        .zip(totals)
+        .enumerate()
+        .map(|(index, (mut nanoseconds, alloc))| {
+            nanoseconds.sort_by(|left, right| left.total_cmp(right));
+            Measured {
+                median_ns: median(&mut nanoseconds.clone()),
+                min_ns: nanoseconds.first().copied().unwrap_or(0.0),
+                max_ns: nanoseconds.last().copied().unwrap_or(0.0),
+                alloc,
+                calls: (samples * inner[index]) as u64,
+                samples,
+                inner: inner[index],
+            }
+        })
+        .collect()
+}
+
+/// Time one side. Thin wrapper over [`interleaved`] for single-side figures.
+#[must_use]
+pub fn measure(target: Duration, samples: usize, run: &mut dyn FnMut()) -> Measured {
+    interleaved(target, samples, &mut [run])
+        .pop()
+        .expect("one side")
 }
 
 #[must_use]
