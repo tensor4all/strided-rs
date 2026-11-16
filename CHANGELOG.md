@@ -116,6 +116,38 @@ the same: column-major over the given axes, or tile by tile for a destination pr
 model tiles. A successful call allocates nothing at any rank. There is no `_uninit` form: with `D = MaybeUninit<T>` the
 destination is initialized when `f` writes every slot. The parallel entries keep their bounds.
 
+### `strided-basic`: `RunSumPlan`, the sorted-run reduction (#479)
+
+`RunSumPlan` computes `dest[r, ..] (=|+=) Σ_{j in ptr[r]..ptr[r+1]} src[perm[j], ..]` over CSR runs, the edge -> node
+accumulation of a message-passing loop. `RunIndex::from_dest(dest, num_runs)` derives that topology from an unsorted
+destination list with a stable counting sort, so rows keep their order inside a run; `RunIndex::from_ptr(ptr)` takes
+offsets a caller already grouped. Both allocate at topology time, and one index can be replayed by any number of plans.
+
+`RunSumPlan::compile(src_dims, src_strides, dest_dims, dest_strides, &runs)` proves the layout facts it can without the
+buffers — matching strides and ranks, the two row extents against `runs`, the trailing extents, a checked element count,
+and an injective destination layout — and fuses the payload traversal. `execute_into` / `execute_acc` take a
+`RawStridedMut`, a `RawStridedRef`, the index and an `Exec`, and allocate nothing while the payload fuses to at most
+eight axes; a payload of more than eight fused axes walks through `kernel_nd_inner_iterative`, whose cursor is a `Vec`
+by contract, as in the `replay_*` entries.
+
+A run is summed by exactly one worker, in increasing `j`, and destination rows are disjoint between runs, so the
+partition cannot change a result: every budget produces identical bits, on `f32`, `f64` and complex types alike. A run
+with no rows writes zeros under `execute_into` and adds nothing under `execute_acc`; the two agree bit for bit on a
+destination seeded with `T::zero()`.
+
+Two error variants carry the new preconditions, `StridedError::InvalidRunIndex` for offsets that do not start at zero or
+step downwards, and `StridedError::IndexOutOfRange { index, runs }` for a destination index outside `0..runs`. Validation
+reuses the existing `StrideLengthMismatch`, `RankMismatch`, `ShapeMismatch`, `OffsetOverflow`,
+`NonInjectiveOutputLayout` and `PlanLayoutMismatch`.
+
+The two `strided-view` variants are an addition to a `StridedError` that is not `#[non_exhaustive]`, so they break a
+downstream exhaustive `match`. `strided-view` is still unpublished in the tree (`scripts/published_identity.py` reports
+`unpublished strided-view 0.8.1`), so no published content changes; whether that body is published as it stands or as a
+`strided-view` minor, and whether `StridedError` gains the attribute, are release decisions for the maintainer.
+
+This is the typed half of #479. The dtype-erased replay (`strided-kernel`) and the segmented-polynomial executor are not
+in it.
+
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
 `index_order_into(strides, out)` writes the stride order into caller storage and returns `StrideLengthMismatch` when

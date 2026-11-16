@@ -191,6 +191,19 @@ pub enum StridedError {
     #[error("destination overlaps input {input}")]
     OverlappingInputOutput { input: usize },
 
+    /// A prepared run index's offsets are not a monotone prefix sum over its rows.
+    ///
+    /// Raised when run offsets do not start at zero or step downwards.
+    #[error("run offsets are not a monotone prefix sum over the rows")]
+    InvalidRunIndex,
+
+    /// A gathered destination index lies outside the run range.
+    ///
+    /// Raised when an index is negative or is not below the run count, including
+    /// any index when there are no runs.
+    #[error("index {index} out of range for {runs} runs")]
+    IndexOutOfRange { index: i64, runs: usize },
+
     /// Integer division or remainder encountered a zero divisor.
     #[error("integer {op} encountered a zero divisor")]
     IntegerDivisionByZero { op: &'static str },
