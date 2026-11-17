@@ -29,9 +29,12 @@ hundreds of MiB at production sizes).
 - **Deterministic.** An output element is a sum whose association is fixed by the
   descriptor, the inputs and the topology: rows in run order, operations in
   descriptor order, paths in `sort_paths(-1)` order, and a unit with more rows
-  than `BLOCK_ROWS` as fixed blocks combined left to right. Every `Exec` budget,
-  worker count and destination layout produces identical bits (up to the sign of
-  zero, which a zero-seeded block partial can normalise).
+  than `BLOCK_ROWS` as fixed blocks combined left to right. A destination whose
+  lane extent is 1 while the inputs' lane extent is `u` is a lane *reduction*: it
+  sums each row's `u` lanes in increasing lane order, after the block partials are
+  combined. Every `Exec` budget, worker count and destination layout produces
+  identical bits (up to the sign of zero, which a zero-seeded block partial can
+  normalise).
 - **No atomics, no locks, no allocation.** One task owns each destination row
   family, and the caller supplies the scratch.
 - **Typed errors, no panics** on caller-reachable paths: indices, extents, segment
@@ -119,6 +122,12 @@ Per buffer, per batch axis (one axis in this increment):
 | `Gather(&[i32])` / `Gather64` | row `idx[b]` | — |
 | `Scatter(&RunIndex)` | — | sorted-run accumulation into row `run(b)` |
 
+Lane extents are uniform across a plan's buffers, except that an output may have a
+lane extent of 1, which sums the row's lanes (a lane reduction). An input with lane
+extent 1 is broadcast along the lane axis; an input whose lane stride is neither 0
+nor 1 is copied into a contiguous tile before the kernel reads it, so the
+arithmetic stays per-lane and the copy cannot move a bit.
+
 A `Shared` output is the transpose of a shared input, i.e. the gradient of a
 shared weight; it is a batch reduction and follows the same fixed order.
 
@@ -126,8 +135,9 @@ shared weight; it is a batch reduction and follows the same fixed order.
 
 Building the descriptor from a polynomial (a separate `segpoly-desc` crate),
 element-indexed inputs (`REPEATED` / `indexed_linear`), half precision, CUDA, and
-shared partial products for degree 2-3 operands. The lane loop is written for
-auto-vectorisation but does not dispatch a SIMD kernel.
+shared partial products for degree 2-3 operands. Operations with four or more
+operands take the scalar per-lane loop (`shortcut:` in `plan/exec.rs`); one to
+three operands run a runtime-dispatched SIMD body.
 
 ## Divergences from the reference
 

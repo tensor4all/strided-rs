@@ -41,10 +41,14 @@ pub enum SegPolyError {
         u: usize,
     },
 
-    /// An output buffer's lane extent is one while the plan's uniform extent is
-    /// larger: an output element is written, never broadcast over lanes
-    /// (decision D5).
-    #[error("output buffer {buffer} has lane extent {lane} but the plan's extent is {u}")]
+    /// An output buffer's lane extent is neither the plan's uniform extent nor
+    /// one. An extent of one is accepted -- it is a *lane reduction*, the row's `u`
+    /// lanes summed in increasing order -- but nothing between 1 and `u` is a
+    /// destination shape this executor has (decision D5).
+    #[error(
+        "output buffer {buffer} has lane extent {lane}; the plan's uniform extent is {u} \
+         (1 or {u} accepted, 1 being a lane reduction)"
+    )]
     OutputLaneBroadcast {
         buffer: usize,
         lane: usize,

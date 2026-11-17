@@ -186,6 +186,27 @@ analytic derivative, the transpose as a discrete adjoint, one-token and n-token 
 table. `benches/executor.rs` measures the fused path against the two-pass alternative (materialise every product, then
 `RunSumPlan`).
 
+#### A dispatched lane kernel and a lane reduction (#496)
+
+The lane loop is no longer left to auto-vectorisation. Operations with one to three operands run a
+`pulp::Arch::new().dispatch(...)` body (`src/simd.rs`: `AxpyF64` / `AxpyF32`, `f64` 8 and `f32` 16 lanes on an
+AVX-512 host, `1` on a scalar target), so a baseline `x86-64` build reaches AVX2 and AVX-512 at run time with no
+`target_arch` case, no width constant and no `-C target-cpu` requirement; `scripts/check-runtime-simd-dispatch.py`
+disassembles both levels, and `lane_width::<T>()` reports the width a call selected. The body multiplies and adds as
+two operations -- never `mul_add` -- and keeps the coefficient-first association, so its result is bit-identical to the
+scalar loop; an operand with a lane extent of 1 is splatted and one with a lane stride other than 0 or 1 is copied into
+a per-worker tile first. Four-or-more-operand operations keep the scalar loop.
+
+A destination whose own lane extent is 1 while the inputs' is `u` used to be rejected (`OutputLaneBroadcast`) and is now
+the lane reduction it reads as: it sums each row's `u` lanes in increasing lane order after the block partials are
+combined, which extends the documented order by one rule and leaves the rest in place. The VJP wrt the spherical
+harmonics of a MACE layer-1 CG block, previously 11 008 scalar paths over `N x 5 120` rows, is 86 paths of 128 lanes:
+11-16x faster in the layer-1 A/B and no `[E, 16, 128]` intermediate, with `f64` `bar_y` at the rounding level of the
+sum (1.7e-15 -> 2.2e-15 relative to the scale at 128 atoms) and `f32` better (3.4e-6 -> 1.0e-6).
+`scratch_len` now also covers one pack area per worker and reports the new floor through `ScratchTooSmall`. The
+measurements, the per-cell before/after tables, the allocation evidence and the thread sweep are in
+[`docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md`](docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md).
+
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
 `index_order_into(strides, out)` writes the stride order into caller storage and returns `StrideLengthMismatch` when

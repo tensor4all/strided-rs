@@ -63,10 +63,12 @@ fn rejects_disagreeing_lane_extents() {
 }
 
 #[test]
-fn rejects_a_lane_broadcast_output() {
+fn rejects_an_output_lane_that_is_neither_one_nor_u() {
+    // A lane extent of 1 on an output is a lane reduction (see the test below); a
+    // lane extent between 1 and `u` is neither that nor the uniform extent.
     let x = [2, 2, 3];
     let strides = [6, 3, 1];
-    let y = [2, 2, 1];
+    let y = [2, 2, 2];
     let error = compile_error(
         &spec(&[], &[], &[BATCHED, BATCHED]),
         &[layout(&x, &strides)],
@@ -74,8 +76,428 @@ fn rejects_a_lane_broadcast_output() {
     );
     assert!(matches!(
         error,
-        SegPolyError::OutputLaneBroadcast { lane: 1, u: 3, .. }
+        SegPolyError::OutputLaneBroadcast { lane: 2, u: 3, .. }
     ));
+}
+
+/// Lanes in the lane-reduction cases: more than one vector on every host here, so
+/// the vector loop *and* its scalar remainder run.
+const LANE_U: usize = 19;
+/// Three `Batched` buffers, the mode lists for the single-path cases below.
+const INDEXES_3: [&[IndexMode<'_>]; 3] = [BATCHED, BATCHED, BATCHED];
+/// Batch rows in the lane-reduction cases. Their destinations are `Batched`, so a
+/// unit is one row and no block partials arise; this only has to exceed one unit
+/// and one block so the row stride and the scheduler's row split are exercised.
+/// `a_shared_lane_reduction_combines_block_partials_first` owns the block case.
+const LANE_ROWS: usize = 2 * BLOCK_ROWS + 5;
+
+/// `x[b, s, l]` = `c · x · w` summed over the plans paths, then over the lanes:
+/// the documented order, in scalar code.
+///
+/// Lane `l` accumulates its own paths in plan order and only then are the lanes
+/// added in increasing order, with the seed as lane 0's initial value. (A unit
+/// here is one row, so there is no block combination to model; that order is the
+/// subject of the shared case below.) A reference that sums the lanes *inside* a path
+/// and then adds path totals is a different association: `[1e16, 1]` and
+/// `[-1e16, 1]` give 2 in this order and 0 in that one.
+// A reference is a transcription of the order; a struct would only rename the
+// parameters.
+#[allow(clippy::too_many_arguments)]
+fn lane_reference(
+    rows: usize,
+    segments: usize,
+    u: usize,
+    span: usize,
+    lane_stride: isize,
+    x: &[f64],
+    x_offset: isize,
+    w: &[f64],
+    paths: &[[u32; 3]],
+    coeffs: &[f64],
+    seed: f64,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; rows * segments];
+    for row in 0..rows {
+        let mut lanes = vec![vec![0.0f64; u]; segments];
+        for lane in lanes.iter_mut() {
+            lane[0] = seed;
+        }
+        for (path, &coefficient) in paths.iter().zip(coeffs.iter()) {
+            let (sx, sw, sy) = (path[0] as usize, path[1] as usize, path[2] as usize);
+            for (lane, slot) in lanes[sy].iter_mut().enumerate() {
+                let index = row * segments * span
+                    + sx * span
+                    + (x_offset + lane as isize * lane_stride).unsigned_abs();
+                let term = coefficient * x[index] * w[sw * u + lane];
+                *slot += term;
+            }
+        }
+        for (segment, lane_sums) in lanes.iter().enumerate() {
+            let mut total = lane_sums[0];
+            for &value in &lane_sums[1..] {
+                total += value;
+            }
+            out[row * segments + segment] = total;
+        }
+    }
+    out
+}
+
+/// A lane-reduced plan and the same sum in the documented order.
+///
+/// `lane_stride` is the x view's lane stride: 1 reads it in place, anything else
+/// makes the replay pack it (0 is a splat, covered separately).
+fn lane_reduction_case(lane_stride: isize, budget: usize, seed: f64) -> (Vec<f64>, Vec<f64>) {
+    let (rows, segments, u) = (LANE_ROWS, 2usize, LANE_U);
+    let span = (u - 1) * lane_stride.unsigned_abs() + 1;
+    // Cancellation-sensitive payload: the association is visible in the bits.
+    let x: Vec<f64> = (0..rows * segments * span)
+        .map(|index| match index % 4 {
+            0 => 1e16,
+            1 => -1e16,
+            2 => 1.0,
+            _ => (index % 7) as f64 * 0.5 - 1.0,
+        })
+        .collect();
+    let w: Vec<f64> = (0..segments * u)
+        .map(|index| 1.0 + (index % 5) as f64 * 0.25)
+        .collect();
+    let mut out = vec![seed; rows * segments];
+    let x_dims = [rows, segments, u];
+    let x_strides = [(segments * span) as isize, span as isize, lane_stride];
+    // A negative lane stride walks backwards, so the view starts at the last lane.
+    let x_offset = if lane_stride < 0 {
+        (u as isize - 1) * -lane_stride
+    } else {
+        0
+    };
+    let w_dims = [1usize, segments, u];
+    let w_strides = [u as isize, u as isize, 1];
+    let out_dims = [rows, segments, 1];
+    let out_strides = [segments as isize, 1, 1];
+    // (x segment, w segment, out segment); the out segment ids interleave so the
+    // compile-time sort has to reorder the accumulation.
+    let paths: [[u32; 3]; 4] = [[0, 0, 0], [1, 0, 1], [0, 1, 0], [1, 1, 1]];
+    let coeffs = [1.0f64, -0.5, 0.25, 2.0];
+    let operations = [Operation {
+        buffers: &[0, 1, 2],
+        path_start: 0,
+        num_paths: paths.len() as u32,
+    }];
+    let path_list: Vec<Path<'_>> = paths
+        .iter()
+        .zip(coeffs.iter())
+        .map(|(segments, &coefficient)| Path {
+            segments,
+            coefficient,
+        })
+        .collect();
+    let descriptor = spec(&operations, &path_list, &[BATCHED, SHARED, BATCHED]);
+    let plan = SegPolyPlan::<f64>::compile(
+        &descriptor,
+        &[
+            Layout {
+                dims: &x_dims,
+                strides: &x_strides,
+            },
+            layout(&w_dims, &w_strides),
+        ],
+        &[layout(&out_dims, &out_strides)],
+    )
+    .expect("a lane-unit output is a lane reduction");
+    let mut scratch = vec![0.0f64; plan.scratch_len(budget)];
+    let inputs = [
+        RawStridedRef::new(&x, &x_dims, &x_strides, x_offset).expect("x view"),
+        RawStridedRef::new(&w, &w_dims, &w_strides, 0).expect("w view"),
+    ];
+    {
+        let mut outputs = [RawStridedMut::new(&mut out, &out_dims, &out_strides, 0).expect("out")];
+        // A seed means `execute_acc`; otherwise the destination starts at zero.
+        if seed == 0.0 {
+            plan.execute_into(
+                &mut outputs,
+                &inputs,
+                descriptor.indexes,
+                &mut scratch,
+                Exec::serial(),
+            )
+            .expect("executes");
+        } else {
+            plan.execute_acc(
+                &mut outputs,
+                &inputs,
+                descriptor.indexes,
+                &mut scratch,
+                Exec::serial(),
+            )
+            .expect("executes");
+        }
+    }
+    let expected = lane_reference(
+        rows,
+        segments,
+        u,
+        span,
+        lane_stride,
+        &x,
+        x_offset,
+        &w,
+        &paths,
+        &coeffs,
+        seed,
+    );
+    (out, expected)
+}
+
+#[test]
+fn a_lane_unit_output_sums_its_lanes_in_order() {
+    // The vector loop and its remainder both run: `LANE_U` is not a multiple of
+    // any supported width.
+    let (out, expected) = lane_reduction_case(1, 1, 0.0);
+    assert_eq!(
+        out, expected,
+        "lane reduction must follow the documented order"
+    );
+}
+
+#[test]
+fn a_packed_lane_matches_the_scalar_reference_bit_for_bit() {
+    // A lane stride that is neither 0 nor 1 is packed into a tile first. Packing is
+    // a copy, so the result must be the same bits the scalar order gives.
+    for stride in [1, 2, 3, 5, -1, -2] {
+        let (out, expected) = lane_reduction_case(stride, 1, 0.0);
+        assert_eq!(
+            out, expected,
+            "lane stride {stride} did not match the reference"
+        );
+    }
+}
+
+#[test]
+fn a_seeded_lane_reduction_adds_the_seed_once() {
+    // `execute_acc` keeps the destination and adds this call's sum to it; a lane
+    // reduction reads the destination as lane 0's first term, so the seed enters
+    // the sum exactly once.
+    let seed = 0.75f64;
+    for stride in [1, 3] {
+        let (out, expected) = lane_reduction_case(stride, 1, seed);
+        assert_eq!(
+            out, expected,
+            "lane stride {stride} seeded reduction differs"
+        );
+    }
+}
+
+/// `y[0, s, l] = Σ_paths c · x[0, s, l] · w[0, s, l]` with x's lane stride given:
+/// the three lane classifications (slice, splat, pack) as the plan sees them.
+///
+/// `x_operands = 4` builds `x · x · x · x · w` instead -- arity six with the
+/// output, past the lane kernel's three, so the scalar fallback takes it.
+fn single_path_plan(
+    u: usize,
+    x_lane_stride: isize,
+    x_lane_extent: usize,
+    x_operands: usize,
+) -> (SegPolyPlan<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let segments = 2usize;
+    let span = (u - 1) * x_lane_stride.unsigned_abs() + 1;
+    let x_len = segments * span;
+    let x: Vec<f64> = (0..x_len).map(|index| 1.0 + index as f64).collect();
+    let w: Vec<f64> = (0..segments * u)
+        .map(|index| 1.0 + index as f64 * 0.5)
+        .collect();
+    let out = vec![0.0f64; segments * u];
+    let x_dims = [1usize, segments, x_lane_extent];
+    let x_strides = [
+        segments as isize * span as isize,
+        span as isize,
+        x_lane_stride,
+    ];
+    let w_dims = [1usize, segments, u];
+    let w_strides = [u as isize, u as isize, 1];
+    let out_dims = [1usize, segments, u];
+    let out_strides = [u as isize, u as isize, 1];
+    let buffers: Vec<u32> = if x_operands == 4 {
+        vec![0, 0, 0, 0, 1, 2]
+    } else {
+        vec![0, 1, 2]
+    };
+    // One segment id per operand, all the same: `Σ c · x · ... · w`.
+    let seg_lists: Vec<Vec<u32>> = (0..segments)
+        .map(|segment| vec![segment as u32; buffers.len()])
+        .collect();
+    let paths: Vec<Path<'_>> = seg_lists
+        .iter()
+        .map(|segments| Path {
+            segments,
+            coefficient: 1.0,
+        })
+        .collect();
+    let operations = [Operation {
+        buffers: &buffers,
+        path_start: 0,
+        num_paths: paths.len() as u32,
+    }];
+    let indexes: Vec<&[IndexMode<'_>]> = (0..3).map(|_| BATCHED).collect();
+    let plan = SegPolyPlan::<f64>::compile(
+        &spec(&operations, &paths, &indexes),
+        &[
+            Layout {
+                dims: &x_dims,
+                strides: &x_strides,
+            },
+            layout(&w_dims, &w_strides),
+        ],
+        &[layout(&out_dims, &out_strides)],
+    )
+    .expect("compiles");
+    (plan, x, w, out)
+}
+
+#[test]
+fn a_stride_zero_lane_is_a_broadcast_not_a_pack() {
+    // Every lane reads the same element, which is a splat: the replay must read one
+    // value, not `u` contiguous lanes (or a packed tile at buffer-space offsets).
+    let (u, segments) = (4usize, 2usize);
+    let (plan, x, w, mut out) = single_path_plan(u, 0, u, 1);
+    let x_dims = [1usize, segments, u];
+    let x_strides = [segments as isize, 1, 0];
+    let w_dims = [1usize, segments, u];
+    let w_strides = [u as isize, u as isize, 1];
+    let out_dims = [1usize, segments, u];
+    let out_strides = [u as isize, u as isize, 1];
+    let x_span = segments;
+    let x: Vec<f64> = x[..x_span].to_vec();
+    let mut scratch = vec![0.0f64; plan.scratch_len(1)];
+    let inputs = [
+        RawStridedRef::new(&x, &x_dims, &x_strides, 0).expect("x view"),
+        RawStridedRef::new(&w, &w_dims, &w_strides, 0).expect("w view"),
+    ];
+    {
+        let mut outputs = [RawStridedMut::new(&mut out, &out_dims, &out_strides, 0).expect("out")];
+        plan.execute_into(
+            &mut outputs,
+            &inputs,
+            &INDEXES_3,
+            &mut scratch,
+            Exec::serial(),
+        )
+        .expect("executes");
+    }
+    let mut expected = Vec::new();
+    for segment in 0..segments {
+        for lane in 0..u {
+            expected.push(x[segment] * w[segment * u + lane]);
+        }
+    }
+    assert_eq!(out, expected, "a stride-zero lane must read one element");
+}
+
+#[test]
+fn a_unit_lane_plan_keeps_the_buffer_strides() {
+    // `u = 1`: no lane reduction, no packing, and the offsets stay the buffer's own
+    // segment stride even though the lane stride is not 1.
+    let segments = 3usize;
+    let x_dims = [1usize, segments, 1];
+    let x_strides = [segments as isize * 4, 4, 2];
+    let x: Vec<f64> = (0..(segments - 1) * 4 + 1)
+        .map(|index| index as f64)
+        .collect();
+    let w_dims = [1usize, segments, 1];
+    let w_strides = [segments as isize, 1, 1];
+    let w: Vec<f64> = vec![2.0, 3.0, 5.0];
+    let out_dims = [1usize, segments, 1];
+    let out_strides = [segments as isize, 1, 1];
+    let mut out = vec![0.0f64; segments];
+    let seg_lists: Vec<[u32; 3]> = (0..segments).map(|segment| [segment as u32; 3]).collect();
+    let paths: Vec<Path<'_>> = seg_lists
+        .iter()
+        .map(|segments| Path {
+            segments,
+            coefficient: 1.0,
+        })
+        .collect();
+    let operations = [Operation {
+        buffers: &[0, 1, 2],
+        path_start: 0,
+        num_paths: segments as u32,
+    }];
+    let plan = SegPolyPlan::<f64>::compile(
+        &spec(&operations, &paths, &[BATCHED, BATCHED, BATCHED]),
+        &[
+            Layout {
+                dims: &x_dims,
+                strides: &x_strides,
+            },
+            layout(&w_dims, &w_strides),
+        ],
+        &[layout(&out_dims, &out_strides)],
+    )
+    .expect("compiles");
+    let mut scratch = vec![0.0f64; plan.scratch_len(1)];
+    let inputs = [
+        RawStridedRef::new(&x, &x_dims, &x_strides, 0).expect("x view"),
+        RawStridedRef::new(&w, &w_dims, &w_strides, 0).expect("w view"),
+    ];
+    {
+        let mut outputs = [RawStridedMut::new(&mut out, &out_dims, &out_strides, 0).expect("out")];
+        plan.execute_into(
+            &mut outputs,
+            &inputs,
+            &INDEXES_3,
+            &mut scratch,
+            Exec::serial(),
+        )
+        .expect("executes");
+    }
+    let expected: Vec<f64> = (0..segments).map(|s| x[s * 4] * w[s]).collect();
+    assert_eq!(
+        out, expected,
+        "a unit lane plan must read its buffer strides"
+    );
+}
+
+#[test]
+fn a_deep_operation_reads_the_buffer_offsets() {
+    // Five operands, so the scalar fallback -- which walks the buffer it names --
+    // takes this path: its offsets must stay in buffer space even though the lane
+    // stride is 2.
+    let (u, segments) = (3usize, 2usize);
+    let (plan, x, _, mut out) = single_path_plan(u, 2, u, 4);
+    let span = (u - 1) * 2 + 1;
+    let x_dims = [1usize, segments, u];
+    let x_strides = [segments as isize * span as isize, span as isize, 2];
+    let w_dims = [1usize, segments, u];
+    let w_strides = [u as isize, u as isize, 1];
+    let out_dims = [1usize, segments, u];
+    let out_strides = [u as isize, u as isize, 1];
+    let x = &x[..segments * span];
+    let w: Vec<f64> = (0..segments * u).map(|index| 1.0 + index as f64).collect();
+    let mut scratch = vec![0.0f64; plan.scratch_len(1)];
+    let inputs = [
+        RawStridedRef::new(x, &x_dims, &x_strides, 0).expect("x view"),
+        RawStridedRef::new(&w, &w_dims, &w_strides, 0).expect("w view"),
+    ];
+    {
+        let mut outputs = [RawStridedMut::new(&mut out, &out_dims, &out_strides, 0).expect("out")];
+        plan.execute_into(
+            &mut outputs,
+            &inputs,
+            &INDEXES_3,
+            &mut scratch,
+            Exec::serial(),
+        )
+        .expect("executes");
+    }
+    // `x * x * x * x` along the lane stride, then `* w`.
+    let mut expected = Vec::new();
+    for segment in 0..segments {
+        for lane in 0..u {
+            let value = x[segment * span + lane * 2];
+            expected.push(value * value * value * value * w[segment * u + lane]);
+        }
+    }
+    assert_eq!(out, expected, "the fallback must use buffer-space offsets");
 }
 
 #[test]
@@ -432,6 +854,73 @@ fn rows_below_one_block_are_block_invariant() {
     }
 }
 
+/// The same sum with a *lane-reduced* shared output:
+/// `y[0, 0, 0] = Σ_lanes Σ_rows x[row, 0, lane]`, block partials combined
+/// lane-wise before the lanes are summed.
+fn run_shared_lane_reduction(values: &[f64], lanes: usize, block_rows: usize) -> Vec<f64> {
+    let rows = values.len() / lanes;
+    let input_dims = [rows, 1, lanes];
+    let input_strides = [lanes as isize, lanes as isize, 1];
+    let out_dims = [1usize, 1, 1];
+    let out_strides = [1isize, 1, 1];
+    let buffers = [0u32, 1];
+    let segments = [0u32, 0];
+    let operations = [Operation {
+        buffers: &buffers,
+        path_start: 0,
+        num_paths: 1,
+    }];
+    let paths = [Path {
+        segments: &segments,
+        coefficient: 1.0,
+    }];
+    let descriptor = spec(&operations, &paths, &[BATCHED, SHARED]);
+    let plan = SegPolyPlan::<f64>::compile_with_block_rows(
+        &descriptor,
+        &[layout(&input_dims, &input_strides)],
+        &[layout(&out_dims, &out_strides)],
+        block_rows,
+    )
+    .expect("compiles");
+    let mut out = vec![0.0];
+    let mut scratch = vec![0.0; plan.scratch_len(1)];
+    let input = RawStridedRef::new(values, &input_dims, &input_strides, 0).unwrap();
+    {
+        let mut outputs = [RawStridedMut::new(&mut out, &out_dims, &out_strides, 0).unwrap()];
+        plan.execute_into(
+            &mut outputs,
+            &[input],
+            descriptor.indexes,
+            &mut scratch,
+            Exec::serial(),
+        )
+        .expect("executes");
+    }
+    out
+}
+
+#[test]
+fn a_shared_lane_reduction_combines_block_partials_first() {
+    // Two blocks whose lane partials cancel: block 1 sums to `[1e16, 1]` per lane
+    // and block 2 to `[-1e16, 1]`. Combined lane-wise first, the lanes are
+    // `[0, 2]` and the reduction is 2; reducing each block's lanes first gives
+    // `1e16 + 1 -> 1e16` and `-1e16 + 1 -> -1e16`, i.e. 0.
+    let values = [1e16, 1.0, -1e16, 1.0];
+    for block_rows in [1, 2, BLOCK_ROWS] {
+        assert_eq!(
+            run_shared_lane_reduction(&values, 2, block_rows),
+            vec![2.0],
+            "block_rows {block_rows}: the lane sum must follow the block partials"
+        );
+    }
+    // The same value has to come out of one block, where no combination happens:
+    // the test above is about the order, not about the block count.
+    assert_eq!(
+        run_shared_lane_reduction(&[1e16, 1.0], 2, BLOCK_ROWS),
+        vec![1e16]
+    );
+}
+
 #[test]
 fn empty_runs_write_zero_and_accumulate_nothing() {
     let dest = [0i32, 0];
@@ -609,6 +1098,70 @@ fn rejects_gather_indices_out_of_range() {
             extent: 4
         }
     ));
+}
+
+/// A minimal lane-reducing plan whose x operand has the given lane stride.
+fn lane_reduction_plan(lane_stride: isize) -> SegPolyPlan<f64> {
+    let u = 5;
+    let span = (u as isize - 1) * lane_stride.unsigned_abs() as isize + 1;
+    let x_dims = [1usize, 2, u];
+    let x_strides = [2 * span, span, lane_stride];
+    let w_dims = [1usize, 2, u];
+    let w_strides = [u as isize, u as isize, 1];
+    let out_dims = [1usize, 2, 1];
+    let out_strides = [2isize, 1, 1];
+    let first = [0u32; 3];
+    let second = [0u32, 1, 1];
+    let operations = [Operation {
+        buffers: &[0, 1, 2],
+        path_start: 0,
+        num_paths: 2,
+    }];
+    let paths = [
+        Path {
+            segments: &first,
+            coefficient: 1.0,
+        },
+        Path {
+            segments: &second,
+            coefficient: -2.0,
+        },
+    ];
+    SegPolyPlan::<f64>::compile(
+        &spec(&operations, &paths, &[BATCHED, SHARED, BATCHED]),
+        &[
+            Layout {
+                dims: &x_dims,
+                strides: &x_strides,
+            },
+            layout(&w_dims, &w_strides),
+        ],
+        &[layout(&out_dims, &out_strides)],
+    )
+    .expect("compiles")
+}
+
+#[test]
+fn scratch_reserves_a_pack_area_per_worker() {
+    // A lane-strided operand is packed into a tile before the vector loop, so the
+    // scratch grows with the budget by one tile per packed operand on top of the
+    // block partials, and the block partials are a compile-time floor.
+    let packed = lane_reduction_plan(3);
+    assert!(packed.pack_elems > 0, "a lane stride of 3 has to be packed");
+    for budget in 1..=4 {
+        let expected = packed.block_slots * packed.tile_elems
+            + budget * (packed.tile_elems + packed.pack_elems);
+        assert_eq!(
+            packed.scratch_len(budget),
+            expected,
+            "budget {budget}: scratch must cover the blocks and one pack area per worker"
+        );
+    }
+    // An unpacked plan pays nothing for a pack area, and a zero budget is the one
+    // worker floor rather than no workers.
+    let contiguous = lane_reduction_plan(1);
+    assert_eq!(contiguous.pack_elems, 0);
+    assert_eq!(contiguous.scratch_len(0), contiguous.scratch_len(1));
 }
 
 #[test]

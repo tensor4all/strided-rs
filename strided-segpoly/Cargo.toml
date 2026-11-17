@@ -19,6 +19,10 @@ publish = false
 # The executor fans out through strided-basic's budgeted primitive and reuses
 # its sorted-run topology; a serial `Exec` still runs it inline.
 strided-basic = { workspace = true, features = ["parallel"] }
+# The lane kernel dispatches its SIMD level at run time
+# (`docs/design/runtime-simd-dispatch.md`); the width comes from the selected
+# level, never from a build-time target feature.
+pulp.workspace = true
 num-traits.workspace = true
 thiserror.workspace = true
 

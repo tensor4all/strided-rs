@@ -782,6 +782,7 @@ name = "strided-segpoly"
 version = "0.1.0"
 dependencies = [
  "num-traits",
+ "pulp",
  "strided-basic",
  "thiserror",
  "threadteam",
