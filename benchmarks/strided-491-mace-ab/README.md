@@ -19,7 +19,8 @@ it and it cannot affect a released artifact.
 | `src/lib.rs` | shared buffers, sequence-valued inputs, comparison helpers |
 | `src/measure.rs` | counting allocator, `VmHWM`, warmup + median-of-15 |
 | `src/main.rs` | one cell per process: `--cell cg-fwd\|cg-vjp --dtype f32\|f64 --threads N --atoms 128\|1024` |
-| `tests/fidelity.rs` | the gates: published counters, both sides agree, 1T/4T bitwise, zero allocation |
+| `tests/fidelity.rs` | the gates: published counters, both sides agree on **every node** in f32 and f64, 1T/4T bitwise for the forward and all three VJPs, a perturbation test that the comparisons are not node-0 only |
+| `tests/alloc.rs` | the zero-allocation gates, in their own test binary (the counters are process-wide, so they cannot be read next to the gates above), each starting by proving the counting allocator sees a 1 MiB allocation |
 | `campaign.sh` | all 16 cells, observer pinned off the measured L3 domain |
 | `raw/` | the recorded cells, host/load/command logs, and the llmlip patch |
 
@@ -45,7 +46,10 @@ repo, so this harness always measures the tree it sits in.
 
 ```sh
 cargo test --release    # the gates; fails if either side changes meaning
-./campaign.sh           # 16 cells -> raw/*.jsonl
+./campaign.sh           # 16 cells -> raw/*.jsonl (+ 2 anchors in raw/campaign.txt);
+                        # exits nonzero if a cell fails or the anchors drift >15 %
+./check_report.py       # re-derives every number in the report from raw/ and
+                        # exits nonzero on any disagreement
 ```
 
 Each cell prints one JSON record. `--raw-dir` also appends it to
@@ -54,8 +58,9 @@ overwriting it.
 
 ## Measurement rules this harness enforces
 
-* **One L3 domain per cell.** Measured CPUs come from `taskset` (`0` for 1T,
-  `0,1,2,3` for 4T, all inside `index3/cache0`); the campaign shell and the
+* **One L3 domain per cell.** Measured CPUs come from `taskset` (`4` for 1T,
+  `4,5,6,7` for 4T, all inside `index3/cache0`; core `0` is avoided because
+  foreign processes were pinned there — see the worklog §3); the campaign shell and the
   observer are pinned to the other domain (`8-15,24-31`). Derive the sets from
   `/sys/devices/system/cpu/*/cache/index3/shared_cpu_list` on a new host.
 * **Thread count, not affinity, on both sides.** llmlip dispatches through
@@ -65,4 +70,21 @@ overwriting it.
 * **Identical work.** Both sides read the same buffers; the harness never
   materializes the `[E, 5120]` conv_tp intermediate for strided (that is the
   point of the comparison) and reports its size per cell.
+* **Round-robin, not one side after the other.** `measure::interleaved` times side
+  0, side 1, ... once per sample, so no side sits in a different slice of the
+  machine's drift, and `campaign.sh` re-measures an anchor cell at both ends and
+  rejects the run if they disagree by more than 15 %; each side's repeat count
+  (`inner`) is warmed until one timed
+  round spans `--target-ms`.
+* **Exact allocation accounting.** Records carry `alloc_bytes_total` /
+  `alloc_calls_total` next to the per-call figures, and the per-call figure is
+  `total / timed_calls` as an `f64` — a handful of bytes per call cannot truncate
+  to 0. The counting allocator is installed in `src/lib.rs`, so the gate tests
+  count too; the counters are process-wide, which is why the allocation gates have
+  their own binary.
+* **The `Exec` mint is quantified, not removed.** `Exec` is neither `Copy` nor
+  `Clone`, so the strided side mints one per call *inside* the timed closure: those
+  nanoseconds are part of every strided figure above. `exec_new` reports that
+  share (2.0-2.4 ns) so a reader can see how much of a cell is token
+  construction — it is not subtracted.
 * **Fresh process per cell** so `VmHWM` is a peak, not a residue.

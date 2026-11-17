@@ -18,6 +18,8 @@
 //! `grad_w` and `grad_y` keep llmlip's own order, so they compare element for
 //! element; `m`/`grad_m` need one untimed permutation (`permute_*`).
 
+use std::cell::RefCell;
+
 use llmlip::mace_lite::bench_api::{self, Layer1Descriptor, Layer1Plan};
 use strided_basic::{Exec, Pool, RawStridedMut, RawStridedRef, RunIndex};
 use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyElem, SegPolyPlan, Spec};
@@ -162,10 +164,12 @@ pub struct Cg<T: Scalar> {
     pub vjp_x: SegPolyPlan<T>,
     pub vjp_w: SegPolyPlan<T>,
     pub vjp_y: SegPolyPlan<T>,
-    pub fwd_scratch: Vec<T>,
-    pub vjp_x_scratch: Vec<T>,
-    pub vjp_w_scratch: Vec<T>,
-    pub vjp_y_scratch: Vec<T>,
+    /// Each plan's scratch. Behind a `RefCell` so both sides of a cell can hold
+    /// their closures at once: the measured cell has to interleave them.
+    pub fwd_scratch: RefCell<Vec<T>>,
+    pub vjp_x_scratch: RefCell<Vec<T>>,
+    pub vjp_w_scratch: RefCell<Vec<T>>,
+    pub vjp_y_scratch: RefCell<Vec<T>>,
     plan: Layer1Plan,
     senders_usize: Vec<usize>,
     receivers_usize: Vec<usize>,
@@ -216,7 +220,7 @@ impl<T: Scalar> Cg<T> {
     }
 
     pub fn strided_forward(
-        &mut self,
+        &self,
         buffers: &Buffers<T>,
         m: &mut [T],
         exec: Exec<'_>,
@@ -248,12 +252,18 @@ impl<T: Scalar> Cg<T> {
         let scatter = [IndexMode::Scatter(&self.runs_receiver)];
         let indexes: [&[IndexMode<'_>]; 5] = [&gather, &gather, &batched, &batched, &scatter];
         self.fwd
-            .execute_into(&mut outputs, &inputs, &indexes, &mut self.fwd_scratch, exec)
+            .execute_into(
+                &mut outputs,
+                &inputs,
+                &indexes,
+                &mut *self.fwd_scratch.borrow_mut(),
+                exec,
+            )
             .map_err(|error| format!("segpoly fwd: {error}"))
     }
 
     pub fn strided_vjp_x(
-        &mut self,
+        &self,
         buffers: &Buffers<T>,
         grad_x: &mut [T],
         exec: Exec<'_>,
@@ -292,14 +302,14 @@ impl<T: Scalar> Cg<T> {
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut self.vjp_x_scratch,
+                &mut *self.vjp_x_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly vjp-x: {error}"))
     }
 
     pub fn strided_vjp_w(
-        &mut self,
+        &self,
         buffers: &Buffers<T>,
         grad_w: &mut [T],
         exec: Exec<'_>,
@@ -336,14 +346,14 @@ impl<T: Scalar> Cg<T> {
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut self.vjp_w_scratch,
+                &mut *self.vjp_w_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly vjp-w: {error}"))
     }
 
     pub fn strided_vjp_y(
-        &mut self,
+        &self,
         buffers: &Buffers<T>,
         grad_y: &mut [T],
         exec: Exec<'_>,
@@ -376,7 +386,7 @@ impl<T: Scalar> Cg<T> {
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut self.vjp_y_scratch,
+                &mut *self.vjp_y_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly vjp-y: {error}"))
@@ -704,10 +714,10 @@ pub fn build<T: Scalar>(topo: &Topology) -> Result<Cg<T>, String> {
 
     let features = 8usize;
     Ok(Cg {
-        fwd_scratch: vec![T::from_f64(0.0); fwd.scratch_len(features)],
-        vjp_x_scratch: vec![T::from_f64(0.0); vjp_x.scratch_len(features)],
-        vjp_w_scratch: vec![T::from_f64(0.0); vjp_w.scratch_len(features)],
-        vjp_y_scratch: vec![T::from_f64(0.0); vjp_y.scratch_len(features)],
+        fwd_scratch: RefCell::new(vec![T::from_f64(0.0); fwd.scratch_len(features)]),
+        vjp_x_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_x.scratch_len(features)]),
+        vjp_w_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_w.scratch_len(features)]),
+        vjp_y_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_y.scratch_len(features)]),
         desc,
         num_nodes: n,
         num_edges: e,

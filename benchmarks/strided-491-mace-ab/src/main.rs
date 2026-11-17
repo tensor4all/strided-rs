@@ -1,18 +1,17 @@
 //! One A/B cell: `cargo run --release -- --cell cg-fwd --dtype f64 --threads 1 --atoms 1024`
 //!
 //! Prints one JSON object (the raw record) and appends it to `raw/<name>.jsonl`
-//! when `--raw-dir` is given.
+//! when `--raw-dir` is given. Both sides of a cell are timed in a round-robin
+//! (`measure::interleaved`), and the per-call `Exec::new` the strided side needs
+//! is measured on its own so it can be subtracted or ignored knowingly.
 
 use std::hint::black_box;
 use std::time::Duration;
 
-use mace_ab::cg::{Buffers, Cg, Scalar};
+use mace_ab::cg::{self, Buffers, Cg, Scalar};
 use mace_ab::measure::{self, Measured};
 use mace_ab::topo;
 use strided_basic::Pool;
-
-#[global_allocator]
-static ALLOCATOR: mace_ab::measure::Counting = mace_ab::measure::Counting;
 
 struct Args {
     cell: String,
@@ -84,17 +83,16 @@ fn fix_llmlip_threads(threads: usize) -> Result<(), String> {
 fn run<T: Scalar>(args: &Args) -> Result<(), String> {
     fix_llmlip_threads(args.threads)?;
     let topology = topo::diamond_si(repeats(args.atoms)?, 6.0)?;
-    let mut cg = mace_ab::cg::build::<T>(&topology)?;
+    let cg = cg::build::<T>(&topology)?;
     let buffers = mace_ab::buffers(&cg, 11);
     let pool = if args.threads > 1 {
-        Some(mace_ab::cg::pool(args.threads)?)
+        Some(cg::pool(args.threads)?)
     } else {
         None
     };
     let target = Duration::from_millis(args.target_ms);
 
-    let mut record =
-        format!(
+    let mut record = format!(
         "{{\"cell\":\"{}\",\"dtype\":\"{}\",\"threads\":{},\"atoms\":{},\"nodes\":{},\"edges\":{},\
          \"avg_neighbors\":{:.3},\"feature_dim\":{},\"out_slots\":{},\"weight_numel\":{},\
          \"cg_entries_per_feature\":{},\"vjp_y_paths\":{},\"samples\":{},\"target_ms\":{}",
@@ -108,32 +106,53 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
         cg.feature_dim(),
         cg.out_m_total(),
         cg.desc.weight_numel,
-        cg.desc.blocks.iter().map(|block| block.cg.len()).sum::<usize>(),
-        cg.desc.blocks.iter().map(|block| block.cg.len() * cg.feature_dim()).sum::<usize>(),
+        cg.desc
+            .blocks
+            .iter()
+            .map(|block| block.cg.len())
+            .sum::<usize>(),
+        cg.desc
+            .blocks
+            .iter()
+            .map(|block| block.cg.len() * cg.feature_dim())
+            .sum::<usize>(),
         args.samples,
         args.target_ms,
     );
 
-    // Self-checking: the numbers both sides produce for this cell.
+    // Self-checking: the numbers both sides produce for this cell, over all nodes.
     let mut check = String::from(",\"check\":{");
     match args.cell.as_str() {
         "cg-fwd" => {
-            let (llmlip, strided) = forward(&mut cg, &buffers, args.threads, pool.as_ref())?;
-            let (max_abs, max_rel) = mace_ab::compare_forward(&mut cg, &llmlip, &strided);
+            let (llmlip, strided) = forward(&cg, &buffers, args.threads, pool.as_ref())?;
+            let (max_abs, max_rel) = mace_ab::compare_forward(&cg, &llmlip, &strided);
+            let scale = mace_ab::scale(&llmlip);
             check.push_str(&format!(
-                "\"max_abs\":{max_abs:.3e},\"max_rel\":{max_rel:.3e}"
+                "\"max_abs\":{max_abs:.3e},\"max_rel\":{max_rel:.3e},\"scale\":{scale:.3e},\
+                 \"rel_to_scale\":{:.3e}",
+                max_abs / scale
             ));
         }
         "cg-vjp" => {
             let (bar_x, bar_y, bar_w, narrow, wide, grad_w, grad_y) =
-                vjp(&mut cg, &buffers, args.threads, pool.as_ref())?;
+                vjp(&cg, &buffers, args.threads, pool.as_ref())?;
             let (abs_x, rel_x) = mace_ab::compare_grad_x(&cg, &bar_x, &narrow, &wide);
             let (abs_w, rel_w) = mace_ab::compare_same_order(&bar_w, &grad_w);
             let (abs_y, rel_y) = mace_ab::compare_same_order(&bar_y, &grad_y);
+            let (sx, sw, sy) = (
+                mace_ab::scale(&bar_x),
+                mace_ab::scale(&bar_w),
+                mace_ab::scale(&bar_y),
+            );
             check.push_str(&format!(
-                "\"bar_x_abs\":{abs_x:.3e},\"bar_x_rel\":{rel_x:.3e},\
-                 \"bar_w_abs\":{abs_w:.3e},\"bar_w_rel\":{rel_w:.3e},\
-                 \"bar_y_abs\":{abs_y:.3e},\"bar_y_rel\":{rel_y:.3e}"
+                "\"bar_x_abs\":{abs_x:.3e},\"bar_x_rel\":{rel_x:.3e},\"bar_x_scale\":{sx:.3e},\
+                 \"bar_w_abs\":{abs_w:.3e},\"bar_w_rel\":{rel_w:.3e},\"bar_w_scale\":{sw:.3e},\
+                 \"bar_y_abs\":{abs_y:.3e},\"bar_y_rel\":{rel_y:.3e},\"bar_y_scale\":{sy:.3e},\
+                 \"bar_x_rel_to_scale\":{:.3e},\"bar_w_rel_to_scale\":{:.3e},\
+                 \"bar_y_rel_to_scale\":{:.3e}",
+                abs_x / sx,
+                abs_w / sw,
+                abs_y / sy
             ));
         }
         other => return Err(format!("unknown cell {other}")),
@@ -141,23 +160,46 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
     check.push('}');
     record.push_str(&check);
 
+    // The strided side mints an `Exec` per call (`Exec` is neither `Copy` nor
+    // `Clone`, and `execute_into` consumes it). The mint sits inside the timed
+    // closure, so it is already part of the strided wall time; this figure
+    // reports its share (and its allocations) so a reader can see how much of the
+    // number is token construction — it is quantified, not subtracted.
+    let mut mint_exec = || {
+        let exec = mace_ab::exec_for(args.threads, pool.as_ref());
+        black_box(&exec);
+    };
+    let exec_new = measure::measure(target, args.samples, &mut mint_exec);
+    record.push_str(&format!(",\"exec_new\":{}", short_json(&exec_new)));
+
     let mut timings = String::from(",\"timings\":{");
     match args.cell.as_str() {
         "cg-fwd" => {
             let mut out =
                 vec![T::from_f64(0.0); cg.num_nodes * cg.out_m_total() * cg.feature_dim()];
-            let (path, llmlip) = measure_llmlip_fwd(&cg, &buffers, target, args.samples);
-            timings.push_str(&format!(
-                "\"llmlip\":{},\"llmlip_path\":\"{}\"",
-                measured_json(&llmlip),
-                path
-            ));
-            let strided = measure::measure(target, args.samples, || {
+            let mut run_llmlip = || {
+                let (_path, out) = cg.llmlip_forward(&buffers).expect("llmlip forward");
+                black_box(out);
+            };
+            let mut run_strided = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
                 cg.strided_forward(&buffers, black_box(&mut out), exec)
                     .expect("strided forward");
-            });
-            timings.push_str(&format!(",\"strided\":{}", measured_json(&strided)));
+            };
+            let mut measured = measure::interleaved(
+                target,
+                args.samples,
+                &mut [&mut run_llmlip, &mut run_strided],
+            );
+            let strided = measured.pop().expect("strided");
+            let llmlip = measured.pop().expect("llmlip");
+            let path = cg.llmlip_forward(&buffers).expect("llmlip forward").0;
+            timings.push_str(&format!(
+                "\"llmlip\":{},\"llmlip_path\":\"{}\",\"strided\":{}",
+                measured_json(&llmlip),
+                path,
+                measured_json(&strided)
+            ));
             record.push_str(&timings);
             record.push('}');
             record.push_str(&format!(
@@ -169,47 +211,58 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
             ));
         }
         "cg-vjp" => {
-            let mut grad_x = vec![T::from_f64(0.0); cg.num_nodes * (128 + 3 * cg.feature_dim())];
+            // `grad_x` holds the narrow `[N, 1, 128]` and the wide `[N, 3, 128]`
+            // view back to back: N*(128 + 3*f) elements, which is 4*N*f because
+            // this descriptor has f = 128.
+            let grad_x_elems = cg.num_nodes * (128 + 3 * cg.feature_dim());
+            let mut grad_x = vec![T::from_f64(0.0); grad_x_elems];
             let mut grad_w = vec![T::from_f64(0.0); cg.num_edges * 10 * cg.feature_dim()];
             let mut grad_y = vec![T::from_f64(0.0); cg.num_edges * 16];
-            let (path, llmlip) = measure_llmlip_vjp(&mut cg, &buffers, target, args.samples);
-            timings.push_str(&format!(
-                "\"llmlip\":{},\"llmlip_path\":\"{}\"",
-                measured_json(&llmlip),
-                path
-            ));
-            let vjp_x = measure::measure(target, args.samples, || {
+            let mut run_llmlip = || {
+                let (_path, out) = cg.llmlip_vjp(&buffers).expect("llmlip vjp");
+                black_box(out);
+            };
+            let mut run_x = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
                 cg.strided_vjp_x(&buffers, black_box(&mut grad_x), exec)
                     .expect("strided vjp-x");
-            });
-            let vjp_w = measure::measure(target, args.samples, || {
+            };
+            let mut run_w = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
                 cg.strided_vjp_w(&buffers, black_box(&mut grad_w), exec)
                     .expect("strided vjp-w");
-            });
-            let vjp_y = measure::measure(target, args.samples, || {
+            };
+            let mut run_y = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
                 cg.strided_vjp_y(&buffers, black_box(&mut grad_y), exec)
                     .expect("strided vjp-y");
-            });
-            let total = vjp_x.median_ns + vjp_w.median_ns + vjp_y.median_ns;
+            };
+            let measured = measure::interleaved(
+                target,
+                args.samples,
+                &mut [&mut run_llmlip, &mut run_x, &mut run_w, &mut run_y],
+            );
+            let path = cg.llmlip_vjp(&buffers).expect("llmlip vjp").0;
+            let total = measured[1].median_ns + measured[2].median_ns + measured[3].median_ns;
             timings.push_str(&format!(
-                ",\"strided_vjp_x\":{},\"strided_vjp_w\":{},\"strided_vjp_y\":{},\
-                 \"strided_total_ns\":{total:.1}",
-                measured_json(&vjp_x),
-                measured_json(&vjp_w),
-                measured_json(&vjp_y)
+                "\"llmlip\":{},\"llmlip_path\":\"{}\",\"strided_vjp_x\":{},\
+                 \"strided_vjp_w\":{},\"strided_vjp_y\":{},\"strided_total_ns\":{total:.1}",
+                measured_json(&measured[0]),
+                path,
+                measured_json(&measured[1]),
+                measured_json(&measured[2]),
+                measured_json(&measured[3])
             ));
             record.push_str(&timings);
             record.push('}');
             record.push_str(&format!(
                 ",\"ratio\":{:.4},\"ratio_x\":{:.4},\"ratio_w\":{:.4},\"ratio_y\":{:.4},\
-                 \"bar_y_intermediate_mib\":{:.1},\"rss_bytes\":{}",
-                total / llmlip.median_ns,
-                vjp_x.median_ns / llmlip.median_ns,
-                vjp_w.median_ns / llmlip.median_ns,
-                vjp_y.median_ns / llmlip.median_ns,
+                 \"grad_x_mib\":{:.1},\"bar_y_intermediate_mib\":{:.1},\"rss_bytes\":{}",
+                total / measured[0].median_ns,
+                measured[1].median_ns / measured[0].median_ns,
+                measured[2].median_ns / measured[0].median_ns,
+                measured[3].median_ns / measured[0].median_ns,
+                (grad_x_elems * std::mem::size_of::<T>()) as f64 / (1024.0 * 1024.0),
                 (cg.num_edges as f64
                     * 16.0
                     * cg.feature_dim() as f64
@@ -239,52 +292,43 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Totals plus unrounded per-call figures, so nothing is lost to rounding.
 fn measured_json(measured: &Measured) -> String {
     format!(
         "{{\"median_ns\":{:.1},\"min_ns\":{:.1},\"max_ns\":{:.1},\
-         \"alloc_bytes_per_call\":{},\"alloc_calls_per_call\":{},\"peak_live_bytes\":{}}}",
+         \"alloc_bytes_total\":{},\"alloc_calls_total\":{},\
+         \"alloc_bytes_per_call\":{:.3},\"alloc_calls_per_call\":{:.3},\
+         \"peak_live_bytes\":{},\"timed_calls\":{},\"inner\":{}}}",
         measured.median_ns,
         measured.min_ns,
         measured.max_ns,
         measured.alloc.bytes,
         measured.alloc.calls,
-        measured.alloc.peak_live
+        measured.bytes_per_call(),
+        measured.alloc_calls_per_call(),
+        measured.alloc.peak_live,
+        measured.calls,
+        measured.inner
     )
 }
 
-fn measure_llmlip_fwd<T: Scalar>(
-    cg: &Cg<T>,
-    buffers: &Buffers<T>,
-    target: Duration,
-    samples: usize,
-) -> (&'static str, Measured) {
-    let (path, _) = cg.llmlip_forward(buffers).expect("llmlip forward");
-    let measured = measure::measure(target, samples, || {
-        let (_path, out) = cg.llmlip_forward(buffers).expect("llmlip forward");
-        black_box(out);
-    });
-    (path, measured)
+fn short_json(measured: &Measured) -> String {
+    format!(
+        "{{\"median_ns\":{:.1},\"alloc_bytes_per_call\":{:.3},\
+         \"alloc_calls_per_call\":{:.3},\"alloc_bytes_total\":{},\"alloc_calls_total\":{}}}",
+        measured.median_ns,
+        measured.bytes_per_call(),
+        measured.alloc_calls_per_call(),
+        measured.alloc.bytes,
+        measured.alloc.calls
+    )
 }
 
-fn measure_llmlip_vjp<T: Scalar>(
-    cg: &Cg<T>,
-    buffers: &Buffers<T>,
-    target: Duration,
-    samples: usize,
-) -> (&'static str, Measured) {
-    let (path, _) = cg.llmlip_vjp(buffers).expect("llmlip vjp");
-    let measured = measure::measure(target, samples, || {
-        let (_path, out) = cg.llmlip_vjp(buffers).expect("llmlip vjp");
-        black_box(out);
-    });
-    (path, measured)
-}
-
-fn forward<T: Scalar>(
-    cg: &mut Cg<T>,
+fn forward<'a, T: Scalar>(
+    cg: &'a Cg<T>,
     buffers: &Buffers<T>,
     threads: usize,
-    pool: Option<&Pool>,
+    pool: Option<&'a Pool>,
 ) -> Result<(Vec<T>, Vec<T>), String> {
     let (_path, llmlip) = cg.llmlip_forward(buffers)?;
     let mut strided = vec![T::from_f64(0.0); cg.num_nodes * cg.out_m_total() * cg.feature_dim()];
@@ -293,8 +337,9 @@ fn forward<T: Scalar>(
     Ok((llmlip, strided))
 }
 
+#[allow(clippy::type_complexity)]
 fn vjp<T: Scalar>(
-    cg: &mut Cg<T>,
+    cg: &Cg<T>,
     buffers: &Buffers<T>,
     threads: usize,
     pool: Option<&Pool>,

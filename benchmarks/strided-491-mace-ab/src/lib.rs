@@ -5,6 +5,12 @@ pub mod cg;
 pub mod measure;
 pub mod topo;
 
+/// Installed here, not in the binary: `tests/` links this library, and a counter
+/// that is never installed reads 0 for every allocation — which would make every
+/// allocation gate pass vacuously.
+#[global_allocator]
+static ALLOCATOR: measure::Counting = measure::Counting;
+
 use cg::{Buffers, Cg, Scalar};
 use strided_basic::{Exec, Pool};
 
@@ -49,27 +55,43 @@ fn convert<T: Scalar>(values: Vec<f64>) -> Vec<T> {
     values.into_iter().map(T::from_f64).collect()
 }
 
+/// Largest magnitude in a reference buffer, so an absolute error can be read
+/// scale relative (elementwise relative error is meaningless where terms cancel).
+#[must_use]
+pub fn scale<T: Scalar>(reference: &[T]) -> f64 {
+    reference
+        .iter()
+        .fold(0.0f64, |acc, value| acc.max(value.to_f64().abs()))
+}
+
 fn diff(value: f64, reference: f64) -> (f64, f64) {
     let abs = (value - reference).abs();
     (abs, abs / reference.abs().max(1e-30))
 }
 
-/// `(max |Δ|, max |Δ|/|ref|)` of the forward, strided against llmlip.
+/// `(max |Δ|, max |Δ|/|ref|)` of the forward, strided against llmlip, over
+/// every node (llmlip packs a node as `[slot][feature]`, the plan as
+/// `[node][slot][feature]`, so the node stride is explicit here).
 pub fn compare_forward<T: Scalar>(cg: &Cg<T>, llmlip: &[T], strided_major: &[T]) -> (f64, f64) {
     let f = cg.desc.feature_dim;
+    let slots = cg.out_m_total();
     let mut worst = (0.0f64, 0.0f64);
-    let mut block_offset = 0usize;
-    for block in &cg.desc.blocks {
-        for feature in 0..f {
-            for k_m in 0..block.out_dim {
-                let reference = llmlip[block_offset + feature * block.out_dim + k_m].to_f64();
-                let slot = block.out_base / f + k_m;
-                let value = strided_major[slot * f + feature].to_f64();
-                let (abs, rel) = diff(value, reference);
-                worst = (worst.0.max(abs), worst.1.max(rel));
+    for node in 0..cg.num_nodes {
+        let mut block_offset = 0usize;
+        for block in &cg.desc.blocks {
+            for feature in 0..f {
+                for k_m in 0..block.out_dim {
+                    let reference = llmlip
+                        [node * slots * f + block_offset + feature * block.out_dim + k_m]
+                        .to_f64();
+                    let slot = block.out_base / f + k_m;
+                    let value = strided_major[node * slots * f + slot * f + feature].to_f64();
+                    let (abs, rel) = diff(value, reference);
+                    worst = (worst.0.max(abs), worst.1.max(rel));
+                }
             }
+            block_offset += f * block.out_dim;
         }
-        block_offset += f * block.out_dim;
     }
     worst
 }
