@@ -282,12 +282,23 @@ taskset -c 4,5,6,7 target/release/mace-ab --cell cg-vjp --dtype f64 \
 
 # 4. all 16 cells, observer pinned off the measured L3 domain
 taskset -c 8-15,24-31 ./campaign.sh
-grep -c '^{' raw/campaign.txt     # 16
+grep -c '^{' raw/campaign.txt     # 18 = 16 cells + 2 anchor records
 grep -c FAILED raw/campaign.txt   # 0
+./check_report.py                 # every table row, size field and range vs raw/
 ```
 
+`campaign.sh` exits nonzero when a cell fails or when the two anchors disagree by
+more than 15 %, so the transcript cannot look finished while a record is missing.
+
 Every number in §4-§7 is a field of one of the 16 records in `raw/*.jsonl` (the
-same 16 lines are in `raw/campaign.txt`).
+same 16 lines are in `raw/campaign.txt`). `check_report.py` is the mechanical form
+of that statement: it parses the tables out of this file, compares each cell
+to the record it claims to come from, re-derives `grad_x_mib` as
+`N*(128 + 3*f)*sizeof`, checks the prose ranges against the records and the
+transcript, and exits nonzero on any disagreement — a mutated table value, a
+deleted row, a truncated transcript or an off-by-one range all fail it. Its output
+on this tree: 8/8 forward rows, 8/8 VJP rows, 8/8 `grad_x_mib` cells, 32/32 numeric
+columns, 18/18 transcript lines, `OK`.
 
 Reviewer record for the implementation plan (required by the session's plan
 gate): `ollama-cloud/glm-5.3-flash:high`, two rounds, both `VERDICT: CHANGES`
@@ -311,3 +322,12 @@ binary after the installed counter showed they were being charged for their
 neighbours' allocations; and the mutation test now corrupts a narrow middle
 element, the narrow tail and the wide tail, one at a time, instead of an index that
 was already `wide[0]`.
+
+The last review round added: `grad_x_mib` derived from the buffer the `Vec` is
+actually allocated with (`N*(128 + 3*f)` = `4*N*f` here, it was half that); the
+1 520 B event described as lazy **per-worker** initialization instead of a "first
+pool dispatch"; the f64 agreement lower bound corrected to `2.8e-16`; the
+contaminated attempt (§3, two foreign processes pinned to cpu 0) reported instead
+of retried; `campaign.sh` exiting nonzero on a failed cell as well as on anchor
+drift; and this checker committed, because a verification claim that is not a
+command in the tree is not a claim anyone can repeat.

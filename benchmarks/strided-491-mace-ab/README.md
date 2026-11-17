@@ -46,7 +46,10 @@ repo, so this harness always measures the tree it sits in.
 
 ```sh
 cargo test --release    # the gates; fails if either side changes meaning
-./campaign.sh           # 16 cells -> raw/*.jsonl
+./campaign.sh           # 16 cells -> raw/*.jsonl (+ 2 anchors in raw/campaign.txt);
+                        # exits nonzero if a cell fails or the anchors drift >15 %
+./check_report.py       # re-derives every number in the report from raw/ and
+                        # exits nonzero on any disagreement
 ```
 
 Each cell prints one JSON record. `--raw-dir` also appends it to

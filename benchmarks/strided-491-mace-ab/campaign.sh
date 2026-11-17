@@ -6,9 +6,9 @@
 # measured them instead of the host (see docs/worklogs, §3).
 set -u
 cd "$(dirname "$0")"
-OUT=raw
+OUT=${OUT:-raw}
 mkdir -p "$OUT"
-BIN=target/release/mace-ab
+BIN=${BIN:-target/release/mace-ab}
 log="$OUT/campaign.txt"
 : > "$log"
 ONE=4          # 1T cell
@@ -27,6 +27,7 @@ start=$(anchor)
 echo "$start" >> "$log"
 if [ -z "$start" ]; then echo "=== FAILED anchor start" >> "$log"; exit 1; fi
 
+failed=0
 for atoms in 128 1024; do
   for dtype in f64 f32; do
     for threads in 1 4; do
@@ -34,9 +35,12 @@ for atoms in 128 1024; do
         cpus="$ONE"
         [ "$threads" = 4 ] && cpus="$FOUR"
         echo "=== $cell $dtype ${threads}T atoms=$atoms cpus=$cpus $(date -Is)" >> "$log"
-        taskset -c "$cpus" "$BIN" --cell "$cell" --dtype "$dtype" \
+        if ! taskset -c "$cpus" "$BIN" --cell "$cell" --dtype "$dtype" \
           --threads "$threads" --atoms "$atoms" --samples 15 --raw-dir "$OUT" \
-          >> "$log" 2>&1 || echo "FAILED $cell $dtype $threads $atoms" >> "$log"
+          >> "$log" 2>&1; then
+          echo "FAILED $cell $dtype $threads $atoms" >> "$log"
+          failed=1
+        fi
       done
     done
   done
@@ -61,9 +65,15 @@ for side, read in (("strided", lambda r: r["timings"]["strided"]["median_ns"]),
         failed = True
 sys.exit(1 if failed else 0)
 PY
-if [ $? -eq 0 ]; then
-  echo "=== done $(date -Is)" >> "$log"
-else
+drift_ok=$?
+# A record that is missing or a cell that died makes the run worthless even when
+# the anchors agree, so the exit status has to carry both.
+if [ $drift_ok -ne 0 ]; then
   echo "=== FAILED drift $(date -Is)" >> "$log"
   exit 1
 fi
+if [ $failed -ne 0 ]; then
+  echo "=== FAILED cells $(date -Is)" >> "$log"
+  exit 1
+fi
+echo "=== done $(date -Is)" >> "$log"

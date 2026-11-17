@@ -14,4 +14,7 @@ taskset -c 4,5,6,7 target/release/mace-ab --cell cg-vjp --dtype f64 --threads 4 
 taskset -c 8-15,24-31 ./campaign.sh
 grep -c '^{' raw/campaign.txt     # 18 = 16 cells + 2 anchors
 grep -c FAILED raw/campaign.txt   # 0
-awk '/^=== anchor/{a=1} a' raw/campaign.txt | tail -3   # anchor drift guard verdict
+awk '/^=== anchor end/{a=1} a' raw/campaign.txt | tail -3   # drift guard verdict
+# campaign.sh itself exits nonzero on a failed cell or drift >15 %, so check the
+# status; the greps above are for reading, not for deciding.
+(cd benchmarks/strided-491-mace-ab && ./check_report.py)   # every claim vs raw/
