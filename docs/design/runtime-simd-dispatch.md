@@ -5,9 +5,9 @@ x86-64 baseline. Auto-vectorization only uses the target features enabled at com
 leaf loop that relies on it alone runs with SSE2 on every user's machine: 2 `f64` lanes, where
 AVX2 gives 4 and AVX-512 gives 8. The elementwise leaf loops in this workspace therefore pick
 their level at run time: strided-basic's map/zip/mul, ops, update and reduce leaves and its line
-kernels (norm, scan), the strided-fused chunk replay and static specializations, and strided-nn's
-softmax. Not yet covered: the `raw_ops` copy-scale loops, `outer_product`, `arg_reduce`, and the
-gather/indexing plans (which are index-bound).
+kernels (norm, scan), the strided-fused chunk replay and static specializations, strided-segpoly's
+contracted-product kernel, and strided-nn's softmax. Not yet covered: the `raw_ops` copy-scale
+loops, `outer_product`, `arg_reduce`, and the gather/indexing plans (which are index-bound).
 
 ## Distribution builds
 
@@ -26,8 +26,10 @@ The loop bodies stay unchanged, and LLVM auto-vectorizes them at the dispatched 
 
 - Dispatch once per leaf call, outside the element loop: `strided_basic::simd::dispatch_if_large`
   per contiguous run in `map_view`, `ops_view`, `update_view` and the reduce kernels, one dispatch
-  per worker range in `erased/line.rs`, one per block in the fused chunk replay, and one per
-  group in `strided-nn`.
+  per worker range in `erased/line.rs`, one per block in the fused chunk replay, one per
+  group in `strided-nn`, and one per **operation row** in `strided-segpoly` -- a row runs every
+  path of its operation, so the layer-1 VJP's 86 paths × 3 gradients are 6 dispatches, not 258
+  (tensor4all/strided-rs#498; per-path dispatch was 1.5-1.7x on that cell).
 - The dispatched body must be inlined into pulp's target-feature function, or it keeps the build
   target's instructions. pulp calls a closure through a plain call. A small closure (one loop) is
   inlined, but a large one is not (see the note on `map_contiguous`, tensor4all/strided-rs#301).
@@ -45,10 +47,11 @@ The loop bodies stay unchanged, and LLVM auto-vectorizes them at the dispatched 
 `python3 scripts/check-runtime-simd-dispatch.py` builds `strided-kernel/examples/runtime_simd_probe.rs`
 in release mode with `RUSTFLAGS` cleared, runs it, and disassembles it. For each dispatched body
 (map `sqrt`, zip `add`, fused chunk `sqrt`, the four-input fused `sqrt`/`rsqrt` specialization,
-softmax `f32` max and divide, softmax `f64` divide), the
-`V4` version must use the named instruction on `zmm` registers and the `V3` version on `ymm`. CI
+softmax `f32` max and divide, softmax `f64` divide, and segpoly's `f64` and `f32` operation row),
+the `V4` version must use the named instruction on `zmm` registers and the `V3` version on `ymm`. CI
 runs it on the ubuntu test job. A body that pulp does not inline fails it. A new dispatched path
-should get a probe call and a `CHECKS` entry.
+should get a probe call and a `CHECKS` entry (`strided-segpoly`'s `simd_probe` example exists for
+that).
 
 ## Baseline vs native comparison (evo)
 

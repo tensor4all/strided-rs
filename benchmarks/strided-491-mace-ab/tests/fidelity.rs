@@ -358,3 +358,101 @@ fn cg_and_layers_are_correctly_sized() {
     assert_eq!(cg.num_nodes, 32);
     assert!(cg.num_edges > 0);
 }
+
+/// The fused VJP is the same three gradients computed in one traversal: it must
+/// reproduce the three split plans bit for bit (1T and 4T), and still agree with
+/// llmlip within the dtype's scale-relative tolerance.
+/// `assert_eq!` on floats is numerical equality (`-0.0 == 0.0`); the gate below is
+/// bit identity, so compare the bit patterns. An `f32` widens to `f64` exactly.
+fn assert_same_bits<T: Scalar>(actual: &[T], expected: &[T], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: lengths differ");
+    for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            actual.to_f64().to_bits(),
+            expected.to_f64().to_bits(),
+            "{what}: element {index} is {}, not {}",
+            actual.to_f64(),
+            expected.to_f64()
+        );
+    }
+}
+
+fn check_fused_vjp<T: Scalar + PartialEq + std::fmt::Debug>() {
+    let topology = small();
+    let cg = cg::build::<T>(&topology).expect("plans");
+    let buffers = mace_ab::buffers(&cg, 17);
+    let (path, (bar_x, bar_y, bar_w)) = cg.llmlip_vjp(&buffers).expect("llmlip vjp");
+    assert_eq!(path, "layer1-fast");
+    let x_len = cg.num_nodes * (128 + 3 * cg.feature_dim());
+    let w_len = cg.num_edges * 10 * cg.feature_dim();
+    let y_len = cg.num_edges * 16;
+
+    // Reference: the three split plans, each its own call, serial and fresh.
+    let mut split_x = vec![T::from_f64(0.0); x_len];
+    let exec = mace_ab::exec_for(1, None);
+    cg.strided_vjp_x(&buffers, &mut split_x, exec)
+        .expect("vjp-x");
+    let mut split_w = vec![T::from_f64(0.0); w_len];
+    let exec = mace_ab::exec_for(1, None);
+    cg.strided_vjp_w(&buffers, &mut split_w, exec)
+        .expect("vjp-w");
+    let mut split_y = vec![T::from_f64(0.0); y_len];
+    let exec = mace_ab::exec_for(1, None);
+    cg.strided_vjp_y(&buffers, &mut split_y, exec)
+        .expect("vjp-y");
+
+    let pool = cg::pool(4).expect("pool");
+    let mut fused_x = vec![T::from_f64(0.0); x_len];
+    let mut fused_w = vec![T::from_f64(0.0); w_len];
+    let mut fused_y = vec![T::from_f64(0.0); y_len];
+    for threads in [1usize, 4] {
+        fused_x.iter_mut().for_each(|value| *value = T::from_f64(0.0));
+        fused_w.iter_mut().for_each(|value| *value = T::from_f64(0.0));
+        fused_y.iter_mut().for_each(|value| *value = T::from_f64(0.0));
+        let exec = mace_ab::exec_for(threads, (threads > 1).then_some(&pool));
+        cg.strided_vjp_fused(&buffers, &mut fused_x, &mut fused_w, &mut fused_y, exec)
+            .expect("vjp fused");
+        assert_same_bits(
+            &fused_x,
+            &split_x,
+            &format!("{}: {threads}T fused bar_x", identity::<T>()),
+        );
+        assert_same_bits(
+            &fused_w,
+            &split_w,
+            &format!("{}: {threads}T fused bar_w", identity::<T>()),
+        );
+        assert_same_bits(
+            &fused_y,
+            &split_y,
+            &format!("{}: {threads}T fused bar_y", identity::<T>()),
+        );
+    }
+
+    let tolerance = tolerance::<T>();
+    let (narrow, wide) = fused_x.split_at(cg.num_nodes * cg.feature_dim());
+    let (abs_x, _) = mace_ab::compare_grad_x(&cg, &bar_x, narrow, wide);
+    let (abs_w, _) = mace_ab::compare_same_order(&bar_w, &fused_w);
+    let (abs_y, _) = mace_ab::compare_same_order(&bar_y, &fused_y);
+    for (name, abs, reference) in [
+        ("bar_x", abs_x, scale(&bar_x)),
+        ("bar_w", abs_w, scale(&bar_w)),
+        ("bar_y", abs_y, scale(&bar_y)),
+    ] {
+        assert!(
+            abs / reference < tolerance,
+            "{} fused {name} max_abs {abs:e} on scale {reference:e}",
+            identity::<T>()
+        );
+    }
+}
+
+#[test]
+fn the_fused_vjp_matches_the_split_plans_f64() {
+    check_fused_vjp::<f64>();
+}
+
+#[test]
+fn the_fused_vjp_matches_the_split_plans_f32() {
+    check_fused_vjp::<f32>();
+}

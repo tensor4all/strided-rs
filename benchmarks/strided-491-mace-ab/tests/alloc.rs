@@ -62,4 +62,31 @@ fn the_executor_allocates_nothing_per_call() {
         (0, 0),
         "per-worker initialization may allocate once, later executions may not, got {pooled:?}"
     );
+
+    // The fused VJP walks all three gradients in one call: its per-output state
+    // lives in the caller's scratch, so it must be as allocation-free as a
+    // single-output plan.
+    let mut grad_x = vec![0.0f64; cg.num_nodes * (128 + 3 * cg.feature_dim())];
+    let mut grad_x_again = vec![0.0f64; grad_x.len()];
+    let mut grad_y = vec![0.0f64; cg.num_edges * 16];
+    let mut grad_y_again = vec![0.0f64; grad_y.len()];
+    let exec = mace_ab::exec_for(4, Some(&pool));
+    cg.strided_vjp_fused(&buffers, &mut grad_x, &mut grad_w, &mut grad_y, exec)
+        .expect("warm fused");
+    let exec = mace_ab::exec_for(4, Some(&pool));
+    mace_ab::measure::reset_alloc();
+    cg.strided_vjp_fused(
+        &buffers,
+        &mut grad_x_again,
+        &mut again,
+        &mut grad_y_again,
+        exec,
+    )
+    .expect("timed fused");
+    let fused = mace_ab::measure::alloc_snapshot();
+    assert_eq!(
+        (fused.bytes, fused.calls),
+        (0, 0),
+        "the fused VJP must not allocate per call, got {fused:?}"
+    );
 }

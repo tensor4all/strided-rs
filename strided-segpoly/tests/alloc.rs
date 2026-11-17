@@ -96,17 +96,46 @@ fn message_passing(batch: usize, segments: usize, u: usize) -> Case {
                 Mode::Scatter((0..batch).map(|row| (row % runs) as i32).collect()),
                 vec![0.0; runs * segments * u],
             ),
+            // A second scattered output over the same topology: the two share one
+            // traversal, so its per-output state must live in the scratch, not in
+            // a fresh allocation.
+            Buffer::dense(
+                [runs, segments, u],
+                Mode::Scatter((0..batch).map(|row| (row % runs) as i32).collect()),
+                vec![0.0; runs * segments * u],
+            ),
+            // A batched output riding along in the same traversal.
+            Buffer::dense(
+                [batch, segments, u],
+                Mode::Batched,
+                vec![0.0; batch * segments * u],
+            ),
             Buffer::dense([1, segments, u], Mode::Shared, vec![0.0; segments * u]),
         ],
         ops: vec![
-            // The scattered output: one operation over (x, w, x, out).
+            // The scattered outputs: one operation over (x, w, x, out).
             Op {
                 buffers: vec![0, 1, 0, 3],
                 paths: paths.clone(),
             },
+            Op {
+                buffers: vec![0, 1, 0, 4],
+                paths: paths.clone(),
+            },
+            // The batched output.
+            Op {
+                buffers: vec![0, 1, 5],
+                paths: paths
+                    .iter()
+                    .map(|path| PathSpec {
+                        segments: vec![path.segments[0]; 3],
+                        coefficient: path.coefficient,
+                    })
+                    .collect(),
+            },
             // The shared output: the same product summed over the batch.
             Op {
-                buffers: vec![0, 2, 4],
+                buffers: vec![0, 2, 6],
                 paths: paths
                     .iter()
                     .map(|path| PathSpec {

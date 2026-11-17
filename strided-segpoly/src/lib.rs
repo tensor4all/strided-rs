@@ -30,6 +30,11 @@
 //!   zero-seeded block partial can normalise).
 //! - **No atomics, no locks, no scratch allocation.** Output rows are owned by one
 //!   task each, and the caller supplies the scratch.
+//! - **One pass per plan.** A plan with several outputs evaluates the compatible
+//!   ones in one traversal of the batch points (scattered outputs with the same
+//!   compiled run topology share it, batched outputs ride along, a shared output
+//!   keeps its own batch reduction). Each output keeps the summation order below;
+//!   no `edges × segments × u` intermediate is materialised.
 //! - **Typed errors, no panics** on any caller-reachable path: indices, extents,
 //!   segment ids, path ranges, layouts and scratch are all checked.
 //! - **Aliasing.** Inputs may alias one another. An output may not alias any other

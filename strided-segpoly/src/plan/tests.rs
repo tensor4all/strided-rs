@@ -1148,9 +1148,14 @@ fn scratch_reserves_a_pack_area_per_worker() {
     // block partials, and the block partials are a compile-time floor.
     let packed = lane_reduction_plan(3);
     assert!(packed.pack_elems > 0, "a lane stride of 3 has to be packed");
+    assert_eq!(
+        packed.acc_stride, 0,
+        "a batched-only plan has no block accumulator"
+    );
+    assert_eq!(packed.row_elems, packed.tile_elems);
     for budget in 1..=4 {
-        let expected = packed.block_slots * packed.tile_elems
-            + budget * (packed.tile_elems + packed.pack_elems);
+        let expected = packed.block_slots * packed.acc_stride
+            + budget * (packed.acc_stride + packed.row_elems + packed.pack_elems);
         assert_eq!(
             packed.scratch_len(budget),
             expected,
@@ -1162,6 +1167,119 @@ fn scratch_reserves_a_pack_area_per_worker() {
     let contiguous = lane_reduction_plan(1);
     assert_eq!(contiguous.pack_elems, 0);
     assert_eq!(contiguous.scratch_len(0), contiguous.scratch_len(1));
+}
+
+#[test]
+fn one_group_accumulator_covers_every_output_of_one_traversal() {
+    // Two scattered outputs with the same topology share one traversal and one
+    // accumulator region per block slot, so the block partials are accounted once
+    // per group, not once per output.
+    let segments = 2usize;
+    let u = 3usize;
+    let dest = [0i32; 3];
+    let runs = RunIndex::from_dest(&dest, 1).unwrap();
+    let scatter: &[IndexMode] = &[IndexMode::Scatter(&runs)];
+    let strides = [segments as isize * u as isize, u as isize, 1];
+    let outputs = [1usize, segments, u];
+    let out_strides = [segments as isize * u as isize, u as isize, 1];
+    let x_dims = [3usize, segments, u];
+    let first = [0u32; 2];
+    let operations = [
+        Operation {
+            buffers: &[0, 1],
+            path_start: 0,
+            num_paths: 1,
+        },
+        Operation {
+            buffers: &[0, 2],
+            path_start: 0,
+            num_paths: 1,
+        },
+    ];
+    let paths = [Path {
+        segments: &first,
+        coefficient: 1.0,
+    }];
+    let indexes: [&[IndexMode]; 3] = [BATCHED, scatter, scatter];
+    let plan = SegPolyPlan::<f64>::compile_with_block_rows(
+        &spec(&operations, &paths, &indexes),
+        &[layout(&x_dims, &strides)],
+        &[
+            layout(&outputs, &out_strides),
+            layout(&outputs, &out_strides),
+        ],
+        1,
+    )
+    .expect("compiles");
+    // One run of three rows, one row per block: three block slots, each holding
+    // both outputs' `segments × u` accumulators.
+    assert_eq!(plan.block_slots, 3);
+    assert_eq!(plan.acc_stride, 2 * segments * u);
+    assert_eq!(plan.row_elems, 0, "no batched output streams a row");
+    assert_eq!(plan.tile_elems, segments * u);
+    for budget in 1..=4 {
+        assert_eq!(
+            plan.scratch_len(budget),
+            3 * 2 * segments * u + budget * (2 * segments * u),
+            "budget {budget}: the two outputs share the block slots and the child region"
+        );
+    }
+    assert_eq!(plan.groups.len(), 1);
+    assert_eq!(plan.groups[0].acc.len(), 2);
+    assert!(plan.units.iter().all(|unit| unit.group == 0));
+}
+
+#[test]
+fn scatter_outputs_with_different_run_orders_get_their_own_group() {
+    // The same windows in a different order sum in a different order, so two
+    // scattered outputs are only interchangeable when their permutations match
+    // too. `[0,1,0,1]` and `[1,0,1,0]` share `ptr` and differ in `perm`.
+    let segments = 2usize;
+    let u = 2usize;
+    let runs_a = RunIndex::from_dest(&[0i32, 1, 0, 1], 2).expect("a run index");
+    let runs_b = RunIndex::from_dest(&[1i32, 0, 1, 0], 2).expect("a run index");
+    assert_eq!(runs_a.ptr(), runs_b.ptr(), "the windows have to agree");
+    assert_ne!(
+        runs_a.perm(),
+        runs_b.perm(),
+        "and the orders have to differ"
+    );
+    let scatter_a: &[IndexMode] = &[IndexMode::Scatter(&runs_a)];
+    let scatter_b: &[IndexMode] = &[IndexMode::Scatter(&runs_b)];
+    let strides = [segments as isize * u as isize, u as isize, 1];
+    let x_dims = [4usize, segments, u];
+    let outputs = [2usize, segments, u];
+    let first = [0u32; 2];
+    let operations = [
+        Operation {
+            buffers: &[0, 1],
+            path_start: 0,
+            num_paths: 1,
+        },
+        Operation {
+            buffers: &[0, 2],
+            path_start: 0,
+            num_paths: 1,
+        },
+    ];
+    let paths = [Path {
+        segments: &first,
+        coefficient: 1.0,
+    }];
+    let indexes: [&[IndexMode]; 3] = [BATCHED, scatter_a, scatter_b];
+    let plan = SegPolyPlan::<f64>::compile_with_block_rows(
+        &spec(&operations, &paths, &indexes),
+        &[layout(&x_dims, &strides)],
+        &[layout(&outputs, &strides), layout(&outputs, &strides)],
+        4,
+    )
+    .expect("compiles");
+    assert_eq!(plan.groups.len(), 2, "one traversal each, not one shared");
+    assert_eq!(plan.acc_stride, segments * u, "one output per group");
+    assert_eq!(plan.block_slots, 0, "two rows per run fit one block");
+    assert_eq!(plan.units.len(), 4, "two runs per group");
+    assert_ne!(plan.out_group[0], plan.out_group[1]);
+    assert_eq!(plan.tasks.len(), 4, "one task per unit");
 }
 
 #[test]

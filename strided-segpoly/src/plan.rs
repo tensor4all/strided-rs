@@ -37,6 +37,20 @@
 //! partial starts from `0`, so a block whose value is exactly `-0.0` contributes
 //! `+0.0`.
 //!
+//! # Several outputs in one plan
+//!
+//! A plan may lower several outputs, and it evaluates them in one pass over the
+//! batch points when their row orders are compatible: scattered outputs with the
+//! same compiled run topology form one group and keep that topology's
+//! permutation order, batched outputs join that group (each of their rows is one
+//! batch point, so the visit order does not enter its sum), and a shared output
+//! keeps its own natural-order `0..batch` reduction. Nothing in the per-output
+//! order above changes: the traversal interleaves outputs, and outputs write
+//! disjoint destinations. The only cross-output requirement is that a group's
+//! scattered outputs were compiled from the same run topology; a call whose
+//! `RunIndex` describes the same windows in a different order is rejected
+//! ([`StridedError::PlanLayoutMismatch`]).
+//!
 //! # Lane access
 //!
 //! The lane loop runs `u` lanes of one path at a time through the dispatched
@@ -81,20 +95,22 @@ mod sealed {
     ///
     /// The lane kernel's dispatch seam lives here so [`SegPolyElem`] carries it
     /// without publishing a second trait. Sealing is about *implementations*: a
-    /// caller generic over `SegPolyElem` can still reach `lane_axpy` through the
-    /// supertrait bound, so an arity the executor never uses is a debug assertion
-    /// and a no-op in release rather than a panic.
+    /// caller generic over [`SegPolyElem`] can still reach this method through the
+    /// supertrait bound, so its contract is the caller's to keep.
     pub trait Sealed {
-        /// One call of the dispatched lane kernel: `acc[i] = acc[i] + c * Π` over
-        /// the lanes, where operand `t` is `operands[t]` if bit `t` is set in
-        /// `slices` and the scalar `splats[t]` otherwise.
-        fn lane_axpy<const N: usize>(
-            acc: &mut [Self],
-            coefficient: Self,
-            operands: [&[Self]; N],
-            splats: [Self; N],
-            slices: u32,
-        ) where
+        /// One operation row through the dispatched lane kernel: for each output
+        /// segment, for each of its paths, `acc[lane] = acc[lane] + ((c · x_0) ·
+        /// x_1) · x_2`, in plan order. The ISA is resolved once per replay and the
+        /// path loop runs inside the dispatched body.
+        ///
+        /// # Safety
+        ///
+        /// The caller of the replay guarantees that every base and offset in `row`
+        /// reaches the operands [`crate::simd::OpRow`] documents, that `row.acc`
+        /// holds `seg_starts.len() * u` elements, and that `row.u` equals the lane
+        /// extent the operands carry.
+        unsafe fn op_row_lanes(arch: pulp::Arch, row: crate::simd::OpRow<'_, Self>)
+        where
             Self: Sized;
 
         /// The lane count the run-time ISA's vector holds for this type, as the
@@ -104,33 +120,9 @@ mod sealed {
 
     impl Sealed for f32 {
         #[inline]
-        fn lane_axpy<const N: usize>(
-            acc: &mut [Self],
-            coefficient: Self,
-            operands: [&[Self]; N],
-            splats: [Self; N],
-            slices: u32,
-        ) {
-            match N {
-                1 => simd::axpy1_f32(acc, coefficient, [operands[0]], [splats[0]], slices),
-                2 => simd::axpy2_f32(
-                    acc,
-                    coefficient,
-                    [operands[0], operands[1]],
-                    [splats[0], splats[1]],
-                    slices,
-                ),
-                3 => simd::axpy3_f32(
-                    acc,
-                    coefficient,
-                    [operands[0], operands[1], operands[2]],
-                    [splats[0], splats[1], splats[2]],
-                    slices,
-                ),
-                _ => {
-                    debug_assert!(false, "the executor dispatches arity 1..=3 only");
-                }
-            }
+        unsafe fn op_row_lanes(arch: pulp::Arch, row: simd::OpRow<'_, f32>) {
+            // SAFETY: the trait's contract is the caller's.
+            unsafe { simd::op_row_f32(arch, row) }
         }
 
         #[inline]
@@ -141,33 +133,9 @@ mod sealed {
 
     impl Sealed for f64 {
         #[inline]
-        fn lane_axpy<const N: usize>(
-            acc: &mut [Self],
-            coefficient: Self,
-            operands: [&[Self]; N],
-            splats: [Self; N],
-            slices: u32,
-        ) {
-            match N {
-                1 => simd::axpy1_f64(acc, coefficient, [operands[0]], [splats[0]], slices),
-                2 => simd::axpy2_f64(
-                    acc,
-                    coefficient,
-                    [operands[0], operands[1]],
-                    [splats[0], splats[1]],
-                    slices,
-                ),
-                3 => simd::axpy3_f64(
-                    acc,
-                    coefficient,
-                    [operands[0], operands[1], operands[2]],
-                    [splats[0], splats[1], splats[2]],
-                    slices,
-                ),
-                _ => {
-                    debug_assert!(false, "the executor dispatches arity 1..=3 only");
-                }
-            }
+        unsafe fn op_row_lanes(arch: pulp::Arch, row: simd::OpRow<'_, f64>) {
+            // SAFETY: the trait's contract is the caller's.
+            unsafe { simd::op_row_f64(arch, row) }
         }
 
         #[inline]
@@ -254,12 +222,45 @@ impl OpPlan {
     }
 }
 
+/// One output whose destination block accumulates over a unit's rows, and
+/// where its accumulator lives in the group's accumulator region.
+#[derive(Clone, Debug)]
+struct AccOut {
+    /// Dense output buffer index.
+    out: usize,
+    /// First element of this output's `[segments, u]` accumulator inside the
+    /// group's `acc_elems` region.
+    offset: usize,
+}
+
+/// The outputs one batch-point traversal evaluates together.
+///
+/// A group exists so that several outputs of one plan share the gather, the
+/// input-row resolution and the cache footprint of one pass over the batch
+/// points instead of one pass per output. Every output keeps the summation
+/// order it has on its own (see the module documentation).
+#[derive(Clone, Debug)]
+struct Group {
+    /// Outputs whose destination block accumulates over the unit's rows: the
+    /// group's scattered outputs, or the single shared output of a shared group.
+    acc: Vec<AccOut>,
+    /// Batched outputs written once per batch point; they never accumulate
+    /// across rows, so they need no block partials or unit slot.
+    stream: Vec<usize>,
+    /// Compiled row order of a scattered group: traversal step to batch point.
+    /// `None` for natural row order (a batched-only or shared group).
+    perm: Option<Vec<usize>>,
+    /// Multiply-adds one row of this group performs over all of its outputs.
+    macs_per_row: usize,
+}
+
 /// A destination block and the batch points that contribute to it.
 #[derive(Clone, Debug)]
 struct Unit {
-    /// Dense output buffer index.
-    out: usize,
-    /// Destination row of the output buffer.
+    /// The group this unit belongs to.
+    group: usize,
+    /// Destination row of the group's accumulating outputs. For a scattered
+    /// output this is the run index; for a shared one it is row 0.
     dest_row: usize,
     /// Rows of the unit's row space, in order. For a scattered output these are
     /// the run's row window, so the plan is tied to the run topology.
@@ -305,6 +306,10 @@ pub struct SegPolyPlan<T> {
     /// may be written by several operations, so one range per output would sweep
     /// up the operations of another output interleaved with them.
     out_ops: Vec<Vec<usize>>,
+    /// Per output: the group whose traversal writes it.
+    out_group: Vec<usize>,
+    /// The output groups, in descriptor order.
+    groups: Vec<Group>,
     /// Per output: number of destination rows.
     out_rows: Vec<usize>,
     /// Per output: whether its `[segments, u]` block is contiguous.
@@ -322,6 +327,12 @@ pub struct SegPolyPlan<T> {
     /// Prefix sums of task row counts, for the row-balanced split.
     cum_rows: Vec<usize>,
     block_slots: usize,
+    /// Elements per block slot: the largest sum of the accumulating outputs'
+    /// `segments × u` over the groups.
+    acc_stride: usize,
+    /// Elements one child reserves for a streamed batched row; 0 when no group
+    /// has a batched output.
+    row_elems: usize,
     tile_elems: usize,
     /// Per-child scratch elements for packed lane tiles; 0 when nothing packs.
     pack_elems: usize,
@@ -746,43 +757,128 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             })
             .collect();
 
-        // Units: one destination block per unit, with the rows that feed it.
-        let mut units: Vec<Unit> = Vec::new();
+        // Groups: outputs evaluated in one pass over the batch points. Scattered
+        // outputs group by their compiled run topology and pin the traversal
+        // order; batched outputs join a scattered group because each of their
+        // rows is one batch point and independent of the visit order; a shared
+        // output keeps its own natural-order batch reduction.
+        let mut groups: Vec<Group> = Vec::new();
+        let mut out_group = vec![usize::MAX; outputs.len()];
+        // Compile-time run offsets of each group, used only while grouping; the
+        // group itself already owns the permutation.
+        let mut topologies: Vec<Option<Vec<usize>>> = Vec::new();
+        fn scatter_group(
+            groups: &mut Vec<Group>,
+            topologies: &mut Vec<Option<Vec<usize>>>,
+            runs: &strided_basic::RunIndex,
+        ) -> usize {
+            // The two vectors are pushed together, so their indices agree.
+            if let Some((group, _)) = topologies.iter().enumerate().find(|(group, offsets)| {
+                offsets.as_deref() == Some(runs.ptr())
+                    && groups[*group].perm.as_deref() == runs.perm()
+            }) {
+                return group;
+            }
+            groups.push(Group {
+                acc: Vec::new(),
+                stream: Vec::new(),
+                perm: runs.perm().map(|perm| perm.to_vec()),
+                macs_per_row: 0,
+            });
+            topologies.push(Some(runs.ptr().to_vec()));
+            groups.len() - 1
+        }
+        for (dense, modes) in spec.indexes.iter().enumerate().skip(num_inputs) {
+            let dense = dense - num_inputs;
+            if let IndexMode::Scatter(runs) = &modes[0] {
+                let group = scatter_group(&mut groups, &mut topologies, runs);
+                let offset = groups[group]
+                    .acc
+                    .iter()
+                    .map(|acc| dims[num_inputs + acc.out][1].saturating_mul(u))
+                    .fold(0usize, usize::saturating_add);
+                groups[group].acc.push(AccOut { out: dense, offset });
+                out_group[dense] = group;
+            }
+        }
         for (dense, modes) in spec.indexes.iter().enumerate().skip(num_inputs) {
             let dense = dense - num_inputs;
             match &modes[0] {
+                IndexMode::Scatter(_) => {}
                 IndexMode::Batched => {
-                    for row in 0..batch {
-                        units.push(Unit {
-                            out: dense,
-                            dest_row: row,
-                            rows: row..row + 1,
-                            blocks: 1,
-                            slot_base: 0,
+                    if groups.is_empty() {
+                        groups.push(Group {
+                            acc: Vec::new(),
+                            stream: Vec::new(),
+                            perm: None,
+                            macs_per_row: 0,
                         });
+                        topologies.push(None);
                     }
+                    groups[0].stream.push(dense);
+                    out_group[dense] = 0;
                 }
-                IndexMode::Shared => units.push(Unit {
-                    out: dense,
-                    dest_row: 0,
-                    rows: 0..batch,
-                    blocks: block_count(batch, block_rows),
-                    slot_base: 0,
-                }),
-                IndexMode::Scatter(runs) => {
-                    for (run, window) in runs.ptr().windows(2).enumerate() {
-                        units.push(Unit {
+                IndexMode::Shared => {
+                    groups.push(Group {
+                        acc: vec![AccOut {
                             out: dense,
-                            dest_row: run,
-                            rows: window[0]..window[1],
-                            blocks: block_count(window[1] - window[0], block_rows),
-                            slot_base: 0,
-                        });
-                    }
+                            offset: 0,
+                        }],
+                        stream: Vec::new(),
+                        perm: None,
+                        macs_per_row: 0,
+                    });
+                    topologies.push(None);
+                    out_group[dense] = groups.len() - 1;
                 }
                 IndexMode::Gather(_) | IndexMode::Gather64(_) => {
                     unreachable!("role checked above")
                 }
+            }
+        }
+        for group in groups.iter_mut() {
+            group.macs_per_row = group
+                .acc
+                .iter()
+                .map(|acc| acc.out)
+                .chain(group.stream.iter().copied())
+                .map(|dense| macs_per_row[dense])
+                .fold(0usize, usize::saturating_add);
+        }
+
+        // Units: one destination block per unit, with the rows that feed it. A
+        // scattered group takes its run windows from the compiled topology;
+        // batched outputs inside it have no per-row unit.
+        let mut units: Vec<Unit> = Vec::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            if let Some(ptr) = &topologies[group_index] {
+                for (run, window) in ptr.windows(2).enumerate() {
+                    units.push(Unit {
+                        group: group_index,
+                        dest_row: run,
+                        rows: window[0]..window[1],
+                        blocks: block_count(window[1] - window[0], block_rows),
+                        slot_base: 0,
+                    });
+                }
+            } else if group.acc.is_empty() {
+                for row in 0..batch {
+                    units.push(Unit {
+                        group: group_index,
+                        dest_row: row,
+                        rows: row..row + 1,
+                        blocks: 1,
+                        slot_base: 0,
+                    });
+                }
+            } else {
+                units.push(Unit {
+                    group: group_index,
+                    dest_row: 0,
+                    rows: 0..batch,
+                    blocks: block_count(batch, block_rows),
+                    slot_base: 0,
+                });
             }
         }
         // Slots: only a multi-block unit's partials need one, and they must all
@@ -806,9 +902,10 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
         for (index, unit) in units.iter().enumerate() {
             let unit_id = u32::try_from(index).map_err(|_| StridedError::OffsetOverflow)?;
             let rows = unit.rows.len();
-            let unit_macs = macs_per_row[unit.out];
+            let group = &groups[unit.group];
+            let unit_macs = group.macs_per_row;
             if unit.blocks == 1 {
-                let slot = if out_direct[unit.out] {
+                let slot = if group.acc.iter().all(|acc| out_direct[acc.out]) {
                     TaskSlot::Direct
                 } else {
                     TaskSlot::Child
@@ -843,6 +940,25 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             .map(|dense| dims[num_inputs + dense][1].saturating_mul(u))
             .max()
             .unwrap_or(0);
+        // One block slot holds every accumulating output of one group; one child
+        // holds a slot's worth of accumulators, the streamed row tile, and the
+        // pack area of the widest operation.
+        let acc_stride = groups
+            .iter()
+            .map(|group| {
+                group
+                    .acc
+                    .iter()
+                    .map(|acc| dims[num_inputs + acc.out][1].saturating_mul(u))
+                    .fold(0usize, usize::saturating_add)
+            })
+            .max()
+            .unwrap_or(0);
+        let row_elems = if groups.iter().any(|group| !group.stream.is_empty()) {
+            tile_elems
+        } else {
+            0
+        };
         // The lane step is the compiled lane stride, not a hardcoded 1: a caller
         // may hand a view whose lanes are separated. A unit-lane buffer (lane
         // extent 1) broadcasts over the `u` lanes, so its step is 0 whatever its
@@ -869,6 +985,8 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             strides,
             in_lane,
             out_ops,
+            out_group,
+            groups,
             out_rows,
             out_direct,
             mode_kinds,
@@ -880,6 +998,8 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             tasks,
             cum_rows,
             block_slots: block_slots as usize,
+            acc_stride,
+            row_elems,
             tile_elems,
             pack_elems,
             macs,
@@ -908,21 +1028,29 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
     ///
     /// Two parts. The block partials of every unit with more rows than
     /// [`BLOCK_ROWS`] are compile-time constants and must all exist at once,
-    /// because the combine runs after the fork joins. The child tiles are one per
-    /// concurrently running child, so this part grows with the budget: pass the
-    /// budget of the token the call will use. A narrower token simply runs fewer
-    /// children, and a call whose scratch cannot hold the block partials fails
-    /// with [`SegPolyError::ScratchTooSmall`] rather than truncating the sum.
+    /// because the combine runs after the fork joins; a slot holds the
+    /// accumulators of every output the unit's group accumulates (a scattered
+    /// group may write several outputs in one pass). The child regions are one
+    /// per concurrently running child, so this part grows with the budget: each
+    /// holds the group's accumulators, one streamed batched row and one pack
+    /// area. Pass the budget of the token the call will use. A narrower token
+    /// simply runs fewer children, and a call whose scratch cannot hold the
+    /// block partials fails with [`SegPolyError::ScratchTooSmall`] rather than
+    /// truncating the sum.
     pub fn scratch_len(&self, budget: usize) -> usize {
-        // `[ block partials ][ child 0: tile | pack ][ child 1: ... ]`; the block
-        // partials stay first because `combine` indexes them by slot.
+        // `[ block partials ][ child 0: acc | row | pack ][ child 1: ... ]`; the
+        // block partials stay first because `combine` indexes them by slot.
         self.block_slots
-            .saturating_mul(self.tile_elems)
-            .saturating_add(
-                budget
-                    .max(1)
-                    .saturating_mul(self.tile_elems.saturating_add(self.pack_elems)),
-            )
+            .saturating_mul(self.acc_stride)
+            .saturating_add(budget.max(1).saturating_mul(self.child_elems()))
+    }
+
+    /// Scratch elements one child region holds: the group's accumulators, the
+    /// streamed row tile, and the pack area of the widest operation.
+    fn child_elems(&self) -> usize {
+        self.acc_stride
+            .saturating_add(self.row_elems)
+            .saturating_add(self.pack_elems)
     }
 
     /// Multiply-adds one call performs: the plan's cost for the token's gate.

@@ -37,6 +37,11 @@ hundreds of MiB at production sizes).
   normalise).
 - **No atomics, no locks, no allocation.** One task owns each destination row
   family, and the caller supplies the scratch.
+- **One pass per plan.** A plan with several outputs evaluates the compatible ones
+  in one traversal of the batch points: scattered outputs with the same compiled
+  run topology share it, batched outputs ride along (their row is one batch
+  point), and a shared output keeps its own batch reduction. Each output keeps
+  its documented order, and no edge × segments × u intermediate is materialised.
 - **Typed errors, no panics** on caller-reachable paths: indices, extents, segment
   ids, path ranges, layouts and scratch are all checked.
 - **Aliasing.** Inputs may alias one another. An output may not alias any other
@@ -109,7 +114,11 @@ assert_eq!(outputs[0].data()[1 * segments * u + 2], 24.0);
 ```
 
 `execute_into` zeroes each destination block and accumulates ([`D2`]); every
-output can also be seeded by the caller and updated with `execute_acc`.
+output can also be seeded by the caller and updated with `execute_acc`. A plan
+whose scattered outputs were compiled from the same run topology evaluates them
+in one pass; the call must supply each output's `RunIndex` with that compiled
+row order, and a different row order is a typed error rather than a silently
+different sum.
 
 ## Indexing
 

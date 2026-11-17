@@ -151,7 +151,8 @@ pub struct Buffers<T: Scalar> {
     pub bar_scatter_major: Vec<T>,
 }
 
-/// The four plans plus the shared index data.
+/// The five plans plus the shared index data: the forward, the three split VJPs and
+/// the one-pass VJP that #498 compares against their sum.
 pub struct Cg<T: Scalar> {
     pub desc: Layer1Descriptor,
     pub num_nodes: usize,
@@ -164,12 +165,16 @@ pub struct Cg<T: Scalar> {
     pub vjp_x: SegPolyPlan<T>,
     pub vjp_w: SegPolyPlan<T>,
     pub vjp_y: SegPolyPlan<T>,
+    /// The three VJP plans fused into one: `bar_x` (two scattered outputs over
+    /// one source run topology) with `bar_w` and `bar_y` batched alongside.
+    pub vjp_fused: SegPolyPlan<T>,
     /// Each plan's scratch. Behind a `RefCell` so both sides of a cell can hold
     /// their closures at once: the measured cell has to interleave them.
     pub fwd_scratch: RefCell<Vec<T>>,
     pub vjp_x_scratch: RefCell<Vec<T>>,
     pub vjp_w_scratch: RefCell<Vec<T>>,
     pub vjp_y_scratch: RefCell<Vec<T>>,
+    pub vjp_fused_scratch: RefCell<Vec<T>>,
     plan: Layer1Plan,
     senders_usize: Vec<usize>,
     receivers_usize: Vec<usize>,
@@ -395,6 +400,79 @@ impl<T: Scalar> Cg<T> {
             )
             .map_err(|error| format!("segpoly vjp-y: {error}"))
     }
+
+    /// All three VJP gradients in one call: the fused plan walks the edges once
+    /// and writes `grad_x` (two scattered outputs), `grad_w` and `grad_y`.
+    pub fn strided_vjp_fused(
+        &self,
+        buffers: &Buffers<T>,
+        grad_x: &mut [T],
+        grad_w: &mut [T],
+        grad_y: &mut [T],
+        exec: Exec<'_>,
+    ) -> Result<(), String> {
+        let n = self.num_nodes;
+        let e = self.num_edges;
+        let f = self.desc.feature_dim;
+        let slots = self.out_m_total();
+        let x0e_dims = [n, 1, f];
+        let x0e_strides = [4 * f as isize, 1, 1];
+        let x1o_dims = [n, 3, f];
+        let x1o_strides = [4 * f as isize, 1, 3];
+        let y_dims = [e, 16, 1];
+        let y_strides = [16, 1isize, 1];
+        let w_dims = [e, 10, f];
+        let w_strides = [10 * f as isize, f as isize, 1];
+        let gm_dims = [n, slots, f];
+        let gm_strides = [(slots * f) as isize, f as isize, 1];
+        let gx0e_dims = [n, 1, f];
+        let gx0e_strides = [f as isize, 1isize, 1];
+        let gx1o_dims = [n, 3, f];
+        let gx1o_strides = [3 * f as isize, 1isize, 3];
+        let gw_dims = [e, 10, f];
+        let gy_dims = [e, 16, 1];
+        let gy_strides = [16, 1isize, 1];
+        let x = &buffers.linear_up;
+        let grad_m = &buffers.bar_scatter_major;
+        let inputs = [
+            RawStridedRef::new(x, &x0e_dims, &x0e_strides, 0).map_err(err)?,
+            RawStridedRef::new(x, &x1o_dims, &x1o_strides, 128).map_err(err)?,
+            RawStridedRef::new(&buffers.edge_attrs, &y_dims, &y_strides, 0).map_err(err)?,
+            RawStridedRef::new(&buffers.tp_weights, &w_dims, &w_strides, 0).map_err(err)?,
+            RawStridedRef::new(grad_m, &gm_dims, &gm_strides, 0).map_err(err)?,
+        ];
+        let (narrow, wide) = grad_x.split_at_mut(n * f);
+        let mut outputs = [
+            RawStridedMut::new(narrow, &gx0e_dims, &gx0e_strides, 0).map_err(err)?,
+            RawStridedMut::new(wide, &gx1o_dims, &gx1o_strides, 0).map_err(err)?,
+            RawStridedMut::new(grad_w, &gw_dims, &w_strides, 0).map_err(err)?,
+            RawStridedMut::new(grad_y, &gy_dims, &gy_strides, 0).map_err(err)?,
+        ];
+        let gather_s = [IndexMode::Gather(&self.senders)];
+        let batched = [IndexMode::Batched];
+        let gather_r = [IndexMode::Gather(&self.receivers)];
+        let scatter_source = [IndexMode::Scatter(&self.runs_source)];
+        let indexes: [&[IndexMode<'_>]; 9] = [
+            &gather_s,
+            &gather_s,
+            &batched,
+            &batched,
+            &gather_r,
+            &scatter_source,
+            &scatter_source,
+            &batched,
+            &batched,
+        ];
+        self.vjp_fused
+            .execute_into(
+                &mut outputs,
+                &inputs,
+                &indexes,
+                &mut self.vjp_fused_scratch.borrow_mut(),
+                exec,
+            )
+            .map_err(|error| format!("segpoly vjp fused: {error}"))
+    }
 }
 
 fn err<E: std::fmt::Display>(error: E) -> String {
@@ -436,7 +514,7 @@ fn leak_segments(paths: &[[u32; 4]]) -> Vec<&'static [u32]> {
         .collect()
 }
 
-/// Build the four plans for one topology.
+/// Build the five plans for one topology.
 /// The descriptor alone, for tests that pin the published counters.
 pub fn layer1_descriptor_for_test() -> Layer1Descriptor {
     llmlip::mace_lite::bench_api::layer1_descriptor()
@@ -739,12 +817,108 @@ pub fn build<T: Scalar>(topo: &Topology) -> Result<Cg<T>, String> {
     )
     .map_err(|error| format!("vjp-y compile: {error}"))?;
 
+    // ---- the fused VJP: the same six operations in one plan -----------------
+    // `bar_x`'s two outputs scatter into the same source runs, so they share one
+    // traversal; `bar_w` and `bar_y` are batched and ride along in it. The
+    // gradient order and every output's summation order are the split plans'
+    // (the fidelity test compares the two bit for bit).
+    let narrow_width = count_width_one(&desc);
+    let mut fused_path_list: Vec<Path<'static>> = Vec::new();
+    let mut fused_ops: Vec<Operation<'_>> = Vec::new();
+    for (kind, narrow_buffers, wide_buffers) in [
+        (Kind::VjpX, &[2u32, 3, 4, 5][..], &[2u32, 3, 4, 6][..]),
+        (Kind::VjpW, &[0, 2, 4, 7][..], &[1, 2, 4, 7][..]),
+        (Kind::VjpY, &[0, 3, 4, 8][..], &[1, 3, 4, 8][..]),
+    ] {
+        let (segments, coeffs) = build_paths(&desc, kind);
+        let narrow = mk_paths(&leak_segments(&segments[..narrow_width]), &coeffs[..narrow_width]);
+        let wide = mk_paths(&leak_segments(&segments[narrow_width..]), &coeffs[narrow_width..]);
+        let start = u32::try_from(fused_path_list.len()).map_err(|error| format!("{error}"))?;
+        let narrow_len = u32::try_from(narrow.len()).map_err(|error| format!("{error}"))?;
+        fused_path_list.extend(narrow);
+        fused_path_list.extend(wide);
+        let wide_len = u32::try_from(fused_path_list.len()).map_err(|error| format!("{error}"))?
+            - (start + narrow_len);
+        fused_ops.push(Operation {
+            buffers: narrow_buffers,
+            path_start: start,
+            num_paths: narrow_len,
+        });
+        fused_ops.push(Operation {
+            buffers: wide_buffers,
+            path_start: start + narrow_len,
+            num_paths: wide_len,
+        });
+    }
+    let fused_indexes = [
+        &[IndexMode::Gather(&senders)][..],
+        &[IndexMode::Gather(&senders)][..],
+        &[IndexMode::Batched][..],
+        &[IndexMode::Batched][..],
+        &[IndexMode::Gather(&receivers)][..],
+        &[IndexMode::Scatter(&runs_source)][..],
+        &[IndexMode::Scatter(&runs_source)][..],
+        &[IndexMode::Batched][..],
+        &[IndexMode::Batched][..],
+    ];
+    let fused_spec = Spec {
+        num_batch_axes: 1,
+        operations: &fused_ops,
+        paths: &fused_path_list,
+        indexes: &fused_indexes,
+    };
+    let vjp_fused = SegPolyPlan::compile(
+        &fused_spec,
+        &[
+            Layout {
+                dims: &x0e_dims,
+                strides: &x0e_strides,
+            },
+            Layout {
+                dims: &x1o_dims,
+                strides: &x1o_strides,
+            },
+            Layout {
+                dims: &y_dims,
+                strides: &y_strides,
+            },
+            Layout {
+                dims: &w_dims,
+                strides: &w_strides,
+            },
+            Layout {
+                dims: &m_dims,
+                strides: &m_strides,
+            },
+        ],
+        &[
+            Layout {
+                dims: &x0e_out_dims,
+                strides: &x0e_out_strides,
+            },
+            Layout {
+                dims: &x1o_out_dims,
+                strides: &x1o_out_strides,
+            },
+            Layout {
+                dims: &gw_dims,
+                strides: &w_strides,
+            },
+            Layout {
+                dims: &gy_dims,
+                strides: &gy_strides,
+            },
+        ],
+    )
+    .map_err(|error| format!("vjp fused compile: {error}"))?;
+
     let features = 8usize;
     Ok(Cg {
         fwd_scratch: RefCell::new(vec![T::from_f64(0.0); fwd.scratch_len(features)]),
         vjp_x_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_x.scratch_len(features)]),
         vjp_w_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_w.scratch_len(features)]),
         vjp_y_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_y.scratch_len(features)]),
+        vjp_fused_scratch: RefCell::new(vec![T::from_f64(0.0); vjp_fused.scratch_len(features)]),
         desc,
         num_nodes: n,
         num_edges: e,
@@ -758,6 +932,7 @@ pub fn build<T: Scalar>(topo: &Topology) -> Result<Cg<T>, String> {
         vjp_x,
         vjp_w,
         vjp_y,
+        vjp_fused,
         plan,
     })
 }
