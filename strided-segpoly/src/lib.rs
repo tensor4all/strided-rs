@@ -60,8 +60,9 @@
 
 mod error;
 mod plan;
+mod simd;
 mod spec;
 
 pub use error::SegPolyError;
-pub use plan::{SegPolyElem, SegPolyPlan, BLOCK_ROWS, MAX_INPUTS, MAX_OUTPUTS};
+pub use plan::{lane_width, SegPolyElem, SegPolyPlan, BLOCK_ROWS, MAX_INPUTS, MAX_OUTPUTS};
 pub use spec::{IndexMode, Layout, Operation, Path, Spec};

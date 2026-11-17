@@ -121,6 +121,76 @@ fn budget_split_is_bitwise_for_a_batched_and_a_shared_output() {
     }
 }
 
+#[test]
+fn a_lane_reduction_is_bitwise_across_budgets_and_block_partials() {
+    // The output has lane extent 1 (a lane reduction) and mode `Shared` (a batch
+    // reduction), so one unit is every row: `3 * BLOCK_ROWS + 7` rows, i.e. four
+    // block partials that must combine lane-wise before the lanes are summed. The
+    // payload stays flag-shaped so the sum is cancellation-sensitive: a different
+    // association would move the bits.
+    let (batch, segments, u) = (3 * strided_segpoly::BLOCK_ROWS + 7, 4usize, 19usize);
+    let paths: Vec<PathSpec> = (0..segments)
+        .map(|segment| PathSpec {
+            segments: vec![segment as u32, segment as u32, segment as u32],
+            coefficient: (1.0 + 0.25 * segment as f64) * if segment % 2 == 0 { 1.0 } else { -1.0 },
+        })
+        .collect();
+    let weights = Buffer::dense([1, segments, u], Mode::Shared, payload(segments * u));
+    let input = Buffer::dense(
+        [batch, segments, u],
+        Mode::Batched,
+        payload(batch * segments * u),
+    );
+    let output = Buffer::dense([1, segments, 1], Mode::Shared, vec![0.0; segments]);
+    let case = Case {
+        batch,
+        inputs: vec![weights, input],
+        outputs: vec![output],
+        ops: vec![Op {
+            buffers: vec![0, 1, 2],
+            paths,
+        }],
+        expected: vec![],
+    };
+    let plan = case.compile().expect("the case compiles");
+    let mut reference: Option<Vec<Vec<f64>>> = None;
+    for threads in [2usize, 4] {
+        let pool = pool(threads);
+        for budget in [1usize, 2, 4] {
+            if budget > threads {
+                break;
+            }
+            let exec = if budget == 1 {
+                Exec::serial()
+            } else {
+                Exec::new(&pool, budget).expect("a token")
+            };
+            let mut data = case.data();
+            let mut scratch = vec![0.0f64; plan.scratch_len(budget)];
+            case.execute(&plan, &mut data, &mut scratch, exec, true)
+                .expect("the case executes");
+            match reference {
+                None => reference = Some(data),
+                Some(ref reference) => assert_eq!(
+                    reference, &data,
+                    "{threads} threads at budget {budget} changed the bits"
+                ),
+            }
+        }
+    }
+    // The reduction really did sum something: every destination segment is nonzero
+    // and no lane was left unsummed.
+    let result = reference.expect("at least one execution");
+    let out = &result[case.inputs.len()];
+    assert_eq!(out.len(), segments);
+    for (segment, value) in out.iter().enumerate() {
+        assert!(
+            value.is_finite() && *value != 0.0,
+            "segment {segment} did not accumulate: {value}"
+        );
+    }
+}
+
 /// `y[b, s, l] = c_s · w[0, s, l] · x[b, s, l] · x[b, s, l]`, whose derivative in
 /// `x[b, s, l]` is `2 · c_s · w[0, s, l] · x[b, s, l]`.
 fn squared_case(batch: usize, segments: usize, u: usize) -> Case {

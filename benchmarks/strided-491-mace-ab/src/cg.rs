@@ -256,7 +256,7 @@ impl<T: Scalar> Cg<T> {
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut *self.fwd_scratch.borrow_mut(),
+                &mut self.fwd_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly fwd: {error}"))
@@ -302,7 +302,7 @@ impl<T: Scalar> Cg<T> {
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut *self.vjp_x_scratch.borrow_mut(),
+                &mut self.vjp_x_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly vjp-x: {error}"))
@@ -346,7 +346,7 @@ impl<T: Scalar> Cg<T> {
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut *self.vjp_w_scratch.borrow_mut(),
+                &mut self.vjp_w_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly vjp-w: {error}"))
@@ -361,32 +361,36 @@ impl<T: Scalar> Cg<T> {
         let n = self.num_nodes;
         let e = self.num_edges;
         let f = self.desc.feature_dim;
-        let w_len = 10 * f;
-        let x_dims = [n, 512, 1];
-        let x_strides = [512, 1isize, 1];
-        let w_dims = [e, w_len, 1];
-        let w_strides = [w_len as isize, 1isize, 1];
-        let gm_dims = [n, self.out_m_total() * f, 1];
-        let gm_strides = [(self.out_m_total() * f) as isize, 1isize, 1];
+        let slots = self.out_m_total();
+        let x0e_dims = [n, 1, f];
+        let x0e_strides = [4 * f as isize, 1, 1];
+        let x1o_dims = [n, 3, f];
+        let x1o_strides = [4 * f as isize, 1, 3];
+        let w_dims = [e, 10, f];
+        let w_strides = [10 * f as isize, f as isize, 1];
+        let m_dims = [n, slots, f];
+        let m_strides = [(slots * f) as isize, f as isize, 1];
         let gy_dims = [e, 16, 1];
         let gy_strides = [16, 1isize, 1];
+        let x = &buffers.linear_up;
         let grad_m = &buffers.bar_scatter_major;
         let inputs = [
-            RawStridedRef::new(&buffers.linear_up, &x_dims, &x_strides, 0).map_err(err)?,
+            RawStridedRef::new(x, &x0e_dims, &x0e_strides, 0).map_err(err)?,
+            RawStridedRef::new(x, &x1o_dims, &x1o_strides, 128).map_err(err)?,
             RawStridedRef::new(&buffers.tp_weights, &w_dims, &w_strides, 0).map_err(err)?,
-            RawStridedRef::new(grad_m, &gm_dims, &gm_strides, 0).map_err(err)?,
+            RawStridedRef::new(grad_m, &m_dims, &m_strides, 0).map_err(err)?,
         ];
         let mut outputs = [RawStridedMut::new(grad_y, &gy_dims, &gy_strides, 0).map_err(err)?];
         let gather_s = [IndexMode::Gather(&self.senders)];
         let batched = [IndexMode::Batched];
         let gather_r = [IndexMode::Gather(&self.receivers)];
-        let indexes: [&[IndexMode<'_>]; 4] = [&gather_s, &batched, &gather_r, &batched];
+        let indexes: [&[IndexMode<'_>]; 5] = [&gather_s, &gather_s, &batched, &gather_r, &batched];
         self.vjp_y
             .execute_into(
                 &mut outputs,
                 &inputs,
                 &indexes,
-                &mut *self.vjp_y_scratch.borrow_mut(),
+                &mut self.vjp_y_scratch.borrow_mut(),
                 exec,
             )
             .map_err(|error| format!("segpoly vjp-y: {error}"))
@@ -464,13 +468,11 @@ pub fn build<T: Scalar>(topo: &Topology) -> Result<Cg<T>, String> {
     let m_strides = [(slots * f) as isize, f as isize, 1];
     let gw_dims = [e, 10, f];
     let gy_dims = [e, 16, 1];
-    let xflat_dims = [n, 512, 1];
+    let gy_strides = [16, 1isize, 1];
     let x0e_out_dims = [n, 1, f];
     let x0e_out_strides = [f as isize, 1isize, 1];
     let x1o_out_dims = [n, 3, f];
     let x1o_out_strides = [3 * f as isize, 1isize, 3];
-    let wflat_dims = [e, 10 * f, 1];
-    let gmflat_dims = [n, slots * f, 1];
 
     // ---- forward -----------------------------------------------------------
     let (fwd_segments, fwd_coeffs) = build_paths(&desc, Kind::Forward);
@@ -663,16 +665,36 @@ pub fn build<T: Scalar>(topo: &Topology) -> Result<Cg<T>, String> {
     )
     .map_err(|error| format!("vjp-w compile: {error}"))?;
 
-    // ---- VJP wrt the spherical harmonics (a lane reduction, u = 1) ---------
-    let (vy_segments, vy_coeffs) = build_paths(&desc, Kind::VjpY);
-    let vy_segs = leak_segments(&vy_segments);
-    let vy_paths = mk_paths(&vy_segs, &vy_coeffs);
-    let vy_ops = [Operation {
-        buffers: &[0, 1, 2, 3],
-        path_start: 0,
-        num_paths: vy_paths.len() as u32,
-    }];
+    // ---- VJP wrt the spherical harmonics (a lane reduction, u = 128) -------
+    // Same reduction as the `u = 1` form -- 86 CG paths times 128 features, summed
+    // into `[E, 16]` -- but the feature axis is the *lane* axis, so the replay runs
+    // 86 paths of 128 lanes instead of 11 008 scalar paths and the plan reduces the
+    // lanes per destination segment (strided-rs#496). The feature offsets of every
+    // operand are the buffer's lane stride, so `x1o` (layout `f*3 + o`) is packed
+    // by the executor and `x0e`, `tp_weights`, `bar_scatter_major` are contiguous.
+    let (vy_narrow, vy_narrow_coeffs) = build_paths(&desc, Kind::VjpY);
+    let vy_split = count_width_one(&desc);
+    let vy_narrow_segs = leak_segments(&vy_narrow[..vy_split]);
+    let vy_wide_segs = leak_segments(&vy_narrow[vy_split..]);
+    let vy_paths = mk_paths(&vy_narrow_segs, &vy_narrow_coeffs[..vy_split]);
+    let vy_wide_paths = mk_paths(&vy_wide_segs, &vy_narrow_coeffs[vy_split..]);
+    let narrow_len = vy_paths.len() as u32;
+    let vy_ops = [
+        Operation {
+            buffers: &[0, 2, 3, 4],
+            path_start: 0,
+            num_paths: narrow_len,
+        },
+        Operation {
+            buffers: &[1, 2, 3, 4],
+            path_start: narrow_len,
+            num_paths: vy_wide_paths.len() as u32,
+        },
+    ];
+    let mut vy_path_list = vy_paths;
+    vy_path_list.extend(vy_wide_paths);
     let vy_indexes = [
+        [IndexMode::Gather(&senders)],
         [IndexMode::Gather(&senders)],
         [IndexMode::Batched],
         [IndexMode::Gather(&receivers)],
@@ -681,33 +703,38 @@ pub fn build<T: Scalar>(topo: &Topology) -> Result<Cg<T>, String> {
     let vy_spec = Spec {
         num_batch_axes: 1,
         operations: &vy_ops,
-        paths: &vy_paths,
+        paths: &vy_path_list,
         indexes: &[
             &vy_indexes[0],
             &vy_indexes[1],
             &vy_indexes[2],
             &vy_indexes[3],
+            &vy_indexes[4],
         ],
     };
     let vjp_y = SegPolyPlan::compile(
         &vy_spec,
         &[
             Layout {
-                dims: &xflat_dims,
-                strides: &[512, 1, 1],
+                dims: &x0e_dims,
+                strides: &x0e_strides,
             },
             Layout {
-                dims: &wflat_dims,
-                strides: &[(10 * f) as isize, 1, 1],
+                dims: &x1o_dims,
+                strides: &x1o_strides,
             },
             Layout {
-                dims: &gmflat_dims,
-                strides: &[(slots * f) as isize, 1, 1],
+                dims: &w_dims,
+                strides: &w_strides,
+            },
+            Layout {
+                dims: &m_dims,
+                strides: &m_strides,
             },
         ],
         &[Layout {
             dims: &gy_dims,
-            strides: &[16, 1, 1],
+            strides: &gy_strides,
         }],
     )
     .map_err(|error| format!("vjp-y compile: {error}"))?;
@@ -806,18 +833,20 @@ fn build_paths(desc: &Layer1Descriptor, kind: Kind) -> (Vec<[u32; 4]>, Vec<f64>)
                 }
             }
             Kind::VjpY => {
-                for feature in 0..f {
-                    for &(i_m, j_m, k_m, scale) in &block.cg {
-                        target.push((
-                            [
-                                (block.x_base + feature * block.x_dim + i_m) as u32,
-                                (block.weight_base + feature) as u32,
-                                (((block.out_base / f + k_m) * f) + feature) as u32,
-                                (block.y_base + j_m) as u32,
-                            ],
-                            scale,
-                        ));
-                    }
+                // One path per CG entry: the feature axis is the plan's lane, so it
+                // is the operand's lane stride, not a path segment id. The narrow
+                // blocks read `x0e` (segment 0) and the wide ones `x1o`.
+                for &(i_m, j_m, k_m, scale) in &block.cg {
+                    let x_seg = if narrow_block { 0 } else { i_m };
+                    target.push((
+                        [
+                            x_seg as u32,
+                            block_index as u32,
+                            (block.out_base / f + k_m) as u32,
+                            (block.y_base + j_m) as u32,
+                        ],
+                        scale,
+                    ));
                 }
             }
         }

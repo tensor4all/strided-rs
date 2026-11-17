@@ -55,7 +55,7 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
     /// [`SegPolyError::Strided`] carrying [`StridedError::ShapeMismatch`] when a
     /// run index describes a different topology, and
     /// [`SegPolyError::ScratchTooSmall`] when the scratch cannot hold the block
-    /// partials.
+    /// partials plus one child's accumulator and pack tiles.
     ///
     /// Inputs may alias one another; an output must not overlap any input or
     /// another output, which is the caller's obligation as for every plan taking
@@ -102,9 +102,13 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
         if self.tasks.is_empty() || self.tile_elems == 0 {
             return Ok(());
         }
-        // The block partials must all exist at once; the child tiles can be
+        // The block partials must all exist at once; the child regions can be
         // capped by what the caller supplied.
-        let floor = (self.block_slots + 1).saturating_mul(self.tile_elems);
+        let floor = self
+            .block_slots
+            .saturating_mul(self.tile_elems)
+            .saturating_add(self.tile_elems)
+            .saturating_add(self.pack_elems);
         if scratch.len() < floor {
             return Err(SegPolyError::ScratchTooSmall {
                 need: floor,
@@ -112,7 +116,8 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             });
         }
         let call = self.call(outputs, inputs, indexes);
-        let child_tiles = scratch.len() / self.tile_elems - self.block_slots;
+        let child_elems = self.tile_elems.saturating_add(self.pack_elems);
+        let child_tiles = (scratch.len() - self.block_slots * self.tile_elems) / child_elems;
         let width = tree_width(&exec, KernelClass::Map, self.macs)
             .get()
             .min(child_tiles)
@@ -299,9 +304,11 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
     ///
     /// # Safety
     ///
-    /// `check_call` matched every view to the compiled layouts; the scratch is at
-    /// least `(block_slots + 1) * tile_elems` elements and `child` is below the
-    /// number of children; every destination row this task writes belongs to
+    /// `check_call` matched every view to the compiled layouts; the scratch holds
+    /// `block_slots * tile_elems` block partials followed by at least one child
+    /// region of `tile_elems + pack_elems` elements -- the floor `execute` checks
+    /// and returns [`SegPolyError::ScratchTooSmall`] below -- and `child` is below
+    /// the number of children; every destination row this task writes belongs to
     /// this task alone.
     unsafe fn run_task(
         &self,
@@ -320,7 +327,6 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
         let len = segments * u;
         let dest_seg = self.strides[buffer][1];
         let dest_lane = self.strides[buffer][2];
-        let direct = self.out_direct[dense];
         // An empty output has nothing to write, and its base pointer is a
         // dangling empty view's, so it must not be offset at all.
         if len == 0 {
@@ -331,20 +337,26 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                 .as_ptr()
                 .offset(unit.dest_row as isize * call.out_batch[dense])
         };
+        // A child owns one region and runs its tasks one at a time, so the same
+        // region carries its accumulator tile and its pack tiles whatever slot
+        // the task uses.
+        let child_base = unsafe {
+            scratch.as_ptr().add(
+                self.block_slots * self.tile_elems + child * (self.tile_elems + self.pack_elems),
+            )
+        };
+        let pack_base = unsafe { child_base.add(self.tile_elems) };
         let acc_ptr = match task.slot {
             TaskSlot::Direct => dest_base,
             TaskSlot::Block(slot) => unsafe {
                 scratch.as_ptr().add(slot as usize * self.tile_elems)
             },
-            TaskSlot::Child => unsafe {
-                scratch
-                    .as_ptr()
-                    .add((self.block_slots + child) * self.tile_elems)
-            },
+            TaskSlot::Child => child_base,
         };
         // SAFETY: the accumulator slot is `tile_elems >= len` elements and owned
         // by this task.
         let acc = unsafe { core::slice::from_raw_parts_mut(acc_ptr, len) };
+        let layout = self.block_layout(dense);
         if into {
             acc.fill(T::zero());
         } else {
@@ -358,7 +370,7 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                 TaskSlot::Block(slot) if slot != unit.slot_base => acc.fill(T::zero()),
                 TaskSlot::Block(_) | TaskSlot::Child => {
                     // SAFETY: the destination block belongs to this task's unit.
-                    unsafe { read_block(dest_base, dest_seg, dest_lane, segments, u, direct, acc) };
+                    unsafe { read_block(dest_base, dest_seg, dest_lane, segments, u, layout, acc) };
                 }
             }
         }
@@ -390,25 +402,50 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             }
             for &op_index in self.out_ops[dense].iter() {
                 let op = &self.ops[op_index];
+                // A pathless operation contributes nothing. Skipping it here also
+                // keeps its inputs' bases unresolved: an empty input's pointer is
+                // dangling, and offsetting it by a row base is undefined even when
+                // no path would read it.
+                if op.num_paths() == 0 {
+                    continue;
+                }
                 let arity = op.inputs.len() + 1;
-                // Contiguous lanes at arity one to three: the row bases are
-                // resolved once here and the paths walk slices, which is the
-                // same arithmetic in the same order as `accumulate` below.
-                if op.unit_lanes && (1..=3).contains(&op.inputs.len()) {
+                // Arity one to three: the lanes of one path go through the
+                // dispatched kernel as whole vectors. Operand bases are resolved
+                // once per batch point -- a lane-contiguous buffer is read where it
+                // lives, a lane-strided one is copied into this child's pack tile
+                // (and the plan's offsets for it are already in tile space), and a
+                // unit-lane one is read as the splat it is.
+                if op.lanes {
                     let paths = op.base..op.base + op.num_paths();
                     let offsets = op.offsets_base..op.offsets_base + op.num_paths() * arity;
-                    macro_rules! contiguous {
+                    let mut tile = pack_base;
+                    macro_rules! lanes {
                         ($n:literal) => {{
                             let bases: [*const T; $n] = core::array::from_fn(|t| {
                                 let input = op.inputs[t] as usize;
+                                let step = self.in_lane[input];
                                 // SAFETY: `rows` holds this row's base for that
-                                // buffer, as in the general path below.
-                                unsafe { call.in_base[input].as_const().offset(rows[input]) }
+                                // buffer, and a packed tile is inside this child's
+                                // own pack region.
+                                let base =
+                                    unsafe { call.in_base[input].as_const().offset(rows[input]) };
+                                if step == 0 || step == 1 {
+                                    return base;
+                                }
+                                let segments = self.dims[input][1];
+                                unsafe {
+                                    pack_into(base, self.strides[input][1], step, segments, u, tile)
+                                };
+                                let packed = tile;
+                                tile = unsafe { tile.add(segments * u) };
+                                packed
                             });
-                            // SAFETY: as for `accumulate`; every input has lane
-                            // step 1, so each path reads `u` contiguous lanes.
+                            // SAFETY: every base reaches the whole segment block
+                            // this op reads, the accumulator holds `segments * u`,
+                            // and a lane-strided operand was packed above.
                             unsafe {
-                                op_row_contiguous::<T, $n>(
+                                op_row_lanes::<T, $n>(
                                     acc,
                                     u,
                                     &op.seg_starts,
@@ -416,14 +453,15 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                                     &self.path_coeffs[paths],
                                     &self.path_offsets[offsets],
                                     &bases,
+                                    op.splat_mask,
                                 )
                             }
                         }};
                     }
                     match op.inputs.len() {
-                        1 => contiguous!(1),
-                        2 => contiguous!(2),
-                        _ => contiguous!(3),
+                        1 => lanes!(1),
+                        2 => lanes!(2),
+                        _ => lanes!(3),
                     }
                     continue;
                 }
@@ -472,7 +510,18 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
         }
         if task.slot == TaskSlot::Child {
             // SAFETY: the destination block belongs to this task's unit.
-            unsafe { write_block(dest_base, dest_seg, dest_lane, segments, u, direct, acc) };
+            unsafe { write_block(dest_base, dest_seg, dest_lane, segments, u, layout, acc) };
+        }
+    }
+
+    /// How one output's destination block is laid out.
+    fn block_layout(&self, dense: usize) -> BlockLayout {
+        if self.reduce_lane[dense] {
+            BlockLayout::ReduceLane
+        } else if self.out_direct[dense] {
+            BlockLayout::Direct
+        } else {
+            BlockLayout::Strided
         }
     }
 
@@ -515,7 +564,7 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                     self.strides[buffer][2],
                     segments,
                     u,
-                    self.out_direct[unit.out],
+                    self.block_layout(unit.out),
                     acc,
                 )
             };
@@ -545,12 +594,10 @@ unsafe fn accumulate<T: SegPolyElem>(
     /// the add phase reads only it, which is what lets the compiler vectorise
     /// both. Past this width the lane loop accumulates directly.
     ///
-    /// `shortcut: the lane loop is not SIMD-dispatched (no pulp kernel), and this
-    /// general path (a lane step other than 1, a broadcast operand, or more than
-    /// three operands) indexes lanes by a runtime step, so it vectorises poorly;
-    /// lane-contiguous operations of arity one to three take
-    /// `op_row_contiguous` instead. Specialise the broadcast case when it is the
-    /// measured bottleneck` (strided-rs#479).
+    /// `shortcut: this path runs only for an operation with more than three
+    /// operands or with none at all (`op.lanes` needs at least one input), so it
+    /// still indexes lanes by a runtime step and vectorises poorly. Give the deeper arities a packed lane tile and the
+    /// dispatched kernel when they are the measured bottleneck` (strided-rs#479).
     const LANE_TILE: usize = 64;
 
     // Sliced to the operation's arity, so the inner loop is a zip over two slices
@@ -559,32 +606,6 @@ unsafe fn accumulate<T: SegPolyElem>(
     let pointers = &pointers[..nin];
     let steps = &steps[..nin];
 
-    // The arities a lowered polynomial actually uses: one, two or three operands.
-    // Unrolling the lane loop for them removes the runtime arity from the inner
-    // most code, which is most of the per-path cost at a narrow lane axis.
-    macro_rules! unrolled {
-        ($($pointer:expr => $step:expr),*) => {{
-            for lane in 0..u {
-                let mut product = coefficient;
-                $( product = product * unsafe { *$pointer.offset(lane as isize * $step) }; )*
-                let slot = lane_base + lane;
-                acc[slot] = acc[slot] + product;
-            }
-            return;
-        }};
-    }
-    match pointers.len() {
-        0 => {
-            for slot in &mut acc[lane_base..lane_base + u] {
-                *slot = *slot + coefficient;
-            }
-            return;
-        }
-        1 => unrolled!(pointers[0] => steps[0]),
-        2 => unrolled!(pointers[0] => steps[0], pointers[1] => steps[1]),
-        3 => unrolled!(pointers[0] => steps[0], pointers[1] => steps[1], pointers[2] => steps[2]),
-        _ => {}
-    }
     if u <= LANE_TILE {
         // Uninitialised, because the read loop writes every slot the add loop
         // reads: zero-filling the whole tile costs more than the arithmetic of a
@@ -619,22 +640,26 @@ unsafe fn accumulate<T: SegPolyElem>(
     }
 }
 
-/// One operation's paths for one batch point, every input lane-contiguous.
+/// One operation's paths for one batch point, through the dispatched lane kernel.
 ///
 /// The same sum as calling [`accumulate`] once per path in plan order: for each
 /// output segment, for each of its paths, `acc[lane] = acc[lane] + ((c · x_0) ·
-/// x_1) · x_2`, the product associated left to right from the coefficient. Only
-/// the bookkeeping moves: the row bases come in resolved, the arity is a
-/// constant, and each path's operands are slices of `u` lanes, so the lane loop
-/// has no index arithmetic or bounds checks and the compiler can vectorise it.
+/// x_1) · x_2` with the product associated left to right from the coefficient.
+/// Only the bookkeeping moves: the row bases come in resolved, the arity is a
+/// constant, a lane-strided operand was packed into contiguous lanes, and each
+/// path's operand is either a slice of `u` lanes or one splatted scalar.
 ///
 /// # Safety
 ///
-/// `acc` holds `seg_starts.len() * u` elements; for every path `p` of
-/// `coeffs` and every operand `t < N`, `bases[t].offset(offsets[p * (N + 1) +
-/// t])` reaches `u` contiguous, initialised elements.
+/// `acc` holds `seg_starts.len() * u` elements; for every path `p` of `coeffs`
+/// and every operand `t < N`, `bases[t].offset(offsets[p * (N + 1) + t])` reaches
+/// either `u` contiguous, initialised elements (bit `t` of `!splat_mask`) or one
+/// initialised element (bit `t` of `splat_mask`).
+// The eight parameters are the loop's own live values; a struct would only move
+// the same list one line up the call.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn op_row_contiguous<T: SegPolyElem, const N: usize>(
+unsafe fn op_row_lanes<T: SegPolyElem, const N: usize>(
     acc: &mut [T],
     u: usize,
     seg_starts: &[u32],
@@ -642,8 +667,10 @@ unsafe fn op_row_contiguous<T: SegPolyElem, const N: usize>(
     coeffs: &[T],
     offsets: &[isize],
     bases: &[*const T; N],
+    splat_mask: u32,
 ) {
     let arity = N + 1;
+    let slices = !splat_mask & ((1u32 << N) - 1);
     for (segment, (&start, &end)) in seg_starts.iter().zip(seg_ends.iter()).enumerate() {
         if start == end {
             continue;
@@ -653,61 +680,113 @@ unsafe fn op_row_contiguous<T: SegPolyElem, const N: usize>(
         for local in start as usize..end as usize {
             let coefficient = coeffs[local];
             let path_offsets = &offsets[local * arity..local * arity + N];
-            // SAFETY: the caller's contract; each operand is `u` contiguous lanes.
-            let operand = |t: usize| unsafe {
-                core::slice::from_raw_parts(bases[t].offset(path_offsets[t]), u)
-            };
-            match N {
-                1 => {
-                    let x0 = operand(0);
-                    for (slot, &a) in slots.iter_mut().zip(x0) {
-                        *slot = *slot + coefficient * a;
-                    }
+            let operands: [&[T]; N] = core::array::from_fn(|t| {
+                if slices & (1 << t) == 0 {
+                    &[]
+                } else {
+                    // SAFETY: the caller's contract; the operand is `u`
+                    // contiguous lanes from this path's segment base.
+                    unsafe { core::slice::from_raw_parts(bases[t].offset(path_offsets[t]), u) }
                 }
-                2 => {
-                    let (x0, x1) = (operand(0), operand(1));
-                    for ((slot, &a), &b) in slots.iter_mut().zip(x0).zip(x1) {
-                        *slot = *slot + coefficient * a * b;
-                    }
+            });
+            let splats: [T; N] = core::array::from_fn(|t| {
+                if slices & (1 << t) != 0 {
+                    T::zero()
+                } else {
+                    // SAFETY: the caller's contract; a unit-lane operand reads one
+                    // element for the whole lane axis.
+                    unsafe { *bases[t].offset(path_offsets[t]) }
                 }
-                _ => {
-                    let (x0, x1, x2) = (operand(0), operand(1), operand(2));
-                    for (((slot, &a), &b), &c) in slots.iter_mut().zip(x0).zip(x1).zip(x2) {
-                        *slot = *slot + coefficient * a * b * c;
-                    }
-                }
+            });
+            T::lane_axpy::<N>(slots, coefficient, operands, splats, slices);
+        }
+    }
+}
+
+/// Copy one input's `[segments, u]` block into a contiguous tile, so its lanes
+/// can be read as whole vectors.
+///
+/// # Safety
+///
+/// `src.offset(segment * seg).offset(lane * lane_step)` must reach an initialised
+/// element for every `segment < segments` and `lane < u`, and `tile` must hold
+/// `segments * u` elements.
+unsafe fn pack_into<T: Copy>(
+    src: *const T,
+    seg: isize,
+    lane: isize,
+    segments: usize,
+    u: usize,
+    tile: *mut T,
+) {
+    for segment in 0..segments {
+        // SAFETY: the caller's contract.
+        let from = unsafe { src.offset(segment as isize * seg) };
+        let to = unsafe { tile.add(segment * u) };
+        for index in 0..u {
+            // SAFETY: the caller's contract.
+            unsafe {
+                *to.add(index) = *from.offset(index as isize * lane);
             }
         }
     }
+}
+
+/// How a destination block is laid out, which decides how an accumulator tile is
+/// seeded from it and written back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockLayout {
+    /// One contiguous run of `segments * u` elements, the accumulator itself.
+    Direct,
+    /// `segments` runs of `u` elements at the compiled strides.
+    Strided,
+    /// `segments` scalars: the accumulator holds `u` lanes per segment and the
+    /// destination sums them.
+    ReduceLane,
 }
 
 /// Copy a destination block into a packed accumulator.
 ///
 /// # Safety
 ///
-/// `dest` must reach the whole `segments x u` block, and `out` must hold
-/// `segments * u` elements.
-unsafe fn read_block<T: Copy>(
+/// `dest` must reach the whole `segments x u` block (or, for
+/// [`BlockLayout::ReduceLane`], `segments` scalars at stride `seg`), and `out`
+/// must hold `segments * u` elements.
+unsafe fn read_block<T: SegPolyElem>(
     dest: *const T,
     seg: isize,
     lane: isize,
     segments: usize,
     u: usize,
-    direct: bool,
+    layout: BlockLayout,
     out: &mut [T],
 ) {
     let len = segments * u;
-    if direct {
-        // SAFETY: a contiguous block is one run of `len` slots.
-        let block = unsafe { core::slice::from_raw_parts(dest, len) };
-        out[..len].copy_from_slice(block);
-        return;
-    }
-    for segment in 0..segments {
-        for lane_index in 0..u {
-            // SAFETY: the block's own layout, per the caller's contract.
-            out[segment * u + lane_index] =
-                unsafe { *dest.offset(segment as isize * seg + lane_index as isize * lane) };
+    match layout {
+        BlockLayout::Direct => {
+            // SAFETY: a contiguous block is one run of `len` slots.
+            let block = unsafe { core::slice::from_raw_parts(dest, len) };
+            out[..len].copy_from_slice(block);
+        }
+        BlockLayout::Strided => {
+            for segment in 0..segments {
+                for lane_index in 0..u {
+                    // SAFETY: the block's own layout, per the caller's contract.
+                    out[segment * u + lane_index] = unsafe {
+                        *dest.offset(segment as isize * seg + lane_index as isize * lane)
+                    };
+                }
+            }
+        }
+        BlockLayout::ReduceLane => {
+            // The destination value is the accumulator's first term, so it seeds
+            // lane 0 -- the first lane the reduction reads -- and the remaining
+            // lanes start from zero rather than repeating it once per lane.
+            out[..len].fill(T::zero());
+            for segment in 0..segments {
+                // SAFETY: the block's own layout, per the caller's contract.
+                out[segment * u] = unsafe { *dest.offset(segment as isize * seg) };
+            }
         }
     }
 }
@@ -717,28 +796,44 @@ unsafe fn read_block<T: Copy>(
 /// # Safety
 ///
 /// As [`read_block`], in the other direction.
-unsafe fn write_block<T: Copy>(
+unsafe fn write_block<T: SegPolyElem>(
     dest: *mut T,
     seg: isize,
     lane: isize,
     segments: usize,
     u: usize,
-    direct: bool,
+    layout: BlockLayout,
     values: &[T],
 ) {
     let len = segments * u;
-    if direct {
-        // SAFETY: a contiguous block is one run of `len` slots.
-        let block = unsafe { core::slice::from_raw_parts_mut(dest, len) };
-        block.copy_from_slice(&values[..len]);
-        return;
-    }
-    for segment in 0..segments {
-        for lane_index in 0..u {
-            // SAFETY: the block's own layout, per the caller's contract.
-            unsafe {
-                *dest.offset(segment as isize * seg + lane_index as isize * lane) =
-                    values[segment * u + lane_index];
+    match layout {
+        BlockLayout::Direct => {
+            // SAFETY: a contiguous block is one run of `len` slots.
+            let block = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+            block.copy_from_slice(&values[..len]);
+        }
+        BlockLayout::Strided => {
+            for segment in 0..segments {
+                for lane_index in 0..u {
+                    // SAFETY: the block's own layout, per the caller's contract.
+                    unsafe {
+                        *dest.offset(segment as isize * seg + lane_index as isize * lane) =
+                            values[segment * u + lane_index];
+                    }
+                }
+            }
+        }
+        BlockLayout::ReduceLane => {
+            // The lane reduction: one sum per destination segment, in increasing
+            // lane order, so the bits do not depend on the `Exec` budget.
+            for segment in 0..segments {
+                let row = &values[segment * u..segment * u + u];
+                let mut sum = row[0];
+                for &value in &row[1..] {
+                    sum = sum + value;
+                }
+                // SAFETY: the block's own layout, per the caller's contract.
+                unsafe { *dest.offset(segment as isize * seg) = sum };
             }
         }
     }

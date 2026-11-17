@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Check that a baseline x86-64 build reaches AVX2 and AVX-512 at run time.
 
-The elementwise leaf loops of strided-basic, strided-fused and strided-nn run
-inside `pulp::Arch::new().dispatch(...)`, which compiles the inlined loop body
-once per SIMD level and picks one at run time (tensor4all/strided-rs#340). This
-script builds `strided-kernel/examples/runtime_simd_probe.rs` in release mode
-with `RUSTFLAGS` cleared, so the build target is the x86-64 baseline, runs it,
-and disassembles it. Each check names a dispatched body and one arithmetic
+The elementwise leaf loops of strided-basic, strided-fused, strided-nn and
+strided-segpoly run inside `pulp::Arch::new().dispatch(...)`, which compiles the
+inlined loop body once per SIMD level and picks one at run time
+(tensor4all/strided-rs#340, #496). This script builds each crate's probe example
+in release mode with `RUSTFLAGS` cleared, so the build target is the x86-64
+baseline, runs it, and disassembles it. Each check names a dispatched body and one arithmetic
 instruction it must hold: the pulp `V4` version must use it on `zmm` registers
 and the `V3` version on `ymm` registers. A body that pulp calls without
 inlining keeps the baseline instructions and fails the check.
@@ -27,7 +27,12 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROBE = "runtime_simd_probe"
+
+# (package, example) pairs whose probes exercise the dispatched bodies below.
+PROBES = [
+    ("strided-kernel", "runtime_simd_probe"),
+    ("strided-segpoly", "simd_probe"),
+]
 
 # (dispatched body, instruction): the body's demangled name fragment and one
 # arithmetic instruction its loop must vectorize.
@@ -39,6 +44,8 @@ CHECKS = [
     ("strided_nn::simd::ShiftGroup>", "vmaxps"),
     ("strided_nn::simd::ScaleGroup>", "vdivps"),
     ("strided_nn::simd::ScaleGroupF64>", "vdivpd"),
+    ("strided_segpoly::simd::AxpyF64<", "vmulpd"),
+    ("strided_segpoly::simd::AxpyF32<", "vmulps"),
 ]
 
 LEVELS = [("V4", "zmm"), ("V3", "ymm")]
@@ -83,37 +90,44 @@ def failures(functions: dict[str, list[str]]) -> list[str]:
     return missing
 
 
-def build_probe() -> pathlib.Path:
+def build_probes() -> list[pathlib.Path]:
+    """Build every probe example against the baseline target."""
     env = dict(os.environ)
     # The baseline target: no `-C target-cpu`, from the environment or config.
     env["RUSTFLAGS"] = ""
     env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     env.pop("CARGO_BUILD_RUSTFLAGS", None)
-    command = [
-        "cargo",
-        "build",
-        "--release",
-        "-p",
-        "strided-kernel",
-        "--example",
-        PROBE,
-        "--message-format=json",
-    ]
     jobs = os.environ.get("CHECK_SIMD_JOBS")
-    if jobs:
-        command += ["-j", jobs]
-    output = subprocess.run(
-        command, cwd=ROOT, env=env, check=True, stdout=subprocess.PIPE, text=True
-    ).stdout
-    for line in output.splitlines():
-        message = json.loads(line)
-        if (
-            message.get("reason") == "compiler-artifact"
-            and message.get("target", {}).get("name") == PROBE
-            and message.get("executable")
-        ):
-            return pathlib.Path(message["executable"])
-    raise RuntimeError("cargo did not report the probe executable")
+    executables: list[pathlib.Path] = []
+    for package, probe in PROBES:
+        command = [
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            package,
+            "--example",
+            probe,
+            "--message-format=json",
+        ]
+        if jobs:
+            command += ["-j", jobs]
+        output = subprocess.run(
+            command, cwd=ROOT, env=env, check=True, stdout=subprocess.PIPE, text=True
+        ).stdout
+        found = None
+        for line in output.splitlines():
+            message = json.loads(line)
+            if (
+                message.get("reason") == "compiler-artifact"
+                and message.get("target", {}).get("name") == probe
+                and message.get("executable")
+            ):
+                found = pathlib.Path(message["executable"])
+        if found is None:
+            raise RuntimeError(f"cargo did not report the {probe} executable")
+        executables.append(found)
+    return executables
 
 
 def main() -> int:
@@ -123,14 +137,15 @@ def main() -> int:
     if args.asm:
         listing = args.asm.read_text()
     else:
-        probe = build_probe()
-        subprocess.run([str(probe)], check=True)
-        listing = subprocess.run(
-            ["objdump", "-d", "--no-show-raw-insn", "-C", str(probe)],
-            check=True,
-            stdout=subprocess.PIPE,
-            text=True,
-        ).stdout
+        listing = ""
+        for probe in build_probes():
+            subprocess.run([str(probe)], check=True)
+            listing += subprocess.run(
+                ["objdump", "-d", "--no-show-raw-insn", "-C", str(probe)],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout
     missing = failures(parse_functions(listing))
     for line in missing:
         print(f"FAIL {line}")

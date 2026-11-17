@@ -95,7 +95,8 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
     let mut record = format!(
         "{{\"cell\":\"{}\",\"dtype\":\"{}\",\"threads\":{},\"atoms\":{},\"nodes\":{},\"edges\":{},\
          \"avg_neighbors\":{:.3},\"feature_dim\":{},\"out_slots\":{},\"weight_numel\":{},\
-         \"cg_entries_per_feature\":{},\"vjp_y_paths\":{},\"samples\":{},\"target_ms\":{}",
+         \"cg_entries_per_feature\":{},\"vjp_y_paths\":{},\"vjp_y_plan_paths\":{},\
+         \"simd\":{{\"f32_lanes\":{},\"f64_lanes\":{}}},\"samples\":{},\"target_ms\":{}",
         args.cell,
         args.dtype,
         args.threads,
@@ -116,6 +117,9 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
             .iter()
             .map(|block| block.cg.len() * cg.feature_dim())
             .sum::<usize>(),
+        cg.desc.blocks.iter().map(|block| block.cg.len()).sum::<usize>(),
+        strided_segpoly::lane_width::<f32>(),
+        strided_segpoly::lane_width::<f64>(),
         args.samples,
         args.target_ms,
     );

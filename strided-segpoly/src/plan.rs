@@ -22,6 +22,13 @@
 //! 3. the operation's paths for that output segment, in the stable
 //!    output-segment sort order above.
 //!
+//! 4. an output whose lane extent is 1 while the plan's uniform extent is `u`
+//!    (a *lane reduction*: the shape a gradient takes when the lane axis was
+//!    contracted, e.g. `bar_edge_attrs` in MACE layer-1) also sums its lanes, in
+//!    increasing lane order, after the block partials are combined. This is the
+//!    lane-axis counterpart of a [`Shared`](crate::IndexMode::Shared) output,
+//!    which is a batch reduction (D4).
+//!
 //! A unit with more rows than [`BLOCK_ROWS`] is split into fixed `BLOCK_ROWS`-row
 //! blocks; the block partials are combined left to right, and block zero is the
 //! one seeded with the destination value. The block boundaries are a function of
@@ -29,6 +36,17 @@
 //! produces the same bits. The one exception is the sign of zero: a later block's
 //! partial starts from `0`, so a block whose value is exactly `-0.0` contributes
 //! `+0.0`.
+//!
+//! # Lane access
+//!
+//! The lane loop runs `u` lanes of one path at a time through the dispatched
+//! kernel in [`crate::simd`]. An input's lanes must be unit-stride for that; an
+//! input whose lane extent is `u` but whose lane stride is not 1 is *packed*:
+//! per batch point the replay copies its `[num_segments, u]` row block into a
+//! contiguous tile in the caller's scratch, and the plan stores its path offsets
+//! in tile space (`segment_id * u`) instead of buffer space. An input with lane
+//! extent 1 is a splat: one value broadcast over the `u` lanes, the same read the
+//! scalar replay did.
 
 use core::ops::{Add, Mul, Range};
 
@@ -56,11 +74,107 @@ pub const MAX_INPUTS: usize = 16;
 pub const MAX_OUTPUTS: usize = 8;
 
 mod sealed {
+    use crate::simd;
+
     /// The sealing bound: only the element types below implement it, so a
     /// downstream crate cannot add a `SegPolyElem` of its own.
-    pub trait Sealed {}
-    impl Sealed for f32 {}
-    impl Sealed for f64 {}
+    ///
+    /// The lane kernel's dispatch seam lives here so [`SegPolyElem`] carries it
+    /// without publishing a second trait. Sealing is about *implementations*: a
+    /// caller generic over `SegPolyElem` can still reach `lane_axpy` through the
+    /// supertrait bound, so an arity the executor never uses is a debug assertion
+    /// and a no-op in release rather than a panic.
+    pub trait Sealed {
+        /// One call of the dispatched lane kernel: `acc[i] = acc[i] + c * Π` over
+        /// the lanes, where operand `t` is `operands[t]` if bit `t` is set in
+        /// `slices` and the scalar `splats[t]` otherwise.
+        fn lane_axpy<const N: usize>(
+            acc: &mut [Self],
+            coefficient: Self,
+            operands: [&[Self]; N],
+            splats: [Self; N],
+            slices: u32,
+        ) where
+            Self: Sized;
+
+        /// The lane count the run-time ISA's vector holds for this type, as the
+        /// kernel's dispatch selects it (`1` on a scalar target).
+        fn vector_lanes() -> usize;
+    }
+
+    impl Sealed for f32 {
+        #[inline]
+        fn lane_axpy<const N: usize>(
+            acc: &mut [Self],
+            coefficient: Self,
+            operands: [&[Self]; N],
+            splats: [Self; N],
+            slices: u32,
+        ) {
+            match N {
+                1 => simd::axpy1_f32(acc, coefficient, [operands[0]], [splats[0]], slices),
+                2 => simd::axpy2_f32(
+                    acc,
+                    coefficient,
+                    [operands[0], operands[1]],
+                    [splats[0], splats[1]],
+                    slices,
+                ),
+                3 => simd::axpy3_f32(
+                    acc,
+                    coefficient,
+                    [operands[0], operands[1], operands[2]],
+                    [splats[0], splats[1], splats[2]],
+                    slices,
+                ),
+                _ => {
+                    debug_assert!(false, "the executor dispatches arity 1..=3 only");
+                }
+            }
+        }
+
+        #[inline]
+        fn vector_lanes() -> usize {
+            simd::lanes_f32()
+        }
+    }
+
+    impl Sealed for f64 {
+        #[inline]
+        fn lane_axpy<const N: usize>(
+            acc: &mut [Self],
+            coefficient: Self,
+            operands: [&[Self]; N],
+            splats: [Self; N],
+            slices: u32,
+        ) {
+            match N {
+                1 => simd::axpy1_f64(acc, coefficient, [operands[0]], [splats[0]], slices),
+                2 => simd::axpy2_f64(
+                    acc,
+                    coefficient,
+                    [operands[0], operands[1]],
+                    [splats[0], splats[1]],
+                    slices,
+                ),
+                3 => simd::axpy3_f64(
+                    acc,
+                    coefficient,
+                    [operands[0], operands[1], operands[2]],
+                    [splats[0], splats[1], splats[2]],
+                    slices,
+                ),
+                _ => {
+                    debug_assert!(false, "the executor dispatches arity 1..=3 only");
+                }
+            }
+        }
+
+        #[inline]
+        fn vector_lanes() -> usize {
+            simd::lanes_f64()
+        }
+    }
 }
 
 /// The scalar types a plan executes.
@@ -96,6 +210,14 @@ impl SegPolyElem for f64 {
     }
 }
 
+/// The lane count the run-time ISA's vector holds for `T`, as selected by the
+/// dispatch the lane kernel uses: (2, 4) on NEON, (4, 8) on AVX2, (8, 16) on
+/// AVX-512, (1, 1) on a scalar target. Reported, not configured.
+#[must_use]
+pub fn lane_width<T: SegPolyElem>() -> usize {
+    <T as sealed::Sealed>::vector_lanes()
+}
+
 /// One operation, prepared for replay.
 #[derive(Clone, Debug)]
 struct OpPlan {
@@ -112,9 +234,16 @@ struct OpPlan {
     seg_starts: Vec<u32>,
     /// Per output segment: one past the last local path index.
     seg_ends: Vec<u32>,
-    /// Whether every input reads its `u` lanes contiguously (lane step 1), so
-    /// the replay can walk them as slices. Set once `in_lane` is known.
-    unit_lanes: bool,
+    /// Whether the replay runs this operation's lanes through the dispatched
+    /// kernel: arity one to three. Deeper operations take the general scalar
+    /// path in `accumulate`.
+    lanes: bool,
+    /// Bit `t` set when input `t` has lane extent 1, so its value for a path is
+    /// one scalar broadcast over the lane axis rather than `u` lanes.
+    splat_mask: u32,
+    /// Scratch elements this operation's packed input tiles need at one batch
+    /// point (0 when every input is lane-contiguous or a splat).
+    pack_elems: usize,
 }
 
 impl OpPlan {
@@ -180,6 +309,9 @@ pub struct SegPolyPlan<T> {
     out_rows: Vec<usize>,
     /// Per output: whether its `[segments, u]` block is contiguous.
     out_direct: Vec<bool>,
+    /// Per output: whether its lane extent is 1 while `u > 1`, i.e. the block is
+    /// accumulated as `[segments, u]` and summed over the lanes on the way out.
+    reduce_lane: Vec<bool>,
     /// Per buffer: the index mode the plan was compiled against.
     mode_kinds: Vec<ModeKind>,
     ops: Vec<OpPlan>,
@@ -191,6 +323,8 @@ pub struct SegPolyPlan<T> {
     cum_rows: Vec<usize>,
     block_slots: usize,
     tile_elems: usize,
+    /// Per-child scratch elements for packed lane tiles; 0 when nothing packs.
+    pack_elems: usize,
     macs: usize,
 }
 
@@ -270,7 +404,11 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
         let u = dims.iter().map(|d| d[2]).max().unwrap_or(1);
         for (buffer, d) in dims.iter().enumerate() {
             let is_output = buffer >= num_inputs;
-            if is_output && d[2] != u {
+            // An output may have the uniform lane extent or 1. A lane extent of 1
+            // under `u > 1` is a *lane reduction*: the block is accumulated as
+            // `[segments, u]` and summed over the lanes on the way out, the lane
+            // axis's counterpart of a `Shared` output's batch reduction (D4).
+            if is_output && d[2] != u && d[2] != 1 {
                 return Err(SegPolyError::OutputLaneBroadcast {
                     buffer,
                     lane: d[2],
@@ -285,6 +423,19 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                 });
             }
         }
+
+        // A lane operand is read one of three ways, and the three must agree
+        // exactly between here and the replay: a lane stride of 1 is a slice of
+        // `u` lanes read in place; a lane extent of 1 or a lane stride of 0 (every
+        // lane reads the same element) is a *splat*; any other lane stride is
+        // packed into a contiguous tile per batch point, and this plan's offsets
+        // for it live in tile space.
+        let splat: Vec<bool> = (0..num_inputs)
+            .map(|buffer| dims[buffer][2] == 1 || strides[buffer][2] == 0)
+            .collect();
+        let packed: Vec<bool> = (0..num_inputs)
+            .map(|buffer| !splat[buffer] && strides[buffer][2] != 1)
+            .collect();
 
         // Destination rows are owned by one task each, so an aliasing output
         // layout would be a data race between workers.
@@ -474,6 +625,10 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
 
             // The per-segment ranges below are `u32` path indices.
             u32::try_from(op_paths.len()).map_err(|_| StridedError::OffsetOverflow)?;
+            // One accumulator vector per path for arity one to three; deeper
+            // operations keep the general scalar loop, and they are also the ones
+            // that must not have their offsets rewritten (see `tiled` below).
+            let lanes = !op_inputs.is_empty() && op_inputs.len() <= 3;
 
             // `sort_paths(-1)`: stable, by the output segment id.
             let mut order: Vec<usize> = (0..op_paths.len()).collect();
@@ -495,13 +650,43 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                     for (buffer, &segment_id) in operation.buffers.iter().zip(path.segments.iter())
                     {
                         let buffer_usize = *buffer as usize;
-                        path_offsets.push(segment_id as isize * strides[buffer_usize][1]);
+                        // A packed input's tile has lane stride 1 and segment
+                        // stride `u`, so its offsets live in tile space. Only an
+                        // operation the replay runs through the lane kernel packs,
+                        // so only its offsets may be rewritten; a deeper operation
+                        // falls back to the scalar loop and reads the buffer it
+                        // names, with the buffer's own segment stride.
+                        let tiled = lanes && packed.get(buffer_usize).copied().unwrap_or(false);
+                        let stride = if tiled {
+                            u as isize
+                        } else {
+                            strides[buffer_usize][1]
+                        };
+                        let offset = (segment_id as isize)
+                            .checked_mul(stride)
+                            .ok_or(StridedError::OffsetOverflow)?;
+                        path_offsets.push(offset);
                     }
                     cursor += 1;
                 }
                 seg_ends[segment] = cursor;
             }
 
+            let mut splat_mask = 0u32;
+            let mut pack_elems = 0usize;
+            for (position, &input) in op_inputs.iter().enumerate() {
+                if splat[input as usize] {
+                    splat_mask |= 1 << position;
+                }
+                if lanes && packed[input as usize] {
+                    let tile = dims[input as usize][1]
+                        .checked_mul(u)
+                        .ok_or(StridedError::OffsetOverflow)?;
+                    pack_elems = pack_elems
+                        .checked_add(tile)
+                        .ok_or(StridedError::OffsetOverflow)?;
+                }
+            }
             ops.push(OpPlan {
                 out,
                 inputs: op_inputs,
@@ -509,7 +694,9 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                 offsets_base,
                 seg_starts,
                 seg_ends,
-                unit_lanes: false,
+                lanes,
+                splat_mask,
+                pack_elems,
             });
         }
         for (op_index, op) in ops.iter().enumerate() {
@@ -542,9 +729,17 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
         }
 
         // A destination block is contiguous when its lanes are unit-stride and
-        // its segments follow the lanes.
+        // its segments follow the lanes. A lane-reducing output is never direct:
+        // its accumulator is `[segments, u]` while the destination row is
+        // `[segments]`, so it always goes through a scratch tile.
+        let reduce_lane: Vec<bool> = (0..outputs.len())
+            .map(|dense| dims[num_inputs + dense][2] == 1 && u > 1)
+            .collect();
         let out_direct: Vec<bool> = (0..outputs.len())
             .map(|dense| {
+                if reduce_lane[dense] {
+                    return false;
+                }
                 let buffer = num_inputs + dense;
                 strides[buffer][2] == 1
                     && (dims[buffer][1] <= 1 || strides[buffer][1] == dims[buffer][2] as isize)
@@ -662,9 +857,9 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
                 }
             })
             .collect::<Vec<isize>>();
-        for op in &mut ops {
-            op.unit_lanes = op.inputs.iter().all(|&input| in_lane[input as usize] == 1);
-        }
+        // Each child runs its tasks one at a time, so one pack region per child
+        // serves every task slot; the widest operation sizes it.
+        let pack_elems = ops.iter().map(|op| op.pack_elems).max().unwrap_or(0);
 
         Ok(Self {
             u,
@@ -680,11 +875,13 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
             ops,
             path_coeffs,
             path_offsets,
+            reduce_lane,
             units,
             tasks,
             cum_rows,
             block_slots: block_slots as usize,
             tile_elems,
+            pack_elems,
             macs,
         })
     }
@@ -717,9 +914,15 @@ impl<T: SegPolyElem> SegPolyPlan<T> {
     /// children, and a call whose scratch cannot hold the block partials fails
     /// with [`SegPolyError::ScratchTooSmall`] rather than truncating the sum.
     pub fn scratch_len(&self, budget: usize) -> usize {
+        // `[ block partials ][ child 0: tile | pack ][ child 1: ... ]`; the block
+        // partials stay first because `combine` indexes them by slot.
         self.block_slots
-            .saturating_add(budget.max(1))
             .saturating_mul(self.tile_elems)
+            .saturating_add(
+                budget
+                    .max(1)
+                    .saturating_mul(self.tile_elems.saturating_add(self.pack_elems)),
+            )
     }
 
     /// Multiply-adds one call performs: the plan's cost for the token's gate.
