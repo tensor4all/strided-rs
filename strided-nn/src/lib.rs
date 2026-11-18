@@ -12,9 +12,13 @@
 //! Rayon registry. Under a serial token the kernel runs inline on the calling
 //! thread.
 
+pub mod activation;
 mod error;
+pub mod norm;
+mod par;
+mod real;
 mod simd;
 mod softmax;
 
-pub use error::SoftmaxError;
+pub use error::{ActivationError, NormError, SoftmaxError};
 pub use softmax::{scratch_len, softmax_axis0_f32, softmax_axis0_f64};
