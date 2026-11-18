@@ -1944,9 +1944,30 @@ impl ScatterPlan {
         T: Copy + Add<Output = T> + Send + Sync,
         I: GatherIndex,
     {
+        self.execute_with_combine(dest, operand, scatter_indices, updates, |a, b| a + b, exec)
+    }
+
+    /// Execute the prepared additive scatter with an explicit combine.
+    ///
+    /// `execute` uses `Add`; dtype-erased callers pass the combine that their
+    /// contract promises, so the initialized and `execute_uninit` entries
+    /// agree (integer element arithmetic wraps).
+    pub fn execute_with_combine<T, I>(
+        &self,
+        dest: &mut RawStridedMut<'_, T>,
+        operand: &RawStridedRef<'_, T>,
+        scatter_indices: &RawStridedRef<'_, I>,
+        updates: &RawStridedRef<'_, T>,
+        combine: fn(T, T) -> T,
+        exec: Exec<'_>,
+    ) -> Result<()>
+    where
+        T: Copy + Add<Output = T> + Send + Sync,
+        I: GatherIndex,
+    {
         self.check_call(dest, operand, scatter_indices, updates)?;
         self.copy_plan.execute(dest, operand, exec)?;
-        self.execute_updates(dest, scatter_indices, updates, |a, b| a + b)
+        self.execute_updates(dest, scatter_indices, updates, combine)
     }
 
     /// Execute additive scatter into a destination whose reachable slots may

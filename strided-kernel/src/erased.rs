@@ -1556,6 +1556,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                add_values::<f32>,
                 exec,
             ),
             KernelDType::F64 => dispatch_scatter_index::<f64>(
@@ -1565,6 +1566,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                add_values::<f64>,
                 exec,
             ),
             KernelDType::I32 => dispatch_scatter_index::<i32>(
@@ -1574,6 +1576,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                i32::wrapping_add,
                 exec,
             ),
             KernelDType::I64 => dispatch_scatter_index::<i64>(
@@ -1583,6 +1586,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                i64::wrapping_add,
                 exec,
             ),
             KernelDType::C32 => dispatch_scatter_index::<Complex32>(
@@ -1592,6 +1596,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                add_values::<Complex32>,
                 exec,
             ),
             KernelDType::C64 => dispatch_scatter_index::<Complex64>(
@@ -1601,6 +1606,7 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
+                add_values::<Complex64>,
                 exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
@@ -3134,6 +3140,7 @@ where
     plan.execute(&mut dest_ref, &operand_ref, &update_ref, &start_ref, exec)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_scatter_index<T>(
     plan: &ScatterPlan,
     index_dtype: KernelDType,
@@ -3141,6 +3148,7 @@ fn dispatch_scatter_index<T>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
+    combine: fn(T, T) -> T,
     exec: Exec<'_>,
 ) -> Result<()>
 where
@@ -3148,10 +3156,10 @@ where
 {
     match index_dtype {
         KernelDType::I32 => {
-            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates, exec)
+            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates, combine, exec)
         }
         KernelDType::I64 => {
-            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates, exec)
+            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates, combine, exec)
         }
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
@@ -3165,6 +3173,7 @@ fn execute_scatter<T, I>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
+    combine: fn(T, T) -> T,
     exec: Exec<'_>,
 ) -> Result<()>
 where
@@ -3216,7 +3225,14 @@ where
     // access to its storage.
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute(&mut dest_ref, &operand_ref, &index_ref, &update_ref, exec)
+    plan.execute_with_combine(
+        &mut dest_ref,
+        &operand_ref,
+        &index_ref,
+        &update_ref,
+        combine,
+        exec,
+    )
 }
 
 fn read_unaligned_scalar<T>(bytes: &[u8]) -> T
