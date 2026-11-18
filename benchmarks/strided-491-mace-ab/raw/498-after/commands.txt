@@ -1,0 +1,18 @@
+# crate gates, from the worktree root
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --release -p strided-segpoly
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo llvm-cov -p strided-segpoly --json --output-path /tmp/cov498.json
+python3 scripts/check-coverage.py /tmp/cov498.json
+python3 scripts/check-runtime-simd-dispatch.py
+# harness (standalone [workspace] under benchmarks/), llmlip checkout at
+# ~/work/llmlip.rs with the bench-api patch of raw/llmlip-bench-api.diff applied
+cd benchmarks/strided-491-mace-ab && cargo test --release && cargo build --release
+# before campaign: the baseline tree at e8d3cdf (git worktree add ... e8d3cdf)
+cd ~/work/strided-rs-498-before/benchmarks/strided-491-mace-ab && OUT=raw/498-before ./campaign.sh
+# after campaign: this branch
+cd ~/work/strided-rs-498/benchmarks/strided-491-mace-ab && OUT=raw/498-after ./campaign.sh
+# the report check
+cd benchmarks/strided-491-mace-ab && ./check_report_498.py

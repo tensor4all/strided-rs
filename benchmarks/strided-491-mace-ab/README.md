@@ -15,11 +15,11 @@ it and it cannot affect a released artifact.
 | path | what it is |
 | --- | --- |
 | `src/topo.rs` | diamond-Si supercells (128 / 1024 atoms) and llmlip's neighbour list |
-| `src/cg.rs` | the layer-1 descriptor, the four segpoly plans, both sides' call sites |
+| `src/cg.rs` | the layer-1 descriptor, the five segpoly plans (`fwd`, the three split VJPs, the one-pass VJP), both sides' call sites |
 | `src/lib.rs` | shared buffers, sequence-valued inputs, comparison helpers |
 | `src/measure.rs` | counting allocator, `VmHWM`, warmup + median-of-15 |
 | `src/main.rs` | one cell per process: `--cell cg-fwd\|cg-vjp --dtype f32\|f64 --threads N --atoms 128\|1024` |
-| `tests/fidelity.rs` | the gates: published counters, both sides agree on **every node** in f32 and f64, 1T/4T bitwise for the forward and all three VJPs, a perturbation test that the comparisons are not node-0 only |
+| `tests/fidelity.rs` | the gates: published counters, both sides agree on **every node** in f32 and f64, 1T/4T bitwise for the forward, all three VJPs and the one-pass VJP against their sum (fused == split, `assert_eq!`), a perturbation test that the comparisons are not node-0 only |
 | `tests/alloc.rs` | the zero-allocation gates, in their own test binary (the counters are process-wide, so they cannot be read next to the gates above), each starting by proving the counting allocator sees a 1 MiB allocation |
 | `campaign.sh` | all 16 cells, observer pinned off the measured L3 domain |
 | `raw/` | the recorded cells, host/load/command logs, and the llmlip patch |
@@ -48,8 +48,9 @@ repo, so this harness always measures the tree it sits in.
 cargo test --release    # the gates; fails if either side changes meaning
 ./campaign.sh           # 16 cells -> raw/*.jsonl (+ 2 anchors in raw/campaign.txt);
                         # exits nonzero if a cell fails or the anchors drift >15 %
-./check_report.py       # re-derives every number in the report from raw/ and
-                        # exits nonzero on any disagreement
+./check_report.py       # re-derives every number in the #491/#496 report from raw/
+./check_report_498.py   # the same for the #498 report (before/after campaigns,
+                        # anchors, targets, allocation, agreement figures)
 ```
 
 Each cell prints one JSON record. `--raw-dir` also appends it to
@@ -85,6 +86,10 @@ overwriting it.
 * **The `Exec` mint is quantified, not removed.** `Exec` is neither `Copy` nor
   `Clone`, so the strided side mints one per call *inside* the timed closure: those
   nanoseconds are part of every strided figure above. `exec_new` reports that
-  share (2.0-2.4 ns) so a reader can see how much of a cell is token
+  share (1.7-2.4 ns) so a reader can see how much of a cell is token
   construction — it is not subtracted.
+* **The number the VJP target is stated against is one call.** `cg-vjp` records
+  `strided_vjp_x`/`_w`/`_y` (the split plans), `strided_split_total_ns` (their sum)
+  and `strided_total_ns` = `strided_vjp_fused` (the one-pass plan #498 added), so
+  `ratio` and `ratio_split` separate the fusion from the kernel that runs it.
 * **Fresh process per cell** so `VmHWM` is a peak, not a residue.

@@ -448,6 +448,102 @@ fn a_plan_rejects_an_inconsistent_call_without_panicking() {
 }
 
 #[test]
+fn a_scatter_call_must_carry_the_compiled_run_order() {
+    // `[0,1,0,1]` and `[1,0,1,0]` give the same windows -- two runs of two rows --
+    // and a different row order, which is a different sum. The plan traverses the
+    // order it compiled, so the second call is rejected before it writes anything.
+    let dest_a = [0i32, 1, 0, 1];
+    let dest_b = [1i32, 0, 1, 0];
+    let runs_a = strided_basic::RunIndex::from_dest(&dest_a, 2).expect("a run index");
+    let runs_b = strided_basic::RunIndex::from_dest(&dest_b, 2).expect("a run index");
+    assert_eq!(runs_a.ptr(), runs_b.ptr(), "the two windows have to agree");
+    assert_ne!(
+        runs_a.perm(),
+        runs_b.perm(),
+        "and the orders have to differ"
+    );
+
+    let (batch, segments, u) = (4usize, 2usize, 2usize);
+    let x = Buffer::dense(
+        [batch, segments, u],
+        Mode::Batched,
+        payload(batch * segments * u),
+    );
+    let m = Buffer::dense(
+        [2, segments, u],
+        Mode::Gather(dest_a.to_vec()),
+        payload(2 * segments * u),
+    );
+    let gx = Buffer::dense(
+        [2, segments, u],
+        Mode::Scatter(dest_a.to_vec()),
+        vec![0.0; 2 * segments * u],
+    );
+    let paths: Vec<PathSpec> = (0..segments)
+        .map(|segment| PathSpec {
+            segments: vec![segment as u32; 3],
+            coefficient: 0.25 + segment as f64,
+        })
+        .collect();
+    let case = Case {
+        batch,
+        inputs: vec![x, m],
+        outputs: vec![gx],
+        ops: vec![Op {
+            buffers: vec![0, 1, 2],
+            paths,
+        }],
+        expected: vec![],
+    };
+    let plan = case.compile().expect("the case compiles");
+    let mut data = case.data();
+    let sentinel = data[case.inputs.len()..].to_vec();
+    let mut scratch = vec![0.0f64; plan.scratch_len(1)];
+    let modes: Vec<Vec<strided_segpoly::IndexMode<'_>>> = vec![
+        vec![strided_segpoly::IndexMode::Batched],
+        vec![strided_segpoly::IndexMode::Gather(&dest_a)],
+        vec![strided_segpoly::IndexMode::Scatter(&runs_b)],
+    ];
+    let indexes: Vec<&[strided_segpoly::IndexMode<'_>]> =
+        modes.iter().map(|mode| mode.as_slice()).collect();
+    for into in [true, false] {
+        let error = case
+            .execute_with_modes(
+                &plan,
+                &mut data,
+                &mut scratch,
+                Exec::serial(),
+                into,
+                &indexes,
+            )
+            .expect_err("a different run order is refused");
+        assert!(
+            matches!(
+                error,
+                strided_segpoly::SegPolyError::Strided(
+                    strided_basic::StridedError::PlanLayoutMismatch
+                )
+            ),
+            "into={into}: {error:?}"
+        );
+    }
+    assert_eq!(
+        &data[case.inputs.len()..],
+        sentinel.as_slice(),
+        "the refused calls must not have written"
+    );
+    // The same call with the compiled order still runs, so the guard is about the
+    // order and not about rejecting the topology.
+    case.execute(&plan, &mut data, &mut scratch, Exec::serial(), true)
+        .expect("the compiled order is accepted");
+    assert_ne!(
+        &data[case.inputs.len()..],
+        sentinel.as_slice(),
+        "and it writes"
+    );
+}
+
+#[test]
 fn a_zero_batch_call_is_a_no_op() {
     // A zero batch must return `Ok` and leave the destination alone rather than
     // slice on a zero extent or write a spurious zero.
@@ -460,4 +556,399 @@ fn a_zero_batch_call_is_a_no_op() {
     case.execute(&plan, &mut data, &mut scratch, Exec::serial(), true)
         .expect("a zero batch executes");
     assert_eq!(data[case.inputs.len()], sentinel, "nothing to write");
+}
+
+/// A VJP-shaped multi-output case: two scattered outputs sharing one run
+/// topology and one batched output, all computed from the same inputs. The
+/// split cases form the same three outputs one plan at a time, so the fused
+/// plan can be compared with them bit for bit.
+///
+/// `strided` puts every lane at stride 2, so the inputs are packed into the
+/// child's tile and the two accumulating outputs are not `Direct`: one child then
+/// holds accumulators, a streamed row and a pack tile at once, and a long run adds
+/// the block partials on top of that (#498's accumulator layout).
+fn fused_case(
+    batch: usize,
+    sources: usize,
+    segments: usize,
+    u: usize,
+    strided: bool,
+) -> (Case, Vec<Case>) {
+    let dest: Vec<i32> = (0..batch).map(|row| ((row * 7) % sources) as i32).collect();
+    // Lane stride 2 with every other element unused, or a dense buffer.
+    let lane_buffer = |dims: [usize; 3], mode: Mode| {
+        let count = dims[0] * dims[1] * dims[2];
+        if strided {
+            Buffer::strided(
+                dims,
+                [(dims[1] * dims[2] * 2) as isize, (dims[2] * 2) as isize, 2],
+                0,
+                mode,
+                payload(count * 2),
+            )
+        } else {
+            Buffer::dense(dims, mode, payload(count))
+        }
+    };
+    let x = lane_buffer([batch, segments, u], Mode::Batched);
+    let w = Buffer::dense(
+        [batch, segments, u],
+        Mode::Batched,
+        payload(batch * segments * u),
+    );
+    let m = Buffer::dense(
+        [sources, segments, u],
+        Mode::Gather(dest.clone()),
+        payload(sources * segments * u),
+    );
+    let scattered = |seed: f64| {
+        if strided {
+            Buffer::strided(
+                [sources, segments, u],
+                [(segments * u * 2) as isize, (u * 2) as isize, 2],
+                0,
+                Mode::Scatter(dest.clone()),
+                vec![seed; sources * segments * u * 2],
+            )
+        } else {
+            Buffer::dense(
+                [sources, segments, u],
+                Mode::Scatter(dest.clone()),
+                vec![seed; sources * segments * u],
+            )
+        }
+    };
+    let gx1 = scattered(0.0);
+    let gx2 = scattered(0.0);
+    let gw = Buffer::dense(
+        [batch, segments, u],
+        Mode::Batched,
+        vec![0.0; batch * segments * u],
+    );
+    // The lane-reducing output (`[batch, segments, 1]`): its block is summed over
+    // the lanes on the way out, so it exercises the streamed reduce-lane path.
+    let gy = Buffer::dense(
+        [batch, segments, 1],
+        Mode::Batched,
+        vec![0.0; batch * segments],
+    );
+    let paths = |arity: usize, coefficient: f64| -> Vec<PathSpec> {
+        (0..segments)
+            .map(|segment| PathSpec {
+                segments: vec![segment as u32; arity],
+                coefficient: coefficient + segment as f64 * 0.25,
+            })
+            .collect()
+    };
+    let x_paths = paths(4, 0.75);
+    let w_paths = paths(3, -0.5);
+    let fused = Case {
+        batch,
+        inputs: vec![x.clone(), w.clone(), m.clone()],
+        outputs: vec![gx1.clone(), gx2.clone(), gw.clone(), gy.clone()],
+        ops: vec![
+            // gx1 += c · x · w · m, and the same into gx2 from the same inputs.
+            Op {
+                buffers: vec![0, 1, 2, 3],
+                paths: x_paths.clone(),
+            },
+            Op {
+                buffers: vec![0, 1, 2, 4],
+                paths: x_paths,
+            },
+            // gw += c · x · m
+            Op {
+                buffers: vec![0, 2, 5],
+                paths: w_paths.clone(),
+            },
+            // gy += c · x · m, summed over the lanes (`[batch, segments, 1]`).
+            Op {
+                buffers: vec![0, 2, 6],
+                paths: w_paths.clone(),
+            },
+        ],
+        expected: vec![],
+    };
+    let split = [
+        Case {
+            batch,
+            inputs: vec![x.clone(), w.clone(), m.clone()],
+            outputs: vec![gx1],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2, 3],
+                paths: paths(4, 0.75),
+            }],
+            expected: vec![],
+        },
+        Case {
+            batch,
+            inputs: vec![x.clone(), w.clone(), m.clone()],
+            outputs: vec![gx2],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2, 3],
+                paths: paths(4, 0.75),
+            }],
+            expected: vec![],
+        },
+        Case {
+            batch,
+            inputs: vec![x.clone(), m.clone()],
+            outputs: vec![gw],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2],
+                paths: w_paths.clone(),
+            }],
+            expected: vec![],
+        },
+        Case {
+            batch,
+            inputs: vec![x, m],
+            outputs: vec![gy],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2],
+                paths: w_paths,
+            }],
+            expected: vec![],
+        },
+    ];
+    (fused, split.to_vec())
+}
+
+/// `assert_eq!` on floats is numerical equality (`-0.0 == 0.0`, `NaN != NaN`); the
+/// claim in these tests is bit identity, so compare the bit patterns.
+fn assert_same_bits(actual: &[f64], expected: &[f64], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: lengths differ");
+    for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "{what}: element {index} is {actual:?}, not {expected:?}"
+        );
+    }
+}
+
+/// Run one case with a fresh copy of its data, returning the output vectors.
+fn run_outputs(
+    case: &Case,
+    plan: &strided_segpoly::SegPolyPlan<f64>,
+    exec: Exec<'_>,
+    into: bool,
+) -> Vec<Vec<f64>> {
+    let mut data = case.data();
+    let mut scratch = vec![0.0f64; plan.scratch_len(exec.budget().get())];
+    case.execute(plan, &mut data, &mut scratch, exec, into)
+        .expect("the case executes");
+    data.split_off(case.inputs.len())
+}
+
+fn assert_fused_matches_split(
+    batch: usize,
+    sources: usize,
+    segments: usize,
+    u: usize,
+    strided: bool,
+) {
+    let (fused, split) = fused_case(batch, sources, segments, u, strided);
+    let fused_plan = fused.compile().expect("the fused case compiles");
+    let split_plans: Vec<_> = split
+        .iter()
+        .map(|case| case.compile().expect("a split case compiles"))
+        .collect();
+    for into in [true, false] {
+        let mut fused_case = fused.clone();
+        let mut split_cases = split.clone();
+        if !into {
+            // A non-zero seed makes `execute_acc` read every destination, which is
+            // where the Direct/Child/Block-0/Block>0 seeding rules differ.
+            for (dense, output) in fused_case.outputs.iter_mut().enumerate() {
+                output.data = payload(output.data.len());
+                split_cases[dense].outputs[0].data = output.data.clone();
+            }
+        }
+        let expected = run_outputs(&fused_case, &fused_plan, Exec::serial(), into);
+        let actual: Vec<Vec<f64>> = split_cases
+            .iter()
+            .zip(split_plans.iter())
+            .map(|(case, plan)| run_outputs(case, plan, Exec::serial(), into)[0].clone())
+            .collect();
+        assert_eq!(actual.len(), expected.len());
+        for (dense, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_same_bits(
+                actual,
+                expected,
+                &format!(
+                    "{batch}x{sources} seg={segments} u={u} output {dense} into={into}: \
+                     the fused plan must keep every output's bits"
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn a_fused_plan_matches_the_split_plans_bit_for_bit() {
+    assert_fused_matches_split(5, 3, 2, 3, false);
+    // One run longer than one block, so the scattered accumulators split into
+    // block partials and the combine runs for both of them.
+    assert_fused_matches_split(300, 1, 2, 2, false);
+    // The same, with packed lane-strided inputs and non-contiguous accumulators;
+    // 300 rows put those in a block slot, 5 rows in a `Child` slot.
+    assert_fused_matches_split(300, 1, 2, 2, true);
+    assert_fused_matches_split(5, 3, 2, 3, true);
+}
+
+#[test]
+fn a_fused_plan_is_budget_and_thread_invariant() {
+    // Two shapes: 300 rows in one run splits into two block partials (two tasks),
+    // and 600 rows over two sources makes two 300-row runs, i.e. four block tasks.
+    // How many of those the executor actually forks is the host's cost model and
+    // the pool it was handed, not the plan's (a baseline aarch64 host narrows this
+    // plan's 9 600 macs to two children), so the test does not assert a width: the
+    // plan's own task count is pinned in `plan::tests`, and the bits below must not
+    // depend on the width either way.
+    for (batch, sources) in [(300usize, 1usize), (600, 2)] {
+        let (fused, _) = fused_case(batch, sources, 2, 2, false);
+        let plan = fused.compile().expect("the fused case compiles");
+        let threads = 4usize;
+        let pool = pool(threads);
+        for into in [true, false] {
+            let mut case = fused.clone();
+            if !into {
+                // A non-zero seed makes `execute_acc` read every destination, so a
+                // wrong seed for a later block or a child region cannot hide.
+                for output in case.outputs.iter_mut() {
+                    output.data = payload(output.data.len());
+                }
+            }
+            let reference = run_outputs(&case, &plan, Exec::serial(), into);
+            for budget in [1usize, 2, 4] {
+                let exec = if budget == 1 {
+                    Exec::serial()
+                } else {
+                    Exec::new(&pool, budget).expect("a token")
+                };
+                let actual = run_outputs(&case, &plan, exec, into);
+                assert_same_bits(
+                    &actual.concat(),
+                    &reference.concat(),
+                    &format!(
+                        "{batch}x{sources} {threads} threads at budget {budget} into={into}: \
+                         the fused bits moved"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn scatter_outputs_with_different_topologies_keep_their_own_order() {
+    // The two scattered outputs have different run indices, so they cannot share
+    // one traversal; each keeps its own run order and the batched output is
+    // written exactly once (by the first group).
+    let (batch, sources, segments, u) = (7usize, 3usize, 2usize, 2usize);
+    let dest_a: Vec<i32> = (0..batch).map(|row| (row % sources) as i32).collect();
+    let dest_b: Vec<i32> = (0..batch)
+        .map(|row| ((row * 2 + 1) % sources) as i32)
+        .collect();
+    let x = Buffer::dense(
+        [batch, segments, u],
+        Mode::Batched,
+        payload(batch * segments * u),
+    );
+    let m = Buffer::dense(
+        [sources, segments, u],
+        Mode::Gather(dest_a.clone()),
+        payload(sources * segments * u),
+    );
+    let paths = || -> Vec<PathSpec> {
+        (0..segments)
+            .map(|segment| PathSpec {
+                segments: vec![segment as u32; 3],
+                coefficient: 0.5 + segment as f64,
+            })
+            .collect()
+    };
+    let outputs = || {
+        [
+            Buffer::dense(
+                [sources, segments, u],
+                Mode::Scatter(dest_a.clone()),
+                vec![0.0; sources * segments * u],
+            ),
+            Buffer::dense(
+                [sources, segments, u],
+                Mode::Scatter(dest_b.clone()),
+                vec![0.0; sources * segments * u],
+            ),
+            Buffer::dense(
+                [batch, segments, u],
+                Mode::Batched,
+                vec![0.0; batch * segments * u],
+            ),
+        ]
+    };
+    let fused = Case {
+        batch,
+        inputs: vec![x.clone(), m.clone()],
+        outputs: outputs().to_vec(),
+        ops: vec![
+            Op {
+                buffers: vec![0, 1, 2],
+                paths: paths(),
+            },
+            Op {
+                buffers: vec![0, 1, 3],
+                paths: paths(),
+            },
+            // The batched output reads the same two inputs.
+            Op {
+                buffers: vec![0, 1, 4],
+                paths: paths(),
+            },
+        ],
+        expected: vec![],
+    };
+    let split = [
+        Case {
+            batch,
+            inputs: vec![x.clone(), m.clone()],
+            outputs: vec![outputs()[0].clone()],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2],
+                paths: paths(),
+            }],
+            expected: vec![],
+        },
+        Case {
+            batch,
+            inputs: vec![x.clone(), m.clone()],
+            outputs: vec![outputs()[1].clone()],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2],
+                paths: paths(),
+            }],
+            expected: vec![],
+        },
+        Case {
+            batch,
+            inputs: vec![x, m],
+            outputs: vec![outputs()[2].clone()],
+            ops: vec![Op {
+                buffers: vec![0, 1, 2],
+                paths: paths(),
+            }],
+            expected: vec![],
+        },
+    ];
+    let fused_plan = fused.compile().expect("the fused case compiles");
+    let expected = run_outputs(&fused, &fused_plan, Exec::serial(), true);
+    for (dense, case) in split.iter().enumerate() {
+        let plan = case.compile().expect("a split case compiles");
+        let actual = run_outputs(case, &plan, Exec::serial(), true);
+        assert_eq!(
+            actual[0], expected[dense],
+            "output {dense} must keep its own topology's order"
+        );
+    }
 }

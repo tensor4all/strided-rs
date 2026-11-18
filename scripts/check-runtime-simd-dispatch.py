@@ -44,8 +44,8 @@ CHECKS = [
     ("strided_nn::simd::ShiftGroup>", "vmaxps"),
     ("strided_nn::simd::ScaleGroup>", "vdivps"),
     ("strided_nn::simd::ScaleGroupF64>", "vdivpd"),
-    ("strided_segpoly::simd::AxpyF64<", "vmulpd"),
-    ("strided_segpoly::simd::AxpyF32<", "vmulps"),
+    ("strided_segpoly::simd::RowF64<", "vmulpd"),
+    ("strided_segpoly::simd::RowF32<", "vmulps"),
 ]
 
 LEVELS = [("V4", "zmm"), ("V3", "ymm")]

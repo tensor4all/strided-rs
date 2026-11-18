@@ -1,4 +1,5 @@
-//! What the four plans ask the caller to supply, per worker budget (strided-rs#496).
+//! What the five plans ask the caller to supply, per worker budget (strided-rs#496,
+//! #498).
 //!
 //! The VJP wrt the spherical harmonics is a lane reduction, so its scratch now
 //! carries one lane tile per worker plus the pack area of its lane-strided
@@ -25,9 +26,11 @@ fn the_vjp_y_lane_reduction_scratch_is_a_tile_per_worker() {
         let cg = plans(atoms);
         let fwd = cg.fwd_scratch.borrow().len();
         let vjp_y = cg.vjp_y_scratch.borrow().len();
+        let fused = cg.vjp_fused_scratch.borrow().len();
         println!(
             "atoms {atoms}: scratch elements per call -- fwd {} (budget 1) / {} (8), \
-             vjp_x {} / {}, vjp_w {} / {}, vjp_y {} / {}; buffers {fwd} and {vjp_y}",
+             vjp_x {} / {}, vjp_w {} / {}, vjp_y {} / {}, fused {} / {}; \
+             buffers {fwd}, {vjp_y} and {fused}",
             cg.fwd.scratch_len(1),
             cg.fwd.scratch_len(features),
             cg.vjp_x.scratch_len(1),
@@ -35,12 +38,21 @@ fn the_vjp_y_lane_reduction_scratch_is_a_tile_per_worker() {
             cg.vjp_w.scratch_len(1),
             cg.vjp_w.scratch_len(features),
             cg.vjp_y.scratch_len(1),
-            cg.vjp_y.scratch_len(features)
+            cg.vjp_y.scratch_len(features),
+            cg.vjp_fused.scratch_len(1),
+            cg.vjp_fused.scratch_len(features)
         );
         // Both buffers are sized from `scratch_len(features)` and must cover the
         // one-worker floor.
         assert!(fwd >= cg.fwd.scratch_len(1));
         assert!(vjp_y >= cg.vjp_y.scratch_len(1));
+        // The fused plan holds both scattered accumulators plus the batched row
+        // tile, and only the per-worker part grows with the budget.
+        assert!(fused >= cg.vjp_fused.scratch_len(1));
+        assert_eq!(
+            cg.vjp_fused.scratch_len(features) - cg.vjp_fused.scratch_len(1),
+            (features - 1) * (cg.vjp_fused.scratch_len(2) - cg.vjp_fused.scratch_len(1))
+        );
         // Growing the budget only grows the tile part, so the floor is the same
         // plan at budget 1.
         assert!(cg.vjp_y.scratch_len(1) <= cg.vjp_y.scratch_len(features));

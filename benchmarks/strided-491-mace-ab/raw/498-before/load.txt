@@ -1,0 +1,13 @@
+# load at campaign start 2026-11-18T07:40:58+09:00 (before)
+ 07:40:58 up 13 days, 18:11,  4 users,  load average: 1.40, 0.92, 0.83
+# load at campaign start 2026-11-18T07:43:18+09:00 (after)
+ 07:43:18 up 13 days, 18:13,  4 users,  load average: 1.27, 1.05, 0.94
+# foreign processes on the machine (not on the measured cores):
+%CPU     PID COMMAND
+ 100  4086706 rtk
+15.4 3079669 kache-engine
+cpu4 performance 2954578kHz
+cpu5 performance 2000000kHz
+cpu6 performance 2000000kHz
+cpu7 performance 2954578kHz
+cpu8 performance 2954578kHz

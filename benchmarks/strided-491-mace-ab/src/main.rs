@@ -218,51 +218,74 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
             // `grad_x` holds the narrow `[N, 1, 128]` and the wide `[N, 3, 128]`
             // view back to back: N*(128 + 3*f) elements, which is 4*N*f because
             // this descriptor has f = 128.
+            // Behind `RefCell`s so the fused call and the three split calls can
+            // interleave over the same buffers: two `&mut` closures over one
+            // vector cannot coexist, and comparing them on different memory would
+            // measure two different cache footprints.
+            use std::cell::RefCell;
             let grad_x_elems = cg.num_nodes * (128 + 3 * cg.feature_dim());
-            let mut grad_x = vec![T::from_f64(0.0); grad_x_elems];
-            let mut grad_w = vec![T::from_f64(0.0); cg.num_edges * 10 * cg.feature_dim()];
-            let mut grad_y = vec![T::from_f64(0.0); cg.num_edges * 16];
+            let grad_x = RefCell::new(vec![T::from_f64(0.0); grad_x_elems]);
+            let grad_w = RefCell::new(vec![T::from_f64(0.0); cg.num_edges * 10 * cg.feature_dim()]);
+            let grad_y = RefCell::new(vec![T::from_f64(0.0); cg.num_edges * 16]);
             let mut run_llmlip = || {
                 let (_path, out) = cg.llmlip_vjp(&buffers).expect("llmlip vjp");
                 black_box(out);
             };
             let mut run_x = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
-                cg.strided_vjp_x(&buffers, black_box(&mut grad_x), exec)
+                cg.strided_vjp_x(&buffers, black_box(&mut grad_x.borrow_mut()), exec)
                     .expect("strided vjp-x");
             };
             let mut run_w = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
-                cg.strided_vjp_w(&buffers, black_box(&mut grad_w), exec)
+                cg.strided_vjp_w(&buffers, black_box(&mut grad_w.borrow_mut()), exec)
                     .expect("strided vjp-w");
             };
             let mut run_y = || {
                 let exec = mace_ab::exec_for(args.threads, pool.as_ref());
-                cg.strided_vjp_y(&buffers, black_box(&mut grad_y), exec)
+                cg.strided_vjp_y(&buffers, black_box(&mut grad_y.borrow_mut()), exec)
                     .expect("strided vjp-y");
+            };
+            // The same three gradients in one call: one traversal, one `Exec`, and
+            // the number the #498 target is stated against.
+            let mut run_fused = || {
+                let exec = mace_ab::exec_for(args.threads, pool.as_ref());
+                cg.strided_vjp_fused(
+                    &buffers,
+                    black_box(&mut grad_x.borrow_mut()),
+                    black_box(&mut grad_w.borrow_mut()),
+                    black_box(&mut grad_y.borrow_mut()),
+                    exec,
+                )
+                .expect("strided vjp fused");
             };
             let measured = measure::interleaved(
                 target,
                 args.samples,
-                &mut [&mut run_llmlip, &mut run_x, &mut run_w, &mut run_y],
+                &mut [&mut run_llmlip, &mut run_x, &mut run_w, &mut run_y, &mut run_fused],
             );
             let path = cg.llmlip_vjp(&buffers).expect("llmlip vjp").0;
-            let total = measured[1].median_ns + measured[2].median_ns + measured[3].median_ns;
+            let split_total = measured[1].median_ns + measured[2].median_ns + measured[3].median_ns;
+            let total = measured[4].median_ns;
             timings.push_str(&format!(
                 "\"llmlip\":{},\"llmlip_path\":\"{}\",\"strided_vjp_x\":{},\
-                 \"strided_vjp_w\":{},\"strided_vjp_y\":{},\"strided_total_ns\":{total:.1}",
+                 \"strided_vjp_w\":{},\"strided_vjp_y\":{},\"strided_vjp_fused\":{},\
+                 \"strided_total_ns\":{total:.1},\"strided_split_total_ns\":{split_total:.1}",
                 measured_json(&measured[0]),
                 path,
                 measured_json(&measured[1]),
                 measured_json(&measured[2]),
-                measured_json(&measured[3])
+                measured_json(&measured[3]),
+                measured_json(&measured[4])
             ));
             record.push_str(&timings);
             record.push('}');
             record.push_str(&format!(
-                ",\"ratio\":{:.4},\"ratio_x\":{:.4},\"ratio_w\":{:.4},\"ratio_y\":{:.4},\
+                ",\"ratio\":{:.4},\"ratio_split\":{:.4},\"ratio_x\":{:.4},\"ratio_w\":{:.4},\
+                 \"ratio_y\":{:.4},\
                  \"grad_x_mib\":{:.1},\"bar_y_intermediate_mib\":{:.1},\"rss_bytes\":{}",
                 total / measured[0].median_ns,
+                split_total / measured[0].median_ns,
                 measured[1].median_ns / measured[0].median_ns,
                 measured[2].median_ns / measured[0].median_ns,
                 measured[3].median_ns / measured[0].median_ns,
@@ -349,15 +372,12 @@ fn vjp<T: Scalar>(
     pool: Option<&Pool>,
 ) -> Result<(Vec<T>, Vec<T>, Vec<T>, Vec<T>, Vec<T>, Vec<T>, Vec<T>), String> {
     let (_path, (bar_x, bar_y, bar_w)) = cg.llmlip_vjp(buffers)?;
+    // One fused call, as the timed cell runs it.
     let mut grad_x = vec![T::from_f64(0.0); cg.num_nodes * (128 + 3 * cg.feature_dim())];
-    let exec = mace_ab::exec_for(threads, pool);
-    cg.strided_vjp_x(buffers, &mut grad_x, exec)?;
     let mut grad_w = vec![T::from_f64(0.0); cg.num_edges * 10 * cg.feature_dim()];
-    let exec = mace_ab::exec_for(threads, pool);
-    cg.strided_vjp_w(buffers, &mut grad_w, exec)?;
     let mut grad_y = vec![T::from_f64(0.0); cg.num_edges * 16];
     let exec = mace_ab::exec_for(threads, pool);
-    cg.strided_vjp_y(buffers, &mut grad_y, exec)?;
+    cg.strided_vjp_fused(buffers, &mut grad_x, &mut grad_w, &mut grad_y, exec)?;
     let (narrow, wide) = grad_x.split_at(cg.num_nodes * cg.feature_dim());
     Ok((
         bar_x,

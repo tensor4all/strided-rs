@@ -1,0 +1,12 @@
+host: AMD Ryzen AI MAX+ 395 (Strix Halo), 32 logical CPUs
+kernel: 7.0.0-42-generic
+rustc / cargo: 1.100.0
+governor: performance; no NVIDIA GPU present (`nvidia-smi` absent,
+/usr/local/cuda-* absent), so no GPU path is exercised
+L3 domains (index3): cache0 = 0-7,16-23 ; cache1 = 8-15,24-31
+measured cell: 1T -> cpu 4 ; 4T -> cpus 4,5,6,7 (all in cache0)
+observer (campaign shell, recorder, agent): cpus 8-15,24-31 (cache1), and the
+agent process was pinned there with `taskset -apc 8-15,24-31 <pid>` for the run
+note: cpu 0 is avoided on purpose, as in the #496 campaign (worklog §3).
+campaign.sh re-measures one anchor cell before and after the 16 cells and refuses
+the run when the two ends disagree by more than 15 %.
