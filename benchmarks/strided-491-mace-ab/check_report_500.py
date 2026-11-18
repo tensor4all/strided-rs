@@ -14,8 +14,15 @@ Checked against `docs/worklogs/2026-11-18-issue-500-aarch64-m5.md`:
   that each transcript holds 18 records and no FAILED line;
 * the x86-64 before/after tables (before = `raw/498-after` from #499, after =
   `raw/500-x86-after3`);
-* that no timed strided call allocates more than 100 B/call or 0.1 calls/call
-  on the M5 side;
+* that no timed strided call allocates more than 200 B/call or 0.1 calls/call
+  on the M5 side. The only allowed nonzero events are rayon's per-worker
+  first-touch 1 520 B allocations, i.e. one event per worker per process, not a
+  per-call allocation: 1 520 B over 15 timed calls is 101.3 B/call, which is why
+  the bar is 200 and not 0;
+* that every campaign.txt the checker opens holds 18 records and no FAILED line
+  (a failed-drift transcript must never pass);
+* that the target, per-plan, repeat and anchor parsers each matched a nonzero
+  number of rows (an empty section is a failure, not a vacuous pass);
 * that every llmlip-agreement figure is inside the bars the worklog states
   (f64 <= 1e-14, f32 <= 1e-5, scale-relative).
 
@@ -49,6 +56,45 @@ X86_AFTER = os.path.join(HERE, "raw", "500-x86-after3")
 MS_TOLERANCE = 6e-3
 RATIO_TOLERANCE = 6e-4
 ANCHOR_TOLERANCE = 5.1e-2
+
+# A strided call allocates 0 B; the only nonzero events are rayon's per-worker
+# first-touch 1 520 B allocations on a 4T pool's first use (one event per worker
+# per process, not per call). 1 520 B over a 15-call cell is 101.3 B/call, so the
+# per-call bar is 200 B and the call bar 0.1, not 0.
+ALLOC_BYTES_PER_CALL = 200.0
+ALLOC_CALLS_PER_CALL = 0.1
+
+
+def read_campaign(raw_dir: str) -> tuple[list[dict] | None, int]:
+    """The JSON records of one campaign.txt and its FAILED-line count."""
+    path = os.path.join(raw_dir, "campaign.txt")
+    if not os.path.exists(path):
+        return None, 0
+    payloads: list[dict] = []
+    failed = 0
+    with open(path) as handle:
+        for line in handle:
+            if "FAILED" in line:
+                failed += 1
+            if line.strip().startswith("{"):
+                payloads.append(json.loads(line))
+    return payloads, failed
+
+
+def check_campaign(raw_dir: str, bad: list[str]) -> int:
+    """Open one campaign.txt: 18 JSON records and no FAILED line."""
+    payloads, failed = read_campaign(raw_dir)
+    if payloads is None:
+        bad.append(f"{raw_dir}/campaign.txt: missing campaign transcript")
+        return 0
+    if len(payloads) != 18:
+        bad.append(f"{raw_dir}/campaign.txt: {len(payloads)} records, expected 18")
+    if failed:
+        bad.append(
+            f"{raw_dir}/campaign.txt: {failed} FAILED line(s) in a transcript "
+            "the report uses"
+        )
+    return len(payloads)
 
 
 def load(raw_dir: str) -> dict[tuple[str, str, int, int], dict]:
@@ -117,8 +163,13 @@ TARGET_ROW = re.compile(
 
 
 def section(text: str, start: str, end: str) -> str:
-    first = text.index(start)
-    return text[first : text.index(end, first)]
+    """The text between two markers; empty when either is missing (the caller's
+    zero-row check then reports it instead of a traceback)."""
+    first = text.find(start)
+    if first < 0:
+        return ""
+    last = text.find(end, first)
+    return "" if last < 0 else text[first:last]
 
 
 def check_table(
@@ -177,6 +228,8 @@ def check_per_plan(text: str, after: dict, bad: list[str]) -> int:
             value = value if isinstance(value, float) else value["median_ns"]
             close(f"per-plan {key} {field}", float(match.group(group)), value / 1e6, MS_TOLERANCE, bad)
         checked += 1
+    if checked == 0:
+        bad.append("per-plan: no table rows matched")
     return checked
 
 
@@ -204,6 +257,8 @@ def check_repeats(text: str, bad: list[str]) -> int:
                 bad,
             )
         checked += 1
+    if checked == 0:
+        bad.append("repeats: no table rows matched")
     return checked
 
 
@@ -221,6 +276,8 @@ def check_targets(text: str, after: dict, bad: list[str]) -> int:
         close(f"target {atoms} llmlip min", float(match.group(6)), min(llmlip), MS_TOLERANCE, bad)
         close(f"target {atoms} llmlip max", float(match.group(7)), max(llmlip), MS_TOLERANCE, bad)
         checked += 1
+    if checked == 0:
+        bad.append("targets: no table rows matched")
     return checked
 
 
@@ -228,13 +285,15 @@ def check_anchors(text: str, bad: list[str]) -> int:
     checked = 0
     for match in ANCHOR_ROW.finditer(section(text, "Accepted pair", "The before tree")):
         campaign = match.group(1)
-        raw_dir = os.path.join(HERE, match.group(2).replace("raw/", "raw/"))
-        payloads = []
-        with open(os.path.join(raw_dir, "campaign.txt")) as handle:
-            for line in handle:
-                line = line.strip()
-                if line.startswith("{"):
-                    payloads.append(json.loads(line))
+        raw_dir = os.path.join(HERE, match.group(2))
+        payloads, failed = read_campaign(raw_dir)
+        if failed:
+            bad.append(
+                f"{campaign} campaign.txt holds {failed} FAILED line(s)"
+            )
+        if payloads is None:
+            bad.append(f"{campaign} campaign.txt is missing")
+            continue
         if len(payloads) != 18:
             bad.append(f"{campaign} campaign holds {len(payloads)} records, expected 18")
             continue
@@ -251,6 +310,8 @@ def check_anchors(text: str, bad: list[str]) -> int:
             drift = abs(read(end) - read(start)) / max(read(start), read(end)) * 100
             close(f"{campaign} {side} anchor drift", float(match.group(group + 2)), drift, 0.06, bad)
         checked += 1
+    if checked == 0:
+        bad.append("anchors: no table rows matched")
     return checked
 
 
@@ -263,11 +324,11 @@ def check_allocation(bad: list[str]) -> int:
                 timings["strided_vjp_fused"]
             ]
             for side in sides:
-                if side["alloc_bytes_per_call"] > 200.0:
+                if side["alloc_bytes_per_call"] > ALLOC_BYTES_PER_CALL:
                     bad.append(
                         f"{raw_dir} {key}: {side['alloc_bytes_per_call']:.1f} B/call"
                     )
-                if side["alloc_calls_per_call"] > 0.1:
+                if side["alloc_calls_per_call"] > ALLOC_CALLS_PER_CALL:
                     bad.append(
                         f"{raw_dir} {key}: {side['alloc_calls_per_call']:.3f} calls/call"
                     )
@@ -306,6 +367,10 @@ def main() -> int:
         text = handle.read()
     before, after = load(BEFORE), load(AFTER)
     bad: list[str] = []
+    campaign_records = sum(
+        check_campaign(raw_dir, bad)
+        for raw_dir in (BEFORE, AFTER, *AFTERS, X86_BEFORE, X86_AFTER)
+    )
     header = (
         "| dtype | T | atoms | llmlip before | strided before | ratio | "
         "llmlip after | strided after | ratio | speedup |"
@@ -339,7 +404,8 @@ def main() -> int:
             print(f"  {item}")
         return 1
     print(
-        f"ok: {m5_forward} M5 forward rows, {m5_vjp} M5 VJP rows, "
+        f"ok: {campaign_records} campaign records, "
+        f"{m5_forward} M5 forward rows, {m5_vjp} M5 VJP rows, "
         f"{per_plan} per-plan rows, {repeats} repeat rows, {targets} targets, "
         f"{anchors} anchors, {x86_checked} x86 rows, {alloc} allocation checks, "
         f"{agreement} agreement figures"

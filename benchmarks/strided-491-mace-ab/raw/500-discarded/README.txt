@@ -8,9 +8,9 @@ what was rejected, as #491 did with its contaminated attempt).
   SETTLE=5 removes; it is not a kernel result.
 * 500-after2, 500-after3: passed the guard but ran while the co-tenant load was
   higher; their absolute 4T medians are inflated (e.g. f64 4T 1024 119.70 /
-  117.78 ms vs 93.11 ms in the accepted 500-after7) while the ratios agree.
+  127.16 ms vs 93.11 ms in the accepted 500-after7) while the ratios agree.
   They are repeats, not the published pair.
 * 500-before-early: the first baseline campaign (01:00Z), valid on its own
-  (anchor drift 3.7 % strided / 2.4 % llmlip) but its matching after run was one
+  (anchor drift 2.7 % strided / 2.4 % llmlip) but its matching after run was one
   of the failed ones; the published before is 500-before4, run back to back with
   500-after4/5/6/7 in the quiet window.

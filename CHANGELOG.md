@@ -216,7 +216,7 @@ the scalar loop and the scalar level is the same chunk with one-lane vectors. Th
 memory operations per path and vector, which is what the aarch64 NEON kernel (2 `f64` / 4 `f32` lanes) is bound by.
 On the Apple M5 Max the f32 4T VJP ratio against llmlip is 0.672 / 0.656 at 128 / 1024 atoms (the target was <= 1.0;
 the untuned floor was 0.775 / 0.786) and the x86-64 evo2 host is 1.30-1.51x faster on VJP than #499. The tests now
-run 137 lanes so every level exercises a full chunk, a partial chunk and the scalar remainder. Before/after tables,
+run 201 lanes so every vector level exercises a full chunk, a partial chunk and the scalar remainder. Before/after tables,
 the host protocol and the raw campaigns are in
 [`docs/worklogs/2026-11-18-issue-500-aarch64-m5.md`](docs/worklogs/2026-11-18-issue-500-aarch64-m5.md).
 

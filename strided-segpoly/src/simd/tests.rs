@@ -2,17 +2,22 @@
 //! carry, against the scalar statement of `acc[i] = acc[i] + ((c·a_0)·a_1)·a_2`.
 //!
 //! The mask is the only thing the dispatch selects by value, so each arity runs
-//! its whole mask space here; the lane count is 137 so, on every supported width,
-//! the vector loop runs at least one full `CHUNK_VECTORS` chunk, a partial chunk
-//! and the scalar remainder. A row here holds one operation with one path per
-//! segment, which is the per-path statement the replay composes into a row.
+//! its whole mask space here; the lane count is 201 so every vector level runs at
+//! least one full `CHUNK_VECTORS` chunk and a partial chunk, and has a non-empty
+//! scalar remainder. (The scalar level's whole slice is one "vector", so its
+//! remainder is the partial chunk and its tail is empty.) A row here holds one
+//! operation with one path per segment, which is the per-path statement the
+//! replay composes into a row.
 
 use super::{lanes_f32, lanes_f64, op_row_f32, op_row_f64, OpRow};
 use crate::plan::MAX_INPUTS;
 
-/// Lanes per case: 137 is 8 f32 vectors on the widest level (16 lanes), so a full
-/// chunk, a partial chunk and the scalar remainder all run on every width.
-const LANES: usize = 137;
+/// Lanes per case: at the widest vector (16 f32 lanes) 201 lanes are 12 vectors,
+/// i.e. one full eight-vector chunk, a four-vector partial chunk and nine scalar
+/// tail lanes; every narrower level has its own non-empty partial chunk and
+/// tail. A count that is an exact multiple of eight vectors would leave `rest`
+/// empty on that level and stop testing the partial-chunk path.
+const LANES: usize = 201;
 
 /// One row of one path against the scalar order, over every mask of the arity.
 ///
@@ -227,6 +232,6 @@ macro_rules! check_row_order {
 
 #[test]
 fn a_row_visits_every_segment_and_path_at_its_own_offset() {
-    check_row_order!(op_row_f64, f64, 137);
-    check_row_order!(op_row_f32, f32, 137);
+    check_row_order!(op_row_f64, f64, 201);
+    check_row_order!(op_row_f32, f32, 201);
 }
