@@ -3140,6 +3140,7 @@ where
     plan.execute(&mut dest_ref, &operand_ref, &update_ref, &start_ref, exec)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_scatter_index<T>(
     plan: &ScatterPlan,
     index_dtype: KernelDType,
