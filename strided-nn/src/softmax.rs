@@ -137,7 +137,7 @@ impl Plan {
 
 /// Hand each task index to `body` within the budget of `exec`, inline on the
 /// calling thread for a serial token.
-fn fan_out<F: Fn(usize) + Sync>(tasks: usize, exec: Exec<'_>, body: F) {
+pub(crate) fn fan_out<F: Fn(usize) + Sync>(tasks: usize, exec: Exec<'_>, body: F) {
     strided_basic::execution::parallel_map_reduce(
         0..tasks,
         exec,

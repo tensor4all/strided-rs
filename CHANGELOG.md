@@ -12,6 +12,18 @@ manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and
 never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
 manifests move when it is released.
 
+### `strided-nn`: `norm` and `activation` row kernels (#504, phase 1)
+
+`strided_nn::norm` adds LayerNorm (optional weight/bias) and RMSNorm over the last axis of a contiguous
+`[rows, width]` slice, `f32`/`f64` (`*_f32` / `*_f64`): forward with optional per-row statistics (`mean`/`inv_std`,
+`inv_rms`), input VJP, and weight/bias VJP that consume the cached statistics. `strided_nn::activation` adds SiLU and
+sigmoid forward with an optionally written `f'(x)` and the matching VJP (`dx = dy * f'(x)`). New errors `NormError` and
+`ActivationError`. Each entry takes the `Exec` token last and creates no pool; the forwards and input VJPs need no
+scratch, the parameter VJPs and activation forwards take caller scratch (`layer_norm_params_scratch_len`,
+`rms_norm_weight_scratch_len`, `activation::scratch_len`). Results are bitwise identical at every thread count. Written
+independently from the mathematical definitions; llmlip.rs is a functional reference only. A3-A5 and B1-B3 of #504
+follow separately.
+
 ### `strided-perm`: `copy_conj_into` and `copy_conj_into_uninit`
 
 The permutation engine gained a conjugating copy for the complex element types (#467):

@@ -27,3 +27,48 @@ pub enum SoftmaxError {
         element_size: usize,
     },
 }
+
+/// A normalization call whose arguments do not describe a valid `[rows, width]`
+/// row layout, or whose scratch is too small.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum NormError {
+    /// `width` is zero, so no row exists.
+    #[error("normalization width must be positive")]
+    EmptyWidth,
+
+    /// The input element count is not a whole number of `width`-element rows.
+    #[error("input length {len} is not a multiple of width {width}")]
+    UnevenRows { len: usize, width: usize },
+
+    /// A slice has the wrong length for the call's `[rows, width]` shape.
+    #[error("`{name}` has {got} elements; {expected} expected")]
+    LengthMismatch {
+        name: &'static str,
+        expected: usize,
+        got: usize,
+    },
+
+    /// The scratch holds fewer elements than the parameter reduction needs.
+    #[error("normalization scratch holds {got} elements; {need} needed")]
+    ScratchTooSmall { need: usize, got: usize },
+
+    /// The scratch size overflowed `usize`.
+    #[error("scratch size for {rows} rows of width {width} overflows")]
+    SizeOverflow { rows: usize, width: usize },
+}
+
+/// An activation call whose slices or scratch do not fit together.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ActivationError {
+    /// A slice has the wrong length.
+    #[error("`{name}` has {got} elements; {expected} expected")]
+    LengthMismatch {
+        name: &'static str,
+        expected: usize,
+        got: usize,
+    },
+
+    /// The scratch holds less than one chunk of elements.
+    #[error("activation scratch holds {got} elements; {need} needed")]
+    ScratchTooSmall { need: usize, got: usize },
+}
