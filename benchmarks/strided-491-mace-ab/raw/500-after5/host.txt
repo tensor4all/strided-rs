@@ -9,7 +9,7 @@ thermal: Note: No thermal warning level has been recorded Note: No performance w
 L3/caches: no index3 shared_cpu_list on macOS; 131072 B L1i, 65536 B L1d, 8388608 B L2 (sysctl hw.l2cachesize)
 note: powermode stayed 0 (automatic); the OS reports no thermal or performance warning before or after the run.
 
-# #500 final pair (raw/500-before4, raw/500-after5)
+# #500 repeat campaign (raw/500-before4, raw/500-after5; accepted after is raw/500-after7)
 The same host, one quiet window (2026-11-18T01:16Z-01:21Z and 01:25Z-01:28Z).
 CPU affinity is unavailable on macOS: campaign.sh auto-detects PIN=0 and runs the
 1T/4T cells unpinned (thread counts, not affinity, bound the work). The observer

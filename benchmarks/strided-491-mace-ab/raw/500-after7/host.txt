@@ -9,13 +9,13 @@ thermal: Note: No thermal warning level has been recorded Note: No performance w
 L3/caches: no index3 shared_cpu_list on macOS; 131072 B L1i, 65536 B L1d, 8388608 B L2 (sysctl hw.l2cachesize)
 note: powermode stayed 0 (automatic); the OS reports no thermal or performance warning before or after the run.
 
-# #500 final pair (raw/500-before4, raw/500-after5)
-The same host, one quiet window (2026-11-18T01:16Z-01:21Z and 01:25Z-01:28Z).
+# #500 final pair (raw/500-before4, raw/500-after7)
+The same host, one quiet window (before 2026-11-18T01:16Z-01:18Z, after 01:31Z-01:34Z).
 CPU affinity is unavailable on macOS: campaign.sh auto-detects PIN=0 and runs the
 1T/4T cells unpinned (thread counts, not affinity, bound the work). The observer
 was therefore not pinned either. Both campaigns passed the anchor guard with
 SETTLE=5 (before: strided 13.5 -> 13.3 ms / 1.3 %, llmlip 44.4 -> 44.3 / 0.1 %;
-after: strided 10.8 -> 10.8 / 0.3 %, llmlip 44.5 -> 44.4 / 0.2 %).
+after: strided 10.4 -> 10.6 ms / 1.7 %, llmlip 43.8 -> 44.7 / 2.0 %).
 SETTLE=5 is a macOS-only measurement fix: a 1024-atom VJP cell leaves ~1.5 GiB
 being reclaimed and the next process starts ~20 % slow; a 5 s pause removes it
 (measured: 16.2 -> 13.4 ms for the 1T f64 anchor). Discarded attempts are in

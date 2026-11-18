@@ -367,10 +367,11 @@ def main() -> int:
         text = handle.read()
     before, after = load(BEFORE), load(AFTER)
     bad: list[str] = []
-    campaign_records = sum(
-        check_campaign(raw_dir, bad)
-        for raw_dir in (BEFORE, AFTER, *AFTERS, X86_BEFORE, X86_AFTER)
+    # AFTER is also the last repeat, so count each campaign transcript once.
+    campaign_dirs = tuple(
+        dict.fromkeys((BEFORE, AFTER, *AFTERS, X86_BEFORE, X86_AFTER))
     )
+    campaign_records = sum(check_campaign(raw_dir, bad) for raw_dir in campaign_dirs)
     header = (
         "| dtype | T | atoms | llmlip before | strided before | ratio | "
         "llmlip after | strided after | ratio | speedup |"
