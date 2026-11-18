@@ -312,7 +312,14 @@ fn vjp_params<T: Real>(
             got: scratch.len(),
         });
     }
-    if rows == 0 || planes == 0 {
+    if rows == 0 {
+        // An empty sum is zero: honor the "overwritten, not accumulated" contract.
+        for d in [dweight, dbias].into_iter().flatten() {
+            d.fill(T::ZERO);
+        }
+        return Ok(());
+    }
+    if planes == 0 {
         return Ok(());
     }
     let chunks = rows.div_ceil(CHUNK_ROWS);

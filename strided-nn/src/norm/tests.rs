@@ -315,6 +315,47 @@ macro_rules! dtype_tests {
             }
 
             #[test]
+            fn zero_rows_overwrite_requested_outputs_with_zero() {
+                let width = 5;
+                let mut scratch = vec![0.0 as T; 1];
+                let (mut dw, mut db) = (vec![7.0 as T; width], vec![7.0 as T; width]);
+                $ln_p(
+                    width,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some(&mut dw),
+                    Some(&mut db),
+                    &mut scratch,
+                    Exec::serial(),
+                )
+                .unwrap();
+                assert!(dw.iter().chain(&db).all(|&v| v == 0.0));
+
+                // Only one output requested: the other stays untouched.
+                let (dw, mut db) = (vec![7.0 as T; width], vec![7.0 as T; width]);
+                $ln_p(
+                    width,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    None,
+                    Some(&mut db),
+                    &mut scratch,
+                    Exec::serial(),
+                )
+                .unwrap();
+                assert!(db.iter().all(|&v| v == 0.0));
+                assert!(dw.iter().all(|&v| v == 7.0));
+
+                let mut dw = vec![7.0 as T; width];
+                $rms_w(width, &[], &[], &[], &mut dw, &mut scratch, Exec::serial()).unwrap();
+                assert!(dw.iter().all(|&v| v == 0.0));
+            }
+
+            #[test]
             fn thread_count_does_not_change_bits() {
                 let pool = threadteam::Pool::builder().threads(4).build().unwrap();
                 let (rows, width) = (20_000, 33);

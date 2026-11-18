@@ -12,7 +12,7 @@ Kernels:
 All are deterministic across thread counts (fixed per-row reduction order; the parameter VJPs reduce in
 fixed 128-row chunks through caller scratch).
 
-Axis-0 softmax is per-slice max, shift, per-slice max, shift, `exp`, sum and scale in
+Axis-0 softmax is per-slice max, shift, `exp`, sum and scale in
 one pass over cache-sized groups, with no full-size intermediate. The API is
 tensor-free: contiguous slices in and out, an explicit
 [`strided_basic::Exec`] token, and caller-provided scratch. Placement and
