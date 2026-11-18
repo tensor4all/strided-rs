@@ -1,0 +1,16 @@
+# Host: Apple M5 Max (aarch64-apple-darwin), macOS 26.7.2, rustc 1.100.0.
+# Branch perf/500-aarch64-m5 (main dcdf3f0 + the register-chunk kernel and the
+# portable harness).
+cd /tmp/strided-mlp/benchmarks/strided-491-mace-ab
+cargo build --release
+OUT=raw/500-after7 SETTLE=5 caffeinate -i ./campaign.sh
+
+# The four crate gates and the harness gates:
+cargo test --release -p strided-segpoly
+cargo test --release            # in benchmarks/strided-491-mace-ab
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# The dispatched body still reaches the run-time level on a baseline build (the
+# script is x86-only; run there, see raw/500-x86-after):
+python3 scripts/check-runtime-simd-dispatch.py

@@ -1,0 +1,10 @@
+Linux 7.0.0-42-generic x86_64
+CPU(s):                                  32
+Model name:                              AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+Thread(s) per core:                      2
+Core(s) per socket:                      16
+Socket(s):                               1
+CPU(s) scaling MHz:                      47%
+L3 cache:                                64 MiB (2 instances)
+bash: line 1: rustc: command not found
+ 10:24:30 up 13 days, 20:55,  4 users,  load average: 1.04, 1.20, 0.73

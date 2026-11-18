@@ -1,0 +1,10 @@
+# Host: AMD Ryzen AI MAX+ 395 (Strix Halo), 32 logical CPUs, Linux 7.0.0-42,
+# rustc 1.100.0 -- the same host as the #491/#496/#498 campaigns.
+# Baseline comparison is raw/498-after (main dcdf3f0, the #499 campaign) on this
+# host with the same pins; this directory is the tuned tree only.
+cd ~/work/strided-500/strided-rs        # worktree of dcdf3f0 + the branch's simd.rs/tests.rs
+cd ~/work/strided-500-harness           # harness/src copied from the branch; path deps -> ../strided-500
+cargo build --release
+OUT=raw/500-x86-after taskset -c 8-15,24-31 ./campaign.sh
+grep -c '^{' raw/500-x86-after/campaign.txt   # 18
+grep -c FAILED raw/500-x86-after/campaign.txt # 0

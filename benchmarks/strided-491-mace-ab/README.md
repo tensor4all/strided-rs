@@ -39,7 +39,10 @@ cargo build --release -p llmlip --features parallel,bench-api
 ```
 
 `Cargo.toml` points at `../../../llmlip.rs`; edit that path if your checkout
-lives elsewhere. `strided-basic` / `strided-segpoly` are path deps on the parent
+lives elsewhere. The committed `raw/llmlip-bench-api.diff` used to be malformed
+(its two new files had no `diff --git`/`new file mode`/`@@ -0,0 +1,N @@`
+headers, so `git apply` silently skipped them); it is valid as of #500 and
+`git apply --check` on a clean `6bfb041` checkout is the gate. `strided-basic` / `strided-segpoly` are path deps on the parent
 repo, so this harness always measures the tree it sits in.
 
 ## Running
@@ -51,6 +54,8 @@ cargo test --release    # the gates; fails if either side changes meaning
 ./check_report.py       # re-derives every number in the #491/#496 report from raw/
 ./check_report_498.py   # the same for the #498 report (before/after campaigns,
                         # anchors, targets, allocation, agreement figures)
+./check_report_500.py   # the same for the #500 report (M5 before/after, per-plan,
+                        # repeat, target, anchor, allocation and x86 tables)
 ```
 
 Each cell prints one JSON record. `--raw-dir` also appends it to
@@ -64,6 +69,17 @@ overwriting it.
   foreign processes were pinned there — see the worklog §3); the campaign shell and the
   observer are pinned to the other domain (`8-15,24-31`). Derive the sets from
   `/sys/devices/system/cpu/*/cache/index3/shared_cpu_list` on a new host.
+* **Hosts without `taskset` (macOS).** macOS has no per-thread core binding.
+  `campaign.sh` auto-detects that (`PIN=0`), runs the cells unpinned and records
+  `pin=0` in the transcript; `PIN=1` requires `taskset`, `PIN=0` forces the
+  unpinned protocol. Thread counts still bound each side, but a 4T cell can be
+  scheduled on either core class, so read the within-cell ratio and the anchor
+  guard, not a single absolute 4T figure. The M5 runs also use `SETTLE=5`
+  (seconds before each cell and anchor): a 1024-atom VJP process leaves ~1.5 GiB
+  being reclaimed, and the three no-pause campaigns ended with the 1T f64 anchor
+  19.8-26.3 % slow; with the pause the accepted pair's anchors moved 1.3 % and
+  1.7-2.0 % (see `raw/500-discarded/`). Both settings default to the Linux
+  behaviour (`PIN=auto`, `SETTLE=0`).
 * **Thread count, not affinity, on both sides.** llmlip dispatches through
   rayon's global pool, so `main.rs` pins that pool to `--threads`; otherwise
   "1T" would be 32 threads on one core and llmlip's 4T scaling would look

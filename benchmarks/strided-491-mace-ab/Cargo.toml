@@ -16,7 +16,11 @@ llmlip = { path = "../../../llmlip.rs/crates/llmlip", default-features = false, 
     "bench-api",
 ] }
 # Only to pin llmlip's global pool to the same thread count as the strided exec.
-rayon = "1" 
+rayon = "1"
+
+# Peak RSS on macOS (`getrusage`); Linux reads /proc/self/status instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 # llmlip's own release profile (llmlip.rs/Cargo.toml:40-42), so neither side is
 # measured under flags the other does not get.

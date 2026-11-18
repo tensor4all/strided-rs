@@ -1,0 +1,7 @@
+# after5 start 2026-11-18T01:25:47Z
+10:25  up 21 days,  4:43, 3 users, load averages: 7.47 6.40 5.01
+  PID  %CPU COMM
+ 3775  63.0 /Applications/Koushi.app/Contents/MacOS/koushi-desktop
+ 1007  34.2 /System/Library/PrivateFrameworks/UserNotificationsCore.framework/Support/usernotificationsd
+49024  12.7 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor
+  739  11.7 /usr/libexec/sysmond

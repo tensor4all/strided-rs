@@ -79,18 +79,38 @@ pub fn alloc_snapshot() -> Alloc {
     }
 }
 
-/// `VmHWM` in bytes, i.e. the process's peak resident set.
+/// Peak resident set of this process in bytes: `VmHWM` on Linux, `ru_maxrss` on
+/// macOS (which reports bytes there, unlike Linux's KiB), `0` where neither
+/// exists. A zero is "not measured on this host", not a measurement of zero.
 #[must_use]
 pub fn peak_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find(|line| line.starts_with("VmHWM:"))
-                .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
-        })
-        .map_or(0, |kib| kib * 1024)
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmHWM:"))
+                    .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+            })
+            .map_or(0, |kib| kib * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut usage = core::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `getrusage` writes the whole struct on success (0).
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if status != 0 {
+            return 0;
+        }
+        // SAFETY: the call succeeded, so the struct is initialised.
+        u64::try_from(unsafe { usage.assume_init() }.ru_maxrss).unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
 }
 
 /// One measured side: wall time per call and the allocations inside it.

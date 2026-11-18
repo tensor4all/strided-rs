@@ -431,6 +431,7 @@ dependencies = [
 name = "mace-ab"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "llmlip",
  "rayon",
  "strided-basic",
