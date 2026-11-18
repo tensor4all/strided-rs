@@ -1,4 +1,5 @@
-//! `strided-segpoly` — an executor for lowered segmented polynomials.
+//! `strided-multilinear` — an executor for cuEquivariance-style segmented
+//! polynomials, i.e. sparse multilinear forms.
 //!
 //! A segmented polynomial is `Σ_paths c · Π_operands x[segment]`: a sparse
 //! multilinear form over segments. `cuEquivariance` lowers one to a flat
@@ -48,7 +49,7 @@
 //!
 //! # Deliberately out of scope
 //!
-//! Building the descriptor from a polynomial (that is the separate `segpoly-desc`
+//! Building the descriptor from a polynomial (that is the separate descriptor-lowering
 //! crate), element-indexed inputs (`REPEATED` / `indexed_linear`, decision D6),
 //! half precision, CUDA, and shared partial products for degree 2-3 operands.
 //!

@@ -158,9 +158,17 @@ downstream exhaustive `match`. `strided-view` is still unpublished in the tree (
 `strided-view` minor, and whether `StridedError` gains the attribute, are release decisions for the maintainer.
 
 This is the typed half of #479, and the executor that consumes the index for its scattered outputs is the
-`strided-segpoly` section below. The dtype-erased replay (`strided-kernel`) is not in it.
+`strided-multilinear` section below. The dtype-erased replay (`strided-kernel`) is not in it.
 
-### `strided-segpoly`: the segmented-polynomial executor (#479 part 2)
+### `strided-multilinear`: the segmented-polynomial executor (#479 part 2)
+
+The crate enters the 0.15.0 release (crate version 0.1.0) as
+`strided-multilinear`, renamed from `strided-segpoly` before
+its first publish (#505): the executor computes a general sparse multilinear form
+(`Σ_paths c · Π_operands x[segment]`), and the polynomial is only the special case where
+one buffer feeds several operands — the name cuEquivariance's `SegmentedPolynomial` comes
+from. The type names (`SegPolyPlan`, …) keep that vocabulary so the correspondence to the
+upstream descriptor stays visible; the crate has never been published, so there is no alias.
 
 A new unpublished crate (`publish = false`, so no published content changes) executes a lowered segmented-polynomial
 descriptor. `SegPolyPlan::compile` takes the operations, paths and per-buffer `IndexMode`s together with the inputs' and

@@ -128,7 +128,7 @@ fn a_lane_reduction_is_bitwise_across_budgets_and_block_partials() {
     // block partials that must combine lane-wise before the lanes are summed. The
     // payload stays flag-shaped so the sum is cancellation-sensitive: a different
     // association would move the bits.
-    let (batch, segments, u) = (3 * strided_segpoly::BLOCK_ROWS + 7, 4usize, 19usize);
+    let (batch, segments, u) = (3 * strided_multilinear::BLOCK_ROWS + 7, 4usize, 19usize);
     let paths: Vec<PathSpec> = (0..segments)
         .map(|segment| PathSpec {
             segments: vec![segment as u32, segment as u32, segment as u32],
@@ -402,10 +402,10 @@ fn a_plan_rejects_an_inconsistent_call_without_panicking() {
     let mut data = case.data();
     // A gather index on an input the plan compiled as batched.
     let index = [0i32, 1];
-    let gather = [strided_segpoly::IndexMode::Gather(&index)];
-    let shared = [strided_segpoly::IndexMode::Shared];
-    let batched = [strided_segpoly::IndexMode::Batched];
-    let indexes: [&[strided_segpoly::IndexMode<'_>]; 3] = [&shared, &gather, &batched];
+    let gather = [strided_multilinear::IndexMode::Gather(&index)];
+    let shared = [strided_multilinear::IndexMode::Shared];
+    let batched = [strided_multilinear::IndexMode::Batched];
+    let indexes: [&[strided_multilinear::IndexMode<'_>]; 3] = [&shared, &gather, &batched];
     let (input_data, output_data) = data.split_at_mut(2);
     let inputs: Vec<RawStridedRef<'_, f64>> = input_data
         .iter()
@@ -440,8 +440,9 @@ fn a_plan_rejects_an_inconsistent_call_without_panicking() {
     assert!(
         matches!(
             error,
-            strided_segpoly::SegPolyError::Strided(strided_basic::StridedError::PlanLayoutMismatch)
-                | strided_segpoly::SegPolyError::IndexModeNotAllowed { .. }
+            strided_multilinear::SegPolyError::Strided(
+                strided_basic::StridedError::PlanLayoutMismatch
+            ) | strided_multilinear::SegPolyError::IndexModeNotAllowed { .. }
         ),
         "{error:?}"
     );
@@ -499,12 +500,12 @@ fn a_scatter_call_must_carry_the_compiled_run_order() {
     let mut data = case.data();
     let sentinel = data[case.inputs.len()..].to_vec();
     let mut scratch = vec![0.0f64; plan.scratch_len(1)];
-    let modes: Vec<Vec<strided_segpoly::IndexMode<'_>>> = vec![
-        vec![strided_segpoly::IndexMode::Batched],
-        vec![strided_segpoly::IndexMode::Gather(&dest_a)],
-        vec![strided_segpoly::IndexMode::Scatter(&runs_b)],
+    let modes: Vec<Vec<strided_multilinear::IndexMode<'_>>> = vec![
+        vec![strided_multilinear::IndexMode::Batched],
+        vec![strided_multilinear::IndexMode::Gather(&dest_a)],
+        vec![strided_multilinear::IndexMode::Scatter(&runs_b)],
     ];
-    let indexes: Vec<&[strided_segpoly::IndexMode<'_>]> =
+    let indexes: Vec<&[strided_multilinear::IndexMode<'_>]> =
         modes.iter().map(|mode| mode.as_slice()).collect();
     for into in [true, false] {
         let error = case
@@ -520,7 +521,7 @@ fn a_scatter_call_must_carry_the_compiled_run_order() {
         assert!(
             matches!(
                 error,
-                strided_segpoly::SegPolyError::Strided(
+                strided_multilinear::SegPolyError::Strided(
                     strided_basic::StridedError::PlanLayoutMismatch
                 )
             ),
@@ -730,7 +731,7 @@ fn assert_same_bits(actual: &[f64], expected: &[f64], what: &str) {
 /// Run one case with a fresh copy of its data, returning the output vectors.
 fn run_outputs(
     case: &Case,
-    plan: &strided_segpoly::SegPolyPlan<f64>,
+    plan: &strided_multilinear::SegPolyPlan<f64>,
     exec: Exec<'_>,
     into: bool,
 ) -> Vec<Vec<f64>> {

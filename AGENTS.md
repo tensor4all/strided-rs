@@ -44,7 +44,7 @@ license-bearing attributions (`strided-perm` is
 | `strided-fused` | Runtime-DAG fused execution using the shared basic implementation |
 | `strided-nn` | Fused neural-network kernels (axis-0 softmax) over contiguous slices, with caller-provided scratch |
 | `strided-perm` | Cache-efficient permutation / transpose (HPTT-derived, `src/hptt/`), feature `parallel` |
-| `strided-segpoly` | Segmented-polynomial executor: lowered descriptor in (inputs indexed by batched/shared/gathered modes, outputs by batched/shared/scattered ones), caller-provided scratch, one `Exec` token per call |
+| `strided-multilinear` | Sparse-multilinear-form executor (cuEquivariance-style segmented polynomials): lowered descriptor in (inputs indexed by batched/shared/gathered modes, outputs by batched/shared/scattered ones), caller-provided scratch, one `Exec` token per call |
 | `threadteam` (external crate, tensor4all/threadteam-rs) | Splittable CPU placement token (`Pool`, `Exec`) and the only crate that starts tasks; `strided-perm` and `strided-basic` take it explicitly (docs/design/cpu-exec-placement.md; the type lives in [threadteam-rs](https://github.com/tensor4all/threadteam-rs)) |
 
 Dense flat-buffer APIs are column-major; see `REPOSITORY_RULES.md` for the

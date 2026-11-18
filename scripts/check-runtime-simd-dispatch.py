@@ -2,7 +2,7 @@
 """Check that a baseline x86-64 build reaches AVX2 and AVX-512 at run time.
 
 The elementwise leaf loops of strided-basic, strided-fused, strided-nn and
-strided-segpoly run inside `pulp::Arch::new().dispatch(...)`, which compiles the
+strided-multilinear run inside `pulp::Arch::new().dispatch(...)`, which compiles the
 inlined loop body once per SIMD level and picks one at run time
 (tensor4all/strided-rs#340, #496). This script builds each crate's probe example
 in release mode with `RUSTFLAGS` cleared, so the build target is the x86-64
@@ -31,7 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # (package, example) pairs whose probes exercise the dispatched bodies below.
 PROBES = [
     ("strided-kernel", "runtime_simd_probe"),
-    ("strided-segpoly", "simd_probe"),
+    ("strided-multilinear", "simd_probe"),
 ]
 
 # (dispatched body, instruction): the body's demangled name fragment and one
@@ -44,8 +44,8 @@ CHECKS = [
     ("strided_nn::simd::ShiftGroup>", "vmaxps"),
     ("strided_nn::simd::ScaleGroup>", "vdivps"),
     ("strided_nn::simd::ScaleGroupF64>", "vdivpd"),
-    ("strided_segpoly::simd::RowF64<", "vmulpd"),
-    ("strided_segpoly::simd::RowF32<", "vmulps"),
+    ("strided_multilinear::simd::RowF64<", "vmulpd"),
+    ("strided_multilinear::simd::RowF32<", "vmulps"),
 ]
 
 LEVELS = [("V4", "zmm"), ("V3", "ymm")]

@@ -17,14 +17,14 @@
 //! both rows.
 //!
 //! ```text
-//! cargo bench --profile release -p strided-segpoly --bench executor
+//! cargo bench --profile release -p strided-multilinear --bench executor
 //! ```
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use strided_basic::{Exec, Pool, RawStridedMut, RawStridedRef, RunIndex, RunSumPlan};
-use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyPlan, Spec};
+use strided_multilinear::{IndexMode, Layout, Operation, Path, SegPolyPlan, Spec};
 
 /// Wall time one sample aims for, so every row is measured over the same span.
 const SAMPLE_TARGET: Duration = Duration::from_millis(20);

@@ -1,6 +1,7 @@
-# strided-segpoly
+# strided-multilinear
 
-Executor for **lowered segmented polynomials**: fused sparse gather, segment
+Executor for **cuEquivariance-style segmented polynomials**, i.e. **sparse
+multilinear forms**: fused sparse gather, segment
 product and accumulation over strided CPU buffers, with no per-edge intermediate.
 
 A segmented polynomial is `Σ_paths c · Π_operands x[segment]` — a sparse
@@ -57,7 +58,7 @@ A shared weight applied per segment (`y[b, s, :] += c_s · x[b, s, :] · w[0, s,
 
 ```rust
 use strided_basic::{Exec, RawStridedMut, RawStridedRef};
-use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyPlan, Spec};
+use strided_multilinear::{IndexMode, Layout, Operation, Path, SegPolyPlan, Spec};
 
 let (batch, segments, u) = (2usize, 2usize, 3usize);
 let x: Vec<f64> = (0..batch * segments * u).map(|i| i as f64).collect();
@@ -142,7 +143,7 @@ shared weight; it is a batch reduction and follows the same fixed order.
 
 ## Deliberately out of scope
 
-Building the descriptor from a polynomial (a separate `segpoly-desc` crate),
+Building the descriptor from a polynomial (a separate descriptor-lowering crate),
 element-indexed inputs (`REPEATED` / `indexed_linear`), half precision, CUDA, and
 shared partial products for degree 2-3 operands. Operations with four or more
 operands take the scalar per-lane loop (`shortcut:` in `plan/exec.rs`); one to

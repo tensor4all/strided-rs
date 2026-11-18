@@ -15,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use strided_basic::{Exec, RawStridedMut, RawStridedRef};
-use strided_segpoly::{IndexMode, SegPolyPlan};
+use strided_multilinear::{IndexMode, SegPolyPlan};
 
 #[allow(dead_code)] // each test binary uses a different part of the harness
 #[path = "support/mod.rs"]

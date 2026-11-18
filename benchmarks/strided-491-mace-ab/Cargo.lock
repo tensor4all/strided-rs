@@ -435,7 +435,7 @@ dependencies = [
  "llmlip",
  "rayon",
  "strided-basic",
- "strided-segpoly",
+ "strided-multilinear",
 ]
 
 [[package]]
@@ -726,6 +726,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "strided-multilinear"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "pulp",
+ "strided-basic",
+ "thiserror",
+]
+
+[[package]]
 name = "strided-perm"
 version = "0.15.0"
 dependencies = [
@@ -733,16 +743,6 @@ dependencies = [
  "thiserror",
  "threadteam",
  "tinyvec",
-]
-
-[[package]]
-name = "strided-segpoly"
-version = "0.1.0"
-dependencies = [
- "num-traits",
- "pulp",
- "strided-basic",
- "thiserror",
 ]
 
 [[package]]

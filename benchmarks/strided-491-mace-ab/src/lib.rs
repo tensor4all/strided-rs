@@ -1,4 +1,4 @@
-//! strided-rs#491: `strided-segpoly` against llmlip.rs on the MACE-MP-0b3
+//! strided-rs#491: `strided-multilinear` against llmlip.rs on the MACE-MP-0b3
 //! layer-1 CG forward and VJP, same descriptor, same graph, same inputs.
 
 pub mod cg;
