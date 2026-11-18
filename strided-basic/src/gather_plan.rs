@@ -1925,6 +1925,13 @@ impl ScatterPlan {
 
     /// Execute the prepared additive scatter traversal.
     ///
+    /// The accumulating combine is [`Add`]. For integer element types overflow
+    /// therefore panics in a build with overflow checks (debug/test) and wraps
+    /// in release, while the dtype-erased entry wraps in both. Callers that
+    /// need the wrapping contract in every profile can pass
+    /// `i32::wrapping_add` / `i64::wrapping_add` to
+    /// [`Self::execute_with_combine`].
+    ///
     /// # Errors
     ///
     /// Returns [`StridedError::PlanLayoutMismatch`] when the operand, index,
