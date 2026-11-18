@@ -207,6 +207,19 @@ sum (1.7e-15 -> 2.2e-15 relative to the scale at 128 atoms) and `f32` better (3.
 measurements, the per-cell before/after tables, the allocation evidence and the thread sweep are in
 [`docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md`](docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md).
 
+#### A register-resident accumulator chunk (#500)
+
+The dispatched row body keeps eight accumulator vectors in registers while it walks the paths of one segment, instead
+of loading and storing the accumulator once per path. The per-lane statement is unchanged -- still
+`((c·a_0)·a_1)·a_2` followed by one add, in path order, with no `mul_add` -- so the kernel remains bit-identical to
+the scalar loop and the scalar level is the same chunk with one-lane vectors. The change removes two of the five
+memory operations per path and vector, which is what the aarch64 NEON kernel (2 `f64` / 4 `f32` lanes) is bound by.
+On the Apple M5 Max the f32 4T VJP ratio against llmlip is 0.672 / 0.656 at 128 / 1024 atoms (the target was <= 1.0;
+the untuned floor was 0.775 / 0.786) and the x86-64 evo2 host is 1.30-1.51x faster on VJP than #499. The tests now
+run 137 lanes so every level exercises a full chunk, a partial chunk and the scalar remainder. Before/after tables,
+the host protocol and the raw campaigns are in
+[`docs/worklogs/2026-11-18-issue-500-aarch64-m5.md`](docs/worklogs/2026-11-18-issue-500-aarch64-m5.md).
+
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
 `index_order_into(strides, out)` writes the stride order into caller storage and returns `StrideLengthMismatch` when

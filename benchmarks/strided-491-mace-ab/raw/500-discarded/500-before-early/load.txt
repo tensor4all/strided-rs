@@ -1,0 +1,13 @@
+# load at campaign start 2026-11-18T00:58:55Z
+ 9:58  up 21 days,  4:16, 3 users, load averages: 2.48 2.93 3.35
+# top CPU consumers
+  PID  %CPU COMM
+ 3775  36.7 /Applications/Koushi.app/Contents/MacOS/koushi-desktop
+ 1007  18.9 /System/Library/PrivateFrameworks/UserNotificationsCore.framework/Support/usernotificationsd
+  739  13.4 /usr/libexec/sysmond
+49024  11.3 /System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor
+28738   7.9 gh
+28748   6.7 bash
+ 1010   4.8 /usr/sbin/usernoted
+# swap
+vm.swapusage: total = 6144.00M  used = 4733.12M  free = 1410.88M  (encrypted)

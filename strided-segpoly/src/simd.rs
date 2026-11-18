@@ -57,6 +57,20 @@ pub struct OpRow<'a, T> {
     pub splat_mask: u32,
 }
 
+/// SIMD vectors one accumulator chunk keeps in registers while the path loop
+/// runs. The per-path form loaded and stored `acc` once per path per vector; a
+/// chunk fetches the vectors once and walks every path inside them, so those
+/// loads and stores happen once per chunk instead of once per path. Eight
+/// vectors fit the register file of every level the dispatch can select (NEON,
+/// AVX2, AVX-512), and the remainder plus the scalar tail take the one-vector
+/// form, which keeps the same saving for a short run.
+///
+/// The arithmetic does not change: for every lane the accumulator starts at its
+/// current value and receives `((c * a_0) * a_1) * a_2` in path order, exactly
+/// the sequence the per-path form executed. Only the moment its value is fetched
+/// and written back moves.
+const CHUNK_VECTORS: usize = 8;
+
 struct RowF64<'a, const N: usize, const MASK: u8> {
     row: OpRow<'a, f64>,
 }
@@ -74,29 +88,15 @@ impl<const N: usize, const MASK: u8> WithSimd for RowF64<'_, N, MASK> {
                 continue;
             }
             let slots = &mut row.acc[segment * u..segment * u + u];
-            for local in start as usize..end as usize {
-                let coefficient = row.coeffs[local];
-                let path = &row.offsets[local * (N + 1)..local * (N + 1) + N];
-                let operands: [&[f64]; N] = core::array::from_fn(|t| {
-                    if MASK & (1 << t) == 0 {
-                        &[]
-                    } else {
-                        // SAFETY: the caller's contract; the operand is `u`
-                        // contiguous lanes from this path's segment base.
-                        unsafe { core::slice::from_raw_parts(row.bases[t].offset(path[t]), u) }
-                    }
-                });
-                let splats: [f64; N] = core::array::from_fn(|t| {
-                    if MASK & (1 << t) != 0 {
-                        0.0
-                    } else {
-                        // SAFETY: the caller's contract; a unit-lane operand reads
-                        // one element for the whole lane axis.
-                        unsafe { *row.bases[t].offset(path[t]) }
-                    }
-                });
-                axpy_f64::<N, MASK, S>(simd, slots, coefficient, operands, splats);
-            }
+            axpy_segment_f64::<N, MASK, S>(
+                simd,
+                slots,
+                row.coeffs,
+                row.offsets,
+                &row.bases,
+                start as usize,
+                end as usize,
+            );
         }
     }
 }
@@ -118,126 +118,239 @@ impl<const N: usize, const MASK: u8> WithSimd for RowF32<'_, N, MASK> {
                 continue;
             }
             let slots = &mut row.acc[segment * u..segment * u + u];
-            for local in start as usize..end as usize {
-                let coefficient = row.coeffs[local];
-                let path = &row.offsets[local * (N + 1)..local * (N + 1) + N];
-                let operands: [&[f32]; N] = core::array::from_fn(|t| {
-                    if MASK & (1 << t) == 0 {
-                        &[]
-                    } else {
-                        // SAFETY: as in `RowF64`.
-                        unsafe { core::slice::from_raw_parts(row.bases[t].offset(path[t]), u) }
-                    }
-                });
-                let splats: [f32; N] = core::array::from_fn(|t| {
-                    if MASK & (1 << t) != 0 {
-                        0.0
-                    } else {
-                        // SAFETY: as in `RowF64`.
-                        unsafe { *row.bases[t].offset(path[t]) }
-                    }
-                });
-                axpy_f32::<N, MASK, S>(simd, slots, coefficient, operands, splats);
-            }
+            axpy_segment_f32::<N, MASK, S>(
+                simd,
+                slots,
+                row.coeffs,
+                row.offsets,
+                &row.bases,
+                start as usize,
+                end as usize,
+            );
         }
     }
 }
 
-/// One path: `acc[i] = acc[i] + ((c * a0[i]) * a1[i]) * a2[i]` over the lanes.
+/// Sum one segment's paths into `acc`, keeping [`CHUNK_VECTORS`] vectors of the
+/// accumulator in registers while the path loop runs.
 ///
-/// The vector loop and the scalar remainder are the same statement, and neither
-/// uses `mul_add`: the rounding must not depend on the selected level.
+/// Per lane the statement is the scalar contract: start from the accumulator,
+/// then for every path in order add `((c * a_0) * a_1) * a_2`. Only when the
+/// accumulator is fetched and written back changes, so the result is bit
+/// identical to fetching it per path.
 #[inline(always)]
-fn axpy_f64<const N: usize, const MASK: u8, S: Simd>(
+fn axpy_segment_f64<const N: usize, const MASK: u8, S: Simd>(
     simd: S,
     acc: &mut [f64],
-    coefficient: f64,
-    operands: [&[f64]; N],
-    splats: [f64; N],
+    coeffs: &[f64],
+    offsets: &[isize],
+    bases: &[*const f64; MAX_INPUTS],
+    start: usize,
+    end: usize,
 ) {
-    let total = acc.len();
-    let (acc_head, acc_tail) = S::as_mut_simd_f64s(acc);
-    let lanes_in_head = total - acc_tail.len();
-    let head_coefficient = simd.splat_f64s(coefficient);
-    // Bit `t` of `MASK` is set when operand `t` is a lane slice; the mask is a
-    // const parameter, so one side of every branch below is dead and removed.
-    let head_splats: [S::f64s; N] = core::array::from_fn(|t| simd.splat_f64s(splats[t]));
-    let heads: [&[S::f64s]; N] = core::array::from_fn(|t| {
-        if MASK & (1 << t) == 0 {
-            &[]
-        } else {
-            S::as_simd_f64s(operands[t]).0
-        }
-    });
-    for (index, slot) in acc_head.iter_mut().enumerate() {
-        let mut value = head_coefficient;
-        for t in 0..N {
-            let operand = if MASK & (1 << t) == 0 {
-                head_splats[t]
-            } else {
-                heads[t][index]
-            };
-            value = simd.mul_f64s(value, operand);
-        }
-        *slot = simd.add_f64s(*slot, value);
+    let u = acc.len();
+    let (head, tail) = S::as_mut_simd_f64s(acc);
+    let full = head.len() / CHUNK_VECTORS * CHUNK_VECTORS;
+    let (groups, rest) = head.split_at_mut(full);
+
+    // The per-path values one vector slice of this path needs: the coefficient as
+    // a vector, each splat operand as a vector, and each slice operand as the
+    // `len` vectors starting at `index`. The mask is a const, so the unused side
+    // of every branch below is removed per instantiation.
+    macro_rules! path {
+        ($local:expr, $index:expr, $len:expr, $co:ident, $splats:ident, $heads:ident) => {
+            let path = &offsets[$local * (N + 1)..$local * (N + 1) + N];
+            let $co = simd.splat_f64s(coeffs[$local]);
+            let $splats: [S::f64s; N] = core::array::from_fn(|t| {
+                if MASK & (1 << t) != 0 {
+                    simd.splat_f64s(0.0)
+                } else {
+                    // SAFETY: the caller's contract; a unit-lane operand reads one
+                    // element for the whole lane axis.
+                    simd.splat_f64s(unsafe { *bases[t].offset(path[t]) })
+                }
+            });
+            let $heads: [&[S::f64s]; N] = core::array::from_fn(|t| {
+                if MASK & (1 << t) == 0 {
+                    &[]
+                } else {
+                    // SAFETY: the caller's contract; the operand is `u` contiguous
+                    // lanes from this path's segment base.
+                    let lanes = unsafe { core::slice::from_raw_parts(bases[t].offset(path[t]), u) };
+                    &S::as_simd_f64s(lanes).0[$index..$index + $len]
+                }
+            });
+        };
     }
-    for (index, slot) in acc_tail.iter_mut().enumerate() {
-        let mut value = coefficient;
-        for t in 0..N {
-            let operand = if MASK & (1 << t) == 0 {
-                splats[t]
-            } else {
-                operands[t][lanes_in_head + index]
-            };
-            value *= operand;
+
+    let (groups, _) = groups.as_chunks_mut::<CHUNK_VECTORS>();
+    for (chunk, group) in groups.iter_mut().enumerate() {
+        let index = chunk * CHUNK_VECTORS;
+        let mut accumulators: [S::f64s; CHUNK_VECTORS] = *group;
+        for local in start..end {
+            path!(local, index, CHUNK_VECTORS, coefficient, splats, heads);
+            for k in 0..CHUNK_VECTORS {
+                let mut value = coefficient;
+                for t in 0..N {
+                    let operand = if MASK & (1 << t) == 0 {
+                        splats[t]
+                    } else {
+                        heads[t][k]
+                    };
+                    value = simd.mul_f64s(value, operand);
+                }
+                accumulators[k] = simd.add_f64s(accumulators[k], value);
+            }
         }
-        *slot += value;
+        *group = accumulators;
+    }
+
+    // Fewer than `CHUNK_VECTORS` vectors remain: one register-resident
+    // accumulator per vector, the same saving over a short run.
+    for (offset, slot) in rest.iter_mut().enumerate() {
+        let index = full + offset;
+        let mut accumulator = *slot;
+        for local in start..end {
+            path!(local, index, 1, coefficient, splats, heads);
+            let mut value = coefficient;
+            for t in 0..N {
+                let operand = if MASK & (1 << t) == 0 {
+                    splats[t]
+                } else {
+                    heads[t][0]
+                };
+                value = simd.mul_f64s(value, operand);
+            }
+            accumulator = simd.add_f64s(accumulator, value);
+        }
+        *slot = accumulator;
+    }
+
+    // Lanes past the last whole vector, in increasing lane order.
+    let first_tail = u - tail.len();
+    for (offset, slot) in tail.iter_mut().enumerate() {
+        let lane = first_tail + offset;
+        let mut accumulator = *slot;
+        for local in start..end {
+            let path = &offsets[local * (N + 1)..local * (N + 1) + N];
+            let mut value = coeffs[local];
+            for t in 0..N {
+                let operand = if MASK & (1 << t) == 0 {
+                    // SAFETY: a unit-lane operand reads one element.
+                    unsafe { *bases[t].offset(path[t]) }
+                } else {
+                    // SAFETY: the lane is inside this path's `u` lanes.
+                    unsafe { *bases[t].offset(path[t] + lane as isize) }
+                };
+                value *= operand;
+            }
+            accumulator += value;
+        }
+        *slot = accumulator;
     }
 }
 
+/// The `f32` form of [`axpy_segment_f64`]; same statement, same chunking.
 #[inline(always)]
-fn axpy_f32<const N: usize, const MASK: u8, S: Simd>(
+fn axpy_segment_f32<const N: usize, const MASK: u8, S: Simd>(
     simd: S,
     acc: &mut [f32],
-    coefficient: f32,
-    operands: [&[f32]; N],
-    splats: [f32; N],
+    coeffs: &[f32],
+    offsets: &[isize],
+    bases: &[*const f32; MAX_INPUTS],
+    start: usize,
+    end: usize,
 ) {
-    let total = acc.len();
-    let (acc_head, acc_tail) = S::as_mut_simd_f32s(acc);
-    let lanes_in_head = total - acc_tail.len();
-    let head_coefficient = simd.splat_f32s(coefficient);
-    let head_splats: [S::f32s; N] = core::array::from_fn(|t| simd.splat_f32s(splats[t]));
-    let heads: [&[S::f32s]; N] = core::array::from_fn(|t| {
-        if MASK & (1 << t) == 0 {
-            &[]
-        } else {
-            S::as_simd_f32s(operands[t]).0
-        }
-    });
-    for (index, slot) in acc_head.iter_mut().enumerate() {
-        let mut value = head_coefficient;
-        for t in 0..N {
-            let operand = if MASK & (1 << t) == 0 {
-                head_splats[t]
-            } else {
-                heads[t][index]
-            };
-            value = simd.mul_f32s(value, operand);
-        }
-        *slot = simd.add_f32s(*slot, value);
+    let u = acc.len();
+    let (head, tail) = S::as_mut_simd_f32s(acc);
+    let full = head.len() / CHUNK_VECTORS * CHUNK_VECTORS;
+    let (groups, rest) = head.split_at_mut(full);
+
+    macro_rules! path {
+        ($local:expr, $index:expr, $len:expr, $co:ident, $splats:ident, $heads:ident) => {
+            let path = &offsets[$local * (N + 1)..$local * (N + 1) + N];
+            let $co = simd.splat_f32s(coeffs[$local]);
+            let $splats: [S::f32s; N] = core::array::from_fn(|t| {
+                if MASK & (1 << t) != 0 {
+                    simd.splat_f32s(0.0)
+                } else {
+                    // SAFETY: as in `axpy_segment_f64`.
+                    simd.splat_f32s(unsafe { *bases[t].offset(path[t]) })
+                }
+            });
+            let $heads: [&[S::f32s]; N] = core::array::from_fn(|t| {
+                if MASK & (1 << t) == 0 {
+                    &[]
+                } else {
+                    // SAFETY: as in `axpy_segment_f64`.
+                    let lanes = unsafe { core::slice::from_raw_parts(bases[t].offset(path[t]), u) };
+                    &S::as_simd_f32s(lanes).0[$index..$index + $len]
+                }
+            });
+        };
     }
-    for (index, slot) in acc_tail.iter_mut().enumerate() {
-        let mut value = coefficient;
-        for t in 0..N {
-            let operand = if MASK & (1 << t) == 0 {
-                splats[t]
-            } else {
-                operands[t][lanes_in_head + index]
-            };
-            value *= operand;
+
+    let (groups, _) = groups.as_chunks_mut::<CHUNK_VECTORS>();
+    for (chunk, group) in groups.iter_mut().enumerate() {
+        let index = chunk * CHUNK_VECTORS;
+        let mut accumulators: [S::f32s; CHUNK_VECTORS] = *group;
+        for local in start..end {
+            path!(local, index, CHUNK_VECTORS, coefficient, splats, heads);
+            for k in 0..CHUNK_VECTORS {
+                let mut value = coefficient;
+                for t in 0..N {
+                    let operand = if MASK & (1 << t) == 0 {
+                        splats[t]
+                    } else {
+                        heads[t][k]
+                    };
+                    value = simd.mul_f32s(value, operand);
+                }
+                accumulators[k] = simd.add_f32s(accumulators[k], value);
+            }
         }
-        *slot += value;
+        *group = accumulators;
+    }
+
+    for (offset, slot) in rest.iter_mut().enumerate() {
+        let index = full + offset;
+        let mut accumulator = *slot;
+        for local in start..end {
+            path!(local, index, 1, coefficient, splats, heads);
+            let mut value = coefficient;
+            for t in 0..N {
+                let operand = if MASK & (1 << t) == 0 {
+                    splats[t]
+                } else {
+                    heads[t][0]
+                };
+                value = simd.mul_f32s(value, operand);
+            }
+            accumulator = simd.add_f32s(accumulator, value);
+        }
+        *slot = accumulator;
+    }
+
+    let first_tail = u - tail.len();
+    for (offset, slot) in tail.iter_mut().enumerate() {
+        let lane = first_tail + offset;
+        let mut accumulator = *slot;
+        for local in start..end {
+            let path = &offsets[local * (N + 1)..local * (N + 1) + N];
+            let mut value = coeffs[local];
+            for t in 0..N {
+                let operand = if MASK & (1 << t) == 0 {
+                    // SAFETY: as in `axpy_segment_f64`.
+                    unsafe { *bases[t].offset(path[t]) }
+                } else {
+                    // SAFETY: as in `axpy_segment_f64`.
+                    unsafe { *bases[t].offset(path[t] + lane as isize) }
+                };
+                value *= operand;
+            }
+            accumulator += value;
+        }
+        *slot = accumulator;
     }
 }
 

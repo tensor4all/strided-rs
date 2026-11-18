@@ -15,14 +15,43 @@ ONE=4          # 1T cell
 FOUR=4,5,6,7   # 4T cell: physical cores 4-7, same index3 cache
 OBSERVER=8-15,24-31
 
+# CPU affinity is a Linux facility. macOS has no per-thread core binding, so on
+# a host without `taskset` the same cells run unpinned and the log says so; the
+# thread counts still fix the work each side is allowed to open. Set PIN=1 to
+# require pins (a missing `taskset` then fails), PIN=0 to run unpinned anywhere.
+PIN=${PIN:-auto}
+if [ "$PIN" = auto ]; then
+  if command -v taskset >/dev/null 2>&1; then PIN=1; else PIN=0; fi
+fi
+run_pinned() {
+  cpus=$1
+  shift
+  if [ "$PIN" = 1 ]; then
+    taskset -c "$cpus" "$@"
+  else
+    "$@"
+  fi
+}
+# BSD `date` (macOS) has no -I, and the transcript is read by humans only.
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# A cell that allocates a gigabyte (the 1024-atom VJP) leaves the OS reclaiming
+# memory after the process exits, and the next process starts ~20 % slow on
+# macOS (measured: an anchor right after that cell is 16.2 ms instead of 13.4,
+# and recovers after 5 s). Linux did not show it, so the delay defaults to 0 and
+# the M5 campaign runs with SETTLE=5; it also gives the fan a moment between
+# cells. A zero keeps the evo2 transcript identical to #493/#498.
+SETTLE=${SETTLE:-0}
+settle() { if [ "$SETTLE" -gt 0 ]; then sleep "$SETTLE"; fi; }
+
 # Drift guard: the same anchor cell at both ends of the campaign has to agree
 # within 15 %, otherwise the run measured a changing machine and is worthless.
 anchor() {
-  taskset -c "$ONE" "$BIN" --cell cg-fwd --dtype f64 --threads 1 --atoms 128 \
+  settle
+  run_pinned "$ONE" "$BIN" --cell cg-fwd --dtype f64 --threads 1 --atoms 128 \
     --samples 15 --target-ms 20 2>/dev/null
 }
 
-echo "=== anchor start $(date -Is) cpus=$ONE" >> "$log"
+echo "=== anchor start $(now) cpus=$ONE pin=$PIN settle=$SETTLE" >> "$log"
 start=$(anchor)
 echo "$start" >> "$log"
 if [ -z "$start" ]; then echo "=== FAILED anchor start" >> "$log"; exit 1; fi
@@ -34,8 +63,9 @@ for atoms in 128 1024; do
       for cell in cg-fwd cg-vjp; do
         cpus="$ONE"
         [ "$threads" = 4 ] && cpus="$FOUR"
-        echo "=== $cell $dtype ${threads}T atoms=$atoms cpus=$cpus $(date -Is)" >> "$log"
-        if ! taskset -c "$cpus" "$BIN" --cell "$cell" --dtype "$dtype" \
+        echo "=== $cell $dtype ${threads}T atoms=$atoms cpus=$cpus $(now)" >> "$log"
+        settle
+        if ! run_pinned "$cpus" "$BIN" --cell "$cell" --dtype "$dtype" \
           --threads "$threads" --atoms "$atoms" --samples 15 --raw-dir "$OUT" \
           >> "$log" 2>&1; then
           echo "FAILED $cell $dtype $threads $atoms" >> "$log"
@@ -46,7 +76,7 @@ for atoms in 128 1024; do
   done
 done
 
-echo "=== anchor end $(date -Is) cpus=$ONE" >> "$log"
+echo "=== anchor end $(now) cpus=$ONE pin=$PIN settle=$SETTLE" >> "$log"
 finish=$(anchor)
 echo "$finish" >> "$log"
 if [ -z "$finish" ]; then echo "=== FAILED anchor end" >> "$log"; exit 1; fi
@@ -69,11 +99,11 @@ drift_ok=$?
 # A record that is missing or a cell that died makes the run worthless even when
 # the anchors agree, so the exit status has to carry both.
 if [ $drift_ok -ne 0 ]; then
-  echo "=== FAILED drift $(date -Is)" >> "$log"
+  echo "=== FAILED drift $(now)" >> "$log"
   exit 1
 fi
 if [ $failed -ne 0 ]; then
-  echo "=== FAILED cells $(date -Is)" >> "$log"
+  echo "=== FAILED cells $(now)" >> "$log"
   exit 1
 fi
-echo "=== done $(date -Is)" >> "$log"
+echo "=== done $(now)" >> "$log"

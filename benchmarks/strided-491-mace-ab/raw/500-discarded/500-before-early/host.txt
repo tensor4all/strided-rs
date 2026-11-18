@@ -1,0 +1,10 @@
+host: Apple M5 Max (Mac17,6), 18 cores (6 super + 12 performance), 128 GB
+kernel: Darwin 25.6.0 (macOS 26.7.2, build 25G332)
+model: Mac17,6, hw.ncpu=18, perflevel0=6, perflevel1=12
+rustc: rustc 1.100.0 (0ef1bc386 2026-11-09) binary: rustc commit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a commit-date: 2026-11-09 host: aarch64-apple-darwin release: 1.100.0 LLVM version: 23.1.5 
+build: baseline aarch64-apple-darwin, no -C target-cpu=native; pulp runtime dispatch picks NEON (2 f64 / 4 f32 lanes, recorded per cell)
+CPU affinity: macOS has no per-thread core binding and no taskset; campaign.sh auto-detected PIN=0, so cells ran unpinned on the OS scheduler (1T = 1 pool/rayon thread, 4T = 4). The observer (campaign shell, agent) was not pinned either; this is the aarch64 protocol difference from the evo2 runs, stated rather than papered over.
+power:  standby              1  Sleep On Power Button 1  powermode            0 
+thermal: Note: No thermal warning level has been recorded Note: No performance warning level has been recorded Note: No CPU power status has been recorded 
+L3/caches: no index3 shared_cpu_list on macOS; 131072 B L1i, 65536 B L1d, 8388608 B L2 (sysctl hw.l2cachesize)
+note: powermode stayed 0 (automatic); the OS reports no thermal or performance warning before or after the run.

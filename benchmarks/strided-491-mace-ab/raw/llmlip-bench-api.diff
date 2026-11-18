@@ -23,22 +23,12 @@ index 7a124ed..67f14a5 100644
  use e3nn_core::{CoreError, Result};
  #[cfg(feature = "parallel")]
  use rayon::prelude::*;
-diff --git a/crates/llmlip/src/mace_lite.rs b/crates/llmlip/src/mace_lite.rs
-index 3f769a1..7113f64 100644
---- a/crates/llmlip/src/mace_lite.rs
-+++ b/crates/llmlip/src/mace_lite.rs
-@@ -40,6 +40,9 @@ use serde::Deserialize;
- use serde_json::Value;
- use thiserror::Error;
- 
-+#[cfg(feature = "bench-api")]
-+pub mod bench_api;
-+
- #[cfg(all(feature = "apple-metal", target_os = "macos"))]
- mod metal;
- 
+diff --git a/crates/llmlip/src/mace/bench_api.rs b/crates/llmlip/src/mace/bench_api.rs
+new file mode 100644
+index 0000000..dd6c8ee
 --- /dev/null
 +++ b/crates/llmlip/src/mace/bench_api.rs
+@@ -0,0 +1,47 @@
 +//! Benchmark-only accessor for the scalar symmetric-contraction entry lists.
 +//!
 +//! Added for the strided-rs#491 A/B and **never enabled by default**. It adds no
@@ -86,8 +76,26 @@ index 3f769a1..7113f64 100644
 +            .collect(),
 +    })
 +}
+diff --git a/crates/llmlip/src/mace_lite.rs b/crates/llmlip/src/mace_lite.rs
+index 3f769a1..7113f64 100644
+--- a/crates/llmlip/src/mace_lite.rs
++++ b/crates/llmlip/src/mace_lite.rs
+@@ -40,6 +40,9 @@ use serde::Deserialize;
+ use serde_json::Value;
+ use thiserror::Error;
+ 
++#[cfg(feature = "bench-api")]
++pub mod bench_api;
++
+ #[cfg(all(feature = "apple-metal", target_os = "macos"))]
+ mod metal;
+ 
+diff --git a/crates/llmlip/src/mace_lite/bench_api.rs b/crates/llmlip/src/mace_lite/bench_api.rs
+new file mode 100644
+index 0000000..7cbe041
 --- /dev/null
 +++ b/crates/llmlip/src/mace_lite/bench_api.rs
+@@ -0,0 +1,340 @@
 +//! Benchmark-only accessors for the layer-1 `conv_tp` (CG message) kernel.
 +//!
 +//! Added for the strided-rs#491 A/B and **never enabled by default**: it is

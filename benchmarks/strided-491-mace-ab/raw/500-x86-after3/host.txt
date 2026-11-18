@@ -1,0 +1,13 @@
+# The #491/#496/#498 host, as raw/host.txt describes it:
+host: AMD Ryzen AI MAX+ 395 (Strix Halo), 32 logical CPUs, 16 cores
+kernel: Linux 7.0.0-42-generic
+rustc: 1.100.0, x86_64-unknown-linux-gnu, release build, no target-cpu
+pins: measured cell 1T -> cpu 4, 4T -> cpus 4,5,6,7 (index3/cache0 = 0-7,16-23);
+      observer/campaign -> 8-15,24-31; boost on, governor performance (unchanged
+      from #498).
+protocol: --samples 15 --target-ms 20, one process per cell, round-robin sides;
+          SETTLE=0 (the default; the macOS reclamation effect did not appear here).
+anchors (raw/500-x86-after3/campaign.txt): strided 16.6 -> 17.7 ms (6.2 %),
+          llmlip 77.8 -> 77.9 ms (0.2 %), inside the 15 % guard.
+runtime ISA: pulp chose f64 8 / f32 16 lanes; scripts/check-runtime-simd-dispatch.py
+          printed "ok: 9 dispatched bodies reach AVX2 and AVX-512".

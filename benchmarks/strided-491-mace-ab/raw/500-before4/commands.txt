@@ -1,0 +1,18 @@
+# Host: Apple M5 Max (aarch64-apple-darwin), macOS 26.7.2, rustc 1.100.0.
+# Baseline library = main dcdf3f0 in /tmp/strided-mlp-before (same harness files:
+# the portable campaign.sh, measure.rs and Cargo.toml copied from the branch so
+# both campaigns use one protocol; the crate sources are main's).
+cd /tmp/llmlip.rs
+git checkout 6bfb041
+git apply /tmp/strided-mlp/benchmarks/strided-491-mace-ab/raw/llmlip-bench-api.diff
+cargo build --release -p llmlip --features parallel,bench-api
+
+cd /tmp/strided-mlp-before/benchmarks/strided-491-mace-ab
+cargo build --release
+OUT=raw/500-before4 SETTLE=5 \
+  BIN=/tmp/strided-mlp-before/benchmarks/strided-491-mace-ab/target/release/mace-ab \
+  caffeinate -i ./campaign.sh
+
+# One cell, the shape of every row (no affinity on macOS; PIN=0 is automatic):
+target/release/mace-ab --cell cg-vjp --dtype f32 --threads 4 --atoms 1024 \
+  --samples 15 --target-ms 20

@@ -22,7 +22,7 @@ A leaf loop runs inside `pulp::Arch::new().dispatch(...)`. pulp compiles the dis
 per level (`V4` = AVX-512, `V3` = AVX2/FMA, scalar; NEON on aarch64), each inside a function with
 those target features enabled, and picks one at run time. `Arch::new()` caches the detection.
 The workspace enables pulp's `x86-v4` feature. AVX-512 target features are stable since Rust 1.89.
-The loop bodies stay unchanged, and LLVM auto-vectorizes them at the dispatched level.
+The loop bodies are ordinary Rust loops, and LLVM auto-vectorizes them at the dispatched level.
 
 - Dispatch once per leaf call, outside the element loop: `strided_basic::simd::dispatch_if_large`
   per contiguous run in `map_view`, `ops_view`, `update_view` and the reduce kernels, one dispatch
@@ -30,6 +30,11 @@ The loop bodies stay unchanged, and LLVM auto-vectorizes them at the dispatched 
   group in `strided-nn`, and one per **operation row** in `strided-segpoly` -- a row runs every
   path of its operation, so the layer-1 VJP's 86 paths × 3 gradients are 6 dispatches, not 258
   (tensor4all/strided-rs#498; per-path dispatch was 1.5-1.7x on that cell).
+- A body may keep more than one vector of an accumulator in registers while an inner loop runs;
+  the loop structure is the body's business as long as each lane's operation order is unchanged.
+  `strided-segpoly`'s row body keeps eight accumulator vectors across its path loop
+  (tensor4all/strided-rs#500), which removes two memory operations per path and vector without
+  changing the per-lane rounding sequence.
 - The dispatched body must be inlined into pulp's target-feature function, or it keeps the build
   target's instructions. pulp calls a closure through a plain call. A small closure (one loop) is
   inlined, but a large one is not (see the note on `map_contiguous`, tensor4all/strided-rs#301).
