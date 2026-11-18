@@ -35,11 +35,12 @@ run_pinned() {
 # BSD `date` (macOS) has no -I, and the transcript is read by humans only.
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # A cell that allocates a gigabyte (the 1024-atom VJP) leaves the OS reclaiming
-# memory after the process exits, and the next process starts ~20 % slow on
-# macOS (measured: an anchor right after that cell is 16.2 ms instead of 13.4,
-# and recovers after 5 s). Linux did not show it, so the delay defaults to 0 and
-# the M5 campaign runs with SETTLE=5; it also gives the fan a moment between
-# cells. A zero keeps the evo2 transcript identical to #493/#498.
+# memory after the process exits. The three no-pause campaigns on the M5 ended
+# with the 1T f64 anchor 19.8-26.3 % slow (13.7-18.0 ms against 11.0-13.5 ms at
+# the start); with SETTLE=5 the accepted pair's anchors moved 1.3 % and
+# 1.7-2.0 %. Linux did not show it, so the delay defaults to 0 and the M5 runs
+# set SETTLE=5; it also gives the fan a moment between cells. A zero keeps the
+# evo2 transcript identical to #493/#498.
 SETTLE=${SETTLE:-0}
 settle() { if [ "$SETTLE" -gt 0 ]; then sleep "$SETTLE"; fi; }
 

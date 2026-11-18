@@ -76,8 +76,10 @@ overwriting it.
   scheduled on either core class, so read the within-cell ratio and the anchor
   guard, not a single absolute 4T figure. The M5 runs also use `SETTLE=5`
   (seconds before each cell and anchor): a 1024-atom VJP process leaves ~1.5 GiB
-  being reclaimed and the next process starts ~20 % slow on macOS. Both default
-  to the Linux behaviour (`PIN=auto`, `SETTLE=0`).
+  being reclaimed, and the three no-pause campaigns ended with the 1T f64 anchor
+  19.8-26.3 % slow; with the pause the accepted pair's anchors moved 1.3 % and
+  1.7-2.0 % (see `raw/500-discarded/`). Both settings default to the Linux
+  behaviour (`PIN=auto`, `SETTLE=0`).
 * **Thread count, not affinity, on both sides.** llmlip dispatches through
   rayon's global pool, so `main.rs` pins that pool to `--threads`; otherwise
   "1T" would be 32 threads on one core and llmlip's 4T scaling would look

@@ -21,8 +21,10 @@ Checked against `docs/worklogs/2026-11-18-issue-500-aarch64-m5.md`:
   the bar is 200 and not 0;
 * that every campaign.txt the checker opens holds 18 records and no FAILED line
   (a failed-drift transcript must never pass);
-* that the target, per-plan, repeat and anchor parsers each matched a nonzero
-  number of rows (an empty section is a failure, not a vacuous pass);
+* that every parser (table, target, per-plan, repeat, anchor) matched a nonzero
+  number of rows and that the allocation and agreement walks saw at least one
+  record (a tree with a campaign.txt but no per-cell jsonl must fail, not print
+  zero rows and exit 0);
 * that every llmlip-agreement figure is inside the bars the worklog states
   (f64 <= 1e-14, f32 <= 1e-5, scale-relative).
 
@@ -199,6 +201,8 @@ def check_table(
         close(f"{label} {key} speedup", float(match.group(10)), strided_ms(rb) / strided_ms(ra), 6e-3, bad)
         checked += 1
     expected = {key for key in after if key[0] == cell}
+    if checked == 0:
+        bad.append(f"{label}: no table rows matched")
     if seen != expected:
         bad.append(f"{label}: table keys {sorted(seen)} != records {sorted(expected)}")
     return checked
@@ -247,7 +251,10 @@ def check_repeats(text: str, bad: list[str]) -> int:
         for index, key in enumerate(keys):
             ratio = float(match.group(2 + 2 * index))
             median = float(match.group(3 + 2 * index))
-            record = records[n][key]
+            record = records[n].get(key)
+            if record is None:
+                bad.append(f"repeat after{n} {key}: missing record")
+                continue
             close(f"repeat after{n} {key} ratio", ratio, record["ratio"], RATIO_TOLERANCE, bad)
             close(
                 f"repeat after{n} {key} median",
@@ -268,6 +275,9 @@ def check_targets(text: str, after: dict, bad: list[str]) -> int:
     for match in TARGET_ROW.finditer(section(text, "## 1. Targets", "The f32 4T target")):
         atoms = int(match.group(2))
         key = ("cg-vjp", "f32", 4, atoms)
+        if key not in after:
+            bad.append(f"target {atoms}: missing record")
+            continue
         close(f"target {atoms} ratio", float(match.group(3)), after[key]["ratio"], RATIO_TOLERANCE, bad)
         strided = [rep[key]["timings"]["strided_total_ns"] / 1e6 for rep in reps]
         llmlip = [llmlip_ms(rep[key]) for rep in reps]
@@ -333,6 +343,8 @@ def check_allocation(bad: list[str]) -> int:
                         f"{raw_dir} {key}: {side['alloc_calls_per_call']:.3f} calls/call"
                     )
                 checked += 1
+    if checked == 0:
+        bad.append("allocation: no timed strided records checked")
     return checked
 
 
@@ -359,6 +371,8 @@ def check_agreement(bad: list[str]) -> int:
                 if value > bar:
                     bad.append(f"{raw_dir} {key}: agreement {value:g} > {bar:g}")
             checked += len(values)
+    if checked == 0:
+        bad.append("agreement: no llmlip-agreement figures checked")
     return checked
 
 

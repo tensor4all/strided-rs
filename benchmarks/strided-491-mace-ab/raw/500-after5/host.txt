@@ -16,13 +16,12 @@ CPU affinity is unavailable on macOS: campaign.sh auto-detects PIN=0 and runs th
 was therefore not pinned either. Both campaigns passed the anchor guard with
 SETTLE=5 (before: strided 13.5 -> 13.3 ms / 1.3 %, llmlip 44.4 -> 44.3 / 0.1 %;
 after: strided 10.8 -> 10.8 / 0.3 %, llmlip 44.5 -> 44.4 / 0.2 %).
-SETTLE=5 is a macOS-only measurement fix: a 1024-atom VJP cell leaves ~1.5 GiB
-being reclaimed and the next process starts ~20 % slow; a 5 s pause removes it
-(measured: 16.2 -> 13.4 ms for the 1T f64 anchor). Discarded attempts are in
-raw/500-discarded/ with the reason in the worklog: two runs failed the 15 % anchor
-guard when the end anchor followed the 1024-atom VJP with no pause, and one ran
-while a co-tenant (Koushi 60 %, UserNotificationsCore 30 %) was active.
-Co-tenants were present in the accepted runs too (Koushi 40-60 % of one core
-intermittently); the per-cell round-robin and the anchors are what make the
-reported pair comparable. Absolute 1T numbers are the boost-clock numbers; the
-4T cells are ~3.6-3.9x the 1T ones, i.e. all-core clock, not a 4x.
+SETTLE=5 is a macOS-only protocol change: a 1024-atom VJP cell leaves ~1.5 GiB
+being reclaimed, and the three no-pause campaigns ended with the 1T f64 anchor
+19.8-26.3 % slow (13.7-18.0 ms against 11.0-13.5 ms at the start); the accepted
+pair's anchors moved 1.3 % and 1.7-2.0 %. raw/500-discarded/ holds six
+non-accepted directories with the reason in its README (three drift-failed, two
+co-tenant repeats, one orphan baseline). The accepted load.txt files record only
+the load average (4.12 / 3.90 / 3.78 before, 3.37 / 4.40 / 4.50 after), not
+per-process CPU. Absolute 1T numbers are the boost-clock numbers; the 4T cells
+are ~3.6-3.9x the 1T ones, i.e. all-core clock, not a 4x.
