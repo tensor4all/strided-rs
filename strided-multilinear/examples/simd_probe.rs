@@ -1,14 +1,14 @@
 //! Probe for `scripts/check-runtime-simd-dispatch.py` (tensor4all/strided-rs#496).
 //!
 //! It runs one representative lane body of each runtime-dispatched SIMD path in
-//! `strided_segpoly::simd`: the `f64` body of a plan whose operand lanes are
+//! `strided_multilinear::simd`: the `f64` body of a plan whose operand lanes are
 //! contiguous, and the `f32` body of a plan whose operand lanes are strided (so
 //! the replay packs them first). A baseline release build (no `-C target-cpu`)
 //! must hold AVX2 and AVX-512 versions of each body; the script checks that in
 //! the disassembly. Running the binary only checks the results.
 
 use strided_basic::{Exec, RawStridedMut, RawStridedRef};
-use strided_segpoly::{
+use strided_multilinear::{
     lane_width, IndexMode, Layout, Operation, Path, SegPolyElem, SegPolyPlan, Spec,
 };
 

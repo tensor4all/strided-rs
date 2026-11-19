@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the `strided-segpoly` fixtures from cuEquivariance.
+"""Generate the `strided-multilinear` fixtures from cuEquivariance.
 
 Pinned to NVIDIA/cuEquivariance `9ed8c7613a79861415071027249cc458e423be30`
 (Apache-2.0). Neither the descriptors nor the numbers in `tests/fixtures/` are

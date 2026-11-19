@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 strided-basic = { path = "../../strided-basic", default-features = false }
-strided-segpoly = { path = "../../strided-segpoly", default-features = false }
+strided-multilinear = { path = "../../strided-multilinear", default-features = false }
 llmlip = { path = "../../../llmlip.rs/crates/llmlip", default-features = false, features = [
     "parallel",
     "bench-api",

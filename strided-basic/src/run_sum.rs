@@ -46,7 +46,7 @@
 //! # Not in this plan
 //!
 //! This module is the typed side only: the dtype-erased replay does not exist, and
-//! no consumer of [#479] needs one. `strided-segpoly` reads the same `RunIndex`
+//! no consumer of [#479] needs one. `strided-multilinear` reads the same `RunIndex`
 //! for its scattered outputs and runs its own payload walk, so a third copy of
 //! this plan that erases `T` would add a code path nothing calls.
 //!

@@ -6,7 +6,7 @@
 
 use strided_basic::StridedError;
 
-/// A `strided-segpoly` call whose descriptor, layouts or scratch violate the
+/// A `strided-multilinear` call whose descriptor, layouts or scratch violate the
 /// plan's contract.
 #[derive(Debug, thiserror::Error)]
 pub enum SegPolyError {

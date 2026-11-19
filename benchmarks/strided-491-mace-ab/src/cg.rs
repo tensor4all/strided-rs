@@ -1,10 +1,10 @@
 //! The layer-1 `conv_tp` (CG message) A/B: llmlip's fused kernel against
-//! `strided-segpoly` executing the same descriptor.
+//! `strided-multilinear` executing the same descriptor.
 //!
 //! Layouts. llmlip addresses a row as `base + feature*component_dim + m`
 //! (`mace_lite.rs:34416-34519`, `:36078-36082`), i.e.
 //! `in1 = [0e: 128 scalars][1o: 128 vectors]`, `out = [block][feature][m]`.
-//! `strided-segpoly` needs `[batch, num_segments, u]` with one stride per axis,
+//! `strided-multilinear` needs `[batch, num_segments, u]` with one stride per axis,
 //! so the strided side views the same buffers with `u = 128 features`:
 //!
 //! | buffer | dims | strides | llmlip memory |
@@ -22,7 +22,7 @@ use std::cell::RefCell;
 
 use llmlip::mace_lite::bench_api::{self, Layer1Descriptor, Layer1Plan};
 use strided_basic::{Exec, Pool, RawStridedMut, RawStridedRef, RunIndex};
-use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyElem, SegPolyPlan, Spec};
+use strided_multilinear::{IndexMode, Layout, Operation, Path, SegPolyElem, SegPolyPlan, Spec};
 
 use crate::topo::Topology;
 
@@ -264,7 +264,7 @@ impl<T: Scalar> Cg<T> {
                 &mut self.fwd_scratch.borrow_mut(),
                 exec,
             )
-            .map_err(|error| format!("segpoly fwd: {error}"))
+            .map_err(|error| format!("multilinear fwd: {error}"))
     }
 
     pub fn strided_vjp_x(
@@ -310,7 +310,7 @@ impl<T: Scalar> Cg<T> {
                 &mut self.vjp_x_scratch.borrow_mut(),
                 exec,
             )
-            .map_err(|error| format!("segpoly vjp-x: {error}"))
+            .map_err(|error| format!("multilinear vjp-x: {error}"))
     }
 
     pub fn strided_vjp_w(
@@ -354,7 +354,7 @@ impl<T: Scalar> Cg<T> {
                 &mut self.vjp_w_scratch.borrow_mut(),
                 exec,
             )
-            .map_err(|error| format!("segpoly vjp-w: {error}"))
+            .map_err(|error| format!("multilinear vjp-w: {error}"))
     }
 
     pub fn strided_vjp_y(
@@ -398,7 +398,7 @@ impl<T: Scalar> Cg<T> {
                 &mut self.vjp_y_scratch.borrow_mut(),
                 exec,
             )
-            .map_err(|error| format!("segpoly vjp-y: {error}"))
+            .map_err(|error| format!("multilinear vjp-y: {error}"))
     }
 
     /// All three VJP gradients in one call: the fused plan walks the edges once
@@ -471,7 +471,7 @@ impl<T: Scalar> Cg<T> {
                 &mut self.vjp_fused_scratch.borrow_mut(),
                 exec,
             )
-            .map_err(|error| format!("segpoly vjp fused: {error}"))
+            .map_err(|error| format!("multilinear vjp fused: {error}"))
     }
 }
 

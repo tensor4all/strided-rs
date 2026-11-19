@@ -6,7 +6,7 @@ members = [
     "strided-traits",
     "strided-view",
     "strided-perm",
-    "strided-segpoly",
+    "strided-multilinear",
     "strided-kernel",
 ]
 resolver = "2"

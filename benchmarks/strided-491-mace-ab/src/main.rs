@@ -118,8 +118,8 @@ fn run<T: Scalar>(args: &Args) -> Result<(), String> {
             .map(|block| block.cg.len() * cg.feature_dim())
             .sum::<usize>(),
         cg.desc.blocks.iter().map(|block| block.cg.len()).sum::<usize>(),
-        strided_segpoly::lane_width::<f32>(),
-        strided_segpoly::lane_width::<f64>(),
+        strided_multilinear::lane_width::<f32>(),
+        strided_multilinear::lane_width::<f64>(),
         args.samples,
         args.target_ms,
     );

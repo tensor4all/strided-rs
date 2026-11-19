@@ -14,7 +14,7 @@
 mod support;
 
 use strided_basic::{Exec, RawStridedMut, RawStridedRef};
-use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyError, SegPolyPlan, Spec};
+use strided_multilinear::{IndexMode, Layout, Operation, Path, SegPolyError, SegPolyPlan, Spec};
 use support::{assert_close, Buffer, Case, Mode, Op, PathSpec};
 
 /// Deterministic payload with mixed magnitudes, so regrouping a sum moves the
@@ -189,7 +189,7 @@ fn execute_acc_adds_the_destination_once_per_unit() {
 
     let plan = case.compile().expect("the case compiles");
     assert!(
-        batch > 2 * strided_segpoly::BLOCK_ROWS,
+        batch > 2 * strided_multilinear::BLOCK_ROWS,
         "more than two blocks"
     );
 
@@ -316,12 +316,12 @@ fn an_operation_may_not_hold_more_operands_than_the_replay_tables() {
     // `MAX_INPUTS` bounds the replay's stack arrays per *operand*, not per distinct
     // buffer, so one input repeated past the capacity has to be rejected.
     let mut case = weight_times_input(2, 1, 1, Mode::Batched, 2);
-    let mut operands = vec![1u32; strided_segpoly::MAX_INPUTS + 1];
+    let mut operands = vec![1u32; strided_multilinear::MAX_INPUTS + 1];
     operands.push(2);
     case.ops = vec![Op {
         buffers: operands,
         paths: vec![PathSpec {
-            segments: vec![0; strided_segpoly::MAX_INPUTS + 2],
+            segments: vec![0; strided_multilinear::MAX_INPUTS + 2],
             coefficient: 1.0,
         }],
     }];
@@ -401,25 +401,25 @@ fn an_f32_plan_rounds_the_coefficient_at_compile_time() {
     let strides = [1isize, 1, 1];
     let input = [2.0f32];
     let mut output = [0.0f32];
-    let operations = [strided_segpoly::Operation {
+    let operations = [strided_multilinear::Operation {
         buffers: &[0, 1],
         path_start: 0,
         num_paths: 1,
     }];
     let segments = [0u32; 2];
-    let paths = [strided_segpoly::Path {
+    let paths = [strided_multilinear::Path {
         segments: &segments,
         coefficient,
     }];
     let batched = [IndexMode::Batched];
     let indexes: [&[IndexMode<'_>]; 2] = [&batched, &batched];
-    let spec = strided_segpoly::Spec {
+    let spec = strided_multilinear::Spec {
         num_batch_axes: 1,
         operations: &operations,
         paths: &paths,
         indexes: &indexes,
     };
-    let layouts = [strided_segpoly::Layout {
+    let layouts = [strided_multilinear::Layout {
         dims: &dims,
         strides: &strides,
     }; 2];

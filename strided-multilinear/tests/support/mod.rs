@@ -1,5 +1,5 @@
 //! Case builder, the naive reference and view plumbing shared by the
-//! `strided-segpoly` integration tests.
+//! `strided-multilinear` integration tests.
 //!
 //! A [`Case`] owns everything a call needs — buffer shapes, data, index modes and
 //! the descriptor — so a test can build the `Spec` ([`Case::with_spec`]) and
@@ -9,7 +9,7 @@
 pub mod npy;
 
 use strided_basic::{Exec, RawStridedMut, RawStridedRef, RunIndex};
-use strided_segpoly::{IndexMode, Layout, Operation, Path, SegPolyError, SegPolyPlan, Spec};
+use strided_multilinear::{IndexMode, Layout, Operation, Path, SegPolyError, SegPolyPlan, Spec};
 
 /// A buffer's batch-axis mode, carrying the index data it needs.
 #[derive(Clone, Debug)]

@@ -1,6 +1,6 @@
 # `strided-491-mace-ab` — A/B harness for strided-rs#491
 
-Compares `strided-segpoly` with `mizukami-group/llmlip.rs` on the MACE-MP-0b3
+Compares `strided-multilinear` with `mizukami-group/llmlip.rs` on the MACE-MP-0b3
 layer-1 tensor-product block (`conv_tp`: CG forward + VJP), the hotspot reported
 in [tensor4all/tenferro-rs#2412](https://github.com/tensor4all/tenferro-rs/issues/2412).
 The report with numbers is
@@ -15,7 +15,7 @@ it and it cannot affect a released artifact.
 | path | what it is |
 | --- | --- |
 | `src/topo.rs` | diamond-Si supercells (128 / 1024 atoms) and llmlip's neighbour list |
-| `src/cg.rs` | the layer-1 descriptor, the five segpoly plans (`fwd`, the three split VJPs, the one-pass VJP), both sides' call sites |
+| `src/cg.rs` | the layer-1 descriptor, the five multilinear plans (`fwd`, the three split VJPs, the one-pass VJP), both sides' call sites |
 | `src/lib.rs` | shared buffers, sequence-valued inputs, comparison helpers |
 | `src/measure.rs` | counting allocator, `VmHWM`, warmup + median-of-15 |
 | `src/main.rs` | one cell per process: `--cell cg-fwd\|cg-vjp --dtype f32\|f64 --threads N --atoms 128\|1024` |
@@ -42,7 +42,7 @@ cargo build --release -p llmlip --features parallel,bench-api
 lives elsewhere. The committed `raw/llmlip-bench-api.diff` used to be malformed
 (its two new files had no `diff --git`/`new file mode`/`@@ -0,0 +1,N @@`
 headers, so `git apply` silently skipped them); it is valid as of #500 and
-`git apply --check` on a clean `6bfb041` checkout is the gate. `strided-basic` / `strided-segpoly` are path deps on the parent
+`git apply --check` on a clean `6bfb041` checkout is the gate. `strided-basic` / `strided-multilinear` are path deps on the parent
 repo, so this harness always measures the tree it sits in.
 
 ## Running

@@ -18,7 +18,7 @@ mod support;
 // `cases.rs` imports the harness types it builds, `assert_close` included.
 
 use strided_basic::{Exec, RawStridedMut, RawStridedRef};
-use strided_segpoly::{IndexMode, SegPolyError};
+use strided_multilinear::{IndexMode, SegPolyError};
 
 include!("fixtures/cases.rs");
 
