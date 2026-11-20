@@ -220,12 +220,15 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static, S: Store<
             }
             // Rank 0: one element, nothing to split.
             ExecMode::Scalar => execute_serial::<T, S>(src, dst, plan),
-            // Rootless grouped tile: every axis of extent > 1 is inside
-            // `group_a` or `group_b` (plan.rs:293-307), so the whole copy is one
-            // tile. Each group is capped near `target * MAX_GROUP_LEN_MULTIPLE`
-            // (plan.rs:376), except a single oversized first axis. There is no
-            // parallel split of one grouped tile yet, so it runs on the calling
-            // thread even when the token would fan out.
+            // Rootless grouped tile: the planner turns every axis of extent > 1
+            // outside `group_a` and `group_b` into an outer loop level
+            // (plan.rs:293-314), so when this branch is reached (`plan.levels`
+            // empty, checked above) every such axis is inside a group and the
+            // whole copy is one tile. Each group is capped near
+            // `target * MAX_GROUP_LEN_MULTIPLE` (plan.rs:376), except a single
+            // oversized first axis. There is no parallel split of one grouped
+            // tile yet, so it runs on the calling thread even when the token
+            // would fan out.
             ExecMode::GroupedTranspose => execute_serial::<T, S>(src, dst, plan),
         }
         return;
