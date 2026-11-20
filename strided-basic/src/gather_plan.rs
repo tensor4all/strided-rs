@@ -69,7 +69,7 @@ mod sealed {
 /// is the accumulating combine of additive scatter, so the typed and
 /// dtype-erased entries share the same element arithmetic.
 pub trait ScatterScalar: sealed::Sealed + Copy + Send + Sync {
-    /// The scatter accumulate `self + rhs`.
+    /// The additive-scatter combine, `self + rhs`.
     ///
     /// Integer types wrap on overflow in every build profile
     /// (`i32::wrapping_add`, `i64::wrapping_add`); floating-point and complex

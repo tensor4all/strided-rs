@@ -89,7 +89,7 @@ pub fn erased_map_into(
     validate_no_overlap(dest, input, 0)?;
     // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
     // mutable allocation may overlap `input`'s byte extent: `dest` is the only one in this call,
-    // and `validate_no_overlap` (erased.rs:1909) checked `input` against it at erased.rs:89 by
+    // and `validate_no_overlap` (erased.rs:1916) checked `input` against it at erased.rs:89 by
     // comparing whole byte ranges (`overlaps_mut`, strided-view/src/raw.rs:338). The allocation
     // contract `input` was built under (strided-view/src/raw.rs:204) must still hold; that is the
     // obligation of whoever built `input`. No conflicting access may happen while the result is
@@ -153,7 +153,7 @@ pub fn erased_zip_into(
     validate_no_overlap(dest, rhs, 1)?;
     // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
     // mutable allocation may overlap `lhs`'s byte extent: `dest` is the only one in this call,
-    // and `validate_no_overlap` (erased.rs:1909) checked `lhs` against it at erased.rs:152 by
+    // and `validate_no_overlap` (erased.rs:1916) checked `lhs` against it at erased.rs:152 by
     // comparing whole byte ranges (`overlaps_mut`, strided-view/src/raw.rs:338). The allocation
     // contract `lhs` was built under (strided-view/src/raw.rs:204) must still hold; that is the
     // obligation of whoever built `lhs`. No conflicting access may happen while the result is
@@ -1641,7 +1641,7 @@ impl ErasedScatterPlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:1632 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:1638 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -1650,11 +1650,11 @@ impl ErasedScatterPlan {
         // outside.
         let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `scatter_indices`
-        // against `dest` at erased.rs:1633, and the same allocation contract and exclusive `dest`
+        // against `dest` at erased.rs:1639, and the same allocation contract and exclusive `dest`
         // borrow apply.
         let scatter_indices = &unsafe { scatter_indices.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `updates` against
-        // `dest` at erased.rs:1634, and the same allocation contract and exclusive `dest` borrow
+        // `dest` at erased.rs:1640, and the same allocation contract and exclusive `dest` borrow
         // apply.
         let updates = &unsafe { updates.try_as_ref_after_no_overlap() }?;
         match self.dtype {
@@ -1764,8 +1764,8 @@ fn execute_one_shot_map<T: OneShotScalar>(
         ($op:ident) => {
             // SAFETY: `map_raw_into_validated` (strided-basic/src/execution.rs:365) requires
             // three things. Every input shape matches the destination: `ensure_same_shape`
-            // checked it at erased.rs:1732. `validated` belongs to this destination's geometry:
-            // `validate_destination_layout_without_alloc` produced it at erased.rs:1728 from the
+            // checked it at erased.rs:1738. `validated` belongs to this destination's geometry:
+            // `validate_destination_layout_without_alloc` produced it at erased.rs:1734 from the
             // same `dest.dims()` and `dest.strides()` that `dest` was rebuilt with. Bounds and
             // aliasing hold throughout the replay: each descriptor is bounded as argued where it
             // is built above, `dest` is an exclusive reborrow, and the public entry rejected
@@ -1819,8 +1819,8 @@ where
     let input = erased_raw_ref::<A>(input)?;
     // SAFETY: `map_raw_into_validated` (strided-basic/src/execution.rs:365) requires three
     // things. Every input shape matches the destination: `ensure_same_shape` checked it at
-    // erased.rs:1799. `validated` belongs to this destination's geometry:
-    // `validate_destination_layout_without_alloc` produced it at erased.rs:1795 from the same
+    // erased.rs:1806. `validated` belongs to this destination's geometry:
+    // `validate_destination_layout_without_alloc` produced it at erased.rs:1802 from the same
     // `dest.dims()` and `dest.strides()` that `dest` was rebuilt with. Bounds and aliasing hold
     // throughout the replay: each descriptor is bounded as argued where it is built above, `dest`
     // is an exclusive reborrow, and the public entry rejected input/output overlap before
@@ -1878,9 +1878,9 @@ fn execute_one_shot_zip<T: OneShotScalar>(
         ($op:ident) => {
             // SAFETY: `zip_map2_raw_into_validated` (strided-basic/src/execution.rs:413) requires
             // three things. Every input shape matches the destination: `ensure_same_shape`
-            // checked it at erased.rs:1845 and erased.rs:1846. `validated` belongs to this
+            // checked it at erased.rs:1852 and erased.rs:1853. `validated` belongs to this
             // destination's geometry: `validate_destination_layout_without_alloc` produced it at
-            // erased.rs:1841 from the same `dest.dims()` and `dest.strides()` that `dest` was
+            // erased.rs:1848 from the same `dest.dims()` and `dest.strides()` that `dest` was
             // rebuilt with. Bounds and aliasing hold throughout the replay: each descriptor is
             // bounded as argued where it is built above, `dest` is an exclusive reborrow, and the
             // public entry rejected input/output overlap before converting the inputs
@@ -2214,7 +2214,7 @@ fn raw_any_odometer<T: Copy>(
     let dims = src.dims();
     let strides = src.strides();
     // INVARIANT: the caller rejected empty extents, so every `dim - 1` is valid.
-    // (`raw_any` returns early for a zero element count at erased.rs:2178.)
+    // (`raw_any` returns early for a zero element count at erased.rs:2185.)
     for axis in 0..dims.len() {
         let last = isize::try_from(dims[axis] - 1).map_err(|_| StridedError::OffsetOverflow)?;
         resets[axis] = strides[axis]
@@ -2228,7 +2228,7 @@ fn raw_any_odometer<T: Copy>(
         // SAFETY: every `RawStridedRef` keeps its reachable offsets inside `data`:
         // `RawStridedRef::new` checks them and `new_unchecked` (strided-view/src/raw.rs:996)
         // makes them the caller's contract. Here `src` comes from `erased_raw_ref` (the only
-        // caller, `raw_any`, runs at erased.rs:1855), whose proof is at erased.rs:2141. The
+        // caller, `raw_any`, runs at erased.rs:1862), whose proof is at erased.rs:2148. The
         // odometer keeps `coordinates[axis] < dims[axis]` and moves `offset` by whole strides, so
         // `offset` is always `src.offset()` plus the offset of a reachable index.
         if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
@@ -2326,7 +2326,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2387,7 +2387,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2398,7 +2398,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `start_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `start_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -2479,7 +2479,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2490,7 +2490,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let starts_ref = unsafe {
@@ -2501,7 +2501,7 @@ where
             starts.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2365): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2568,7 +2568,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2579,7 +2579,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `update` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `update` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -2590,7 +2590,7 @@ where
             update.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let starts_ref = unsafe {
@@ -2601,7 +2601,7 @@ where
             starts.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2365): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2673,7 +2673,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2684,7 +2684,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `scatter_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `scatter_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -2695,7 +2695,7 @@ where
             indices.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `updates` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `updates` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -2706,7 +2706,7 @@ where
             updates.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2365): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2715,7 +2715,7 @@ where
     // rejected before the input references existed, live descriptor contracts, and no initialized
     // reference to the output. This function is reached only from
     // `ErasedScatterPlan::execute_uninit` (through its dispatch helper), which rejected every
-    // input/output overlap before converting the inputs (last check at erased.rs:1634). The
+    // input/output overlap before converting the inputs (last check at erased.rs:1640). The
     // descriptors stay borrowed for the call, and `dest_data` is `&mut [MaybeUninit<T>]`, so no
     // initialized reference to the output is formed.
     unsafe {
@@ -2745,7 +2745,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2756,7 +2756,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2365): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2778,7 +2778,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2811,7 +2811,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2822,7 +2822,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2365): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2846,7 +2846,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2881,7 +2881,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2892,7 +2892,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2365): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2937,7 +2937,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2948,7 +2948,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `start_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `start_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -3004,7 +3004,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -3015,7 +3015,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let start_ref = unsafe {
@@ -3073,7 +3073,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -3084,7 +3084,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `update` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `update` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -3095,7 +3095,7 @@ where
             update.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let start_ref = unsafe {
@@ -3154,7 +3154,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -3165,7 +3165,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `scatter_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `scatter_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -3176,7 +3176,7 @@ where
             scatter_indices.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2141): `updates` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `updates` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -3204,7 +3204,7 @@ where
     // SAFETY: `read_unaligned` needs `size_of::<T>()` readable bytes and, for the value, a valid
     // bit pattern of `T`; it accepts any alignment. Both callers, `execute_pad` and
     // `execute_pad_uninit`, run only after `ErasedPadPlan::execute`/`execute_uninit` called
-    // `validate_scalar_bytes` (erased.rs:2291) at erased.rs:549 and erased.rs:594. It checks
+    // `validate_scalar_bytes` (erased.rs:2298) at erased.rs:549 and erased.rs:594. It checks
     // that `fill.len()` is the dtype's size, which is `size_of::<T>()` for the `T` each match arm
     // picks, and rejects bool bytes other than 0 or 1; the other dtypes accept any bit pattern.
     // This safe helper depends on that validation: a shorter slice would be read out of bounds.
