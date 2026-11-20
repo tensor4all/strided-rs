@@ -5,7 +5,9 @@
 //! indexed shape vocabulary, but keeps tensor allocation, dtype promotion, and
 //! frontend error policy outside `strided-kernel`.
 
-use core::{mem::MaybeUninit, ops::Add};
+use core::mem::MaybeUninit;
+
+use num_complex::{Complex32, Complex64};
 
 use crate::copy_plan::{replay_fused_raw, CopyPlan, OverwriteWriter, ReadModifyWrite};
 use crate::cost::KernelClass;
@@ -54,6 +56,59 @@ impl GatherIndex for i64 {
         self
     }
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Element types accepted by [`ScatterPlan::execute`].
+///
+/// The trait is sealed: it is implemented for `f32`, `f64`, `i32`, `i64`,
+/// [`Complex32`] and [`Complex64`] (the dtypes the erased scatter entry
+/// dispatches) and cannot be implemented outside this crate. Its one method
+/// is the accumulating combine of additive scatter, so the typed and
+/// dtype-erased entries share the same element arithmetic.
+pub trait ScatterScalar: sealed::Sealed + Copy + Send + Sync {
+    /// The additive-scatter combine, `self + rhs`.
+    ///
+    /// Integer types wrap on overflow in every build profile
+    /// (`i32::wrapping_add`, `i64::wrapping_add`); floating-point and complex
+    /// types use IEEE addition, which has no overflow panic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_basic::ScatterScalar;
+    /// assert_eq!(ScatterScalar::wrapping_add(i32::MAX, 1), i32::MIN);
+    /// assert_eq!(ScatterScalar::wrapping_add(1.5_f64, 2.0), 3.5);
+    /// ```
+    fn wrapping_add(self, rhs: Self) -> Self;
+}
+
+macro_rules! impl_scatter_scalar {
+    (wrapping: $($int:ty),*; ieee: $($float:ty),*) => {
+        $(
+            impl sealed::Sealed for $int {}
+            impl ScatterScalar for $int {
+                #[inline(always)]
+                fn wrapping_add(self, rhs: Self) -> Self {
+                    <$int>::wrapping_add(self, rhs)
+                }
+            }
+        )*
+        $(
+            impl sealed::Sealed for $float {}
+            impl ScatterScalar for $float {
+                #[inline(always)]
+                fn wrapping_add(self, rhs: Self) -> Self {
+                    self + rhs
+                }
+            }
+        )*
+    };
+}
+
+impl_scatter_scalar!(wrapping: i32, i64; ieee: f32, f64, Complex32, Complex64);
 
 /// A compiled gather traversal for one value layout, index layout, and output layout.
 #[derive(Clone, Debug)]
@@ -1925,12 +1980,34 @@ impl ScatterPlan {
 
     /// Execute the prepared additive scatter traversal.
     ///
-    /// The accumulating combine is [`Add`]. For integer element types overflow
-    /// therefore panics in a build with overflow checks (debug/test) and wraps
-    /// in release, while the dtype-erased entry wraps in both. Callers that
-    /// need the wrapping contract in every profile can pass
-    /// `i32::wrapping_add` / `i64::wrapping_add` to
-    /// [`Self::execute_with_combine`].
+    /// The accumulating combine is [`ScatterScalar::wrapping_add`]: integer
+    /// element types wrap on overflow in every build profile, and floating-point
+    /// and complex types use IEEE addition. This is the combine the dtype-erased
+    /// entries (`ErasedScatterPlan::execute` and `execute_uninit`) use, so the
+    /// typed and erased, initialized and uninitialized entries agree on the same
+    /// input. Use [`Self::execute_with_combine`] for any other combine or for an
+    /// element type outside the sealed [`ScatterScalar`] set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_basic::{Exec, RawStridedMut, RawStridedRef, ScatterPlan, ScatterSpec};
+    /// let spec = ScatterSpec {
+    ///     update_window_dims: vec![],
+    ///     inserted_window_dims: vec![0],
+    ///     scatter_dims_to_operand_dims: vec![0],
+    ///     index_vector_dim: 1,
+    /// };
+    /// let plan =
+    ///     ScatterPlan::compile(&[2], &[1], &[1, 1], &[1, 1], &[1], &[1], &[2], &[1], spec).unwrap();
+    /// let operand = RawStridedRef::new(&[i32::MAX, 7], &[2], &[1], 0).unwrap();
+    /// let indices = RawStridedRef::new(&[0_i64], &[1, 1], &[1, 1], 0).unwrap();
+    /// let updates = RawStridedRef::new(&[1_i32], &[1], &[1], 0).unwrap();
+    /// let mut out = [0_i32; 2];
+    /// let mut dest = RawStridedMut::new(&mut out, &[2], &[1], 0).unwrap();
+    /// plan.execute(&mut dest, &operand, &indices, &updates, Exec::serial()).unwrap();
+    /// assert_eq!(out, [i32::MIN, 7]);
+    /// ```
     ///
     /// # Errors
     ///
@@ -1948,17 +2025,30 @@ impl ScatterPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Add<Output = T> + Send + Sync,
+        T: ScatterScalar,
         I: GatherIndex,
     {
-        self.execute_with_combine(dest, operand, scatter_indices, updates, |a, b| a + b, exec)
+        self.execute_with_combine(
+            dest,
+            operand,
+            scatter_indices,
+            updates,
+            <T as ScatterScalar>::wrapping_add,
+            exec,
+        )
     }
 
-    /// Execute the prepared additive scatter with an explicit combine.
+    /// Execute the prepared scatter traversal with an explicit combine.
     ///
-    /// `execute` uses `Add`; dtype-erased callers pass the combine that their
-    /// contract promises, so the initialized and `execute_uninit` entries
-    /// agree (integer element arithmetic wraps).
+    /// `combine(current, update)` is the read-modify-write applied to each
+    /// destination slot an update reaches, after the operand copy. Pass
+    /// [`ScatterScalar::wrapping_add`] for the [`Self::execute`] contract;
+    /// any other combine is the caller's contract, including its overflow
+    /// behavior.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::execute`].
     pub fn execute_with_combine<T, I>(
         &self,
         dest: &mut RawStridedMut<'_, T>,
@@ -1969,7 +2059,7 @@ impl ScatterPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Add<Output = T> + Send + Sync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.check_call(dest, operand, scatter_indices, updates)?;
@@ -1989,7 +2079,7 @@ impl ScatterPlan {
         exec: Exec<'_>,
     ) -> Result<()>
     where
-        T: Copy + Add<Output = T> + Send + Sync,
+        T: Copy + Send + Sync,
         I: GatherIndex,
     {
         self.check_call(dest, operand, scatter_indices, updates)?;

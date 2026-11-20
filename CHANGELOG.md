@@ -12,6 +12,22 @@ manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and
 never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
 manifests move when it is released.
 
+### `strided-basic`: `ScatterPlan::execute` is bound to the sealed `ScatterScalar` and wraps integers (#508) — breaking
+
+`ScatterPlan::execute` (also reachable as `strided_kernel::ScatterPlan`) now takes `T: ScatterScalar` instead of
+`T: Copy + Add<Output = T> + Send + Sync`, and accumulates with `ScatterScalar::wrapping_add`. `ScatterScalar` is a
+new sealed trait implemented for `f32`, `f64`, `i32`, `i64`, `Complex32` and `Complex64`: integers wrap on overflow in
+every build profile, floats and complex numbers use IEEE addition. Before, an `i32`/`i64` update past the dtype extrema
+panicked under overflow checks (debug/test) and wrapped in release, while `ErasedScatterPlan::execute` and both
+`execute_uninit` entries wrapped; all four entries now share one combine and agree on the same input (#502, #503).
+`ErasedScatterPlan::execute` calls the typed `execute` directly, and `execute_uninit` passes the same
+`ScatterScalar::wrapping_add`.
+
+This is breaking for a generic caller whose element type is outside that set or that names only the old bound: use
+`ScatterPlan::execute_with_combine(.., combine, ..)`, the explicit-combine entry, which keeps `fn(T, T) -> T` and now
+needs only `T: Copy + Send + Sync` (the unused `Add` bound is dropped there and on
+`execution::scatter_into_uninit`, which is not breaking).
+
 ### `strided-nn`: `norm` and `activation` row kernels (#504, phase 1)
 
 `strided_nn::norm` adds LayerNorm (optional weight/bias) and RMSNorm over the last axis of a contiguous

@@ -1,5 +1,4 @@
 use crate::*;
-use core::ops::Add;
 use num_complex::{Complex32, Complex64};
 use strided_basic::execution::check_static_indexing_dtype;
 use strided_basic::execution::{check_dtype, validate_uninit_no_overlap};
@@ -90,7 +89,7 @@ pub fn erased_map_into(
     validate_no_overlap(dest, input, 0)?;
     // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
     // mutable allocation may overlap `input`'s byte extent: `dest` is the only one in this call,
-    // and `validate_no_overlap` (erased.rs:1926) checked `input` against it at erased.rs:90 by
+    // and `validate_no_overlap` (erased.rs:1916) checked `input` against it at erased.rs:89 by
     // comparing whole byte ranges (`overlaps_mut`, strided-view/src/raw.rs:338). The allocation
     // contract `input` was built under (strided-view/src/raw.rs:204) must still hold; that is the
     // obligation of whoever built `input`. No conflicting access may happen while the result is
@@ -154,7 +153,7 @@ pub fn erased_zip_into(
     validate_no_overlap(dest, rhs, 1)?;
     // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things. No
     // mutable allocation may overlap `lhs`'s byte extent: `dest` is the only one in this call,
-    // and `validate_no_overlap` (erased.rs:1926) checked `lhs` against it at erased.rs:153 by
+    // and `validate_no_overlap` (erased.rs:1916) checked `lhs` against it at erased.rs:152 by
     // comparing whole byte ranges (`overlaps_mut`, strided-view/src/raw.rs:338). The allocation
     // contract `lhs` was built under (strided-view/src/raw.rs:204) must still hold; that is the
     // obligation of whoever built `lhs`. No conflicting access may happen while the result is
@@ -162,7 +161,7 @@ pub fn erased_zip_into(
     // contract (strided-view/src/raw.rs:212) rules out concurrent mutation from outside.
     let lhs = unsafe { lhs.try_as_ref_after_no_overlap() }?;
     // SAFETY: as for `lhs` above: `validate_no_overlap` checked `rhs` against `dest` at
-    // erased.rs:154, and the same allocation contract and exclusive `dest` borrow apply.
+    // erased.rs:153, and the same allocation contract and exclusive `dest` borrow apply.
     let rhs = unsafe { rhs.try_as_ref_after_no_overlap() }?;
 
     match dtype {
@@ -319,7 +318,7 @@ impl ErasedSlicePlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:318 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:317 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -446,7 +445,7 @@ impl ErasedReversePlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:445 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:444 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -597,7 +596,7 @@ impl ErasedPadPlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:596 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:595 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -847,7 +846,7 @@ impl ErasedGatherPlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:845 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:844 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -856,7 +855,7 @@ impl ErasedGatherPlan {
         // outside.
         let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `start_indices`
-        // against `dest` at erased.rs:846, and the same allocation contract and exclusive `dest`
+        // against `dest` at erased.rs:845, and the same allocation contract and exclusive `dest`
         // borrow apply.
         let start_indices = &unsafe { start_indices.try_as_ref_after_no_overlap() }?;
         match self.dtype {
@@ -1101,7 +1100,7 @@ impl ErasedDynamicSlicePlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:1099 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:1098 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -1110,7 +1109,7 @@ impl ErasedDynamicSlicePlan {
         // outside.
         let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `starts` against
-        // `dest` at erased.rs:1100, and the same allocation contract and exclusive `dest` borrow
+        // `dest` at erased.rs:1099, and the same allocation contract and exclusive `dest` borrow
         // apply.
         let starts = &unsafe { starts.try_as_ref_after_no_overlap() }?;
         match self.dtype {
@@ -1368,7 +1367,7 @@ impl ErasedDynamicUpdateSlicePlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:1365 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:1364 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -1377,11 +1376,11 @@ impl ErasedDynamicUpdateSlicePlan {
         // outside.
         let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `update` against
-        // `dest` at erased.rs:1366, and the same allocation contract and exclusive `dest` borrow
+        // `dest` at erased.rs:1365, and the same allocation contract and exclusive `dest` borrow
         // apply.
         let update = &unsafe { update.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `starts` against
-        // `dest` at erased.rs:1367, and the same allocation contract and exclusive `dest` borrow
+        // `dest` at erased.rs:1366, and the same allocation contract and exclusive `dest` borrow
         // apply.
         let starts = &unsafe { starts.try_as_ref_after_no_overlap() }?;
         match self.dtype {
@@ -1556,7 +1555,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<f32>,
                 exec,
             ),
             KernelDType::F64 => dispatch_scatter_index::<f64>(
@@ -1566,7 +1564,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<f64>,
                 exec,
             ),
             KernelDType::I32 => dispatch_scatter_index::<i32>(
@@ -1576,7 +1573,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                i32::wrapping_add,
                 exec,
             ),
             KernelDType::I64 => dispatch_scatter_index::<i64>(
@@ -1586,7 +1582,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                i64::wrapping_add,
                 exec,
             ),
             KernelDType::C32 => dispatch_scatter_index::<Complex32>(
@@ -1596,7 +1591,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<Complex32>,
                 exec,
             ),
             KernelDType::C64 => dispatch_scatter_index::<Complex64>(
@@ -1606,7 +1600,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<Complex64>,
                 exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
@@ -1648,7 +1641,7 @@ impl ErasedScatterPlan {
         // SAFETY: `try_as_ref_after_no_overlap` (strided-view/src/raw.rs:288) needs three things.
         // No mutable allocation may overlap `operand`'s byte extent: `dest` is the only one in
         // this call, and `validate_uninit_no_overlap` (strided-basic/src/erased_common.rs:18)
-        // checked `operand` against it at erased.rs:1639 by comparing whole byte ranges
+        // checked `operand` against it at erased.rs:1638 by comparing whole byte ranges
         // (`overlaps_uninit_mut`, strided-view/src/raw.rs:355). The allocation contract
         // `operand` was built under (strided-view/src/raw.rs:204) must still hold; that is the
         // obligation of whoever built `operand`. No conflicting access may happen while the
@@ -1657,11 +1650,11 @@ impl ErasedScatterPlan {
         // outside.
         let operand = &unsafe { operand.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `scatter_indices`
-        // against `dest` at erased.rs:1640, and the same allocation contract and exclusive `dest`
+        // against `dest` at erased.rs:1639, and the same allocation contract and exclusive `dest`
         // borrow apply.
         let scatter_indices = &unsafe { scatter_indices.try_as_ref_after_no_overlap() }?;
         // SAFETY: as for `operand` above: `validate_uninit_no_overlap` checked `updates` against
-        // `dest` at erased.rs:1641, and the same allocation contract and exclusive `dest` borrow
+        // `dest` at erased.rs:1640, and the same allocation contract and exclusive `dest` borrow
         // apply.
         let updates = &unsafe { updates.try_as_ref_after_no_overlap() }?;
         match self.dtype {
@@ -1672,7 +1665,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<f32>,
                 exec,
             ),
             KernelDType::F64 => execute_scatter_uninit_dispatch::<f64>(
@@ -1682,7 +1674,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<f64>,
                 exec,
             ),
             KernelDType::I32 => execute_scatter_uninit_dispatch::<i32>(
@@ -1692,7 +1683,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                i32::wrapping_add,
                 exec,
             ),
             KernelDType::I64 => execute_scatter_uninit_dispatch::<i64>(
@@ -1702,7 +1692,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                i64::wrapping_add,
                 exec,
             ),
             KernelDType::C32 => execute_scatter_uninit_dispatch::<Complex32>(
@@ -1712,7 +1701,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<Complex32>,
                 exec,
             ),
             KernelDType::C64 => execute_scatter_uninit_dispatch::<Complex64>(
@@ -1722,7 +1710,6 @@ impl ErasedScatterPlan {
                 operand,
                 scatter_indices,
                 updates,
-                add_values::<Complex64>,
                 exec,
             ),
             _ => Err(StridedError::UnsupportedDType {
@@ -1730,10 +1717,6 @@ impl ErasedScatterPlan {
             }),
         }
     }
-}
-
-fn add_values<T: Add<Output = T>>(lhs: T, rhs: T) -> T {
-    lhs + rhs
 }
 
 fn execute_one_shot_map<T: OneShotScalar>(
@@ -1781,12 +1764,12 @@ fn execute_one_shot_map<T: OneShotScalar>(
         ($op:ident) => {
             // SAFETY: `map_raw_into_validated` (strided-basic/src/execution.rs:365) requires
             // three things. Every input shape matches the destination: `ensure_same_shape`
-            // checked it at erased.rs:1749. `validated` belongs to this destination's geometry:
-            // `validate_destination_layout_without_alloc` produced it at erased.rs:1745 from the
+            // checked it at erased.rs:1738. `validated` belongs to this destination's geometry:
+            // `validate_destination_layout_without_alloc` produced it at erased.rs:1734 from the
             // same `dest.dims()` and `dest.strides()` that `dest` was rebuilt with. Bounds and
             // aliasing hold throughout the replay: each descriptor is bounded as argued where it
             // is built above, `dest` is an exclusive reborrow, and the public entry rejected
-            // input/output overlap before converting the inputs (erased.rs:90).
+            // input/output overlap before converting the inputs (erased.rs:89).
             unsafe {
                 strided_basic::execution::map_raw_into_validated::<T, T, Identity>(
                     &mut dest,
@@ -1828,7 +1811,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<D>()?;
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest =
@@ -1836,12 +1819,12 @@ where
     let input = erased_raw_ref::<A>(input)?;
     // SAFETY: `map_raw_into_validated` (strided-basic/src/execution.rs:365) requires three
     // things. Every input shape matches the destination: `ensure_same_shape` checked it at
-    // erased.rs:1816. `validated` belongs to this destination's geometry:
-    // `validate_destination_layout_without_alloc` produced it at erased.rs:1812 from the same
+    // erased.rs:1806. `validated` belongs to this destination's geometry:
+    // `validate_destination_layout_without_alloc` produced it at erased.rs:1802 from the same
     // `dest.dims()` and `dest.strides()` that `dest` was rebuilt with. Bounds and aliasing hold
     // throughout the replay: each descriptor is bounded as argued where it is built above, `dest`
     // is an exclusive reborrow, and the public entry rejected input/output overlap before
-    // converting the inputs (erased.rs:90).
+    // converting the inputs (erased.rs:89).
     unsafe {
         strided_basic::execution::map_raw_into_validated::<D, A, Identity>(
             &mut dest, &input, map, validated, exec,
@@ -1884,7 +1867,7 @@ fn execute_one_shot_zip<T: OneShotScalar>(
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest =
@@ -1895,13 +1878,13 @@ fn execute_one_shot_zip<T: OneShotScalar>(
         ($op:ident) => {
             // SAFETY: `zip_map2_raw_into_validated` (strided-basic/src/execution.rs:413) requires
             // three things. Every input shape matches the destination: `ensure_same_shape`
-            // checked it at erased.rs:1862 and erased.rs:1863. `validated` belongs to this
+            // checked it at erased.rs:1852 and erased.rs:1853. `validated` belongs to this
             // destination's geometry: `validate_destination_layout_without_alloc` produced it at
-            // erased.rs:1858 from the same `dest.dims()` and `dest.strides()` that `dest` was
+            // erased.rs:1848 from the same `dest.dims()` and `dest.strides()` that `dest` was
             // rebuilt with. Bounds and aliasing hold throughout the replay: each descriptor is
             // bounded as argued where it is built above, `dest` is an exclusive reborrow, and the
             // public entry rejected input/output overlap before converting the inputs
-            // (erased.rs:153, erased.rs:154).
+            // (erased.rs:152, erased.rs:153).
             unsafe {
                 strided_basic::execution::zip_map2_raw_into_validated::<
                     T,
@@ -2231,7 +2214,7 @@ fn raw_any_odometer<T: Copy>(
     let dims = src.dims();
     let strides = src.strides();
     // INVARIANT: the caller rejected empty extents, so every `dim - 1` is valid.
-    // (`raw_any` returns early for a zero element count at erased.rs:2195.)
+    // (`raw_any` returns early for a zero element count at erased.rs:2185.)
     for axis in 0..dims.len() {
         let last = isize::try_from(dims[axis] - 1).map_err(|_| StridedError::OffsetOverflow)?;
         resets[axis] = strides[axis]
@@ -2245,7 +2228,7 @@ fn raw_any_odometer<T: Copy>(
         // SAFETY: every `RawStridedRef` keeps its reachable offsets inside `data`:
         // `RawStridedRef::new` checks them and `new_unchecked` (strided-view/src/raw.rs:996)
         // makes them the caller's contract. Here `src` comes from `erased_raw_ref` (the only
-        // caller, `raw_any`, runs at erased.rs:1872), whose proof is at erased.rs:2158. The
+        // caller, `raw_any`, runs at erased.rs:1862), whose proof is at erased.rs:2148. The
         // odometer keeps `coordinates[axis] < dims[axis]` and moves `offset` by whole strides, so
         // `offset` is always `src.offset()` plus the offset of a reachable index.
         if predicate(unsafe { *src.data().as_ptr().offset(offset) }) {
@@ -2343,7 +2326,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2354,7 +2337,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
@@ -2404,7 +2387,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2415,7 +2398,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `start_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `start_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -2441,7 +2424,7 @@ where
     // before the input references existed, live descriptor contracts, and no initialized
     // reference to the output. This function is reached only from
     // `ErasedGatherPlan::execute_uninit` (through its dispatch helper), which rejected every
-    // input/output overlap before converting the inputs (last check at erased.rs:846). The
+    // input/output overlap before converting the inputs (last check at erased.rs:845). The
     // descriptors stay borrowed for the call, and `dest_data` is `&mut [MaybeUninit<T>]`, so no
     // initialized reference to the output is formed.
     unsafe {
@@ -2496,7 +2479,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2507,7 +2490,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let starts_ref = unsafe {
@@ -2518,7 +2501,7 @@ where
             starts.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2382): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2527,7 +2510,7 @@ where
     // rejected before the input references existed, live descriptor contracts, and no initialized
     // reference to the output. This function is reached only from
     // `ErasedDynamicSlicePlan::execute_uninit` (through its dispatch helper), which rejected
-    // every input/output overlap before converting the inputs (last check at erased.rs:1100). The
+    // every input/output overlap before converting the inputs (last check at erased.rs:1099). The
     // descriptors stay borrowed for the call, and `dest_data` is `&mut [MaybeUninit<T>]`, so no
     // initialized reference to the output is formed.
     unsafe {
@@ -2585,7 +2568,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2596,7 +2579,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `update` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `update` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -2607,7 +2590,7 @@ where
             update.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let starts_ref = unsafe {
@@ -2618,7 +2601,7 @@ where
             starts.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2382): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2628,7 +2611,7 @@ where
     // reference to the output. This function is reached only from
     // `ErasedDynamicUpdateSlicePlan::execute_uninit` (through its dispatch helper), which
     // rejected every input/output overlap before converting the inputs (last check at
-    // erased.rs:1367). The descriptors stay borrowed for the call, and `dest_data` is `&mut
+    // erased.rs:1366). The descriptors stay borrowed for the call, and `dest_data` is `&mut
     // [MaybeUninit<T>]`, so no initialized reference to the output is formed.
     unsafe {
         strided_basic::execution::dynamic_update_into_uninit(
@@ -2642,8 +2625,8 @@ where
     }
 }
 
-// Dtype plus the operand, index, update and destination layouts and the combine op:
-// the dispatch key.
+// Dtype plus the operand, index, update and destination layouts: the dispatch key. The
+// combine is `ScatterScalar::wrapping_add`, the one `ScatterPlan::execute` uses.
 #[allow(clippy::too_many_arguments)]
 fn execute_scatter_uninit_dispatch<T>(
     plan: &ScatterPlan,
@@ -2652,31 +2635,18 @@ fn execute_scatter_uninit_dispatch<T>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
-    combine: fn(T, T) -> T,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+    T: ScatterScalar + KernelStorageElement,
 {
     match index_dtype {
-        KernelDType::I32 => execute_scatter_uninit::<T, i32>(
-            plan,
-            dest,
-            operand,
-            scatter_indices,
-            updates,
-            combine,
-            exec,
-        ),
-        KernelDType::I64 => execute_scatter_uninit::<T, i64>(
-            plan,
-            dest,
-            operand,
-            scatter_indices,
-            updates,
-            combine,
-            exec,
-        ),
+        KernelDType::I32 => {
+            execute_scatter_uninit::<T, i32>(plan, dest, operand, scatter_indices, updates, exec)
+        }
+        KernelDType::I64 => {
+            execute_scatter_uninit::<T, i64>(plan, dest, operand, scatter_indices, updates, exec)
+        }
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
         }),
@@ -2689,11 +2659,10 @@ fn execute_scatter_uninit<T, I>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
-    combine: fn(T, T) -> T,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+    T: ScatterScalar + KernelStorageElement,
     I: GatherIndex + KernelStorageElement,
 {
     let indices = scatter_indices;
@@ -2704,7 +2673,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2715,7 +2684,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `scatter_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `scatter_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -2726,7 +2695,7 @@ where
             indices.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `updates` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `updates` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -2737,7 +2706,7 @@ where
             updates.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2382): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2746,7 +2715,7 @@ where
     // rejected before the input references existed, live descriptor contracts, and no initialized
     // reference to the output. This function is reached only from
     // `ErasedScatterPlan::execute_uninit` (through its dispatch helper), which rejected every
-    // input/output overlap before converting the inputs (last check at erased.rs:1641). The
+    // input/output overlap before converting the inputs (last check at erased.rs:1640). The
     // descriptors stay borrowed for the call, and `dest_data` is `&mut [MaybeUninit<T>]`, so no
     // initialized reference to the output is formed.
     unsafe {
@@ -2756,7 +2725,7 @@ where
             &operand_ref,
             &index_ref,
             &update_ref,
-            combine,
+            <T as ScatterScalar>::wrapping_add,
             exec,
         )
     }
@@ -2776,7 +2745,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2787,7 +2756,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2382): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2809,7 +2778,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2820,7 +2789,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
@@ -2842,7 +2811,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2853,7 +2822,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2382): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2877,7 +2846,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2888,7 +2857,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
@@ -2912,7 +2881,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_uninit_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2923,7 +2892,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2382): `dest`'s construction
+    // SAFETY: as for `dest` in `execute_gather_uninit` (erased.rs:2412): `dest`'s construction
     // ran `validate_bounds` over these dims, strides and offset, and `data_as_uninit_mut` hands
     // out the only access to its slots.
     let mut dest_ref =
@@ -2968,7 +2937,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -2979,7 +2948,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `start_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `start_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -2990,7 +2959,7 @@ where
             start_indices.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
@@ -3035,7 +3004,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -3046,13 +3015,13 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let start_ref = unsafe {
         RawStridedRef::new_unchecked(start_data, starts.dims(), starts.strides(), starts.offset())
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
@@ -3104,7 +3073,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -3115,7 +3084,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `update` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `update` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -3126,13 +3095,13 @@ where
             update.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `starts` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `starts` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let start_ref = unsafe {
         RawStridedRef::new_unchecked(start_data, starts.dims(), starts.strides(), starts.offset())
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
@@ -3148,18 +3117,17 @@ fn dispatch_scatter_index<T>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
-    combine: fn(T, T) -> T,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+    T: ScatterScalar + KernelStorageElement,
 {
     match index_dtype {
         KernelDType::I32 => {
-            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates, combine, exec)
+            execute_scatter::<T, i32>(plan, dest, operand, scatter_indices, updates, exec)
         }
         KernelDType::I64 => {
-            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates, combine, exec)
+            execute_scatter::<T, i64>(plan, dest, operand, scatter_indices, updates, exec)
         }
         _ => Err(StridedError::UnsupportedDType {
             dtype: index_dtype.label(),
@@ -3173,11 +3141,10 @@ fn execute_scatter<T, I>(
     operand: &ErasedRawStridedRef<'_>,
     scatter_indices: &ErasedRawStridedRef<'_>,
     updates: &ErasedRawStridedRef<'_>,
-    combine: fn(T, T) -> T,
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + Add<Output = T> + Send + Sync + KernelStorageElement,
+    T: ScatterScalar + KernelStorageElement,
     I: GatherIndex + KernelStorageElement,
 {
     let operand_data = operand.data_as::<T>()?;
@@ -3187,7 +3154,7 @@ where
     let dest_strides = dest.strides();
     let dest_offset = dest.offset();
     let dest_data = dest.data_as_mut::<T>()?;
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `operand` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `operand` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let operand_ref = unsafe {
@@ -3198,7 +3165,7 @@ where
             operand.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `scatter_indices` checked these dims,
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `scatter_indices` checked these dims,
     // strides and offset with `validate_bounds` when it was built, and `data_as` returned its
     // whole element count.
     let index_ref = unsafe {
@@ -3209,7 +3176,7 @@ where
             scatter_indices.offset(),
         )
     };
-    // SAFETY: as in `erased_raw_ref` (erased.rs:2158): `updates` checked these dims, strides and
+    // SAFETY: as in `erased_raw_ref` (erased.rs:2148): `updates` checked these dims, strides and
     // offset with `validate_bounds` when it was built, and `data_as` returned its whole element
     // count.
     let update_ref = unsafe {
@@ -3220,19 +3187,14 @@ where
             updates.offset(),
         )
     };
-    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1733): `dest`'s construction ran
+    // SAFETY: as for `dest` in `execute_one_shot_map` (erased.rs:1747): `dest`'s construction ran
     // `validate_bounds` over these dims, strides and offset, and `data_as_mut` hands out the only
     // access to its storage.
     let mut dest_ref =
         unsafe { RawStridedMut::new_unchecked(dest_data, dest_dims, dest_strides, dest_offset) };
-    plan.execute_with_combine(
-        &mut dest_ref,
-        &operand_ref,
-        &index_ref,
-        &update_ref,
-        combine,
-        exec,
-    )
+    // The typed entry itself, so the erased and typed initialized scatter share one combine
+    // (`ScatterScalar::wrapping_add`).
+    plan.execute(&mut dest_ref, &operand_ref, &index_ref, &update_ref, exec)
 }
 
 fn read_unaligned_scalar<T>(bytes: &[u8]) -> T
@@ -3242,7 +3204,7 @@ where
     // SAFETY: `read_unaligned` needs `size_of::<T>()` readable bytes and, for the value, a valid
     // bit pattern of `T`; it accepts any alignment. Both callers, `execute_pad` and
     // `execute_pad_uninit`, run only after `ErasedPadPlan::execute`/`execute_uninit` called
-    // `validate_scalar_bytes` (erased.rs:2308) at erased.rs:550 and erased.rs:595. It checks
+    // `validate_scalar_bytes` (erased.rs:2298) at erased.rs:549 and erased.rs:594. It checks
     // that `fill.len()` is the dtype's size, which is `size_of::<T>()` for the `T` each match arm
     // picks, and rejects bool bytes other than 0 or 1; the other dtypes accept any bit pattern.
     // This safe helper depends on that validation: a shorter slice would be read out of bounds.

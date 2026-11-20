@@ -745,7 +745,7 @@ fn one_shot_rejects_overlap_before_forming_input_reference() {
     // descriptor's use: `ptr` heads the live `[f64; 2]` `storage` (`f64`-aligned, 16 initialized
     // bytes). The descriptor overlaps the destination built from `storage` below, which its
     // contract allows (strided-view/src/raw.rs:211); `erased_map_into` rejects that overlap
-    // before converting or reading it (strided-kernel/src/erased.rs:90), so nothing is ever read
+    // before converting or reading it (strided-kernel/src/erased.rs:89), so nothing is ever read
     // through `ptr`, and forming `&mut storage` afterwards does not conflict.
     let input = unsafe {
         ErasedRawStridedPtr::from_raw_parts(

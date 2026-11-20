@@ -748,7 +748,7 @@ pub unsafe fn scatter_into_uninit<'a, T, I>(
     exec: Exec<'_>,
 ) -> Result<()>
 where
-    T: Copy + core::ops::Add<Output = T> + Send + Sync,
+    T: Copy + Send + Sync,
     I: crate::GatherIndex,
 {
     plan.execute_uninit(dest, operand, scatter_indices, updates, combine, exec)
