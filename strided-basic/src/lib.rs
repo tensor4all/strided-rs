@@ -265,7 +265,7 @@ mod run_sum;
 mod static_indexing_plan;
 pub use gather_plan::{
     DynamicSlicePlan, DynamicUpdateSlicePlan, GatherIndex, GatherPlan, GatherSpec, ScatterPlan,
-    ScatterSpec,
+    ScatterScalar, ScatterSpec,
 };
 pub use outer_product::{
     batched_outer_product_into, batched_outer_product_into_uninit, plan_lazy_outer_product,

@@ -14,7 +14,9 @@ depend on one another.
   - Copy and update: `CopyPlan`, `UpdatePlan`
   - Structural: `SlicePlan`, `ReversePlan`, `PadPlan`, `ConcatenatePlan`
   - Gather family: `GatherSpec` / `GatherPlan`, `ScatterSpec` / `ScatterPlan`,
-    `DynamicSlicePlan`, `DynamicUpdateSlicePlan`
+    `DynamicSlicePlan`, `DynamicUpdateSlicePlan`. `ScatterPlan::execute` takes
+    an element type of the sealed `ScatterScalar` set and wraps integer overflow,
+    like `ErasedScatterPlan`; `execute_with_combine` takes any combine
 - Dtype-erased replays of the plans above: `ErasedCopyPlan`, `ErasedUpdatePlan`,
   `ErasedConcatenatePlan`, `ErasedSlicePlan`, `ErasedReversePlan`,
   `ErasedPadPlan`, `ErasedGatherPlan`, `ErasedScatterPlan`,
