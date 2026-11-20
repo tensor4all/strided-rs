@@ -218,13 +218,25 @@ pub unsafe fn execute_permute_blocked<T: Copy + Send + Sync + 'static, S: Store<
                     };
                 });
             }
-            _ => execute_serial::<T, S>(src, dst, plan),
+            // Rank 0: one element, nothing to split.
+            ExecMode::Scalar => execute_serial::<T, S>(src, dst, plan),
+            // Rootless grouped tile: every axis of extent > 1 is inside
+            // `group_a` or `group_b` (plan.rs:293-307), so the whole copy is one
+            // tile. Each group is capped near `target * MAX_GROUP_LEN_MULTIPLE`
+            // (plan.rs:376), except a single oversized first axis. There is no
+            // parallel split of one grouped tile yet, so it runs on the calling
+            // thread even when the token would fan out.
+            ExecMode::GroupedTranspose => execute_serial::<T, S>(src, dst, plan),
         }
         return;
     }
 
     let root = &plan.levels[0];
     let outer_dim = root.end;
+    // Defensive: every loop order admits only axes of extent > 1
+    // (plan.rs:474, :502, :304) and `build_loop_levels` copies that extent into
+    // `end` (plan.rs:528), so a planned root always has `outer_dim >= 2`. One
+    // iteration has nothing to split, so fall back to the serial walk.
     if outer_dim <= 1 {
         execute_serial::<T, S>(src, dst, plan);
         return;
