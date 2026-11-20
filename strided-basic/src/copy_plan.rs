@@ -77,10 +77,7 @@ impl<'a, T> OverwriteWriter<T> for RawStridedMut<'a, T> {
     }
 }
 
-impl<'a, T> ReadModifyWrite<T> for RawStridedMut<'a, T>
-where
-    T: Add<Output = T>,
-{
+impl<'a, T> ReadModifyWrite<T> for RawStridedMut<'a, T> {
     #[inline(always)]
     unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
     where
@@ -147,10 +144,7 @@ impl<'a, T> OverwriteWriter<T> for InitializedRawDest<'a, T> {
     }
 }
 
-impl<'a, T> ReadModifyWrite<T> for InitializedRawDest<'a, T>
-where
-    T: Add<Output = T>,
-{
+impl<'a, T> ReadModifyWrite<T> for InitializedRawDest<'a, T> {
     #[inline(always)]
     unsafe fn add_at<F>(&mut self, offset: isize, value: T, combine: F)
     where
@@ -245,7 +239,7 @@ impl CopyPlan {
     /// `CopyPlan::compile(&[2], &[2], &[1])` the offset-1 hole keeps the caller's
     /// value (measured `[7.0, 99.0, 8.0]` for `src = [7, 8]`) rather than
     /// becoming uninitialized. That is why the receipt exposes
-    /// `write_at`/`add_at` (copy_plan.rs:138, :150) instead of a typed slice: their
+    /// `write_at`/`add_at` (copy_plan.rs:140, :149) instead of a typed slice: their
     /// contracts require an offset proven by this plan's layout. The receipt borrows
     /// the destination for `f`'s lifetime, so a read-modify-write consumer (the
     /// gather and scatter update replay in gather_plan.rs) sees the copied operand

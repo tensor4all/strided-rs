@@ -31,7 +31,7 @@ fn assert_initialized_eq<T: PartialEq + core::fmt::Debug>(
         // whose extent is the whole buffer, so every slot is reachable. `ErasedGatherPlan`,
         // `ErasedDynamicSlicePlan`, `ErasedDynamicUpdateSlicePlan`, `ErasedScatterPlan` and
         // `ErasedReducePlan` document that success overwrites every reachable slot
-        // (strided-kernel/src/erased.rs:815, :1073, :1336, :1612,
+        // (strided-kernel/src/erased.rs:814, :1072, :1335, :1611,
         // strided-basic/src/erased.rs:709).
         assert_eq!(unsafe { actual.assume_init_ref() }, expected);
     }
@@ -347,7 +347,7 @@ fn gather_generic_window_offset_negative_stride_and_holes() {
         // SAFETY: `raw` is laid out as `dd` `[2, 2]` with strides `[-1, 3]` and offset 3, which
         // reaches exactly offsets 3, 2, 6 and 5, the ones read here, and the successful
         // `ErasedGatherPlan::execute_uninit` above overwrote every reachable slot
-        // (strided-kernel/src/erased.rs:815).
+        // (strided-kernel/src/erased.rs:814).
         assert_eq!(unsafe { raw[offset].assume_init_ref() }, &expected);
     }
 }
@@ -781,7 +781,7 @@ fn dynamic_update_hole_layout_preserves_unreachable_bytes() {
         (8, reachable[4]),
     ] {
         // SAFETY: every slot of `raw` was created as `MaybeUninit::new(0xa5)`. The successful
-        // call overwrote the reachable even slots (strided-kernel/src/erased.rs:1336); the holes
+        // call overwrote the reachable even slots (strided-kernel/src/erased.rs:1335); the holes
         // keep their initial value.
         assert_eq!(unsafe { raw[slot].assume_init_ref() }, &expected);
     }
@@ -1507,7 +1507,7 @@ fn dynamic_update_uninitialized_holes_are_never_read() {
     .unwrap();
     // SAFETY: `storage` has 5 slots under `dims` `[3]` with stride `[2]`, so the layout reaches
     // slots 0, 2 and 4, and the successful `ErasedDynamicUpdateSlicePlan::execute_uninit` above
-    // overwrote every reachable slot (strided-kernel/src/erased.rs:1336).
+    // overwrote every reachable slot (strided-kernel/src/erased.rs:1335).
     assert_eq!(unsafe { storage[0].assume_init_ref() }, &1);
     // SAFETY: slot 2 is reachable; see above.
     assert_eq!(unsafe { storage[2].assume_init_ref() }, &9);

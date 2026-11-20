@@ -39,7 +39,7 @@ fn assume_init_vec<T>(data: Vec<MaybeUninit<T>>) -> Vec<T> {
     // `ErasedSlicePlan`, `ErasedReversePlan` or `ErasedConcatenatePlan` `execute_uninit` filled
     // through a layout that reaches every slot (`[len]`/`[1]`, `[2; 9]` column-major over 512
     // slots, `[4]`/`[1]`), each documented to overwrite every reachable slot
-    // (strided-kernel/src/erased.rs:291, :418, strided-basic/src/erased.rs:230), or a buffer
+    // (strided-kernel/src/erased.rs:290, :417, strided-basic/src/erased.rs:230), or a buffer
     // created as `MaybeUninit::new(f64::NAN)` in every slot.
     unsafe { Vec::from_raw_parts(data.as_mut_ptr().cast::<T>(), data.len(), data.capacity()) }
 }
@@ -211,7 +211,7 @@ fn erased_pad_and_concatenate_uninit_cover_noncontiguous_and_multi_input_outputs
     // SAFETY: `padded` has 7 slots under `padded_dims` `[4]` with stride `[2]`, so the layout
     // reaches exactly slots 0, 2, 4 and 6, the ones read here, and the successful
     // `ErasedPadPlan::execute_uninit` above overwrote every reachable slot
-    // (strided-kernel/src/erased.rs:567).
+    // (strided-kernel/src/erased.rs:566).
     assert_eq!(
         [0usize, 2, 4, 6].map(|index| unsafe { padded[index].assume_init() }),
         [-1, 10, 20, -1]
@@ -274,7 +274,7 @@ fn erased_uninit_static_replay_rejects_input_output_overlap_before_writing() {
     // descriptor's use: the pointer heads the live `storage` (`i32`-aligned, both slots created
     // initialized). The descriptor overlaps the destination built from `storage` below, which its
     // contract allows (strided-view/src/raw.rs:211); `ErasedSlicePlan::execute_uninit` rejects
-    // that overlap before converting or reading it (strided-kernel/src/erased.rs:318).
+    // that overlap before converting or reading it (strided-kernel/src/erased.rs:317).
     let input_ptr = unsafe {
         ErasedRawStridedPtr::from_raw_parts(
             KernelDType::I32,

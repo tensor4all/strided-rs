@@ -553,7 +553,7 @@ fn assert_uninitialized_layout(
         // 1099) passes a buffer that a successful `execute_uninit` of `ErasedDynamicSlicePlan`,
         // `ErasedDynamicUpdateSlicePlan` or `ErasedScatterPlan` filled with these same dims,
         // strides and offset, and each documents that success overwrites every reachable slot
-        // (strided-kernel/src/erased.rs:1073, :1336, :1612). Unreachable holes are never read.
+        // (strided-kernel/src/erased.rs:1072, :1335, :1611). Unreachable holes are never read.
         assert_eq!(unsafe { actual[slot].assume_init_ref() }, &expected[slot]);
     }
 }
@@ -833,7 +833,7 @@ fn erased_dynamic_update_zero_window_still_copies_operand() {
         // SAFETY: `raw` has 4 slots under `operand_dims` `[2, 2]` with strides `[1, 2]`, so the
         // layout reaches every slot, and the successful
         // `ErasedDynamicUpdateSlicePlan::execute_uninit` above overwrote every reachable slot
-        // (strided-kernel/src/erased.rs:1336).
+        // (strided-kernel/src/erased.rs:1335).
         assert_eq!(unsafe { *actual.assume_init_ref() }, expected);
     }
 }

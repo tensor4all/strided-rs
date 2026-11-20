@@ -285,7 +285,7 @@ fn generic_gather_matches_across_threshold_for_initialized_and_uninit_outputs() 
             // SAFETY: `raw` has `len` slots under `dest_dims` `[2, len / 2]` with strides `[1,
             // 2]`; every `len` here is even, so the layout reaches every slot, and the successful
             // `ErasedGatherPlan::execute_uninit` above overwrote every reachable slot
-            // (strided-kernel/src/erased.rs:815).
+            // (strided-kernel/src/erased.rs:814).
             assert_eq!(unsafe { actual.assume_init_ref() }, expected);
         }
     }
