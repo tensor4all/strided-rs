@@ -4,13 +4,10 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
-## 0.15.0 (unreleased) — minor
+## Unreleased — minor (`strided-basic` and `strided-kernel` 0.16.0)
 
-`0.14.0` (and `strided-view` 0.8.0) is the published line. The tree already carries this section's unreleased `0.15.0`
-manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel`, and `strided-view`
-0.8.1; the inherited workspace version is `0.7.2`. The parked `0.14.1` patch (#452) was superseded by the #468 bump and
-never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
-manifests move when it is released.
+`0.15.0` was published on 2026-11-17 from `e9e6abe` (#493). The change below landed after that tag, so it is not in
+`0.15.0`. Because it breaks the public API, the next release of `strided-basic` and `strided-kernel` is a minor (0.16.0).
 
 ### `strided-basic`: `ScatterPlan::execute` is bound to the sealed `ScatterScalar` and wraps integers (#508) — breaking
 
@@ -18,15 +15,30 @@ manifests move when it is released.
 `T: Copy + Add<Output = T> + Send + Sync`, and accumulates with `ScatterScalar::wrapping_add`. `ScatterScalar` is a
 new sealed trait implemented for `f32`, `f64`, `i32`, `i64`, `Complex32` and `Complex64`: integers wrap on overflow in
 every build profile, floats and complex numbers use IEEE addition. Before, an `i32`/`i64` update past the dtype extrema
-panicked under overflow checks (debug/test) and wrapped in release, while `ErasedScatterPlan::execute` and both
-`execute_uninit` entries wrapped; all four entries now share one combine and agree on the same input (#502, #503).
-`ErasedScatterPlan::execute` calls the typed `execute` directly, and `execute_uninit` passes the same
-`ScatterScalar::wrapping_add`.
+panicked under overflow checks (debug/test) and wrapped in release, while `ErasedScatterPlan::execute` and
+`ErasedScatterPlan::execute_uninit` wrapped (#502, #503). The three scatter entries with a fixed combine
+(`ScatterPlan::execute` and the two `ErasedScatterPlan` entries) now share `ScatterScalar::wrapping_add` and agree on the
+same input: `ErasedScatterPlan::execute` calls the typed `execute` directly, and `ErasedScatterPlan::execute_uninit`
+passes `ScatterScalar::wrapping_add` to `execution::scatter_into_uninit`.
+
+The explicit-combine entries are unchanged in behavior. `ScatterPlan::execute_with_combine` and
+`execution::scatter_into_uninit` apply whatever `combine` the caller passes, so they match `execute` only when that
+combine is `ScatterScalar::wrapping_add`. A caller that passes `|a, b| a + b` still panics at integer extrema under
+overflow checks. Other accumulating plans, such as `RunSumPlan::execute_acc`, still use `Add` and are not covered by
+this change.
 
 This is breaking for a generic caller whose element type is outside that set or that names only the old bound: use
-`ScatterPlan::execute_with_combine(.., combine, ..)`, the explicit-combine entry, which keeps `fn(T, T) -> T` and now
-needs only `T: Copy + Send + Sync` (the unused `Add` bound is dropped there and on
-`execution::scatter_into_uninit`, which is not breaking).
+`ScatterPlan::execute_with_combine(.., combine, ..)`, which keeps `fn(T, T) -> T` and now needs only
+`T: Copy + Send + Sync`. The unused `Add` bound is dropped there and on `execution::scatter_into_uninit`, which is not
+breaking.
+
+## 0.15.0 (unreleased) — minor
+
+`0.14.0` (and `strided-view` 0.8.0) is the published line. The tree already carries this section's unreleased `0.15.0`
+manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel`, and `strided-view`
+0.8.1; the inherited workspace version is `0.7.2`. The parked `0.14.1` patch (#452) was superseded by the #468 bump and
+never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
+manifests move when it is released.
 
 ### `strided-nn`: `norm` and `activation` row kernels (#504, phase 1)
 
