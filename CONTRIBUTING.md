@@ -16,10 +16,13 @@ This file only records what is specific to `strided-rs`:
 - **Feature combinations CI builds**: default features; then four lanes, each asserting the feature set it actually
   compiled (`scripts/assert-lane-features.py`): `--no-default-features`; the parallel set
   (`strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel`) with
-  `strided-basic`'s default `simd` on, on both Linux and macOS; and that parallel set under
+  `strided-basic`'s default `simd` on, on both Linux and macOS (macOS daily); and that parallel set under
   `--no-default-features`, i.e. no SIMD. Clippy lints `--workspace --all-targets` and the `parallel` feature, and
   `package-tests` builds each published crate with `--all-features`.
-- **Platforms claimed**: `ubuntu-latest` and `macos-latest` for the `test` job and the feature lanes. `fmt`, `clippy`,
+- **Platforms claimed**: `ubuntu-latest` and `macos-latest` for the `test` job and the `parallel` feature lane.
+  `ubuntu-latest` runs them on every PR (`ci.yml`); `macos-latest` runs them daily and on manual dispatch
+  (`macos-nightly.yml`), not per PR, because macOS runners are costly and limited to five concurrent jobs across the
+  organization. The other feature lanes run on `ubuntu-latest` per PR. `fmt`, `clippy`,
   `doc`, `coverage`, the Miri lanes and `package-tests` run on `ubuntu-latest` only. Windows is neither built nor
   tested.
 - **Local gate**: `cargo test --workspace`.
