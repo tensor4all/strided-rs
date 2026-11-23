@@ -1,0 +1,116 @@
+name: macOS nightly
+
+# macOS is a claimed platform (CONTRIBUTING.md, "Platforms claimed"). Its two
+# jobs used to be matrix rows of ci.yml and ran on every pull request and push:
+# `cargo test (macos-latest)` and `feature lanes (parallel, macos-latest)`.
+# macOS runners are the organization's most expensive Actions SKU (November
+# 2026: about $1,480 list price across tensor4all, 57% of Actions cost), and the
+# Team plan allows only five concurrent macOS jobs across the whole
+# organization, so per-PR runs queued macOS jobs in every other repository.
+# They now run once a day; dispatch this workflow on a branch to check a
+# macOS-sensitive change before merging. A failing scheduled run files an issue.
+
+on:
+  schedule:
+    - cron: "37 17 * * *"   # 17:37 UTC = 02:37 JST, daily; off the :00/:30 herd
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test (macos-latest)
+    runs-on: macos-latest
+    # Same backstop as ci.yml's `test` job (tensor4all/strided-rs#395).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --profile ci
+
+      - name: Report Cargo artifact usage
+        if: always()
+        run: |
+          du -sh target
+          df -h target
+
+  # The macOS row of ci.yml's `parallel` feature lane; see the comments on the
+  # `features` job there for why the package lists and assertions look like this.
+  features-parallel:
+    name: feature lanes (parallel, macos-latest)
+    runs-on: macos-latest
+    env:
+      LANE_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-kernel -p strided-fused
+      LANE_TEST_PACKAGES: >-
+        -p strided-traits -p strided-view -p strided-basic -p strided-perm
+        -p strided-fused
+      LANE_TEST_EXTRA: -p strided-kernel
+      LANE_FLAGS: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: features-parallel-macos-latest
+
+      - name: Assert the lane's feature set (library graph)
+        env:
+          WANT_BASIC: default parallel simd
+          WANT_PULP: "yes"
+        run: |
+          cargo build --profile ci $LANE_PACKAGES $LANE_FLAGS --message-format=json \
+            | python3 scripts/assert-lane-features.py
+
+      - name: Assert the lane's feature set (test graph)
+        env:
+          WANT_BASIC: default parallel simd
+          WANT_PULP: "yes"
+        run: |
+          cargo test --profile ci $LANE_TEST_PACKAGES $LANE_TEST_EXTRA $LANE_FLAGS --no-run --message-format=json \
+            | python3 scripts/assert-lane-features.py
+
+      - name: Run tests (parallel)
+        run: cargo test --profile ci $LANE_TEST_PACKAGES $LANE_TEST_EXTRA $LANE_FLAGS
+
+  # A separate job, so a run that dies before its last step still reports. One
+  # rolling issue, found by title. Manual dispatches report in the run only.
+  report:
+    name: Report a failing night
+    needs: [test, features-parallel]
+    if: ${{ always() && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: File or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Scheduled macOS nightly is failing"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf -v body '%s\n\n%s\n' \
+            "The scheduled macOS jobs failed in [run ${GITHUB_RUN_ID}](${run_url}) on \`${GITHUB_SHA:0:8}\`." \
+            "PR CI no longer runs on macOS; dispatch \`macos-nightly.yml\` on a fix branch to verify it."
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

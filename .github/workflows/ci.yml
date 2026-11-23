@@ -74,7 +74,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS runs daily in macos-nightly.yml, not per PR (Actions cost and the
+        # organization-wide limit of five concurrent macOS jobs). The matrix stays
+        # so the required check keeps its name, `cargo test (ubuntu-latest)`.
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       # No `components: clippy`: clippy runs in its own job, and installing it here
@@ -117,11 +120,11 @@ jobs:
   # on.
   #
   # The `default` lane is the `test` job's `cargo test --profile ci` step. The
-  # `parallel` lane runs on both operating systems, because it is the only place
-  # the `#[cfg(feature = "parallel")]` tests of `strided-fused`
+  # `parallel` lane also runs on macOS, daily, in macos-nightly.yml, because it is
+  # the only place the `#[cfg(feature = "parallel")]` tests of `strided-fused`
   # (strided-fused/src/fused/tests/tests.rs:336,778) and of `strided-kernel`
-  # (strided-kernel/tests/erased_policy_parallel.rs, 13 tests) run alongside the
-  # macOS host class.
+  # (strided-kernel/tests/erased_policy_parallel.rs, 13 tests) run on the macOS
+  # host class.
   features:
     name: feature lanes (${{ matrix.lane }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -149,13 +152,6 @@ jobs:
         include:
           - lane: parallel
             os: ubuntu-latest
-            flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
-            test_flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
-            test_extra: -p strided-kernel
-            basic: default parallel simd
-            pulp: yes
-          - lane: parallel
-            os: macos-latest
             flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
             test_flags: --features strided-basic/parallel,strided-kernel/parallel,strided-fused/parallel,strided-perm/parallel
             test_extra: -p strided-kernel
