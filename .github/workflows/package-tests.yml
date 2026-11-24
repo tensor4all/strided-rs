@@ -9,8 +9,14 @@ name: Packaged crate tests
 # コスト: matrix の各ジョブが自分の依存グラフを一からビルドするので、1 回の run で
 # 共有クレート（strided-traits など）をジョブの数だけコンパイルし直す。なので PR ごとの
 # 必須レーンには置かない。週次 schedule + `workflow_dispatch` と、リリースブランチへの
-# push のときだけ回す。失敗は run の色だけで示す（miri のように issue は起票しない。
-# PR を止めない週次の信号なので、まず色を見る）。
+# push のときだけ回す。
+#
+# 失敗は **issue にする**（末尾の `report` job、main の run だけ）。以前は「run の色
+# だけで示す」としていたが、2026-11-09 / 11-16 / 11-23 の 3 週連続の赤を誰も拾わず、
+# 外部の nightly monitor が #517 を起票するまで放置された。PR を止めない週次の信号は
+# 色を見る人がいないので、miri.yml と同じく手番の残る issue で知らせる。同じ issue に
+# 追記し、緑に戻ったら閉じる。release/** への push はリリース途中の赤が想定内なので
+# 起票しない。
 #
 # 対象クレートはハードコードしない。ここは workspace の Cargo.toml の publish 設定
 # から機械的に決める（`cargo metadata` の `publish` が `[]` のクレート＝
@@ -70,6 +76,8 @@ jobs:
     name: published content identity
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      report: ${{ steps.compare.outputs.report }}
     steps:
       # 公開アーカイブが記録する commit がこの ref の祖先かを git に聞くので、
       # checkout の既定（fetch-depth: 1）では「検証不能」になる。
@@ -77,8 +85,26 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      # 出力は `report` job が issue に **そのまま** 貼る（#517 は手で書き写した
+      # crate 名と file 一覧が食い違い、診断を誤らせた）。終了コードは保つ。
       - name: Compare each published .crate with this tree
-        run: python3 scripts/published_identity.py . --ref "$GITHUB_SHA"
+        id: compare
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/identity.txt"
+          # Actions は `bash -e` で回すので、`|| rc=$?` で受けないと MISMATCH (exit 1)
+          # の時点で step が止まり、肝心の report が出力されない。pipefail なので
+          # rc は python の終了コード（tee が落ちればそれも赤）。
+          rc=0
+          python3 scripts/published_identity.py . --ref "$GITHUB_SHA" 2>&1 | tee "$out" || rc=$?
+          delim="identity_$(openssl rand -hex 16)"
+          {
+            echo "report<<${delim}"
+            echo "exit ${rc}"
+            head -n 200 "$out"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
   package:
     name: cargo test in the .crate (${{ matrix.crate }})
@@ -125,3 +151,30 @@ jobs:
       - name: Test the unpacked package
         working-directory: ${{ steps.package.outputs.dir }}
         run: cargo test --all-features
+
+  # 失敗を issue にする（#517）。main の run だけ（schedule と main での dispatch）。
+  # 起票ロジックは scripts/package-tests-report.sh（stub の gh でローカル検証できる）。
+  # 既存の open issue があれば追記、全緑なら追記して閉じる。起票に失敗したら赤。
+  report:
+    name: file the result as an issue
+    needs: [list, identity, package]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - name: File, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LIST_RESULT: ${{ needs.list.result }}
+          IDENTITY_RESULT: ${{ needs.identity.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          IDENTITY_REPORT: ${{ needs.identity.outputs.report }}
+        run: bash scripts/package-tests-report.sh
