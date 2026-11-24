@@ -4,13 +4,36 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
-## 0.15.0 (unreleased) — minor
+## 0.16.0 / 0.15.1 (unreleased) — breaking for `strided-basic` and `strided-kernel`
 
-`0.14.0` (and `strided-view` 0.8.0) is the published line. The tree already carries this section's unreleased `0.15.0`
-manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel`, and `strided-view`
-0.8.1; the inherited workspace version is `0.7.2`. The parked `0.14.1` patch (#452) was superseded by the #468 bump and
-never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
-manifests move when it is released.
+`0.15.0` shipped on crates.io on 2026-11-17 from `e9e6abe` (the per-crate `*-v0.15.0` tags). Since then `main` has
+changed shipped files in `strided-basic`, `strided-kernel`, `strided-nn` and `strided-perm` without moving their
+versions, so `python3 scripts/published_identity.py .` reported `4 mismatch(es)` on `main` (`dc7d27a`, `e2beae9`) while
+the same check at the tags reports none: **the published 0.15.0 archives match their tags, and do not match `main`
+before this bump** (#517, #518). The weekly `Packaged crate tests` job failed on it, and `cargo test` in the packaged
+`strided-kernel` could not build (`cannot find trait ScatterScalar`) because it resolved `strided-basic` 0.15.0 from
+crates.io. Nothing is yanked and the tags do not move: 0.15.0 is exactly what its tag says.
+
+| crate | version | why |
+|---|---|---|
+| `strided-basic` | 0.15.0 → **0.16.0** | #510 narrows the public bound of `ScatterPlan::execute` from `Copy + Add<Output = T> + Send + Sync` to the sealed `ScatterScalar` (below): a type 0.15.0 accepts is rejected, so the 0.x "major" moves. #503/#507/#509 change behaviour and docs inside that release. |
+| `strided-kernel` | 0.15.0 → **0.16.0** | `pub use strided_basic::*` re-exports the narrowed `ScatterPlan`, so the break is its own; #503 makes initialized erased integer scatter wrap. |
+| `strided-nn` | 0.15.0 → **0.15.1** | #506 only adds items (`norm`, `activation`, `NormError`, `ActivationError`); no existing signature or enum changes, and its public API names no type owned by `strided-basic` (`Exec` is `threadteam`'s). |
+| `strided-perm` | 0.15.0 → **0.15.1** | #511/#512 change comments and turn a `_` match arm into the two explicit arms it covered; no API or behaviour change. Still a byte change in a shipped file. |
+| `strided-fused` | 0.15.0 → **0.15.1** | No source change, but it depends on `strided-basic`, whose requirement becomes `^0.16`: a `strided-fused` packaged from this tree is not the 0.15.0 archive (which requires `^0.15`), and while it says 0.15.0 the identity check cannot package it at all (exit 2, an unpublished dependency). Its public API names no `strided-basic`-owned type (`StridedView`, `StridedError` are `strided-view`'s), so a patch. |
+| `strided-view`, `strided-traits` | unchanged (0.8.1, 0.7.2) | Identical to the published archives. |
+
+`strided-multilinear` (0.1.0, `publish = false`) also changed after the tag (#497, #499, #501, #507; its notes sit in
+the 0.15.0 section below), but it has never been published, so there is no archive to match and no version to move.
+
+`[workspace.dependencies]` moves with the crates; no workspace crate pins an exact `=0.15.x`. The crate READMEs'
+dependency snippets name the version they will ship in.
+
+**Pinned to 0.15.0?** Nothing changes for you: 0.15.0 is still on crates.io, still matches its tag, and `^0.15` will
+pick up `strided-nn`, `strided-perm` and `strided-fused` 0.15.1 once published (additive or no API change). The
+`ScatterScalar` bound and the integer-scatter wrapping exist only in `strided-basic` / `strided-kernel` 0.16.0, which
+`^0.15` never selects; moving to them is an explicit edit. Code read from `main` between 2026-11-17 and this bump
+describes 0.16.0, not 0.15.0.
 
 ### `strided-basic`: `ScatterPlan::execute` is bound to the sealed `ScatterScalar` and wraps integers (#508) — breaking
 
@@ -39,6 +62,21 @@ scratch, the parameter VJPs and activation forwards take caller scratch (`layer_
 `rms_norm_weight_scratch_len`, `activation::scratch_len`). Results are bitwise identical at every thread count. Written
 independently from the mathematical definitions; llmlip.rs is a functional reference only. A3-A5 and B1-B3 of #504
 follow separately.
+
+### `strided-perm`: the serial fallbacks of the blocked executor state why they stay serial (#209)
+
+Comments only, plus the `_` arm of the rootless-plan match spelled as its two cases (`Scalar`, `GroupedTranspose`),
+both still `execute_serial` (#511, #512). No behaviour change.
+
+## 0.15.0 (2026-11-17) — minor
+
+Published from `e9e6abe` (tags `strided-*-v0.15.0`). The paragraph below is the pre-release note, kept as written.
+
+`0.14.0` (and `strided-view` 0.8.0) is the published line. The tree already carries this section's unreleased `0.15.0`
+manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel`, and `strided-view`
+0.8.1; the inherited workspace version is `0.7.2`. The parked `0.14.1` patch (#452) was superseded by the #468 bump and
+never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
+manifests move when it is released.
 
 ### `strided-perm`: `copy_conj_into` and `copy_conj_into_uninit`
 
