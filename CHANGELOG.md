@@ -4,7 +4,7 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
-## 0.16.0 / 0.15.1 (unreleased) — breaking for `strided-basic` and `strided-kernel`
+## 0.16.0 / `strided-perm` 0.15.1 (unreleased) — breaking
 
 `0.15.0` shipped on crates.io on 2026-11-17 from `e9e6abe` (the per-crate `*-v0.15.0` tags). Since then `main` has
 changed shipped files in `strided-basic`, `strided-kernel`, `strided-nn` and `strided-perm` without moving their
@@ -16,11 +16,11 @@ crates.io. Nothing is yanked and the tags do not move: 0.15.0 is exactly what it
 
 | crate | version | why |
 |---|---|---|
-| `strided-basic` | 0.15.0 → **0.16.0** | #510 narrows the public bound of `ScatterPlan::execute` from `Copy + Add<Output = T> + Send + Sync` to the sealed `ScatterScalar` (below): a type 0.15.0 accepts is rejected, so the 0.x "major" moves. #503/#507/#509 change behaviour and docs inside that release. |
+| `strided-basic` | 0.15.0 → **0.16.0** | #510 narrows the public bound of `ScatterPlan::execute` from `Copy + Add<Output = T> + Send + Sync` to the sealed `ScatterScalar` (below): a type 0.15.0 accepts is rejected, so the 0.x major moves. #503/#507/#509 change behaviour and docs inside that release. |
 | `strided-kernel` | 0.15.0 → **0.16.0** | `pub use strided_basic::*` re-exports the narrowed `ScatterPlan`, so the break is its own; #503 makes initialized erased integer scatter wrap. |
-| `strided-nn` | 0.15.0 → **0.15.1** | #506 only adds items (`norm`, `activation`, `NormError`, `ActivationError`); no existing signature or enum changes, and its public API names no type owned by `strided-basic` (`Exec` is `threadteam`'s). |
-| `strided-perm` | 0.15.0 → **0.15.1** | #511/#512 change comments and turn a `_` match arm into the two explicit arms it covered; no API or behaviour change. Still a byte change in a shipped file. |
-| `strided-fused` | 0.15.0 → **0.15.1** | No source change, but it depends on `strided-basic`, whose requirement becomes `^0.16`: a `strided-fused` packaged from this tree is not the 0.15.0 archive (which requires `^0.15`), and while it says 0.15.0 the identity check cannot package it at all (exit 2, an unpublished dependency). Its public API names no `strided-basic`-owned type (`StridedView`, `StridedError` are `strided-view`'s), so a patch. |
+| `strided-nn` | 0.15.0 → **0.16.0** | #506 itself only adds items (`norm`, `activation`, `NormError`, `ActivationError`). It moves with `strided-basic` because its requirement becomes `^0.16`: as a 0.15.1 it would be selected by `^0.15` and pull `strided-basic` 0.16.0 into a 0.15 dependency graph next to the 0.15.0 that `strided-kernel`/`strided-basic` 0.15.0 require (two copies, with no edit by the user). |
+| `strided-fused` | 0.15.0 → **0.16.0** | No source change; the identity check reports it `ok` only because the generated `Cargo.toml` is not compared. Its `strided-basic` requirement becomes `^0.16`, so a fused packaged from this tree is not the 0.15.0 archive (left at 0.15.0 the identity check cannot package it: exit 2). Its public API also names basic-owned items: the public fields `FusedInst::inputs` and `FusedPlan::outputs` / `ops` are `strided_basic::OperandVec<usize>` / `InlineVec<FusedInst>`, `tinyvec::TinyVec` aliases whose capacities (`OPERAND_CAP = 5`, and `strided-view`'s `INLINE_RANK`) only stay the same type across basic versions while those constants agree. Same reason as `strided-nn` to take the major. |
+| `strided-perm` | 0.15.0 → **0.15.1** | #511/#512 change comments and turn a `_` match arm into the two explicit arms it covered; no API or behaviour change. It does not depend on `strided-basic`. Still a byte change in a shipped file. |
 | `strided-view`, `strided-traits` | unchanged (0.8.1, 0.7.2) | Identical to the published archives. |
 
 `strided-multilinear` (0.1.0, `publish = false`) also changed after the tag (#497, #499, #501, #507; entries below),
@@ -29,11 +29,18 @@ but it has never been published, so there is no archive to match and no version 
 `[workspace.dependencies]` moves with the crates; no workspace crate pins an exact `=0.15.x`. The crate READMEs'
 dependency snippets name the version they will ship in.
 
-**Pinned to 0.15.0?** Nothing changes for you: 0.15.0 is still on crates.io, still matches its tag, and `^0.15` will
-pick up `strided-nn`, `strided-perm` and `strided-fused` 0.15.1 once published (additive or no API change). The
-`ScatterScalar` bound and the integer-scatter wrapping exist only in `strided-basic` / `strided-kernel` 0.16.0, which
-`^0.15` never selects; moving to them is an explicit edit. Code read from `main` between 2026-11-17 and this bump
-describes 0.16.0, not 0.15.0.
+**Pinned to 0.15.0?** 0.15.0 stays on crates.io, still matches its tag, and is not yanked. Once this line is published,
+`^0.15` selects only `strided-perm` 0.15.1 (comments and an equivalent match; no API or behaviour change); every crate
+that depends on `strided-basic` moves to 0.16.0, which `^0.15` never selects, so a 0.15 graph gets no `strided-basic`
+0.16.0 and no `ScatterScalar` bound or integer-wrap change without an explicit edit. Code read from `main` between
+2026-11-17 and this bump describes 0.16.0, not 0.15.0.
+
+**Between merging this and the publish, `main` is red in `Packaged crate tests`.** `cargo package` resolves
+dependencies on crates.io, so the `.crate` jobs for `strided-basic` (needs `strided-perm` 0.15.1), `-fused`, `-nn` and
+`-kernel` (need `strided-basic` 0.16.0) fail with `failed to select a version`, and on `main` the report job opens (or
+appends to) a `package-tests-failure` issue. Only the identity job is green, as `unpublished` — which also means it
+verifies nothing for the five moved crates until they are published. Publishing in dependency order (`strided-perm`
+0.15.1 → `strided-basic` 0.16.0 → `strided-fused` / `strided-nn` 0.16.0 → `strided-kernel` 0.16.0) closes it.
 
 ### `strided-basic`: `ScatterPlan::execute` is bound to the sealed `ScatterScalar` and wraps integers (#508) — breaking
 
