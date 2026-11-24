@@ -23,8 +23,8 @@ crates.io. Nothing is yanked and the tags do not move: 0.15.0 is exactly what it
 | `strided-fused` | 0.15.0 → **0.15.1** | No source change, but it depends on `strided-basic`, whose requirement becomes `^0.16`: a `strided-fused` packaged from this tree is not the 0.15.0 archive (which requires `^0.15`), and while it says 0.15.0 the identity check cannot package it at all (exit 2, an unpublished dependency). Its public API names no `strided-basic`-owned type (`StridedView`, `StridedError` are `strided-view`'s), so a patch. |
 | `strided-view`, `strided-traits` | unchanged (0.8.1, 0.7.2) | Identical to the published archives. |
 
-`strided-multilinear` (0.1.0, `publish = false`) also changed after the tag (#497, #499, #501, #507; its notes sit in
-the 0.15.0 section below), but it has never been published, so there is no archive to match and no version to move.
+`strided-multilinear` (0.1.0, `publish = false`) also changed after the tag (#497, #499, #501, #507; entries below),
+but it has never been published, so there is no archive to match and no version to move.
 
 `[workspace.dependencies]` moves with the crates; no workspace crate pins an exact `=0.15.x`. The crate READMEs'
 dependency snippets name the version they will ship in.
@@ -41,15 +41,22 @@ describes 0.16.0, not 0.15.0.
 `T: Copy + Add<Output = T> + Send + Sync`, and accumulates with `ScatterScalar::wrapping_add`. `ScatterScalar` is a
 new sealed trait implemented for `f32`, `f64`, `i32`, `i64`, `Complex32` and `Complex64`: integers wrap on overflow in
 every build profile, floats and complex numbers use IEEE addition. Before, an `i32`/`i64` update past the dtype extrema
-panicked under overflow checks (debug/test) and wrapped in release, while `ErasedScatterPlan::execute` and both
-`execute_uninit` entries wrapped; all four entries now share one combine and agree on the same input (#502, #503).
-`ErasedScatterPlan::execute` calls the typed `execute` directly, and `execute_uninit` passes the same
-`ScatterScalar::wrapping_add`.
+panicked under overflow checks (debug/test) and wrapped in release, while `ErasedScatterPlan::execute` and
+`ErasedScatterPlan::execute_uninit` wrapped (#502, #503). The three scatter entries with a fixed combine
+(`ScatterPlan::execute` and the two `ErasedScatterPlan` entries) now share `ScatterScalar::wrapping_add` and agree on the
+same input: `ErasedScatterPlan::execute` calls the typed `execute` directly, and `ErasedScatterPlan::execute_uninit`
+passes `ScatterScalar::wrapping_add` to `execution::scatter_into_uninit`.
+
+The explicit-combine entries are unchanged in behavior. `ScatterPlan::execute_with_combine` and
+`execution::scatter_into_uninit` apply whatever `combine` the caller passes, so they match `execute` only when that
+combine is `ScatterScalar::wrapping_add`. A caller that passes `|a, b| a + b` still panics at integer extrema under
+overflow checks. Other accumulating plans, such as `RunSumPlan::execute_acc`, still use `Add` and are not covered by
+this change.
 
 This is breaking for a generic caller whose element type is outside that set or that names only the old bound: use
-`ScatterPlan::execute_with_combine(.., combine, ..)`, the explicit-combine entry, which keeps `fn(T, T) -> T` and now
-needs only `T: Copy + Send + Sync` (the unused `Add` bound is dropped there and on
-`execution::scatter_into_uninit`, which is not breaking).
+`ScatterPlan::execute_with_combine(.., combine, ..)`, which keeps `fn(T, T) -> T` and now needs only
+`T: Copy + Send + Sync`. The unused `Add` bound is dropped there and on `execution::scatter_into_uninit`, which is not
+breaking.
 
 ### `strided-nn`: `norm` and `activation` row kernels (#504, phase 1)
 
@@ -68,15 +75,54 @@ follow separately.
 Comments only, plus the `_` arm of the rootless-plan match spelled as its two cases (`Scalar`, `GroupedTranspose`),
 both still `execute_serial` (#511, #512). No behaviour change.
 
+### `strided-multilinear`: renamed from `strided-segpoly` (#505)
+
+The crate is renamed from `strided-segpoly` to `strided-multilinear` before its first publish (#505, #507): the
+executor computes a general sparse multilinear form (`Σ_paths c · Π_operands x[segment]`), and the polynomial is only
+the special case where one buffer feeds several operands — the name cuEquivariance's `SegmentedPolynomial` comes from. The type names (`SegPolyPlan`, …) keep that vocabulary so the correspondence to the
+upstream descriptor stays visible; the crate has never been published, so there is no alias.
+
+### `strided-multilinear`: a dispatched lane kernel and a lane reduction (#496)
+
+The lane loop is no longer left to auto-vectorisation. Operations with one to three operands run a
+`pulp::Arch::new().dispatch(...)` body (`src/simd.rs`: `AxpyF64` / `AxpyF32`, `f64` 8 and `f32` 16 lanes on an
+AVX-512 host, `1` on a scalar target), so a baseline `x86-64` build reaches AVX2 and AVX-512 at run time with no
+`target_arch` case, no width constant and no `-C target-cpu` requirement; `scripts/check-runtime-simd-dispatch.py`
+disassembles both levels, and `lane_width::<T>()` reports the width a call selected. The body multiplies and adds as
+two operations -- never `mul_add` -- and keeps the coefficient-first association, so its result is bit-identical to the
+scalar loop; an operand with a lane extent of 1 is splatted and one with a lane stride other than 0 or 1 is copied into
+a per-worker tile first. Four-or-more-operand operations keep the scalar loop.
+
+A destination whose own lane extent is 1 while the inputs' is `u` used to be rejected (`OutputLaneBroadcast`) and is now
+the lane reduction it reads as: it sums each row's `u` lanes in increasing lane order after the block partials are
+combined, which extends the documented order by one rule and leaves the rest in place. The VJP wrt the spherical
+harmonics of a MACE layer-1 CG block, previously 11 008 scalar paths over `N x 5 120` rows, is 86 paths of 128 lanes:
+11-16x faster in the layer-1 A/B and no `[E, 16, 128]` intermediate, with `f64` `bar_y` at the rounding level of the
+sum (1.7e-15 -> 2.2e-15 relative to the scale at 128 atoms) and `f32` better (3.4e-6 -> 1.0e-6).
+`scratch_len` now also covers one pack area per worker and reports the new floor through `ScratchTooSmall`. The
+measurements, the per-cell before/after tables, the allocation evidence and the thread sweep are in
+[`docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md`](docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md).
+
+### `strided-multilinear`: a register-resident accumulator chunk (#500)
+
+The dispatched row body keeps eight accumulator vectors in registers while it walks the paths of one segment, instead
+of loading and storing the accumulator once per path. The per-lane statement is unchanged -- still
+`((c·a_0)·a_1)·a_2` followed by one add, in path order, with no `mul_add` -- so the kernel remains bit-identical to
+the scalar loop and the scalar level is the same chunk with one-lane vectors. The change removes two of the five
+memory operations per path and vector, which is what the aarch64 NEON kernel (2 `f64` / 4 `f32` lanes) is bound by.
+On the Apple M5 Max the f32 4T VJP ratio against llmlip is 0.672 / 0.656 at 128 / 1024 atoms (the target was <= 1.0;
+the untuned floor was 0.775 / 0.786) and the x86-64 evo2 host is 1.30-1.51x faster on VJP than #499. The tests now
+run 201 lanes so every vector level exercises a full chunk, a partial chunk and the scalar remainder. Before/after tables,
+the host protocol and the raw campaigns are in
+[`docs/worklogs/2026-11-18-issue-500-aarch64-m5.md`](docs/worklogs/2026-11-18-issue-500-aarch64-m5.md).
+
 ## 0.15.0 (2026-11-17) — minor
 
-Published from `e9e6abe` (tags `strided-*-v0.15.0`). The paragraph below is the pre-release note, kept as written.
-
-`0.14.0` (and `strided-view` 0.8.0) is the published line. The tree already carries this section's unreleased `0.15.0`
-manifests for `strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel`, and `strided-view`
-0.8.1; the inherited workspace version is `0.7.2`. The parked `0.14.1` patch (#452) was superseded by the #468 bump and
-never published, so a new parameter on `copy_into_col_major` is a minor that lands in this unreleased section, and those
-manifests move when it is released.
+Published to crates.io on 2026-11-17 from `e9e6abe` (#493; tags `strided-{basic,fused,kernel,nn,perm}-v0.15.0`):
+`strided-basic`, `strided-nn`, `strided-fused`, `strided-perm` and `strided-kernel` 0.15.0, with `strided-view` 0.8.1
+(`strided-view-v0.8.1`); `strided-traits` stays 0.7.2. It supersedes the unpublished `0.14.1` patch (#452, #468) and
+carries the `copy_into_col_major` signature change, a minor on the 0.x line. Entries below that say a crate or version
+is "still unpublished in the tree" describe the state before this release.
 
 ### `strided-perm`: `copy_conj_into` and `copy_conj_into_uninit`
 
@@ -214,15 +260,7 @@ downstream exhaustive `match`. `strided-view` is still unpublished in the tree (
 This is the typed half of #479, and the executor that consumes the index for its scattered outputs is the
 `strided-multilinear` section below. The dtype-erased replay (`strided-kernel`) is not in it.
 
-### `strided-multilinear`: the segmented-polynomial executor (#479 part 2)
-
-The crate enters the 0.15.0 release (crate version 0.1.0) as
-`strided-multilinear`, renamed from `strided-segpoly` before
-its first publish (#505): the executor computes a general sparse multilinear form
-(`Σ_paths c · Π_operands x[segment]`), and the polynomial is only the special case where
-one buffer feeds several operands — the name cuEquivariance's `SegmentedPolynomial` comes
-from. The type names (`SegPolyPlan`, …) keep that vocabulary so the correspondence to the
-upstream descriptor stays visible; the crate has never been published, so there is no alias.
+### `strided-multilinear` (then `strided-segpoly`): the segmented-polynomial executor (#479 part 2)
 
 A new unpublished crate (`publish = false`, so no published content changes) executes a lowered segmented-polynomial
 descriptor. `SegPolyPlan::compile` takes the operations, paths and per-buffer `IndexMode`s together with the inputs' and
@@ -259,40 +297,6 @@ gather+scatter message-passing case with a run of several rows. On top of those,
 analytic derivative, the transpose as a discrete adjoint, one-token and n-token bitwise equality, and the rejection
 table. `benches/executor.rs` measures the fused path against the two-pass alternative (materialise every product, then
 `RunSumPlan`).
-
-#### A dispatched lane kernel and a lane reduction (#496)
-
-The lane loop is no longer left to auto-vectorisation. Operations with one to three operands run a
-`pulp::Arch::new().dispatch(...)` body (`src/simd.rs`: `AxpyF64` / `AxpyF32`, `f64` 8 and `f32` 16 lanes on an
-AVX-512 host, `1` on a scalar target), so a baseline `x86-64` build reaches AVX2 and AVX-512 at run time with no
-`target_arch` case, no width constant and no `-C target-cpu` requirement; `scripts/check-runtime-simd-dispatch.py`
-disassembles both levels, and `lane_width::<T>()` reports the width a call selected. The body multiplies and adds as
-two operations -- never `mul_add` -- and keeps the coefficient-first association, so its result is bit-identical to the
-scalar loop; an operand with a lane extent of 1 is splatted and one with a lane stride other than 0 or 1 is copied into
-a per-worker tile first. Four-or-more-operand operations keep the scalar loop.
-
-A destination whose own lane extent is 1 while the inputs' is `u` used to be rejected (`OutputLaneBroadcast`) and is now
-the lane reduction it reads as: it sums each row's `u` lanes in increasing lane order after the block partials are
-combined, which extends the documented order by one rule and leaves the rest in place. The VJP wrt the spherical
-harmonics of a MACE layer-1 CG block, previously 11 008 scalar paths over `N x 5 120` rows, is 86 paths of 128 lanes:
-11-16x faster in the layer-1 A/B and no `[E, 16, 128]` intermediate, with `f64` `bar_y` at the rounding level of the
-sum (1.7e-15 -> 2.2e-15 relative to the scale at 128 atoms) and `f32` better (3.4e-6 -> 1.0e-6).
-`scratch_len` now also covers one pack area per worker and reports the new floor through `ScratchTooSmall`. The
-measurements, the per-cell before/after tables, the allocation evidence and the thread sweep are in
-[`docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md`](docs/worklogs/2026-11-17-issue-496-segpoly-simd-reduce.md).
-
-#### A register-resident accumulator chunk (#500)
-
-The dispatched row body keeps eight accumulator vectors in registers while it walks the paths of one segment, instead
-of loading and storing the accumulator once per path. The per-lane statement is unchanged -- still
-`((c·a_0)·a_1)·a_2` followed by one add, in path order, with no `mul_add` -- so the kernel remains bit-identical to
-the scalar loop and the scalar level is the same chunk with one-lane vectors. The change removes two of the five
-memory operations per path and vector, which is what the aarch64 NEON kernel (2 `f64` / 4 `f32` lanes) is bound by.
-On the Apple M5 Max the f32 4T VJP ratio against llmlip is 0.672 / 0.656 at 128 / 1024 atoms (the target was <= 1.0;
-the untuned floor was 0.775 / 0.786) and the x86-64 evo2 host is 1.30-1.51x faster on VJP than #499. The tests now
-run 201 lanes so every vector level exercises a full chunk, a partial chunk and the scalar remainder. Before/after tables,
-the host protocol and the raw campaigns are in
-[`docs/worklogs/2026-11-18-issue-500-aarch64-m5.md`](docs/worklogs/2026-11-18-issue-500-aarch64-m5.md).
 
 ### `strided-view` 0.8.1: `auxiliary::index_order_into`
 
