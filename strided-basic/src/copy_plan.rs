@@ -17,6 +17,7 @@ use core::{
     marker::PhantomData,
     mem::{size_of, MaybeUninit},
     ops::{Add, Mul},
+    time::Duration,
 };
 
 use num_traits::{One, Zero};
@@ -304,6 +305,43 @@ impl CopyPlan {
             dst_span: span_elements(dims, dst_strides),
             src_span: span_elements(dims, src_strides),
         })
+    }
+
+    /// Serial time one replay of this plan is estimated at on this host, for
+    /// operands of `T`.
+    ///
+    /// The rate is the one the plan's own width decision uses: the `Copy` row,
+    /// plus the per-run cache-line term of its walk, plus the beyond-L2 term when
+    /// the working set does not fit the class's L2 cache (strided-rs#364). The
+    /// element type is a parameter because `compile` stores only the layout; the
+    /// working set in bytes, and so the cache level that selects the rate, needs
+    /// `size_of::<T>()`.
+    ///
+    /// A caller that composes many plans under its own outer split can compare
+    /// this duration with `Exec`'s dispatch cost without restating the model, so
+    /// the two decisions stay consistent (strided-rs#363).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strided_basic::CopyPlan;
+    ///
+    /// let plan = CopyPlan::compile(&[2, 3], &[1, 2], &[3, 1]).unwrap();
+    /// let cost: core::time::Duration = plan.serial_cost::<f64>();
+    /// assert!(cost > core::time::Duration::ZERO);
+    /// ```
+    pub fn serial_cost<T>(&self) -> Duration {
+        self.serial_cost_on::<T, T>(HostClass::detect())
+    }
+
+    /// [`Self::serial_cost`] priced for host class `host`: the class is a
+    /// parameter so that the tests can pin it.
+    pub(crate) fn serial_cost_on<D, S>(&self, host: HostClass) -> Duration {
+        // `compile` already rejected an overflowing element count, so the
+        // saturation is unreachable; it is the conservative direction if it ever
+        // were reached.
+        let elements = crate::kernel::total_len(&self.dims).unwrap_or(usize::MAX);
+        Duration::from_secs_f64(elements as f64 * self.ns_per_element_on::<D, S>(host) * 1e-9)
     }
 
     /// Serial rate this plan prices itself at on host class `host`: the `Copy`

@@ -42,6 +42,10 @@ appends to) a `package-tests-failure` issue. Only the identity job is green, as 
 verifies nothing for the five moved crates until they are published. Publishing in dependency order (`strided-perm`
 0.15.1 → `strided-basic` 0.16.0 → `strided-fused` / `strided-nn` 0.16.0 → `strided-kernel` 0.16.0) closes it.
 
+### `strided-basic`: `CopyPlan::serial_cost` exposes the rate the plan's gate uses (#363)
+
+`CopyPlan::serial_cost::<T>()` returns the serial `Duration` one replay is priced at: the element count times the plan's own rate, including the per-run cache-line term and the beyond-L2 term of #364. The element type is a parameter because `compile` stores only the layout; the working set in bytes, and so the cache level that selects the rate, needs `size_of::<T>()`. A caller composing many plans under an outer split can compare it with `Exec`'s dispatch cost without restating the model, so the two decisions stay consistent.
+
 ### `strided-basic`: `ScatterPlan::execute` is bound to the sealed `ScatterScalar` and wraps integers (#508) — breaking
 
 `ScatterPlan::execute` (also reachable as `strided_kernel::ScatterPlan`) now takes `T: ScatterScalar` instead of
