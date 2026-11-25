@@ -1335,3 +1335,37 @@ fn an_update_plan_past_l2_forks_at_its_own_rate() {
         "priced for a class without a per-run term the update replay must stay serial"
     );
 }
+
+/// A plan's `serial_cost` is its element count times the rate its own gate uses,
+/// so a caller composing plans under an outer split can reuse that rate instead
+/// of restating the model (strided-rs#363).
+#[test]
+fn serial_cost_is_elements_times_the_plans_own_rate() {
+    use threadteam::HostClass;
+    let host = HostClass::X86_64Avx512;
+    let plan = CopyPlan::compile(&[512usize, 512], &[512, 1], &[1, 512]).unwrap();
+    let expected = core::time::Duration::from_secs_f64(
+        512.0 * 512.0 * plan.ns_per_element_on::<f64, f64>(host) * 1e-9,
+    );
+    assert_eq!(plan.serial_cost_on::<f64, f64>(host), expected);
+    // The public method prices against the host the replay detects.
+    assert_eq!(
+        plan.serial_cost::<f64>(),
+        plan.serial_cost_on::<f64, f64>(HostClass::detect())
+    );
+    // The element size selects the cache level: 257 x 257 f64 is 1.056 MB of
+    // source and destination, past the class's 1 MiB L2, while f32 is inside it.
+    let edge = CopyPlan::compile(&[257usize, 257], &[257, 1], &[1, 257]).unwrap();
+    assert!(
+        edge.serial_cost_on::<f64, f64>(host) > edge.serial_cost_on::<f32, f32>(host),
+        "f64 crosses the L2 boundary at 257 x 257 where f32 does not"
+    );
+    // A contiguous plan keeps the `Copy` row at every footprint.
+    let contiguous = CopyPlan::compile(&[4096usize], &[1], &[1]).unwrap();
+    assert_eq!(
+        contiguous.serial_cost_on::<f64, f64>(host),
+        core::time::Duration::from_secs_f64(
+            4096.0 * KernelClass::Copy.ns_per_element_of(host) * 1e-9
+        )
+    );
+}
