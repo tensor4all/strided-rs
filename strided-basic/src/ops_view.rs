@@ -4,7 +4,7 @@ use crate::kernel::{
     ensure_same_shape, for_each_inner_block_preordered, pointwise_plan, same_contiguous_layout,
     sequential_contiguous_layout, total_len,
 };
-use crate::map_view::{copy_map_into, map_into, zip_map2_into};
+use crate::map_view::{copy_map_into, map_into, validate_destination_layout, zip_map2_into};
 use crate::reduce_view::reduce;
 use crate::simd;
 use crate::view::{StridedView, StridedViewMut};
@@ -356,6 +356,13 @@ pub fn copy_into_col_major<T: Copy + Send + Sync + 'static>(
 /// extents, and [`StridedError::OffsetOverflow`] when the element count of
 /// the shape does not fit in `usize`. Every check runs before the first
 /// write, so a rejected call leaves `dest` untouched.
+///
+/// # Destination contract
+///
+/// [`StridedError::NonInjectiveOutputLayout`] when two logical indices of
+/// `dest` name the same element (for example a stride-0 broadcast axis of
+/// extent above one): the update reads and writes `dest`, so an aliased
+/// destination would be order-dependent, and a race under a threaded `exec`.
 pub fn add_acc<
     D: Copy + Add<S, Output = D> + Send + Sync,
     S: Copy + Send + Sync,
@@ -366,6 +373,7 @@ pub fn add_acc<
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let src_ptr = src.ptr();
@@ -474,6 +482,13 @@ pub fn add_acc<
 /// extents, and [`StridedError::OffsetOverflow`] when the element count of
 /// the shape does not fit in `usize`. Every check runs before the first
 /// write, so a rejected call leaves `dest` untouched.
+///
+/// # Destination contract
+///
+/// [`StridedError::NonInjectiveOutputLayout`] when two logical indices of
+/// `dest` name the same element (for example a stride-0 broadcast axis of
+/// extent above one): the update reads and writes `dest`, so an aliased
+/// destination would be order-dependent, and a race under a threaded `exec`.
 pub fn mul_acc<
     D: Copy + Mul<S, Output = D> + Send + Sync,
     S: Copy + Send + Sync,
@@ -484,6 +499,7 @@ pub fn mul_acc<
     exec: Exec<'_>,
 ) -> Result<()> {
     ensure_same_shape(dest.dims(), src.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let src_ptr = src.ptr();
@@ -592,6 +608,13 @@ pub fn mul_acc<
 /// extents, and [`StridedError::OffsetOverflow`] when the element count of
 /// the shape does not fit in `usize`. Every check runs before the first
 /// write, so a rejected call leaves `dest` untouched.
+///
+/// # Destination contract
+///
+/// [`StridedError::NonInjectiveOutputLayout`] when two logical indices of
+/// `dest` name the same element (for example a stride-0 broadcast axis of
+/// extent above one): the update reads and writes `dest`, so an aliased
+/// destination would be order-dependent, and a race under a threaded `exec`.
 pub fn axpy_acc<D, S, A, Op>(
     dest: &mut StridedViewMut<D>,
     src: &StridedView<S, Op>,
@@ -605,6 +628,7 @@ where
     Op: ElementOp<S>,
 {
     ensure_same_shape(dest.dims(), src.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let src_ptr = src.ptr();
@@ -715,6 +739,13 @@ where
 /// different extents, and [`StridedError::OffsetOverflow`] when the element
 /// count of the shape does not fit in `usize`. Every check runs before the
 /// first write, so a rejected call leaves `dest` untouched.
+///
+/// # Destination contract
+///
+/// [`StridedError::NonInjectiveOutputLayout`] when two logical indices of
+/// `dest` name the same element (for example a stride-0 broadcast axis of
+/// extent above one): the update reads and writes `dest`, so an aliased
+/// destination would be order-dependent, and a race under a threaded `exec`.
 pub fn fma_acc<D, A, B, OpA, OpB>(
     dest: &mut StridedViewMut<D>,
     a: &StridedView<A, OpA>,
@@ -730,6 +761,7 @@ where
 {
     ensure_same_shape(dest.dims(), a.dims())?;
     ensure_same_shape(dest.dims(), b.dims())?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
 
     let dst_ptr = dest.as_mut_ptr();
     let a_ptr = a.ptr();
@@ -1904,7 +1936,8 @@ unsafe fn copy_transpose_scale_2d_loop<T>(
 /// permutation path also returns [`StridedError::OffsetOverflow`] when the
 /// layout cannot be expressed in `isize` stride arithmetic or a fused extent
 /// overflows, and [`StridedError::NonInjectiveOutputLayout`] when the
-/// destination layout cannot be proven representable and injective.
+/// destination layout cannot be proven representable and injective. The
+/// injectivity check runs on every route, before the first write.
 pub fn copy_transpose_scale_into<T>(
     dest: &mut StridedViewMut<T>,
     src: &StridedView<T>,
@@ -1922,6 +1955,7 @@ where
     let src_dims = src.dims();
     let expected_dims = [src_dims[1], src_dims[0]];
     ensure_same_shape(dest.dims(), &expected_dims)?;
+    validate_destination_layout(dest.dims(), dest.strides())?;
     // Reject an element count beyond usize (a huge stride-0 broadcast) up
     // front instead of looping over it.
     total_len(src_dims)?;

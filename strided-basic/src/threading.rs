@@ -553,14 +553,37 @@ fn mapreduce_threaded_dyn(
     // suppress the split. The shared layer applies this for every map, zip and
     // fused caller.
     let blocks = scheduler_blocks(dims, blocks);
+    let costs = write_split_costs(strides_list, costs);
     ThreadedMapReduce {
         blocks: &blocks,
         strides_list,
-        costs,
+        costs: &costs,
         ns_per_element,
         operation: f,
     }
     .run(dims, offsets, exec)
+}
+
+/// Costs for the splitter of a writing region: `costs` with the "do not split"
+/// signal (zero, tested by [`split_axis`]) set on every axis where the first
+/// operand, the destination, has stride zero.
+///
+/// `compute_costs` cannot carry that signal itself: it also weights the block
+/// sizes, which need a nonzero cost on a broadcast axis, so it maps zero to
+/// one. Splitting an axis the destination does not advance along would hand
+/// one element to two tasks, a read-modify-write race. The public RMW entries
+/// reject such destinations, so this is the second line of defence for the
+/// callers that reach the splitter without that check.
+fn write_split_costs(strides_list: &[&[isize]], costs: &[isize]) -> SVec<isize> {
+    let mut out: SVec<isize> = costs.iter().copied().collect();
+    if let Some(dst) = strides_list.first() {
+        for (cost, &stride) in out.iter_mut().zip(dst.iter()) {
+            if stride == 0 {
+                *cost = 0;
+            }
+        }
+    }
+    out
 }
 
 struct ThreadedMapReduce<'a> {
