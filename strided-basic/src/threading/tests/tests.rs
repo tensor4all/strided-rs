@@ -528,3 +528,43 @@ fn split_axis_scores_beyond_isize_select_the_exact_maximum() {
     // wrapping `isize` score (-2^63) selected axis 1.
     assert_eq!(split_axis(&[3, 8192], &[1, 1], &[1 << 62, 2]), Some(0));
 }
+
+/// A writing region never splits an axis the destination does not advance
+/// along, even when `compute_costs` (which maps zero to one for the block
+/// model) reports a nonzero cost for it. Before the guard was wired up, the
+/// zero test in `split_axis` could not fire for any real input.
+#[test]
+fn write_region_never_splits_a_stride_zero_destination_axis() {
+    let pool = test_pool(4);
+    let (exec, _root) = pooled(&pool, 4);
+    let dims = vec![1 << 12, 1 << 12];
+    let blocks = vec![64, 64];
+    let strides = vec![vec![0isize, 1], vec![1isize, 1 << 12]];
+    let costs = crate::fuse::compute_costs(&strides);
+    assert_eq!(costs.as_slice()[0], 1, "the block model needs this nonzero");
+    let offsets = vec![0isize, 0];
+
+    let axis0_extents = std::sync::Mutex::new(Vec::new());
+    mapreduce_threaded(
+        &dims,
+        &blocks,
+        &strides,
+        &offsets,
+        costs.as_slice(),
+        KernelClass::Map,
+        exec,
+        &|dims, _blocks, _strides, _offsets| {
+            axis0_extents.lock().unwrap().push(dims[0]);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let seen = axis0_extents.into_inner().unwrap();
+    // Without `parallel` nothing forks; the unsplit assertion below still holds.
+    #[cfg(feature = "parallel")]
+    assert!(seen.len() > 1, "axis 1 should still split");
+    assert!(
+        seen.iter().all(|&d| d == 1 << 12),
+        "axis 0 was split: {seen:?}"
+    );
+}
