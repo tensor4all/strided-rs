@@ -715,7 +715,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "strided-basic"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "num-complex",
  "num-traits",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "strided-perm"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "strided-view",
  "thiserror",
