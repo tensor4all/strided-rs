@@ -560,6 +560,8 @@ fn write_region_never_splits_a_stride_zero_destination_axis() {
     )
     .unwrap();
     let seen = axis0_extents.into_inner().unwrap();
+    // Without `parallel` nothing forks; the unsplit assertion below still holds.
+    #[cfg(feature = "parallel")]
     assert!(seen.len() > 1, "axis 1 should still split");
     assert!(
         seen.iter().all(|&d| d == 1 << 12),
