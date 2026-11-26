@@ -1,0 +1,23 @@
+cell dtype T atoms | ratio(median) | S min/med/max ms | L min/med/max ms | verdict (spread-overlap rule)
+cg-fwd f32 1T 128: 0.259 | 8.73/8.99/9.95 | 34.71/34.75/34.88 | strided faster
+cg-fwd f32 1T 1024: 0.332 | 92.50/92.76/93.17 | 278.87/279.21/279.93 | strided faster
+cg-fwd f32 4T 128: 0.240 | 2.15/2.31/5.87 | 8.83/9.61/12.54 | strided faster
+cg-fwd f32 4T 1024: 0.343 | 24.66/24.79/26.13 | 71.90/72.35/80.16 | strided faster
+cg-fwd f64 1T 128: 0.230 | 17.84/17.91/18.32 | 77.78/77.89/78.13 | strided faster
+cg-fwd f64 1T 1024: 0.232 | 146.27/146.67/147.73 | 631.10/632.30/633.89 | strided faster
+cg-fwd f64 4T 128: 0.449 | 4.48/4.59/5.23 | 10.13/10.23/11.75 | strided faster
+cg-fwd f64 4T 1024: 0.456 | 39.06/39.49/53.96 | 85.93/86.57/114.21 | strided faster
+cg-vjp f32 1T 128: 0.576 | 26.43/26.57/26.82 | 46.08/46.15/46.21 | strided faster
+cg-vjp f32 1T 1024: 0.519 | 221.49/222.16/223.19 | 425.40/427.66/435.21 | strided faster
+cg-vjp f32 4T 128: 0.532 | 6.33/6.37/6.58 | 11.86/11.97/14.05 | strided faster
+cg-vjp f32 4T 1024: 0.331 | 53.38/53.53/53.80 | 159.47/161.56/162.68 | strided faster
+cg-vjp f64 1T 128: 0.238 | 46.25/46.47/46.68 | 195.22/195.51/196.22 | strided faster
+cg-vjp f64 1T 1024: 0.231 | 355.04/356.57/358.39 | 1541.61/1544.13/1564.97 | strided faster
+cg-vjp f64 4T 128: 0.321 | 11.68/11.81/15.32 | 35.52/36.79/41.21 | strided faster
+cg-vjp f64 4T 1024: 0.372 | 96.43/97.01/114.33 | 258.84/260.64/263.19 | strided faster
+
+ratio = strided / llmlip (LOWER = strided faster). Spread = min..max of 15 samples. Spread rule: overlapping min..max = no change.
+Commit 131baaa, host EVO-X2 (Ryzen AI MAX+ 395), PIN=1 SETTLE=5, cells pinned to cpu 4 / 4-7.
+Anchor drift (cg-fwd f64 1T 128): strided 17.7 -> 17.0 ms (3.5 %), llmlip 77.6 -> 77.8 ms (0.3 %).
+Boost: policy*/boost = 0 on all 32 policies; global /sys/devices/system/cpu/cpufreq/boost reads 1 (see raw/522-x86/host.txt).
+Note: the harness runs 16 cells (2 cells x 2 dtypes x 1T/4T x 128/1024 atoms), not 12.

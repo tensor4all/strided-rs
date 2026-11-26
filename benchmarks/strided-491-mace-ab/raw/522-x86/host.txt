@@ -1,0 +1,5 @@
+7.0.0-42-generic
+     32 0
+1
+ 21:49:01 up 22 days,  8:19,  4 users,  load average: 0.44, 0.97, 0.61
+131baaa16c714c52d32bb21a70d8676f49748be4
