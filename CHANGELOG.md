@@ -4,6 +4,31 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 `strided-kernel`, `strided-fused`, `strided-nn`. Per-release worklogs live in
 `docs/worklogs/`.
 
+## Unreleased
+
+### `strided-fused`: `FusedOp::Subtract`; complex plans documented as unvectorized (#528) — breaking
+
+- `FusedOp::Subtract` is `a - b` with the scalar's own subtraction (IEEE, componentwise complex, wrapping integers). It
+  is bit-identical to the per-element interpreter and to `strided-kernel`'s `ErasedZipOp::Subtract`. It is not lowered
+  to `Negate` + `Add`, so a NaN operand keeps its sign. `bool` rejects it.
+- Breaking: `FusedOp` gains a variant (exhaustive matches must add an arm), and `FusedScalar` gains the required
+  method `fused_subtract` (external implementors must add it). The version row for `strided-fused` (proposed:
+  0.16.0 → 0.17.0) is left to the maintainer's decision on this PR.
+- `has_vectorized_replay::<T>()` reports whether `T` has the chunked replay. Complex32/Complex64 (and integer and
+  bool) plans that reach the interpreter (multi-instruction or multi-output, no static specialization) run element by
+  element and are not expected to beat separate `zip_map2_into` passes. Single-instruction plans keep the ordinary
+  kernels. Measurement (0.15.0, Apple M3, macOS 15.6.1, Rust 1.100.0, serial, ns/element, chain
+  `((x*y + z) + x)*z + y`, from the #528 report):
+
+  | elements | f64 fused | f64 unfused | c64 fused | c64 unfused |
+  |---|---|---|---|---|
+  | 65,536 | 1.05 | 0.89 | 15.4–15.7 | 2.2 |
+  | 4,194,304 | 1.14–1.16 | 1.43–1.51 | 15.4–15.8 | 3.0 |
+  | 16,777,216 | 1.14 | 1.44–1.52 | 15.4–15.8 | 2.9–3.0 |
+
+- A vectorized complex replay is out of scope. It needs its own issue, with the acceptance criteria from #528: bitwise
+  parity, `robust_complex_divide_*` kept, and fused ≤ 1.05 × unfused at 64 KiB and 16 Mi elements.
+
 ## 0.16.0 / `strided-perm` 0.15.1 (unreleased) — breaking
 
 `0.15.0` shipped on crates.io on 2026-11-17 from `e9e6abe` (the per-crate `*-v0.15.0` tags). Since then `main` has
