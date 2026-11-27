@@ -819,3 +819,194 @@ fn erased_fused_plan_rejects_input_output_overlap_for_uninit_outputs() {
     }
     assert_eq!(storage, [1.0, 2.0, 3.0, 4.0]);
 }
+
+// ---- `FusedOp::Subtract` (tensor4all/strided-rs#528) ----
+
+use std::hint::black_box;
+
+/// `Conj(0); Subtract(conj, 1)`: two instructions, so a chunked replay for f64.
+fn conj_subtract_plan() -> FusedPlan {
+    FusedPlan {
+        input_count: 2,
+        outputs: vec![3].into_iter().collect(),
+        ops: vec![
+            FusedInst::new(FusedOp::Conj, vec![0]),
+            FusedInst::new(FusedOp::Subtract, vec![2, 1]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// `((x*y + z) - x)*z + y` over inputs `x, y, z`.
+fn subtract_chain_plan() -> FusedPlan {
+    FusedPlan {
+        input_count: 3,
+        outputs: vec![7].into_iter().collect(),
+        ops: vec![
+            FusedInst::new(FusedOp::Multiply, vec![0, 1]),
+            FusedInst::new(FusedOp::Add, vec![3, 2]),
+            FusedInst::new(FusedOp::Subtract, vec![4, 0]),
+            FusedInst::new(FusedOp::Multiply, vec![5, 2]),
+            FusedInst::new(FusedOp::Add, vec![6, 1]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[test]
+fn erased_fused_plan_subtracts_f64_c64_and_i64() {
+    let dims = [4usize];
+    let unit = [1isize];
+
+    let a = [5.0f64, -0.0, f64::INFINITY, 1.5];
+    let b = [2.0f64, 0.0, f64::INFINITY, f64::NAN];
+    let mut dst = [0.0f64; 4];
+    let plan = ErasedFusedPlan::compile(KernelDType::F64, binary_plan(FusedOp::Subtract)).unwrap();
+    let inputs = [
+        ErasedRawStridedRef::from_slice(&a, &dims, &unit, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims, &unit, 0).unwrap(),
+    ];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims, &unit, 0).unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
+    for i in 0..4 {
+        assert_eq!(
+            dst[i].to_bits(),
+            (black_box(a[i]) - black_box(b[i])).to_bits()
+        );
+    }
+
+    let a = [Complex64::new(1.0, 2.0), Complex64::new(-3.0, 0.5)];
+    let b = [Complex64::new(0.25, -1.0), Complex64::new(2.0, 3.0)];
+    let mut dst = [Complex64::new(0.0, 0.0); 2];
+    let dims2 = [2usize];
+    let plan = ErasedFusedPlan::compile(KernelDType::C64, binary_plan(FusedOp::Subtract)).unwrap();
+    let inputs = [
+        ErasedRawStridedRef::from_slice(&a, &dims2, &unit, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims2, &unit, 0).unwrap(),
+    ];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims2, &unit, 0).unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
+    assert_eq!(dst, [Complex64::new(0.75, 3.0), Complex64::new(-5.0, -2.5)]);
+
+    let a = [i64::MIN, 0, 7];
+    let b = [1i64, i64::MIN, 10];
+    let mut dst = [0i64; 3];
+    let dims3 = [3usize];
+    let plan = ErasedFusedPlan::compile(KernelDType::I64, binary_plan(FusedOp::Subtract)).unwrap();
+    let inputs = [
+        ErasedRawStridedRef::from_slice(&a, &dims3, &unit, 0).unwrap(),
+        ErasedRawStridedRef::from_slice(&b, &dims3, &unit, 0).unwrap(),
+    ];
+    let mut dest = ErasedRawStridedMut::from_slice_mut(&mut dst, &dims3, &unit, 0).unwrap();
+    plan.execute(&mut dest, &inputs, Exec::serial()).unwrap();
+    assert_eq!(dst, [i64::MAX, i64::MIN, -3]);
+}
+
+#[test]
+fn erased_fused_plan_rejects_bool_subtract() {
+    let err =
+        ErasedFusedPlan::compile(KernelDType::Bool, binary_plan(FusedOp::Subtract)).unwrap_err();
+    assert!(matches!(
+        err,
+        StridedError::UnsupportedOp {
+            op: "subtract",
+            dtype: "bool"
+        }
+    ));
+}
+
+/// Run `plan` over f64 inputs through `execute` (initialized destination) and
+/// through `execute_uninit`, and require bitwise-equal results. `strides` gives
+/// each input's element stride (2 makes the block non-contiguous, so the
+/// per-element interpreter runs).
+fn run_both_ways(plan: &FusedPlan, len: usize, columns: &[Vec<f64>], strides: &[isize]) {
+    let dims = [len];
+    let unit = [1isize];
+    let compiled = ErasedFusedPlan::compile(KernelDType::F64, plan.clone()).unwrap();
+    let buffers: Vec<Vec<f64>> = columns
+        .iter()
+        .zip(strides)
+        .map(|(column, &stride)| {
+            if stride == 1 {
+                column.clone()
+            } else {
+                let mut spread = vec![0.0; len * 2 - 1];
+                for (i, &v) in column.iter().enumerate() {
+                    spread[i * 2] = v;
+                }
+                spread
+            }
+        })
+        .collect();
+    let stride_arrays: Vec<[isize; 1]> = strides.iter().map(|&s| [s]).collect();
+    let inputs: Vec<ErasedRawStridedRef> = buffers
+        .iter()
+        .zip(&stride_arrays)
+        .map(|(buffer, stride)| ErasedRawStridedRef::from_slice(buffer, &dims, stride, 0).unwrap())
+        .collect();
+
+    let mut initialized = vec![0.0f64; len];
+    {
+        let mut dest =
+            ErasedRawStridedMut::from_slice_mut(&mut initialized, &dims, &unit, 0).unwrap();
+        compiled
+            .execute(&mut dest, &inputs, Exec::serial())
+            .unwrap();
+    }
+
+    let mut uninit = vec![MaybeUninit::<f64>::uninit(); len];
+    {
+        let mut dest =
+            ErasedRawStridedUninitMut::from_uninit_slice(&mut uninit, &dims, &unit, 0).unwrap();
+        let pointers: Vec<ErasedRawStridedPtr> =
+            inputs.iter().map(ErasedRawStridedPtr::from_ref).collect();
+        compiled
+            .execute_uninit(&mut dest, &pointers, Exec::serial())
+            .unwrap();
+    }
+    for (i, (slot, want)) in uninit.iter().zip(&initialized).enumerate() {
+        // SAFETY: `execute_uninit` returned `Ok` for a unit-stride destination of
+        // `len` slots, so it initialized every element.
+        let got = unsafe { slot.assume_init() };
+        assert_eq!(got.to_bits(), want.to_bits(), "element {i}");
+    }
+}
+
+#[test]
+fn erased_uninit_subtract_matches_initialized_on_every_path() {
+    let len = 2049;
+    let specials = [
+        1.5,
+        -2.0,
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        -f64::NAN,
+    ];
+    let specials: Vec<f64> = specials.iter().map(|&v| black_box(v)).collect();
+    let column = |shift: usize| -> Vec<f64> {
+        (0..len)
+            .map(|i| specials[(i / 8 * shift + i) % 8])
+            .collect()
+    };
+    let (x, y, z) = (column(1), column(3), column(5));
+
+    // Static single-instruction kernel.
+    run_both_ways(
+        &binary_plan(FusedOp::Subtract),
+        len,
+        &[x.clone(), y.clone()],
+        &[1, 1],
+    );
+    // Chunked replay (two instructions, contiguous) and interpreter (gapped).
+    run_both_ways(&conj_subtract_plan(), len, &[x.clone(), y.clone()], &[1, 1]);
+    run_both_ways(&conj_subtract_plan(), len, &[x.clone(), y.clone()], &[2, 1]);
+    // The five-instruction chain, contiguous and gapped.
+    let chain_inputs = [x, y, z];
+    run_both_ways(&subtract_chain_plan(), len, &chain_inputs, &[1, 1, 1]);
+    run_both_ways(&subtract_chain_plan(), len, &chain_inputs, &[2, 1, 1]);
+}

@@ -6,4 +6,6 @@ pub use strided_basic::{Result, StridedError, StridedView, StridedViewMut};
 mod erased;
 mod fused;
 pub use erased::ErasedFusedPlan;
-pub use fused::{fused_elementwise_into, FusedInst, FusedOp, FusedPlan, FusedScalar};
+pub use fused::{
+    fused_elementwise_into, has_vectorized_replay, FusedInst, FusedOp, FusedPlan, FusedScalar,
+};

@@ -899,3 +899,196 @@ fn fused_specialized_binary_plan_handles_broadcast_inputs() {
         assert_relative_eq!(out.get(&[i]), a.get(&[i]) + 10.0, epsilon = 1e-12);
     }
 }
+
+// ---- `FusedOp::Subtract` (tensor4all/strided-rs#528) ----
+
+fn run_binary<T: strided_fused::FusedScalar + Default>(
+    op: FusedOp,
+    a: &[T],
+    b: &[T],
+) -> Result<Vec<T>, StridedError> {
+    let a = StridedArray::<T>::from_parts(a.to_vec(), &[a.len()], &[1], 0).unwrap();
+    let b = StridedArray::<T>::from_parts(b.to_vec(), &[b.len()], &[1], 0).unwrap();
+    let mut out = StridedArray::<T>::col_major(&[a.dims()[0]]);
+    let plan = FusedPlan::new(2, vec![2], vec![FusedInst::new(op, vec![0, 1])]);
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), b.view()],
+        &plan,
+        Exec::serial(),
+    )?;
+    Ok((0..a.dims()[0]).map(|i| out.get(&[i])).collect())
+}
+
+#[test]
+fn single_subtract_matches_scalar_subtraction_for_floats() {
+    use std::hint::black_box;
+    let nan = black_box(f64::NAN);
+    let a: Vec<f64> = [
+        1.5,
+        -0.0,
+        0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        nan,
+        -nan,
+        3.0,
+        nan,
+    ]
+    .into_iter()
+    .map(black_box)
+    .collect();
+    let b: Vec<f64> = [
+        0.5,
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1.0,
+        1.0,
+        nan,
+        -nan,
+    ]
+    .into_iter()
+    .map(black_box)
+    .collect();
+    let got = run_binary(FusedOp::Subtract, &a, &b).unwrap();
+    for i in 0..a.len() {
+        assert_eq!(
+            got[i].to_bits(),
+            (black_box(a[i]) - black_box(b[i])).to_bits(),
+            "f64 {i}"
+        );
+    }
+    assert!(got[3].is_nan() && got[4].is_nan(), "inf - inf is NaN");
+
+    let a32: Vec<f32> = a.iter().map(|&v| black_box(v as f32)).collect();
+    let b32: Vec<f32> = b.iter().map(|&v| black_box(v as f32)).collect();
+    let got = run_binary(FusedOp::Subtract, &a32, &b32).unwrap();
+    for i in 0..a32.len() {
+        assert_eq!(
+            got[i].to_bits(),
+            (black_box(a32[i]) - black_box(b32[i])).to_bits(),
+            "f32 {i}"
+        );
+    }
+}
+
+#[test]
+fn subtract_complex_is_componentwise_with_nan_components() {
+    use std::hint::black_box;
+    let nan = black_box(f64::NAN);
+    let a = [
+        Complex64::new(1.0, 2.0),
+        Complex64::new(nan, -0.0),
+        Complex64::new(f64::INFINITY, 1.0),
+    ];
+    let b = [
+        Complex64::new(0.5, -1.0),
+        Complex64::new(1.0, 0.0),
+        Complex64::new(f64::INFINITY, nan),
+    ];
+    let got = run_binary(FusedOp::Subtract, &a, &b).unwrap();
+    for i in 0..a.len() {
+        let want = black_box(a[i]) - black_box(b[i]);
+        assert_eq!(got[i].re.to_bits(), want.re.to_bits(), "c64 re {i}");
+        assert_eq!(got[i].im.to_bits(), want.im.to_bits(), "c64 im {i}");
+    }
+    let a32 = [Complex32::new(1.0, 2.0), Complex32::new(f32::NAN, 3.0)];
+    let b32 = [Complex32::new(0.5, 0.25), Complex32::new(1.0, f32::NAN)];
+    let got = run_binary(FusedOp::Subtract, &a32, &b32).unwrap();
+    for i in 0..a32.len() {
+        let want = a32[i] - b32[i];
+        assert_eq!(got[i].re.to_bits(), want.re.to_bits(), "c32 re {i}");
+        assert_eq!(got[i].im.to_bits(), want.im.to_bits(), "c32 im {i}");
+    }
+
+    // A multi-instruction complex plan reaches the per-element interpreter.
+    let plan = FusedPlan::new(
+        2,
+        vec![3],
+        vec![
+            FusedInst::new(FusedOp::Subtract, vec![0, 1]),
+            FusedInst::new(FusedOp::Multiply, vec![2, 1]),
+        ],
+    );
+    let av = StridedArray::<Complex64>::from_parts(a.to_vec(), &[3], &[1], 0).unwrap();
+    let bv = StridedArray::<Complex64>::from_parts(b.to_vec(), &[3], &[1], 0).unwrap();
+    let mut out = StridedArray::<Complex64>::col_major(&[3]);
+    fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[av.view(), bv.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .unwrap();
+    for i in 0..3 {
+        let want = (a[i] - b[i]) * b[i];
+        let got = out.get(&[i]);
+        assert_eq!(got.re.to_bits(), want.re.to_bits(), "chain re {i}");
+        assert_eq!(got.im.to_bits(), want.im.to_bits(), "chain im {i}");
+    }
+}
+
+#[test]
+fn subtract_signed_integers_wrap() {
+    assert_eq!(
+        run_binary(FusedOp::Subtract, &[i32::MIN, 5], &[1, 7]).unwrap(),
+        [i32::MAX, -2]
+    );
+    assert_eq!(
+        run_binary(FusedOp::Subtract, &[0i64, 9], &[i64::MIN, 4]).unwrap(),
+        [i64::MIN, 5]
+    );
+}
+
+#[test]
+fn subtract_label_and_arity() {
+    assert_eq!(FusedOp::Subtract.label(), "subtract");
+    let a = input(&[1.0, 2.0], &[2]);
+    let mut out = StridedArray::<f64>::col_major(&[2]);
+    let plan = FusedPlan::new(1, vec![1], vec![FusedInst::new(FusedOp::Subtract, vec![0])]);
+    let err = fused_elementwise_into(&mut [out.view_mut()], &[a.view()], &plan, Exec::serial())
+        .expect_err("a one-operand Subtract must be rejected");
+    assert!(matches!(err, StridedError::RankMismatch(1, 2)), "{err:?}");
+}
+
+#[test]
+fn bool_rejects_subtract_before_writing() {
+    let a = StridedArray::<bool>::from_parts(vec![true, false], &[2], &[1], 0).unwrap();
+    let mut out = StridedArray::<bool>::col_major(&[2]);
+    let plan = FusedPlan::new(
+        2,
+        vec![2],
+        vec![FusedInst::new(FusedOp::Subtract, vec![0, 1])],
+    );
+    let err = fused_elementwise_into(
+        &mut [out.view_mut()],
+        &[a.view(), a.view()],
+        &plan,
+        Exec::serial(),
+    )
+    .expect_err("bool Subtract is unsupported");
+    assert!(
+        matches!(
+            err,
+            StridedError::UnsupportedOp {
+                op: "subtract",
+                dtype: "bool"
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn has_vectorized_replay_is_true_only_for_real_floats() {
+    use strided_fused::has_vectorized_replay;
+    assert!(has_vectorized_replay::<f32>());
+    assert!(has_vectorized_replay::<f64>());
+    assert!(!has_vectorized_replay::<Complex32>());
+    assert!(!has_vectorized_replay::<Complex64>());
+    assert!(!has_vectorized_replay::<i32>());
+    assert!(!has_vectorized_replay::<i64>());
+    assert!(!has_vectorized_replay::<bool>());
+}

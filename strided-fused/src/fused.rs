@@ -87,7 +87,7 @@ impl<T> Default for OperandPtr<T> {
 }
 
 // SAFETY: an `OperandPtr` only carries an address. Every dereference sits in an `unsafe` block
-// whose contract proves liveness and exclusivity (`interpret_inner_loop`, fused.rs:1301;
+// whose contract proves liveness and exclusivity (`interpret_inner_loop`, fused.rs:1335;
 // `replay_chunked`, chunk.rs:152), so sending or sharing the address is sound.
 unsafe impl<T> Send for OperandPtr<T> {}
 // SAFETY: as for `Send` above: sharing a reference only shares the address.
@@ -121,6 +121,13 @@ fn operand_const_ptrs<T>(ptrs: &[OperandPtr<T>]) -> &[*const T] {
 pub enum FusedOp {
     #[default]
     Add,
+    /// `a - b` with the scalar type's own subtraction: IEEE for `f32`/`f64`,
+    /// componentwise for complex, wrapping for signed integers. It is
+    /// bit-identical to the per-element interpreter and to the unfused binary
+    /// kernel. It is not `Negate` + `Add`: a NaN operand's sign bit is not
+    /// flipped (with a NaN in both operands, which payload propagates is the
+    /// hardware's choice, as for scalar `-`). `bool` rejects it.
+    Subtract,
     Multiply,
     Negate,
     Conj,
@@ -146,6 +153,7 @@ impl FusedOp {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Add => "add",
+            Self::Subtract => "subtract",
             Self::Multiply => "multiply",
             Self::Negate => "negate",
             Self::Conj => "conj",
@@ -269,6 +277,7 @@ pub trait FusedScalar: Copy + Send + Sync + 'static {
     }
 
     fn fused_add(self, rhs: Self) -> Self;
+    fn fused_subtract(self, rhs: Self) -> Self;
     fn fused_multiply(self, rhs: Self) -> Self;
     fn fused_negate(self) -> Self;
     fn fused_conj(self) -> Self;
@@ -301,6 +310,11 @@ macro_rules! impl_real_fused_scalar {
             #[inline(always)]
             fn fused_add(self, rhs: Self) -> Self {
                 self + rhs
+            }
+
+            #[inline(always)]
+            fn fused_subtract(self, rhs: Self) -> Self {
+                self - rhs
             }
 
             #[inline(always)]
@@ -407,6 +421,11 @@ macro_rules! impl_complex_fused_scalar {
             #[inline(always)]
             fn fused_add(self, rhs: Self) -> Self {
                 self + rhs
+            }
+
+            #[inline(always)]
+            fn fused_subtract(self, rhs: Self) -> Self {
+                self - rhs
             }
 
             #[inline(always)]
@@ -534,6 +553,7 @@ macro_rules! impl_signed_integer_fused_scalar {
                 matches!(
                     op,
                     FusedOp::Add
+                        | FusedOp::Subtract
                         | FusedOp::Multiply
                         | FusedOp::Negate
                         | FusedOp::Conj
@@ -547,6 +567,11 @@ macro_rules! impl_signed_integer_fused_scalar {
             #[inline(always)]
             fn fused_add(self, rhs: Self) -> Self {
                 self.wrapping_add(rhs)
+            }
+
+            #[inline(always)]
+            fn fused_subtract(self, rhs: Self) -> Self {
+                self.wrapping_sub(rhs)
             }
 
             #[inline(always)]
@@ -662,6 +687,11 @@ impl FusedScalar for bool {
     }
 
     #[inline(always)]
+    fn fused_subtract(self, _rhs: Self) -> Self {
+        unsupported_fused_op!("subtract", "bool")
+    }
+
+    #[inline(always)]
     fn fused_multiply(self, _rhs: Self) -> Self {
         unsupported_fused_op!("multiply", "bool")
     }
@@ -768,6 +798,7 @@ fn op_arity(op: FusedOp) -> usize {
         | FusedOp::Expm1
         | FusedOp::Log1p => 1,
         FusedOp::Add
+        | FusedOp::Subtract
         | FusedOp::Multiply
         | FusedOp::Divide
         | FusedOp::Maximum
@@ -875,6 +906,7 @@ fn eval_op<T: FusedScalar>(op: FusedOp, regs: &[T], inputs: &[usize]) -> T {
         | FusedOp::Expm1
         | FusedOp::Log1p => eval_unary(op, regs[inputs[0]]),
         FusedOp::Add
+        | FusedOp::Subtract
         | FusedOp::Multiply
         | FusedOp::Divide
         | FusedOp::Maximum
@@ -907,6 +939,7 @@ fn eval_unary<T: FusedScalar>(op: FusedOp, x: T) -> T {
 fn eval_binary<T: FusedScalar>(op: FusedOp, a: T, b: T) -> T {
     match op {
         FusedOp::Add => a.fused_add(b),
+        FusedOp::Subtract => a.fused_subtract(b),
         FusedOp::Multiply => a.fused_multiply(b),
         FusedOp::Divide => a.fused_divide(b),
         FusedOp::Maximum => a.fused_maximum(b),
@@ -1099,11 +1132,11 @@ where
                 ($apply:expr) => {{
                     // SAFETY: `map_into_validated` (strided-basic/src/execution.rs:161) needs
                     // three things. Every input shape equals `dest`'s: `validate_shapes` checked
-                    // it (fused.rs:857) on the initialized path, and
-                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1811) on the
+                    // it (fused.rs:888) on the initialized path, and
+                    // `fused_elementwise_into_uninit_multi` did (fused.rs:1845) on the
                     // uninitialized one. `validated` belongs to this `dest`'s geometry: here
-                    // `dest` is `dests[0]` of a single-destination call (fused.rs:1256,
-                    // fused.rs:1814), and the marker was made for `dests[0]` (fused.rs:851;
+                    // `dest` is `dests[0]` of a single-destination call (fused.rs:1290,
+                    // fused.rs:1848), and the marker was made for `dests[0]` (fused.rs:882;
                     // uninitialized entry: erased.rs:328). Bounds and aliasing hold for the
                     // replay: every view keeps its construction-time bounds, `dest` is borrowed
                     // `&mut`, and the inputs are shared views.
@@ -1138,7 +1171,7 @@ where
             // As above: one monomorphized kernel per `FusedOp`.
             macro_rules! binary {
                 ($apply:expr) => {{
-                    // SAFETY: as for the unary arm (fused.rs:1111): `zip_map2_into_validated`
+                    // SAFETY: as for the unary arm (fused.rs:1144): `zip_map2_into_validated`
                     // (strided-basic/src/execution.rs:203) has the same contract, met the same
                     // way.
                     unsafe {
@@ -1155,6 +1188,7 @@ where
             }
             match op {
                 FusedOp::Add => binary!(|x: T, y: T| x.fused_add(y)),
+                FusedOp::Subtract => binary!(|x: T, y: T| x.fused_subtract(y)),
                 FusedOp::Multiply => binary!(|x: T, y: T| x.fused_multiply(y)),
                 FusedOp::Divide => binary!(|x: T, y: T| x.fused_divide(y)),
                 FusedOp::Maximum => binary!(|x: T, y: T| x.fused_maximum(y)),
@@ -1165,7 +1199,7 @@ where
         }
         StaticFusedKind::Ternary(op, a, b, c) => match op {
             FusedOp::Clamp => {
-                // SAFETY: as for the unary arm (fused.rs:1111): `zip_map3_into_validated`
+                // SAFETY: as for the unary arm (fused.rs:1144): `zip_map3_into_validated`
                 // (strided-basic/src/execution.rs:251) has the same contract, met the same way.
                 unsafe {
                     zip_map3_into_validated(
@@ -1181,7 +1215,7 @@ where
             }
             _ => unreachable!("not a ternary fused op: {op:?}"),
         },
-        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map2_into_validated`
+        // SAFETY: as for the unary arm (fused.rs:1144): `zip_map2_into_validated`
         // (strided-basic/src/execution.rs:203) has the same contract, met the same way.
         StaticFusedKind::AddMulLeft => unsafe {
             zip_map2_into_validated(
@@ -1193,7 +1227,7 @@ where
                 exec,
             )
         }?,
-        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map2_into_validated`
+        // SAFETY: as for the unary arm (fused.rs:1144): `zip_map2_into_validated`
         // (strided-basic/src/execution.rs:203) has the same contract, met the same way.
         StaticFusedKind::AddMulRight => unsafe {
             zip_map2_into_validated(
@@ -1205,7 +1239,7 @@ where
                 exec,
             )
         }?,
-        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map3_into_validated`
+        // SAFETY: as for the unary arm (fused.rs:1144): `zip_map3_into_validated`
         // (strided-basic/src/execution.rs:251) has the same contract, met the same way.
         StaticFusedKind::MulAddExp => unsafe {
             zip_map3_into_validated(
@@ -1218,7 +1252,7 @@ where
                 exec,
             )
         }?,
-        // SAFETY: as for the unary arm (fused.rs:1111): `zip_map4_into_validated`
+        // SAFETY: as for the unary arm (fused.rs:1144): `zip_map4_into_validated`
         // (strided-basic/src/execution.rs:305) has the same contract, met the same way.
         StaticFusedKind::DivClampSqrtRsqrt => unsafe {
             zip_map4_into_validated(
@@ -1311,14 +1345,14 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
         return;
     }
     // SAFETY: `len > 0` (checked above), and `validate_plan` admits no plan without inputs: every
-    // output names a defined value (fused.rs:816) and instructions read only earlier values
-    // (fused.rs:805), so with `input_count == 0` there is no value to name and the plan is
+    // output names a defined value (fused.rs:847) and instructions read only earlier values
+    // (fused.rs:836), so with `input_count == 0` there is no value to name and the plan is
     // rejected. So `input_ptrs[0]` exists, and its element at `offsets[n]` (`k = 0`) is readable
-    // under this function's contract (fused.rs:1291).
+    // under this function's contract (fused.rs:1325).
     let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
-        // SAFETY: `interpret_loop_body` has this function's contract (fused.rs:1291), passed on
+        // SAFETY: `interpret_loop_body` has this function's contract (fused.rs:1325), passed on
         // unchanged, plus one clause: no operand element may lie inside `regs`. That holds
         // because `regs` is `inline`, a local array created just above, so no operand pointer
         // can point into it. `regs` holds `register_count` values, one per register
@@ -1336,7 +1370,7 @@ unsafe fn interpret_inner_loop<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: as for the inline register file above (fused.rs:1321): `heap` is a fresh `Vec`,
+        // SAFETY: as for the inline register file above (fused.rs:1355): `heap` is a fresh `Vec`,
         // so no operand element lies inside it either.
         unsafe {
             interpret_loop_body(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
@@ -1371,7 +1405,7 @@ unsafe fn interpret_loop_body<T: FusedScalar>(
             let stride = inner_stride(strides, stride_index);
             // SAFETY: element `i < len` of input `input_index`, at its block offset and inner
             // stride, readable under the contract this body shares with `interpret_inner_loop`
-            // (fused.rs:1291).
+            // (fused.rs:1325).
             regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
         for (instruction, inst) in plan.ops.iter().enumerate() {
@@ -1381,7 +1415,7 @@ unsafe fn interpret_loop_body<T: FusedScalar>(
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
             // SAFETY: element `i < len` of output `output_index`, writable under this body's
-            // contract with `interpret_inner_loop` (fused.rs:1291); no other thread touches it.
+            // contract with `interpret_inner_loop` (fused.rs:1325); no other thread touches it.
             unsafe {
                 *dst_ptr.offset(offsets[output_index] + i * stride) =
                     regs[plan.outputs[output_index]];
@@ -1398,8 +1432,8 @@ fn chunk_seed<T: FusedScalar>(inputs: &[StridedView<'_, T>]) -> Option<T> {
         return None;
     }
     // SAFETY: both interpreters call this only after returning early for an empty `dests[0]`
-    // (fused.rs:1466, fused.rs:1826) and after checking every input against its shape
-    // (fused.rs:857, fused.rs:1811), so `inputs[0]` is non-empty and `ptr()` is its element at
+    // (fused.rs:1500, fused.rs:1860) and after checking every input against its shape
+    // (fused.rs:888, fused.rs:1845), so `inputs[0]` is non-empty and `ptr()` is its element at
     // the view offset (`base_ptr`, strided-view/src/view.rs:446). This safe helper relies on
     // those two callers.
     Some(unsafe { *inputs[0].ptr() })
@@ -1536,11 +1570,11 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                     // buffer (chunk.rs:103), handed out only to this closure, so no operand
                     // overlaps it, and it holds `register_file_len(plan)` values because `seed`
                     // is `Some` (chunk.rs:108). `direct` came from `direct_inputs`, which starts
-                    // from `single_use_inputs` (fused.rs:1434), which never marks an input that
+                    // from `single_use_inputs` (fused.rs:1468), which never marks an input that
                     // `plan.outputs` names (chunk.rs:76), and then keeps only stride-1 inputs
-                    // (fused.rs:1441). The plan passed `validate_plan_for_scalar`, and only this
+                    // (fused.rs:1475). The plan passed `validate_plan_for_scalar`, and only this
                     // partition writes these destination elements (see `replay_partitions`,
-                    // fused.rs:1634).
+                    // fused.rs:1668).
                     unsafe {
                         chunk::replay_chunked(
                             operand_ptrs(&dst_ptrs),
@@ -1555,7 +1589,7 @@ fn interpret_fused_elementwise_into<T: FusedScalar>(
                     }
                     return Ok(());
                 }
-                // SAFETY: `interpret_inner_loop`'s contract (fused.rs:1291) holds: `offsets`,
+                // SAFETY: `interpret_inner_loop`'s contract (fused.rs:1325) holds: `offsets`,
                 // `len` and `strides` describe one generated block over shapes checked equal, so
                 // every element it reaches is inside each operand; only this partition writes
                 // those destination elements (see `replay_partitions`); and the plan passed
@@ -1654,7 +1688,7 @@ where
         // `ordered_strides` and `initial_offsets` come from one `build_plan_fused*` result, and
         // `costs` from `compute_costs` over it. Partitions run concurrently, so their mutable
         // regions must be disjoint. Every destination layout is injective: the initialized path
-        // checks it with `validate_destination_layout` (fused.rs:851, fused.rs:853), and the
+        // checks it with `validate_destination_layout` (fused.rs:882, fused.rs:884), and the
         // uninitialized entry with its per-destination markers (erased.rs:328). The partitions
         // cover disjoint index sets, so no two of them write one destination element, and
         // distinct destinations are distinct exclusive borrows.
@@ -1694,14 +1728,14 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
         return;
     }
     // SAFETY: `len > 0` (checked above), and `validate_plan` admits no plan without inputs: every
-    // output names a defined value (fused.rs:816) and instructions read only earlier values
-    // (fused.rs:805), so with `input_count == 0` there is no value to name and the plan is
+    // output names a defined value (fused.rs:847) and instructions read only earlier values
+    // (fused.rs:836), so with `input_count == 0` there is no value to name and the plan is
     // rejected. So `input_ptrs[0]` exists, and its element at `offsets[n]` (`k = 0`) is readable
-    // under this function's contract (fused.rs:1679).
+    // under this function's contract (fused.rs:1713).
     let init = unsafe { *input_ptrs[0].offset(offsets[dst_ptrs.len()]) };
     if register_count <= INLINE_REGS {
         let mut inline = [init; INLINE_REGS];
-        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1679),
+        // SAFETY: `interpret_loop_body_uninit` has this function's contract (fused.rs:1713),
         // passed on unchanged, plus one clause: no operand element may lie inside `regs`. That
         // holds because `regs` is `inline`, a local array created just above. `regs` holds
         // `register_count` values.
@@ -1718,7 +1752,7 @@ unsafe fn interpret_inner_loop_uninit<T: FusedScalar>(
         };
     } else {
         let mut heap = vec![init; register_count];
-        // SAFETY: as for the inline register file above (fused.rs:1704): `heap` is a fresh `Vec`,
+        // SAFETY: as for the inline register file above (fused.rs:1738): `heap` is a fresh `Vec`,
         // so no operand element lies inside it either.
         unsafe {
             interpret_loop_body_uninit(dst_ptrs, input_ptrs, plan, offsets, len, strides, &mut heap)
@@ -1752,7 +1786,7 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
             let stride = inner_stride(strides, stride_index);
             // SAFETY: element `i < len` of input `input_index`, at its block offset and inner
             // stride, readable under the contract this body shares with
-            // `interpret_inner_loop_uninit` (fused.rs:1679).
+            // `interpret_inner_loop_uninit` (fused.rs:1713).
             regs[input_index] = unsafe { *input_ptr.offset(offsets[stride_index] + i * stride) };
         }
         for (instruction, inst) in plan.ops.iter().enumerate() {
@@ -1762,7 +1796,7 @@ unsafe fn interpret_loop_body_uninit<T: FusedScalar>(
         for (output_index, &dst_ptr) in dst_ptrs.iter().enumerate() {
             let stride = inner_stride(strides, output_index);
             // SAFETY: element `i < len` of output `output_index`, writable under this body's
-            // contract with `interpret_inner_loop_uninit` (fused.rs:1679); it is never read.
+            // contract with `interpret_inner_loop_uninit` (fused.rs:1713); it is never read.
             unsafe {
                 *dst_ptr.offset(offsets[output_index] + i * stride) =
                     MaybeUninit::new(regs[plan.outputs[output_index]]);
@@ -1901,11 +1935,11 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     // buffer (chunk.rs:103), handed out only to this closure, so no operand
                     // overlaps it, and it holds `register_file_len(plan)` values because `seed`
                     // is `Some` (chunk.rs:108). `direct` came from `direct_inputs`, which starts
-                    // from `single_use_inputs` (fused.rs:1434), which never marks an input that
+                    // from `single_use_inputs` (fused.rs:1468), which never marks an input that
                     // `plan.outputs` names (chunk.rs:76), and then keeps only stride-1 inputs
-                    // (fused.rs:1441). The plan passed `validate_plan_for_scalar`, and only this
+                    // (fused.rs:1475). The plan passed `validate_plan_for_scalar`, and only this
                     // partition writes these destination elements (see `replay_partitions`,
-                    // fused.rs:1634).
+                    // fused.rs:1668).
                     unsafe {
                         chunk::replay_chunked_uninit(
                             operand_ptrs(&dst_ptrs),
@@ -1920,7 +1954,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
                     }
                     return Ok(());
                 }
-                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1679) holds:
+                // SAFETY: `interpret_inner_loop_uninit`'s contract (fused.rs:1713) holds:
                 // `offsets`, `len` and `strides` describe one generated block over shapes checked
                 // equal, so every element it reaches is inside each operand; only this partition
                 // writes those destination elements (see `replay_partitions`); and the plan
@@ -1959,6 +1993,30 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
     )
 }
 
+/// Returns whether `T` has the chunked vectorized replay for plans that reach
+/// the interpreter.
+///
+/// Those are plans with more than one instruction or output that match no
+/// static specialization; single-instruction plans use the ordinary unfused
+/// kernels for every `T`. When this is `false`, such plans run element by
+/// element and are not expected to be faster than unfused passes. When it is
+/// `true`, a block is replayed vectorized only if every output is unit-stride
+/// and every input is unit-stride or broadcast along the innermost axis.
+///
+/// This is a property of the scalar type, not a promise about one call:
+/// contiguity is decided per block at run time.
+///
+/// ```
+/// use strided_fused::has_vectorized_replay;
+///
+/// assert!(has_vectorized_replay::<f64>());
+/// assert!(!has_vectorized_replay::<num_complex::Complex64>());
+/// ```
+#[inline]
+pub fn has_vectorized_replay<T: FusedScalar>() -> bool {
+    chunk::is_real_chunk_scalar::<T>()
+}
+
 /// Evaluate a runtime-DAG elementwise plan into one or more destinations.
 ///
 /// The plan is validated before any destination is written:
@@ -1977,6 +2035,16 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
 /// per-element interpreter for arbitrary validated DAGs. Overlapping
 /// source/destination memory is not supported by the strided kernels generally.
 ///
+/// # Performance
+///
+/// Plans that reach the interpreter (more than one instruction or output, and
+/// no static specialization) are replayed vectorized only for `f32` and `f64`.
+/// For `Complex32`, `Complex64` and the integer and `bool` scalars they run the
+/// per-element interpreter, so such a plan is not expected to beat the same
+/// ops run as separate `zip_map2_into` passes; callers that fuse for speed
+/// should decline multi-instruction regions of those dtypes (#528).
+/// [`has_vectorized_replay`] reports this per scalar type.
+///
 /// # Numerics
 ///
 /// The chunked replay evaluates `Exp`, `Log`, `Sin`, `Cos`, `Tanh` and `Expm1`
@@ -1986,7 +2054,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
 /// functions those six instructions differ by at most one ULP of their own
 /// output magnitude; a chain of them multiplies that difference by the output
 /// magnitude, so an exponential chain is not bit-stable to `std`. `Log1p` and
-/// every other instruction (`Add`, `Multiply`, `Negate`, `Conj`, `Divide`,
+/// every other instruction (`Add`, `Subtract`, `Multiply`, `Negate`, `Conj`, `Divide`,
 /// `Abs`, `Maximum`, `Minimum`, `Clamp`, `Sqrt`, `Rsqrt`, `Pow`) keep the scalar
 /// `FusedScalar` methods and are bit-identical to the per-element replay.
 ///
@@ -1997,7 +2065,7 @@ fn interpret_fused_elementwise_into_uninit<T: FusedScalar>(
 /// `clamp` on equal bounds preserve the signed zero of the left/bound operand.
 /// Complex `Abs` returns the norm in the real component; complex `Maximum`,
 /// `Minimum`, and `Clamp` compare by squared norm. Signed integer `Add`,
-/// `Multiply`, `Negate`, and `Abs` use wrapping arithmetic. `bool` supports
+/// `Subtract`, `Multiply`, `Negate`, and `Abs` use wrapping arithmetic. `bool` supports
 /// only copy-like identity plans and `Conj`; ambiguous arithmetic and
 /// transcendental op/dtype pairs are rejected before any destination is
 /// written.
