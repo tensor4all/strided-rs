@@ -236,9 +236,9 @@ unsafe fn inner_loop_map1<D: Copy, A: Copy, Op: ElementOp<A>, K: MapKernel<A, D>
             }
         });
     } else {
-        let mut dp = dp;
-        let mut sp = sp;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut dp = dp;
+            let mut sp = sp;
             for _ in 0..len {
                 *dp = f(Op::apply(*sp));
                 dp = dp.wrapping_offset(ds);
@@ -302,8 +302,8 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
     } else if ds == 1 && b_s == 0 {
         let b = OpB::apply(*bp);
         let dst = std::slice::from_raw_parts_mut(dp, len);
-        let mut ap = ap;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut ap = ap;
             for d in dst.iter_mut() {
                 *d = f(OpA::apply(*ap), b);
                 ap = ap.wrapping_offset(a_s);
@@ -312,18 +312,18 @@ unsafe fn inner_loop_map2<D: Copy, A: Copy, B: Copy, OpA: ElementOp<A>, OpB: Ele
     } else if ds == 1 && a_s == 0 {
         let a = OpA::apply(*ap);
         let dst = std::slice::from_raw_parts_mut(dp, len);
-        let mut bp = bp;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut bp = bp;
             for d in dst.iter_mut() {
                 *d = f(a, OpB::apply(*bp));
                 bp = bp.wrapping_offset(b_s);
             }
         });
     } else {
-        let mut dp = dp;
-        let mut ap = ap;
-        let mut bp = bp;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut dp = dp;
+            let mut ap = ap;
+            let mut bp = bp;
             for _ in 0..len {
                 *dp = f(OpA::apply(*ap), OpB::apply(*bp));
                 dp = dp.wrapping_offset(ds);
@@ -484,8 +484,8 @@ unsafe fn inner_loop_mul2<
         });
     } else if ds == 1 && b_s == 0 {
         let b = *bp;
-        let mut ap = ap;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut ap = ap;
             for i in 0..len {
                 O::write(dp.add(i), multiply_value(*ap, b));
                 ap = ap.wrapping_offset(a_s);
@@ -493,18 +493,18 @@ unsafe fn inner_loop_mul2<
         });
     } else if ds == 1 && a_s == 0 {
         let a = *ap;
-        let mut bp = bp;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut bp = bp;
             for i in 0..len {
                 O::write(dp.add(i), multiply_value(a, *bp));
                 bp = bp.wrapping_offset(b_s);
             }
         });
     } else {
-        let mut dp = dp;
-        let mut ap = ap;
-        let mut bp = bp;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut dp = dp;
+            let mut ap = ap;
+            let mut bp = bp;
             for _ in 0..len {
                 O::write(dp, multiply_value(*ap, *bp));
                 dp = dp.wrapping_offset(ds);
@@ -1092,11 +1092,11 @@ unsafe fn inner_loop_map3<
             }
         });
     } else {
-        let mut dp = dp;
-        let mut ap = ap;
-        let mut bp = bp;
-        let mut cp = cp;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut dp = dp;
+            let mut ap = ap;
+            let mut bp = bp;
+            let mut cp = cp;
             for _ in 0..len {
                 *dp = f(OpA::apply(*ap), OpB::apply(*bp), OpC::apply(*cp));
                 dp = dp.wrapping_offset(ds);
@@ -1154,12 +1154,12 @@ unsafe fn inner_loop_map4<
             }
         });
     } else {
-        let mut dp = dp;
-        let mut ap = ap;
-        let mut bp = bp;
-        let mut cp = cp;
-        let mut ep = ep;
-        simd::dispatch_if_large(len, || {
+        simd::dispatch_if_large(len, move || {
+            let mut dp = dp;
+            let mut ap = ap;
+            let mut bp = bp;
+            let mut cp = cp;
+            let mut ep = ep;
             for _ in 0..len {
                 *dp = f(
                     OpA::apply(*ap),
