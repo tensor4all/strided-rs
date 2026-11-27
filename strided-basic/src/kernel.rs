@@ -7,6 +7,8 @@ use crate::fuse::{compress_dims, fuse_dims};
 use crate::inline::{InlineVec, OperandVec};
 use crate::{block, order, Exec, Result, StridedError};
 
+mod tile;
+
 /// Maximum total elements for the small tensor fast path.
 /// Tensors at or below this size skip `compute_order` and `compute_block_sizes`
 /// since they fit in L1 cache and blocking provides no benefit.
@@ -141,12 +143,16 @@ fn plan_fused(
     // tiles, which order its single accumulator.
     let identity: InlineVec<usize> = (0..compressed_dims.len()).collect();
     let block = match fit_dest {
-        Some(dest) => block::destination_block_sizes(
-            &compressed_dims,
-            &compressed_strides_refs,
-            elem_sizes,
-            dest,
-        ),
+        // A small tile under one long axis is blocked on the long axis only
+        // (strided-rs#526); every other destination plan takes the model.
+        Some(dest) => tile::tile_blocks(&compressed_dims, elem_sizes).unwrap_or_else(|| {
+            block::destination_block_sizes(
+                &compressed_dims,
+                &compressed_strides_refs,
+                elem_sizes,
+                dest,
+            )
+        }),
         None => block::compute_block_sizes(&compressed_dims, &compressed_strides_refs, elem_sizes),
     };
     #[cfg(feature = "bench-hooks")]
@@ -622,7 +628,7 @@ where
 /// This avoids the redundant re-ordering and per-callback `Vec` allocation
 /// that `for_each_inner_block_with_offsets` previously incurred.
 ///
-/// The block-walking machinery is compiled once (`preordered_dyn`): a generic
+/// The block-walking machinery is compiled once (`preordered_walk`): a generic
 /// caller only instantiates its own callback, reached through one indirect call
 /// per inner block (a run of elements, never per element). Keeping the walk
 /// generic would duplicate it for every operation, dtype and element-op
@@ -639,13 +645,42 @@ where
     F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
 {
     let refs: OperandVec<&[isize]> = strides.iter().map(|s| s.as_ref()).collect();
-    preordered_dyn(dims, blocks, &refs, initial_offsets, &mut f)
+    preordered_walk(dims, blocks, &refs, initial_offsets, &mut f)
+}
+
+/// [`for_each_inner_block_preordered`] for a pointwise operation: every
+/// destination element is computed from its own inputs and written once, so
+/// the order in which the runs are visited does not change the result.
+///
+/// A plan whose leading axes form a small unfusable tile under a long axis
+/// (the per-block transpose of strided-rs#526) is walked by
+/// [`tile::SmallTile`]: one callback per tile element over an L1 block of the
+/// long axis instead of one per innermost run of the tile. Every element still
+/// reaches `f` exactly once with the same per-element operands; only the order
+/// of the runs, and how the long axis is cut into runs, differs. Folds and
+/// any other order-dependent caller use [`for_each_inner_block_preordered`].
+#[inline]
+pub(crate) fn for_each_pointwise_block_preordered<S: AsRef<[isize]>, F>(
+    dims: &[usize],
+    blocks: &[usize],
+    strides: &[S],
+    initial_offsets: &[isize],
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&[isize], usize, &[isize]) -> Result<()>,
+{
+    let refs: OperandVec<&[isize]> = strides.iter().map(|s| s.as_ref()).collect();
+    if let Some(tile) = tile::SmallTile::of(dims, blocks, &refs) {
+        return tile.walk(dims, blocks, &refs, initial_offsets, &mut f);
+    }
+    preordered_walk(dims, blocks, &refs, initial_offsets, &mut f)
 }
 
 type BlockFn<'a> = &'a mut dyn FnMut(&[isize], usize, &[isize]) -> Result<()>;
 
 #[inline(never)]
-fn preordered_dyn(
+fn preordered_walk(
     dims: &[usize],
     blocks: &[usize],
     strides: &[&[isize]],

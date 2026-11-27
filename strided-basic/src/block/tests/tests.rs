@@ -748,7 +748,10 @@ fn a_zero_sized_source_stops_the_increasing_strides_exit() {
     let strides = [&dst_strides[..], &src_strides[..]];
     let (_, _, plan) = build_plan_fused(&dims, &strides, Some(0), &[8, 0]);
     assert_eq!(model_blocks_sized(&dims, &strides, &[8, 0]), [2, 2044]);
-    assert_eq!(plan.block.as_slice(), [2, 2044]);
+    // The plan itself is a 2-element tile under a long axis, which is blocked
+    // on the long axis from the summed element sizes, `8 + 0` bytes per
+    // element (strided-rs#526): 24 KiB / (2 * 8) = 1536 positions.
+    assert_eq!(plan.block.as_slice(), [2, 1536]);
     // The planner before #426 sized both operands at 8 and overflowed here.
     assert_eq!(
         legacy_blocks(&dims, &strides, 8, LegacyCosts::Saturating),

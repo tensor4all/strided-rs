@@ -1,8 +1,8 @@
 //! High-level operations on dynamic-rank strided views.
 
 use crate::kernel::{
-    ensure_same_shape, for_each_inner_block_preordered, pointwise_plan, same_contiguous_layout,
-    sequential_contiguous_layout, total_len,
+    ensure_same_shape, for_each_inner_block_preordered, for_each_pointwise_block_preordered,
+    pointwise_plan, same_contiguous_layout, sequential_contiguous_layout, total_len,
 };
 use crate::map_view::{copy_map_into, map_into, validate_destination_layout, zip_map2_into};
 use crate::reduce_view::reduce;
@@ -16,9 +16,7 @@ use strided_view::{ElementOp, ElementOpApply};
 
 use crate::cost::KernelClass;
 use crate::fuse::compute_costs;
-use crate::threading::{
-    for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded, SendPtr,
-};
+use crate::threading::{is_parallel, mapreduce_threaded, SendPtr};
 // ============================================================================
 // Stride-specialized inner loop helpers for ops_view
 //
@@ -427,7 +425,7 @@ pub fn add_acc<
             KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
-                for_each_inner_block_with_offsets(
+                for_each_pointwise_block_preordered(
                     dims,
                     blocks,
                     strides_list,
@@ -451,7 +449,7 @@ pub fn add_acc<
 
     let initial_offsets: crate::inline::OperandVec<isize> =
         ordered_strides.iter().map(|_| 0isize).collect();
-    for_each_inner_block_preordered(
+    for_each_pointwise_block_preordered(
         &fused_dims,
         &plan.block,
         &ordered_strides,
@@ -553,7 +551,7 @@ pub fn mul_acc<
             KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
-                for_each_inner_block_with_offsets(
+                for_each_pointwise_block_preordered(
                     dims,
                     blocks,
                     strides_list,
@@ -577,7 +575,7 @@ pub fn mul_acc<
 
     let initial_offsets: crate::inline::OperandVec<isize> =
         ordered_strides.iter().map(|_| 0isize).collect();
-    for_each_inner_block_preordered(
+    for_each_pointwise_block_preordered(
         &fused_dims,
         &plan.block,
         &ordered_strides,
@@ -682,7 +680,7 @@ where
             KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
-                for_each_inner_block_with_offsets(
+                for_each_pointwise_block_preordered(
                     dims,
                     blocks,
                     strides_list,
@@ -707,7 +705,7 @@ where
 
     let initial_offsets: crate::inline::OperandVec<isize> =
         ordered_strides.iter().map(|_| 0isize).collect();
-    for_each_inner_block_preordered(
+    for_each_pointwise_block_preordered(
         &fused_dims,
         &plan.block,
         &ordered_strides,
@@ -823,7 +821,7 @@ where
             KernelClass::Map,
             exec,
             &|dims, blocks, strides_list, offsets| {
-                for_each_inner_block_with_offsets(
+                for_each_pointwise_block_preordered(
                     dims,
                     blocks,
                     strides_list,
@@ -849,7 +847,7 @@ where
 
     let initial_offsets: crate::inline::OperandVec<isize> =
         ordered_strides.iter().map(|_| 0isize).collect();
-    for_each_inner_block_preordered(
+    for_each_pointwise_block_preordered(
         &fused_dims,
         &plan.block,
         &ordered_strides,

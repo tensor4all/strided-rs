@@ -86,3 +86,7 @@ required-features = ["parallel"]
 [[bench]]
 name = "conj_route_467"
 harness = false
+
+[[bench]]
+name = "small_tile_526"
+harness = false
