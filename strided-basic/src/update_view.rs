@@ -19,7 +19,7 @@
 //! follows the budget of the [`Exec`](crate::Exec) token each entry takes).
 
 use crate::kernel::{
-    ensure_same_shape, for_each_inner_block_preordered, pointwise_plan,
+    ensure_same_shape, for_each_pointwise_block_preordered, pointwise_plan,
     sequential_contiguous_layout, total_len,
 };
 use crate::layout_check::is_injective_layout;
@@ -30,7 +30,7 @@ use strided_view::ElementOp;
 
 use crate::cost::KernelClass;
 use crate::fuse::compute_costs;
-use crate::threading::{for_each_inner_block_with_offsets, is_parallel, mapreduce_threaded};
+use crate::threading::{is_parallel, mapreduce_threaded};
 
 /// The per-inner-block callback: `(offsets, len, strides)`.
 type Body<'a> = &'a (dyn Fn(&[isize], usize, &[isize]) + Sync);
@@ -118,7 +118,7 @@ fn run_update(
                 KernelClass::Map,
                 exec,
                 &|dims, blocks, strides_list, offsets| {
-                    for_each_inner_block_with_offsets(
+                    for_each_pointwise_block_preordered(
                         dims,
                         blocks,
                         strides_list,
@@ -135,7 +135,7 @@ fn run_update(
 
     let initial_offsets: crate::inline::OperandVec<isize> =
         ordered_strides.iter().map(|_| 0isize).collect();
-    for_each_inner_block_preordered(
+    for_each_pointwise_block_preordered(
         &fused_dims,
         &plan.block,
         &ordered_strides,
