@@ -42,6 +42,10 @@ impl FusedScalar for ThreadTracked {
         Self::observed(self.0 + rhs.0)
     }
 
+    fn fused_subtract(self, rhs: Self) -> Self {
+        Self::observed(self.0 - rhs.0)
+    }
+
     fn fused_multiply(self, rhs: Self) -> Self {
         Self(self.0 * rhs.0)
     }
@@ -186,7 +190,7 @@ fn replay_all_static_families<'p>(mint: impl Fn() -> Exec<'p>, mut collect: impl
         // SAFETY: `output` has `arrays[0].len()` slots under `arrays[0].dims()` with stride `[1]`
         // (rank 1), so the layout reaches every slot, and `fused_elementwise_into_uninit`
         // returned `Ok`; its implementation documents fully overwriting the destination
-        // (fused.rs:1792).
+        // (fused.rs:1826).
         collect(
             &output
                 .iter()
@@ -699,6 +703,10 @@ impl FusedScalar for BroadcastTracked {
             std::hint::spin_loop();
         }
         Self(self.0.wrapping_add(rhs.0))
+    }
+
+    fn fused_subtract(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_sub(rhs.0))
     }
 
     fn fused_multiply(self, rhs: Self) -> Self {

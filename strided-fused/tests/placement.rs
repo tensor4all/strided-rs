@@ -158,6 +158,10 @@ impl FusedScalar for TrackedValue {
         self.observed(self.value + rhs.value)
     }
 
+    fn fused_subtract(self, rhs: Self) -> Self {
+        self.observed(self.value - rhs.value)
+    }
+
     fn fused_multiply(self, rhs: Self) -> Self {
         self.observed(self.value * rhs.value)
     }

@@ -276,6 +276,7 @@ fn chunked_replay_propagates_special_values() {
     let b: Vec<f64> = specials.iter().map(|v| v * 2.0 + 0.5).collect();
     let gapped_a = gapped(&specials);
     for (op, arity) in [
+        (FusedOp::Subtract, 2),
         (FusedOp::Divide, 2),
         (FusedOp::Maximum, 2),
         (FusedOp::Minimum, 2),
@@ -993,4 +994,244 @@ fn cheap_dispatch_costs() -> threadteam::DispatchCosts {
         .with(DispatchKind::Team, cheap)
         .with(DispatchKind::InPool, cheap)
         .with(DispatchKind::Outside, cheap)
+}
+
+// ---------------------------------------------------------------------------
+// `FusedOp::Subtract` (tensor4all/strided-rs#528): `a - b`, bit for bit.
+// ---------------------------------------------------------------------------
+
+use std::hint::black_box;
+
+/// The raw bit pattern of a float, for NaN-sign-exact comparisons.
+trait Bits: Copy {
+    type Raw: Eq + std::fmt::Debug;
+    fn bits(self) -> Self::Raw;
+    fn is_sign_negative_nan(self) -> bool;
+}
+
+macro_rules! impl_bits {
+    ($ty:ty) => {
+        impl Bits for $ty {
+            type Raw = <$ty as BitsRaw>::Raw;
+            fn bits(self) -> Self::Raw {
+                self.to_bits()
+            }
+            fn is_sign_negative_nan(self) -> bool {
+                self.is_nan() && self.is_sign_negative()
+            }
+        }
+    };
+}
+
+trait BitsRaw {
+    type Raw;
+}
+impl BitsRaw for f32 {
+    type Raw = u32;
+}
+impl BitsRaw for f64 {
+    type Raw = u64;
+}
+impl_bits!(f32);
+impl_bits!(f64);
+
+fn assert_bits_eq<T: Bits>(got: &[T], want: &[T], what: &str) {
+    assert_eq!(got.len(), want.len());
+    for (index, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(g.bits(), w.bits(), "{what}: element {index}");
+    }
+}
+
+/// Finite values, signed zeros, infinities and NaNs of both signs (one with a
+/// payload), built at run time so the compiler cannot fold arithmetic on them.
+fn special_values<T: Float>() -> Vec<T> {
+    let nan = black_box(T::nan());
+    let values = [
+        T::from(1.5).unwrap(),
+        T::from(-2.0).unwrap(),
+        T::zero(),
+        -T::zero(),
+        T::infinity(),
+        T::neg_infinity(),
+        nan,
+        -nan,
+    ];
+    values.into_iter().map(black_box).collect()
+}
+
+/// `len` pairs covering every (a, b) combination of `special_values` (needs
+/// `len >= 64`).
+fn special_pairs<T: Float>(len: usize) -> (Vec<T>, Vec<T>) {
+    let values = special_values::<T>();
+    let n = values.len();
+    let a = (0..len).map(|i| values[i % n]).collect();
+    let b = (0..len).map(|i| values[(i / n + i) % n]).collect();
+    (a, b)
+}
+
+fn subtract_chain() -> FusedPlan {
+    // ((x*y + z) - x)*z + y over inputs x=0, y=1, z=2.
+    FusedPlan {
+        input_count: 3,
+        outputs: vec![7].into_iter().collect(),
+        ops: vec![
+            FusedInst::new(FusedOp::Multiply, vec![0, 1]),
+            FusedInst::new(FusedOp::Add, vec![3, 2]),
+            FusedInst::new(FusedOp::Subtract, vec![4, 0]),
+            FusedInst::new(FusedOp::Multiply, vec![5, 2]),
+            FusedInst::new(FusedOp::Add, vec![6, 1]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// The same chain as five separate passes, each `black_box`ed so that no step
+/// can be fused or reassociated.
+fn subtract_chain_reference<T: Float>(x: &[T], y: &[T], z: &[T]) -> Vec<T> {
+    let pass = |l: &[T], r: &[T], f: &dyn Fn(T, T) -> T| -> Vec<T> {
+        l.iter()
+            .zip(r)
+            .map(|(&a, &b)| f(black_box(a), black_box(b)))
+            .collect()
+    };
+    let t3 = pass(x, y, &|a, b| a * b);
+    let t4 = pass(&t3, z, &|a, b| a + b);
+    let t5 = pass(&t4, x, &|a, b| a - b);
+    let t6 = pass(&t5, z, &|a, b| a * b);
+    pass(&t6, y, &|a, b| a + b)
+}
+
+fn check_subtract_chain<T: Float + FusedScalar + Bits>() {
+    // 4099 elements: three full 1024-element chunks plus a ragged tail.
+    let len = 4099;
+    let (x, y) = special_pairs::<T>(len);
+    let z: Vec<T> = (0..len)
+        .map(|i| T::from((i % 13) as f64 - 4.0).unwrap())
+        .collect();
+    let want = subtract_chain_reference(&x, &y, &z);
+    let plan = subtract_chain();
+
+    // T2: every operand contiguous, so the chunked replay (`chunk_binary`).
+    let chunked = replay(&plan, len, &[(&x, 1), (&y, 1), (&z, 1)]);
+    assert_bits_eq(&chunked, &want, "chunked replay");
+
+    // T3: `x` has stride 2, so the per-element interpreter (`eval_binary`).
+    let gapped_x = gapped(&x);
+    let scalar = replay(&plan, len, &[(&gapped_x, 2), (&y, 1), (&z, 1)]);
+    assert_bits_eq(&scalar, &want, "per-element interpreter");
+
+    // T4: both routes agree with each other bit for bit.
+    assert_bits_eq(&chunked, &scalar, "chunked vs interpreter");
+}
+
+#[test]
+fn subtract_chain_is_bitwise_equal_to_op_by_op_f64() {
+    check_subtract_chain::<f64>();
+}
+
+#[test]
+fn subtract_chain_is_bitwise_equal_to_op_by_op_f32() {
+    check_subtract_chain::<f32>();
+}
+
+#[test]
+fn subtract_ten_binary_chains_match_between_replays() {
+    for length in LENGTHS {
+        let a: Vec<f64> = (0..length).map(|v| v as f64 * 0.5 - 3.0).collect();
+        let b: Vec<f64> = (0..length).map(|v| (v % 7) as f64 - 2.5).collect();
+        let gapped_a = gapped(&a);
+        let plan = ten_binary(FusedOp::Subtract);
+        let chunked = replay(&plan, length, &[(&a, 1), (&b, 1)]);
+        let scalar = replay(&plan, length, &[(&gapped_a, 2), (&b, 1)]);
+        assert_bits_eq(&chunked, &scalar, "ten_binary(Subtract)");
+    }
+}
+
+/// `Subtract[0,1]` and `Negate[1]` then `Add[0,2]`, both behind a `Conj` so that
+/// neither is a single-instruction static kernel.
+fn subtract_plan() -> FusedPlan {
+    FusedPlan {
+        input_count: 2,
+        outputs: vec![3].into_iter().collect(),
+        ops: vec![
+            FusedInst::new(FusedOp::Conj, vec![0]),
+            FusedInst::new(FusedOp::Subtract, vec![2, 1]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+fn negate_add_plan() -> FusedPlan {
+    FusedPlan {
+        input_count: 2,
+        outputs: vec![4].into_iter().collect(),
+        ops: vec![
+            FusedInst::new(FusedOp::Conj, vec![0]),
+            FusedInst::new(FusedOp::Negate, vec![1]),
+            FusedInst::new(FusedOp::Add, vec![2, 3]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// T5: `Subtract` is not lowered to `Negate` + `Add`. With a NaN in `b` the two
+/// plans differ in the NaN's sign bit, and `Subtract` matches scalar `a - b`.
+fn check_subtract_is_not_negate_add<T: Float + FusedScalar + Bits>() {
+    let len = 2049;
+    let (a, b) = special_pairs::<T>(len);
+    let want: Vec<T> = a
+        .iter()
+        .zip(&b)
+        .map(|(&x, &y)| black_box(x) - black_box(y))
+        .collect();
+    let lowered: Vec<T> = a
+        .iter()
+        .zip(&b)
+        .map(|(&x, &y)| black_box(x) + black_box(-black_box(y)))
+        .collect();
+    let gapped_a = gapped(&a);
+
+    let sub_chunked = replay(&subtract_plan(), len, &[(&a, 1), (&b, 1)]);
+    let sub_scalar = replay(&subtract_plan(), len, &[(&gapped_a, 2), (&b, 1)]);
+    assert_bits_eq(&sub_chunked, &want, "Subtract, chunked");
+    assert_bits_eq(&sub_scalar, &want, "Subtract, interpreter");
+
+    let lowered_chunked = replay(&negate_add_plan(), len, &[(&a, 1), (&b, 1)]);
+    let lowered_scalar = replay(&negate_add_plan(), len, &[(&gapped_a, 2), (&b, 1)]);
+    assert_bits_eq(&lowered_chunked, &lowered, "Negate+Add, chunked");
+    assert_bits_eq(&lowered_scalar, &lowered, "Negate+Add, interpreter");
+
+    // Where `b` is a NaN and `a` is not, `a - b` keeps `b`'s sign and
+    // `a + (-b)` flips it. A lowering could not pass this.
+    let mut differing = 0;
+    for index in 0..len {
+        if b[index].is_nan() && !a[index].is_nan() {
+            assert_eq!(
+                sub_chunked[index].is_sign_negative_nan(),
+                b[index].is_sign_negative_nan(),
+                "element {index}: Subtract must keep the NaN's sign"
+            );
+            if sub_chunked[index].bits() != lowered_chunked[index].bits() {
+                differing += 1;
+            }
+        }
+    }
+    // On x86-64 and aarch64 a NaN operand is propagated with its sign, so the
+    // two formulations must disagree; elsewhere the hardware may not.
+    if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+        assert!(differing > 0, "Negate+Add never differed from Subtract");
+    }
+}
+
+#[test]
+fn subtract_is_not_lowered_to_negate_add_f64() {
+    check_subtract_is_not_negate_add::<f64>();
+}
+
+#[test]
+fn subtract_is_not_lowered_to_negate_add_f32() {
+    check_subtract_is_not_negate_add::<f32>();
 }

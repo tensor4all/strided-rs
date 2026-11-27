@@ -18,6 +18,12 @@ fused_elementwise_into(&mut [output.view_mut()], &[input.view()], &plan, Exec::s
 assert_eq!(output.get(&[1]), -3.0);
 ```
 
+Plans that reach the interpreter (more than one instruction or output, no static
+specialization) are replayed vectorized only for `f32`/`f64`; for complex,
+integer and `bool` scalars they run element by element and are not expected to
+beat separate unfused passes. `has_vectorized_replay::<T>()` reports this per
+scalar type.
+
 `simd` is enabled by default; `parallel` enables bounded parallel replay and
 forwards to the shared foundation. This crate does not create an independent
 thread pool. An assembling backend can retain automatic fusion by calling this
