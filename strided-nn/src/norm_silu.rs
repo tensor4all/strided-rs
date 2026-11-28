@@ -58,7 +58,8 @@ const CHUNK: usize = 1024;
 
 /// Scratch elements a forward over `rows` rows of `width` needs when its [`Exec`] has `budget`.
 ///
-/// Each task uses `2 * min(width, 1024)` elements (`z` and `-z` of one chunk).
+/// Each task uses `2 * min(width, 1024)` elements (`z` and `-z` of one chunk); at least one
+/// task's worth is always reported, so a zero-row call is validated like any other.
 ///
 /// # Errors
 ///
@@ -74,7 +75,7 @@ pub fn norm_silu_scratch_len(rows: usize, width: usize, budget: usize) -> Result
     CHUNK
         .min(width)
         .checked_mul(2)
-        .and_then(|n| n.checked_mul(rows.min(budget.max(1))))
+        .and_then(|n| n.checked_mul(rows.min(budget.max(1)).max(1)))
         .ok_or(NormError::SizeOverflow { rows, width })
 }
 
@@ -382,7 +383,6 @@ macro_rules! entries {
             scratch: &mut [$t],
             exec: Exec<'_>,
         ) -> Result<(), NormError> {
-            check_len("deriv", x.len(), deriv.len())?;
             vjp_params(
                 width,
                 x,
@@ -461,7 +461,6 @@ macro_rules! entries {
             scratch: &mut [$t],
             exec: Exec<'_>,
         ) -> Result<(), NormError> {
-            check_len("deriv", x.len(), deriv.len())?;
             vjp_params(
                 width,
                 x,

@@ -241,6 +241,34 @@ macro_rules! suite {
             }
 
             #[test]
+            fn zero_rows_is_ok_with_sized_scratch() {
+                let mut sc = vec![0.0 as $t; norm_silu_scratch_len(0, 8, 1).unwrap()];
+                let mut y: Vec<$t> = vec![];
+                $f_rms(
+                    8,
+                    EPS,
+                    &[],
+                    None,
+                    &mut y,
+                    None,
+                    None,
+                    &mut sc,
+                    Exec::serial(),
+                )
+                .unwrap();
+            }
+
+            #[test]
+            fn bad_width_is_reported_before_bad_deriv() {
+                let mut dw = vec![0.0 as $t; 1];
+                let mut sc = vec![0.0 as $t; 4];
+                assert_eq!(
+                    $f_rms_w(0, &[], &[], &[1.0], &[], &mut dw, &mut sc, Exec::serial()),
+                    Err(crate::NormError::EmptyWidth)
+                );
+            }
+
+            #[test]
             fn errors_before_output() {
                 let x = vec![1.0 as $t; 6];
                 let mut y = vec![7.0 as $t; 6];
