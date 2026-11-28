@@ -50,7 +50,7 @@ pub struct AxisShape {
 }
 
 /// Cache budget in bytes of one block of columns (`axis_len` rows of the block width).
-const BLOCK_BYTES: usize = 256 * 1024;
+const BLOCK_BYTES: usize = 2097152;
 /// Smallest block width in columns: one 64-byte line of `f32`.
 const MIN_BLOCK: usize = 16;
 /// `exp` dominates the passes, as in the contiguous kernel.

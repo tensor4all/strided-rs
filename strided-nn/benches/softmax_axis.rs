@@ -55,6 +55,12 @@ macro_rules! grid {
     ($t:ty, $name:literal, $axis0:ident, $fwd:ident, $vjp:ident) => {{
         for &width in &[512usize, 1024, 2048, 4096] {
             for &rows in &[16usize, 256, 4096] {
+                if let Ok(only) = std::env::var("ONLY") {
+                    // `ONLY=width,rows` runs one cell (block-width tuning).
+                    if only != format!("{width},{rows}") {
+                        continue;
+                    }
+                }
                 let n = width * rows;
                 let x: Vec<$t> = (0..n)
                     .map(|i| ((i * 2654435761) % 1000) as $t / 40.0 - 12.0)
@@ -135,6 +141,18 @@ macro_rules! grid {
 
 fn main() {
     println!("samples per cell: {}", samples());
-    grid!(f32, "f32", softmax_axis0_f32, softmax_axis_f32, softmax_vjp_axis_f32);
-    grid!(f64, "f64", softmax_axis0_f64, softmax_axis_f64, softmax_vjp_axis_f64);
+    grid!(
+        f32,
+        "f32",
+        softmax_axis0_f32,
+        softmax_axis_f32,
+        softmax_vjp_axis_f32
+    );
+    grid!(
+        f64,
+        "f64",
+        softmax_axis0_f64,
+        softmax_axis_f64,
+        softmax_vjp_axis_f64
+    );
 }
