@@ -12,6 +12,10 @@ pub enum SoftmaxError {
     #[error("input length {len} is not a multiple of axis length {axis_len}")]
     UnevenColumns { len: usize, axis_len: usize },
 
+    /// A slice does not hold `inner * axis_len * outer` elements.
+    #[error("slice holds {got} elements; the [inner, axis_len, outer] shape needs {expected}")]
+    ShapeMismatch { expected: usize, got: usize },
+
     /// The output does not have one slot per input element.
     #[error("input and output lengths differ: {input} vs {output}")]
     LengthMismatch { input: usize, output: usize },
