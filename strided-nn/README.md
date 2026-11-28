@@ -5,6 +5,8 @@ Fused neural-network kernels over contiguous strided CPU slices.
 Kernels:
 
 - `softmax_axis0_{f32,f64}`: axis-0 softmax (below).
+- `softmax_axis_{f32,f64}` / `softmax_vjp_axis_{f32,f64}`: softmax and its VJP over the middle axis of a column-major
+  `[inner, axis_len, outer]` slice (`inner == 1` is `softmax_axis0`; `inner > 1` walks the strided axis without a copy).
 - `norm`: LayerNorm and RMSNorm over the last axis of a `[rows, width]` slice, forward with optional
   per-row statistics, input VJP and weight/bias VJP that consume the cached statistics.
 - `norm_silu`: fused LayerNorm/RMSNorm -> SiLU forward and VJP in one pass over each row, bit-identical to

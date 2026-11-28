@@ -6,6 +6,14 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 
 ## Unreleased
 
+### `strided-nn`: softmax over any axis, forward and VJP (#504, A4)
+
+`softmax_axis_{f32,f64}` and `softmax_vjp_axis_{f32,f64}` take `AxisShape { inner, axis_len, outer }` (column-major
+`[inner, axis_len, outer]`, softmax over the middle axis) plus `softmax_axis_scratch_len` / `softmax_vjp_axis_scratch_len`.
+`inner == 1` delegates to `softmax_axis0_*` unchanged. `inner > 1` walks the strided axis in place (no transpose, no copy)
+with per-column running max/sum in caller scratch. `SoftmaxError` gains `ShapeMismatch` (additive variant on a public
+enum: exhaustive matches must add an arm). `softmax_axis0_*` is untouched. Numerics and measurements: see the PR.
+
 ### `strided-nn`: fused `LayerNorm/RMSNorm -> SiLU` rows, forward and VJP (#504, A3)
 
 `strided_nn::norm_silu` adds `{layer,rms}_norm_silu_forward_{f32,f64}` (one pass; optionally caches `mean`/`inv_std` or

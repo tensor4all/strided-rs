@@ -119,5 +119,68 @@ fn main() {
         .map(|value| unsafe { value.assume_init() })
         .sum();
     assert!((column - 1.0).abs() < 1e-12);
+    // Strided-axis softmax and its VJP: [inner = 64, axis_len = 64].
+    let shape = strided_nn::AxisShape {
+        inner: 64,
+        axis_len: 64,
+        outer: 1,
+    };
+    let mut axis32 = vec![core::mem::MaybeUninit::<f32>::uninit(); n];
+    let mut axis_scratch32 = vec![0.0f32; strided_nn::softmax_axis_scratch_len::<f32>(shape, 1)];
+    strided_nn::softmax_axis_f32(
+        shape,
+        &logits32,
+        &mut axis32,
+        &mut axis_scratch32,
+        Exec::serial(),
+    )
+    .unwrap();
+    let mut axis64 = vec![core::mem::MaybeUninit::<f64>::uninit(); n];
+    let mut axis_scratch64 = vec![0.0f64; strided_nn::softmax_axis_scratch_len::<f64>(shape, 1)];
+    strided_nn::softmax_axis_f64(
+        shape,
+        &logits64,
+        &mut axis64,
+        &mut axis_scratch64,
+        Exec::serial(),
+    )
+    .unwrap();
+    // SAFETY: the kernels wrote every element.
+    let y64: Vec<f64> = axis64.iter().map(|v| unsafe { v.assume_init() }).collect();
+    let y32: Vec<f32> = axis32.iter().map(|v| unsafe { v.assume_init() }).collect();
+    let mut dx64 = vec![0.0f64; n];
+    let mut vjp_scratch64 = vec![0.0f64; strided_nn::softmax_vjp_axis_scratch_len::<f64>(shape, 1)];
+    strided_nn::softmax_vjp_axis_f64(
+        shape,
+        &y64,
+        &logits64,
+        &mut dx64,
+        &mut vjp_scratch64,
+        Exec::serial(),
+    )
+    .unwrap();
+    let mut dx32 = vec![0.0f32; n];
+    let mut vjp_scratch32 = vec![0.0f32; strided_nn::softmax_vjp_axis_scratch_len::<f32>(shape, 1)];
+    strided_nn::softmax_vjp_axis_f32(
+        shape,
+        &y32,
+        &logits32,
+        &mut dx32,
+        &mut vjp_scratch32,
+        Exec::serial(),
+    )
+    .unwrap();
+    let column0: f64 = (0..64).map(|row| y64[row * 64]).sum();
+    assert!((column0 - 1.0).abs() < 1e-12);
+    // Contiguous-axis VJP rows.
+    let rows = strided_nn::AxisShape {
+        inner: 1,
+        axis_len: 64,
+        outer: 64,
+    };
+    strided_nn::softmax_vjp_axis_f64(rows, &y64, &logits64, &mut dx64, &mut [], Exec::serial())
+        .unwrap();
+    strided_nn::softmax_vjp_axis_f32(rows, &y32, &logits32, &mut dx32, &mut [], Exec::serial())
+        .unwrap();
     println!("runtime SIMD probe: ok");
 }

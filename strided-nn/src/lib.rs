@@ -20,6 +20,11 @@ mod par;
 mod real;
 mod simd;
 mod softmax;
+mod softmax_axis;
 
 pub use error::{ActivationError, NormError, SoftmaxError};
 pub use softmax::{scratch_len, softmax_axis0_f32, softmax_axis0_f64};
+pub use softmax_axis::{
+    softmax_axis_f32, softmax_axis_f64, softmax_axis_scratch_len, softmax_vjp_axis_f32,
+    softmax_vjp_axis_f64, softmax_vjp_axis_scratch_len, AxisShape,
+};
