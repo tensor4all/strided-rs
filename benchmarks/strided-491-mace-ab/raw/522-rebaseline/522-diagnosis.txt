@@ -1,0 +1,30 @@
+f32 vs f64 VJP, x86-64 (evo2), commit 03e8760. perf is blocked (perf_event_paranoid=4); evidence is static disassembly of target/release/mace-ab
+(objdump -d by nm address range) + the recorded timings.
+
+1. Kernel tier: both dtypes run V4 (AVX-512): record "simd":{"f32_lanes":16,"f64_lanes":8}.
+2. Lane kernels strided_multilinear::simd::RowF32<A,B> vs RowF64<A,B> (V4), 10 shape pairs (2,1 2,2 2,3 3,1..3,7), transcript in 522-disasm.txt
+   (script 522-disasm.sh; counting rule in its header: all objdump instruction lines of the symbol range, nops included; absolute counts depend on the
+   build, the f32 = f64 equality does not):
+   instruction counts identical per pair (e.g. <3,3>: 645 vs 645), zmm-op counts identical (106 vs 106), vcvt count 0 in both,
+   per pair the vmulp{s,d}/vaddp{s,d}/vmovup{s,d} counts are equal between f32 and f64 (e.g. <3,3>: 48/16/32; other shapes have 16 or 32 muls); no FMA in either.
+3. SegPolyPlan<f32> vs <f64> execute / run_task / accumulate_output / compile_with_block_rows: insns 1240/1240, 781/780, 1495/1502, 3133/3131;
+   0 vcvt. compile_with_block_rows<f32> has 2 plain cvt* instructions (<f64> has 0); not inspected, and where the plan is compiled relative to the timed region was not checked.
+4. Cell record f32 vs f64 (cg-vjp 1T 1024): every plan field equal (nodes, edges, cg_entries, vjp_y_paths 11008, vjp_y_plan_paths 86);
+   the size fields scale with element width: grad_x 2 vs 4 MiB and bar_y intermediate 368 vs 736 MiB exactly 2x; peak live 549,631,568 vs
+   1,084,563,390 B = 1.97x (llmlip 1.98x, rss 1.98x). Non-width difference: timings.llmlip.alloc_calls_per_call 17 (f32) vs 46 (f64), the same
+   on M5 and x86, so dtype-driven inside llmlip. Strided allocs per call = 0 in both.
+5. Part speedups f64->f32 (1T 1024): vjp_x 1.96x, vjp_w 1.92x, vjp_y 1.58x, fused total 1.72x; forward 1.56x.
+   llmlip f64->f32: VJP 3.63x, forward 2.26x.   (M5: strided VJP 1.78x, llmlip 1.60x.)
+
+6. What this does and does not establish. Established: equal instruction counts, equal zmm/mul/add/mov counts (width-agnostic classes, so a ps<->pd swap is invisible) and zero vcvt between strided's f32 and f64 for the 10 sampled lane-kernel
+   shapes and the SegPolyPlan entry points, with no widening. NOT established: that those sampled shapes cover the hot path (no counters), or why the
+   ratio differs between precisions. Observation, not cause: llmlip's f64 1T 1024 VJP is 4.0x slower on x86 than on M5 (1560 vs 393 ms), its f32 only
+   1.75x, and llmlip allocates 17 (f32) / 46 (f64) times per call; a working-set / page-fault effect on the f64 side is consistent with this and was not
+   tested (no llmlip profile).
+7. Unexplained, flagged: vs 131baaa (raw/522-x86) all four f32 4T cells are 8.1-11.0 % slower at 03e8760 (two of them below the ~10 % in-campaign floor) while the four f64 4T cells are within +-3 %.
+   strided-basic changed in between; not bisected (out of scope here). The 1T f32 VJP cells moved +1.0 / -1.0 %.
+8. The headline comparison. raw/496-after's 1.384 / 1.526 are the SUM of three separate VJP calls (split total); the fused VJP call (timings.strided_vjp_fused,
+   introduced with #499) gives 0.511 / 0.586 now. Like for like (split sum): 1.384 / 1.526 -> 0.591 / 0.635 (see the table footnote for the path through
+   498-after and 500-x86-after3). The loss is gone either way.
+9. Reading the records: check.max_rel in the cell jsonl (e.g. 3.7e22 for cg-fwd f32 1T 128) is abs / max(|reference|, 1e-30) with one near-zero reference
+   element (src/lib.rs); the meaningful figure is check.*_rel_to_scale (~3e-7 f32). It does not indicate a broken result; tests/fidelity.rs is the gate.

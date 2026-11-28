@@ -23,6 +23,7 @@ it and it cannot affect a released artifact.
 | `tests/alloc.rs` | the zero-allocation gates, in their own test binary (the counters are process-wide, so they cannot be read next to the gates above), each starting by proving the counting allocator sees a 1 MiB allocation |
 | `campaign.sh` | all 16 cells, observer pinned off the measured L3 domain |
 | `raw/` | the recorded cells, host/load/command logs, and the llmlip patch |
+| `raw/522-rebaseline*` | the #522 x86-64 re-baseline at 03e8760: `522-rebaseline-table.txt` (regenerate ratios with `raw/522-rebaseline/522-table.py`), the f32/f64 disassembly comparison `522-disasm.sh` / `522-disasm.txt`, and `522-diagnosis.txt` |
 
 ## Prerequisite: the llmlip checkout
 
