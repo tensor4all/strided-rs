@@ -19,8 +19,8 @@ cg-vjp f64 4T 128: 0.341 | 11.76/11.81/18.06 | 34.18/34.64/40.60 | strided faste
 ratio = strided / llmlip (LOWER = strided faster); vjp strided = the fused VJP (timings.strided_vjp_fused). Spread = min..max of 15 samples.
 Commit 03e8760, host EVO-X2 (Ryzen AI MAX+ 395), --release, PIN=1 SETTLE=5, 1T cells on cpu 4, 4T on 4-7. Regenerate: python3 raw/522-rebaseline/522-table.py raw/522-rebaseline (ratios).
 Anchor drift (cg-fwd f64 1T 128, start vs end): strided 16.9 -> 17.7 ms (4.2 %), llmlip 77.5 -> 78.2 ms (0.9 %). A third anchor read in campaign.txt gives 16.16 ms, so the three reads span 9.4 % peak-to-peak; the ~10 % floor, not the 4.2 % start-end drift, is the repeatability bound.
-Relation to raw/522-x86-table.txt (131baaa): strided-multilinear is unchanged between 131baaa and 03e8760, but strided-basic changed (tile walk, alias checks, serial_cost); I did not bisect, so the differences below are NOT attributed to noise. Both tables are measurements; neither supersedes the other. The same anchor cell spans ~10 % within this one campaign, so treat any cell move under ~10 % as inside the noise floor.
-strided median, 03e8760 vs 131baaa (llmlip median delta in brackets):
+Relation to raw/522-x86-table.txt (131baaa): strided-multilinear is unchanged between 131baaa and 03e8760, but strided-basic changed (tile walk, alias checks, serial_cost); I did not bisect, so the differences below are NOT attributed to noise. Both tables are measurements; neither supersedes the other. The same anchor cell spans ~10 % within this one campaign, so treat any cell move under ~10 % as inside the noise floor (two of the four f32 4T moves, +8.1 / +8.3 %, are below that; +10.1 / +11.0 % are not).
+strided median, 03e8760 vs 131baaa (llmlip median delta in brackets; llmlip is the out-of-repo tree recorded in host.txt, assumed unchanged between campaigns, not verified):
   cg-fwd f32 1T 128: +3.1 % [-0.3 %]
   cg-fwd f32 1T 1024: +0.1 % [+0.3 %]
   cg-fwd f64 1T 128: -9.7 % [-0.1 %]
@@ -37,4 +37,7 @@ strided median, 03e8760 vs 131baaa (llmlip median delta in brackets):
   cg-vjp f32 4T 1024: +8.1 % [+0.1 %]
   cg-vjp f64 4T 128: +0.0 % [-5.8 %]
   cg-vjp f64 4T 1024: +0.5 % [+0.8 %]
+Like-for-like VJP (sum of the three separate x/w/y calls, which is what raw/496-after recorded; timings.strided_split_total_ns / llmlip), cg-vjp f32 1T 128 / 1024:
+  496-after 1.526 / 1.384 -> 498-after 1.044 / 0.861 -> 500-x86-after3 0.659 / 0.578 -> 131baaa 0.625 / 0.581 -> 03e8760 0.635 / 0.591.
+The fused-call ratios in the main table (0.586 / 0.511) are a further ~10 % lower and are NOT comparable to 496-after's 1.38-1.53.
 The 1T band of the issue's table (1.09-1.53) mixes cells: raw/496-after is 1.384 (1T 1024) and 1.526 (1T 128); 1.089 is the 4T 1024 cell.

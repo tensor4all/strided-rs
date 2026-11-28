@@ -5,3 +5,4 @@ global cpufreq/boost: 1
 policy*/boost: 0 on all 32 policies
 build: cargo build --release (thin LTO, cgu=1); pins: PIN=1 SETTLE=5, 1T cpu 4, 4T cpus 4-7, observer 8-15,24-31
 perf: perf_event_paranoid=4, no root -> no hardware counters; see 522-diagnosis.txt (disassembly)
+llmlip: 6bfb0418cc5aba0a13416fd783994fa82552cc34 (the #2412 pin) + raw/llmlip-bench-api.diff applied (working tree modified: Cargo.toml, mace.rs, mace_lite.rs)
