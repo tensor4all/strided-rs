@@ -25,3 +25,7 @@ threadteam = { workspace = true, features = ["ledger"] }
 
 [lib]
 bench = false
+
+[[bench]]
+name = "norm_silu"
+harness = false

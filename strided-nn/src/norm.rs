@@ -60,7 +60,11 @@ pub(crate) fn check_len(name: &'static str, expected: usize, got: usize) -> Resu
     }
 }
 
-pub(crate) fn check_opt<T>(name: &'static str, expected: usize, v: &Option<&[T]>) -> Result<(), NormError> {
+pub(crate) fn check_opt<T>(
+    name: &'static str,
+    expected: usize,
+    v: &Option<&[T]>,
+) -> Result<(), NormError> {
     v.map_or(Ok(()), |s| check_len(name, expected, s.len()))
 }
 
@@ -177,32 +181,20 @@ fn rms_row_forward<T: Real>(x: &[T], weight: Option<&[T]>, y: &mut [T], eps: T) 
 }
 
 /// Input gradient of one row; `center` is the LayerNorm mean (`None` for RMSNorm).
-///
-/// `gate` is the fused-epilogue hook: when present the upstream gradient is first multiplied
-/// by it elementwise (`dy * f'(z)`, the activation VJP), with that product rounded exactly as
-/// the standalone activation VJP rounds it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn row_vjp_input<T: Real>(
+fn row_vjp_input<T: Real>(
     x: &[T],
     center: Option<T>,
     scale: T,
     weight: Option<&[T]>,
-    gate: Option<&[T]>,
     dy: &[T],
     dx: &mut [T],
 ) {
     let n = x.len();
     let count = T::from_usize(n);
     let mu = center.unwrap_or(T::ZERO);
-    let g = |i: usize| {
-        let d = match gate {
-            Some(f) => dy[i] * f[i],
-            None => dy[i],
-        };
-        match weight {
-            Some(w) => d * w[i],
-            None => d,
-        }
+    let g = |i: usize| match weight {
+        Some(w) => dy[i] * w[i],
+        None => dy[i],
     };
     let mean_g = match center {
         Some(_) => lane_sum(n, g) / count,
@@ -297,7 +289,6 @@ fn vjp_input<T: Real>(
                 mean.map(|m| m[r]),
                 scale[r],
                 weight,
-                None,
                 &dy[span],
                 out,
             );

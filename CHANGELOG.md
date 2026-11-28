@@ -6,6 +6,17 @@ Crates: `strided-traits`, `strided-view`, `strided-perm`, `strided-basic`,
 
 ## Unreleased
 
+### `strided-nn`: fused `LayerNorm/RMSNorm -> SiLU` rows, forward and VJP (#504, A3)
+
+`strided_nn::norm_silu` adds `{layer,rms}_norm_silu_forward_{f32,f64}` (one pass; optionally caches `mean`/`inv_std` or
+`inv_rms` and `silu'(z)`), `*_vjp_input_*` and `*_vjp_params_*` / `rms_norm_silu_vjp_weight_*`, plus
+`norm_silu_scratch_len`. Additive only: no A1/A2 signature or result changes (`activation` gains a crate-private
+`epilogue` that the standalone SiLU now also calls; `norm` gains crate-private statistics helpers and a `gate` in its
+parameter reduction). Prologue = row statistics + normalize-scale-shift; epilogue = `activation::epilogue`, so A5's
+linear/bias prologue replaces only the prologue. The fused results are bit-identical to the A1 + A2 composition
+(tested bit for bit, f32/f64, serial and 4 threads). Measured on one core: forward 1.00-1.10x, VJP 1.2-1.4x of the
+two-pass time, see the PR.
+
 ### `strided-fused`: `FusedOp::Subtract`; complex plans documented as unvectorized (#528) — breaking
 
 - `FusedOp::Subtract` is `a - b` with the scalar's own subtraction (IEEE, componentwise complex, wrapping integers). It

@@ -39,7 +39,13 @@ macro_rules! suite {
             const EPS: $t = 1e-5;
 
             /// Fused forward + VJP versus the two-pass composition, compared bit for bit.
-            fn check(layer: bool, rows: usize, width: usize, aff: (bool, bool), mut exec: Exec<'_>) {
+            fn check(
+                layer: bool,
+                rows: usize,
+                width: usize,
+                aff: (bool, bool),
+                mut exec: Exec<'_>,
+            ) {
                 let n = rows * width;
                 let x = vec(n, 1);
                 let w = vec(width, 2);
@@ -54,8 +60,17 @@ macro_rules! suite {
                 let mut y0 = vec![0.0 as $t; n];
                 let mut d0 = vec![0.0 as $t; n];
                 if layer {
-                    nm::$a_ln(width, EPS, &x, w, b, &mut z, Some((&mut m0, &mut s0)), Exec::serial())
-                        .unwrap();
+                    nm::$a_ln(
+                        width,
+                        EPS,
+                        &x,
+                        w,
+                        b,
+                        &mut z,
+                        Some((&mut m0, &mut s0)),
+                        Exec::serial(),
+                    )
+                    .unwrap();
                 } else {
                     nm::$a_rms(width, EPS, &x, w, &mut z, Some(&mut s0), Exec::serial()).unwrap();
                 }
@@ -68,11 +83,32 @@ macro_rules! suite {
                 let (mut m1, mut s1) = (vec![0.0 as $t; rows], vec![0.0 as $t; rows]);
                 let mut sc = vec![0.0 as $t; norm_silu_scratch_len(rows, width, 8).unwrap()];
                 if layer {
-                    $f_ln(width, EPS, &x, w, b, &mut y1, Some((&mut m1, &mut s1)), Some(&mut d1), &mut sc, exec.reborrow())
-                        .unwrap();
+                    $f_ln(
+                        width,
+                        EPS,
+                        &x,
+                        w,
+                        b,
+                        &mut y1,
+                        Some((&mut m1, &mut s1)),
+                        Some(&mut d1),
+                        &mut sc,
+                        exec.reborrow(),
+                    )
+                    .unwrap();
                 } else {
-                    $f_rms(width, EPS, &x, w, &mut y1, Some(&mut s1), Some(&mut d1), &mut sc, exec.reborrow())
-                        .unwrap();
+                    $f_rms(
+                        width,
+                        EPS,
+                        &x,
+                        w,
+                        &mut y1,
+                        Some(&mut s1),
+                        Some(&mut d1),
+                        &mut sc,
+                        exec.reborrow(),
+                    )
+                    .unwrap();
                 }
                 assert_eq!(bits(&y0), bits(&y1), "y {ctx}");
                 assert_eq!(bits(&d0), bits(&d1), "deriv {ctx}");
@@ -84,9 +120,32 @@ macro_rules! suite {
                 // Forward without the optional caches gives the same y.
                 let mut y2 = vec![0.0 as $t; n];
                 if layer {
-                    $f_ln(width, EPS, &x, w, b, &mut y2, None, None, &mut sc, exec.reborrow()).unwrap();
+                    $f_ln(
+                        width,
+                        EPS,
+                        &x,
+                        w,
+                        b,
+                        &mut y2,
+                        None,
+                        None,
+                        &mut sc,
+                        exec.reborrow(),
+                    )
+                    .unwrap();
                 } else {
-                    $f_rms(width, EPS, &x, w, &mut y2, None, None, &mut sc, exec.reborrow()).unwrap();
+                    $f_rms(
+                        width,
+                        EPS,
+                        &x,
+                        w,
+                        &mut y2,
+                        None,
+                        None,
+                        &mut sc,
+                        exec.reborrow(),
+                    )
+                    .unwrap();
                 }
                 assert_eq!(bits(&y0), bits(&y2), "y(no cache) {ctx}");
 
@@ -101,17 +160,48 @@ macro_rules! suite {
                 let mut psc = vec![0.0 as $t; plen];
                 if layer {
                     nm::$a_ln_in(width, &x, &m0, &s0, w, &dz, &mut dx0, Exec::serial()).unwrap();
-                    nm::$a_ln_par(width, &x, &m0, &s0, &dz, Some(&mut dw0), Some(&mut db0), &mut psc, Exec::serial())
-                        .unwrap();
+                    nm::$a_ln_par(
+                        width,
+                        &x,
+                        &m0,
+                        &s0,
+                        &dz,
+                        Some(&mut dw0),
+                        Some(&mut db0),
+                        &mut psc,
+                        Exec::serial(),
+                    )
+                    .unwrap();
                     $f_ln_in(width, &x, &m1, &s1, w, &d1, &dy, &mut dx1, exec.reborrow()).unwrap();
-                    $f_ln_par(width, &x, &m1, &s1, &d1, &dy, Some(&mut dw1), Some(&mut db1), &mut psc, exec.reborrow())
-                        .unwrap();
+                    $f_ln_par(
+                        width,
+                        &x,
+                        &m1,
+                        &s1,
+                        &d1,
+                        &dy,
+                        Some(&mut dw1),
+                        Some(&mut db1),
+                        &mut psc,
+                        exec.reborrow(),
+                    )
+                    .unwrap();
                     assert_eq!(bits(&db0), bits(&db1), "dbias {ctx}");
                 } else {
                     nm::$a_rms_in(width, &x, &s0, w, &dz, &mut dx0, Exec::serial()).unwrap();
                     nm::$a_rms_w(width, &x, &s0, &dz, &mut dw0, &mut psc, Exec::serial()).unwrap();
                     $f_rms_in(width, &x, &s1, w, &d1, &dy, &mut dx1, exec.reborrow()).unwrap();
-                    $f_rms_w(width, &x, &s1, &d1, &dy, &mut dw1, &mut psc, exec.reborrow()).unwrap();
+                    $f_rms_w(
+                        width,
+                        &x,
+                        &s1,
+                        &d1,
+                        &dy,
+                        &mut dw1,
+                        &mut psc,
+                        exec.reborrow(),
+                    )
+                    .unwrap();
                 }
                 let _ = planes;
                 assert_eq!(bits(&dx0), bits(&dx1), "dx {ctx}");
@@ -123,7 +213,8 @@ macro_rules! suite {
                 for layer in [true, false] {
                     for &rows in &ROWS {
                         for &width in &WIDTHS {
-                            for aff in [(false, false), (true, false), (false, true), (true, true)] {
+                            for aff in [(false, false), (true, false), (false, true), (true, true)]
+                            {
                                 check(layer, rows, width, aff, Exec::serial());
                             }
                         }
@@ -137,7 +228,13 @@ macro_rules! suite {
                 for layer in [true, false] {
                     for &rows in &[5usize, 131] {
                         for &width in &[7usize, 257, 1025] {
-                            check(layer, rows, width, (true, true), Exec::new(&pool, 4).unwrap());
+                            check(
+                                layer,
+                                rows,
+                                width,
+                                (true, true),
+                                Exec::new(&pool, 4).unwrap(),
+                            );
                         }
                     }
                 }
@@ -158,11 +255,31 @@ macro_rules! suite {
                     Err(crate::NormError::UnevenRows { .. })
                 ));
                 assert!(matches!(
-                    $f_rms(3, EPS, &x, None, &mut y, None, Some(&mut [0.0; 5]), &mut sc, e.reborrow()),
+                    $f_rms(
+                        3,
+                        EPS,
+                        &x,
+                        None,
+                        &mut y,
+                        None,
+                        Some(&mut [0.0; 5]),
+                        &mut sc,
+                        e.reborrow()
+                    ),
                     Err(crate::NormError::LengthMismatch { name: "deriv", .. })
                 ));
                 assert!(matches!(
-                    $f_rms(3, EPS, &x, None, &mut y, None, None, &mut sc[..5], e.reborrow()),
+                    $f_rms(
+                        3,
+                        EPS,
+                        &x,
+                        None,
+                        &mut y,
+                        None,
+                        None,
+                        &mut sc[..5],
+                        e.reborrow()
+                    ),
                     Err(crate::NormError::ScratchTooSmall { need: 6, got: 5 })
                 ));
                 assert!(y.iter().all(|&v| v == 7.0));
@@ -172,18 +289,38 @@ macro_rules! suite {
 }
 
 suite!(
-    f32_suite, f32,
-    layer_norm_silu_forward_f32, layer_norm_silu_vjp_input_f32, layer_norm_silu_vjp_params_f32,
-    rms_norm_silu_forward_f32, rms_norm_silu_vjp_input_f32, rms_norm_silu_vjp_weight_f32,
-    layer_norm_forward_f32, layer_norm_vjp_input_f32, layer_norm_vjp_params_f32,
-    rms_norm_forward_f32, rms_norm_vjp_input_f32, rms_norm_vjp_weight_f32,
-    silu_forward_f32, silu_vjp_f32
+    f32_suite,
+    f32,
+    layer_norm_silu_forward_f32,
+    layer_norm_silu_vjp_input_f32,
+    layer_norm_silu_vjp_params_f32,
+    rms_norm_silu_forward_f32,
+    rms_norm_silu_vjp_input_f32,
+    rms_norm_silu_vjp_weight_f32,
+    layer_norm_forward_f32,
+    layer_norm_vjp_input_f32,
+    layer_norm_vjp_params_f32,
+    rms_norm_forward_f32,
+    rms_norm_vjp_input_f32,
+    rms_norm_vjp_weight_f32,
+    silu_forward_f32,
+    silu_vjp_f32
 );
 suite!(
-    f64_suite, f64,
-    layer_norm_silu_forward_f64, layer_norm_silu_vjp_input_f64, layer_norm_silu_vjp_params_f64,
-    rms_norm_silu_forward_f64, rms_norm_silu_vjp_input_f64, rms_norm_silu_vjp_weight_f64,
-    layer_norm_forward_f64, layer_norm_vjp_input_f64, layer_norm_vjp_params_f64,
-    rms_norm_forward_f64, rms_norm_vjp_input_f64, rms_norm_vjp_weight_f64,
-    silu_forward_f64, silu_vjp_f64
+    f64_suite,
+    f64,
+    layer_norm_silu_forward_f64,
+    layer_norm_silu_vjp_input_f64,
+    layer_norm_silu_vjp_params_f64,
+    rms_norm_silu_forward_f64,
+    rms_norm_silu_vjp_input_f64,
+    rms_norm_silu_vjp_weight_f64,
+    layer_norm_forward_f64,
+    layer_norm_vjp_input_f64,
+    layer_norm_vjp_params_f64,
+    rms_norm_forward_f64,
+    rms_norm_vjp_input_f64,
+    rms_norm_vjp_weight_f64,
+    silu_forward_f64,
+    silu_vjp_f64
 );

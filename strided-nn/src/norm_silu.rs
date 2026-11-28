@@ -46,11 +46,9 @@ use strided_basic::Exec;
 
 use crate::activation;
 use crate::error::NormError;
-use crate::norm::{
-    check_len, check_opt, ln_stats, rms_stats, row_vjp_input, rows_of, vjp_params, CLASS,
-};
+use crate::norm::{check_len, check_opt, ln_stats, rms_stats, rows_of, vjp_params, CLASS};
 use crate::par::{for_unit_ranges, span_mut};
-use crate::real::Real;
+use crate::real::{lane_sum, Real};
 
 #[cfg(test)]
 mod tests;
@@ -111,12 +109,7 @@ fn fill_chunk<T: Real>(
     neg_z: &mut [T],
 ) {
     #[inline(always)]
-    fn run<T: Real>(
-        x: &[T],
-        z: &mut [T],
-        neg_z: &mut [T],
-        f: impl Fn(usize, T) -> T,
-    ) {
+    fn run<T: Real>(x: &[T], z: &mut [T], neg_z: &mut [T], f: impl Fn(usize, T) -> T) {
         for (i, ((o, n), &v)) in z.iter_mut().zip(neg_z.iter_mut()).zip(x).enumerate() {
             let r = f(i, v);
             *o = r;
@@ -234,6 +227,46 @@ fn forward<T: Real>(
     Ok(())
 }
 
+/// Input gradient of one row of the fused kernel; `center` is the LayerNorm mean.
+///
+/// The epilogue's backward `dz = dy * deriv` (times `weight`, the prologue's `g`) is staged
+/// once into the output row, which is L1-hot and is overwritten in place by the final pass.
+/// The expressions and the reduction order are those of A1's `row_vjp_input`, so the result
+/// is bit-identical to `silu_vjp` followed by `layer_norm_vjp_input`.
+fn row_vjp_staged<T: Real>(
+    x: &[T],
+    center: Option<T>,
+    scale: T,
+    weight: Option<&[T]>,
+    deriv: &[T],
+    dy: &[T],
+    dx: &mut [T],
+) {
+    let n = x.len();
+    let count = T::from_usize(n);
+    let mu = center.unwrap_or(T::ZERO);
+    match weight {
+        Some(w) => {
+            for (((o, &g), &f), &w) in dx.iter_mut().zip(dy).zip(deriv).zip(w) {
+                *o = (g * f) * w;
+            }
+        }
+        None => {
+            for ((o, &g), &f) in dx.iter_mut().zip(dy).zip(deriv) {
+                *o = g * f;
+            }
+        }
+    }
+    let mean_g = match center {
+        Some(_) => lane_sum(n, |i| dx[i]) / count,
+        None => T::ZERO,
+    };
+    let mean_gx = lane_sum(n, |i| dx[i] * ((x[i] - mu) * scale)) / count;
+    for (o, &v) in dx.iter_mut().zip(x) {
+        *o = scale * (*o - mean_g - (v - mu) * scale * mean_gx);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn vjp_input<T: Real>(
     width: usize,
@@ -259,12 +292,12 @@ fn vjp_input<T: Real>(
             let span = r * width..(r + 1) * width;
             // SAFETY: `dx.len() == rows * width` was checked and `r < rows`; one task per row.
             let out = unsafe { span_mut(dx_ptr, r * width, width) };
-            row_vjp_input(
+            row_vjp_staged(
                 &x[span.clone()],
                 mean.map(|m| m[r]),
                 scale[r],
                 weight,
-                Some(&deriv[span.clone()]),
+                &deriv[span.clone()],
                 &dy[span],
                 out,
             );
