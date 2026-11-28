@@ -42,13 +42,13 @@ use crate::real::{lane_sum, Real};
 #[cfg(test)]
 mod tests;
 
-const CLASS: KernelClass = KernelClass::Reduce;
+pub(crate) const CLASS: KernelClass = KernelClass::Reduce;
 /// Rows per parameter-VJP partial; fixed so the summation order never depends on the token.
 const CHUNK_ROWS: usize = 128;
 /// Columns per task when the chunk partials are combined.
 const COLUMN_BLOCK: usize = 64;
 
-fn check_len(name: &'static str, expected: usize, got: usize) -> Result<(), NormError> {
+pub(crate) fn check_len(name: &'static str, expected: usize, got: usize) -> Result<(), NormError> {
     if expected == got {
         Ok(())
     } else {
@@ -60,12 +60,16 @@ fn check_len(name: &'static str, expected: usize, got: usize) -> Result<(), Norm
     }
 }
 
-fn check_opt<T>(name: &'static str, expected: usize, v: &Option<&[T]>) -> Result<(), NormError> {
+pub(crate) fn check_opt<T>(
+    name: &'static str,
+    expected: usize,
+    v: &Option<&[T]>,
+) -> Result<(), NormError> {
     v.map_or(Ok(()), |s| check_len(name, expected, s.len()))
 }
 
 /// Validate the row shape and return `rows`.
-fn rows_of(width: usize, len: usize) -> Result<usize, NormError> {
+pub(crate) fn rows_of(width: usize, len: usize) -> Result<usize, NormError> {
     if width == 0 {
         return Err(NormError::EmptyWidth);
     }
@@ -109,6 +113,23 @@ pub fn rms_norm_weight_scratch_len(rows: usize, width: usize) -> Result<usize, N
 
 // ---------------------------------------------------------------- row kernels
 
+/// Per-row LayerNorm statistics `(mean, inv_std)`; shared with the fused epilogue kernels.
+#[inline(always)]
+pub(crate) fn ln_stats<T: Real>(x: &[T], eps: T) -> (T, T) {
+    let n = x.len();
+    let count = T::from_usize(n);
+    let mean = lane_sum(n, |i| x[i]) / count;
+    let var = lane_sum(n, |i| (x[i] - mean) * (x[i] - mean)) / count;
+    (mean, T::ONE / (var + eps).sqrt())
+}
+
+/// Per-row RMSNorm statistic `inv_rms`; shared with the fused epilogue kernels.
+#[inline(always)]
+pub(crate) fn rms_stats<T: Real>(x: &[T], eps: T) -> T {
+    let n = x.len();
+    T::ONE / (lane_sum(n, |i| x[i] * x[i]) / T::from_usize(n) + eps).sqrt()
+}
+
 fn ln_row_forward<T: Real>(
     x: &[T],
     weight: Option<&[T]>,
@@ -116,11 +137,7 @@ fn ln_row_forward<T: Real>(
     y: &mut [T],
     eps: T,
 ) -> (T, T) {
-    let n = x.len();
-    let count = T::from_usize(n);
-    let mean = lane_sum(n, |i| x[i]) / count;
-    let var = lane_sum(n, |i| (x[i] - mean) * (x[i] - mean)) / count;
-    let inv_std = T::ONE / (var + eps).sqrt();
+    let (mean, inv_std) = ln_stats(x, eps);
     match (weight, bias) {
         (Some(w), Some(b)) => {
             for (((o, &v), &w), &b) in y.iter_mut().zip(x).zip(w).zip(b) {
@@ -147,8 +164,7 @@ fn ln_row_forward<T: Real>(
 }
 
 fn rms_row_forward<T: Real>(x: &[T], weight: Option<&[T]>, y: &mut [T], eps: T) -> T {
-    let n = x.len();
-    let inv_rms = T::ONE / (lane_sum(n, |i| x[i] * x[i]) / T::from_usize(n) + eps).sqrt();
+    let inv_rms = rms_stats(x, eps);
     match weight {
         Some(w) => {
             for ((o, &v), &w) in y.iter_mut().zip(x).zip(w) {
@@ -283,11 +299,12 @@ fn vjp_input<T: Real>(
 
 /// Parameter gradients: `dweight = sum_rows dy * xhat`, `dbias = sum_rows dy`.
 #[allow(clippy::too_many_arguments)]
-fn vjp_params<T: Real>(
+pub(crate) fn vjp_params<T: Real>(
     width: usize,
     x: &[T],
     mean: Option<&[T]>,
     scale: &[T],
+    gate: Option<&[T]>,
     dy: &[T],
     dweight: Option<&mut [T]>,
     dbias: Option<&mut [T]>,
@@ -298,6 +315,7 @@ fn vjp_params<T: Real>(
     check_len("dy", x.len(), dy.len())?;
     check_len("inv_std", rows, scale.len())?;
     check_opt("mean", rows, &mean)?;
+    check_opt("deriv", x.len(), &gate)?;
     if let Some(d) = &dweight {
         check_len("dweight", width, d.len())?;
     }
@@ -353,16 +371,21 @@ fn vjp_params<T: Real>(
                 for r in c * CHUNK_ROWS..((c + 1) * CHUNK_ROWS).min(rows) {
                     let xr = &x[r * width..(r + 1) * width];
                     let dr = &dy[r * width..(r + 1) * width];
+                    let gr = gate.map(|g| &g[r * width..(r + 1) * width]);
                     let mu = mean.map_or(T::ZERO, |m| m[r]);
                     let s = scale[r];
+                    let dz = |i: usize| match gr {
+                        Some(f) => dr[i] * f[i],
+                        None => dr[i],
+                    };
                     if let Some(p) = pw.as_deref_mut() {
-                        for ((a, &v), &g) in p.iter_mut().zip(xr).zip(dr) {
-                            *a += g * ((v - mu) * s);
+                        for (i, (a, &v)) in p.iter_mut().zip(xr).enumerate() {
+                            *a += dz(i) * ((v - mu) * s);
                         }
                     }
                     if let Some(p) = pb.as_deref_mut() {
-                        for (a, &g) in p.iter_mut().zip(dr) {
-                            *a += g;
+                        for (i, a) in p.iter_mut().enumerate() {
+                            *a += dz(i);
                         }
                     }
                 }
@@ -478,6 +501,7 @@ macro_rules! norm_entries {
                 x,
                 Some(mean),
                 inv_std,
+                None,
                 dy,
                 dweight,
                 dbias,
@@ -547,6 +571,7 @@ macro_rules! norm_entries {
                 x,
                 None,
                 inv_rms,
+                None,
                 dy,
                 Some(dweight),
                 None,

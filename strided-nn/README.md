@@ -7,6 +7,8 @@ Kernels:
 - `softmax_axis0_{f32,f64}`: axis-0 softmax (below).
 - `norm`: LayerNorm and RMSNorm over the last axis of a `[rows, width]` slice, forward with optional
   per-row statistics, input VJP and weight/bias VJP that consume the cached statistics.
+- `norm_silu`: fused LayerNorm/RMSNorm -> SiLU forward and VJP in one pass over each row, bit-identical to
+  `norm` followed by `activation`, caching the row statistics and `silu'(z)` for the VJP.
 - `activation`: SiLU and sigmoid forward with an optionally cached `f'(x)`, and the matching VJP.
 
 All are deterministic across thread counts (fixed per-row reduction order; the parameter VJPs reduce in

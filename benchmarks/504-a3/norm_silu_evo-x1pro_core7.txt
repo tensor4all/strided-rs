@@ -1,0 +1,65 @@
+samples per cell: 31
+f32  fwd w=512   rows=1     two-pass         1175 ns  fused         1112 ns  ratio 1.057   (min 1169 / 1105)  [A1 alone 550, A2 alone 622]
+f32  vjp w=512   rows=1     two-pass          981 ns  fused          701 ns  ratio 1.399   (min 975 / 691)
+f32  fwd w=512   rows=16    two-pass        17070 ns  fused        16469 ns  ratio 1.037   (min 16820 / 16417)  [A1 alone 8062, A2 alone 9047]
+f32  vjp w=512   rows=16    two-pass        14474 ns  fused        10538 ns  ratio 1.374   (min 14378 / 10499)
+f32  fwd w=512   rows=256   two-pass       269726 ns  fused       262911 ns  ratio 1.026   (min 267864 / 262083)  [A1 alone 127374, A2 alone 142714]
+f32  vjp w=512   rows=256   two-pass       241025 ns  fused       173217 ns  ratio 1.391   (min 240315 / 172469)
+f32  fwd w=512   rows=4096  two-pass      4372144 ns  fused      4345194 ns  ratio 1.006   (min 4353239 / 4325678)  [A1 alone 2050720, A2 alone 2323348]
+f32  vjp w=512   rows=4096  two-pass      3989301 ns  fused      2906153 ns  ratio 1.373   (min 3957972 / 2865959)
+f32  fwd w=1024  rows=1     two-pass         2207 ns  fused         2093 ns  ratio 1.055   (min 2178 / 2082)  [A1 alone 1019, A2 alone 1195]
+f32  vjp w=1024  rows=1     two-pass         1861 ns  fused         1331 ns  ratio 1.399   (min 1856 / 1325)
+f32  fwd w=1024  rows=16    two-pass        33633 ns  fused        32422 ns  ratio 1.037   (min 33398 / 32260)  [A1 alone 15547, A2 alone 18046]
+f32  vjp w=1024  rows=16    two-pass        28606 ns  fused        21014 ns  ratio 1.361   (min 28513 / 20926)
+f32  fwd w=1024  rows=256   two-pass       535254 ns  fused       521426 ns  ratio 1.027   (min 533441 / 518676)  [A1 alone 249657, A2 alone 284113]
+f32  vjp w=1024  rows=256   two-pass       488284 ns  fused       348631 ns  ratio 1.401   (min 486532 / 346742)
+f32  fwd w=1024  rows=4096  two-pass      9095963 ns  fused      8557590 ns  ratio 1.063   (min 9035431 / 8515091)  [A1 alone 4346667, A2 alone 4767280]
+f32  vjp w=1024  rows=4096  two-pass      8123872 ns  fused      6210117 ns  ratio 1.308   (min 8086383 / 6066420)
+f32  fwd w=2048  rows=1     two-pass         4244 ns  fused         4090 ns  ratio 1.038   (min 4206 / 4058)  [A1 alone 1948, A2 alone 2264]
+f32  vjp w=2048  rows=1     two-pass         3625 ns  fused         2660 ns  ratio 1.363   (min 3611 / 2643)
+f32  fwd w=2048  rows=16    two-pass        65483 ns  fused        65561 ns  ratio 0.999   (min 65212 / 65209)  [A1 alone 30283, A2 alone 35061]
+f32  vjp w=2048  rows=16    two-pass        56707 ns  fused        42124 ns  ratio 1.346   (min 56306 / 41867)
+f32  fwd w=2048  rows=256   two-pass      1065745 ns  fused      1047196 ns  ratio 1.018   (min 1059223 / 1040828)  [A1 alone 491901, A2 alone 569528]
+f32  vjp w=2048  rows=256   two-pass       967465 ns  fused       730992 ns  ratio 1.323   (min 960806 / 714010)
+f32  fwd w=2048  rows=4096  two-pass     17630220 ns  fused     17541245 ns  ratio 1.005   (min 17538089 / 17456066)  [A1 alone 8149500, A2 alone 9501288]
+f32  vjp w=2048  rows=4096  two-pass     17374645 ns  fused     14298244 ns  ratio 1.215   (min 17301027 / 14206002)
+f32  fwd w=4096  rows=1     two-pass         8555 ns  fused         8247 ns  ratio 1.037   (min 8462 / 8215)  [A1 alone 3867, A2 alone 4578]
+f32  vjp w=4096  rows=1     two-pass         7155 ns  fused         5203 ns  ratio 1.375   (min 7126 / 5174)
+f32  fwd w=4096  rows=16    two-pass       133041 ns  fused       127580 ns  ratio 1.043   (min 132271 / 127109)  [A1 alone 60082, A2 alone 71947]
+f32  vjp w=4096  rows=16    two-pass       120673 ns  fused        85336 ns  ratio 1.414   (min 119811 / 84912)
+f32  fwd w=4096  rows=256   two-pass      2224384 ns  fused      2162858 ns  ratio 1.028   (min 2202863 / 2139035)  [A1 alone 1009641, A2 alone 1182834]
+f32  vjp w=4096  rows=256   two-pass      2054577 ns  fused      1568056 ns  ratio 1.310   (min 2032777 / 1553624)
+f32  fwd w=4096  rows=4096  two-pass     38290495 ns  fused     35446016 ns  ratio 1.080   (min 38115099 / 35333607)  [A1 alone 17613339, A2 alone 20802339]
+f32  vjp w=4096  rows=4096  two-pass     36597321 ns  fused     27143231 ns  ratio 1.348   (min 36012391 / 26959348)
+f64  fwd w=512   rows=1     two-pass         2287 ns  fused         2218 ns  ratio 1.031   (min 2272 / 2205)  [A1 alone 658, A2 alone 1628]
+f64  vjp w=512   rows=1     two-pass         1216 ns  fused          916 ns  ratio 1.328   (min 1209 / 906)
+f64  fwd w=512   rows=16    two-pass        34991 ns  fused        34271 ns  ratio 1.021   (min 34844 / 34137)  [A1 alone 9962, A2 alone 24961]
+f64  vjp w=512   rows=16    two-pass        18097 ns  fused        14371 ns  ratio 1.259   (min 18050 / 14289)
+f64  fwd w=512   rows=256   two-pass       565238 ns  fused       550974 ns  ratio 1.026   (min 562894 / 548690)  [A1 alone 161144, A2 alone 402640]
+f64  vjp w=512   rows=256   two-pass       317927 ns  fused       242598 ns  ratio 1.311   (min 316132 / 241336)
+f64  fwd w=512   rows=4096  two-pass      9586858 ns  fused      9292339 ns  ratio 1.032   (min 9527548 / 9257815)  [A1 alone 2863895, A2 alone 6716050]
+f64  vjp w=512   rows=4096  two-pass      5515664 ns  fused      4511994 ns  ratio 1.222   (min 5476381 / 4442325)
+f64  fwd w=1024  rows=1     two-pass         4455 ns  fused         4378 ns  ratio 1.018   (min 4433 / 4365)  [A1 alone 1238, A2 alone 3186]
+f64  vjp w=1024  rows=1     two-pass         2319 ns  fused         1805 ns  ratio 1.284   (min 2305 / 1795)
+f64  fwd w=1024  rows=16    two-pass        69124 ns  fused        67838 ns  ratio 1.019   (min 68907 / 67677)  [A1 alone 19234, A2 alone 49859]
+f64  vjp w=1024  rows=16    two-pass        35538 ns  fused        28584 ns  ratio 1.243   (min 35416 / 28315)
+f64  fwd w=1024  rows=256   two-pass      1125792 ns  fused      1117556 ns  ratio 1.007   (min 1119070 / 1109808)  [A1 alone 315337, A2 alone 812310]
+f64  vjp w=1024  rows=256   two-pass       685487 ns  fused       548570 ns  ratio 1.250   (min 679646 / 530088)
+f64  fwd w=1024  rows=4096  two-pass     19010541 ns  fused     18482888 ns  ratio 1.029   (min 18900337 / 18401648)  [A1 alone 5307717, A2 alone 13673771]
+f64  vjp w=1024  rows=4096  two-pass     11985576 ns  fused     10872662 ns  ratio 1.102   (min 11915185 / 10760093)
+f64  fwd w=2048  rows=1     two-pass         8914 ns  fused         8725 ns  ratio 1.022   (min 8887 / 8684)  [A1 alone 2477, A2 alone 6426]
+f64  vjp w=2048  rows=1     two-pass         4567 ns  fused         3514 ns  ratio 1.300   (min 4550 / 3496)
+f64  fwd w=2048  rows=16    two-pass       140598 ns  fused       134783 ns  ratio 1.043   (min 140018 / 134450)  [A1 alone 37978, A2 alone 101404]
+f64  vjp w=2048  rows=16    two-pass        76655 ns  fused        57928 ns  ratio 1.323   (min 76249 / 57600)
+f64  fwd w=2048  rows=256   two-pass      2323638 ns  fused      2286699 ns  ratio 1.016   (min 2302258 / 2270439)  [A1 alone 656757, A2 alone 1640621]
+f64  vjp w=2048  rows=256   two-pass      1407272 ns  fused      1175174 ns  ratio 1.198   (min 1389248 / 1151700)
+f64  fwd w=2048  rows=4096  two-pass     40594486 ns  fused     36931494 ns  ratio 1.099   (min 40272877 / 36788487)  [A1 alone 12122932, A2 alone 28265021]
+f64  vjp w=2048  rows=4096  two-pass     25919311 ns  fused     20811276 ns  ratio 1.245   (min 25829683 / 20728071)
+f64  fwd w=4096  rows=1     two-pass        17593 ns  fused        16945 ns  ratio 1.038   (min 17488 / 16874)  [A1 alone 4787, A2 alone 12767]
+f64  vjp w=4096  rows=1     two-pass         8907 ns  fused         7163 ns  ratio 1.244   (min 8882 / 7141)
+f64  fwd w=4096  rows=16    two-pass       281885 ns  fused       276409 ns  ratio 1.020   (min 280752 / 275583)  [A1 alone 75995, A2 alone 204232]
+f64  vjp w=4096  rows=16    two-pass       156447 ns  fused       119016 ns  ratio 1.315   (min 156072 / 118241)
+f64  fwd w=4096  rows=256   two-pass      4703742 ns  fused      4565374 ns  ratio 1.030   (min 4672173 / 4543172)  [A1 alone 1372972, A2 alone 3320936]
+f64  vjp w=4096  rows=256   two-pass      3165256 ns  fused      2256784 ns  ratio 1.403   (min 3136302 / 2235063)
+f64  fwd w=4096  rows=4096  two-pass     78174228 ns  fused     73029185 ns  ratio 1.070   (min 77886292 / 72749634)  [A1 alone 23050627, A2 alone 55137798]
+f64  vjp w=4096  rows=4096  two-pass     53930007 ns  fused     38616212 ns  ratio 1.397   (min 53729153 / 38514362)
