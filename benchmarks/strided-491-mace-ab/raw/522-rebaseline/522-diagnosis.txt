@@ -26,3 +26,5 @@ f32 vs f64 VJP, x86-64 (evo2), commit 03e8760. perf is blocked (perf_event_paran
 8. The headline comparison. raw/496-after's 1.384 / 1.526 are the SUM of three separate VJP calls (split total); the fused VJP call (timings.strided_vjp_fused,
    introduced with #499) gives 0.511 / 0.586 now. Like for like (split sum): 1.384 / 1.526 -> 0.591 / 0.635 (see the table footnote for the path through
    498-after and 500-x86-after3). The loss is gone either way.
+9. Reading the records: check.max_rel in the cell jsonl (e.g. 3.7e22 for cg-fwd f32 1T 128) is abs / max(|reference|, 1e-30) with one near-zero reference
+   element (src/lib.rs); the meaningful figure is check.*_rel_to_scale (~3e-7 f32). It does not indicate a broken result; tests/fidelity.rs is the gate.

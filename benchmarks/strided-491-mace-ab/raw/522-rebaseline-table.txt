@@ -39,5 +39,5 @@ strided median, 03e8760 vs 131baaa (llmlip median delta in brackets; llmlip is t
   cg-vjp f64 4T 1024: +0.5 % [+0.8 %]
 Like-for-like VJP (sum of the three separate x/w/y calls, which is what raw/496-after recorded; timings.strided_split_total_ns / llmlip), cg-vjp f32 1T 128 / 1024:
   496-after 1.526 / 1.384 -> 498-after 1.044 / 0.861 -> 500-x86-after3 0.659 / 0.578 -> 131baaa 0.625 / 0.581 -> 03e8760 0.635 / 0.591.
-The fused-call ratios in the main table (0.586 / 0.511) are a further ~10 % lower and are NOT comparable to 496-after's 1.38-1.53.
+The fused-call ratios in the main table (0.586 / 0.511) are a further 8-14 % lower (7.8 % at 128 atoms, 13.5 % at 1024) and are NOT comparable to 496-after's 1.38-1.53.
 The 1T band of the issue's table (1.09-1.53) mixes cells: raw/496-after is 1.384 (1T 1024) and 1.526 (1T 128); 1.089 is the 4T 1024 cell.
