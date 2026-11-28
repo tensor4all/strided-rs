@@ -327,3 +327,60 @@ fn extreme_logits_stay_finite() {
         assert_eq!(y[i + inner], 0.0);
     }
 }
+
+#[test]
+fn strided_f32_differs_from_axis0_only_by_summation_order() {
+    // Same columns, gathered contiguously: only the sum order differs (lane order vs source
+    // order), so the results agree to a few ulp of the probability.
+    for &(inner, a, outer) in &[(16usize, 64usize, 3usize), (17, 513, 2), (100, 4096, 1)] {
+        let mut worst = 0.0f64;
+        let (mut err_strided, mut err_axis0) = (0.0f64, 0.0f64);
+        let x: Vec<f32> = data(inner * a * outer, 21)
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        let got = fwd!(
+            softmax_axis_f32,
+            f32,
+            inner,
+            a,
+            outer,
+            &x,
+            Exec::serial(),
+            1
+        );
+        let mut cols = Vec::new();
+        for o in 0..outer {
+            for i in 0..inner {
+                cols.extend((0..a).map(|j| x[i + inner * (j + a * o)]));
+            }
+        }
+        let mut out = vec![MaybeUninit::<f32>::uninit(); cols.len()];
+        let mut sc = vec![0f32; crate::scratch_len::<f32>(a, cols.len(), 1)];
+        softmax_axis0_f32(a, &cols, &mut out, &mut sc, Exec::serial()).unwrap();
+        let truth = oracle(
+            &x.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+            inner,
+            a,
+            outer,
+        );
+        let mut k = 0;
+        for o in 0..outer {
+            for i in 0..inner {
+                for j in 0..a {
+                    // SAFETY: `softmax_axis0_f32` wrote every slot.
+                    let want = unsafe { out[k].assume_init() };
+                    let g = got[i + inner * (j + a * o)];
+                    worst = worst
+                        .max(f64::from((g - want).abs()) / f64::from(want.max(f32::MIN_POSITIVE)));
+                    let t = truth[i + inner * (j + a * o)];
+                    err_strided = err_strided.max((f64::from(g) - t).abs() / t);
+                    err_axis0 = err_axis0.max((f64::from(want) - t).abs() / t);
+                    k += 1;
+                }
+            }
+        }
+        println!("{inner},{a},{outer}: strided-vs-axis0 {worst:e}; vs f64 oracle strided {err_strided:e}, axis0 {err_axis0:e}");
+        assert!(worst < 1e-5, "{worst}");
+    }
+}

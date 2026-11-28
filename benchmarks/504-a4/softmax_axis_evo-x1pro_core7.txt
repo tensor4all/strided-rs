@@ -1,0 +1,49 @@
+samples per cell: 21
+f32 w=512   rows=16    contig  fwd axis0       6676 ns  axis       6725 ns  ratio 1.007   vjp       2523 ns
+f32 w=512   rows=16    strided fwd walk       19079 ns  gather      29102 ns  walk/axis0-contig 2.858  gather/walk 1.525   vjp       8941 ns
+f32 w=512   rows=256   contig  fwd axis0     110514 ns  axis     113240 ns  ratio 1.025   vjp      37181 ns
+f32 w=512   rows=256   strided fwd walk      124584 ns  gather    1040278 ns  walk/axis0-contig 1.127  gather/walk 8.350   vjp      57129 ns
+f32 w=512   rows=4096  contig  fwd axis0    2007280 ns  axis    2019572 ns  ratio 1.006   vjp     651898 ns
+f32 w=512   rows=4096  strided fwd walk     2784867 ns  gather   30029120 ns  walk/axis0-contig 1.387  gather/walk 10.783   vjp    1336830 ns
+f32 w=1024  rows=16    contig  fwd axis0      14485 ns  axis      14355 ns  ratio 0.991   vjp       3994 ns
+f32 w=1024  rows=16    strided fwd walk       36675 ns  gather     121767 ns  walk/axis0-contig 2.532  gather/walk 3.320   vjp      16922 ns
+f32 w=1024  rows=256   contig  fwd axis0     246152 ns  axis     251028 ns  ratio 1.020   vjp      72245 ns
+f32 w=1024  rows=256   strided fwd walk      267939 ns  gather    4564051 ns  walk/axis0-contig 1.089  gather/walk 17.034   vjp     119050 ns
+f32 w=1024  rows=4096  contig  fwd axis0    4619335 ns  axis    4676802 ns  ratio 1.012   vjp    1646598 ns
+f32 w=1024  rows=4096  strided fwd walk     5843335 ns  gather  101146409 ns  walk/axis0-contig 1.265  gather/walk 17.310   vjp    3602620 ns
+f32 w=2048  rows=16    contig  fwd axis0      28555 ns  axis      28376 ns  ratio 0.994   vjp       9835 ns
+f32 w=2048  rows=16    strided fwd walk       73779 ns  gather     243023 ns  walk/axis0-contig 2.584  gather/walk 3.294   vjp      33809 ns
+f32 w=2048  rows=256   contig  fwd axis0     489101 ns  axis     497938 ns  ratio 1.018   vjp     139589 ns
+f32 w=2048  rows=256   strided fwd walk      535522 ns  gather    9263116 ns  walk/axis0-contig 1.095  gather/walk 17.297   vjp     244626 ns
+f32 w=2048  rows=4096  contig  fwd axis0    8777551 ns  axis    8905890 ns  ratio 1.015   vjp    3778579 ns
+f32 w=2048  rows=4096  strided fwd walk    14670669 ns  gather  201877976 ns  walk/axis0-contig 1.671  gather/walk 13.761   vjp    8884781 ns
+f32 w=4096  rows=16    contig  fwd axis0      60044 ns  axis      61149 ns  ratio 1.018   vjp      15748 ns
+f32 w=4096  rows=16    strided fwd walk      154110 ns  gather     518536 ns  walk/axis0-contig 2.567  gather/walk 3.365   vjp      69701 ns
+f32 w=4096  rows=256   contig  fwd axis0     997072 ns  axis    1009315 ns  ratio 1.012   vjp     332884 ns
+f32 w=4096  rows=256   strided fwd walk     1494104 ns  gather   18021682 ns  walk/axis0-contig 1.498  gather/walk 12.062   vjp    1091694 ns
+f32 w=4096  rows=4096  contig  fwd axis0   16762987 ns  axis   17049901 ns  ratio 1.017   vjp    7153005 ns
+f32 w=4096  rows=4096  strided fwd walk    29385200 ns  gather  405607550 ns  walk/axis0-contig 1.753  gather/walk 13.803   vjp   21469104 ns
+f64 w=512   rows=16    contig  fwd axis0      31465 ns  axis      31365 ns  ratio 0.997   vjp       3942 ns
+f64 w=512   rows=16    strided fwd walk       30372 ns  gather      85260 ns  walk/axis0-contig 0.965  gather/walk 2.807   vjp       9824 ns
+f64 w=512   rows=256   contig  fwd axis0     510008 ns  axis     514909 ns  ratio 1.010   vjp      70631 ns
+f64 w=512   rows=256   strided fwd walk      373531 ns  gather    2645979 ns  walk/axis0-contig 0.732  gather/walk 7.084   vjp     117306 ns
+f64 w=512   rows=4096  contig  fwd axis0    8886384 ns  axis    8989756 ns  ratio 1.012   vjp    1389188 ns
+f64 w=512   rows=4096  strided fwd walk     7355151 ns  gather   56897791 ns  walk/axis0-contig 0.828  gather/walk 7.736   vjp    2768107 ns
+f64 w=1024  rows=16    contig  fwd axis0      63966 ns  axis      63806 ns  ratio 0.997   vjp       9831 ns
+f64 w=1024  rows=16    strided fwd walk       68217 ns  gather     172088 ns  walk/axis0-contig 1.066  gather/walk 2.523   vjp      22468 ns
+f64 w=1024  rows=256   contig  fwd axis0    1049170 ns  axis    1053978 ns  ratio 1.005   vjp     137511 ns
+f64 w=1024  rows=256   strided fwd walk      748902 ns  gather    5355166 ns  walk/axis0-contig 0.714  gather/walk 7.151   vjp     228135 ns
+f64 w=1024  rows=4096  contig  fwd axis0   17889967 ns  axis   18123371 ns  ratio 1.013   vjp    3750206 ns
+f64 w=1024  rows=4096  strided fwd walk    15593778 ns  gather  114678627 ns  walk/axis0-contig 0.872  gather/walk 7.354   vjp    7368637 ns
+f64 w=2048  rows=16    contig  fwd axis0     130812 ns  axis     132336 ns  ratio 1.012   vjp      15778 ns
+f64 w=2048  rows=16    strided fwd walk      119339 ns  gather     356862 ns  walk/axis0-contig 0.912  gather/walk 2.990   vjp      46348 ns
+f64 w=2048  rows=256   contig  fwd axis0    2155034 ns  axis    2180582 ns  ratio 1.012   vjp     336894 ns
+f64 w=2048  rows=256   strided fwd walk     1812922 ns  gather   10572976 ns  walk/axis0-contig 0.841  gather/walk 5.832   vjp     711626 ns
+f64 w=2048  rows=4096  contig  fwd axis0   35466488 ns  axis   35887512 ns  ratio 1.012   vjp    7136113 ns
+f64 w=2048  rows=4096  strided fwd walk    35978563 ns  gather  229675137 ns  walk/axis0-contig 1.014  gather/walk 6.384   vjp   15944642 ns
+f64 w=4096  rows=16    contig  fwd axis0     267456 ns  axis     270117 ns  ratio 1.010   vjp      41383 ns
+f64 w=4096  rows=16    strided fwd walk      238982 ns  gather     718863 ns  walk/axis0-contig 0.894  gather/walk 3.008   vjp     132634 ns
+f64 w=4096  rows=256   contig  fwd axis0    4379578 ns  axis    4433048 ns  ratio 1.012   vjp     819537 ns
+f64 w=4096  rows=256   strided fwd walk     4859412 ns  gather   41475081 ns  walk/axis0-contig 1.110  gather/walk 8.535   vjp    2339097 ns
+f64 w=4096  rows=4096  contig  fwd axis0   70908721 ns  axis   71721726 ns  ratio 1.011   vjp   14698250 ns
+f64 w=4096  rows=4096  strided fwd walk    78829587 ns  gather  690547588 ns  walk/axis0-contig 1.112  gather/walk 8.760   vjp   41049238 ns
