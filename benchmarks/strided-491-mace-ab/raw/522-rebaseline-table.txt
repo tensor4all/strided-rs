@@ -1,17 +1,23 @@
-cell dtype T atoms | ratio | S ms (total) | L ms | vjp parts x/w/y ms
-cg-fwd f32 1T 1024 | 0.331 | 92.85 | 280.10 | 
-cg-fwd f32 1T 128 | 0.268 | 9.27 | 34.63 | 
-cg-fwd f32 4T 1024 | 0.382 | 27.53 | 72.07 | 
-cg-fwd f32 4T 128 | 0.281 | 2.50 | 8.89 | 
-cg-fwd f64 1T 1024 | 0.228 | 144.79 | 633.94 | 
-cg-fwd f64 1T 128 | 0.208 | 16.16 | 77.78 | 
-cg-fwd f64 4T 1024 | 0.457 | 39.61 | 86.72 | 
-cg-fwd f64 4T 128 | 0.432 | 4.46 | 10.32 | 
-cg-vjp f32 1T 1024 | 0.511 | 219.84 | 429.84 | 63.9/59.4/130.8
-cg-vjp f32 1T 128 | 0.586 | 26.83 | 45.79 | 7.0/6.1/16.0
-cg-vjp f32 4T 1024 | 0.358 | 57.87 | 161.67 | 16.6/15.3/35.8
-cg-vjp f32 4T 128 | 0.583 | 7.01 | 12.03 | 1.7/1.8/4.6
-cg-vjp f64 1T 1024 | 0.242 | 377.26 | 1559.93 | 125.0/114.0/207.3
-cg-vjp f64 1T 128 | 0.223 | 43.52 | 195.29 | 15.3/12.8/25.3
-cg-vjp f64 4T 1024 | 0.371 | 97.54 | 262.80 | 32.5/26.3/52.0
-cg-vjp f64 4T 128 | 0.341 | 11.81 | 34.64 | 4.4/3.3/6.9
+cell dtype T atoms | ratio(median) | S min/med/max ms | L min/med/max ms | verdict (spread-overlap rule)
+cg-fwd f32 1T 1024: 0.331 | 92.49/92.85/93.24 | 279.59/280.10/280.83 | strided faster
+cg-fwd f32 1T 128: 0.268 | 8.94/9.27/10.43 | 34.58/34.63/34.77 | strided faster
+cg-fwd f32 4T 1024: 0.382 | 27.26/27.53/29.98 | 71.83/72.07/83.63 | strided faster
+cg-fwd f32 4T 128: 0.281 | 2.36/2.50/2.77 | 8.86/8.89/9.73 | strided faster
+cg-fwd f64 1T 1024: 0.228 | 143.76/144.79/145.56 | 632.52/633.94/636.09 | strided faster
+cg-fwd f64 1T 128: 0.208 | 16.08/16.16/16.49 | 77.69/77.78/77.90 | strided faster
+cg-fwd f64 4T 1024: 0.457 | 39.37/39.61/39.82 | 86.08/86.72/115.03 | strided faster
+cg-fwd f64 4T 128: 0.432 | 4.41/4.46/4.95 | 10.11/10.32/12.17 | strided faster
+cg-vjp f32 1T 1024: 0.511 | 218.53/219.84/220.43 | 426.25/429.84/437.03 | strided faster
+cg-vjp f32 1T 128: 0.586 | 26.51/26.83/27.03 | 45.37/45.79/45.92 | strided faster
+cg-vjp f32 4T 1024: 0.358 | 57.60/57.87/58.15 | 160.20/161.67/162.98 | strided faster
+cg-vjp f32 4T 128: 0.583 | 6.92/7.01/8.45 | 11.99/12.03/14.18 | strided faster
+cg-vjp f64 1T 1024: 0.242 | 375.83/377.26/379.29 | 1557.50/1559.93/1578.72 | strided faster
+cg-vjp f64 1T 128: 0.223 | 43.28/43.52/43.64 | 194.20/195.29/196.09 | strided faster
+cg-vjp f64 4T 1024: 0.371 | 96.47/97.54/98.04 | 252.76/262.80/271.48 | strided faster
+cg-vjp f64 4T 128: 0.341 | 11.76/11.81/18.06 | 34.18/34.64/40.60 | strided faster
+
+ratio = strided / llmlip (LOWER = strided faster); vjp strided = the fused VJP (timings.strided_vjp_fused). Spread = min..max of 15 samples.
+Commit 03e8760, host EVO-X2 (Ryzen AI MAX+ 395), --release, PIN=1 SETTLE=5, 1T cells on cpu 4, 4T on 4-7. Regenerate: python3 raw/522-rebaseline/522-table.py raw/522-rebaseline (ratios).
+Anchor drift (cg-fwd f64 1T 128, start vs end): strided 16.9 -> 17.7 ms (4.2 %), llmlip 77.5 -> 78.2 ms (0.9 %). A third anchor read in the same campaign file spans 16.16/16.95/17.68 ms (9.4 % peak-to-peak), so per-cell repeatability is ~10 %, not the 4 % drift.
+Relation to raw/522-x86-table.txt (131baaa) and raw/500-x86-after3: strided-multilinear is unchanged between 131baaa and 03e8760, so differences are measurement variation. 1T rows agree within 0.7-1.8 %; 4T rows move 7-17 % between campaigns (e.g. cg-fwd f32 4T 128: 0.240 / 0.266 / 0.281). Treat 4T rows as a band, not a baseline. This table is the baseline at the current head; the 131baaa table remains the record at that commit, neither supersedes the other's data.
+The 1T band of the issue's table (1.09-1.53) mixes cells: raw/496-after is 1.384 (1T 1024) and 1.526 (1T 128); 1.089 is the 4T 1024 cell.

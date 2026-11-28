@@ -1,0 +1,16 @@
+== V4 lane kernels RowF32<A,B> vs RowF64<A,B>
+Row<2,1>: f32: insns=563 nop=12 zmm=90 vcvt=0 fma=0 mul=32 add=16 mov=32; f64: insns=563 nop=12 zmm=90 vcvt=0 fma=0 mul=32 add=16 mov=32;
+Row<2,2>: f32: insns=564 nop=11 zmm=73 vcvt=0 fma=0 mul=16 add=16 mov=32; f64: insns=564 nop=11 zmm=73 vcvt=0 fma=0 mul=16 add=16 mov=32;
+Row<2,3>: f32: insns=596 nop=12 zmm=89 vcvt=0 fma=0 mul=32 add=16 mov=32; f64: insns=596 nop=12 zmm=89 vcvt=0 fma=0 mul=32 add=16 mov=32;
+Row<3,1>: f32: insns=602 nop=10 zmm=107 vcvt=0 fma=0 mul=48 add=16 mov=32; f64: insns=602 nop=10 zmm=107 vcvt=0 fma=0 mul=48 add=16 mov=32;
+Row<3,2>: f32: insns=599 nop=7 zmm=90 vcvt=0 fma=0 mul=32 add=16 mov=32; f64: insns=599 nop=7 zmm=90 vcvt=0 fma=0 mul=32 add=16 mov=32;
+Row<3,3>: f32: insns=645 nop=10 zmm=106 vcvt=0 fma=0 mul=48 add=16 mov=32; f64: insns=645 nop=10 zmm=106 vcvt=0 fma=0 mul=48 add=16 mov=32;
+Row<3,4>: f32: insns=595 nop=12 zmm=73 vcvt=0 fma=0 mul=16 add=16 mov=32; f64: insns=595 nop=12 zmm=73 vcvt=0 fma=0 mul=16 add=16 mov=32;
+Row<3,5>: f32: insns=645 nop=10 zmm=106 vcvt=0 fma=0 mul=48 add=16 mov=32; f64: insns=645 nop=10 zmm=106 vcvt=0 fma=0 mul=48 add=16 mov=32;
+Row<3,6>: f32: insns=630 nop=13 zmm=89 vcvt=0 fma=0 mul=32 add=16 mov=32; f64: insns=630 nop=13 zmm=89 vcvt=0 fma=0 mul=32 add=16 mov=32;
+Row<3,7>: f32: insns=658 nop=11 zmm=105 vcvt=0 fma=0 mul=48 add=16 mov=32; f64: insns=658 nop=11 zmm=105 vcvt=0 fma=0 mul=48 add=16 mov=32;
+== SegPolyPlan<f32> vs <f64>
+execute: f32: insns=1240 vcvt=0 cvt=0; f64: insns=1240 vcvt=0 cvt=0;
+run_task: f32: insns=781 vcvt=0 cvt=0; f64: insns=780 vcvt=0 cvt=0;
+accumulate_output: f32: insns=1495 vcvt=0 cvt=0; f64: insns=1502 vcvt=0 cvt=0;
+compile_with_block_rows: f32: insns=3133 vcvt=0 cvt=2; f64: insns=3131 vcvt=0 cvt=0;
