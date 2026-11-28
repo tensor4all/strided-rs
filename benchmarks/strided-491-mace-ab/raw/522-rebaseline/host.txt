@@ -1,0 +1,8 @@
+1
+     32 0
+03e8760c6c5b24c0cec3523dcf8a04c293b828d0
+ 17:32:37 up 24 days,  4:03,  5 users,  load average: 0.98, 0.39, 0.37
+host: EVO-X2 (Ryzen AI MAX+ 395), Linux 7.0.0-42-generic, rustc 1.100.0 (0ef1bc386 2026-11-09)
+build: cargo build --release (benchmarks/strided-491-mace-ab, thin LTO, cgu=1), commit 03e8760c6c5b24c0cec3523dcf8a04c293b828d0
+pins: PIN=1 SETTLE=5, 1T cells on cpu 4, 4T on 4-7, observer on 8-15,24-31
+boost: global cpufreq/boost=1, policy*/boost=0 on all 32 policies

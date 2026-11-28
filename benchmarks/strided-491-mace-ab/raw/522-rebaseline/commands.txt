@@ -1,0 +1,4 @@
+cd benchmarks/strided-491-mace-ab && cargo build --release
+OUT=raw/522-rebaseline PIN=1 SETTLE=5 taskset -c 8-15,24-31 ./campaign.sh      # all 16 cells + 2 anchors; drift strided 4.2 %, llmlip 0.9 %
+python3 <table script> raw/522-rebaseline > raw/522-rebaseline-table.txt           # ratio = strided_total_ns (vjp fused) or strided / llmlip median
+perf stat/record: refused (perf_event_paranoid=4, no root) -> disassembly instead, see 522-diagnosis.txt
