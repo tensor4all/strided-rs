@@ -14,7 +14,7 @@
 //!   here, the row statistics and the normalize-scale-shift of A1 (`prepare_row` /
 //!   `fill_chunk`). A bias-add prologue (`z = x + bias`) or a linear prologue (`z` = a
 //!   caller-GEMM output row plus bias) replaces only this part.
-//! - **Epilogue** — [`crate::activation::epilogue`]: `exp(-z)`, then `silu(z)` and, if
+//! - **Epilogue** — `activation::epilogue` (crate-private): `exp(-z)`, then `silu(z)` and, if
 //!   requested, `silu'(z)`. It is the *same function* the standalone A2 kernels call, so it
 //!   is the only place the activation is rounded.
 //!
