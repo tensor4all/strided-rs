@@ -115,15 +115,32 @@ fn forward<T: Real>(
 }
 
 fn chunk_forward<T: Real>(silu: bool, x: &[T], y: &mut [T], d: Option<&mut [T]>, tmp: &mut [T]) {
-    // `y` holds exp(-x) first, then is overwritten by the result.
     for (t, &v) in tmp.iter_mut().zip(x) {
         *t = -v;
     }
+    epilogue(silu, x, tmp, y, d);
+}
+
+/// The activation epilogue shared with the fused norm kernels.
+///
+/// Given the pre-activation `z` and `neg_z = -z` (both produced by whatever prologue precedes
+/// the activation), writes `f(z)` into `y` and, if requested, `f'(z)` into `d`. `y` doubles as
+/// the `exp(-z)` buffer, so the epilogue needs no scratch of its own. This is the only code
+/// that rounds the activation; the standalone and the fused kernels both call it.
+pub(crate) fn epilogue<T: Real>(
+    silu: bool,
+    z: &[T],
+    neg_z: &[T],
+    y: &mut [T],
+    d: Option<&mut [T]>,
+) {
+    // `y` holds exp(-z) first, then is overwritten by the result.
     // SAFETY: `&mut [T]` and `&mut [MaybeUninit<T>]` have the same layout. `exp_into` only
     // stores finished `T` values (never uninitialized ones), so `y` stays fully initialized.
     let y_uninit = unsafe { &mut *(core::ptr::from_mut::<[T]>(y) as *mut [MaybeUninit<T>]) };
-    let ok = T::exp_into(tmp, y_uninit);
+    let ok = T::exp_into(neg_z, y_uninit);
     debug_assert!(ok, "chunk and scratch lengths are equal");
+    let x = z;
     let one = T::ONE;
     match (silu, d) {
         (false, None) => {

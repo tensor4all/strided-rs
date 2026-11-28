@@ -15,6 +15,7 @@
 pub mod activation;
 mod error;
 pub mod norm;
+pub mod norm_silu;
 mod par;
 mod real;
 mod simd;
